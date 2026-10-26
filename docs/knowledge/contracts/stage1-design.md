@@ -2196,6 +2196,25 @@ Choices S4 made where this design left the mechanic to the slice:
   case asserts the design's observable — one pending intent and the kept leaf,
   whichever conservative stop the race produces — and the marker-last
   `ENOTEMPTY` retry itself stays proved by the counted unit counterfactual.
+- **The native's same-uid observability preflight (owner ruling).** Some hosts
+  refuse `proc_pidinfo` on processes of their own effective user — observed here
+  as `EPERM` on two `/usr/bin/login` processes — and custody correctly reads an
+  unreadable process as `Unknown` and refuses. Whether this account may read its
+  own processes is an environment capability, not a product fact, so before any
+  case, inside the same qualified supervisor, the proof performs the two
+  descriptor observations the gate requires and nothing else replaces them:
+  it launches one same-uid sentinel child that stays in the supervisor's
+  session, lists that child's descriptors with
+  `proc_pidinfo(PROC_PIDLISTFDS)` — the primitive the custody scan uses — then
+  terminates and reaps it within a fixed bound; and it lists the descriptors of
+  a pre-existing process whose effective uid it has verified as its own from the
+  kernel process table (`sysctl KERN_PROC_ALL`), preferring the supervisor that
+  runs it, excluding itself and the sentinel. If either listing is unavailable,
+  the run classifies itself `infrastructure`, unqualified, and aborts before any
+  case (exit 4): a missing capability is never a case failure and never a pass.
+  Identity, session and supervisor-pin checks stay, as supplemental checks. No
+  product rule, path exception or case oracle changes; an unreadable
+  same-effective-uid descriptor is still `Unknown` and still refuses.
 - **What S4 does not claim.** No real-drive sweep, no reaper or LaunchAgent
   change, no Oxide or Effigy adoption, and no native receipt until the owner
   activates the runs. `scratch:expiry:native` and its `:diagnostic` twin are

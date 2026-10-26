@@ -69,7 +69,9 @@ admission = "heavy"
 run = "python3 scripts/run-scratch-expiry-native.py --diagnostic"
 
 # Pure apparatus regression of the proof itself: the case map, the pinned
-# supervisor digest, the nine-premise record and the environment hook list. No
-# image, no scratch, no child process.
+# supervisor digest, the nine-premise record, the same-uid observability
+# preflight (both positive descriptor probes and an infrastructure abort on
+# either failure) and the environment hook list. No image, no scratch, no child
+# process.
 [tasks."scratch:expiry:test"]
 run = "python3 scripts/test-scratch-expiry.py --self-check"
