@@ -27,3 +27,17 @@ Answer: Barge reads Oxide's existing formats in place; Oxide switches one part a
 
 Status: answered 2026-10-26
 Answer: macOS on APFS only for now, with an OS layer throughout so Linux can follow later (Tom); see [architecture](architecture.md#platforms).
+
+## Q-006 — Does kept data have to sit outside `root_dir`, or only outside its managed folders?
+
+Status: open
+Context: Tom's rulings put kept data outside the group folders, and `root_dir`
+may be empty, which makes the drive root the folder that holds everything Barge
+owns on that volume. The stage 1 design reads the ruling as "outside the
+resolved feature folders and every declared area", so kept data can live
+anywhere else on a volume whose `root_dir` is empty; the alternative is that kept
+data needs a non-empty `root_dir` on its volume, which would force a layout
+change on the Vault drive. This decides the containment predicate used at adopt
+and at every later use, so it must be settled before area and placement
+implementation. The proposed reading and the alternative are in the
+[stage 1 design](contracts/stage1-design.md#open-design-issues) (O-004).
