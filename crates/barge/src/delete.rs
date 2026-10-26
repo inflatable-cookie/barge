@@ -914,6 +914,7 @@ impl<'a> WalkState<'a> {
                 "`{private}` holds the unverified capture of `{}`, whose put back {}: {}; it is never unlinked, so the intent stays pending",
                 record.original,
                 match record.put_back {
+                    PutBackOutcome::Renamed => "put it back under its own name",
                     PutBackOutcome::Taken => "was refused because the name was taken",
                     PutBackOutcome::Failed => "failed",
                 },
@@ -1067,11 +1068,11 @@ impl<'a> WalkState<'a> {
 
     /// Verify one captured object against the observation it was captured from.
     ///
-    /// An entry the classification recorded, and a private name a stopped
-    /// deletion left behind, must report the same device, inode and kind as the
-    /// observation the walk took, and still belong to this account. Finder
-    /// metadata that appeared after the classification is verified by class:
-    /// a regular file of this user on this device, inside the size bound. The
+    /// An entry the classification recorded must report the same device, inode and
+    /// kind as the observation the walk took, and still belong to this account. A
+    /// Finder-named regular file is verified by class instead, whether the
+    /// classification recorded it or it was recreated: a regular file of this user
+    /// on this device, inside the size bound. The
     /// parent binding is re-read through the descriptor the capture went through,
     /// so a volume that changed under it stops the deletion before any unlink.
     fn verify_capture(
@@ -1084,21 +1085,28 @@ impl<'a> WalkState<'a> {
         let parent = self.dirs.recheck_dir(handle)?;
         let opened = handle.identity();
         if parent.device != self.device || parent.inode != opened.inode {
-            return Ok(Verify::Mismatch(format!(
-                "the directory holding `{private}` is device {} inode {}, not the opened {} / {} on the recorded device {}",
-                parent.device, parent.inode, opened.device, opened.inode, self.device
-            )));
+            return Ok(Verify::Mismatch {
+                reason: format!(
+                    "the directory holding `{private}` is device {} inode {}, not the opened {} / {} on the recorded device {}",
+                    parent.device, parent.inode, opened.device, opened.inode, self.device
+                ),
+                captured: None,
+            });
         }
         let Some(facts) = self.dirs.child_facts(handle, private)? else {
-            return Ok(Verify::Mismatch(format!(
-                "the captured object is not there under `{private}`"
-            )));
+            return Ok(Verify::Mismatch {
+                reason: format!("the captured object is not there under `{private}`"),
+                captured: None,
+            });
         };
         if facts.uid != self.uid {
-            return Ok(Verify::Mismatch(format!(
-                "the captured `{private}` belongs to uid {}, not this account's {}",
-                facts.uid, self.uid
-            )));
+            return Ok(Verify::Mismatch {
+                reason: format!(
+                    "the captured `{private}` belongs to uid {}, not this account's {}",
+                    facts.uid, self.uid
+                ),
+                captured: Some(facts),
+            });
         }
         let matched = match allowance {
             Allowance::Finder => {
@@ -1115,16 +1123,19 @@ impl<'a> WalkState<'a> {
         if matched {
             return Ok(Verify::Verified);
         }
-        Ok(Verify::Mismatch(format!(
-            "the captured `{private}` is a {} on device {} inode {} of {} bytes, not the observed {} on device {} inode {}",
-            facts.kind.as_str(),
-            facts.device,
-            facts.inode,
-            facts.size,
-            observed.kind.as_str(),
-            observed.device,
-            observed.inode
-        )))
+        Ok(Verify::Mismatch {
+            reason: format!(
+                "the captured `{private}` is a {} on device {} inode {} of {} bytes, not the observed {} on device {} inode {}",
+                facts.kind.as_str(),
+                facts.device,
+                facts.inode,
+                facts.size,
+                observed.kind.as_str(),
+                observed.device,
+                observed.inode
+            ),
+            captured: Some(facts),
+        })
     }
 
     /// Capture one entry under a private name, verify the captured object, then
@@ -1151,7 +1162,7 @@ impl<'a> WalkState<'a> {
             Capture::Held(private) => private,
             Capture::Stopped(reason) => return Ok(Walk::Stop(reason)),
         };
-        if let Verify::Mismatch(reason) =
+        if let Verify::Mismatch { reason, captured } =
             self.verify_capture(handle, &private, observed, allowance)?
         {
             // Never unlink. A put-back that itself fails still reports both the
@@ -1166,19 +1177,24 @@ impl<'a> WalkState<'a> {
                     ),
                 ),
             };
-            if put_back != PutBack::Renamed {
-                // The object stays under its private name. Record it durably, so
-                // no later run and no replay can mistake it for an ordinary entry
-                // of the root and unlink an object whose capture never verified.
+            // Record the mismatch whatever the put-back answered. A successful
+            // put-back leaves the captured object under its original name, where
+            // an ordinary walk would find it again and unlink it; the record is
+            // what tells a later run and a replay that Barge never observed it.
+            if let Some(captured) = captured {
                 self.leftovers.push(LeftoverRecord {
                     private,
                     original: name.to_owned(),
                     device: observed.device.get(),
                     inode: observed.inode,
                     kind: observed.kind.as_str().to_owned(),
+                    captured_device: captured.device.get(),
+                    captured_inode: captured.inode,
+                    captured_kind: captured.kind.as_str().to_owned(),
                     put_back: match put_back {
+                        PutBack::Renamed => PutBackOutcome::Renamed,
                         PutBack::Taken => PutBackOutcome::Taken,
-                        PutBack::Renamed | PutBack::Failed => PutBackOutcome::Failed,
+                        PutBack::Failed => PutBackOutcome::Failed,
                     },
                     reason: bounded_reason(&reason),
                 });
@@ -1374,10 +1390,13 @@ impl<'a> WalkState<'a> {
                 return Ok(Walk::Stop(self.leftover_stop(&entry.name)));
             }
             let path = relative.join(&entry.name);
-            let allowance = if self.expected.contains(&path) {
-                Allowance::Observed
-            } else if is_finder_metadata(&entry.name) && facts.kind == EntryKind::File {
+            let allowance = if is_finder_metadata(&entry.name) && facts.kind == EntryKind::File {
+                // Finder metadata is verified by class whether the classification
+                // recorded it or Finder rebuilt it between the observation and the
+                // capture: its inode is not a stable identity.
                 Allowance::Finder
+            } else if self.expected.contains(&path) {
+                Allowance::Observed
             } else {
                 return Ok(Walk::Stop(format!(
                     "`{}` appeared after the classification, so the delete stops",
@@ -1451,8 +1470,11 @@ enum Allowance {
     /// The entry the classification pass recorded, verified against the
     /// observation the delete pass took of it.
     Observed,
-    /// Finder metadata that appeared after the classification, verified by class
-    /// instead of by inode, because it has no recorded inode to match.
+    /// A Finder-named regular file, verified by class instead of by inode.
+    ///
+    /// Finder rebuilds `.DS_Store` and `._name` whenever it likes, so such a file
+    /// has no stable inode to match: whether the classification recorded it or it
+    /// appeared afterwards, what is verified is the class and the size bound.
     Finder,
 }
 
@@ -1469,8 +1491,15 @@ enum Verify {
     /// The captured object is the observed one, or Finder metadata of the allowed
     /// class.
     Verified,
-    /// The object is not the observed one, so it is never unlinked.
-    Mismatch(String),
+    /// The object is not the observed one, so it is never unlinked. The captured
+    /// facts are carried when they could be read, so the record says what was
+    /// there instead.
+    Mismatch {
+        /// Why the capture did not verify.
+        reason: String,
+        /// The captured object's own facts, when they could be read.
+        captured: Option<EntryFacts>,
+    },
 }
 
 /// What a put-back of one unverified capture answered.
@@ -1665,6 +1694,9 @@ fn replay_one(
                 return Ok(ReplayOutcome::RolledBack);
             }
             if leaf_matches && marker_matches(&marker_digest, intent) {
+                if let Some(reason) = recorded_mismatch(&intent.leftovers) {
+                    return Ok(ReplayOutcome::Pending(reason));
+                }
                 // The rename happened before its phase was recorded: resume.
                 let renamed =
                     state::advance_intent(&write, state_paths, intent, IntentPhase::Renamed)?;
@@ -1694,6 +1726,9 @@ fn replay_one(
             ))
         }
         IntentPhase::Renamed => {
+            if let Some(reason) = recorded_mismatch(&intent.leftovers) {
+                return Ok(ReplayOutcome::Pending(reason));
+            }
             if leaf_matches && marker_matches(&marker_digest, intent) {
                 let report = finish_deletion(
                     &write,
@@ -1721,6 +1756,9 @@ fn replay_one(
             ))
         }
         IntentPhase::MarkerLast => {
+            if let Some(reason) = recorded_mismatch(&intent.leftovers) {
+                return Ok(ReplayOutcome::Pending(reason));
+            }
             if leaf_facts.is_none() {
                 // Both the leaf and the marker are positively absent, and the
                 // marker-last phase was recorded: that is the proof.
@@ -1808,6 +1846,37 @@ fn root_still_in_place(
 /// recorded.
 fn marker_matches(digest: &Option<MarkerBytes>, intent: &IntentRecord) -> bool {
     matches!(digest, Some(MarkerBytes::Digest(bytes)) if bytes == &intent.marker_digest)
+}
+
+/// The replay stop naming every capture whose verification failed.
+///
+/// A recorded mismatch proves an object Barge never observed is somewhere in the
+/// leaf: under its private name, or back under its original name when the put-back
+/// succeeded. No replay resumes such an intent, because resuming would walk that
+/// object as an ordinary entry of the root and unlink it.
+fn recorded_mismatch(leftovers: &[LeftoverRecord]) -> Option<String> {
+    if leftovers.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = leftovers
+        .iter()
+        .map(|record| {
+            format!(
+                "`{}` (captured to `{}`, put back {})",
+                record.original,
+                record.private,
+                match record.put_back {
+                    PutBackOutcome::Renamed => "under its own name",
+                    PutBackOutcome::Taken => "refused, the name was taken",
+                    PutBackOutcome::Failed => "failed",
+                }
+            )
+        })
+        .collect();
+    Some(format!(
+        "the intent records captures that did not verify, so an object Barge never observed is in the leaf and nothing is unlinked: {}",
+        named.join(", ")
+    ))
 }
 
 /// Settle a `marker_last` intent whose area folder is gone.
@@ -2769,6 +2838,11 @@ mod tests {
                 .expect("an ASCII name")
         );
         assert_eq!(recorded[0].kind, "file");
+        assert_eq!(recorded[0].captured_kind, "file");
+        assert_ne!(
+            recorded[0].captured_inode, recorded[0].inode,
+            "the record keeps the identity that did not match"
+        );
         assert_eq!(recorded[0].put_back, state::PutBackOutcome::Taken);
         assert!(
             !recorded[0].reason.is_empty(),
@@ -2857,6 +2931,117 @@ mod tests {
         assert!(private.is_file(), "the leftover is never unlinked");
         assert!(leaf.is_dir(), "the intent stays pending with its leaf");
         assert_eq!(prepared.pending_intents().len(), 1);
+    }
+
+    #[test]
+    fn replay_after_a_successful_put_back_keeps_the_foreign_object_and_the_intent() {
+        // The review's second replay gap: a put-back that succeeds leaves the
+        // captured object back under its original name, where an ordinary walk
+        // finds it again. The mismatch is durable evidence, so a replay must not
+        // resume and unlink the object Barge never observed.
+        let prepared = prepared("replay-after-successful-put-back");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"mine");
+        let foreign = b"the racer's object";
+        let faults = Faults::new();
+        faults.racing(&area, "payload.txt", 2, Replacement::File(foreign.to_vec()));
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert!(
+            report
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("put back under its own name"),
+            "{:?}",
+            report.reason
+        );
+        let leaf = report.quarantine.clone();
+        assert_eq!(
+            std::fs::read(leaf.join("payload.txt")).expect("the put-back object"),
+            foreign
+        );
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1);
+        let recorded = &pending[0].leftovers;
+        assert_eq!(recorded.len(), 1, "the mismatch is recorded: {recorded:?}");
+        assert_eq!(recorded[0].original, "payload.txt");
+        assert_eq!(recorded[0].put_back, state::PutBackOutcome::Renamed);
+        assert_ne!(
+            recorded[0].captured_inode, recorded[0].inode,
+            "the record keeps the identity that did not match"
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0].reason.contains("payload.txt"),
+            "{:?}",
+            replay.pending[0].reason
+        );
+        assert_eq!(
+            std::fs::read(leaf.join("payload.txt"))
+                .expect("the replay never unlinks the put-back object"),
+            foreign
+        );
+        assert!(leaf.join(ROOT_MARKER_FILE).is_file(), "the root is kept");
+        assert_eq!(prepared.pending_intents().len(), 1);
+    }
+
+    #[test]
+    fn finder_metadata_replaced_between_observation_and_capture_is_removed_by_class() {
+        // A classified `.DS_Store` has no stable inode: Finder rebuilds it. When
+        // the file under that name is replaced between the observation and the
+        // capture, the capture is verified by class and the deletion continues.
+        let prepared = prepared("delete-finder-classified-replaced");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        VolumeFixture::payload(&root, ".DS_Store", b"finder");
+        let faults = Faults::new();
+        faults.racing(
+            &area,
+            ".DS_Store",
+            2,
+            Replacement::File(b"finder rebuilt it".to_vec()),
+        );
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_deleted(), "{:?}", report.reason);
+        assert!(!root.exists(), "the whole root is gone");
+        assert!(!report.quarantine.exists());
+    }
+
+    #[test]
+    fn finder_metadata_over_the_size_bound_stops_the_delete() {
+        // The class check keeps the brief's size bound: a recreated Finder file
+        // that is too large is not Finder metadata, so the deletion stops.
+        let prepared = prepared("delete-finder-too-large");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        VolumeFixture::payload(&root, ".DS_Store", b"finder");
+        let oversized = vec![b'x'; usize::try_from(super::FINDER_METADATA_BYTES).unwrap_or(0) + 1];
+        let faults = Faults::new();
+        faults.racing(&area, ".DS_Store", 2, Replacement::File(oversized));
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        let leaf = report.quarantine.clone();
+        assert!(
+            std::fs::metadata(leaf.join(".DS_Store"))
+                .expect("the oversized file is put back")
+                .len()
+                > super::FINDER_METADATA_BYTES,
+            "the object is kept, never unlinked"
+        );
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].leftovers.len(), 1, "the mismatch is recorded");
     }
 
     #[test]

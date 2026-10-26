@@ -1146,31 +1146,42 @@ pub fn is_capture_name(name: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PutBackOutcome {
+    /// The object is back under its original name, and it is still not the
+    /// observed one.
+    Renamed,
     /// The original name was taken, so the object stays under its private name.
     Taken,
     /// The put-back could not be attempted or failed, so the object stays too.
     Failed,
 }
 
-/// One captured object a deletion could not put back.
+/// One capture whose verification failed.
 ///
-/// It records the private name that holds the object, the name it was captured
-/// from and the observation its capture failed to match, so a replay can say
-/// what is there and why, and so it never unlinks that object as if it were an
-/// ordinary entry of the root.
+/// It records the private name the object was captured to, the name it came from,
+/// the identity the walk observed there and the identity the captured object
+/// actually had, what the put-back answered and why the capture did not verify.
+/// The record is written whether or not the put-back succeeded, so a later run and
+/// a replay know an object Barge never observed is somewhere in the leaf — under
+/// its private name or back under its original one — and never unlink it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LeftoverRecord {
-    /// The private `.barge-del-<nonce>` name the object is held under.
+    /// The private `.barge-del-<nonce>` name the object was captured to.
     pub private: String,
     /// The name the object was captured from.
     pub original: String,
-    /// The device the failed observation reported.
+    /// The device the observation at the original name reported.
     pub device: u64,
-    /// The inode the failed observation reported.
+    /// The inode that observation reported.
     pub inode: u64,
-    /// The kind the failed observation reported: `file` or `directory`.
+    /// The kind that observation reported: `file` or `directory`.
     pub kind: String,
+    /// The device the captured object actually had.
+    pub captured_device: u64,
+    /// The inode the captured object actually had.
+    pub captured_inode: u64,
+    /// The kind the captured object actually had.
+    pub captured_kind: String,
     /// What the put-back attempt answered.
     pub put_back: PutBackOutcome,
     /// Why the captured object was not verified, bounded.
@@ -1206,6 +1217,13 @@ impl LeftoverRecord {
             return Err(Error::new(
                 ErrorKind::UnknownState,
                 format!("an unverified capture records the kind `{}`", self.kind),
+            )
+            .with_detail("private", self.private.clone().into()));
+        }
+        if self.captured_kind.is_empty() || self.captured_kind.len() > 16 {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "an unverified capture does not record the captured object's kind".to_owned(),
             )
             .with_detail("private", self.private.clone().into()));
         }
@@ -1320,13 +1338,15 @@ pub fn advance_intent(
     Ok(next)
 }
 
-/// Record the captured objects a deletion could not put back.
+/// Record the captures whose verification failed.
 ///
-/// The record names the private names a replay must never unlink, with the
-/// observation each capture failed to match. The phase does not change, but the
-/// generation still increases, so a stale writer cannot drop a record it raced.
-/// A caller that records a leftover stops the deletion, so no phase advances on a
-/// record it has not read back.
+/// A record names the private name a replay must never unlink and the name the
+/// object came from, with both the observation the capture failed to match and
+/// the identity the captured object actually had. The phase does not change, but
+/// the generation still increases, so a stale writer cannot drop a record it
+/// raced. A caller that records a mismatch stops the deletion, so no phase
+/// advances on a record it has not read back, and a replay that reads one refuses
+/// to resume.
 pub fn record_leftovers(
     write: &IntentWrite,
     state: &StatePaths,
@@ -2015,7 +2035,10 @@ mod intent_tests {
             device: 16_777_219,
             inode: 4_242,
             kind: "file".to_owned(),
-            put_back: PutBackOutcome::Taken,
+            captured_device: 16_777_219,
+            captured_inode: 4_243,
+            captured_kind: "file".to_owned(),
+            put_back: PutBackOutcome::Renamed,
             reason: "the captured object is not the observed one".to_owned(),
         }
     }
@@ -2083,6 +2106,9 @@ mod intent_tests {
         let mut wrong_kind = leftover("payload.txt", 3);
         wrong_kind.kind = "symlink".to_owned();
         cases.push(("a kind", wrong_kind));
+        let mut no_captured_kind = leftover("payload.txt", 5);
+        no_captured_kind.captured_kind = String::new();
+        cases.push(("the captured object's kind", no_captured_kind));
         let mut long_reason = leftover("payload.txt", 4);
         long_reason.reason = "x".repeat(super::LEFTOVER_REASON_BYTES + 1);
         cases.push(("a reason", long_reason));
