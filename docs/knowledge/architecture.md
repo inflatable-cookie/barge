@@ -3,7 +3,9 @@
 Barge is one Rust library and a thin CLI over it. Oxide links the library;
 every other consumer uses the CLI and its versioned JSON output. There is no
 daemon: state lives in files under the account's state directory and on each
-registered volume, protected by file locks.
+registered volume, protected by file locks. The concrete stage 1 crate shape,
+formats and interfaces are in the [stage 1
+design](contracts/stage1-design.md).
 
 ## Concepts
 

@@ -4,6 +4,7 @@ Barge moves heavy, rebuildable developer data (build output, caches, scratch, VM
 
 - [Vision and operator ruling](knowledge/vision.md)
 - [Architecture and the boundary with Oxide](knowledge/architecture.md)
+- [Stage 1 design: library, CLI, locations, areas, scratch and caches](knowledge/contracts/stage1-design.md)
 - [Open decisions](knowledge/questions.md)
 - [Knowledge map](knowledge/README.md)
 
