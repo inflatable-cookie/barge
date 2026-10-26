@@ -1,0 +1,9 @@
+[catalog]
+alias = "barge"
+
+[tasks]
+"docs:check" = [
+  "effigy skill run northstar/check-links",
+  "effigy skill run northstar/retired-concepts",
+  "git diff --check HEAD",
+]

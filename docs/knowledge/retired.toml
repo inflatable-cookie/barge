@@ -1,0 +1,3 @@
+# Concepts that no longer exist. The retired-concepts check fails on any listed
+# term, path or config key found outside `allow`. See the Northstar skill's
+# references/knowledge.md.
