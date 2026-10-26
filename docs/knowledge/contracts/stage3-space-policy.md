@@ -531,7 +531,11 @@ which requires, in this stage's terms:
 - the root's device, inode and marker digest still equal the observation the
   candidate was built from;
 - the area's declaration still says `counts`, and the policy generation still
-  matches the snapshot; and
+  matches the snapshot;
+- when a root also carries Barge's durable identity record (`barge.root.identity/1`,
+  [stage 4](stage4-design.md#root-identity)), that record verifies and agrees
+  with this observation; a disagreement keeps the root rather than being resolved
+  in either direction; and
 - there is no pending intent for the root.
 
 A held root — one with a live hold, one whose holder is alive, one the scan

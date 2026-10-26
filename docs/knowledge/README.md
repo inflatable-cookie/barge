@@ -15,6 +15,13 @@ Contracts own durable interfaces and formats:
   idleness and least-recently-used order, concurrent pruning under consumer
   holds, the stage 3 formats, bounds, failure matrix, slices and its bounded
   native design.
+- [Stage 4 design](contracts/stage4-design.md) owns owned-root identity across
+  remounts, the durable identity and the path-absence documents and their
+  versions, the reference check, the gate that authorizes releasing a whole
+  owned root, how that gate combines with the stage 3 space prune, the
+  diagnostic that answers the carried "device or inode changed" finding, the
+  stage 4 matrix and bounds, the Oxide compatibility reading of the absence
+  rule, the stage 4 slices and the proposed validation.
 
 Rust quality policy owns the strict profile for the Rust workspace:
 [activation](contracts/language-quality-activation.json) records the
