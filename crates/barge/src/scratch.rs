@@ -477,6 +477,23 @@ pub fn conclude(
     if let Some(project) = request.project {
         area::validate_name("project", project)?;
     }
+    // A positive closure is the claim that the run closed; recording it beside a
+    // retained, unclosed or failed outcome would authorize an expiry the owner's
+    // own facts contradict. Refuse the combination at the write, so no invalid
+    // conclusion fact ever lands in a marker.
+    if request.closure == ConclusionClosure::Positive
+        && request.outcome != ConclusionOutcome::Closed
+    {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            format!(
+                "a positive closure is only recorded for a closed run, not `{}`",
+                outcome_name(request.outcome)
+            ),
+        )
+        .with_detail("outcome", outcome_name(request.outcome).into())
+        .with_detail("closure", "positive".into()));
+    }
     let record = area::registered_volume(state_paths, request.volume_uuid)?;
     record.declared_durability()?;
     let scratch = scratch_folder(&record);
@@ -1035,6 +1052,12 @@ pub fn declare_delegation(
 /// against the design's units and records it; it is never inferred from a name,
 /// a marker's absence or an mtime, and removing it returns the scope to keep and
 /// report without touching data.
+///
+/// A project claim is valid for any project name the design's unit vocabulary
+/// allows, including an eight-character name like `underlay`: the claim, not the
+/// name, establishes that the folder is a project. Because such a name can also
+/// be read as one ad-hoc top-level entry, a project claim for it and a
+/// `top_level_adhoc` claim may not overlap, and the second declaration refuses.
 pub fn declare_claim(
     state_paths: &StatePaths,
     volume_uuid: &VolumeUuid,
@@ -1043,6 +1066,12 @@ pub fn declare_claim(
 ) -> Result<GrantsReport> {
     validate_claim(claim)?;
     update_grants(state_paths, volume_uuid, |grants| {
+        // The overlap is a property of the recorded set, so it is checked under
+        // the same locks the change is published under. A withdrawal is always
+        // allowed: it is how an operator resolves an overlap.
+        if !revoke {
+            refuse_scope_overlap(grants, &claim.scope)?;
+        }
         let before = grants.claims.len();
         grants
             .claims
@@ -1055,6 +1084,36 @@ pub fn declare_claim(
         grants.claims.sort_by_key(|claim| scope_key(&claim.scope));
         Ok(true)
     })
+}
+
+/// Refuse a declaration whose scope can name the same top-level directory as an
+/// existing claim of the other reading.
+///
+/// A bare eight-character directory is a project folder only when a
+/// `project:<name>` claim names it, and one ad-hoc entry only when a
+/// `top_level_adhoc` claim covers it. Both readings at once would be two
+/// authorities over one path, so the operator declares one or the other.
+fn refuse_scope_overlap(grants: &ScratchGrants, scope: &ClaimScope) -> Result<()> {
+    let top_level = grants
+        .claims
+        .iter()
+        .any(|claim| matches!(claim.scope, ClaimScope::TopLevelAdhoc));
+    let eight_character_project = grants
+        .claims
+        .iter()
+        .any(|claim| matches!(&claim.scope, ClaimScope::Project { name } if is_run_name(name)));
+    let overlap = match scope {
+        ClaimScope::Project { name } => top_level && is_run_name(name),
+        ClaimScope::TopLevelAdhoc => eight_character_project,
+    };
+    if !overlap {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::Usage,
+        "an eight-character top-level directory can be read as a project folder or as one ad-hoc entry, so a project claim and a top_level_adhoc claim may not cover the same name".to_owned(),
+    )
+    .with_detail("scope", scope_key(scope).into()))
 }
 
 fn same_scope(left: &ClaimScope, right: &ClaimScope) -> bool {
@@ -1112,14 +1171,6 @@ fn validate_claim(claim: &ScratchClaim) -> Result<()> {
                     "the `oxide` project is Oxide's own and can never be claimed".to_owned(),
                 ));
             }
-            if is_run_name(name) {
-                return Err(Error::new(
-                    ErrorKind::Usage,
-                    format!(
-                        "`{name}` has the shape of a scratch run folder, so no claim may cover it"
-                    ),
-                ));
-            }
             if name.contains('.') {
                 return Err(Error::new(
                     ErrorKind::Usage,
@@ -1152,13 +1203,25 @@ where
 {
     // An invalid registry refuses before any effect, and a volume that is not
     // registered is never granted anything.
-    let current = registry::read(state_paths)?;
-    let record = area::registered_volume(state_paths, volume_uuid)?;
+    if matches!(registry::read(state_paths)?, registry::Registry::Absent) {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "no registry exists, so there is no volume to record a grant on".to_owned(),
+        ));
+    }
     state_paths.initialize()?;
     let mut locks = state::LockSet::new(state_paths.clone());
     let lock = locks.lock_registry()?;
-    let mut document = match &current {
-        registry::Registry::Present(document) => document.clone(),
+    // A grant change is serialized with a deletion's locked authorization
+    // window, so it takes the volume lock too, in the documented order. A
+    // deletion re-verifies the grant under that same lock, so a withdrawal can
+    // never land between the verification and the effect.
+    let _volume_lock = locks.lock_volume(volume_uuid)?;
+    // Reread under both locks and modify *that* document: reading before the
+    // lock and publishing the stale object silently discarded a concurrent
+    // writer's change, and could restore authority another writer withdrew.
+    let mut document = match registry::read(state_paths)? {
+        registry::Registry::Present(document) => document,
         registry::Registry::Absent => {
             return Err(Error::new(
                 ErrorKind::UnknownState,
@@ -1166,29 +1229,30 @@ where
             ))
         }
     };
-    let mut grants = record.scratch_grants.clone();
+    let Some(slot) = document
+        .volumes
+        .iter_mut()
+        .find(|volume| volume.volume_uuid == *volume_uuid)
+    else {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!("volume {volume_uuid} is not registered"),
+        )
+        .with_detail("volume_uuid", volume_uuid.as_str().into()));
+    };
+    let mut grants = slot.scratch_grants.clone();
     let changed = change(&mut grants)?;
     if !changed {
         return Ok(GrantsReport {
-            volume_uuid: record.volume_uuid.as_str().to_owned(),
+            volume_uuid: volume_uuid.as_str().to_owned(),
             grants,
             changed: false,
         });
     }
-    let Some(slot) = document
-        .volumes
-        .iter_mut()
-        .find(|volume| volume.volume_uuid == record.volume_uuid)
-    else {
-        return Err(Error::new(
-            ErrorKind::UnknownState,
-            format!("volume {} is not registered", record.volume_uuid),
-        ));
-    };
     slot.scratch_grants = grants.clone();
     registry::RegistryWriter::new(state_paths).publish(&lock, &document)?;
     Ok(GrantsReport {
-        volume_uuid: record.volume_uuid.as_str().to_owned(),
+        volume_uuid: volume_uuid.as_str().to_owned(),
         grants,
         changed: true,
     })
@@ -1462,8 +1526,17 @@ pub struct ExpireReport {
 
 impl ExpireReport {
     /// Whether the run left an intent that a later run must replay.
+    ///
+    /// A run can create no new intent and still leave work unsettled: its replay
+    /// of an earlier intent may have stopped short, and `replay.pending` names
+    /// that. The command's unsettled exit uses this, so a pending replay is never
+    /// reported as success.
     pub fn has_pending(&self) -> bool {
         self.pending.count > 0
+            || self
+                .replay
+                .as_ref()
+                .is_some_and(|replay| !replay.is_settled())
     }
 }
 
@@ -1672,6 +1745,14 @@ pub fn sweep(
             },
             UnitFamily::Unmarked => IdentityProof::Unmarked,
         };
+        // The grant that authorized this row is re-verified inside the
+        // deletion's own locked window, against the registry record re-read
+        // under the volume lock, so a withdrawal between the plan and the effect
+        // refuses the unit and a later withdrawal waits for the window to close.
+        let authorization = delete::Authorization {
+            what: "the recorded scratch grant",
+            check: &|fresh: &VolumeRecord| grant_covers(fresh, &row.scope, row.family),
+        };
         match delete::delete_unit_on_volume(
             state_paths,
             dirs,
@@ -1685,6 +1766,7 @@ pub fn sweep(
             &digest,
             request.delete_bounds,
             proof,
+            Some(&authorization),
         ) {
             Ok(report) => {
                 if report.is_deleted() {
@@ -1844,6 +1926,52 @@ impl SweepContext<'_> {
                 _ => false,
             })
     }
+}
+
+/// Whether one recorded claim covers one unit scope, with the unit shape the
+/// claim declared matching the scope's.
+fn claim_covers(claim: &ScratchClaim, scope: &UnitScope) -> bool {
+    claim.unit == scope.claim_unit()
+        && match (&claim.scope, scope) {
+            (ClaimScope::Project { name }, UnitScope::Project { name: unit }) => name == unit,
+            (ClaimScope::TopLevelAdhoc, UnitScope::TopLevel) => true,
+            _ => false,
+        }
+}
+
+/// Re-verify, under the deletion's volume lock, that a freshly read registry
+/// record still authorizes deleting one planned unit.
+///
+/// This is the same predicate the plan's assessment applied, evaluated once more
+/// on the record the deletion re-read in its locked window: a withdrawn
+/// delegation or revoked claim refuses the effect with `refused_boundary` (the
+/// sweep's per-unit refusal), and nothing else about the unit is re-decided here.
+fn grant_covers(record: &VolumeRecord, scope: &UnitScope, family: UnitFamily) -> Result<()> {
+    let grants = &record.scratch_grants;
+    let covered = match family {
+        UnitFamily::Native => true,
+        UnitFamily::OxideScratch => grants
+            .delegations
+            .iter()
+            .any(|delegation| delegation.family == MarkerFamily::OxideScratch),
+        UnitFamily::EffigyScratch => grants
+            .delegations
+            .iter()
+            .any(|delegation| delegation.family == MarkerFamily::EffigyScratch),
+        UnitFamily::Unmarked => grants.claims.iter().any(|claim| claim_covers(claim, scope)),
+    };
+    if covered {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::RefusedBoundary,
+        format!(
+            "the recorded grant no longer covers `{}`, so the effect was abandoned",
+            scope.key()
+        ),
+    )
+    .with_detail("scope", scope.key().into())
+    .with_detail("family", family.as_str().into()))
 }
 
 /// One unit as the classifier decided it.
@@ -2044,21 +2172,56 @@ fn classify_top_level(
             );
         }
         if is_run_name(&entry.name) {
-            // A bare eight-character name is never a run root and never a
-            // claimable project folder; a marked family unit inside it still is.
+            // A bare eight-character name is a run name by shape, and a name never
+            // establishes ownership. It is a project folder only when an
+            // explicit `project:<name>` claim names it, and one ad-hoc entry only
+            // when a `top_level_adhoc` claim covers it; the two claims may not
+            // overlap. A marked family unit inside it is always classified.
+            if ctx
+                .claim_for(&UnitScope::Project {
+                    name: entry.name.clone(),
+                })
+                .is_some()
+            {
+                return classify_project(
+                    ctx,
+                    handle,
+                    &entry.name,
+                    &unit_path,
+                    Reserved::No,
+                    budget,
+                    candidates,
+                    kept,
+                );
+            }
+            if ctx.claim_for(&UnitScope::TopLevel).is_some() {
+                return classify_unit(
+                    ctx,
+                    handle,
+                    &entry.name,
+                    &unit_path,
+                    &UnitScope::TopLevel,
+                    UnitFamily::Unmarked,
+                    budget,
+                    candidates,
+                    kept,
+                );
+            }
             kept.push(kept_row(
                 &entry.name,
                 "top_level",
                 Some(unit_path.clone()),
                 "run_name_like",
-                "a bare eight-character name is never treated as a project folder",
+                "a bare eight-character name is a project folder only under an explicit project claim and an ad-hoc entry only under a top_level_adhoc claim",
             ));
             return classify_project(
                 ctx,
                 handle,
                 &entry.name,
                 &unit_path,
-                Reserved::MarkedOnly("a bare eight-character name is never claimed"),
+                Reserved::MarkedOnly(
+                    "a bare eight-character name is never claimed without a project claim",
+                ),
                 budget,
                 candidates,
                 kept,
@@ -2151,6 +2314,11 @@ fn classify_project(
             return Ok(());
         }
     };
+    // A project folder whose listing stopped at the name bound was not fully
+    // examined, so the plan says so instead of presenting a partial plan as whole.
+    if listing.truncated {
+        budget.truncated = true;
+    }
     let mut entries = listing.entries.clone();
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     let scope = UnitScope::Project {
@@ -2512,6 +2680,18 @@ fn assess_native(
             reason: "the run is unconcluded".to_owned(),
         });
     };
+    // The outcome is one of the four pinned facts, and only `closed` can carry a
+    // positive closure: a retained, unclosed or failed run is never expirable,
+    // whatever else its conclusion records.
+    if conclusion.outcome != ConclusionOutcome::Closed {
+        return Ok(Assessed::Kept {
+            state: "native".to_owned(),
+            reason: format!(
+                "the run's recorded outcome is `{}`, which is never expirable",
+                outcome_name(conclusion.outcome)
+            ),
+        });
+    }
     if conclusion.closure != ConclusionClosure::Positive {
         return Ok(Assessed::Kept {
             state: "native".to_owned(),
@@ -2571,6 +2751,16 @@ fn kept_reason_name(reason: KeptReason) -> &'static str {
     }
 }
 
+/// The conclusion outcome's recorded name.
+fn outcome_name(outcome: ConclusionOutcome) -> &'static str {
+    match outcome {
+        ConclusionOutcome::Closed => "closed",
+        ConclusionOutcome::Unclosed => "unclosed",
+        ConclusionOutcome::Failed => "failed",
+        ConclusionOutcome::Retained => "retained",
+    }
+}
+
 fn assess_oxide(
     ctx: &SweepContext<'_>,
     unit: &DirHandle,
@@ -2611,6 +2801,24 @@ fn assess_oxide(
         return Ok(Assessed::Kept {
             state: "oxide_scratch".to_owned(),
             reason: format!("the oxide marker's version {} is not read", marker.version),
+        });
+    }
+    // The pinned field set's own semantics are checked before eligibility: a run
+    // id that is not the 32-hex id Oxide writes, or an outcome other than
+    // `closed`, is not the document this rule was written against and is kept.
+    if !is_hex32(&marker.run_id) {
+        return Ok(Assessed::Kept {
+            state: "oxide_scratch".to_owned(),
+            reason: "the oxide run id is not a 32-hex id".to_owned(),
+        });
+    }
+    if marker.outcome != "closed" {
+        return Ok(Assessed::Kept {
+            state: "oxide_scratch".to_owned(),
+            reason: format!(
+                "the oxide root's outcome `{}` is never expirable",
+                marker.outcome
+            ),
         });
     }
     if marker.owner_uid != ctx.observer.effective_uid()? {
@@ -2664,6 +2872,33 @@ fn assess_oxide(
             reason: "the oxide conclusion time is not usable".to_owned(),
         });
     };
+    if concluded_ms > ctx.now_ms {
+        return Ok(Assessed::Kept {
+            state: "oxide_scratch".to_owned(),
+            reason: "the oxide conclusion is dated in the future".to_owned(),
+        });
+    }
+    // A creation time that cannot be read, or that is later than the conclusion,
+    // is not the sequence the family writes: it is kept rather than defaulted to
+    // zero, which would silently authorise a conclusion with no known origin.
+    let Some(created_ms) = seconds_to_ms(marker.created_unix) else {
+        return Ok(Assessed::Kept {
+            state: "oxide_scratch".to_owned(),
+            reason: "the oxide marker's creation time is not usable".to_owned(),
+        });
+    };
+    if created_ms > ctx.now_ms {
+        return Ok(Assessed::Kept {
+            state: "oxide_scratch".to_owned(),
+            reason: "the oxide marker is dated in the future".to_owned(),
+        });
+    }
+    if created_ms > concluded_ms {
+        return Ok(Assessed::Kept {
+            state: "oxide_scratch".to_owned(),
+            reason: "the oxide marker was created after its conclusion".to_owned(),
+        });
+    }
     let age_ms = ctx.policy.oxide_age_seconds.saturating_mul(1000);
     if ctx.now_ms.saturating_sub(concluded_ms) <= age_ms {
         return Ok(Assessed::Kept {
@@ -2671,7 +2906,6 @@ fn assess_oxide(
             reason: "the oxide conclusion is not older than the delegated age".to_owned(),
         });
     }
-    let created_ms = seconds_to_ms(marker.created_unix).unwrap_or(0);
     Ok(Assessed::Eligible(
         Box::new(plan_row(
             name,
@@ -2920,6 +3154,14 @@ fn newest_entry(
     }
     let mut newest = own_modified_ms;
     for entry in &listing.entries {
+        // Every examined entry is charged to the sweep's budget and checked
+        // against its deadline: a unit holding many files must not be walked
+        // past the bound the plan claims it applied.
+        if !budget.spend(1) {
+            return Ok(Err(
+                "the sweep's examination budget was reached inside this unit".to_owned(),
+            ));
+        }
         if entry.facts.kind == EntryKind::Symlink {
             return Ok(Err(format!(
                 "`{}` is a symbolic link inside the unit, which is never followed",
@@ -3064,6 +3306,14 @@ fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Whether a value is the 32-character lowercase hexadecimal id a run records.
+fn is_hex32(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -3085,8 +3335,8 @@ mod tests {
     use crate::delete::DeleteBounds;
     use crate::error::ErrorKind;
     use crate::os::{DirHandle, DirOps, ProcessObserver};
-    use crate::registry::{ClaimScope, ClaimUnit, MarkerFamily, ScratchClaim};
-    use crate::state;
+    use crate::registry::{ClaimScope, ClaimUnit, MarkerFamily, ScratchClaim, ScratchDelegation};
+    use crate::state::{self, IntentPhase};
     use crate::testkit::{Faults, VolumeFixture, FIXTURE_UUID};
 
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
@@ -4168,28 +4418,77 @@ mod tests {
     }
 
     #[test]
-    fn the_oxide_project_and_run_shaped_names_are_reserved() {
+    fn the_oxide_project_and_eight_character_names_are_never_inferred() {
         let harness = Harness::new("scratch-reserved");
         let oxide_child = harness.project("oxide").join("unmarked");
         std::fs::create_dir_all(&oxide_child).expect("the oxide child");
         let run_child = harness.project("abcdefgh").join("unmarked");
         std::fs::create_dir_all(&run_child).expect("the run-shaped child");
-        harness.adhoc_claim(60);
+        // Without any claim, neither name establishes a project: both children
+        // are kept, and the eight-character folder itself is reported kept.
+        let bare = harness.plan(1);
+        assert!(
+            bare.plan.candidates.rows.is_empty(),
+            "{:?}",
+            bare.plan.candidates.rows
+        );
+        let bare_reason = |path: &Path| -> String {
+            bare.plan
+                .kept
+                .rows
+                .iter()
+                .find(|row| row.path.as_ref().is_some_and(|known| known == path))
+                .map(|row| row.reason.clone())
+                .unwrap_or_else(|| panic!("{} is reported kept", path.display()))
+        };
+        assert!(bare_reason(&run_child).contains("never claimed"));
+        assert!(bare_reason(&harness.scratch().join("abcdefgh")).contains("eight-character"));
+        // An ad-hoc claim reads the folder itself as the one top-level unit; it is
+        // fresh, so it is kept by the claim's own idle age rather than deleted.
+        harness.adhoc_claim(14 * 24 * 60 * 60);
         let plan = harness.plan(1);
         assert!(
             plan.plan.candidates.rows.is_empty(),
             "{:?}",
             plan.plan.candidates.rows
         );
-        assert!(harness
-            .kept_reason(&plan, "abcdefgh")
-            .contains("eight-character"));
+        assert!(plan
+            .plan
+            .candidates
+            .rows
+            .iter()
+            .all(|row| row.name != "unmarked"));
+        let reason_at = |path: &Path| -> String {
+            plan.plan
+                .kept
+                .rows
+                .iter()
+                .find(|row| row.path.as_ref().is_some_and(|known| known == path))
+                .map(|row| row.reason.clone())
+                .unwrap_or_else(|| panic!("{} is reported kept", path.display()))
+        };
+        // The folder itself is the covered ad-hoc unit and is fresh, so it is
+        // kept by the claim's idle age; its children are not walked at all.
+        assert!(reason_at(&harness.scratch().join("abcdefgh"))
+            .contains("not older than the claim's idle age"));
+        assert!(plan
+            .plan
+            .candidates
+            .rows
+            .iter()
+            .all(|row| row.name != "abcdefgh"));
+        assert!(plan
+            .plan
+            .kept
+            .rows
+            .iter()
+            .all(|row| row.path.as_ref() != Some(&run_child)));
     }
 
     #[test]
-    fn a_claim_for_the_oxide_project_or_a_run_name_is_refused() {
+    fn a_claim_for_the_oxide_project_or_a_dotted_name_is_refused() {
         let harness = Harness::new("scratch-claim-shape");
-        for name in ["oxide", "abcdefgh", "has.dot"] {
+        for name in ["oxide", "has.dot"] {
             let claim = ScratchClaim {
                 scope: ClaimScope::Project {
                     name: name.to_owned(),
@@ -4547,6 +4846,17 @@ mod tests {
         std::fs::create_dir_all(&effigy).expect("the effigy run");
         effigy_marker(&effigy, 0xFFFF_FFFE, false, None);
         age_tree(&effigy, 20);
+        // A known project whose name is eight characters: the host reaper exempts
+        // it from its run-name skip, so its old children are units it deletes.
+        let underlay_old = harness.project("underlay").join("old-child");
+        std::fs::create_dir_all(&underlay_old).expect("the unit");
+        std::fs::write(underlay_old.join("payload.txt"), b"bytes").expect("a payload");
+        age_tree(&underlay_old, 20);
+        // `figmatic` is the other known eight-character project: Barge reaches it
+        // the same way, so a second old child proves the rule is not one name.
+        let figmatic_old = harness.project("figmatic").join("old-child");
+        std::fs::create_dir_all(&figmatic_old).expect("the unit");
+        age_tree(&figmatic_old, 20);
 
         let now = state::now_ms() + 3_600_000;
         let reaper_all = reaper_units(&scratch, now);
@@ -4579,12 +4889,34 @@ mod tests {
             );
         }
 
-        // Under claims for every scope the reaper acts in, the deletable sets are
-        // the same.
+        // The design stages the reaper's replacement as a sequence of recorded
+        // declarations, and an eight-character project claim and a top-level
+        // ad-hoc claim may not cover the same name at once. The first declaration
+        // set is the ad-hoc claim plus the plain project claims.
         harness.claim("alpha", 14 * 24 * 60 * 60);
         harness.claim("beta", 14 * 24 * 60 * 60);
         harness.adhoc_claim(14 * 24 * 60 * 60);
         let granted = harness.plan_at(now);
+        let eight_character: Vec<PathBuf> = reaper
+            .iter()
+            .filter(|unit| {
+                unit.parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "underlay" || name == "figmatic")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            eight_character.len(),
+            2,
+            "both known eight-character projects are in the reaper's set: {reaper:?}"
+        );
+        let mut first_expected: Vec<PathBuf> = reaper
+            .iter()
+            .filter(|unit| !eight_character.contains(unit))
+            .cloned()
+            .collect();
+        first_expected.sort();
         let mut barge: Vec<PathBuf> = granted
             .plan
             .candidates
@@ -4593,20 +4925,64 @@ mod tests {
             .map(|row| row.path.clone())
             .collect();
         barge.sort();
-        assert_eq!(barge, reaper, "the granted sweep matches the reaper");
+        assert_eq!(
+            barge, first_expected,
+            "the first granted sweep matches the reaper outside the eight-character projects"
+        );
 
         // The same run deletes exactly that set, including the ad-hoc file.
         let real = harness.expire_at(now, &granted.plan_digest);
         assert_eq!(
             real.deleted.count,
-            reaper.len(),
+            first_expected.len(),
             "{:?} {:?}",
             real.deleted.rows,
             real.skipped.rows
         );
+        for unit in &first_expected {
+            assert!(!unit.exists(), "{} was deleted", unit.display());
+        }
+
+        // The second declaration set withdraws the ad-hoc claim and records the
+        // explicit eight-character project claims: together the two sets reach
+        // the reaper's whole deletable set, and neither deletes anything else.
+        let adhoc = ScratchClaim {
+            scope: ClaimScope::TopLevelAdhoc,
+            unit: ClaimUnit::Entry,
+            unmarked_idle_seconds: 14 * 24 * 60 * 60,
+            families_excluded: vec![MarkerFamily::OxideScratch, MarkerFamily::EffigyScratch],
+            declared_by: "operator".to_owned(),
+            declared_ms: state::now_ms(),
+        };
+        declare_claim(&harness.fixture.state, &harness.fixture.uuid, &adhoc, true)
+            .expect("the ad-hoc claim is withdrawn");
+        harness.claim("underlay", 14 * 24 * 60 * 60);
+        harness.claim("figmatic", 14 * 24 * 60 * 60);
+        let second = harness.plan_at(now);
+        let mut second_barge: Vec<PathBuf> = second
+            .plan
+            .candidates
+            .rows
+            .iter()
+            .map(|row| row.path.clone())
+            .collect();
+        second_barge.sort();
+        assert_eq!(
+            second_barge, eight_character,
+            "the explicit eight-character project claims reach exactly the reaper's branch"
+        );
+        let second_real = harness.expire_at(now, &second.plan_digest);
+        assert_eq!(
+            second_real.deleted.count,
+            eight_character.len(),
+            "{:?} {:?}",
+            second_real.deleted.rows,
+            second_real.skipped.rows
+        );
         for unit in &reaper {
             assert!(!unit.exists(), "{} was deleted", unit.display());
         }
+        assert!(!underlay_old.exists() && !figmatic_old.exists());
 
         // Each condition the design lists is at least as conservative: every
         // reaper skip is also a Barge keep, and the validation temp is kept.
@@ -4941,5 +5317,781 @@ mod tests {
         .expect("the bounded preview reports");
         assert!(report.plan.truncated, "the bound is reported");
         assert!(report.plan.examined <= 2);
+    }
+
+    // ---- the corrected grant, conclusion and replay seams ------------------
+
+    #[test]
+    fn grant_covers_rechecks_the_record_and_keeps_marker_precedence() {
+        let harness = Harness::new("scratch-grant-recheck");
+        let record = harness.fixture.record.clone();
+        let scope = super::UnitScope::Project {
+            name: "alpha".to_owned(),
+        };
+        // A native root is its own authority.
+        assert!(super::grant_covers(&record, &scope, UnitFamily::Native).is_ok());
+        // With no grants, every other family refuses.
+        for family in [
+            UnitFamily::Unmarked,
+            UnitFamily::EffigyScratch,
+            UnitFamily::OxideScratch,
+        ] {
+            let error = super::grant_covers(&record, &scope, family)
+                .expect_err("no grant covers this unit");
+            assert_eq!(error.kind(), ErrorKind::RefusedBoundary, "{family:?}");
+            assert!(error.message().contains("no longer covers"), "{error}");
+        }
+        // A project claim covers unmarked children and never a marked family:
+        // marker precedence needs the family's own delegation.
+        let mut record = record;
+        record.scratch_grants.claims.push(ScratchClaim {
+            scope: ClaimScope::Project {
+                name: "alpha".to_owned(),
+            },
+            unit: ClaimUnit::Child,
+            unmarked_idle_seconds: 60,
+            families_excluded: vec![],
+            declared_by: "operator".to_owned(),
+            declared_ms: state::now_ms(),
+        });
+        assert!(super::grant_covers(&record, &scope, UnitFamily::Unmarked).is_ok());
+        assert_eq!(
+            super::grant_covers(&record, &scope, UnitFamily::EffigyScratch)
+                .expect_err("a project claim never covers a marked family")
+                .kind(),
+            ErrorKind::RefusedBoundary
+        );
+        record.scratch_grants.delegations.push(ScratchDelegation {
+            family: MarkerFamily::EffigyScratch,
+            by: "family owner".to_owned(),
+            declared_ms: state::now_ms(),
+        });
+        assert!(super::grant_covers(&record, &scope, UnitFamily::EffigyScratch).is_ok());
+        // The claim's declared unit shape must match the scope it is read for.
+        assert_eq!(
+            super::grant_covers(&record, &super::UnitScope::TopLevel, UnitFamily::Unmarked)
+                .expect_err("a project claim is not an ad-hoc claim")
+                .kind(),
+            ErrorKind::RefusedBoundary
+        );
+    }
+
+    #[test]
+    fn a_deletion_refuses_a_withdrawn_grant_inside_its_locked_window() {
+        let harness = Harness::new("scratch-auth-window");
+        let root = harness.alloc("project-a", "owner");
+        let (device, inode) = identity(&root);
+        let record = harness.fixture.record.clone();
+        let folder = format!("{}/project-a", scratch_folder(&record));
+        let declaration = super::scratch_declaration(&record, &folder);
+        let marker = std::fs::read(root.join(area::ROOT_MARKER_FILE)).expect("the marker");
+        let observed = ObservedRoot {
+            root_id: root
+                .file_name()
+                .expect("a root name")
+                .to_string_lossy()
+                .to_string(),
+            volume_uuid: harness.fixture.uuid.clone(),
+            root_dir: record.root_dir.clone(),
+            folder,
+            device: crate::os::DeviceId::new(device),
+            inode,
+            marker_digest: crate::digest::sha256_hex(&marker),
+            path: root.clone(),
+        };
+        let digest = "ab".repeat(32);
+        let refused = crate::delete::Authorization {
+            what: "the recorded scratch grant",
+            check: &|_record: &crate::registry::VolumeRecord| {
+                Err(crate::error::Error::new(
+                    ErrorKind::RefusedBoundary,
+                    "the recorded grant no longer covers `project:project-a`",
+                ))
+            },
+        };
+        let observer = harness.fixture.observer();
+        let facts = harness.fixture.facts();
+        let mounts = harness.fixture.mounts();
+        let platform = harness.fixture.platform();
+        let error = crate::delete::delete_unit_on_volume(
+            &harness.fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &harness.fixture.uuid,
+            &declaration,
+            None,
+            &observed,
+            &digest,
+            DeleteBounds {
+                retry_pause: std::time::Duration::ZERO,
+                ..DeleteBounds::default()
+            },
+            crate::custody::IdentityProof::OwnedRoot,
+            Some(&refused),
+        )
+        .expect_err("the withdrawn grant refuses the effect");
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        assert_eq!(
+            error
+                .detail()
+                .get("authorization")
+                .and_then(|value| value.as_str()),
+            Some("the recorded scratch grant")
+        );
+        assert!(root.exists(), "nothing was renamed or deleted");
+        let intents = state::read_intents(&harness.fixture.state, 64).expect("the journal");
+        assert!(
+            intents.pending().next().is_none(),
+            "no intent was written under withdrawn authority"
+        );
+
+        // The same deletion under a current grant proceeds, so the refusal above
+        // is the authority and not the plumbing. The allocation's owner hold is
+        // released first: custody, not this check, decides a live holder's root.
+        area::release(&harness.fixture.state, &observed.root_id, "owner")
+            .expect("the owner hold is released");
+        let current = crate::delete::Authorization {
+            what: "the recorded scratch grant",
+            check: &|_record: &crate::registry::VolumeRecord| Ok(()),
+        };
+        let report = crate::delete::delete_unit_on_volume(
+            &harness.fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &harness.fixture.uuid,
+            &declaration,
+            None,
+            &observed,
+            &digest,
+            DeleteBounds {
+                retry_pause: std::time::Duration::ZERO,
+                ..DeleteBounds::default()
+            },
+            crate::custody::IdentityProof::OwnedRoot,
+            Some(&current),
+        )
+        .expect("the deletion reports");
+        assert!(report.is_deleted(), "{report:?}");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn concurrent_grant_writes_keep_both_declarations() {
+        let harness = Harness::new("scratch-grant-concurrent");
+        let state_paths = harness.fixture.state.clone();
+        let uuid = harness.fixture.uuid.clone();
+        // Hold the registry lock so both writers are inside their read-then-write
+        // window when the other publishes: the interleaving that used to lose one
+        // declaration (and could restore a withdrawn one).
+        let mut locks = state::LockSet::new(state_paths.clone());
+        let held = locks.lock_registry().expect("the registry lock");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let results = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for family in [MarkerFamily::OxideScratch, MarkerFamily::EffigyScratch] {
+                let state_paths = state_paths.clone();
+                let uuid = uuid.clone();
+                let started = started_tx.clone();
+                handles.push(scope.spawn(move || {
+                    started.send(()).expect("the writer starts");
+                    declare_delegation(
+                        &state_paths,
+                        &uuid,
+                        family,
+                        "operator",
+                        state::now_ms(),
+                        false,
+                    )
+                }));
+            }
+            drop(started_tx);
+            for _ in 0..2 {
+                started_rx.recv().expect("both writers started");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("the writer joins"))
+                .collect::<Vec<_>>()
+        });
+        for result in results {
+            result.expect("each declaration is recorded");
+        }
+        let report =
+            super::grants(&harness.fixture.state, &harness.fixture.uuid).expect("the grants read");
+        assert_eq!(
+            report.grants.delegations.len(),
+            2,
+            "one declaration was lost: {:?}",
+            report.grants.delegations
+        );
+    }
+
+    #[test]
+    fn a_grant_write_waits_for_the_deletion_window() {
+        let harness = Harness::new("scratch-grant-window");
+        let state_paths = harness.fixture.state.clone();
+        let uuid = harness.fixture.uuid.clone();
+        let mut locks = state::LockSet::new(state_paths.clone());
+        let held = locks.lock_volume(&uuid).expect("the volume lock");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let state_paths = state_paths.clone();
+            let uuid = uuid.clone();
+            let handle = scope.spawn(move || {
+                let result = declare_delegation(
+                    &state_paths,
+                    &uuid,
+                    MarkerFamily::OxideScratch,
+                    "operator",
+                    state::now_ms(),
+                    false,
+                );
+                done_tx.send(()).expect("the writer finishes");
+                result
+            });
+            // The writer must still be waiting: the volume lock is the deletion's
+            // authorization window, and a grant change may not interleave it.
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "the grant write did not wait for the volume lock"
+            );
+            drop(held);
+            handle
+                .join()
+                .expect("the writer joins")
+                .expect("the delegation is recorded");
+        });
+        let report =
+            super::grants(&harness.fixture.state, &harness.fixture.uuid).expect("the grants read");
+        assert_eq!(report.grants.delegations.len(), 1);
+    }
+
+    #[test]
+    fn a_retained_or_invalid_conclusion_is_never_eligible() {
+        let harness = Harness::new("scratch-conclusion-outcome");
+        let retained = harness.alloc("project-a", "owner");
+        let closed = harness.alloc("project-a", "owner");
+        harness.conclude(
+            &closed,
+            "owner",
+            ConclusionOutcome::Closed,
+            ConclusionClosure::Positive,
+            KeptReason::Evidence,
+            NestedScope::Exclusive,
+        );
+        harness.conclude(
+            &retained,
+            "owner",
+            ConclusionOutcome::Closed,
+            ConclusionClosure::Positive,
+            KeptReason::Evidence,
+            NestedScope::Exclusive,
+        );
+        // Rewrite one conclusion as if it had been retained, which the write path
+        // now refuses: the reader must still never make it eligible.
+        let marker_path = retained.join(area::ROOT_MARKER_FILE);
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).expect("the marker"))
+                .expect("the marker parses");
+        marker["conclusion"]["outcome"] = serde_json::json!("retained");
+        marker["conclusion"]["concluded_ms"] = serde_json::json!(state::now_ms() - 30 * DAY_MS);
+        write_marker(
+            &marker_path,
+            &serde_json::to_vec(&marker).expect("the marker encodes"),
+        );
+        let days = NATIVE_AGE_SECONDS / (24 * 60 * 60) + 1;
+        let plan = harness.plan(days);
+        let names = harness.candidate_names(&plan);
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(
+            !names.contains(&retained.file_name().unwrap().to_string_lossy().to_string()),
+            "the retained run is not a candidate: {names:?}"
+        );
+        let kept = plan
+            .plan
+            .kept
+            .rows
+            .iter()
+            .find(|row| row.path.as_ref().is_some_and(|path| path == &retained))
+            .expect("the retained run is reported kept");
+        assert!(kept.reason.contains("retained"), "{}", kept.reason);
+
+        // The write path refuses the same contradiction.
+        let error = conclude(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.fixture.facts(),
+            &harness.fixture.mounts(),
+            &harness.fixture.observer(),
+            &ConcludeRequest {
+                volume_uuid: &harness.fixture.uuid,
+                root_id: closed.file_name().unwrap().to_str().expect("a name"),
+                holder: "owner",
+                project: Some("project-a"),
+                outcome: ConclusionOutcome::Retained,
+                closure: ConclusionClosure::Positive,
+                kept_reason: KeptReason::Evidence,
+                nested_scope: NestedScope::Exclusive,
+            },
+        )
+        .expect_err("a retained run cannot claim positive closure");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert!(error.message().contains("retained"));
+    }
+
+    #[test]
+    fn an_oxide_marker_with_invalid_or_future_facts_is_kept() {
+        let harness = Harness::new("scratch-oxide-facts");
+        harness.delegate(MarkerFamily::OxideScratch);
+        let now = state::now_ms();
+        let concluded = now - 30 * DAY_MS;
+        let root = harness.project("oxide").join("oxide-proof.facts");
+        std::fs::create_dir_all(&root).expect("the root");
+        let (device, inode) = identity(&root);
+        let write = |overrides: serde_json::Value| {
+            let mut value = serde_json::json!({
+                "version": 1,
+                "run_id": "0123456789abcdef0123456789abcdef",
+                "root": root.display().to_string(),
+                "owner_uid": crate::os::platform().effective_uid().expect("the uid"),
+                "device": device,
+                "inode": inode,
+                "created_unix": (concluded as f64) / 1000.0 - 60.0,
+                "concluded_unix": (concluded as f64) / 1000.0,
+                "outcome": "closed",
+                "closure": "positive",
+                "kept_reason": "evidence",
+                "nested_scope": "exclusive",
+            });
+            for (key, replacement) in overrides.as_object().expect("an object").iter() {
+                value[key] = replacement.clone();
+            }
+            write_marker(
+                &root.join(super::OXIDE_MARKER_FILE),
+                &serde_json::to_vec(&value).expect("the marker encodes"),
+            );
+        };
+        let plan_at_now = || harness.plan_at(now + 3_600_000);
+
+        // The valid marker is the control: it is eligible.
+        write(serde_json::json!({}));
+        let valid = plan_at_now();
+        assert!(
+            harness
+                .candidate_names(&valid)
+                .contains(&"oxide-proof.facts".to_owned()),
+            "{:?}",
+            valid.plan.candidates.rows
+        );
+
+        // A retained outcome, an invalid run id, a future creation and an
+        // unreadable creation are each kept, and none is ever eligible.
+        let cases = [
+            (
+                serde_json::json!({ "outcome": "retained" }),
+                "never expirable",
+            ),
+            (serde_json::json!({ "run_id": "not-a-run-id" }), "32-hex"),
+            (
+                serde_json::json!({ "created_unix": (now as f64) / 1000.0 + 86_400.0 }),
+                "future",
+            ),
+            (
+                serde_json::json!({ "created_unix": "not a number" }),
+                "not usable",
+            ),
+        ];
+        for (overrides, expected) in cases {
+            write(overrides);
+            let plan = plan_at_now();
+            let kept = plan
+                .plan
+                .kept
+                .rows
+                .iter()
+                .find(|row| row.path.as_ref().is_some_and(|path| path == &root))
+                .unwrap_or_else(|| panic!("the invalid marker is reported kept: {expected}"));
+            assert!(
+                kept.reason.contains(expected),
+                "expected `{expected}` in `{}`",
+                kept.reason
+            );
+            assert!(
+                !harness
+                    .candidate_names(&plan)
+                    .contains(&"oxide-proof.facts".to_owned()),
+                "an invalid oxide marker was eligible: {}",
+                kept.reason
+            );
+        }
+    }
+
+    #[test]
+    fn a_quarantined_file_leaf_replays_to_settlement() {
+        let harness = Harness::new("scratch-file-replay");
+        std::fs::create_dir_all(harness.scratch()).expect("the scratch folder");
+        harness.adhoc_claim(60);
+        let record = harness.fixture.record.clone();
+        for (index, phase) in [IntentPhase::Renamed, IntentPhase::MarkerLast]
+            .into_iter()
+            .enumerate()
+        {
+            let name = format!("val.REPLAY{index}");
+            let file = harness.scratch().join(&name);
+            std::fs::write(&file, b"payload").expect("the ad-hoc file");
+            let (device, inode) = identity(&file);
+            let digest =
+                unmarked_provenance_digest_parts(&harness.fixture.uuid, &name, device, inode);
+            let intent_id = format!("{:032x}", index + 11);
+            let quarantine_name = format!("{}{intent_id}", state::QUARANTINE_PREFIX);
+            std::fs::rename(&file, harness.scratch().join(&quarantine_name))
+                .expect("the file is quarantined");
+            let now = state::now_ms();
+            let intent = state::IntentRecord {
+                schema: crate::contract::INTENT_SCHEMA.to_owned(),
+                intent_id: intent_id.clone(),
+                root_id: name.clone(),
+                volume_uuid: harness.fixture.uuid.clone(),
+                mount_hint: harness.fixture.root.clone(),
+                root_dir: record.root_dir.clone(),
+                folder: scratch_folder(&record),
+                root_name: name.clone(),
+                quarantine_name: quarantine_name.clone(),
+                device,
+                inode,
+                marker_digest: digest,
+                plan_digest: "ab".repeat(32),
+                phase: IntentPhase::Intent,
+                generation: 1,
+                recorded_ms: now,
+                phase_ms: now,
+            };
+            let mut locks = state::LockSet::new(harness.fixture.state.clone());
+            {
+                let _volume = locks
+                    .lock_volume(&harness.fixture.uuid)
+                    .expect("the volume lock");
+                let _root = locks.lock_root(&intent.root_id).expect("the root lock");
+                let write = locks.begin_intent_write().expect("the intent step");
+                state::publish_intent(&write, &harness.fixture.state, &intent)
+                    .expect("the intent publishes");
+                state::advance_intent(&write, &harness.fixture.state, &intent, phase)
+                    .expect("the phase advances");
+            }
+            drop(locks);
+
+            let observer = harness.fixture.observer();
+            let facts = harness.fixture.facts();
+            let mounts = harness.fixture.mounts();
+            let platform = harness.fixture.platform();
+            let report = crate::delete::replay_pending(
+                &harness.fixture.state,
+                &platform,
+                &facts,
+                &mounts,
+                &observer,
+                DeleteBounds {
+                    retry_pause: std::time::Duration::ZERO,
+                    ..DeleteBounds::default()
+                },
+            )
+            .expect("the replay reports");
+            assert!(
+                report.pending.is_empty(),
+                "a file leaf at {phase:?} stayed pending: {:?}",
+                report.pending
+            );
+            assert_eq!(report.settled + report.resumed, 1, "{report:?}");
+            assert!(
+                !harness.scratch().join(&quarantine_name).exists(),
+                "the verified file leaf was settled"
+            );
+            let intents = state::read_intents(&harness.fixture.state, 64).expect("the journal");
+            assert!(intents.pending().next().is_none());
+        }
+    }
+
+    #[test]
+    fn a_pending_replay_makes_the_run_unsettled() {
+        let replay = crate::delete::ReplayReport {
+            examined: 1,
+            settled: 0,
+            rolled_back: 0,
+            resumed: 0,
+            pending: vec![crate::delete::PendingRow {
+                intent_id: "0123456789abcdef0123456789abcdef".to_owned(),
+                root_id: "leftover".to_owned(),
+                phase: crate::state::IntentPhase::Renamed,
+                reason: "the area folder is gone but the marker-last phase was not recorded"
+                    .to_owned(),
+            }],
+            entries_removed: 0,
+        };
+        let report = super::ExpireReport {
+            volume_uuid: FIXTURE_UUID.to_owned(),
+            volume_present: true,
+            preview: false,
+            plan_digest: "ab".repeat(32),
+            plan: super::SweepPlan {
+                schema: super::PLAN_SCHEMA.to_owned(),
+                volume_uuid: harness_uuid(),
+                mount_point: PathBuf::from("/fixture"),
+                root_dir: String::new(),
+                folder: "scratch".to_owned(),
+                policy: SweepPolicy::design(),
+                candidates: crate::contract::RowSet::empty(),
+                kept: crate::contract::RowSet::empty(),
+                examined: 0,
+                truncated: false,
+            },
+            deleted: crate::contract::RowSet::empty(),
+            pending: crate::contract::RowSet::empty(),
+            skipped: crate::contract::RowSet::empty(),
+            replay: Some(replay),
+        };
+        assert!(
+            report.has_pending(),
+            "a run with no new pending row but a pending replay must exit unsettled"
+        );
+    }
+
+    fn harness_uuid() -> crate::os::VolumeUuid {
+        crate::os::VolumeUuid::parse(FIXTURE_UUID).expect("the fixture UUID")
+    }
+
+    #[test]
+    fn the_examination_budget_is_spent_inside_a_claimed_unit() {
+        let harness = Harness::new("scratch-unit-budget");
+        let unit = harness.project("alpha").join("leftover");
+        std::fs::create_dir_all(&unit).expect("the unit");
+        for index in 0..20 {
+            std::fs::write(unit.join(format!("file-{index:02}.txt")), b"bytes").expect("a payload");
+        }
+        age_tree(&unit, 20);
+        harness.claim("alpha", 60);
+        let observer = harness.fixture.observer();
+        let facts = harness.fixture.facts();
+        let mounts = harness.fixture.mounts();
+        let platform = harness.fixture.platform();
+        let uuid = harness.fixture.uuid.clone();
+        let request = SweepRequest {
+            volume_uuid: &uuid,
+            preview: true,
+            plan_digest: None,
+            bounds: SweepBounds {
+                examine: 6,
+                timeout: super::SWEEP_TIMEOUT,
+            },
+            delete_bounds: DeleteBounds::default(),
+            now_ms: sweep_now(1, 0),
+        };
+        let report = sweep(
+            &harness.fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &request,
+        )
+        .expect("the bounded preview reports");
+        assert!(report.plan.truncated, "the bound is reported");
+        assert!(
+            report.plan.examined <= 6,
+            "the unit was examined past the bound: {}",
+            report.plan.examined
+        );
+        assert!(
+            report
+                .plan
+                .candidates
+                .rows
+                .iter()
+                .all(|row| row.name != "leftover"),
+            "an unexamined unit was made eligible: {:?}",
+            report.plan.candidates.rows
+        );
+        let kept = report
+            .plan
+            .kept
+            .rows
+            .iter()
+            .find(|row| row.name == "leftover")
+            .expect("the unit is reported kept");
+        assert!(kept.reason.contains("budget"), "{}", kept.reason);
+    }
+
+    // ---- eight-character project names (O-005 architect ruling) ------------
+
+    #[test]
+    fn an_eight_character_project_claim_is_accepted_and_expires_its_children() {
+        let harness = Harness::new("scratch-eight-character-project");
+        // The old shape-only rule refused every eight-character name because it
+        // had the shape of a run folder. The claim, not the name, establishes the
+        // project, so this is the counterfactual: the same name now has a claim.
+        assert!(super::is_run_name("underlay"));
+        let child = harness.project("underlay").join("old-child");
+        std::fs::create_dir_all(&child).expect("the unit");
+        std::fs::write(child.join("payload.txt"), b"bytes").expect("a payload");
+        age_tree(&child, 20);
+        harness.claim("underlay", 14 * 24 * 60 * 60);
+        let now = state::now_ms() + 3_600_000;
+        let plan = harness.plan_at(now);
+        assert_eq!(
+            plan.plan.candidates.count, 1,
+            "{:?} {:?}",
+            plan.plan.candidates.rows, plan.plan.kept.rows
+        );
+        assert_eq!(plan.plan.candidates.rows[0].name, "old-child");
+        assert_eq!(
+            plan.plan.candidates.rows[0].scope,
+            super::UnitScope::Project {
+                name: "underlay".to_owned()
+            }
+        );
+        let real = harness.expire_at(now, &plan.plan_digest);
+        assert_eq!(real.deleted.count, 1, "{:?}", real.skipped.rows);
+        assert!(!child.exists(), "the claimed child was deleted");
+    }
+
+    #[test]
+    fn a_marked_family_inside_a_claimed_eight_character_project_needs_its_delegation() {
+        let harness = Harness::new("scratch-eight-character-marked");
+        let marked = harness.project("underlay").join("marked-run");
+        std::fs::create_dir_all(&marked).expect("the effigy root");
+        effigy_marker(&marked, 0xFFFF_FFFE, false, None);
+        age_tree(&marked, 20);
+        harness.claim("underlay", 14 * 24 * 60 * 60);
+        let now = state::now_ms() + 3_600_000;
+        let plan = harness.plan_at(now);
+        assert!(
+            plan.plan.candidates.rows.is_empty(),
+            "a marked family is never covered by a project claim: {:?}",
+            plan.plan.candidates.rows
+        );
+        assert!(
+            harness
+                .kept_reason(&plan, "marked-run")
+                .contains("no delegation"),
+            "{:?}",
+            plan.plan.kept.rows
+        );
+        harness.delegate(MarkerFamily::EffigyScratch);
+        let granted = harness.plan_at(now);
+        assert_eq!(
+            granted.plan.candidates.count, 1,
+            "{:?}",
+            granted.plan.candidates.rows
+        );
+        assert_eq!(granted.plan.candidates.rows[0].name, "marked-run");
+    }
+
+    #[test]
+    fn an_unclaimed_eight_character_name_survives_and_the_ad_hoc_claim_covers_it() {
+        let harness = Harness::new("scratch-eight-character-unclaimed");
+        let child = harness.project("underlay").join("old-child");
+        std::fs::create_dir_all(&child).expect("the unit");
+        age_tree(&harness.project("underlay"), 20);
+        let now = state::now_ms() + 3_600_000;
+        let bare = harness.plan_at(now);
+        assert!(
+            bare.plan.candidates.rows.is_empty(),
+            "an unclaimed eight-character name is never a project: {:?}",
+            bare.plan.candidates.rows
+        );
+        assert!(bare
+            .plan
+            .kept
+            .rows
+            .iter()
+            .any(|row| row.name == "underlay" && row.reason.contains("eight-character")));
+        // A top_level_adhoc claim reads the folder itself as one ad-hoc unit.
+        harness.adhoc_claim(14 * 24 * 60 * 60);
+        let adhoc = harness.plan_at(now);
+        assert_eq!(adhoc.plan.candidates.count, 1);
+        assert_eq!(adhoc.plan.candidates.rows[0].name, "underlay");
+        assert_eq!(
+            adhoc.plan.candidates.rows[0].scope,
+            super::UnitScope::TopLevel
+        );
+        let real = harness.expire_at(now, &adhoc.plan_digest);
+        assert_eq!(real.deleted.count, 1, "{:?}", real.skipped.rows);
+        assert!(!harness.scratch().join("underlay").exists());
+    }
+
+    #[test]
+    fn a_project_claim_and_a_top_level_claim_may_not_overlap_on_an_eight_character_name() {
+        let harness = Harness::new("scratch-eight-character-overlap");
+        harness.claim("underlay", 60);
+        let adhoc = ScratchClaim {
+            scope: ClaimScope::TopLevelAdhoc,
+            unit: ClaimUnit::Entry,
+            unmarked_idle_seconds: 60,
+            families_excluded: vec![],
+            declared_by: "operator".to_owned(),
+            declared_ms: state::now_ms(),
+        };
+        let error = declare_claim(&harness.fixture.state, &harness.fixture.uuid, &adhoc, false)
+            .expect_err("the overlapping ad-hoc claim is refused");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert!(
+            error.message().contains("may not cover the same name"),
+            "{error}"
+        );
+        // A withdrawal is always allowed: it is how an operator resolves an
+        // overlap, and withdrawing the project claim is what releases the name.
+        let project = ScratchClaim {
+            scope: ClaimScope::Project {
+                name: "underlay".to_owned(),
+            },
+            unit: ClaimUnit::Child,
+            unmarked_idle_seconds: 60,
+            families_excluded: vec![],
+            declared_by: "operator".to_owned(),
+            declared_ms: state::now_ms(),
+        };
+        assert!(
+            declare_claim(
+                &harness.fixture.state,
+                &harness.fixture.uuid,
+                &project,
+                true
+            )
+            .expect("the withdrawal is allowed")
+            .changed
+        );
+        declare_claim(&harness.fixture.state, &harness.fixture.uuid, &adhoc, false)
+            .expect("the ad-hoc claim is recorded once the other is withdrawn");
+        // The other direction refuses the same way.
+        let error = declare_claim(
+            &harness.fixture.state,
+            &harness.fixture.uuid,
+            &project,
+            false,
+        )
+        .expect_err("the overlapping project claim is refused");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        // A project claim for a name that is never an ad-hoc unit (a plain
+        // project name) coexists with the ad-hoc claim: only an eight-character
+        // name can be read both ways, and that is the overlap refused above.
+        let plain = ScratchClaim {
+            scope: ClaimScope::Project {
+                name: "alpha".to_owned(),
+            },
+            unit: ClaimUnit::Child,
+            unmarked_idle_seconds: 60,
+            families_excluded: vec![],
+            declared_by: "operator".to_owned(),
+            declared_ms: state::now_ms(),
+        };
+        declare_claim(&harness.fixture.state, &harness.fixture.uuid, &plain, false)
+            .expect("a plain project claim is recorded beside the ad-hoc claim");
     }
 }

@@ -20,8 +20,13 @@ processes at all: whether `proc_pidinfo` may read a process of this account is a
 property of the host, not of the product, so a host that cannot is classified
 `infrastructure` and aborted unqualified (exit 4) instead of being reported as a
 case failure. It launches one same-uid sentinel child that stays in the shared
-supervisor's session, lists its descriptors and the descriptors of a pre-existing
-same-uid process, and reaps the child within a fixed bound.
+supervisor's session and lists its descriptors, then censuses every process the
+kernel table reports as this effective uid (tolerating a process that exited,
+never inspecting another uid, and naming the pid and command of any refusal or
+bound), and reaps the child within a fixed bound. Premise 2 is asserted the same
+way: the real account state is digested before and after, and `describe`'s
+resolver facts must name the fixture state directory, its environment override
+and the password-database account home.
 
 Every environment hook it reads is listed in `ENVIRONMENT` and recorded in the
 receipt, because premise 6 requires naming each one.
@@ -35,8 +40,10 @@ import inspect
 import json
 import os
 import plistlib
+import pwd
 import select
 import shutil
+import stat as stat_module
 import subprocess
 import sys
 import tempfile
@@ -66,9 +73,18 @@ SENTINEL_READY = "ready"
 SENTINEL_LIFETIME_S = 20
 SENTINEL_READY_S = 5
 SENTINEL_REAP_S = 5
-# The two positive preflight checks, in the order they run. A host that cannot
-# list a same-uid child, or a pre-existing same-uid process, is `infrastructure`.
-PREFLIGHT_CHECKS = ["sentinel_descriptors", "preexisting_descriptors"]
+# The two positive preflight checks, in the order they run: the proof's own
+# same-uid child, and the census of every same-effective-uid process on the host.
+# A host that cannot list one of them is `infrastructure`, unqualified, aborted
+# before any case.
+PREFLIGHT_CHECKS = ["sentinel_descriptors", "same_uid_census"]
+# The census's own bounds. A bound that is reached is not a partial pass: the
+# receipt says `bounded`, the run is unqualified infrastructure, and no case runs.
+CENSUS_PROCESS_CAP = 8192
+CENSUS_DESCRIPTOR_CAP = 4096
+CENSUS_SECONDS = 20
+# How many pre-existing same-uid processes the receipt names by pid and command.
+CENSUS_SAMPLE = 8
 # The same-uid descriptor observation S5's custody scan uses: `libproc`'s
 # `proc_pidinfo(PROC_PIDLISTFDS)` over one process. The preflight proves the
 # host exposes it; it is never a second product primitive.
@@ -84,6 +100,8 @@ KERN_PROC_ALL = 0
 KINFO_PROC_SIZE = 648
 KINFO_PID_OFFSET = 40
 KINFO_UID_OFFSET = 420
+KINFO_COMMAND_OFFSET = 243
+KINFO_COMMAND_BYTES = 17
 # Exit status for an infrastructure classification: the environment cannot
 # observe same-uid processes, so no case ran and nothing here is evidence.
 EXIT_INFRASTRUCTURE = 4
@@ -158,6 +176,77 @@ def run(command, env, cwd=None, timeout=120, check=True):
             f"{(result.stderr or result.stdout).strip()[-400:]}",
         )
     return result
+
+
+# The product's own relative state root (crates/barge/src/os/macos.rs): the real
+# account state this proof must leave untouched, and the one premise 2 names.
+REAL_STATE_RELATIVE = "Library/Application Support/barge/state"
+# The bounds of the before/after real-state observation: names, bytes and time.
+REAL_STATE_ENTRIES = 4096
+REAL_STATE_BYTES = 8 * 1024 * 1024
+REAL_STATE_SECONDS = 20
+# The `barge describe` facts the resolver identity assertion reads.
+RESOLVER_FACTS = ["state.dir", "state.source", "state.home.account",
+                  "state.home.environment", "state.home.mismatch"]
+
+
+def account_home():
+    """The password-database home for the effective uid, never `$HOME`."""
+    return pwd.getpwuid(os.geteuid()).pw_dir
+
+
+def real_state_digest(deadline_seconds=REAL_STATE_SECONDS):
+    """A bounded, read-only digest of the real account state, or `absent`.
+
+    Premise 2 is not a declaration: the proof reads the real state directory
+    before and after the run and asserts the two are equal. The walk never
+    follows a symlink, never writes, and stops at its own name, byte and time
+    bounds; a bound is part of the digest, so a truncated pair never compares
+    equal to a complete one.
+    """
+    root = os.path.join(account_home(), REAL_STATE_RELATIVE)
+    digest = hashlib.sha256()
+    deadline = time.monotonic() + deadline_seconds
+    if not os.path.isdir(root):
+        return "absent"
+    entries = 0
+    total = 0
+    stack = [""]
+    while stack:
+        relative = stack.pop()
+        directory = os.path.join(root, relative)
+        with os.scandir(directory) as listing:
+            for entry in sorted(listing, key=lambda row: row.name):
+                if entries >= REAL_STATE_ENTRIES or total >= REAL_STATE_BYTES:
+                    return f"bounded:{entries}:{total}"
+                if time.monotonic() >= deadline:
+                    return f"deadline:{entries}:{total}"
+                entries += 1
+                info = entry.stat(follow_symlinks=False)
+                name = os.path.join(relative, entry.name)
+                digest.update(name.encode("utf-8", "surrogateescape"))
+                digest.update(b"\0")
+                digest.update(str(info.st_mode & 0o170000).encode())
+                digest.update(b"\0")
+                digest.update(str(info.st_size).encode())
+                digest.update(b"\0")
+                if stat_module.S_ISDIR(info.st_mode):
+                    stack.append(name)
+                elif stat_module.S_ISREG(info.st_mode):
+                    with open(entry.path, "rb") as handle:
+                        remaining = REAL_STATE_BYTES - total
+                        while True:
+                            block = handle.read(min(1 << 20, remaining))
+                            if not block:
+                                break
+                            digest.update(block)
+                            total += len(block)
+                            remaining -= len(block)
+                            if remaining <= 0:
+                                break
+                else:
+                    digest.update(b"special")
+    return f"{digest.hexdigest()}:{entries}:{total}"
 
 
 class Fault(Exception):
@@ -275,9 +364,13 @@ def process_table():
     return raw
 
 
-def table_entries(raw):
-    """`{pid: effective uid}` from the kernel's own table."""
-    entries = {}
+def table_rows(raw):
+    """`[(pid, effective uid, command)]` from the kernel's own table.
+
+    The command is the kernel's short name for the process, so a refusal can be
+    reported with the pid *and* what the process is, without inspecting it.
+    """
+    rows = []
     for index in range(len(raw) // KINFO_PROC_SIZE):
         entry = raw[index * KINFO_PROC_SIZE:(index + 1) * KINFO_PROC_SIZE]
         pid = int.from_bytes(
@@ -286,57 +379,105 @@ def table_entries(raw):
         uid = int.from_bytes(
             entry[KINFO_UID_OFFSET:KINFO_UID_OFFSET + 4], sys.byteorder
         )
-        entries[pid] = uid
-    return entries
+        command = entry[
+            KINFO_COMMAND_OFFSET:KINFO_COMMAND_OFFSET + KINFO_COMMAND_BYTES
+        ].split(b"\0", 1)[0].decode("utf-8", "replace")
+        rows.append((pid, uid, command))
+    return rows
 
 
-def choose_preexisting(parent, own_pid, own_uid, exclude, table, uid_of):
-    """Pick the pre-existing same-uid process the second descriptor probe reads.
-
-    The parent — the shared supervisor that runs this proof — is preferred; a
-    fallback comes from the kernel table in table order. A candidate's effective
-    uid is a kinfo fact (`uid_of`), never an assumption about who forked this
-    process, and neither this process nor the preflight's own sentinel is ever
-    chosen. Returns `(pid, source)` or `(None, reason)`.
-    """
-    skipped = {own_pid, *exclude}
-    if parent not in skipped and uid_of(parent) == own_uid:
-        return parent, "parent"
-    for pid in table:
-        if pid in skipped:
-            continue
-        if uid_of(pid) == own_uid:
-            return pid, "kernel table"
-    return None, "the kernel table names no other process of this effective uid"
-
-
-def verified_entries(raw, own_pid, own_uid):
-    """`{pid: effective uid}` from the kernel table, after it proves itself.
+def verified_rows(raw, own_pid, own_uid):
+    """The kernel table's rows, after it proves it describes this process.
 
     The table must describe *this* process as this pid and this effective uid
     before any entry is trusted: an entry size or offset that disagrees with
     `getpid` and `geteuid` would otherwise classify another account's process as
     this one's. A table that disagrees is refused, never parsed further.
     """
-    entries = table_entries(raw)
-    if entries.get(own_pid) != own_uid:
-        raise OSError(
-            f"the kernel process table does not describe this process ({own_pid}) as "
-            f"uid {own_uid}, so its offsets cannot be trusted"
-        )
-    return entries
-
-
-def preexisting_process(exclude=()):
-    """A pre-existing same-uid process, its uid read from the kernel table."""
-    own_pid, own_uid = os.getpid(), os.geteuid()
-    entries = verified_entries(process_table(), own_pid, own_uid)
-    pid, source = choose_preexisting(
-        os.getppid(), own_pid, own_uid, tuple(exclude), list(entries), entries.get
+    rows = table_rows(raw)
+    for pid, uid, _command in rows:
+        if pid == own_pid:
+            if uid == own_uid:
+                return rows
+            break
+    raise OSError(
+        f"the kernel process table does not describe this process ({own_pid}) as "
+        f"uid {own_uid}, so its offsets cannot be trusted"
     )
-    if pid is None:
-        raise OSError(source)
-    return pid, source
+
+
+def same_uid_rows(own_pid, own_uid, table=process_table):
+    """The kernel table's verified rows, with this process proved to be itself."""
+    return verified_rows(table(), own_pid, own_uid)
+
+
+def same_uid_census(own_pid, own_uid, sentinel_pid, rows=None,
+                    describe=list_descriptors, process_cap=CENSUS_PROCESS_CAP,
+                    descriptor_cap=CENSUS_DESCRIPTOR_CAP, seconds=CENSUS_SECONDS,
+                    clock=time.monotonic):
+    """List the descriptors of every same-effective-uid process, bounded.
+
+    This is the required second observation, made on the whole host rather than
+    one sample: `proc_pidinfo(PROC_PIDLISTFDS)` for every process whose effective
+    uid the kernel table reports as this account's. A process that exited during
+    the census (`ESRCH`) is tolerated, because it positively held nothing open; a
+    foreign effective uid is skipped and counted, never inspected; and a refusal
+    (`EPERM`), a bound, or the deadline is recorded with the pid and command it
+    hit, so the caller can classify the run as `infrastructure` rather than let a
+    capability limitation look like a case result.
+    """
+    record = {
+        "processes": 0,
+        "same_uid": 0,
+        "listed": 0,
+        "exited": 0,
+        "foreign": 0,
+        "descriptors": 0,
+        "pre_existing_listed": 0,
+        "pre_existing": [],
+        "refused": [],
+        "bounded": None,
+        "seconds": 0.0,
+    }
+    started = clock()
+    deadline = started + seconds
+    if rows is None:
+        rows = same_uid_rows(own_pid, own_uid)
+    elif callable(rows):
+        rows = rows()
+    for pid, uid, command in rows:
+        record["processes"] += 1
+        if record["processes"] > process_cap:
+            record["bounded"] = f"the process cap {process_cap} was reached"
+            break
+        if uid != own_uid:
+            record["foreign"] += 1
+            continue
+        record["same_uid"] += 1
+        if clock() >= deadline:
+            record["bounded"] = f"the census deadline {seconds:g}s was reached"
+            break
+        try:
+            descriptors = describe(pid, descriptor_cap)
+        except OSError as error:
+            if error.errno == errno.ESRCH:
+                record["exited"] += 1
+                continue
+            record["refused"].append(
+                {"pid": pid, "command": command, "error": str(error)}
+            )
+            continue
+        record["listed"] += 1
+        record["descriptors"] += len(descriptors)
+        if pid in (own_pid, sentinel_pid):
+            continue
+        record["pre_existing_listed"] += 1
+        if len(record["pre_existing"]) < CENSUS_SAMPLE:
+            record["pre_existing"].append(
+                {"pid": pid, "command": command, "descriptors": len(descriptors)}
+            )
+    record["seconds"] = round(clock() - started, 3)
+    return record
 
 
 class Sentinel:
@@ -423,7 +564,7 @@ def reap_sentinel(sentinel, budget=SENTINEL_REAP_S):
 
 
 def preflight(spawn=spawn_sentinel, describe=list_descriptors, reap=reap_sentinel,
-              session_of=os.getsid, preexisting=preexisting_process):
+              session_of=os.getsid, census=same_uid_census):
     """Prove this host can observe same-uid processes, before any case.
 
     `proc_pidinfo` answers `EPERM` for some same-effective-uid processes on some
@@ -439,8 +580,10 @@ def preflight(spawn=spawn_sentinel, describe=list_descriptors, reap=reap_sentine
     1. the descriptors of a same-uid child this proof launches (`sentinel`), which
        must have stayed in the shared supervisor's session and be reaped within a
        fixed bound;
-    2. the descriptors of a pre-existing same-uid process this proof did not
-       start, whose effective uid is a kernel-table fact, never an assumption.
+    2. a bounded full census of every same-effective-uid process the kernel table
+       names, so the observation is proven for the whole account and not for one
+       sample. A refusal, a bound or the deadline is named with its pid and
+       command in the receipt.
     """
     record = {"checks": [], "sentinel": None, "reap": None}
     failure = None
@@ -484,23 +627,50 @@ def preflight(spawn=spawn_sentinel, describe=list_descriptors, reap=reap_sentine
                     )
     if failure is None:
         try:
-            pid, source = preexisting(tuple([sentinel.pid]) if sentinel else ())
-            descriptors = describe(pid)
+            census_record = census(
+                os.getpid(), os.geteuid(), sentinel.pid if sentinel else None,
+                describe=describe,
+            )
         except OSError as error:
             failure = (
-                "preexisting_descriptors",
-                f"a pre-existing same-uid process could not be observed: {error}",
+                "same_uid_census",
+                f"the same-uid process census could not be read: {error}",
             )
         else:
-            record["checks"].append({
-                "check": "preexisting_descriptors", "status": "passed",
-                "pid": pid, "uid": os.geteuid(), "uid_source": source,
-                "descriptors": descriptors,
-            })
-            if not descriptors:
+            record["census"] = census_record
+            check = {
+                "check": "same_uid_census", "status": "passed",
+                "same_uid": census_record["same_uid"],
+                "listed": census_record["listed"],
+                "exited": census_record["exited"],
+                "foreign": census_record["foreign"],
+                "pre_existing_listed": census_record["pre_existing_listed"],
+                "refused": census_record["refused"],
+                "bounded": census_record["bounded"],
+                "seconds": census_record["seconds"],
+            }
+            record["checks"].append(check)
+            if census_record["refused"]:
+                named = ", ".join(
+                    f"pid {row['pid']} ({row['command']}): {row['error']}"
+                    for row in census_record["refused"][:CENSUS_SAMPLE]
+                )
                 failure = (
-                    "preexisting_descriptors",
-                    "the pre-existing same-uid process listed no descriptors",
+                    "same_uid_census",
+                    f"{len(census_record['refused'])} same-uid process(es) could not be "
+                    f"listed: {named}",
+                )
+            elif census_record["bounded"] is not None:
+                failure = (
+                    "same_uid_census",
+                    f"the census did not finish: {census_record['bounded']} "
+                    f"({census_record['listed']} listed, {census_record['same_uid']} same-uid)",
+                )
+            elif census_record["pre_existing_listed"] < 1:
+                failure = (
+                    "same_uid_census",
+                    "the census listed no pre-existing same-uid process besides this "
+                    "proof and its sentinel",
                 )
     if sentinel is not None:
         record["reap"] = reap(sentinel)
@@ -533,6 +703,8 @@ class Proof:
         self.fault = None
         self.preflight = None
         self.infrastructure = None
+        self.real_state = None
+        self.resolver = None
         self.attached = False
         self.env = None
 
@@ -542,6 +714,14 @@ class Proof:
         scratch = os.environ.get("TMPDIR")
         if not scratch or not os.path.isdir(scratch):
             raise Fault("premise", "TMPDIR is not a directory the guard created")
+        # Premise 2's before-observation: the real account state as it is now.
+        self.real_state = {
+            "path": os.path.join(account_home(), REAL_STATE_RELATIVE),
+            "account_home": account_home(),
+            "before": real_state_digest(),
+            "after": None,
+            "unchanged": None,
+        }
         self.root = tempfile.mkdtemp(prefix="barge-scratch-proof-", dir=scratch)
         self.home = tempfile.mkdtemp(prefix="home-", dir=self.root)
         self.state = tempfile.mkdtemp(prefix="state-", dir=self.root)
@@ -733,8 +913,37 @@ class Proof:
 
     def case_two_concurrent_allocations_get_distinct_ids(self):
         project = "concurrent"
-        first = self.alloc(project, "first")
-        second = self.alloc(project, "second")
+        # Both allocations are launched before either is awaited, so the case
+        # proves concurrent distinct ids rather than two sequential allocations.
+        commands = [
+            [
+                self.binary, "scratch", "alloc", "--volume", self.uuid,
+                "--project", project, "--consumer", consumer,
+                "--pid", str(os.getpid()), "--json",
+            ]
+            for consumer in ("first", "second")
+        ]
+        processes = [
+            subprocess.Popen(
+                command, env=self.env, cwd=self.root,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            for command in commands
+        ]
+        roots = []
+        for process in processes:
+            out, err = process.communicate(timeout=120)
+            if process.returncode != 0:
+                raise Fault(
+                    "case",
+                    f"an overlapping allocation exited {process.returncode}: "
+                    f"{(err or out).strip()[-300:]}",
+                )
+            try:
+                roots.append(json.loads(out)["data"]["root"])
+            except (ValueError, KeyError) as error:
+                raise Fault("case", f"an allocation printed no root: {error}: {out[-300:]}")
+        first, second = roots
         if first["root_id"] == second["root_id"]:
             raise Fault("case", "two allocations received the same root id")
         for root in (first, second):
@@ -929,27 +1138,38 @@ class Proof:
             command, env=self.env, cwd=self.root,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        leaf = None
+        pulled = None
         try:
-            leaf = self.wait_for_quarantine(folder, timeout=60)
-            # Premise 5: a forced detach only of the owned image's own whole disk.
-            run(["hdiutil", "detach", "-force", f"/dev/{self.whole_disk}"], self.env, timeout=120)
-            self.attached = False
+            self.wait_for_quarantine(folder, timeout=60)
+            pulled = self.pull()
         finally:
             try:
                 process.wait(timeout=180)
             except subprocess.TimeoutExpired:
                 process.kill()
                 raise Fault("case", "the expiry did not stop after the volume was pulled")
+        # The pending intent is state, not the image: it must be readable while the
+        # volume is away.
         pending = self.pending_intents()
         if len(pending) != 1:
             raise Fault("case", f"expected one pending intent after the pull, found {len(pending)}")
-        kept = os.path.join(folder, pending[0]["quarantine_name"])
+        intent = pending[0]
+        kept_name = intent["quarantine_name"]
+        self.reattach()
+        # Only now, after re-attach, is the on-image identity checkable: the kept
+        # quarantine leaf, its marker, and the device and inode the intent recorded.
+        kept = os.path.join(folder, kept_name)
         if not os.path.isdir(kept):
             raise Fault("case", "the quarantine leaf was not kept through the pull")
         if not os.path.isfile(os.path.join(kept, ".barge-root.json")):
             raise Fault("case", "the kept leaf lost its marker")
-        self.reattach()
+        device, inode = self.identity(kept)
+        if (device, inode) != (intent["device"], intent["inode"]):
+            raise Fault(
+                "case",
+                f"the kept leaf's identity is {device}:{inode}, not the intent's "
+                f"{intent['device']}:{intent['inode']}",
+            )
         digest_after, plan = self.empty_plan_digest()
         if plan["candidates"]["count"] != 0:
             raise Fault("case", "a settled-plan run would delete something new")
@@ -961,10 +1181,15 @@ class Proof:
             raise Fault("case", "the intent is still pending after the replay")
         if os.path.isdir(kept):
             raise Fault("case", "the kept leaf survived the replay")
-        return "an ordinary pull mid-delete kept the leaf; the replay after re-attach settled it"
+        return (
+            f"a {pulled} pull mid-delete kept the leaf; the identity recorded in the "
+            "intent survived the re-attach, and the replay settled it"
+        )
 
     def case_a_stale_mount_point_is_never_written(self):
-        self.detach()
+        failure = self.detach()
+        if failure is not None:
+            raise Fault("case", failure)
         stale = self.mount
         existed = os.path.isdir(stale)
         code, document = self.barge("scratch", "expire", "--volume", self.uuid, "--plan", expect=2)
@@ -1093,12 +1318,88 @@ class Proof:
         self.attached = True
 
     def detach(self):
+        """Detach the owned image ordinarily, and never by force.
+
+        Premise 5 allows a forced detach only of the owned image's own whole-disk
+        device, and only the pull case uses it. A failed ordinary detach here
+        leaves the image attached, so the caller can keep its backing and report
+        unqualified instead of force-unmounting a path.
+        """
         if not self.attached:
-            return
+            return None
         result = run(["hdiutil", "detach", self.mount], self.env, timeout=180, check=False)
         if result.returncode != 0:
-            result = run(["hdiutil", "detach", "-force", self.mount], self.env, timeout=180)
+            return (
+                f"the ordinary detach of {self.mount} failed "
+                f"({result.returncode}: {(result.stderr or result.stdout).strip()[-200:]})"
+            )
         self.attached = False
+        return None
+
+    def pull(self):
+        """Pull the owned image mid-delete, in an authorized detach mode.
+
+        The design's case is an ordinary detach mid-delete; when the running
+        delete holds the volume busy, premise 5's one forced detach is the owned
+        image's own whole-disk device. Returns the mode that actually detached
+        it, which the case records, so the receipt shows the mode used.
+        """
+        result = run(["hdiutil", "detach", self.mount], self.env, timeout=120, check=False)
+        if result.returncode == 0:
+            self.attached = False
+            return "ordinary"
+        forced = run(
+            ["hdiutil", "detach", "-force", f"/dev/{self.whole_disk}"],
+            self.env,
+            timeout=120,
+            check=False,
+        )
+        if forced.returncode != 0:
+            raise Fault(
+                "case",
+                "neither the ordinary detach nor the owned image's own whole-disk "
+                f"force detached it: {(forced.stderr or forced.stdout).strip()[-200:]}",
+            )
+        self.attached = False
+        return "forced-owned-whole-disk"
+
+    def assert_resolver(self):
+        """Assert which state directory the product selected, and why.
+
+        Premise 2 is about the resolver, not about `HOME`: the account home is the
+        password-database one, and only `BARGE_STATE_DIR` moves state. The
+        document must report the fixture directory, the environment override as
+        its source, and the real account home — with this proof's private `HOME`
+        visible as a mismatch.
+        """
+        code, document = self.barge("describe", expect=0)
+        if code != 0:
+            raise Fault("premise", f"describe exited {code}: {document}")
+        data = document.get("data") or {}
+        state = data.get("state") or {}
+        home = state.get("home") or {}
+        actual = {
+            "state.dir": state.get("dir"),
+            "state.source": state.get("source"),
+            "state.home.account": home.get("account"),
+            "state.home.environment": home.get("environment"),
+            "state.home.mismatch": home.get("mismatch"),
+        }
+        expected = {
+            "state.dir": self.state,
+            "state.source": "environment_override",
+            "state.home.account": account_home(),
+            "state.home.environment": self.home,
+            "state.home.mismatch": True,
+        }
+        for fact in RESOLVER_FACTS:
+            if actual[fact] != expected[fact]:
+                raise Fault(
+                    "premise",
+                    f"the resolver's {fact} is {actual[fact]!r}, not the fixture's "
+                    f"{expected[fact]!r}",
+                )
+        self.resolver = {"facts": actual, "asserted": list(RESOLVER_FACTS)}
 
     # -- the run ----------------------------------------------------------
 
@@ -1146,19 +1447,25 @@ class Proof:
         # and passed, and nothing was cancelled. An infrastructure abort is
         # unqualified in both modes and carries no case rows at all: no case ran.
         classification = "infrastructure" if self.infrastructure else "proof"
+        state_ok = bool(self.real_state and self.real_state.get("unchanged") is True)
         return {
             "schema": SCHEMA,
             "qualified": (classification == "proof"
                           and not self.diagnostic
                           and self.fault is None
                           and cancelled is None
+                          and state_ok
+                          and self.resolver is not None
                           and all(row["status"] == "passed" for row in self.results)
                           and len(self.results) == len(CASES)),
             "classification": classification,
             "infrastructure": self.infrastructure,
             "preflight": self.preflight,
+            "real_state": self.real_state,
+            "resolver": self.resolver,
             "diagnostic": self.diagnostic,
             "cancelled": cancelled,
+            "cleanup_failure": cancelled,
             "wall_limit_ms": WALL_MS,
             "scratch_budget_mib": SCRATCH_MIB,
             "image_mib": IMAGE_MIB,
@@ -1181,11 +1488,19 @@ class Proof:
             handle.write("\n")
 
     def cleanup(self):
-        try:
-            self.detach()
-        finally:
-            if self.root and os.path.isdir(self.root):
-                shutil.rmtree(self.root, ignore_errors=True)
+        """Detach ordinarily and remove the owned root; a failure keeps both.
+
+        A failed ordinary detach leaves the image attached and its backing file in
+        place: the proof never force-detaches by mount path and never removes the
+        backing of an image it could not detach. The failure is returned so the
+        receipt is unqualified, never suppressed.
+        """
+        failure = self.detach()
+        if failure is not None:
+            return failure
+        if self.root and os.path.isdir(self.root):
+            shutil.rmtree(self.root, ignore_errors=True)
+        return None
 
 
 def expiry_evidence(document):
@@ -1231,16 +1546,18 @@ def expiry_evidence(document):
 
 
 def preflight_problems():
-    """Pure tests of the preflight: both positives and an abort on either failure.
+    """Pure tests of the preflight: both probes, and an abort on either failure.
 
     No child, no image and no descriptor of a real process: the spawner, the
-    listing and the reap are injected. A failing check must raise
-    `Infrastructure` naming the check, and a sentinel that was started must be
-    reaped on every path, including the refusals, so cleanup stays bounded when
-    the preflight refuses.
+    kernel table, the listing and the reap are injected. A failing probe must
+    raise `Infrastructure` naming the check, carry the pid and command it hit,
+    and a sentinel that was started must be reaped on every path, including the
+    refusals, so cleanup stays bounded when the preflight refuses.
     """
     problems = []
-    sentinel_pid, preexisting_pid, session = 4242, 4343, 99
+    # The census is called with this process's real pid and uid, so the fake
+    # table has to name them as this process for its self-verification.
+    sentinel_pid, own_pid, own_uid, session = 4242, os.getpid(), os.geteuid(), 99
 
     class FakeSentinel:
         """A sentinel that owns no process at all."""
@@ -1250,8 +1567,7 @@ def preflight_problems():
             self.session = session_id
             self.process = None
 
-    def run(describe, spawn=None, reap=None,
-            preexisting=lambda exclude: (preexisting_pid, "parent")):
+    def run(table, describe, spawn=None, reap=None, census=same_uid_census):
         spawned = []
         reaped = []
 
@@ -1267,186 +1583,217 @@ def preflight_problems():
             reaped.append((sentinel, outcome))
             return outcome
 
+        def fake_census(pid, uid, sentinel_id, describe=None, **_kwargs):
+            return census(pid, uid, sentinel_id, table, describe)
+
         try:
             record = preflight(
                 spawn=fake_spawn,
                 describe=describe,
                 reap=fake_reap,
                 session_of=lambda pid: session,
-                preexisting=preexisting,
+                census=fake_census,
             )
         except Infrastructure as error:
             return None, error, spawned, reaped
         return record, None, spawned, reaped
+    def table(*rows):
+        return lambda: list(rows)
 
-    def listable(pid):
+    def census(pid, uid, sentinel_id, rows, describe):
+        return same_uid_census(
+            pid, uid, sentinel_id, rows=rows, describe=describe,
+            process_cap=CENSUS_PROCESS_CAP, descriptor_cap=CENSUS_DESCRIPTOR_CAP,
+            seconds=CENSUS_SECONDS, clock=lambda: 0.0,
+        )
+
+    def listable(pid, cap=CENSUS_DESCRIPTOR_CAP):
         return [0, 1, 2]
 
-    # The pre-existing candidate is chosen from verified same-uid facts only:
-    # the parent preferred, the kernel table as fallback, never this process,
-    # never the preflight's own sentinel.
-    own_pid, own_uid = 10, 501
-    facts = {99: 501, 11: 501, 12: 0, own_pid: own_uid}
-    if choose_preexisting(99, own_pid, own_uid, (), [11, 12], facts.get) != (99, "parent"):
-        problems.append("the pre-existing probe does not prefer a same-uid parent")
-    facts[99] = 0
-    if choose_preexisting(99, own_pid, own_uid, (), [11, 12], facts.get) != (11, "kernel table"):
-        problems.append("the pre-existing probe does not fall back to the kernel table")
-    facts[99] = own_uid
-    if choose_preexisting(99, own_pid, own_uid, (99,), [11, 12], facts.get) != (11, "kernel table"):
-        problems.append("the pre-existing probe can choose the preflight's own sentinel")
-    if choose_preexisting(98, own_pid, own_uid, (), [own_pid, 12], facts.get)[0] is not None:
-        problems.append("the pre-existing probe chose a pid with no same-uid process")
-    if choose_preexisting(98, own_pid, own_uid, (), [own_pid, 12], facts.get)[1] == "":
-        problems.append("a table without a same-uid process gives no reason")
+    # The table: this process, its sentinel, one pre-existing same-uid process,
+    # one process of another uid that must never be inspected.
+    healthy = table(
+        (own_pid, own_uid, "python3"),
+        (sentinel_pid, own_uid, "python3"),
+        (5000, own_uid, "login"),
+        (5001, own_uid, "login"),
+        (6000, own_uid + 1, "sandboxd"),
+    )
 
-    # The kinfo read proves itself before any entry is trusted, and is the
-    # product's own unprivileged classification fact.
-    if KINFO_PROC_SIZE != 648:
-        problems.append("the kinfo entry size changed")
-    for offset in (KINFO_PID_OFFSET, KINFO_UID_OFFSET):
-        if not 0 < offset <= KINFO_PROC_SIZE - 4:
-            problems.append(f"the kinfo offset {offset} is outside the entry")
-    if "KERN_PROC_ALL" not in inspect.getsource(process_table):
-        problems.append("the preflight no longer reads the kernel process table")
+    record, error, spawned, reaped = run(healthy, listable)
+    if record is None:
+        problems.append(f"a host that can observe same-uid processes was refused: {error.detail}")
+    else:
+        checks = [check["check"] for check in record["checks"]]
+        if checks != PREFLIGHT_CHECKS:
+            problems.append(f"the positive preflight records {checks}, not {PREFLIGHT_CHECKS}")
+        first = record["checks"][0]
+        if first["status"] != "passed" or 1 not in first["descriptors"]:
+            problems.append("the sentinel probe is not a passed listing of its own table")
+        second = record["checks"][1]
+        if second["status"] != "passed":
+            problems.append("the positive census is not a passed listing")
+        for field, expected in (("same_uid", 4), ("listed", 4), ("foreign", 1),
+                                ("pre_existing_listed", 2), ("exited", 0)):
+            if second[field] != expected:
+                problems.append(f"the census's {field} is {second[field]}, not {expected}")
+        if second["refused"] or second["bounded"] is not None:
+            problems.append("the positive census records a refusal or a bound")
+        if not record["reap"] or not record["reap"].get("reaped"):
+            problems.append("the positive preflight did not reap its sentinel")
+    if len(spawned) != 1 or len(reaped) != 1:
+        problems.append("the positive preflight did not start and reap exactly one sentinel")
 
-    # The kinfo read is exercised purely on a hand-built table at the declared
-    # offsets: agreeing entries parse, and a table that does not describe this
-    # process as itself is refused before any uid is trusted.
+    # A foreign uid is skipped, never inspected.
+    def refuse_foreign(pid, cap=CENSUS_DESCRIPTOR_CAP):
+        if pid == 6000:
+            raise AssertionError("a foreign-uid process was inspected")
+        return [0, 1, 2]
+
+    record, error, _spawned, _reaped = run(healthy, refuse_foreign)
+    if record is None:
+        problems.append(f"a foreign-uid entry was inspected or refused the census: {error and error.detail}")
+
+    # An unreadable same-uid process is infrastructure, named by pid and command,
+    # and the sentinel is still reaped.
+    def unreadable_login(pid, cap=CENSUS_DESCRIPTOR_CAP):
+        if pid == 5000:
+            raise OSError(errno.EPERM, "Operation not permitted")
+        return [0, 1, 2]
+
+    record, error, spawned, reaped = run(healthy, unreadable_login)
+    if record is not None:
+        problems.append("an unreadable same-uid process was not refused")
+    else:
+        if error.check != "same_uid_census":
+            problems.append(f"a census refusal is classified `{error.check}`")
+        if "pid 5000" not in error.detail or "login" not in error.detail:
+            problems.append(f"the census refusal does not name the pid and command: {error.detail}")
+        if "1 same-uid process" not in error.detail:
+            problems.append(f"the census refusal does not count the refused processes: {error.detail}")
+        if len(reaped) != 1 or not reaped[0][1].get("reaped"):
+            problems.append("a census refusal did not bound and reap its sentinel")
+
+    # A process that exited during the census is tolerated: it positively held
+    # nothing open.
+    def exited(pid, cap=CENSUS_DESCRIPTOR_CAP):
+        if pid == 5000:
+            raise OSError(errno.ESRCH, "No such process")
+        return [0, 1, 2]
+
+    record, error, _spawned, _reaped = run(healthy, exited)
+    if record is None:
+        problems.append(f"an exited process was not tolerated: {error and error.detail}")
+    elif record["checks"][1]["exited"] != 1:
+        problems.append("the census did not count the exited process")
+
+    # A bound hit is infrastructure, not a partial pass.
+    def many_rows(*_rows):
+        return [
+            (pid, own_uid, "worker") for pid in range(10, 10 + CENSUS_PROCESS_CAP + 2)
+        ]
+
+    record, error, _spawned, reaped = run(many_rows, listable)
+    if record is not None or error.check != "same_uid_census":
+        problems.append("a census that hit the process cap was not refused")
+    elif "process cap" not in error.detail:
+        problems.append(f"the bound refusal does not name the bound: {error.detail}")
+
+    # The deadline is a bound too.
+    def census_deadline(pid, uid, sentinel_id, rows, describe):
+        return same_uid_census(
+            pid, uid, sentinel_id, rows=rows, describe=describe,
+            seconds=0.0, clock=lambda: 1.0,
+        )
+
+    record, error, _spawned, reaped = run(healthy, listable, census=census_deadline)
+    if record is not None or error.check != "same_uid_census":
+        problems.append("a census past its deadline was not refused")
+    elif "deadline" not in error.detail:
+        problems.append(f"the deadline refusal does not name the bound: {error.detail}")
+
+    # A host where only this proof and its sentinel are same-uid has no
+    # pre-existing same-uid process to list, so the required observation is
+    # unavailable.
+    record, error, _spawned, _reaped = run(
+        table((own_pid, own_uid, "python3"), (sentinel_pid, own_uid, "python3")), listable
+    )
+    if record is not None or error.check != "same_uid_census":
+        problems.append("a host with no pre-existing same-uid process was not refused")
+    elif "no pre-existing" not in error.detail:
+        problems.append(f"the empty census refusal does not say why: {error.detail}")
+
+    # The sentinel's own probe still refuses an unusable listing.
+    def sentinel_without_table(pid, cap=CENSUS_DESCRIPTOR_CAP):
+        return [0, 2] if pid == sentinel_pid else [0, 1, 2]
+
+    record, error, _spawned, _reaped = run(healthy, sentinel_without_table)
+    if record is not None or error.check != "sentinel_descriptors":
+        problems.append("a sentinel listing without its own stdout pipe was not refused")
+
+    # The kinfo read proves itself before any entry is trusted.
     def raw_table(rows):
         raw = bytearray()
-        for pid, uid in rows:
+        for pid, uid, command in rows:
             entry = bytearray(KINFO_PROC_SIZE)
             entry[KINFO_PID_OFFSET:KINFO_PID_OFFSET + 4] = pid.to_bytes(4, sys.byteorder)
             entry[KINFO_UID_OFFSET:KINFO_UID_OFFSET + 4] = uid.to_bytes(4, sys.byteorder)
+            encoded = command.encode()[:KINFO_COMMAND_BYTES - 1]
+            entry[KINFO_COMMAND_OFFSET:KINFO_COMMAND_OFFSET + len(encoded)] = encoded
             raw.extend(entry)
         return bytes(raw)
 
-    if verified_entries(raw_table([(10, 501), (11, 0)]), 10, 501) != {10: 501, 11: 0}:
-        problems.append("the kinfo table does not parse the pid and uid it was built with")
-    bad_tables = [
-        [(10, 502), (11, 0)],  # this pid, another uid
-        [(11, 0)],             # this pid absent
-    ]
-    for rows in bad_tables:
+    parsed = verified_rows(raw_table([(10, 501, "login"), (11, 0, "launchd")]), 10, 501)
+    if parsed[0] != (10, 501, "login") or parsed[1] != (11, 0, "launchd"):
+        problems.append("the kinfo table does not parse the pid, uid and command it was built with")
+    for rows in ([(10, 502, "wrong")], [(11, 0, "absent")]):
         try:
-            verified_entries(raw_table(rows), 10, 501)
+            verified_rows(raw_table(rows), 10, 501)
         except OSError:
             pass
         else:
             problems.append("a kinfo table that does not describe this process was trusted")
     try:
-        verified_entries(raw_table([(10, 501)])[:-1], 10, 501)
+        verified_rows(raw_table([(10, 501, "login")])[:-1], 10, 501)
     except OSError:
         pass
     else:
         problems.append("a kinfo table that is not whole entries was parsed")
-
-    # Both checks pass: the same-uid child and a pre-existing same-uid process.
-    record, error, spawned, reaped = run(listable)
-    if record is None:
-        problems.append(
-            f"a host that can list same-uid descriptors was refused: {error.detail}"
-        )
-    else:
-        checks = [check["check"] for check in record["checks"]]
-        if checks != PREFLIGHT_CHECKS:
-            problems.append(f"the positive preflight records {checks}, not {PREFLIGHT_CHECKS}")
-        for check in record["checks"]:
-            if check["status"] != "passed" or 1 not in check["descriptors"]:
-                problems.append(
-                    f"the positive preflight's `{check['check']}` is not a passed listing"
-                )
-        if not record["reap"] or not record["reap"].get("reaped"):
-            problems.append("the positive preflight did not reap its sentinel")
-        second = record["checks"][-1]
-        if second.get("uid") != os.geteuid() or not second.get("uid_source"):
-            problems.append("the pre-existing probe records no verified same-uid fact")
-    if len(spawned) != 1 or len(reaped) != 1:
-        problems.append("the positive preflight did not start and reap exactly one sentinel")
-
-    def unreadable(broken):
-        def describe(pid):
-            if broken == "sentinel" and pid == sentinel_pid:
-                raise OSError(errno.EPERM, "Operation not permitted")
-            if broken == "preexisting" and pid == preexisting_pid:
-                raise OSError(errno.EPERM, "Operation not permitted")
-            return [0, 1, 2]
-        return describe
-
-    # Either listing failing is infrastructure: unqualified, aborted before any
-    # case, and still cleaned up.
-    for broken, expected in (("sentinel", "sentinel_descriptors"),
-                             ("preexisting", "preexisting_descriptors")):
-        record, error, spawned, reaped = run(unreadable(broken))
-        if record is not None:
-            problems.append(f"an unreadable {broken} same-uid process was not refused")
-            continue
-        if error.check != expected:
-            problems.append(f"the {broken} failure is `{error.check}`, not `{expected}`")
-        if not error.detail:
-            problems.append(f"the {broken} refusal names no reason")
-        if not error.record.get("failed", {}).get("check"):
-            problems.append(f"the {broken} refusal kept no failed-check record")
-        if len(spawned) != 1 or len(reaped) != 1 or not reaped[0][1].get("reaped"):
-            problems.append(f"the {broken} refusal did not bound and reap its sentinel")
-
-    # A listing that answers but is not the sentinel's own table (no stdout
-    # pipe) is a refusal, not a pass: `proc_pidinfo` answers zero bytes with no
-    # error for a process with no descriptors, and that must not be evidence.
-    def sentinel_without_table(pid):
-        return [0, 2] if pid == sentinel_pid else [0, 1, 2]
-
-    record, error, spawned, reaped = run(sentinel_without_table)
-    if record is not None or error.check != "sentinel_descriptors":
-        problems.append("a sentinel listing without its own stdout pipe was not refused")
-
-    def empty_preexisting(pid):
-        return [0, 1, 2] if pid == sentinel_pid else []
-
-    record, error, spawned, reaped = run(empty_preexisting)
-    if record is not None or error.check != "preexisting_descriptors":
-        problems.append("an empty pre-existing listing was not refused")
-
-    # A host with no other process of this effective uid cannot run the second
-    # required observation, so it is infrastructure, not a pass.
-    def no_other_same_uid(exclude):
-        raise OSError("the kernel table names no other process of this effective uid")
-
-    record, error, spawned, reaped = run(listable, preexisting=no_other_same_uid)
-    if record is not None or error.check != "preexisting_descriptors":
-        problems.append("a host with no pre-existing same-uid process was not refused")
+    if KINFO_PROC_SIZE != 648:
+        problems.append("the kinfo entry size changed")
+    for offset, size in ((KINFO_PID_OFFSET, 4), (KINFO_UID_OFFSET, 4),
+                         (KINFO_COMMAND_OFFSET, KINFO_COMMAND_BYTES)):
+        if not 0 < offset <= KINFO_PROC_SIZE - size:
+            problems.append(f"the kinfo offset {offset} is outside the entry")
 
     # A sentinel that left the shared supervisor's session is refused and reaped.
-    record, error, spawned, reaped = run(
-        listable, spawn=lambda: FakeSentinel(session_id=session + 1)
+    record, error, _spawned, reaped = run(
+        healthy, listable, spawn=lambda: FakeSentinel(session_id=session + 1)
     )
     if record is not None or error.check != "sentinel_session":
         problems.append("a sentinel outside the shared supervisor's session was not refused")
     elif len(reaped) != 1 or not reaped[0][1].get("reaped"):
         problems.append("the escaped sentinel was not reaped")
 
-    # A child that never becomes ready is a launch failure, so the preflight
-    # refuses instead of listing something else.
+    # A child that never becomes ready is a launch failure.
     def never_ready():
         raise OSError("the sentinel child did not report ready within 5s")
 
-    record, error, spawned, reaped = run(listable, spawn=never_ready)
+    record, error, _spawned, _reaped = run(healthy, listable, spawn=never_ready)
     if record is not None or error.check != "sentinel_launch":
         problems.append("a sentinel that never became ready was not a launch refusal")
 
-    # A sentinel that outlives its reap bound is infrastructure too: a refused
-    # preflight must not leave a child behind.
+    # A sentinel that outlives its reap bound is infrastructure too.
     def unreapable(sentinel):
         return {"reaped": False, "signal": "SIGKILL", "ms": SENTINEL_REAP_S * 1000}
 
-    record, error, spawned, reaped = run(listable, reap=unreapable)
+    record, error, _spawned, _reaped = run(healthy, listable, reap=unreapable)
     if record is not None or error.check != "sentinel_reap":
         problems.append("an unreaped sentinel was not refused as infrastructure")
 
     # An infrastructure receipt: unqualified, no case rows, mode preserved.
     proof = Proof("/nonexistent/barge", None, False)
-    proof.infrastructure = {"check": "sentinel_descriptors", "detail": "Operation not permitted"}
+    proof.infrastructure = {"check": "same_uid_census", "detail": "Operation not permitted"}
     proof.preflight = {"checks": [], "failed": dict(proof.infrastructure)}
     receipt = proof.receipt()
     if receipt["classification"] != "infrastructure" or receipt["qualified"]:
@@ -1472,9 +1819,53 @@ def preflight_problems():
         problems.append("the sentinel's reap bound is not short")
     if "PROC_PIDLISTFDS" not in inspect.getsource(list_descriptors):
         problems.append("the preflight no longer lists descriptors with PROC_PIDLISTFDS")
-    if PREFLIGHT_CHECKS != ["sentinel_descriptors", "preexisting_descriptors"]:
+    if PREFLIGHT_CHECKS != ["sentinel_descriptors", "same_uid_census"]:
         problems.append("the preflight check names changed")
+    if CENSUS_PROCESS_CAP > 65536 or CENSUS_DESCRIPTOR_CAP > 65536:
+        problems.append("the census bounds are not bounded")
+    if not 0 < CENSUS_SECONDS <= 60:
+        problems.append("the census deadline is not short")
+
+    # Premise 2: the proof reads the real state before and after, and asserts the
+    # resolver's fixture identity rather than declaring it.
+    setup_source = inspect.getsource(Proof.setup)
+    if "real_state_digest()" not in setup_source:
+        problems.append("setup does not observe the real account state before the run")
+    main_source = inspect.getsource(main)
+    if "real_state_digest()" not in main_source or "unchanged" not in main_source:
+        problems.append("main does not observe and compare the real account state after the run")
+    if "the real account state changed during the run" not in main_source:
+        problems.append("a changed real account state does not fail the premise")
+    resolver_source = inspect.getsource(Proof.assert_resolver)
+    for fact in RESOLVER_FACTS:
+        if fact not in resolver_source:
+            problems.append(f"the resolver assertion does not read {fact}")
+    if "environment_override" not in resolver_source:
+        problems.append("the resolver assertion does not require the fixture override")
+    if REAL_STATE_RELATIVE != "Library/Application Support/barge/state":
+        problems.append("the real state root is not the product's own layout")
+
+    # Cleanup: a failed ordinary detach keeps the backing and is never suppressed.
+    cleanup_source = inspect.getsource(Proof.cleanup)
+    if "shutil.rmtree" in cleanup_source.split("return failure")[0]:
+        problems.append("cleanup removes the root before it knows the detach succeeded")
+    detach_source = inspect.getsource(Proof.detach)
+    if '"-force"' in detach_source:
+        problems.append("the ordinary detach force-detaches by mount path")
+    main_source_cleanup = inspect.getsource(main)
+    if "proof.cleanup()" not in main_source_cleanup:
+        problems.append("main no longer collects the cleanup failure")
+    if "cancelled = proof.cleanup()" not in main_source_cleanup:
+        problems.append("main does not take the cleanup failure as the run's status")
+    if "the proof cleanup raised" not in main_source_cleanup:
+        problems.append("main does not record a cleanup that raised")
+    pull_source = inspect.getsource(Proof.pull)
+    if 'f"/dev/{self.whole_disk}"' not in pull_source:
+        problems.append("the pull is not the owned image's own whole-disk force")
+    if '["hdiutil", "detach", self.mount]' not in pull_source:
+        problems.append("the pull does not attempt the ordinary detach first")
     return problems
+
 
 
 def self_check():
@@ -1607,7 +1998,18 @@ def main(argv):
                     "lifetime_s": SENTINEL_LIFETIME_S,
                     "reap_s": SENTINEL_REAP_S,
                 },
+                "census": {
+                    "process_cap": CENSUS_PROCESS_CAP,
+                    "descriptor_cap": CENSUS_DESCRIPTOR_CAP,
+                    "seconds": CENSUS_SECONDS,
+                },
                 "infrastructure_exit": EXIT_INFRASTRUCTURE,
+            },
+            "premise_2": {
+                "real_state": REAL_STATE_RELATIVE,
+                "entries": REAL_STATE_ENTRIES,
+                "bytes": REAL_STATE_BYTES,
+                "resolver_facts": RESOLVER_FACTS,
             },
             "supervisor_sha256": SUPERVISOR_SHA256,
             "problems": problems,
@@ -1631,12 +2033,14 @@ def main(argv):
         receipt_path = os.path.join(receipt_path, "scratch-expiry-receipt.json")
     proof = Proof(binary, receipt_path, options.diagnostic)
     cancelled = None
+    premise_failure = None
     try:
         # Before any case, and before the image: prove this host lets the account
         # read a same-uid process. An unobservable host is `infrastructure`, and
         # no case runs, so a capability limitation is never a case result.
         proof.preflight = preflight()
         proof.setup()
+        proof.assert_resolver()
         proof.run_cases()
     except Infrastructure as error:
         proof.preflight = error.record
@@ -1652,11 +2056,33 @@ def main(argv):
                               "trace": traceback.format_exc()[-800:]})
         proof.fault = "setup"
     finally:
+        # A cleanup failure is never suppressed: it keeps the image's backing and
+        # makes the receipt unqualified, so a fixture that could not be cleaned up
+        # can never look like a cleanup that succeeded.
         try:
-            proof.cleanup()
-        except Exception:
-            cancelled = None
+            cancelled = proof.cleanup()
+        except Exception as error:
+            cancelled = f"the proof cleanup raised: {type(error).__name__}: {error}"
+    # Premise 2's after-observation, and its assertion: the real account state is
+    # exactly what it was, and the resolver's fixture identity was already proved.
+    if proof.real_state is not None:
+        proof.real_state["after"] = real_state_digest()
+        proof.real_state["unchanged"] = (
+            proof.real_state["after"] == proof.real_state["before"]
+        )
+        if not proof.real_state["unchanged"]:
+            premise_failure = (
+                "the real account state changed during the run: "
+                f"{proof.real_state['before']} -> {proof.real_state['after']}"
+            )
+    else:
+        premise_failure = "the real account state was never observed before the run"
+    if proof.resolver is None:
+        premise_failure = (premise_failure or "") + (
+            " the state resolver's fixture identity was never asserted"
+        )
     receipt = proof.receipt(cancelled)
+    receipt["premise_failure"] = premise_failure.strip() if premise_failure else None
     receipt["receipt_path"] = proof.receipt_path
     proof.write_receipt(receipt)
     print(json.dumps({
@@ -1665,6 +2091,10 @@ def main(argv):
         "classification": receipt["classification"],
         "infrastructure": receipt["infrastructure"],
         "preflight": receipt["preflight"],
+        "real_state": receipt["real_state"],
+        "resolver": receipt["resolver"],
+        "premise_failure": receipt["premise_failure"],
+        "cancelled": receipt["cancelled"],
         "diagnostic": receipt["diagnostic"],
         "receipt_path": receipt["receipt_path"],
         "cases": receipt["cases"],

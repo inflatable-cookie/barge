@@ -16,9 +16,10 @@ never lands outside the guard's own root.
 The owner activates each run separately: one uncounted `--diagnostic` pass, then
 the counted pass at the exact head. A counted pass with a missing receipt is a
 missing proof. The case script's own preflight runs first, inside this
-supervisor: a host that cannot list the descriptors of a same-uid child and of a
-pre-existing same-uid process classifies itself `infrastructure` and aborts
-unqualified (exit 4) before any case.
+supervisor: a host that cannot list the descriptors of its own same-uid sentinel
+and of every process the kernel table reports as this account's classifies itself
+`infrastructure` and aborts unqualified (exit 4) before any case, naming the pid
+and command it could not read.
 """
 
 import argparse

@@ -2215,6 +2215,60 @@ Choices S4 made where this design left the mechanic to the slice:
   Identity, session and supervisor-pin checks stay, as supplemental checks. No
   product rule, path exception or case oracle changes; an unreadable
   same-effective-uid descriptor is still `Unknown` and still refuses.
+- **Grants are re-verified in the deletion's window.** The plan's assessment
+  reads the grants, but the authority that matters is read again inside S5's
+  locked deletion: `delete_unit_on_volume` takes the volume lock, re-reads the
+  registry record, and runs the caller's own authorization check on it before
+  custody or the intent. A delegation withdrawn or a claim revoked before that
+  point refuses the unit with `refused_boundary` and no effect; a change attempted
+  after it waits for the window. Grant writes therefore take the registry lock
+  and then the volume lock, in the documented order, and re-read and modify the
+  document under both: a concurrent writer's declaration is merged rather than
+  discarded, and a stale document can never restore withdrawn authority.
+- **Conclusion facts are validated, not just recorded.** A positive closure is
+  only written for a `closed` outcome, so a retained, unclosed or failed run can
+  never carry the one closure that expires it. The expiry reader applies the same
+  rule to both families: a native conclusion whose `outcome` is not `closed` is
+  never eligible, and an Oxide marker must have a 32-hex `run_id`, `outcome:
+  closed`, and a readable, non-future `created_unix` that is not later than its
+  conclusion — an unusable value is kept, never defaulted to zero.
+- **A quarantined file unit replays.** A claimed ad-hoc entry may be a regular
+  file, and replay no longer opens such a leaf as a directory (`O_DIRECTORY`
+  would fail and leave the intent pending forever). A verified file leaf reaches
+  its own phase handling: `renamed` finishes the unit, `marker_last` removes the
+  leaf and settles.
+- **An unsettled replay is unsettled.** `has_pending` covers both a new pending
+  intent and a replay that stopped short (`replay.pending`), so a real run with
+  an empty candidate plan and an unresolved earlier intent exits `3` instead of
+  reporting success.
+- **The examination budget is charged per entry.** A claimed unit's walk spends
+  one examination for every entry it reads, not one per directory, so a unit
+  holding thousands of files cannot be walked past the plan's own bound; the
+  deadline is checked by the same spend. A project folder whose listing stopped
+  at the name bound sets the plan's `truncated` flag instead of presenting a
+  partial plan as whole.
+- **The native's same-uid census.** The preflight observes every process the
+  kernel table reports as this effective uid — not a sample — with
+  `proc_pidinfo(PROC_PIDLISTFDS)`; a process that exited is tolerated, a foreign
+  uid is never inspected, and one refusal (`EPERM`) or a bound hit makes the run
+  `infrastructure`, unqualified, with the pid, command and count in the receipt.
+- **Premise 2 is an assertion.** The proof digests the real account state
+  (bounded, read-only, no symlink followed) before the run and after it, and a
+  change makes the receipt unqualified; it also asserts `barge describe`'s
+  resolver facts — the fixture state directory, the environment override as its
+  source, and the password-database account home with the fixture `HOME` visible
+  as a mismatch — so "the account home used for state resolution is the
+  fixture's" is observed rather than declared.
+- **A failed ordinary detach keeps the backing.** Cleanup detaches ordinarily and
+  stops there: it never force-detaches by mount path, and a failed detach leaves
+  the image attached and its backing in place and makes the receipt unqualified.
+  The one forced detach stays premise 5's — the owned image's own whole-disk
+  device, used by the pull case after the ordinary detach is refused.
+- **The native's oracles are the design's behaviours.** The allocation case
+  launches both allocations before awaiting either; the pull case attempts the
+  ordinary detach, records the authorized mode that actually detached the image,
+  and checks the quarantine leaf and its recorded device and inode *after*
+  re-attaching, before the replay.
 - **What S4 does not claim.** No real-drive sweep, no reaper or LaunchAgent
   change, no Oxide or Effigy adoption, and no native receipt until the owner
   activates the runs. `scratch:expiry:native` and its `:diagnostic` twin are
@@ -2384,6 +2438,26 @@ the one reading the owner should confirm before implementation starts.
   name; the implementation brief must decide the collision rule for a project
   literally named with eight lowercase characters and no marker: proposed, it is
   a project folder and is never treated as a run root.
+
+  **Implementation note (architect ruling, Oxide Supervisor message 2ff249cb,
+  2026-10-26).** The collision rule is decided by the claim, never by the name,
+  and S4 implements it this way:
+
+  - An explicit recorded `project:<name>` claim is valid for **any** project name
+    the unit vocabulary allows — including an eight-character `underlay` or
+    `figmatic`. There is no known-names list anywhere in the classifier: a name
+    never establishes ownership, and a project claim never depends on one.
+  - Marker precedence is unchanged: an Effigy- or Oxide-marked root inside a
+    claimed project folder is that family's unit and needs the family's own
+    delegation. A project claim covers only unmarked children.
+  - An unmarked eight-character top-level directory with **no** project claim
+    survives and is reported; it is an ad-hoc unit only when a `top_level_adhoc`
+    claim covers it, and only then is the directory itself deletable.
+  - A `project:<name>` claim for an eight-character name and a `top_level_adhoc`
+    claim may not both be recorded: the same directory could be read either way,
+    so the second declaration refuses and the operator withdraws one first. That
+    is why the reaper's replacement stays the design's staged sequence of
+    declarations rather than one switch.
 - **O-006 — Host job identity and schedule.** Proposed: one host job calling
   `barge maintain` with preview-then-real, replacing only the reaper's scratch
   part; Oxide's prune entry stays until stage 4. The plist content, label,
