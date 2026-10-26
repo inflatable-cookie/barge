@@ -8,6 +8,9 @@
 //! and `inspect` mutate nothing. The `area` verbs are slice S3's: `declare`,
 //! `show` and `list` manage declarations, `root create` and `root list` create
 //! and observe owned roots, and `hold` and `release` record cooperative custody.
+//! The `cache` verbs are slice S6's: `adopt` records one package-cache placement
+//! (and writes a tool setting only when the explicit adopt asks for it), `undo`
+//! reverses exactly the recorded form, and `list` reports every placement.
 //! Each mutating verb refuses before any effect when the registry is invalid, the
 //! volume is absent or mismatched, or the volume's durability is undeclared.
 
@@ -21,10 +24,11 @@ use barge::area::{
     ListReport, PrunePolicy, ReleaseReport, ReserveParticipation, RootCreateReport, RootKind,
     RootListReport, RootSpec, ShowReport,
 };
+use barge::cache::{self, AdoptRequest, CacheKind, FormRequest, UndoRequest};
 use barge::contract::{
     self, AREA_DECLARE_SCHEMA, AREA_HOLD_SCHEMA, AREA_LIST_SCHEMA, AREA_RELEASE_SCHEMA,
-    AREA_ROOT_CREATE_SCHEMA, AREA_ROOT_LIST_SCHEMA, AREA_SHOW_SCHEMA, DESCRIBE_SCHEMA,
-    INSPECT_SCHEMA, ROOT_ROWS,
+    AREA_ROOT_CREATE_SCHEMA, AREA_ROOT_LIST_SCHEMA, AREA_SHOW_SCHEMA, CACHE_ADOPT_SCHEMA,
+    CACHE_LIST_SCHEMA, CACHE_UNDO_SCHEMA, DESCRIBE_SCHEMA, INSPECT_SCHEMA, ROOT_ROWS,
 };
 use barge::describe::{
     self, DescribeData, DescribeRequest, InspectData, InspectRequest, StateDirSource,
@@ -33,14 +37,17 @@ use barge::error::{Error, ErrorKind};
 use barge::os::{self, VolumeUuid};
 use barge::state::{self, StatePaths};
 
-const USAGE: &str = "usage: barge <describe|inspect|area> [--json]
+const USAGE: &str = "usage: barge <describe|inspect|area|cache> [--json]
        barge area declare --namespace <ns> --area <name> --folder <folder> [--override <uuid>=<folder>]... --absent <fail:drive|wait|fallback:path> --prune <none|oldest-idle:seconds> --reserve <counts|excluded>
        barge area show --namespace <ns> --area <name>
        barge area list
        barge area root create --namespace <ns> --area <name> --volume <uuid> --kind <area_root|cache_root|scratch_run>
        barge area root list --namespace <ns> --area <name> --volume <uuid>
        barge area hold --root <root-id> --holder <id> --pid <pid> --scope <read|write> --purpose <text>
-       barge area release --root <root-id> --holder <id>";
+       barge area release --root <root-id> --holder <id>
+       barge cache adopt --kind <npm-cache|bun-cache|cargo-registry|cargo-git> --volume <uuid> [--form <setting|held-root|link>] [--write-setting] [--adopt-existing-root] [--plan]
+       barge cache undo (--placement <id> | --kind <kind>) [--plan]
+       barge cache list";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -77,6 +84,10 @@ fn command_name(args: &[String]) -> String {
             Some(verb) => format!("area.{verb}"),
             None => "area".to_owned(),
         },
+        Some("cache") => match words.next() {
+            Some(verb) => format!("cache.{verb}"),
+            None => "cache".to_owned(),
+        },
         Some(other) => other.to_owned(),
         None => "barge".to_owned(),
     }
@@ -88,11 +99,12 @@ enum Report {
     Describe(Box<DescribeData>),
     /// `barge.inspect/1`.
     Inspect(Box<InspectData>),
-    /// One `area` command document, already serialised by its library type.
-    Area(Box<AreaReport>),
+    /// One `area` or `cache` command document, already serialised by its library
+    /// type.
+    Verb(Box<VerbReport>),
 }
 
-struct AreaReport {
+struct VerbReport {
     schema: &'static str,
     command: &'static str,
     data: serde_json::Value,
@@ -104,11 +116,11 @@ impl Report {
         match self {
             Self::Describe(_) => describe::DESCRIBE_COMMAND.to_owned(),
             Self::Inspect(_) => describe::INSPECT_COMMAND.to_owned(),
-            Self::Area(report) => report.command.to_owned(),
+            Self::Verb(report) => report.command.to_owned(),
         }
     }
 
-    fn area<T: serde::Serialize>(
+    fn verb<T: serde::Serialize>(
         schema: &'static str,
         command: &'static str,
         data: &T,
@@ -120,7 +132,7 @@ impl Report {
                 format!("could not encode the {schema} document: {error}"),
             )
         })?;
-        Ok(Self::Area(Box::new(AreaReport {
+        Ok(Self::Verb(Box::new(VerbReport {
             schema,
             command,
             data,
@@ -157,6 +169,7 @@ fn dispatch(args: &[String]) -> Result<Report, Error> {
             inspect().map(Box::new).map(Report::Inspect)
         }
         "area" => area(rest),
+        "cache" => cache(rest),
         other => Err(usage(format!("unknown command: {other}"))),
     }
 }
@@ -174,6 +187,9 @@ fn no_extra_arguments(rest: &[String]) -> Result<(), Error> {
 
 /// The values one command line gives for one option name.
 type Options = BTreeMap<String, Vec<String>>;
+
+/// The options that take no value: their presence is `true`.
+const FLAGS: [&str; 3] = ["plan", "write-setting", "adopt-existing-root"];
 
 /// One command line's positional words and its `--key value` options.
 struct Parsed {
@@ -202,6 +218,11 @@ fn parse(args: &[String]) -> Result<Parsed, Error> {
             let key = argument.trim_start_matches("--").to_owned();
             if key.is_empty() {
                 return Err(usage("an empty option name"));
+            }
+            if FLAGS.contains(&key.as_str()) {
+                options.entry(key).or_default().push("true".to_owned());
+                index += 1;
+                continue;
             }
             let Some(value) = args.get(index + 1) else {
                 return Err(usage(format!("--{key} needs a value")));
@@ -292,7 +313,7 @@ fn area_declare(mut options: Options) -> Result<Report, Error> {
         path.display(),
         document.generation
     );
-    Report::area(
+    Report::verb(
         AREA_DECLARE_SCHEMA,
         "area.declare",
         &DeclareReport {
@@ -321,7 +342,7 @@ fn area_show(mut options: Options) -> Result<Report, Error> {
         "area {}/{}: folder {}, generation {}\n",
         document.namespace, document.area, document.folder, document.generation
     );
-    Report::area(
+    Report::verb(
         AREA_SHOW_SCHEMA,
         "area.show",
         &ShowReport {
@@ -343,7 +364,7 @@ fn area_list(options: Options) -> Result<Report, Error> {
         areas.total,
         if areas.count == 1 { "" } else { "s" }
     );
-    Report::area(AREA_LIST_SCHEMA, "area.list", &ListReport { areas }, human)
+    Report::verb(AREA_LIST_SCHEMA, "area.list", &ListReport { areas }, human)
 }
 
 fn area_root(
@@ -373,7 +394,7 @@ fn area_root(
                 RootSpec { kind },
             )?;
             let human = format!("created root {} at {}\n", root.root_id, root.path.display());
-            Report::area(
+            Report::verb(
                 AREA_ROOT_CREATE_SCHEMA,
                 "area.root.create",
                 &RootCreateReport {
@@ -413,7 +434,7 @@ fn area_root(
                 if listing.roots.len() == 1 { "" } else { "s" },
                 volume.resolved.path.display()
             );
-            Report::area(
+            Report::verb(
                 AREA_ROOT_LIST_SCHEMA,
                 "area.root.list",
                 &RootListReport {
@@ -477,7 +498,7 @@ fn area_hold(mut options: Options) -> Result<Report, Error> {
         "held root {} as {}\n",
         held.record.root_id, held.record.holder
     );
-    Report::area(
+    Report::verb(
         AREA_HOLD_SCHEMA,
         "area.hold",
         &HoldReport {
@@ -504,7 +525,7 @@ fn area_release(mut options: Options) -> Result<Report, Error> {
     } else {
         format!("{holder} held nothing on root {root_id}\n")
     };
-    Report::area(
+    Report::verb(
         AREA_RELEASE_SCHEMA,
         "area.release",
         &ReleaseReport {
@@ -586,6 +607,146 @@ fn parse_kind(raw: &str) -> Result<RootKind, Error> {
     }
 }
 
+/// Run one `cache` verb.
+fn cache(args: &[String]) -> Result<Report, Error> {
+    let Parsed { words, options } = parse(args)?;
+    match words.first().map(String::as_str) {
+        Some("adopt") if words.len() == 1 => cache_adopt(options),
+        Some("undo") if words.len() == 1 => cache_undo(options),
+        Some("list") if words.len() == 1 => cache_list(options),
+        _ => Err(usage(format!("unknown cache verb: {}", words.join(" ")))),
+    }
+}
+
+fn cache_adopt(mut options: Options) -> Result<Report, Error> {
+    let kind = CacheKind::parse(&required(&mut options, "kind")?).map_err(with_usage)?;
+    let volume = VolumeUuid::parse(&required(&mut options, "volume")?).map_err(with_usage)?;
+    let form = match options.remove("form") {
+        Some(values) if values.len() > 1 => return Err(usage("--form was given more than once")),
+        Some(mut values) => Some(FormRequest::parse(&values.remove(0)).map_err(with_usage)?),
+        None => None,
+    };
+    let write_setting = flag(&mut options, "write-setting")?;
+    let adopt_existing_root = flag(&mut options, "adopt-existing-root")?;
+    let plan = flag(&mut options, "plan")?;
+    refuse_unknown(options)?;
+    let state = state_paths()?;
+    let platform = os::platform();
+    let request = AdoptRequest {
+        kind,
+        volume_uuid: &volume,
+        form,
+        write_setting,
+        adopt_existing_root,
+        plan,
+    };
+    let report = cache::adopt(
+        &state, &platform, &platform, &platform, &platform, &platform, &request,
+    )?;
+    let human = if report.plan {
+        format!(
+            "plan for {} on volume {volume}: {} change(s), nothing was written\n{}\n",
+            kind.as_str(),
+            report.changes.len(),
+            report.changes.join("\n")
+        )
+    } else {
+        let id = report
+            .placement
+            .as_ref()
+            .map_or_else(String::new, |placement| placement.placement_id.clone());
+        format!(
+            "adopted {} as placement {id} on volume {volume}\n{}\n",
+            kind.as_str(),
+            report.changes.join("\n")
+        )
+    };
+    Report::verb(CACHE_ADOPT_SCHEMA, "cache.adopt", &report, human)
+}
+
+fn cache_undo(mut options: Options) -> Result<Report, Error> {
+    let placement_id = options
+        .remove("placement")
+        .map(|mut values| values.remove(0));
+    let kind = match options.remove("kind") {
+        Some(values) if values.len() > 1 => return Err(usage("--kind was given more than once")),
+        Some(mut values) => Some(CacheKind::parse(&values.remove(0)).map_err(with_usage)?),
+        None => None,
+    };
+    if placement_id.is_some() == kind.is_some() {
+        return Err(usage(
+            "cache undo takes exactly one of --placement or --kind",
+        ));
+    }
+    let plan = flag(&mut options, "plan")?;
+    refuse_unknown(options)?;
+    let state = state_paths()?;
+    let platform = os::platform();
+    let report = cache::undo(
+        &state,
+        &platform,
+        &platform,
+        &platform,
+        &platform,
+        &UndoRequest {
+            placement_id: placement_id.as_deref(),
+            kind,
+            plan,
+        },
+    )?;
+    let human = if report.plan {
+        format!(
+            "plan to undo placement {}: {} change(s), nothing was written\n{}\n",
+            report.placement_id,
+            report.changes.len(),
+            report.changes.join("\n")
+        )
+    } else {
+        format!(
+            "undid placement {}\n{}\n",
+            report.placement_id,
+            report.changes.join("\n")
+        )
+    };
+    Report::verb(CACHE_UNDO_SCHEMA, "cache.undo", &report, human)
+}
+
+fn cache_list(options: Options) -> Result<Report, Error> {
+    refuse_unknown(options)?;
+    let state = state_paths()?;
+    let platform = os::platform();
+    let report = cache::list(&state, &platform, &platform, &platform, &platform)?;
+    let human = format!(
+        "{} of {} placement{}\n",
+        report.placements.count,
+        report.placements.total,
+        if report.placements.count == 1 {
+            ""
+        } else {
+            "s"
+        }
+    );
+    Report::verb(CACHE_LIST_SCHEMA, "cache.list", &report, human)
+}
+
+/// Give a usage refusal the command's usage text, so every usage error names it.
+fn with_usage(error: Error) -> Error {
+    if error.kind() == ErrorKind::Usage && !error.detail().contains_key("usage") {
+        return error.with_detail("usage", USAGE.into());
+    }
+    error
+}
+
+/// Read one boolean flag: present is true, absent is false, and a repeated flag
+/// is a usage refusal rather than a guess.
+fn flag(options: &mut Options, key: &str) -> Result<bool, Error> {
+    match options.remove(key) {
+        None => Ok(false),
+        Some(values) if values.len() == 1 => Ok(values[0] == "true"),
+        Some(_) => Err(usage(format!("--{key} was given more than once"))),
+    }
+}
+
 /// Read the describe document's data through the platform's OS layer.
 fn describe() -> Result<DescribeData, Error> {
     let platform = os::platform();
@@ -643,7 +804,7 @@ fn emit(report: &Report, json: bool) -> Result<(), Error> {
                 write_stdout(inspect_summary(data).as_bytes())
             }
         }
-        Report::Area(data) => {
+        Report::Verb(data) => {
             if json {
                 let bytes = contract::success_bytes(data.schema, data.command, &data.data)?;
                 write_stdout(&bytes)

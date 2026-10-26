@@ -287,6 +287,11 @@ pub struct EntryFacts {
     pub st_mode: u32,
     /// The size in bytes; a marker is refused over its cap before it is read.
     pub size: u64,
+    /// The bytes allocated to the entry itself. For a directory this is the
+    /// directory's own allocation, not the tree's: a cache placement's
+    /// pre-adoption observation records exactly this fact and claims nothing
+    /// about its contents.
+    pub allocated_bytes: u64,
     /// The modification time, when the platform reports one.
     pub modified_ms: Option<u64>,
 }
@@ -473,6 +478,20 @@ pub trait DirOps {
     /// replaced is visible as a different device, and the caller stops before it
     /// unlinks anything through it.
     fn recheck_dir(&self, handle: &DirHandle) -> Result<DirId>;
+
+    /// Create one child symbolic link whose text is exactly `target`.
+    ///
+    /// The link is created under `name`; a caller that needs an atomic
+    /// publication creates it under a temporary name in the same directory and
+    /// renames it, so the published path is never briefly absent.
+    fn create_child_symlink(&self, parent: &DirHandle, name: &str, target: &Path) -> Result<()>;
+
+    /// Read one absolute path's symbolic-link text, never following it.
+    ///
+    /// `Ok(None)` is "not there", which is a different fact from an unreadable
+    /// one. A path that exists and is not a symbolic link is an error: a caller
+    /// that asked for a link's text must not be handed a resolved target.
+    fn read_link(&self, path: &Path) -> Result<Option<PathBuf>>;
 
     /// Fresh random bytes from the platform's entropy source, used for a root's
     /// id and nonce.

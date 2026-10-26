@@ -26,6 +26,10 @@ use crate::os::facts::{
     VolumeFacts, VolumeIdentity, VolumeUuid, BLIND_SPOT_RECORDS,
 };
 
+/// The largest symbolic-link text Barge reads, so a link cannot make a record
+/// grow without limit. Cache placement targets are ordinary volume paths.
+const MAX_LINK_BYTES: usize = 4096;
+
 /// The parent every managed volume mounts directly under.
 const VOLUMES_PARENT: &str = "/Volumes";
 
@@ -2282,6 +2286,73 @@ impl DirOps for MacOs {
         })?;
         read_dir_identity(descriptor, Path::new("recheck"))
     }
+
+    fn create_child_symlink(&self, parent: &DirHandle, name: &str, target: &Path) -> Result<()> {
+        let directory = parent_descriptor(parent, name)?;
+        let child = name_cstring(name)?;
+        let text = path_cstring(target)?;
+        // SAFETY: `directory` is open, `child` is one NUL-terminated component
+        // inside it, and `text` is the link's own NUL-terminated text. The call
+        // creates a new directory entry and nothing else.
+        if unsafe { libc::symlinkat(text.as_ptr(), directory, child.as_ptr()) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        Err(Error::new(
+            ErrorKind::Io,
+            format!("cannot create the link `{name}`: {error}"),
+        )
+        .with_detail("name", name.into())
+        .with_detail("target", target.display().to_string().into())
+        .with_detail("os_error", error.to_string().into()))
+    }
+
+    fn read_link(&self, path: &Path) -> Result<Option<PathBuf>> {
+        let raw = path_cstring(path)?;
+        let mut buffer = vec![0u8; MAX_LINK_BYTES];
+        // SAFETY: `raw` is a NUL-terminated path and `buffer` is writable memory
+        // of the length passed, so `readlink` writes only inside it.
+        let written = unsafe {
+            libc::readlink(
+                raw.as_ptr(),
+                buffer.as_mut_ptr().cast::<libc::c_char>(),
+                buffer.len(),
+            )
+        };
+        if written < 0 {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT) => Ok(None),
+                Some(libc::EINVAL) => Err(Error::new(
+                    ErrorKind::UnknownState,
+                    format!("{} is not a symbolic link", path.display()),
+                )
+                .with_detail("path", path.display().to_string().into())),
+                _ => Err(Error::new(
+                    ErrorKind::Io,
+                    format!("cannot read the link {}: {error}", path.display()),
+                )
+                .with_detail("path", path.display().to_string().into())
+                .with_detail("os_error", error.to_string().into())),
+            };
+        }
+        let length = usize::try_from(written).unwrap_or(0);
+        if length >= buffer.len() {
+            // A link whose text fills the buffer may be truncated, so it is
+            // unknown rather than a shorter target.
+            return Err(Error::new(
+                ErrorKind::ResourceBound,
+                format!(
+                    "the link {} is at least {MAX_LINK_BYTES} bytes, over the link-text cap",
+                    path.display()
+                ),
+            )
+            .with_detail("path", path.display().to_string().into())
+            .with_detail("cap", MAX_LINK_BYTES.into()));
+        }
+        buffer.truncate(length);
+        Ok(Some(PathBuf::from(OsStr::from_bytes(&buffer))))
+    }
 }
 
 /// Open `path` as a directory, never following a symbolic link at the leaf.
@@ -2651,6 +2722,9 @@ fn entry_facts(status: &libc::stat) -> EntryFacts {
         mode: u32::from(status.st_mode) & 0o7777,
         st_mode: u32::from(status.st_mode),
         size: u64::try_from(status.st_size).unwrap_or(0),
+        allocated_bytes: u64::try_from(status.st_blocks)
+            .unwrap_or(0)
+            .saturating_mul(512),
         modified_ms: modified_ms(status),
     }
 }

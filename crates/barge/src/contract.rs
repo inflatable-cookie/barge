@@ -46,6 +46,13 @@ pub const INTENT_CAP_BYTES: usize = 4 * 1024;
 /// The row cap for intents read in one pass. A journal over this is unbounded
 /// work, so a caller reports the bound instead of the unfinished part.
 pub const INTENT_ROWS: usize = 4096;
+/// The largest one placement record. It carries a settings file's exact before
+/// and after bytes as hexadecimal for an undo proof, so it is larger than a
+/// marker and still small and bounded.
+pub const PLACEMENT_CAP_BYTES: usize = 64 * 1024;
+/// The largest tool settings file Barge reads or edits. A file over this is not
+/// edited: an unexpected shape refuses rather than being rewritten.
+pub const SETTING_CAP_BYTES: usize = 8 * 1024;
 
 /// The describe document's schema string.
 pub const DESCRIBE_SCHEMA: &str = "barge.describe/1";
@@ -71,6 +78,12 @@ pub const AREA_ROOT_LIST_SCHEMA: &str = "barge.area.root.list/1";
 pub const AREA_HOLD_SCHEMA: &str = "barge.area.hold/1";
 /// The hold release command document.
 pub const AREA_RELEASE_SCHEMA: &str = "barge.area.release/1";
+/// The cache adopt command document (slice S6).
+pub const CACHE_ADOPT_SCHEMA: &str = "barge.cache.adopt/1";
+/// The cache undo command document.
+pub const CACHE_UNDO_SCHEMA: &str = "barge.cache.undo/1";
+/// The cache list command document.
+pub const CACHE_LIST_SCHEMA: &str = "barge.cache.list/1";
 /// The account volume registry's format (written from slice S2).
 pub const REGISTRY_SCHEMA: &str = "barge.registry/1";
 /// One area declaration's format.

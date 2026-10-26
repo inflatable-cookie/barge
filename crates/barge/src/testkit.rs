@@ -1166,6 +1166,14 @@ impl DirOps for Faults {
         Ok(identity)
     }
 
+    fn create_child_symlink(&self, parent: &DirHandle, name: &str, target: &Path) -> Result<()> {
+        self.inner.create_child_symlink(parent, name, target)
+    }
+
+    fn read_link(&self, path: &Path) -> Result<Option<PathBuf>> {
+        self.inner.read_link(path)
+    }
+
     fn random_bytes(&self, length: usize) -> Result<Vec<u8>> {
         self.inner.random_bytes(length)
     }
