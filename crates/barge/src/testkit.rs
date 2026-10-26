@@ -286,6 +286,17 @@ impl ProcessObserver for FakeObserver {
         Ok(self.processes.get(&pid).copied().flatten())
     }
 
+    fn verify_platform_binary(
+        &self,
+        _classified: crate::os::ProcessIdentity,
+    ) -> Result<crate::os::PlatformStatus> {
+        // The fixture scan reports no opaque descriptor, so this is never asked;
+        // it answers honestly rather than pretending to a platform binary.
+        Ok(crate::os::PlatformStatus::NotVerified {
+            reason: "this observer reports no platform binary".to_owned(),
+        })
+    }
+
     fn scan_open_descriptors(
         &self,
         _request: &DescriptorScanRequest<'_>,
@@ -296,6 +307,7 @@ impl ProcessObserver for FakeObserver {
                 descriptors: 12,
                 foreign: 0,
                 retry: crate::os::RetryEvidence::default(),
+                os_blind_spot: crate::os::BlindSpotEvidence::default(),
                 open: Vec::new(),
             }),
             ScanMode::Open(open) => Ok(DescriptorScan::Complete {
@@ -303,6 +315,7 @@ impl ProcessObserver for FakeObserver {
                 descriptors: 12,
                 foreign: 0,
                 retry: crate::os::RetryEvidence::default(),
+                os_blind_spot: crate::os::BlindSpotEvidence::default(),
                 open: open.clone(),
             }),
             ScanMode::Bounded => Ok(DescriptorScan::Bounded {
