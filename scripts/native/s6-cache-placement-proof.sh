@@ -63,6 +63,11 @@ readonly LIMIT_SECONDS=300
 readonly SCRATCH_BUDGET_MIB=512
 readonly IMAGE_MIB=128
 
+# The per-case preflight's sentinel bound. The sentinel is a child of this run in
+# the shared supervisor's own session; the probe observes it while it is alive,
+# then terminates and reaps it inside this same bound, before the case starts.
+readonly PREFLIGHT_SENTINEL_BOUND_SECONDS=2
+
 readonly MODE="${1:-}"
 
 usage() {
@@ -131,12 +136,26 @@ esac
 BARGE_BIN="$(cd "$(dirname "$BARGE_BIN_INPUT")" && pwd)/$(basename "$BARGE_BIN_INPUT")"
 [[ -x "$BARGE_BIN" ]] || refuse "$BARGE_BIN is not an executable CLI"
 
+# The shared supervisor starts this run as one guarded leader in its own
+# session. That session is captured once and every case's preflight requires it
+# to be unchanged, so a re-parented or re-sessioned run refuses before a case.
+PREFLIGHT_SESSION="$(/bin/ps -o sess= -p $$ | tr -d ' ')"
+[[ -n "$PREFLIGHT_SESSION" ]] || refuse "cannot read this run's session id"
+readonly PREFLIGHT_SESSION
+PREFLIGHT_RUNS=0
+PREFLIGHT_FAILURE=""
+PREFLIGHT_LAST_SENTINEL=""
+PREFLIGHT_LAST_EXISTING=""
+
 STARTED_MS="$(/usr/bin/python3 -c 'import time;print(int(time.time()*1000))')"
 readonly STARTED_MS
 RUN="$(mktemp -d "$TMPDIR/barge-s6-run.XXXXXX")" || refuse "cannot create the run root"
 readonly RUN
 readonly CASES_TSV="$RUN/cases.tsv"
 : >"$CASES_TSV"
+# One bounded row per preflight probe, one preflight per case that runs.
+readonly PREFLIGHT_TSV="$RUN/preflight.tsv"
+: >"$PREFLIGHT_TSV"
 
 # Premise 3: every inherited scratch/spool pointer moves inside the run root.
 export HOME="$RUN/home"
@@ -239,6 +258,11 @@ write_receipt() {
   S6_RECEIPT="$RECEIPT" \
   S6_EVIDENCE="$EVIDENCE" \
   S6_CASES="$CASES_TSV" \
+  S6_PREFLIGHT_TSV="$PREFLIGHT_TSV" \
+  S6_PREFLIGHT_RUNS="$PREFLIGHT_RUNS" \
+  S6_PREFLIGHT_FAILURE="$PREFLIGHT_FAILURE" \
+  S6_PREFLIGHT_SESSION="$PREFLIGHT_SESSION" \
+  S6_PREFLIGHT_BOUND="$PREFLIGHT_SENTINEL_BOUND_SECONDS" \
   S6_CASE_LOGS="$CASE_LOGS" \
   S6_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')" \
   S6_REPO="$REPO_ROOT" \
@@ -370,19 +394,46 @@ premises = [
     {
         "id": 9,
         "premise": "The qualified runner bytes and selector are named and hash-pinned; Barge adds no second supervisor, session or accounting harness.",
-        "trace": ["startup supervisor pin", "effigy selector cache:native / cache:native:diagnostic"],
+        "trace": ["startup supervisor pin", "per-case preflight: sentinel and existing-process descriptor probes", "effigy selector cache:native / cache:native:diagnostic"],
         "evidence": {
             "supervisor": os.environ["S6_SUPERVISOR"],
             "supervisor_sha256": os.environ["S6_SUPERVISOR_SHA"],
             "limit_seconds": int(os.environ["S6_LIMIT"]),
             "scratch_budget_mib": int(os.environ["S6_SCRATCH_MIB"]),
             "second_supervisor": False,
+            "preflight_probes": ["supervisor", "sentinel-descriptors", "existing-descriptors"],
+            "descriptor_primitive": "proc_pidinfo(PROC_PIDLISTFDS) with a proc_pidinfo(PROC_PIDTBSDINFO) same-uid fact",
         },
     },
 ]
 
 real_after = os.environ["S6_REAL_AFTER"]
 unchanged = real_after == os.environ["S6_REAL_BEFORE"]
+
+preflight_failure = os.environ.get("S6_PREFLIGHT_FAILURE") or None
+preflight_observations = []
+preflight_path = os.environ.get("S6_PREFLIGHT_TSV")
+if preflight_path and os.path.exists(preflight_path):
+    with open(preflight_path, encoding="utf-8") as handle:
+        for line in handle:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 3:
+                preflight_observations.append({
+                    "case": parts[0],
+                    "probe": parts[1],
+                    "detail": parts[2][:400],
+                })
+preflight = {
+    "probes": ["supervisor", "sentinel-descriptors", "existing-descriptors"],
+    "primitive": "proc_pidinfo(PROC_PIDLISTFDS) with proc_pidinfo(PROC_PIDTBSDINFO) kinfo facts",
+    "session": os.environ["S6_PREFLIGHT_SESSION"],
+    "sentinel_bound_seconds": int(os.environ["S6_PREFLIGHT_BOUND"]),
+    "runs": int(os.environ["S6_PREFLIGHT_RUNS"]),
+    "status": "infrastructure" if preflight_failure is not None else "passed",
+    "failure": preflight_failure,
+    "aborted": preflight_failure is not None,
+    "observations": preflight_observations,
+}
 
 all_cases = {"absent-path", "empty-directory", "setting-unchanged", "setting-written",
              "diverged-undo", "non-empty-refused", "hand-made-in-place",
@@ -407,6 +458,8 @@ qualified = (
     and skipped == 0
     and not_run == []
     and unchanged
+    and preflight_failure is None
+    and int(os.environ["S6_PREFLIGHT_RUNS"]) == len(cases)
     and int(os.environ["S6_EXIT"]) == 0
 )
 
@@ -433,6 +486,7 @@ receipt = {
         "after": real_after,
         "unchanged": unchanged,
     },
+    "preflight": preflight,
     "premises": premises,
     "cases": cases,
     "summary": summary,
@@ -533,6 +587,300 @@ for part in sys.argv[2].split("."):
 print(value)
 PY
 }
+
+# ---- the harness preflight: the required descriptor probes, before every case
+#
+# The supervisor's own closure says nothing about whether this account can read
+# the descriptor evidence custody depends on. So every case that runs is preceded
+# by two required observations made through the same macOS primitive Barge's
+# observer uses: `proc_pidinfo(PROC_PIDLISTFDS)` for the descriptor listing, and
+# `proc_pidinfo(PROC_PIDTBSDINFO)` for the "kinfo" fact that a process's
+# effective uid is this account's own.
+#
+#  - the sentinel probe starts one sentinel child in this run's session - the
+#    shared supervisor's guarded session - lists its descriptors while it is
+#    alive, then terminates and reaps it inside one fixed bound;
+#  - the existing-process probe lists at least one pre-existing process of this
+#    account (this shell, then its parent), after the same kinfo fact.
+#
+# Either descriptor-listing capability being unavailable is an infrastructure
+# fault: the run is unqualified and aborts before any case body. The probes
+# start no second supervisor, create no second session, and write nothing
+# outside the run root. `crates/barge/tests/native_proof_harness.rs` extracts
+# this block between the two markers and drives the probes against fixture
+# inputs, so both the capability and the abort are proved below the elevated
+# tier.
+# >>> s6-preflight
+session_id() {
+  /bin/ps -o sess= -p $$ | tr -d ' '
+}
+
+descriptor_observation() {
+  # usage: descriptor_observation <kind> <pid> [<identity-path>]
+  #
+  # One same-uid process descriptor listing, through the kernel's own primitive.
+  # On success prints one line to stdout:
+  #   <kind> <uid> <descriptors> <vnodes> <identity-fd> <identity-vnode>
+  # and returns 0; when the kinfo fact, the listing or the identity descriptor is
+  # unavailable it says why on stderr and returns 3.
+  local kind="$1" pid="$2" identity="${3:-}" uid
+  uid="$(/usr/bin/id -u)" || return 3
+  /usr/bin/python3 - "$kind" "$pid" "$identity" "$uid" <<'PY'
+import ctypes, struct, sys
+
+PROC_PIDLISTFDS = 1
+PROC_PIDTBSDINFO = 3
+PROC_FDINFO_SIZE = 8
+PROC_BSDINFO_SIZE = 136
+PROX_FDTYPE_VNODE = 1
+DESCRIPTOR_CAP = 4096
+
+kind, pid_text, identity, uid_text = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+try:
+    pid, uid = int(pid_text), int(uid_text)
+except ValueError:
+    print(f"the process id {pid_text!r} is not a number", file=sys.stderr)
+    raise SystemExit(3)
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.proc_pidinfo.restype = ctypes.c_int
+libc.proc_pidinfo.argtypes = [
+    ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int
+]
+
+def kinfo(pid):
+    # struct proc_bsdinfo: pbi_pid at 12 and pbi_uid (the effective uid) at 20.
+    # Both are read, so a wrong offset cannot pass as a wrong uid.
+    buf = ctypes.create_string_buffer(PROC_BSDINFO_SIZE)
+    ctypes.set_errno(0)
+    written = libc.proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, buf, PROC_BSDINFO_SIZE)
+    error = ctypes.get_errno()
+    if written != PROC_BSDINFO_SIZE:
+        return None, f"the kinfo fact of pid {pid} is unreadable (wrote {written}, errno {error})"
+    reported_pid = struct.unpack_from("<I", buf.raw, 12)[0]
+    reported_uid = struct.unpack_from("<I", buf.raw, 20)[0]
+    if reported_pid != pid:
+        return None, f"the kinfo fact of pid {pid} names pid {reported_pid}"
+    return reported_uid, None
+
+reported_uid, problem = kinfo(pid)
+if problem:
+    print(problem, file=sys.stderr)
+    raise SystemExit(3)
+if reported_uid != uid:
+    print(f"pid {pid} has effective uid {reported_uid}, not this account's {uid}", file=sys.stderr)
+    raise SystemExit(3)
+
+buf = ctypes.create_string_buffer(DESCRIPTOR_CAP * PROC_FDINFO_SIZE)
+ctypes.set_errno(0)
+written = libc.proc_pidinfo(
+    pid, PROC_PIDLISTFDS, 0, buf, DESCRIPTOR_CAP * PROC_FDINFO_SIZE
+)
+error = ctypes.get_errno()
+if written <= 0:
+    print(f"the descriptor listing of pid {pid} is unavailable (wrote {written}, errno {error})",
+          file=sys.stderr)
+    raise SystemExit(3)
+if written >= DESCRIPTOR_CAP * PROC_FDINFO_SIZE:
+    print(f"the descriptor listing of pid {pid} reached its {DESCRIPTOR_CAP}-descriptor bound",
+          file=sys.stderr)
+    raise SystemExit(3)
+rows = []
+for index in range(written // PROC_FDINFO_SIZE):
+    fd, fdtype = struct.unpack_from("<iI", buf.raw, index * PROC_FDINFO_SIZE)
+    rows.append((fd, fdtype))
+vnodes = sum(1 for _, fdtype in rows if fdtype == PROX_FDTYPE_VNODE)
+identity_fd, identity_vnode = 0, 0
+if identity:
+    for fd, fdtype in rows:
+        if fd == 9:
+            identity_fd = 9
+            identity_vnode = 1 if fdtype == PROX_FDTYPE_VNODE else 0
+            break
+print(f"{kind} {reported_uid} {len(rows)} {vnodes} {identity_fd} {identity_vnode}")
+PY
+}
+
+preflight_supervisor() {
+  # Supplemental: the pinned supervisor's bytes are still the pinned bytes, this
+  # run is still in the owned scratch the guard gave it, and it is still in the
+  # session captured at startup. Not a substitute for the two descriptor probes.
+  local supervisor="$1" pinned="$2" expected_session="$3" actual session
+  if [[ ! -f "$supervisor" || ! -r "$supervisor" ]]; then
+    printf 'preflight: the supervisor %s is not a readable regular file\n' "$supervisor" >&2
+    return 1
+  fi
+  actual="$(shasum -a 256 "$supervisor" 2>/dev/null | awk '{print $1}')"
+  if [[ "$actual" != "$pinned" ]]; then
+    printf 'preflight: %s is %s, not the pinned %s\n' \
+      "$supervisor" "${actual:-unreadable}" "$pinned" >&2
+    return 1
+  fi
+  if [[ -z "${OXIDE_TASK_SCRATCH_ROOT:-}" || -z "${TMPDIR:-}" ]]; then
+    printf 'preflight: the guard scratch pointers are unset\n' >&2
+    return 1
+  fi
+  case "$TMPDIR" in
+    "$OXIDE_TASK_SCRATCH_ROOT"*) ;;
+    *)
+      printf 'preflight: TMPDIR %s left the guard scratch %s\n' \
+        "$TMPDIR" "$OXIDE_TASK_SCRATCH_ROOT" >&2
+      return 1
+      ;;
+  esac
+  session="$(session_id)"
+  if [[ -z "$session" || -z "$expected_session" || "$session" != "$expected_session" ]]; then
+    printf 'preflight: session %s is not the guarded session %s\n' \
+      "${session:-unknown}" "${expected_session:-unknown}" >&2
+    return 1
+  fi
+  return 0
+}
+
+preflight_sentinel() {
+  # Required probe one: one sentinel child in this run's session, alive while its
+  # descriptors are listed, then terminated and reaped inside one fixed bound.
+  # The child opens the identity file on fd 9 before exec, so the listing must
+  # report that live vnode descriptor of that live same-uid process.
+  local probe_dir="$1" bound="${2:-$PREFLIGHT_SENTINEL_BOUND_SECONDS}"
+  local steps=$((bound * 10)) waited=0 pid identity expected observation status
+  local problem="" inside_bound=1 recorded_pid recorded_session
+  if ! mkdir -p "$probe_dir"; then
+    printf 'preflight: cannot create the sentinel probe directory %s\n' "$probe_dir" >&2
+    return 1
+  fi
+  identity="$probe_dir/sentinel.identity"
+  rm -f "$identity"
+  expected="$(session_id)"
+  if [[ -z "$expected" ]]; then
+    printf 'preflight: cannot read the session id of this run\n' >&2
+    return 1
+  fi
+  # The sentinel is a plain child of this shell, in the shared supervisor's
+  # guarded session, so the supervisor's census sees it and nothing else does.
+  # It is never detached into a session of its own.
+  /bin/sh -c 'exec 9>"$1"; printf "pid=%s session=%s\n" "$$" "$(/bin/ps -o sess= -p $$ | tr -d " ")" >&9; exec /bin/sleep "$2"' \
+    _ "$identity" 30 &
+  pid=$!
+  while [[ ! -s "$identity" ]] && (( waited < steps )); do
+    /bin/sleep 0.1
+    waited=$((waited + 1))
+  done
+  if [[ ! -s "$identity" ]]; then
+    problem="the sentinel did not record its identity inside its ${bound} s bound"
+  elif ! kill -0 "$pid" 2>/dev/null; then
+    problem="the sentinel exited before its ${bound} s bound"
+  else
+    # The required observation: this live same-uid sentinel's descriptor listing.
+    observation="$(descriptor_observation sentinel "$pid" "$identity")" ||
+      problem="the sentinel's descriptor listing is unavailable: $observation"
+  fi
+  # Terminate and reap inside the same fixed bound. The shell prints its own
+  # "Terminated" job notice for a signalled child on stderr; the probe answers
+  # with an explicit return instead, so that notice is silenced here rather than
+  # leaking into a case log.
+  {
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      while kill -0 "$pid" 2>/dev/null && (( waited < steps )); do
+        /bin/sleep 0.1
+        waited=$((waited + 1))
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        inside_bound=0
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+    fi
+    # Always reap: the probe's own child never outlives it.
+    wait "$pid" 2>/dev/null
+    status=$?
+  } 2>/dev/null
+  if kill -0 "$pid" 2>/dev/null; then
+    printf 'preflight: the sentinel %s was not reaped\n' "$pid" >&2
+    return 1
+  fi
+  if [[ "$inside_bound" != 1 ]]; then
+    printf 'preflight: the sentinel needed KILL after its %s s bound\n' "$bound" >&2
+    return 1
+  fi
+  if [[ -n "$problem" ]]; then
+    printf 'preflight: %s\n' "$problem" >&2
+    return 1
+  fi
+  recorded_pid="$(awk '{print $1}' "$identity" 2>/dev/null)"
+  recorded_session="$(awk '{print $2}' "$identity" 2>/dev/null)"
+  if [[ "$recorded_pid" != "pid=$pid" || "$recorded_session" != "session=$expected" ]]; then
+    printf 'preflight: the sentinel recorded %s %s, not pid %s in session %s\n' \
+      "$recorded_pid" "$recorded_session" "$pid" "$expected" >&2
+    return 1
+  fi
+  local kind_out uid_out descriptors vnodes identity_fd identity_vnode
+  read -r kind_out uid_out descriptors vnodes identity_fd identity_vnode <<<"$observation"
+  if [[ "$kind_out" != sentinel || "$descriptors" -lt 1 || "$identity_fd" != 9 || "$identity_vnode" != 1 ]]; then
+    printf 'preflight: the sentinel descriptor observation was %s\n' "$observation" >&2
+    return 1
+  fi
+  PREFLIGHT_LAST_SENTINEL="$observation"
+  return 0
+}
+
+preflight_existing_descriptors() {
+  # Required probe two: the same primitive on at least one pre-existing process
+  # of this account, whose effective uid the kinfo fact confirms first. This
+  # shell is the first candidate and its parent the second.
+  local candidates pid observation problem=""
+  if [[ "$#" -gt 0 ]]; then
+    candidates=("$@")
+  else
+    candidates=("$$" "${PPID:-}")
+  fi
+  for pid in "${candidates[@]}"; do
+    [[ -n "$pid" ]] || continue
+    if observation="$(descriptor_observation existing "$pid")"; then
+      local kind_out uid_out descriptors
+      read -r kind_out uid_out descriptors _ _ _ <<<"$observation"
+      if [[ "$descriptors" -ge 1 ]]; then
+        PREFLIGHT_LAST_EXISTING="$observation"
+        return 0
+      fi
+      problem="pid $pid listed no descriptors"
+    else
+      problem="pid $pid: $observation"
+    fi
+  done
+  printf 'preflight: no pre-existing same-uid descriptor listing is available: %s\n' \
+    "${problem:-no candidate process}" >&2
+  return 1
+}
+
+preflight() {
+  # Both required descriptor probes before one case, plus the supplemental
+  # supervisor identity check. Either descriptor capability failing is an
+  # infrastructure abort: no case body runs, the receipt is unqualified, and the
+  # run exits 125 rather than reporting a case result.
+  local case_id="$1" probe_dir="$2"
+  if ! preflight_supervisor "$SUPERVISOR" "$SUPERVISOR_SHA256" "$PREFLIGHT_SESSION"; then
+    PREFLIGHT_FAILURE="supervisor probe failed before $case_id"
+    return 1
+  fi
+  if ! preflight_sentinel "$probe_dir" "$PREFLIGHT_SENTINEL_BOUND_SECONDS"; then
+    PREFLIGHT_FAILURE="sentinel descriptor probe failed before $case_id"
+    return 1
+  fi
+  if ! preflight_existing_descriptors; then
+    PREFLIGHT_FAILURE="existing-process descriptor probe failed before $case_id"
+    return 1
+  fi
+  PREFLIGHT_RUNS=$((PREFLIGHT_RUNS + 1))
+  printf '%s\tsupervisor\tsession=%s pinned=%s\n' \
+    "$case_id" "$PREFLIGHT_SESSION" "$SUPERVISOR_SHA256" >>"$PREFLIGHT_TSV"
+  printf '%s\tsentinel-descriptors\t%s\n' \
+    "$case_id" "$PREFLIGHT_LAST_SENTINEL" >>"$PREFLIGHT_TSV"
+  printf '%s\texisting-descriptors\t%s\n' \
+    "$case_id" "$PREFLIGHT_LAST_EXISTING" >>"$PREFLIGHT_TSV"
+  return 0
+}
+# <<< s6-preflight
 
 # ---- the cases --------------------------------------------------------------
 
@@ -722,6 +1070,14 @@ run_case() {
     record "$id" "skipped" "depends on $depends, which did not pass"
     return 0
   fi
+  # The harness preflight precedes every case that runs. A failed probe is an
+  # infrastructure abort, not a product result: stop every remaining case and
+  # let the run's verdict refuse the receipt.
+  if ! preflight "$id" "$dir/preflight"; then
+    record "$id" "skipped" "infrastructure abort: $PREFLIGHT_FAILURE"
+    STOPPED="$id"
+    return 0
+  fi
   export HOME="$dir/home"
   export BARGE_STATE_DIR="$dir/state"
   export BARGE_ACCOUNT_HOME="$dir/home"
@@ -763,8 +1119,13 @@ run_case hand-made-in-place "" case_hand_made_in_place
 run_case plan-effect-free "" case_plan_effect_free
 run_case ordinary-detach absent-path case_ordinary_detach
 
-# The run's own verdict: a counted pass needs every case, safe custody and an
-# untouched real account state; the diagnostic twin never qualifies.
+# The run's own verdict: a counted pass needs every case, a preflight before
+every case, safe custody and an untouched real account state; the diagnostic
+twin never qualifies. A failed preflight is an infrastructure abort: the harness
+is unsound, so nothing the run did counts and the receipt is refused.
+if [[ -n "$PREFLIGHT_FAILURE" ]]; then
+  refuse "preflight infrastructure abort: $PREFLIGHT_FAILURE; no case result counts"
+fi
 if [[ -n "$FIRST_FAULT" ]]; then
   printf 's6: %s: first fault %s; see %s\n' "$MODE" "$FIRST_FAULT" "$RECEIPT" >&2
   exit 1

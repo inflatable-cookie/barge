@@ -49,7 +49,8 @@ A source test (`crates/barge/tests/native_proof_harness.rs`) holds the script to
 this contract: the pinned digest is an exact constant, the supervisor gate is
 `-f`/`-r` and not `-x`, the bytes are executed by `/usr/bin/python3`, the script
 never changes a mode, and a fixture supervisor kept `0644` gets past the mode
-gate only to be refused for its digest.
+gate only to be refused for its digest. The same file runs the per-case
+preflight block described below against fixture inputs.
 
 The receipt records the supervisor's path and the pinned digest it verified, and
 the digest is compared before the supervisor is executed.
@@ -63,6 +64,7 @@ the digest is compared before the supervisor is executed.
 | Owned APFS image | one sparse image, 128 MiB, `hdiutil ... -owners on` |
 | Evidence | `$OXIDE_PROOF_EVIDENCE/s6-cache-placement-receipt.json`, never removed by cleanup |
 | Run root | one `mktemp -d "$TMPDIR/barge-s6-run.XXXXXX"` inside the guard's owned scratch |
+| Preflight sentinel | one child per case in the guarded session, alive for at most 2 s, then terminated and reaped inside the same 2 s |
 | Detach | ordinary; a forced detach is allowed only for this image's own whole-disk device, and a failed detach keeps the backing file |
 
 ## What the run creates
@@ -75,6 +77,8 @@ the digest is compared before the supervisor is executed.
   share a settings file, a registry or a placement record.
 - One fixture `barge.registry/1` per case, in that case's private state
   directory, registering the image at the exact volume UUID the kernel reports.
+- One preflight directory per case under the run root, holding only the sentinel
+  identity file; the preflight probes write nothing else.
 
 Nothing is created, written or deleted outside the run root, the image's own
 mount, and the evidence directory.
@@ -91,7 +95,7 @@ mount, and the evidence directory.
 | 6 | Every flag and environment hook used is listed with its purpose; no debug-only product bypass exists | the receipt's `premises[6].evidence` lists every hook and every product flag; the product flags are `--json`, `--kind`, `--volume`, `--placement`, `--write-setting`, `--adopt-existing-root`, `--plan`, and the product has no debug or force bypass | receipt `flags_and_hooks` |
 | 7 | Temporary storage: everything inside the guard's one owned root; no home folder, no drive root, no fixed `/tmp/<name>` | the run root is `mktemp -d "$TMPDIR/…"`; the image backing, evidence-adjacent metadata, per-case homes and state all live under it; cleanup removes it only after an ordinary detach | run root, all cases, cleanup |
 | 8 | `mktemp -d` under that root for every fixture directory, never a shared name | one `mktemp -d` run root, then `cases/<case-id>/{home,state,out}` created fresh per case under it; no fixed name is used anywhere | run root, `run_case` |
-| 9 | The qualified runner bytes and selector are named and hash-pinned; Barge adds no second supervisor, session or accounting harness | the supervisor path and SHA-256 are constants in the script and in this plan; the script gates it as a readable regular Python file, runs it with `/usr/bin/python3` and refuses different bytes; the receipt records them; the two selectors are the whole entry point | startup supervisor pin, `effigy cache:native`, `effigy cache:native:diagnostic` |
+| 9 | The qualified runner bytes and selector are named and hash-pinned; Barge adds no second supervisor, session or accounting harness | the supervisor path and SHA-256 are constants in the script and in this plan; the script gates it as a readable regular Python file, runs it with `/usr/bin/python3` and refuses different bytes; before every case the preflight re-checks the pin and session, then makes the two required descriptor probes in the same guarded session and aborts the run if either is unavailable; the receipt records them; the two selectors are the whole entry point | startup supervisor pin, per-case preflight (sentinel and existing-process descriptor probes), `effigy cache:native`, `effigy cache:native:diagnostic` |
 
 `BARGE_ACCOUNT_HOME` is the one new environment hook S6 needed for this plan: it
 is the fixture-only sibling of `BARGE_STATE_DIR`, documented in
@@ -127,8 +131,16 @@ The script always writes `$OXIDE_PROOF_EVIDENCE/s6-cache-placement-receipt.json`
 (`barge.s6.native/1`) and prints one compact JSON summary line. It holds:
 
 - `qualified` — true only for a counted run in which all nine cases passed, none
-  was skipped or missing, the real account state's before/after digests match,
-  and the run exited 0; always false for the diagnostic twin;
+  was skipped or missing, the preflight ran before every recorded case with no
+  failure, the real account state's before/after digests match, and the run
+  exited 0; always false for the diagnostic twin;
+- `preflight` — the probe names, the descriptor primitive, the guarded session,
+  the sentinel's 2 s bound, how many preflights ran, the failure (or `null`),
+  `status` (`passed`, or `infrastructure` on an abort), `aborted`, and one
+  bounded observation row per probe per case: the sentinel
+  and existing-process listings print `<kind> <uid> <descriptors> <vnodes>
+  <identity-fd> <identity-vnode>`, and the supervisor row names the session and
+  pin it re-checked;
 - `mode`, `head`, `repo`, `binary`, `supervisor`, `supervisor_sha256`,
   `evidence`, the volume block (name, mount, backing, `size_mib`, `owners: true`),
   the `real_state` block (path, before, after, unchanged), the nine `premises`
@@ -137,18 +149,44 @@ The script always writes `$OXIDE_PROOF_EVIDENCE/s6-cache-placement-receipt.json`
   real_state_unchanged).
 
 A receipt written by a failed run is still a receipt: it reports the first fault
-and the cases it reached. It never counts as a pass.
+and the cases it reached, or the preflight failure that aborted the run before
+its cases. It never counts as a pass.
 
 ## The harness preflight
 
-Before any native case runs, one preflight proves the harness itself: the pinned
-supervisor is executed once with `/usr/bin/python3` around `/usr/bin/true`, with
-the same 300 s and 512 MiB bounds, from a fresh disposable root under
-`/Volumes/Builds/scratch/barge`. Its evidence is the supervisor's closure and
-cleanup record for that root, and only the positively owned empty scratch is
-removed. The preflight runs no image, no proof case and no selector, and it is
-sequenced after the harness correction's review. A preflight that is uncertain
-about custody stops, and it is never retried.
+Every case that runs is preceded by one preflight of **two required descriptor
+probes**, made through the same macOS primitive Barge's own observer uses:
+`proc_pidinfo(PROC_PIDLISTFDS)` for the listing, and
+`proc_pidinfo(PROC_PIDTBSDINFO)` for the *kinfo* fact that a process's effective
+uid is this account's own. A valid supervisor pin and session say nothing about
+whether this account can read descriptor evidence at all, so they are not
+substitutes: they are only a supplemental check.
+
+- **The sentinel probe** starts one sentinel child in this run's session — the
+  shared supervisor's guarded session — as a plain child with no `setsid`, no
+  `nohup` and no `disown`, so the supervisor's census still sees it. The child
+  records its pid and session on an identity descriptor it keeps open, then
+  execs a long sleep. While it is alive the probe reads its kinfo fact and lists
+  its descriptors, requiring the live identity vnode on the recorded descriptor;
+  then it terminates the child inside the same fixed 2 s bound, with a KILL only
+  as an already-failed fallback, and reaps it with `wait`. The probe fails if the
+  sentinel exited before its bound, if the listing is unavailable or does not
+  show the live identity descriptor, if it ran in a different session, or if it
+  survived the reap.
+- **The existing-process probe** makes the same two calls on at least one
+  pre-existing process of this account — this shell first, then its parent —
+  after confirming the kinfo fact. A process whose effective uid is not this
+  account's is skipped, never inspected.
+
+When either descriptor-listing capability is unavailable, or either probe
+otherwise fails, the run **records INFRASTRUCTURE, stays unqualified, and aborts
+before any case body**: the case is recorded `skipped` with the probe named,
+every remaining case is stopped in both modes, the receipt carries
+`preflight.aborted: true` and the failure, and the run exits 125. A case is never
+reported as a product failure when the harness itself is unsound, and a preflight
+is never retried. The probes start no second supervisor, create no second
+session, and write only inside the run root; the source test runs both their
+success paths and their abort paths below the elevated tier.
 
 ## Diagnostic history
 
@@ -174,6 +212,15 @@ It found three things, all since closed:
 
 The failed receipt is history, not a proof: a fresh diagnostic is required at the
 new head, then the counted author and independent reviewer natives.
+
+A later source review at `0e7926d` found the harness preflight was still only a
+plan and that its proposed form could not establish the descriptor capability the
+custody decisions depend on. The apparatus correction replaces it with the
+two-probe, per-case preflight above: the sentinel descriptor listing and an
+existing-process listing, both through
+`proc_pidinfo(PROC_PIDLISTFDS)`/`proc_pidinfo(PROC_PIDTBSDINFO)`, both required
+before every case, with an infrastructure abort when either fails. It changes no
+selector, bound, case or product code, and no receipt exists yet at the new head.
 
 ## Activation order
 
