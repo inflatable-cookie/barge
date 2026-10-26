@@ -21,6 +21,30 @@ registered volume, protected by file locks.
 - **Writer custody.** Before any move, swap or delete, Barge proves that no
   process has the data open. Where it cannot prove that, it keeps the data.
 
+## Locations on a volume (Tom, 2026-10-26)
+
+A drive may have other uses, so where Barge puts things is configurable for
+each registered volume.
+
+- **`root_dir`** is the folder on the volume, relative to its mount, that holds
+  everything Barge owns there. Empty means the drive root. Examples:
+  `root_dir = "barge"` keeps all of Barge's data under `/Volumes/<drive>/barge/`;
+  `root_dir = ""` puts the groups directly at the root.
+- **Feature groups** each get one folder under `root_dir`, using these defaults:
+  `scratch/` (per-project scratch), `caches/` (package caches), `outputs/`
+  (owned build-output roots), `pools/` (build pools such as Oxide's slots) and
+  `kept/` (kept placements such as VMs). Any group's folder can be overridden
+  per volume, still relative to `root_dir`.
+- A path is resolved once, when a placement is adopted, and recorded in that
+  placement. Changing `root_dir` or a group folder later never silently moves
+  existing data; relocating it is an explicit command.
+- Barge never writes outside its resolved folders. A folder name that would
+  escape the volume (absolute, `..`, or a link leaving the mount) is refused.
+- Today's Builds layout (`scratch/`, `caches/`, `oxide-pool/` and
+  `oxide-outputs/` at the drive root) is expressed as `root_dir = ""` with the
+  pool and output groups mapped to Oxide's existing folder names, so adopting
+  Barge moves nothing (Q-004).
+
 ## Volume modes
 
 A volume has two independent properties, and a placement's behaviour follows

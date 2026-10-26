@@ -13,7 +13,10 @@ rebuildable data it may prune, and kept data it only places and never deletes.
   UUID and mount. It declares its availability (permanent: always attached;
   ephemeral: attached on and off) and its durability (expendable data Barge
   may prune and recreate, or kept data it never touches). Placement behaviour
-  follows from both ([architecture](architecture.md#volume-modes)).
+  follows from both ([architecture](architecture.md#volume-modes)). Each
+  volume also sets a `root_dir` (empty means the drive root) and, optionally, a
+  folder for each feature group, so a drive used for other things keeps Barge's
+  data in one place ([locations](architecture.md#locations-on-a-volume-tom-2026-10-26)).
 - **Places data.** A path such as a package cache, a scratch tree or a VM
   folder is relocated onto a registered volume behind an owned link. The
   original path keeps working, and the placement can be undone.
