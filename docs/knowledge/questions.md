@@ -25,6 +25,5 @@ Answer: Barge reads Oxide's existing formats in place; Oxide switches one part a
 
 ## Q-005 — Which platforms are in scope?
 
-Status: open
-macOS on APFS first. Whether Linux (ext4 or btrfs, with no Finder metadata and
-different mount identity) is designed for now or later is undecided.
+Status: answered 2026-10-26
+Answer: macOS on APFS only for now, with an OS layer throughout so Linux can follow later (Tom); see [architecture](architecture.md#platforms).

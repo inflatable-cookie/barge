@@ -101,6 +101,10 @@ kept.
   one part at a time, in the order above. Old formats retire only once both
   sides agree.
 
+## Platforms
+
+macOS on APFS only for now (Tom, 2026-10-26, Q-005). Every platform-specific fact sits behind an OS layer: volume identity and mount, writer custody, Finder metadata, flush and detach. Linux can then be added later without changing the placement model.
+
 ## Invariants
 
 - Nothing is written to a drive root or a home folder as scratch.
