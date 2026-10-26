@@ -43,3 +43,33 @@ alias = "barge"
 # cannot keep the run open.
 run = "oxide test --admission-budget 300s --execution-budget 300s --workspace --all-targets --locked"
 default = false
+
+# Slice S4's scratch expiry and deletion native: the frozen design's one bounded
+# native, run under Oxide's qualified shared supervisor whose bytes this
+# repository hash-pins (`scripts/run-scratch-expiry-native.py`) rather than
+# writing a second supervisor. One owned APFS sparse image of at most 128 MiB
+# attached `-owners on` inside the guard's own scratch, a 300 s wall clock, 512
+# MiB of monitored scratch, ordinary detach with the backing kept, and
+# `--plan` effect-free. The nine cases are exactly the design's list.
+#
+# HELD for owner activation: this declaration activates nothing, and no native
+# receipt exists yet. The owner runs one uncounted diagnostic and then one
+# counted pass, each separately, each at an exact head, with `BARGE_PROOF_BIN`
+# naming the binary under test. A missing receipt is a missing proof.
+[tasks."scratch:expiry:native"]
+admission = "heavy"
+run = "python3 scripts/run-scratch-expiry-native.py"
+
+# The uncounted diagnostic of the same proof: recoverable faults are recorded,
+# the first is latched, only its dependents are skipped, and the receipt says
+# `qualified: false`. It is required before the counted run and is never counted
+# native evidence.
+[tasks."scratch:expiry:native:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/run-scratch-expiry-native.py --diagnostic"
+
+# Pure apparatus regression of the proof itself: the case map, the pinned
+# supervisor digest, the nine-premise record and the environment hook list. No
+# image, no scratch, no child process.
+[tasks."scratch:expiry:test"]
+run = "python3 scripts/test-scratch-expiry.py --self-check"
