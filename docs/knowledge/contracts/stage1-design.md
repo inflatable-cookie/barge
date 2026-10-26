@@ -510,6 +510,12 @@ version, pid alive but start identity unreadable) is *unknown*, and unknown
 blocks deletion. Holds are advice to other cooperative writers plus evidence to
 custody; they are not a kernel lock and this design does not claim they are.
 
+The durable record of a root's identity, and the rule for which of these facts
+may be compared after a remount, are owned by the [stage 4
+design](stage4-design.md#root-identity): the device is a within-run fact there,
+and the marker's absolute path becomes a mount-relative one in `barge.root/2`.
+This design's marker fields and validation are otherwise unchanged.
+
 ### Kept placements
 
 A kept placement is a path the user chose on a kept volume, outside every
@@ -1013,7 +1019,10 @@ Rules that keep this safe:
   added and refuses a document it does not understand rather than guessing.
 - No stage boundary is closed by this design: registration writes, reserve
   pruning, Oxide's area adoption, and the host-job replacement each need their
-  own brief, review and (where they touch a real drive) operator gate.
+  own brief, review and (where they touch a real drive) operator gate. The
+  [stage 4 design](stage4-design.md) carries owned-root identity, the absence
+  proof and the one gate that authorizes pruning a whole owned root; Oxide's
+  roots stay Oxide's to prune until its own adoption slice.
 
 ## Alternatives considered and rejected
 
@@ -1053,8 +1062,10 @@ No slice authorizes a native run, a host change or a data move on its own.
 
 Dependencies that are not slices: a real-drive qualification (later, operator
 gated), Linux (later, additive behind `os`), reserve/floor pruning (later,
-after a qualified space measurement), and the retirement of any foreign format
-(after its owner's adoption).
+after a qualified space measurement, on the gate the [stage 4
+design](stage4-design.md) owns), owned-root identity across remounts and the
+absence proof a prune needs (the [stage 4 design](stage4-design.md)), and the
+retirement of any foreign format (after its owner's adoption).
 
 ### Implementation status
 

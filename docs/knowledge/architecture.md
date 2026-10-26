@@ -175,7 +175,8 @@ macOS on APFS only for now (Tom, 2026-10-26, Q-005). Every platform-specific fac
 - Idleness comes only from Barge's own hold and release, never from a
   consumer's internals. Unknown is never idle.
 - Owned-root identity must survive remounts: volume UUID plus a stable
-  per-root identity, never the raw device number alone.
+  per-root identity, never the raw device number alone
+  ([stage 4 design](contracts/stage4-design.md#root-identity)).
 
 These are designed in stages 3 and 4 (Queue leads a077df77 and 6dd31d9e).
 
