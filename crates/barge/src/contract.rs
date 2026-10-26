@@ -86,6 +86,20 @@ pub const CACHE_UNDO_SCHEMA: &str = "barge.cache.undo/1";
 pub const CACHE_LIST_SCHEMA: &str = "barge.cache.list/1";
 /// The read-only full descriptor census diagnostic document.
 pub const DESCRIPTOR_CENSUS_SCHEMA: &str = "barge.diagnostic.descriptor-census/1";
+/// The scratch command documents (slice S4).
+pub const SCRATCH_ALLOC_SCHEMA: &str = "barge.scratch.alloc/1";
+/// The scratch conclusion command document.
+pub const SCRATCH_CONCLUDE_SCHEMA: &str = "barge.scratch.conclude/1";
+/// The scratch expiry command document.
+pub const SCRATCH_EXPIRE_SCHEMA: &str = "barge.scratch.expire/1";
+/// The scratch grants report command document.
+pub const SCRATCH_GRANTS_SCHEMA: &str = "barge.scratch.grants/1";
+/// The scratch delegation declaration command document.
+pub const SCRATCH_DELEGATE_SCHEMA: &str = "barge.scratch.delegate/1";
+/// The scratch legacy-claim declaration command document.
+pub const SCRATCH_CLAIM_SCHEMA: &str = "barge.scratch.claim/1";
+/// The scratch grant withdrawal command document.
+pub const SCRATCH_REVOKE_SCHEMA: &str = "barge.scratch.revoke/1";
 /// The account volume registry's format (written from slice S2).
 pub const REGISTRY_SCHEMA: &str = "barge.registry/1";
 /// One area declaration's format.

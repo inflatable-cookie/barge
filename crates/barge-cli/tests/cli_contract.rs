@@ -75,7 +75,7 @@ fn stdout_document(output: &Output) -> Value {
 }
 
 /// The usage's first line; the full text names every area verb too.
-const USAGE: &str = "usage: barge <describe|inspect|area|cache|diagnostic> [--json]";
+const USAGE: &str = "usage: barge <describe|inspect|area|cache|diagnostic|scratch> [--json]";
 
 #[test]
 fn descriptor_census_refuses_bad_arguments_and_missing_roots_without_scanning() {
@@ -885,4 +885,142 @@ fn an_unknown_cache_kind_or_form_is_a_usage_refusal() {
             .is_some_and(|usage| usage.contains("barge cache adopt")),
         "the usage names the cache verbs"
     );
+}
+
+// ---- the scratch verbs (slice S4) ----------------------------------------
+
+const VOLUME: &str = "A6AC3ED7-33EA-46B4-8082-7254CF291ED2";
+
+/// Run one `scratch` command with a fixture state directory.
+fn run_scratch(args: &[&str], state_dir: &Path) -> Output {
+    let mut full = vec!["scratch"];
+    full.extend_from_slice(args);
+    full.push("--json");
+    run_in(&full, state_dir)
+}
+
+#[test]
+fn a_scratch_verb_on_an_unregistered_volume_refuses_and_creates_nothing() {
+    let (fixture, state_dir) = absent_state_dir("scratch-unregistered");
+    let output = run_scratch(&["expire", "--volume", VOLUME, "--plan"], &state_dir);
+    assert_eq!(output.status.code(), Some(3), "unknown state exits 3");
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.error/1");
+    assert_eq!(document["error"]["kind"], "unknown_state");
+    assert_eq!(document["command"], "scratch.expire");
+    assert!(!state_dir.exists(), "nothing was created");
+    assert!(!fixture.join("scratch").exists());
+}
+
+#[test]
+fn a_scratch_alloc_on_an_unregistered_volume_refuses_before_any_effect() {
+    let (fixture, state_dir) = absent_state_dir("scratch-alloc-unregistered");
+    let output = run_scratch(
+        &[
+            "alloc",
+            "--volume",
+            VOLUME,
+            "--project",
+            "project-a",
+            "--consumer",
+            "consumer",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "unknown_state");
+    assert!(!state_dir.exists());
+    assert!(!fixture.join("scratch").exists());
+}
+
+#[test]
+fn a_scratch_expire_real_run_needs_the_preview_digest() {
+    let (_fixture, state_dir) = absent_state_dir("scratch-digest");
+    let output = run_scratch(&["expire", "--volume", VOLUME], &state_dir);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a missing digest is a refusal"
+    );
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "usage");
+    assert!(document["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("--plan-sha256")));
+}
+
+#[test]
+fn a_bad_volume_uuid_and_an_unknown_scratch_verb_are_usage_refusals() {
+    let (_fixture, state_dir) = absent_state_dir("scratch-usage");
+    let output = run_scratch(&["expire", "--volume", "not-a-uuid", "--plan"], &state_dir);
+    assert_eq!(output.status.code(), Some(2));
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "usage");
+
+    let output = run_scratch(&["frobnicate"], &state_dir);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+
+    let output = run_scratch(
+        &[
+            "delegate", "--volume", VOLUME, "--family", "banana", "--by", "operator",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+}
+
+#[test]
+fn a_claim_over_the_oxide_project_is_refused_before_the_registry_is_read() {
+    let (_fixture, state_dir) = absent_state_dir("scratch-claim-shape");
+    let output = run_scratch(
+        &[
+            "claim",
+            "--volume",
+            VOLUME,
+            "--scope",
+            "project:oxide",
+            "--unit",
+            "child",
+            "--idle-seconds",
+            "1209600",
+            "--declared-by",
+            "operator",
+        ],
+        &state_dir,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a refused declaration exits 2"
+    );
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "usage");
+    assert_eq!(document["command"], "scratch.claim");
+    assert!(!state_dir.exists(), "a refused declaration creates nothing");
+}
+
+#[test]
+fn a_scratch_conclude_without_its_five_facts_is_a_usage_refusal() {
+    let (_fixture, state_dir) = absent_state_dir("scratch-conclude-usage");
+    let output = run_scratch(
+        &[
+            "conclude",
+            "--volume",
+            VOLUME,
+            "--root",
+            "0123456789abcdef0123456789abcdef",
+            "--holder",
+            "owner",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "usage");
+    assert!(document["error"]["detail"]["usage"]
+        .as_str()
+        .is_some_and(|usage| usage.contains("scratch conclude")));
 }

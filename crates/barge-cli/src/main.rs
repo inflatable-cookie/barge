@@ -29,15 +29,20 @@ use barge::contract::{
     self, AREA_DECLARE_SCHEMA, AREA_HOLD_SCHEMA, AREA_LIST_SCHEMA, AREA_RELEASE_SCHEMA,
     AREA_ROOT_CREATE_SCHEMA, AREA_ROOT_LIST_SCHEMA, AREA_SHOW_SCHEMA, CACHE_ADOPT_SCHEMA,
     CACHE_LIST_SCHEMA, CACHE_UNDO_SCHEMA, DESCRIBE_SCHEMA, INSPECT_SCHEMA, ROOT_ROWS,
+    SCRATCH_ALLOC_SCHEMA, SCRATCH_CLAIM_SCHEMA, SCRATCH_CONCLUDE_SCHEMA, SCRATCH_DELEGATE_SCHEMA,
+    SCRATCH_EXPIRE_SCHEMA, SCRATCH_GRANTS_SCHEMA, SCRATCH_REVOKE_SCHEMA,
 };
 use barge::describe::{
     self, DescribeData, DescribeRequest, InspectData, InspectRequest, StateDirSource,
 };
 use barge::error::{Error, ErrorKind};
 use barge::os::{self, VolumeUuid};
+use barge::scratch::{
+    self, AllocRequest, ConcludeRequest, ExpireReport, SweepBounds, SweepRequest,
+};
 use barge::state::{self, StatePaths};
 
-const USAGE: &str = "usage: barge <describe|inspect|area|cache|diagnostic> [--json]
+const USAGE: &str = "usage: barge <describe|inspect|area|cache|diagnostic|scratch> [--json]
        barge diagnostic descriptor-census --root <existing-directory>
        barge area declare --namespace <ns> --area <name> --folder <folder> [--override <uuid>=<folder>]... --absent <fail:drive|wait|fallback:path> --prune <none|oldest-idle:seconds> --reserve <counts|excluded>
        barge area show --namespace <ns> --area <name>
@@ -48,7 +53,13 @@ const USAGE: &str = "usage: barge <describe|inspect|area|cache|diagnostic> [--js
        barge area release --root <root-id> --holder <id>
        barge cache adopt --kind <npm-cache|bun-cache|cargo-registry|cargo-git> --volume <uuid> [--form <setting|held-root|link>] [--write-setting] [--adopt-existing-root] [--plan]
        barge cache undo (--placement <id> | --kind <kind>) [--plan]
-       barge cache list";
+       barge cache list
+       barge scratch alloc --volume <uuid> --project <name> --consumer <id> [--pid <pid>]
+       barge scratch conclude --volume <uuid> --root <root-id> --holder <id> [--project <name>] --outcome <closed|unclosed|failed|retained> --closure <positive|none> --kept-reason <none|evidence|unclosed|exception|nested-unclosed> --nested-scope <exclusive|hosting>
+       barge scratch expire --volume <uuid> [--plan] [--plan-sha256 <hex>]
+       barge scratch grants --volume <uuid>
+       barge scratch delegate --volume <uuid> --family <oxide_scratch|effigy_scratch> --by <name> [--revoke]
+       barge scratch claim --volume <uuid> --scope <project:name|top-level-adhoc> --unit <child|entry> --idle-seconds <n> [--exclude-family <family>]... --declared-by <name> [--revoke]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -67,7 +78,7 @@ fn main() -> ExitCode {
 
     match dispatch(&args) {
         Ok(report) => match emit(&report, json) {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(()) => ExitCode::from(report.exit()),
             Err(error) => fail(&report.command(), &error, json),
         },
         Err(error) => fail(&command, &error, json),
@@ -80,10 +91,11 @@ fn command_name(args: &[String]) -> String {
         .iter()
         .filter(|argument| !argument.starts_with('-'))
         .take(2);
-    match words.next().map(String::as_str) {
-        Some("area") => match words.next() {
-            Some(verb) => format!("area.{verb}"),
-            None => "area".to_owned(),
+    let first = words.next().map(String::as_str);
+    match first {
+        Some(command @ ("area" | "scratch")) => match words.next() {
+            Some(verb) => format!("{command}.{verb}"),
+            None => command.to_owned(),
         },
         Some("cache") => match words.next() {
             Some(verb) => format!("cache.{verb}"),
@@ -104,6 +116,16 @@ enum Report {
     /// One `area` or `cache` command document, already serialised by its library
     /// type.
     Verb(Box<VerbReport>),
+    /// A scratch command with its outcome exit code.
+    Scratch(Box<ScratchReport>),
+}
+
+struct ScratchReport {
+    schema: &'static str,
+    command: &'static str,
+    data: serde_json::Value,
+    human: String,
+    exit: u8,
 }
 
 struct VerbReport {
@@ -119,7 +141,39 @@ impl Report {
             Self::Describe(_) => describe::DESCRIBE_COMMAND.to_owned(),
             Self::Inspect(_) => describe::INSPECT_COMMAND.to_owned(),
             Self::Verb(report) => report.command.to_owned(),
+            Self::Scratch(report) => report.command.to_owned(),
         }
+    }
+
+    /// The exit code a finished document forces: `3` when a scratch expiry left
+    /// an intent that needs replay, `0` otherwise.
+    fn exit(&self) -> u8 {
+        match self {
+            Self::Scratch(report) => report.exit,
+            _ => 0,
+        }
+    }
+
+    fn scratch<T: serde::Serialize>(
+        schema: &'static str,
+        command: &'static str,
+        data: &T,
+        human: String,
+        exit: u8,
+    ) -> Result<Self, Error> {
+        let data = serde_json::to_value(data).map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("could not encode the {schema} document: {error}"),
+            )
+        })?;
+        Ok(Self::Scratch(Box::new(ScratchReport {
+            schema,
+            command,
+            data,
+            human,
+            exit,
+        })))
     }
 
     fn verb<T: serde::Serialize>(
@@ -173,6 +227,7 @@ fn dispatch(args: &[String]) -> Result<Report, Error> {
         "area" => area(rest),
         "cache" => cache(rest),
         "diagnostic" => descriptor_census(rest),
+        "scratch" => scratch(rest),
         other => Err(usage(format!("unknown command: {other}"))),
     }
 }
@@ -213,8 +268,8 @@ fn no_extra_arguments(rest: &[String]) -> Result<(), Error> {
 /// The values one command line gives for one option name.
 type Options = BTreeMap<String, Vec<String>>;
 
-/// The options that take no value: their presence is `true`.
-const FLAGS: [&str; 3] = ["plan", "write-setting", "adopt-existing-root"];
+/// The options that take no value.
+const FLAGS: [&str; 4] = ["plan", "write-setting", "adopt-existing-root", "revoke"];
 
 /// One command line's positional words and its `--key value` options.
 struct Parsed {
@@ -244,6 +299,7 @@ fn parse(args: &[String]) -> Result<Parsed, Error> {
             if key.is_empty() {
                 return Err(usage("an empty option name"));
             }
+            // A flag carries no value; every other option takes exactly one.
             if FLAGS.contains(&key.as_str()) {
                 options.entry(key).or_default().push("true".to_owned());
                 index += 1;
@@ -563,6 +619,346 @@ fn area_release(mut options: Options) -> Result<Report, Error> {
     )
 }
 
+/// Run one `scratch` verb.
+fn scratch(args: &[String]) -> Result<Report, Error> {
+    let Parsed { words, options } = parse(args)?;
+    match words.first().map(String::as_str) {
+        Some("alloc") if words.len() == 1 => scratch_alloc(options),
+        Some("conclude") if words.len() == 1 => scratch_conclude(options),
+        Some("expire") if words.len() == 1 => scratch_expire(options),
+        Some("grants") if words.len() == 1 => scratch_grants(options),
+        Some("delegate") if words.len() == 1 => scratch_delegate(options),
+        Some("claim") if words.len() == 1 => scratch_claim(options),
+        _ => Err(usage(format!("unknown scratch verb: {}", words.join(" ")))),
+    }
+}
+
+fn volume_arg(raw: &str) -> Result<VolumeUuid, Error> {
+    VolumeUuid::parse(raw).map_err(|error| usage(format!("--volume: {}", error.message())))
+}
+
+fn scratch_alloc(mut options: Options) -> Result<Report, Error> {
+    let volume = volume_arg(&required(&mut options, "volume")?)?;
+    let project = required(&mut options, "project")?;
+    let consumer = required(&mut options, "consumer")?;
+    let pid = match options.remove("pid") {
+        Some(mut values) => {
+            if values.len() > 1 {
+                return Err(usage("--pid was given more than once"));
+            }
+            values
+                .pop()
+                .unwrap_or_default()
+                .parse::<u32>()
+                .map_err(|_| usage("--pid is a process id"))?
+        }
+        None => std::process::id(),
+    };
+    refuse_unknown(options)?;
+    let state = state_paths()?;
+    let platform = os::platform();
+    let report = scratch::alloc(
+        &state,
+        &platform,
+        &platform,
+        &platform,
+        &platform,
+        &AllocRequest {
+            volume_uuid: volume,
+            project,
+            consumer,
+            pid,
+        },
+    )?;
+    let human = format!(
+        "allocated scratch root {} at {} for {}\n",
+        report.root.root_id,
+        report.root.path.display(),
+        report.consumer
+    );
+    Report::scratch(SCRATCH_ALLOC_SCHEMA, "scratch.alloc", &report, human, 0)
+}
+
+fn scratch_conclude(mut options: Options) -> Result<Report, Error> {
+    let volume = volume_arg(&required(&mut options, "volume")?)?;
+    let root = required(&mut options, "root")?;
+    let holder = required(&mut options, "holder")?;
+    let project = options.remove("project").map(|mut values| {
+        if values.len() > 1 {
+            values.pop();
+            values.pop()
+        } else {
+            values.pop()
+        }
+    });
+    let project = match project {
+        Some(Some(value)) => Some(value),
+        Some(None) => return Err(usage("--project was given more than once")),
+        None => None,
+    };
+    let outcome = parse_outcome(&required(&mut options, "outcome")?)?;
+    let closure = match required(&mut options, "closure")?.as_str() {
+        "positive" => barge::area::ConclusionClosure::Positive,
+        "none" => barge::area::ConclusionClosure::None,
+        other => return Err(usage(format!("unknown closure: {other}"))),
+    };
+    let kept_reason = parse_kept_reason(&required(&mut options, "kept-reason")?)?;
+    let nested_scope = match required(&mut options, "nested-scope")?.as_str() {
+        "exclusive" => barge::area::NestedScope::Exclusive,
+        "hosting" => barge::area::NestedScope::Hosting,
+        other => return Err(usage(format!("unknown nested scope: {other}"))),
+    };
+    refuse_unknown(options)?;
+    let state = state_paths()?;
+    let platform = os::platform();
+    let report = scratch::conclude(
+        &state,
+        &platform,
+        &platform,
+        &platform,
+        &platform,
+        &ConcludeRequest {
+            volume_uuid: &volume,
+            root_id: &root,
+            holder: &holder,
+            project: project.as_deref(),
+            outcome,
+            closure,
+            kept_reason,
+            nested_scope,
+        },
+    )?;
+    let human = format!(
+        "concluded scratch root {} at {}\n",
+        report.root_id,
+        report.path.display()
+    );
+    Report::scratch(
+        SCRATCH_CONCLUDE_SCHEMA,
+        "scratch.conclude",
+        &report,
+        human,
+        0,
+    )
+}
+
+fn scratch_expire(mut options: Options) -> Result<Report, Error> {
+    let volume = volume_arg(&required(&mut options, "volume")?)?;
+    let preview = options
+        .remove("plan")
+        .is_some_and(|values| !values.is_empty());
+    let plan_digest = options
+        .remove("plan-sha256")
+        .map(|mut values| values.pop().unwrap_or_default());
+    refuse_unknown(options)?;
+    let state = state_paths()?;
+    let platform = os::platform();
+    let report = scratch::sweep(
+        &state,
+        &platform,
+        &platform,
+        &platform,
+        &platform,
+        &SweepRequest {
+            volume_uuid: &volume,
+            preview,
+            plan_digest: plan_digest.as_deref(),
+            bounds: SweepBounds::default(),
+            delete_bounds: barge::delete::DeleteBounds::default(),
+            now_ms: state::now_ms(),
+        },
+    )?;
+    let human = expire_summary(&report);
+    let exit = if report.has_pending() { 3 } else { 0 };
+    Report::scratch(
+        SCRATCH_EXPIRE_SCHEMA,
+        "scratch.expire",
+        &report,
+        human,
+        exit,
+    )
+}
+
+fn scratch_grants(mut options: Options) -> Result<Report, Error> {
+    let volume = volume_arg(&required(&mut options, "volume")?)?;
+    refuse_unknown(options)?;
+    let state = state_paths()?;
+    let report = scratch::grants(&state, &volume)?;
+    let human = format!(
+        "{} delegation(s), {} claim(s) on {}\n",
+        report.grants.delegations.len(),
+        report.grants.claims.len(),
+        report.volume_uuid
+    );
+    Report::scratch(SCRATCH_GRANTS_SCHEMA, "scratch.grants", &report, human, 0)
+}
+
+fn scratch_delegate(mut options: Options) -> Result<Report, Error> {
+    let volume = volume_arg(&required(&mut options, "volume")?)?;
+    let family = match required(&mut options, "family")?.as_str() {
+        "oxide_scratch" => barge::registry::MarkerFamily::OxideScratch,
+        "effigy_scratch" => barge::registry::MarkerFamily::EffigyScratch,
+        other => return Err(usage(format!("unknown marker family: {other}"))),
+    };
+    let by = required(&mut options, "by")?;
+    let revoke = options
+        .remove("revoke")
+        .is_some_and(|values| !values.is_empty());
+    refuse_unknown(options)?;
+    let state = state_paths()?;
+    let report =
+        scratch::declare_delegation(&state, &volume, family, &by, state::now_ms(), revoke)?;
+    let human = format!(
+        "{} family {:?} on {}\n",
+        if revoke { "withdrew" } else { "recorded" },
+        family,
+        report.volume_uuid
+    );
+    let schema = if revoke {
+        SCRATCH_REVOKE_SCHEMA
+    } else {
+        SCRATCH_DELEGATE_SCHEMA
+    };
+    Report::scratch(
+        schema,
+        if revoke {
+            "scratch.revoke"
+        } else {
+            "scratch.delegate"
+        },
+        &report,
+        human,
+        0,
+    )
+}
+
+fn scratch_claim(mut options: Options) -> Result<Report, Error> {
+    use barge::registry::{ClaimScope, ClaimUnit, MarkerFamily, ScratchClaim};
+    let volume = volume_arg(&required(&mut options, "volume")?)?;
+    let raw_scope = required(&mut options, "scope")?;
+    let scope = match raw_scope.as_str() {
+        "top-level-adhoc" | "top_level_adhoc" => ClaimScope::TopLevelAdhoc,
+        other => match other.strip_prefix("project:") {
+            Some(name) if !name.is_empty() => ClaimScope::Project {
+                name: name.to_owned(),
+            },
+            _ => return Err(usage("--scope takes project:<name> or top-level-adhoc")),
+        },
+    };
+    let unit = match required(&mut options, "unit")?.as_str() {
+        "child" => ClaimUnit::Child,
+        "entry" => ClaimUnit::Entry,
+        other => return Err(usage(format!("unknown claim unit: {other}"))),
+    };
+    let mut families_excluded = Vec::new();
+    for raw in repeated(&mut options, "exclude-family") {
+        families_excluded.push(match raw.as_str() {
+            "oxide_scratch" => MarkerFamily::OxideScratch,
+            "effigy_scratch" => MarkerFamily::EffigyScratch,
+            other => return Err(usage(format!("unknown marker family: {other}"))),
+        });
+    }
+    let revoke = options
+        .remove("revoke")
+        .is_some_and(|values| !values.is_empty());
+    let declared_by = if revoke {
+        options
+            .remove("declared-by")
+            .and_then(|mut values| values.pop())
+            .unwrap_or_else(|| "revoke".to_owned())
+    } else {
+        required(&mut options, "declared-by")?
+    };
+    let idle_seconds = if revoke {
+        options
+            .remove("idle-seconds")
+            .and_then(|mut values| values.pop())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1)
+    } else {
+        required(&mut options, "idle-seconds")?
+            .parse::<u64>()
+            .map_err(|_| usage("--idle-seconds is a number of seconds"))?
+    };
+    refuse_unknown(options)?;
+    let claim = ScratchClaim {
+        scope,
+        unit,
+        unmarked_idle_seconds: idle_seconds,
+        families_excluded,
+        declared_by,
+        declared_ms: state::now_ms(),
+    };
+    let state = state_paths()?;
+    let report = scratch::declare_claim(&state, &volume, &claim, revoke)?;
+    let human = format!(
+        "{} claim on {}\n",
+        if revoke { "withdrew" } else { "recorded" },
+        report.volume_uuid
+    );
+    let schema = if revoke {
+        SCRATCH_REVOKE_SCHEMA
+    } else {
+        SCRATCH_CLAIM_SCHEMA
+    };
+    Report::scratch(
+        schema,
+        if revoke {
+            "scratch.revoke"
+        } else {
+            "scratch.claim"
+        },
+        &report,
+        human,
+        0,
+    )
+}
+
+fn expire_summary(report: &ExpireReport) -> String {
+    let plan = &report.plan;
+    let replay = report.replay.as_ref().map_or_else(String::new, |replay| {
+        format!(
+            "replay: {} settled, {} resumed, {} pending; ",
+            replay.settled,
+            replay.resumed,
+            replay.pending.len()
+        )
+    });
+    format!(
+        "{}scratch plan {}: {} candidate(s), {} kept, {} examined{}, deleted {}, pending {}; {replay}{}\n",
+        if report.preview { "previewed " } else { "" },
+        report.plan_digest,
+        plan.candidates.count,
+        plan.kept.count,
+        plan.examined,
+        if plan.truncated { " (bounded)" } else { "" },
+        report.deleted.count,
+        report.pending.count,
+        if report.volume_present { "volume attached" } else { "volume absent" },
+    )
+}
+
+fn parse_outcome(raw: &str) -> Result<barge::area::ConclusionOutcome, Error> {
+    match raw {
+        "closed" => Ok(barge::area::ConclusionOutcome::Closed),
+        "unclosed" => Ok(barge::area::ConclusionOutcome::Unclosed),
+        "failed" => Ok(barge::area::ConclusionOutcome::Failed),
+        "retained" => Ok(barge::area::ConclusionOutcome::Retained),
+        other => Err(usage(format!("unknown outcome: {other}"))),
+    }
+}
+
+fn parse_kept_reason(raw: &str) -> Result<barge::area::KeptReason, Error> {
+    match raw {
+        "none" => Ok(barge::area::KeptReason::None),
+        "evidence" => Ok(barge::area::KeptReason::Evidence),
+        "unclosed" => Ok(barge::area::KeptReason::Unclosed),
+        "exception" => Ok(barge::area::KeptReason::Exception),
+        "nested-unclosed" => Ok(barge::area::KeptReason::NestedUnclosed),
+        other => Err(usage(format!("unknown kept reason: {other}"))),
+    }
+}
+
 fn require_declaration(
     state: &StatePaths,
     namespace: &str,
@@ -830,6 +1226,14 @@ fn emit(report: &Report, json: bool) -> Result<(), Error> {
             }
         }
         Report::Verb(data) => {
+            if json {
+                let bytes = contract::success_bytes(data.schema, data.command, &data.data)?;
+                write_stdout(&bytes)
+            } else {
+                write_stdout(data.human.as_bytes())
+            }
+        }
+        Report::Scratch(data) => {
             if json {
                 let bytes = contract::success_bytes(data.schema, data.command, &data.data)?;
                 write_stdout(&bytes)

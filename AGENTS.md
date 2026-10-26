@@ -45,6 +45,14 @@ lists the commands. Each covers what it names:
   installed Northstar skill from the effective account (or repository override)
   and passes its explicit path, so a private fixture `HOME` does not hide it;
   missing or ambiguous skill installations still refuse.
+- `effigy scratch:expiry:test` — the scratch native proof's own apparatus
+  self-check: its case map, the hash-pinned supervisor and the premise record.
+  No image, no scratch and no child process.
+- `effigy scratch:expiry:native` and `effigy scratch:expiry:native:diagnostic`
+  — S4's one bounded native under Oxide's qualified shared supervisor. HELD for
+  owner activation: the declarations activate nothing, `BARGE_PROOF_BIN` names
+  the binary, and each run is separately activated (diagnostic first, then the
+  counted pass at the exact head). A missing receipt is a missing proof.
 
 RustQuality strict is active for the Rust source, manifests, tests and their
 documentation: `docs/knowledge/contracts/language-quality-activation.json` opts
