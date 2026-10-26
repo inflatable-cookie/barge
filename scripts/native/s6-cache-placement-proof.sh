@@ -156,6 +156,11 @@ readonly CASES_TSV="$RUN/cases.tsv"
 # One bounded row per preflight probe, one preflight per case that runs.
 readonly PREFLIGHT_TSV="$RUN/preflight.tsv"
 : >"$PREFLIGHT_TSV"
+# One row per (premise, case body, concrete assertion): the design's nine-premise
+# checklist traced through the case bodies, folded into the receipt against the
+# cases that actually ran.
+readonly PREMISE_TRACE_TSV="$RUN/premise-trace.tsv"
+: >"$PREMISE_TRACE_TSV"
 
 # Premise 3: every inherited scratch/spool pointer moves inside the run root.
 export HOME="$RUN/home"
@@ -252,12 +257,14 @@ detach_image() {
 # ---- the receipt ------------------------------------------------------------
 
 write_receipt() {
+  # >>> s6-receipt
   local exit_status="$1"
   S6_MODE="$MODE" \
   S6_EXIT="$exit_status" \
   S6_RECEIPT="$RECEIPT" \
   S6_EVIDENCE="$EVIDENCE" \
   S6_CASES="$CASES_TSV" \
+  S6_PREMISE_TRACE="$PREMISE_TRACE_TSV" \
   S6_PREFLIGHT_TSV="$PREFLIGHT_TSV" \
   S6_PREFLIGHT_RUNS="$PREFLIGHT_RUNS" \
   S6_PREFLIGHT_FAILURE="$PREFLIGHT_FAILURE" \
@@ -296,11 +303,15 @@ if os.path.exists(path):
             parts = line.rstrip("\n").split("\t")
             if len(parts) >= 3:
                 log = os.path.join(os.environ["S6_CASE_LOGS"], parts[0] + ".log")
+                premises = []
+                if len(parts) >= 4:
+                    premises = [int(part) for part in parts[3].split(",") if part.strip().isdigit()]
                 cases.append({
                     "id": parts[0],
                     "status": parts[1],
                     "evidence": parts[2],
                     "log": log if os.path.exists(log) else None,
+                    "premises": premises,
                 })
 
 passed = sum(1 for case in cases if case["status"] == "pass")
@@ -312,7 +323,7 @@ premises = [
     {
         "id": 1,
         "premise": "A private HOME, CARGO_HOME and state directory, so no real account state is read or written.",
-        "trace": ["every case"],
+        "trace": ["guarded startup export", "receipt: home/cargo_home/state/account_home"],
         "evidence": {
             "home": os.environ["S6_HOME"],
             "cargo_home": os.environ["S6_CARGO_HOME"],
@@ -323,18 +334,19 @@ premises = [
     {
         "id": 2,
         "premise": "The account home used for state resolution is the fixture's, and the real account state is untouched (before/after digest of the real state directory).",
-        "trace": ["every case", "receipt: real_state"],
+        "trace": ["guarded startup export", "receipt: real_state before/after digest"],
         "evidence": {
             "account_home": os.environ["S6_HOME"],
             "environment_home": os.environ["S6_HOME"],
             "real_state": os.environ["S6_REAL_STATE"],
             "before": os.environ["S6_REAL_BEFORE"],
+            "after": os.environ["S6_REAL_AFTER"],
         },
     },
     {
         "id": 3,
         "premise": "Environment isolation: BARGE_STATE_DIR, TMPDIR/TMP/TEMP and every inherited scratch point inside the guard's owned scratch; no inherited real paths.",
-        "trace": ["guarded startup assertion", "every case"],
+        "trace": ["guarded startup assertion"],
         "evidence": {
             "scratch": os.environ["S6_SCRATCH"],
             "tmpdir": os.environ["S6_TMPDIR"],
@@ -345,14 +357,15 @@ premises = [
     {
         "id": 4,
         "premise": "Explicit adoption only: every fixture placement is adopted with an explicit command and a recorded plan, never by an implicit default.",
-        "trace": ["plan-effect-free", "absent-path", "empty-directory", "setting-unchanged", "hand-made-in-place"],
+        "trace": ["every adopt in the case bodies is an explicit command"],
         "evidence": {"plan_case": "plan-effect-free", "explicit_flag": "--adopt-existing-root"},
     },
     {
         "id": 5,
         "premise": "Owned image with ownership enabled (-owners on), ordinary detach, never a forced detach of anything but the owned image's own whole-disk device.",
-        "trace": ["startup attach", "ordinary-detach", "cleanup"],
+        "trace": ["startup attach", "cleanup detach"],
         "evidence": {
+            "detach": "ordinary; forced only for this image's own whole disk, backing kept on failure",
             "volume": os.environ["S6_VOLUME"],
             "mount": os.environ["S6_MOUNT"],
             "backing": os.environ["S6_BACKING"],
@@ -382,13 +395,13 @@ premises = [
     {
         "id": 7,
         "premise": "Temporary storage: everything inside the guard's one owned root; no home folder, no drive root, no fixed /tmp/<name>.",
-        "trace": ["mktemp run root", "every case", "cleanup"],
+        "trace": ["mktemp run root", "cleanup"],
         "evidence": {"scratch": os.environ["S6_SCRATCH"], "run_root": os.path.dirname(os.environ["S6_STATE"])},
     },
     {
         "id": 8,
         "premise": "mktemp -d under that root for every fixture directory, never a shared name.",
-        "trace": ["run root", "per-case home/state/out"],
+        "trace": ["run_case creates cases/<id>/{home,state,out}"],
         "evidence": {"run_root_pattern": "barge-s6-run.XXXXXX", "case_dirs": "cases/<case-id>/{home,state,out}"},
     },
     {
@@ -409,6 +422,44 @@ premises = [
 
 real_after = os.environ["S6_REAL_AFTER"]
 unchanged = real_after == os.environ["S6_REAL_BEFORE"]
+
+# The design's nine-premise checklist, folded against the case results that
+# actually ran: a premise is traced by the case bodies that assert it, and every
+# mapped case must have passed for it to count.
+premise_rows = []
+premise_path = os.environ.get("S6_PREMISE_TRACE")
+if premise_path and os.path.exists(premise_path):
+    with open(premise_path, encoding="utf-8") as handle:
+        for line in handle:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 3 and parts[0].strip().isdigit():
+                premise_rows.append((int(parts[0]), parts[1], parts[2][:400]))
+
+case_by_id = {case["id"]: case for case in cases}
+for premise in premises:
+    observations = []
+    for number, case_id, asserts in premise_rows:
+        if number != premise["id"]:
+            continue
+        case = case_by_id.get(case_id)
+        observations.append({
+            "case": case_id,
+            "asserts": asserts,
+            "status": case["status"] if case else "not_run",
+            "evidence": case["evidence"] if case else None,
+        })
+    premise["observations"] = observations
+    premise["covered"] = bool(observations) and all(
+        item["status"] == "pass" for item in observations
+    )
+    premise["missing"] = [item["case"] for item in observations if item["status"] != "pass"]
+
+premise_trace = {
+    "premises": len(premises),
+    "covered": sum(1 for premise in premises if premise["covered"]),
+    "missing": [premise["id"] for premise in premises if not premise["covered"]],
+    "complete": len(premises) == 9 and all(premise["covered"] for premise in premises),
+}
 
 preflight_failure = os.environ.get("S6_PREFLIGHT_FAILURE") or None
 preflight_observations = []
@@ -459,6 +510,7 @@ qualified = (
     and not_run == []
     and unchanged
     and preflight_failure is None
+    and premise_trace["complete"]
     and int(os.environ["S6_PREFLIGHT_RUNS"]) == len(cases)
     and int(os.environ["S6_EXIT"]) == 0
 )
@@ -488,6 +540,7 @@ receipt = {
     },
     "preflight": preflight,
     "premises": premises,
+    "premise_trace": premise_trace,
     "cases": cases,
     "summary": summary,
     "started_ms": int(os.environ["S6_STARTED"]),
@@ -503,6 +556,7 @@ print(json.dumps({"schema": receipt["schema"], "qualified": qualified, "mode": m
                   "head": receipt["head"], "summary": summary,
                   "receipt": os.environ["S6_RECEIPT"]}, separators=(",", ":")))
 PY
+  # <<< s6-receipt
 }
 
 cleanup() {
@@ -882,6 +936,60 @@ preflight() {
 }
 # <<< s6-preflight
 
+# ---- the premise trace ------------------------------------------------------
+#
+# The design's nine-premise HIGH checklist, traced through the case bodies that
+# demonstrate it. Each row is a premise, the case body that asserts it, and the
+# concrete assertion in that body; the receipt folds these rows against the
+# recorded case results, so a premise is traced by a case that actually passed,
+# not by prose. `crates/barge/tests/native_proof_harness.rs` extracts this block
+# and proves it covers every premise, every case and no case that does not exist.
+# >>> s6-premise-trace
+write_premise_trace() {
+  local premise case_id asserts
+  while IFS='|' read -r premise case_id asserts; do
+    [[ -n "$premise" ]] || continue
+    printf '%s\t%s\t%s\n' "$premise" "$case_id" "$asserts" >>"$PREMISE_TRACE_TSV"
+  done <<'TRACE'
+1|plan-effect-free|describe reports the fixture account home and the fixture state directory, so state resolves outside the real account
+1|setting-written|the adopted setting and its undo read and write only the fixture home's ~/.npmrc
+1|hand-made-in-place|the adopted layout is the fixture home's link, not the real ~/.cargo
+2|plan-effect-free|describe's state.home.account is the fixture home, not the password database's account home
+2|ordinary-detach|the absent-volume refusal is read from the fixture state directory's own registry
+3|absent-path|the adopted cache target is under the case's caches folder on the owned image
+3|plan-effect-free|describe's state.dir is the case's BARGE_STATE_DIR inside the run root
+4|absent-path|the link is published only by an explicit cache adopt --kind --volume
+4|empty-directory|the empty directory becomes a link only through the explicit adopt
+4|setting-unchanged|the already-pointing setting is recorded by the explicit adopt with no byte written
+4|setting-written|the setting is written only by the explicit adopt with --write-setting
+4|hand-made-in-place|the existing root is adopted only with the explicit --adopt-existing-root
+4|plan-effect-free|--plan reports the intended effects and adopts nothing
+5|ordinary-detach|an ordinary hdiutil detach makes the cache unavailable naming the drive, and a re-attach makes it work again
+6|absent-path|the adopt uses only --kind, --volume and --json
+6|setting-written|the setting write requires the explicit --write-setting flag
+6|hand-made-in-place|the in-place form requires the explicit --adopt-existing-root flag
+6|plan-effect-free|the preview uses --plan and adopts nothing
+7|absent-path|the adopted root and the link target are inside the case's caches folder on the owned image
+7|empty-directory|the restored directory is the fixture home's, inside the run root
+7|hand-made-in-place|the adopted root and its marker are on the owned image, under the case's caches folder
+7|plan-effect-free|the state directory the CLI used is inside the run root
+8|absent-path|the case's home, state and out are case-scoped under the mktemp run root
+8|hand-made-in-place|the case's caches folder is case-scoped under the owned image
+8|plan-effect-free|the plan case's own state directory is case-scoped
+9|absent-path|the per-case preflight ran before this case with both descriptor probes
+9|empty-directory|the per-case preflight ran before this case with both descriptor probes
+9|setting-unchanged|the per-case preflight ran before this case with both descriptor probes
+9|setting-written|the per-case preflight ran before this case with both descriptor probes
+9|diverged-undo|the per-case preflight ran before this case with both descriptor probes
+9|non-empty-refused|the per-case preflight ran before this case with both descriptor probes
+9|hand-made-in-place|the per-case preflight ran before this case with both descriptor probes
+9|plan-effect-free|the per-case preflight ran before this case with both descriptor probes
+9|ordinary-detach|the per-case preflight ran before this case with both descriptor probes
+TRACE
+}
+# <<< s6-premise-trace
+write_premise_trace
+
 # ---- the cases --------------------------------------------------------------
 
 case_absent_path() {
@@ -1047,7 +1155,9 @@ case_ordinary_detach() {
 # ---- the runner -------------------------------------------------------------
 
 record() {
-  printf '%s\t%s\t%s\n' "$1" "$2" "$(printf '%s' "$3" | tr '\n\t' '  ' | cut -c1-400)" >>"$CASES_TSV"
+  # id, status, evidence, and the premise ids the case body demonstrates.
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" \
+    "$(printf '%s' "$3" | tr '\n\t' '  ' | cut -c1-400)" "$4" >>"$CASES_TSV"
 }
 
 status_of() {
@@ -1058,23 +1168,23 @@ FIRST_FAULT=""
 STOPPED=""
 
 run_case() {
-  local id="$1" depends="$2" body="$3"
+  local id="$1" depends="$2" body="$3" premises="$4"
   local dir="$RUN/cases/$id"
   local log="$CASE_LOGS/$id.log"
   mkdir -p "$dir/home" "$dir/state" "$dir/out"
   if [[ -n "$STOPPED" ]]; then
-    record "$id" "skipped" "the counted run stopped at $STOPPED"
+    record "$id" "skipped" "the counted run stopped at $STOPPED" "$premises"
     return 0
   fi
   if [[ -n "$depends" && "$(status_of "$depends")" != "pass" ]]; then
-    record "$id" "skipped" "depends on $depends, which did not pass"
+    record "$id" "skipped" "depends on $depends, which did not pass" "$premises"
     return 0
   fi
   # The harness preflight precedes every case that runs. A failed probe is an
   # infrastructure abort, not a product result: stop every remaining case and
   # let the run's verdict refuse the receipt.
   if ! preflight "$id" "$dir/preflight"; then
-    record "$id" "skipped" "infrastructure abort: $PREFLIGHT_FAILURE"
+    record "$id" "skipped" "infrastructure abort: $PREFLIGHT_FAILURE" "$premises"
     STOPPED="$id"
     return 0
   fi
@@ -1084,14 +1194,14 @@ run_case() {
   CASE_OUT="$dir/out"
   CASE_CACHES="$MOUNT/cases/$id/caches"
   write_registry "$dir/state" "cases/$id" || {
-    record "$id" "fail" "the fixture registry could not be written"
+    record "$id" "fail" "the fixture registry could not be written" "$premises"
     FIRST_FAULT="${FIRST_FAULT:-$id}"
     return 0
   }
   if "$body" >"$log" 2>&1; then
-    record "$id" "pass" "$(tr '\n' ';' <"$log")"
+    record "$id" "pass" "$(tr '\n' ';' <"$log")" "$premises"
   else
-    record "$id" "fail" "$(tr '\n' ';' <"$log")"
+    record "$id" "fail" "$(tr '\n' ';' <"$log")" "$premises"
     FIRST_FAULT="${FIRST_FAULT:-$id}"
     if [[ "$MODE" == "counted" ]]; then
       STOPPED="$id"
@@ -1109,15 +1219,17 @@ UUID="$(diskutil info -plist "$MOUNT" | plutil -extract VolumeUUID raw -o - -)" 
   refuse "cannot read the image's volume UUID"
 readonly UUID
 
-run_case absent-path "" case_absent_path
-run_case empty-directory "" case_empty_directory
-run_case setting-unchanged "" case_setting_unchanged
-run_case setting-written "" case_setting_written
-run_case diverged-undo setting-written case_diverged_undo
-run_case non-empty-refused "" case_non_empty_refused
-run_case hand-made-in-place "" case_hand_made_in_place
-run_case plan-effect-free "" case_plan_effect_free
-run_case ordinary-detach absent-path case_ordinary_detach
+# The last argument is the set of premise ids the body demonstrates, as traced in
+# write_premise_trace. The receipt folds them against the recorded results.
+run_case absent-path "" case_absent_path "3,4,6,7,8,9"
+run_case empty-directory "" case_empty_directory "4,7,9"
+run_case setting-unchanged "" case_setting_unchanged "4,9"
+run_case setting-written "" case_setting_written "1,4,6,9"
+run_case diverged-undo setting-written case_diverged_undo "9"
+run_case non-empty-refused "" case_non_empty_refused "9"
+run_case hand-made-in-place "" case_hand_made_in_place "1,4,6,7,8,9"
+run_case plan-effect-free "" case_plan_effect_free "1,2,3,4,6,7,8,9"
+run_case ordinary-detach absent-path case_ordinary_detach "2,5,9"
 
 # The run's own verdict: a counted pass needs every case, a preflight before
 every case, safe custody and an untouched real account state; the diagnostic
