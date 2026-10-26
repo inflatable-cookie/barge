@@ -2215,16 +2215,24 @@ Choices S4 made where this design left the mechanic to the slice:
   Identity, session and supervisor-pin checks stay, as supplemental checks. No
   product rule, path exception or case oracle changes; an unreadable
   same-effective-uid descriptor is still `Unknown` and still refuses.
-- **Grants are re-verified in the deletion's window.** The plan's assessment
-  reads the grants, but the authority that matters is read again inside S5's
-  locked deletion: `delete_unit_on_volume` takes the volume lock, re-reads the
-  registry record, and runs the caller's own authorization check on it before
-  custody or the intent. A delegation withdrawn or a claim revoked before that
-  point refuses the unit with `refused_boundary` and no effect; a change attempted
-  after it waits for the window. Grant writes therefore take the registry lock
-  and then the volume lock, in the documented order, and re-read and modify the
-  document under both: a concurrent writer's declaration is merged rather than
-  discarded, and a stale document can never restore withdrawn authority.
+- **Grants are re-verified in the deletion's window, policy included.** The
+  plan's assessment reads the grants, but the authority that matters is read
+  again inside S5's locked deletion: `delete_unit_on_volume` takes the volume
+  lock, re-reads the registry record, and runs the caller's own authorization
+  check on it before custody or the intent. S4's check re-evaluates the **whole
+  current eligibility policy** under that record — the family delegation or the
+  scope's claim, the claim's unit shape and the claim's own idle age — and
+  compares the recorded identity, so replacing a claim with a stricter one
+  between the plan and the effect refuses the unit instead of authorizing it under
+  the older policy. A withdrawal or stricter replacement before that point refuses
+  with `refused_boundary` and no effect; a change attempted after it waits for the
+  window. Grant writes therefore take the registry lock and then the volume lock,
+  in the documented order, and re-read and modify the document under both: a
+  concurrent writer's declaration is merged rather than discarded, and a stale
+  document can never restore withdrawn authority. The write's registration
+  preflight runs before the state layout exists, so a grant verb naming an
+  unregistered volume refuses and creates no directory, lock or file; the locked
+  re-read still re-checks presence before publishing.
 - **Conclusion facts are validated, not just recorded.** A positive closure is
   only written for a `closed` outcome, so a retained, unclosed or failed run can
   never carry the one closure that expires it. The expiry reader applies the same
@@ -2252,23 +2260,35 @@ Choices S4 made where this design left the mechanic to the slice:
   `proc_pidinfo(PROC_PIDLISTFDS)`; a process that exited is tolerated, a foreign
   uid is never inspected, and one refusal (`EPERM`) or a bound hit makes the run
   `infrastructure`, unqualified, with the pid, command and count in the receipt.
-- **Premise 2 is an assertion.** The proof digests the real account state
-  (bounded, read-only, no symlink followed) before the run and after it, and a
-  change makes the receipt unqualified; it also asserts `barge describe`'s
-  resolver facts — the fixture state directory, the environment override as its
-  source, and the password-database account home with the fixture `HOME` visible
-  as a mismatch — so "the account home used for state resolution is the
-  fixture's" is observed rather than declared.
+  A descriptor table that fills its own cap is the same refusal: a full buffer is
+  incomplete evidence, never a complete listing. Under the Supervisor's
+  sequencing this census moves to Barge's own observer (with the custody
+  correction in barge#012) so the proof's execution identity matches the product;
+  that is apparatus-only and awaits the rebase.
+- **Premise 2 is a complete-content assertion.** The proof observes the real
+  account state before the run and after it through descriptors: the state
+  directory is opened with `O_NOFOLLOW` and every name relative to its parent's
+  descriptor with `O_NOFOLLOW`, so a symlinked or swapped path is an incomplete
+  observation and never a followed one, and each entry's name, kind, mode, size,
+  mtime and bytes are hashed. The entry cap, the byte cap, the deadline, a short
+  read or an entry whose identity changed under the walk make the observation
+  `incomplete`; two incomplete observations never prove equality, and an
+  incomplete or changed reading makes the receipt unqualified. The resolver is
+  proved from fixture-only evidence, never from `describe` (which observes live
+  Oxide state): a delegation recorded through a state-only verb must land in the
+  proof's fixture registry, and its withdrawal must remove it, while the account
+  home is the password database's and this proof's `HOME` is its private fixture.
 - **A failed ordinary detach keeps the backing.** Cleanup detaches ordinarily and
   stops there: it never force-detaches by mount path, and a failed detach leaves
   the image attached and its backing in place and makes the receipt unqualified.
-  The one forced detach stays premise 5's — the owned image's own whole-disk
-  device, used by the pull case after the ordinary detach is refused.
+  The proof uses no forced detach at all. The pull case is the brief's ordinary
+  detach mid-delete; if that ordinary detach is refused, the case is left
+  unproved rather than satisfied by a forced detach of the same image.
 - **The native's oracles are the design's behaviours.** The allocation case
-  launches both allocations before awaiting either; the pull case attempts the
-  ordinary detach, records the authorized mode that actually detached the image,
-  and checks the quarantine leaf and its recorded device and inode *after*
-  re-attaching, before the replay.
+  launches both allocations before awaiting either; the pull case uses the
+  ordinary detach mid-delete (a refusal leaves it unproved), and checks the
+  quarantine leaf and its recorded device and inode *after* re-attaching, before
+  the replay.
 - **What S4 does not claim.** No real-drive sweep, no reaper or LaunchAgent
   change, no Oxide or Effigy adoption, and no native receipt until the owner
   activates the runs. `scratch:expiry:native` and its `:diagnostic` twin are

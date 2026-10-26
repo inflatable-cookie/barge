@@ -973,6 +973,64 @@ fn a_bad_volume_uuid_and_an_unknown_scratch_verb_are_usage_refusals() {
 }
 
 #[test]
+fn a_grant_verb_on_an_unregistered_volume_refuses_and_creates_nothing() {
+    // The refusal is an effect-free preflight: an unregistered volume creates no
+    // state directory, no lock and no layout entry.
+    for (label, args) in [
+        (
+            "scratch-delegate-unregistered",
+            vec![
+                "delegate",
+                "--volume",
+                VOLUME,
+                "--family",
+                "effigy_scratch",
+                "--by",
+                "operator",
+            ],
+        ),
+        (
+            "scratch-claim-unregistered",
+            vec![
+                "claim",
+                "--volume",
+                VOLUME,
+                "--scope",
+                "project:alpha",
+                "--unit",
+                "child",
+                "--idle-seconds",
+                "1209600",
+                "--declared-by",
+                "operator",
+            ],
+        ),
+    ] {
+        let (fixture, state_dir) = absent_state_dir(label);
+        let output = run_scratch(&args, &state_dir);
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{label}: an unregistered volume is unknown state"
+        );
+        let document = stdout_document(&output);
+        assert_eq!(document["schema"], "barge.error/1", "{label}");
+        assert_eq!(document["error"]["kind"], "unknown_state", "{label}");
+        assert!(
+            !state_dir.exists(),
+            "{label}: the refusal created the state layout"
+        );
+        assert!(
+            std::fs::read_dir(&fixture.path)
+                .expect("the fixture directory")
+                .next()
+                .is_none(),
+            "{label}: the refusal created an entry beside the state directory"
+        );
+    }
+}
+
+#[test]
 fn a_claim_over_the_oxide_project_is_refused_before_the_registry_is_read() {
     let (_fixture, state_dir) = absent_state_dir("scratch-claim-shape");
     let output = run_scratch(

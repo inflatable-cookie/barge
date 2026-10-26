@@ -1202,12 +1202,29 @@ where
     F: FnOnce(&mut ScratchGrants) -> Result<bool>,
 {
     // An invalid registry refuses before any effect, and a volume that is not
-    // registered is never granted anything.
-    if matches!(registry::read(state_paths)?, registry::Registry::Absent) {
-        return Err(Error::new(
-            ErrorKind::UnknownState,
-            "no registry exists, so there is no volume to record a grant on".to_owned(),
-        ));
+    // registered is never granted anything. This preflight runs before the layout
+    // exists, so a refusal creates no directory, no lock and no file:
+    // `state_paths.initialize()` below is the first write.
+    match registry::read(state_paths)? {
+        registry::Registry::Absent => {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "no registry exists, so there is no volume to record a grant on".to_owned(),
+            ))
+        }
+        registry::Registry::Present(document) => {
+            if document
+                .volumes
+                .iter()
+                .all(|volume| volume.volume_uuid != *volume_uuid)
+            {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    format!("volume {volume_uuid} is not registered"),
+                )
+                .with_detail("volume_uuid", volume_uuid.as_str().into()));
+            }
+        }
     }
     state_paths.initialize()?;
     let mut locks = state::LockSet::new(state_paths.clone());
@@ -1749,13 +1766,26 @@ pub fn sweep(
             },
             UnitFamily::Unmarked => IdentityProof::Unmarked,
         };
-        // The grant that authorized this row is re-verified inside the
-        // deletion's own locked window, against the registry record re-read
-        // under the volume lock, so a withdrawal between the plan and the effect
-        // refuses the unit and a later withdrawal waits for the window to close.
+        // The authority that authorized this row is re-verified inside the
+        // deletion's own locked window, against the registry record re-read under
+        // the volume lock: the full current eligibility policy (delegation or
+        // claim, unit shape, the claim's idle age) and the recorded identity. A
+        // withdrawal or a stricter replacement between the plan and the effect
+        // refuses the unit, and a change attempted after the window waits for it.
         let authorization = delete::Authorization {
-            what: "the recorded scratch grant",
-            check: &|fresh: &VolumeRecord| grant_covers(fresh, &row.scope, row.family),
+            what: "the recorded scratch grant and its current eligibility policy",
+            check: &|fresh: &VolumeRecord| {
+                authorize_under(
+                    dirs,
+                    facts,
+                    mounts,
+                    observer,
+                    state_paths,
+                    fresh,
+                    row,
+                    request.now_ms,
+                )
+            },
         };
         match delete::delete_unit_on_volume(
             state_paths,
@@ -1932,50 +1962,63 @@ impl SweepContext<'_> {
     }
 }
 
-/// Whether one recorded claim covers one unit scope, with the unit shape the
-/// claim declared matching the scope's.
-fn claim_covers(claim: &ScratchClaim, scope: &UnitScope) -> bool {
-    claim.unit == scope.claim_unit()
-        && match (&claim.scope, scope) {
-            (ClaimScope::Project { name }, UnitScope::Project { name: unit }) => name == unit,
-            (ClaimScope::TopLevelAdhoc, UnitScope::TopLevel) => true,
-            _ => false,
-        }
-}
-
-/// Re-verify, under the deletion's volume lock, that a freshly read registry
-/// record still authorizes deleting one planned unit.
+/// Re-verify one planned unit under the registry record the deletion read in its
+/// locked window.
 ///
-/// This is the same predicate the plan's assessment applied, evaluated once more
-/// on the record the deletion re-read in its locked window: a withdrawn
-/// delegation or revoked claim refuses the effect with `refused_boundary` (the
-/// sweep's per-unit refusal), and nothing else about the unit is re-decided here.
-fn grant_covers(record: &VolumeRecord, scope: &UnitScope, family: UnitFamily) -> Result<()> {
-    let grants = &record.scratch_grants;
-    let covered = match family {
-        UnitFamily::Native => true,
-        UnitFamily::OxideScratch => grants
-            .delegations
-            .iter()
-            .any(|delegation| delegation.family == MarkerFamily::OxideScratch),
-        UnitFamily::EffigyScratch => grants
-            .delegations
-            .iter()
-            .any(|delegation| delegation.family == MarkerFamily::EffigyScratch),
-        UnitFamily::Unmarked => grants.claims.iter().any(|claim| claim_covers(claim, scope)),
+/// The whole current policy is re-evaluated, not just the grant's presence: the
+/// family's delegation or the scope's claim must still cover the unit, the
+/// claim's declared unit shape must still match, and the claim's own idle age
+/// must still make the unit eligible. A claim replaced by a stricter one between
+/// the plan and the effect therefore refuses the unit (`refused_boundary`, the
+/// sweep's per-unit refusal) instead of authorizing it under the old policy; the
+/// recorded identity must not have changed either.
+#[allow(clippy::too_many_arguments)]
+fn authorize_under(
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    state_paths: &StatePaths,
+    record: &VolumeRecord,
+    row: &PlanRow,
+    now_ms: u64,
+) -> Result<()> {
+    let Some(current) = reassess_under(
+        dirs,
+        facts,
+        mounts,
+        observer,
+        state_paths,
+        record,
+        &row.scope,
+        &row.name,
+        now_ms,
+    )?
+    else {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "`{}` is no longer eligible under the record's current grant and policy, so the effect was abandoned",
+                row.scope.key()
+            ),
+        )
+        .with_detail("scope", row.scope.key().into())
+        .with_detail("family", row.family.as_str().into()));
     };
-    if covered {
-        return Ok(());
+    if current.marker_digest != row.marker_digest
+        || current.device.get() != row.device
+        || current.inode != row.inode
+    {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "`{}` is not the identity the plan recorded, so the effect was abandoned",
+                row.scope.key()
+            ),
+        )
+        .with_detail("scope", row.scope.key().into()));
     }
-    Err(Error::new(
-        ErrorKind::RefusedBoundary,
-        format!(
-            "the recorded grant no longer covers `{}`, so the effect was abandoned",
-            scope.key()
-        ),
-    )
-    .with_detail("scope", scope.key().into())
-    .with_detail("family", family.as_str().into()))
+    Ok(())
 }
 
 /// One unit as the classifier decided it.
@@ -3254,14 +3297,43 @@ fn reassess(
 ) -> Result<Option<ObservedRoot>> {
     let record = area::registered_volume(state_paths, volume_uuid)?;
     record.declared_durability()?;
-    let scratch = scratch_folder(&record);
+    reassess_under(
+        dirs,
+        facts,
+        mounts,
+        observer,
+        state_paths,
+        &record,
+        scope,
+        name,
+        now_ms,
+    )
+}
+
+/// Re-assess one planned unit against a registry record already in hand.
+///
+/// The deletion's locked window passes the record it re-read there, so the
+/// eligibility it checks is the current policy, never the plan's older reading.
+#[allow(clippy::too_many_arguments)]
+fn reassess_under(
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    state_paths: &StatePaths,
+    record: &VolumeRecord,
+    scope: &UnitScope,
+    name: &str,
+    now_ms: u64,
+) -> Result<Option<ObservedRoot>> {
+    let scratch = scratch_folder(record);
     let folder = scope.parent_folder(&scratch);
     let Some((path, handle)) = area::open_folder(
         dirs,
         facts,
         mounts,
         observer,
-        &record,
+        record,
         &record.root_dir,
         &folder,
     )?
@@ -3277,7 +3349,7 @@ fn reassess(
         dirs,
         observer,
         state_paths,
-        record: &record,
+        record,
         scratch: &scratch,
         device: handle.identity().device,
         now_ms,
@@ -5153,6 +5225,25 @@ mod tests {
     /// Age a tree's entries by rewriting their mtimes through `find` and
     /// `touch`, which is the only portable way for a test to move a file's
     /// modification time without an unsafe libc call.
+    /// Set every entry's mtime to `age` before now, so a policy whose window is
+    /// between two ages can be tested exactly.
+    fn set_tree_age(path: &Path, age: std::time::Duration) {
+        let stamp = std::time::SystemTime::now() - age;
+        let mut stack = vec![path.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            let file = std::fs::File::open(&current).expect("the entry opens");
+            file.set_modified(stamp).expect("the mtime is set");
+            if std::fs::symlink_metadata(&current)
+                .expect("the entry's facts")
+                .is_dir()
+            {
+                for entry in std::fs::read_dir(&current).expect("the folder").flatten() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+    }
+
     fn age_tree(path: &Path, _days: u64) {
         let status = std::process::Command::new("find")
             .arg(path)
@@ -5326,56 +5417,188 @@ mod tests {
     // ---- the corrected grant, conclusion and replay seams ------------------
 
     #[test]
-    fn grant_covers_rechecks_the_record_and_keeps_marker_precedence() {
-        let harness = Harness::new("scratch-grant-recheck");
+    fn the_locked_authorization_rechecks_the_full_current_policy() {
+        let harness = Harness::new("scratch-locked-policy");
+        let idle = 14 * 24 * 60 * 60;
+        // An unmarked child in a claimed project, fifteen days old at `now`.
+        let unit = harness.project("alpha").join("leftover");
+        std::fs::create_dir_all(&unit).expect("the unit");
+        std::fs::write(unit.join("payload.txt"), b"bytes").expect("a payload");
+        set_tree_age(&unit, std::time::Duration::from_secs(15 * 24 * 60 * 60));
+        // An Effigy-marked root in the same claimed project, old enough for its
+        // family's rule.
+        let marked = harness.project("alpha").join("marked-run");
+        std::fs::create_dir_all(&marked).expect("the marked root");
+        effigy_marker(&marked, 0xFFFF_FFFE, false, None);
+        age_tree(&marked, 20);
+        let now = sweep_now(0, 0);
         let record = harness.fixture.record.clone();
-        let scope = super::UnitScope::Project {
-            name: "alpha".to_owned(),
+        let row_for = |name: &str, family: UnitFamily| super::PlanRow {
+            name: name.to_owned(),
+            scope: super::UnitScope::Project {
+                name: "alpha".to_owned(),
+            },
+            family,
+            path: harness.project("alpha").join(name),
+            device: 0,
+            inode: 0,
+            marker_file: None,
+            marker_digest: String::new(),
+            concluded_ms: None,
+            created_ms: None,
+            last_activity_ms: 0,
+            grant: family.grant().to_owned(),
+            reason: "the test's row".to_owned(),
         };
-        // A native root is its own authority.
-        assert!(super::grant_covers(&record, &scope, UnitFamily::Native).is_ok());
-        // With no grants, every other family refuses.
-        for family in [
-            UnitFamily::Unmarked,
-            UnitFamily::EffigyScratch,
-            UnitFamily::OxideScratch,
-        ] {
-            let error = super::grant_covers(&record, &scope, family)
-                .expect_err("no grant covers this unit");
-            assert_eq!(error.kind(), ErrorKind::RefusedBoundary, "{family:?}");
-            assert!(error.message().contains("no longer covers"), "{error}");
-        }
-        // A project claim covers unmarked children and never a marked family:
-        // marker precedence needs the family's own delegation.
-        let mut record = record;
-        record.scratch_grants.claims.push(ScratchClaim {
+        // The identity a row records is what the authorization compares, so the
+        // rows are filled from a first successful assessment below.
+        let observer = harness.fixture.observer();
+        let facts = harness.fixture.facts();
+        let mounts = harness.fixture.mounts();
+        let platform = harness.fixture.platform();
+        let mut claimed = record.clone();
+        claimed.scratch_grants.claims.push(ScratchClaim {
             scope: ClaimScope::Project {
                 name: "alpha".to_owned(),
             },
             unit: ClaimUnit::Child,
-            unmarked_idle_seconds: 60,
+            unmarked_idle_seconds: idle,
             families_excluded: vec![],
             declared_by: "operator".to_owned(),
             declared_ms: state::now_ms(),
         });
-        assert!(super::grant_covers(&record, &scope, UnitFamily::Unmarked).is_ok());
+        let observed_row =
+            |record: &crate::registry::VolumeRecord, name: &str, family: UnitFamily| {
+                let mut row = row_for(name, family);
+                let found = super::reassess_under(
+                    &platform,
+                    &facts,
+                    &mounts,
+                    &observer,
+                    &harness.fixture.state,
+                    record,
+                    &row.scope,
+                    name,
+                    now,
+                )
+                .expect("the unit reassesses")
+                .unwrap_or_else(|| panic!("`{name}` is eligible under the record"));
+                row.device = found.device.get();
+                row.inode = found.inode;
+                row.marker_digest = found.marker_digest;
+                row
+            };
+        let unmarked = observed_row(&claimed, "leftover", UnitFamily::Unmarked);
+        assert!(
+            super::authorize_under(
+                &platform,
+                &facts,
+                &mounts,
+                &observer,
+                &harness.fixture.state,
+                &claimed,
+                &unmarked,
+                now,
+            )
+            .is_ok(),
+            "the claim's own idle age authorizes the fifteen-day unit"
+        );
+
+        // A stricter replacement claim over the same scope (thirty days, same
+        // unit shape) no longer makes the unit eligible: the locked window
+        // re-evaluates the policy, it does not just check that a claim exists.
+        let mut stricter = claimed.clone();
+        stricter.scratch_grants.claims[0].unmarked_idle_seconds = 30 * 24 * 60 * 60;
+        let error = super::authorize_under(
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &harness.fixture.state,
+            &stricter,
+            &unmarked,
+            now,
+        )
+        .expect_err("the stricter claim refuses the older unit");
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        assert!(error.message().contains("no longer eligible"), "{error}");
+
+        // A withdrawn claim is the same refusal.
+        let mut withdrawn = claimed.clone();
+        withdrawn.scratch_grants.claims.clear();
         assert_eq!(
-            super::grant_covers(&record, &scope, UnitFamily::EffigyScratch)
-                .expect_err("a project claim never covers a marked family")
-                .kind(),
+            super::authorize_under(
+                &platform,
+                &facts,
+                &mounts,
+                &observer,
+                &harness.fixture.state,
+                &withdrawn,
+                &unmarked,
+                now,
+            )
+            .expect_err("a withdrawn claim refuses")
+            .kind(),
             ErrorKind::RefusedBoundary
         );
-        record.scratch_grants.delegations.push(ScratchDelegation {
-            family: MarkerFamily::EffigyScratch,
-            by: "family owner".to_owned(),
-            declared_ms: state::now_ms(),
-        });
-        assert!(super::grant_covers(&record, &scope, UnitFamily::EffigyScratch).is_ok());
-        // The claim's declared unit shape must match the scope it is read for.
+
+        // Marker precedence: the project claim never covers the marked family, so
+        // the Effigy root needs the family's own delegation even though the
+        // claim is current.
+        let mut delegated = claimed.clone();
+        delegated
+            .scratch_grants
+            .delegations
+            .push(ScratchDelegation {
+                family: MarkerFamily::EffigyScratch,
+                by: "family owner".to_owned(),
+                declared_ms: state::now_ms(),
+            });
+        let mut marked_row = observed_row(&delegated, "marked-run", UnitFamily::EffigyScratch);
+        marked_row.marker_file = Some(super::EFFIGY_MARKER_FILE.to_owned());
+        let error = super::authorize_under(
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &harness.fixture.state,
+            &claimed,
+            &marked_row,
+            now,
+        )
+        .expect_err("a project claim never covers a marked family");
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        assert!(
+            super::authorize_under(
+                &platform,
+                &facts,
+                &mounts,
+                &observer,
+                &harness.fixture.state,
+                &delegated,
+                &marked_row,
+                now,
+            )
+            .is_ok(),
+            "the delegation is the marker family's authority"
+        );
+
+        // An identity that is not the plan's is refused under a current policy.
+        let mut moved = unmarked.clone();
+        moved.inode = moved.inode.saturating_add(1);
         assert_eq!(
-            super::grant_covers(&record, &super::UnitScope::TopLevel, UnitFamily::Unmarked)
-                .expect_err("a project claim is not an ad-hoc claim")
-                .kind(),
+            super::authorize_under(
+                &platform,
+                &facts,
+                &mounts,
+                &observer,
+                &harness.fixture.state,
+                &claimed,
+                &moved,
+                now,
+            )
+            .expect_err("a changed identity refuses")
+            .kind(),
             ErrorKind::RefusedBoundary
         );
     }

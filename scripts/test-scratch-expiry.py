@@ -185,9 +185,6 @@ REAL_STATE_RELATIVE = "Library/Application Support/barge/state"
 REAL_STATE_ENTRIES = 4096
 REAL_STATE_BYTES = 8 * 1024 * 1024
 REAL_STATE_SECONDS = 20
-# The `barge describe` facts the resolver identity assertion reads.
-RESOLVER_FACTS = ["state.dir", "state.source", "state.home.account",
-                  "state.home.environment", "state.home.mismatch"]
 
 
 def account_home():
@@ -195,58 +192,141 @@ def account_home():
     return pwd.getpwuid(os.geteuid()).pw_dir
 
 
-def real_state_digest(deadline_seconds=REAL_STATE_SECONDS):
-    """A bounded, read-only digest of the real account state, or `absent`.
+def _incomplete(reason, entries=0, total=0):
+    """An observation that cannot prove the state's content: never a pass."""
+    return {
+        "status": "incomplete",
+        "digest": None,
+        "entries": entries,
+        "bytes": total,
+        "reason": reason,
+    }
 
-    Premise 2 is not a declaration: the proof reads the real state directory
-    before and after the run and asserts the two are equal. The walk never
-    follows a symlink, never writes, and stops at its own name, byte and time
-    bounds; a bound is part of the digest, so a truncated pair never compares
-    equal to a complete one.
+
+def real_state_observation(deadline_seconds=REAL_STATE_SECONDS):
+    """A bounded, read-only, descriptor-relative observation of the real state.
+
+    Premise 2 needs *complete content equality*, so this walks the account state
+    directory through descriptors: the root is opened with `O_NOFOLLOW` and every
+    name is opened relative to its parent's descriptor with `O_NOFOLLOW`, so a
+    symlinked or swapped path is an incomplete observation and never a followed
+    one. Each entry's name, kind, mode, size, mtime and bytes are hashed. A cap,
+    the deadline, a short read or an entry whose identity changed under the walk
+    makes the observation `incomplete`; an incomplete observation can never prove
+    the state unchanged, whichever two incomplete readings agree.
     """
     root = os.path.join(account_home(), REAL_STATE_RELATIVE)
+    try:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return {
+            "status": "absent",
+            "digest": None,
+            "entries": 0,
+            "bytes": 0,
+            "reason": None,
+        }
+    except OSError as error:
+        return _incomplete(f"the real state directory cannot be opened without following: {error}")
     digest = hashlib.sha256()
     deadline = time.monotonic() + deadline_seconds
-    if not os.path.isdir(root):
-        return "absent"
     entries = 0
     total = 0
-    stack = [""]
-    while stack:
-        relative = stack.pop()
-        directory = os.path.join(root, relative)
-        with os.scandir(directory) as listing:
-            for entry in sorted(listing, key=lambda row: row.name):
-                if entries >= REAL_STATE_ENTRIES or total >= REAL_STATE_BYTES:
-                    return f"bounded:{entries}:{total}"
-                if time.monotonic() >= deadline:
-                    return f"deadline:{entries}:{total}"
-                entries += 1
-                info = entry.stat(follow_symlinks=False)
-                name = os.path.join(relative, entry.name)
-                digest.update(name.encode("utf-8", "surrogateescape"))
-                digest.update(b"\0")
-                digest.update(str(info.st_mode & 0o170000).encode())
-                digest.update(b"\0")
-                digest.update(str(info.st_size).encode())
-                digest.update(b"\0")
-                if stat_module.S_ISDIR(info.st_mode):
-                    stack.append(name)
-                elif stat_module.S_ISREG(info.st_mode):
-                    with open(entry.path, "rb") as handle:
-                        remaining = REAL_STATE_BYTES - total
-                        while True:
-                            block = handle.read(min(1 << 20, remaining))
-                            if not block:
-                                break
-                            digest.update(block)
-                            total += len(block)
-                            remaining -= len(block)
-                            if remaining <= 0:
-                                break
-                else:
-                    digest.update(b"special")
-    return f"{digest.hexdigest()}:{entries}:{total}"
+    stack = [(root_fd, "")]
+    try:
+        while stack:
+            fd, relative = stack.pop()
+            try:
+                try:
+                    with os.scandir(fd) as listing:
+                        children = sorted(listing, key=lambda entry: entry.name)
+                except OSError as error:
+                    return _incomplete(
+                        f"`{relative or '.'}` cannot be listed: {error}", entries, total
+                    )
+                for entry in children:
+                    if entries >= REAL_STATE_ENTRIES:
+                        return _incomplete(
+                            f"the entry cap {REAL_STATE_ENTRIES} was reached", entries, total
+                        )
+                    if time.monotonic() >= deadline:
+                        return _incomplete(
+                            f"the deadline {deadline_seconds:g}s was reached", entries, total
+                        )
+                    entries += 1
+                    name = os.path.join(relative, entry.name) if relative else entry.name
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError as error:
+                        return _incomplete(f"`{name}` changed while it was read: {error}", entries, total)
+                    digest.update(name.encode("utf-8", "surrogateescape"))
+                    digest.update(b"\0")
+                    digest.update(str(info.st_mode & 0o170000).encode())
+                    digest.update(b"\0")
+                    digest.update(str(info.st_mode & 0o7777).encode())
+                    digest.update(b"\0")
+                    digest.update(str(info.st_size).encode())
+                    digest.update(b"\0")
+                    digest.update(str(info.st_mtime_ns).encode())
+                    digest.update(b"\0")
+                    try:
+                        if stat_module.S_ISDIR(info.st_mode):
+                            child = os.open(
+                                entry.name,
+                                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=fd,
+                            )
+                            opened = os.fstat(child)
+                            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                                os.close(child)
+                                return _incomplete(
+                                    f"`{name}` was replaced between its facts and its open",
+                                    entries,
+                                    total,
+                                )
+                            stack.append((child, name))
+                        elif stat_module.S_ISREG(info.st_mode):
+                            file_fd = os.open(
+                                entry.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd
+                            )
+                            try:
+                                opened = os.fstat(file_fd)
+                                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                                    return _incomplete(
+                                        f"`{name}` was replaced between its facts and its open",
+                                        entries,
+                                        total,
+                                    )
+                                while True:
+                                    block = os.read(file_fd, 1 << 20)
+                                    if not block:
+                                        break
+                                    total += len(block)
+                                    if total > REAL_STATE_BYTES:
+                                        return _incomplete(
+                                            f"the byte cap {REAL_STATE_BYTES} was exceeded",
+                                            entries,
+                                            total,
+                                        )
+                                    digest.update(block)
+                            finally:
+                                os.close(file_fd)
+                        else:
+                            digest.update(b"special")
+                    except OSError as error:
+                        return _incomplete(f"`{name}` cannot be opened without following: {error}", entries, total)
+            finally:
+                os.close(fd)
+    finally:
+        for fd, _relative in stack:
+            os.close(fd)
+    return {
+        "status": "complete",
+        "digest": digest.hexdigest(),
+        "entries": entries,
+        "bytes": total,
+        "reason": None,
+    }
 
 
 class Fault(Exception):
@@ -301,6 +381,15 @@ def libproc():
     return _LIBPROC
 
 
+class DescriptorBound(OSError):
+    """A process holds at least its descriptor cap, so its listing is incomplete.
+
+    `proc_pidinfo` fills the buffer and answers its full byte count; reading that
+    as the process's whole table would turn a bound into evidence of absence, so a
+    full buffer is refused and the caller classifies the census incomplete.
+    """
+
+
 def list_descriptors(pid, cap=SCAN_DESCRIPTORS_PER_PROCESS):
     """One process's descriptor numbers, by S5's own custody primitive.
 
@@ -321,6 +410,12 @@ def list_descriptors(pid, cap=SCAN_DESCRIPTORS_PER_PROCESS):
         if error == 0:
             return []
         raise OSError(error, os.strerror(error))
+    if written >= cap * ctypes.sizeof(_FdInfo):
+        raise DescriptorBound(
+            errno.EOVERFLOW,
+            f"the descriptor table filled the {cap}-descriptor cap, so the listing is "
+            "incomplete",
+        )
     count = written // ctypes.sizeof(_FdInfo)
     return [buffer[index].proc_fd for index in range(count)]
 
@@ -459,6 +554,13 @@ def same_uid_census(own_pid, own_uid, sentinel_pid, rows=None,
             break
         try:
             descriptors = describe(pid, descriptor_cap)
+        except DescriptorBound as error:
+            # A descriptor table that fills its cap is incomplete evidence: the
+            # census did not see the whole table, so it cannot be a pass.
+            record["bounded"] = (
+                f"pid {pid} ({command}) holds at least {descriptor_cap} descriptors: {error}"
+            )
+            break
         except OSError as error:
             if error.errno == errno.ESRCH:
                 record["exited"] += 1
@@ -714,12 +816,15 @@ class Proof:
         scratch = os.environ.get("TMPDIR")
         if not scratch or not os.path.isdir(scratch):
             raise Fault("premise", "TMPDIR is not a directory the guard created")
-        # Premise 2's before-observation: the real account state as it is now.
+        # Premise 2's before-observation: the real account state as it is now,
+        # observed through descriptors without following a link and only ever
+        # complete if every entry and byte was read.
         self.real_state = {
             "path": os.path.join(account_home(), REAL_STATE_RELATIVE),
             "account_home": account_home(),
-            "before": real_state_digest(),
+            "before": real_state_observation(),
             "after": None,
+            "complete": False,
             "unchanged": None,
         }
         self.root = tempfile.mkdtemp(prefix="barge-scratch-proof-", dir=scratch)
@@ -1337,69 +1442,86 @@ class Proof:
         return None
 
     def pull(self):
-        """Pull the owned image mid-delete, in an authorized detach mode.
+        """Pull the owned image mid-delete with the ordinary detach the case names.
 
-        The design's case is an ordinary detach mid-delete; when the running
-        delete holds the volume busy, premise 5's one forced detach is the owned
-        image's own whole-disk device. Returns the mode that actually detached
-        it, which the case records, so the receipt shows the mode used.
+        The brief's case is an ordinary detach mid-delete. A forced detach is
+        never substituted for it: if the ordinary detach is refused, the case is
+        unproved and says so, rather than proving a different behaviour under the
+        same name.
         """
         result = run(["hdiutil", "detach", self.mount], self.env, timeout=120, check=False)
-        if result.returncode == 0:
-            self.attached = False
-            return "ordinary"
-        forced = run(
-            ["hdiutil", "detach", "-force", f"/dev/{self.whole_disk}"],
-            self.env,
-            timeout=120,
-            check=False,
-        )
-        if forced.returncode != 0:
+        if result.returncode != 0:
             raise Fault(
                 "case",
-                "neither the ordinary detach nor the owned image's own whole-disk "
-                f"force detached it: {(forced.stderr or forced.stdout).strip()[-200:]}",
+                "the ordinary detach mid-delete was refused "
+                f"({result.returncode}: {(result.stderr or result.stdout).strip()[-200:]}), "
+                "so this case is unproved; no forced detach is used as a substitute",
             )
         self.attached = False
-        return "forced-owned-whole-disk"
+        return "ordinary"
 
     def assert_resolver(self):
-        """Assert which state directory the product selected, and why.
+        """Prove the product's state resolution from fixture-only evidence.
 
-        Premise 2 is about the resolver, not about `HOME`: the account home is the
-        password-database one, and only `BARGE_STATE_DIR` moves state. The
-        document must report the fixture directory, the environment override as
-        its source, and the real account home — with this proof's private `HOME`
-        visible as a mismatch.
+        `describe` is not used: it observes live Oxide pools and removable
+        records, which a proof must never read. Instead a state-only verb reads
+        and writes only the state directory: the delegation it records has to land
+        in this proof's fixture registry (a resolver that had chosen the real
+        account state could not see that registry, would refuse `unknown_state`,
+        and would write there instead), and the withdrawal then has to remove it
+        from the same fixture registry. The account home is the password
+        database's, not this proof's `HOME`, so an override is the only thing that
+        could have moved state, and premise 2's before/after observation covers
+        the real directory.
         """
-        code, document = self.barge("describe", expect=0)
-        if code != 0:
-            raise Fault("premise", f"describe exited {code}: {document}")
-        data = document.get("data") or {}
-        state = data.get("state") or {}
-        home = state.get("home") or {}
-        actual = {
-            "state.dir": state.get("dir"),
-            "state.source": state.get("source"),
-            "state.home.account": home.get("account"),
-            "state.home.environment": home.get("environment"),
-            "state.home.mismatch": home.get("mismatch"),
+        if os.environ.get("BARGE_STATE_DIR") != self.state:
+            raise Fault(
+                "premise",
+                "BARGE_STATE_DIR is not this proof's fixture state directory",
+            )
+        registry_path = os.path.join(self.state, "registry.json")
+        if not os.path.isfile(registry_path):
+            raise Fault("premise", "the fixture state directory holds no registry")
+        home = account_home()
+        if os.environ.get("HOME") != self.home:
+            raise Fault("premise", "HOME is not this proof's private fixture home")
+        if home == self.home:
+            raise Fault(
+                "premise",
+                "the fixture HOME is also the account home, so the proof cannot "
+                "separate the two",
+            )
+        resolver = "barge-proof-resolver"
+        self.barge(
+            "scratch", "delegate", "--volume", self.uuid, "--family",
+            "effigy_scratch", "--by", resolver, expect=0,
+        )
+        with open(registry_path, encoding="utf-8") as handle:
+            recorded = json.load(handle)["volumes"][0]["scratch_grants"]["delegations"]
+        if [row["by"] for row in recorded] != [resolver]:
+            raise Fault(
+                "premise",
+                f"the recorded delegation did not land in the fixture registry: {recorded}",
+            )
+        self.barge(
+            "scratch", "delegate", "--volume", self.uuid, "--family",
+            "effigy_scratch", "--by", resolver, "--revoke", expect=0,
+        )
+        with open(registry_path, encoding="utf-8") as handle:
+            withdrawn = json.load(handle)["volumes"][0]["scratch_grants"]["delegations"]
+        if withdrawn:
+            raise Fault(
+                "premise",
+                f"the withdrawn delegation is still recorded in the fixture: {withdrawn}",
+            )
+        self.resolver = {
+            "command": "scratch.delegate/scratch.revoke",
+            "state_dir": self.state,
+            "source": "BARGE_STATE_DIR override (the only path that moves state)",
+            "account_home": home,
+            "fixture_home": self.home,
+            "observed": "the delegation was recorded in and withdrawn from the fixture registry",
         }
-        expected = {
-            "state.dir": self.state,
-            "state.source": "environment_override",
-            "state.home.account": account_home(),
-            "state.home.environment": self.home,
-            "state.home.mismatch": True,
-        }
-        for fact in RESOLVER_FACTS:
-            if actual[fact] != expected[fact]:
-                raise Fault(
-                    "premise",
-                    f"the resolver's {fact} is {actual[fact]!r}, not the fixture's "
-                    f"{expected[fact]!r}",
-                )
-        self.resolver = {"facts": actual, "asserted": list(RESOLVER_FACTS)}
 
     # -- the run ----------------------------------------------------------
 
@@ -1447,7 +1569,11 @@ class Proof:
         # and passed, and nothing was cancelled. An infrastructure abort is
         # unqualified in both modes and carries no case rows at all: no case ran.
         classification = "infrastructure" if self.infrastructure else "proof"
-        state_ok = bool(self.real_state and self.real_state.get("unchanged") is True)
+        state_ok = bool(
+            self.real_state
+            and self.real_state.get("complete") is True
+            and self.real_state.get("unchanged") is True
+        )
         return {
             "schema": SCHEMA,
             "qualified": (classification == "proof"
@@ -1687,6 +1813,25 @@ def preflight_problems():
     elif record["checks"][1]["exited"] != 1:
         problems.append("the census did not count the exited process")
 
+    # A descriptor table that fills its cap is incomplete evidence, not a
+    # complete listing.
+    def cap_filled(pid, cap=CENSUS_DESCRIPTOR_CAP):
+        if pid == 5000:
+            raise DescriptorBound(
+                errno.EOVERFLOW,
+                f"the descriptor table filled the {cap}-descriptor cap, so the listing "
+                "is incomplete",
+            )
+        return [0, 1, 2]
+
+    record, error, _spawned, reaped = run(healthy, cap_filled)
+    if record is not None or error.check != "same_uid_census":
+        problems.append("a cap-filled descriptor table was accepted as complete")
+    elif "descriptors" not in error.detail or "pid 5000" not in error.detail:
+        problems.append(f"the descriptor-cap refusal does not name the pid and cap: {error.detail}")
+    if "written >= cap * ctypes.sizeof(_FdInfo)" not in inspect.getsource(list_descriptors):
+        problems.append("the descriptor listing does not detect a full buffer")
+
     # A bound hit is infrastructure, not a partial pass.
     def many_rows(*_rows):
         return [
@@ -1826,22 +1971,31 @@ def preflight_problems():
     if not 0 < CENSUS_SECONDS <= 60:
         problems.append("the census deadline is not short")
 
-    # Premise 2: the proof reads the real state before and after, and asserts the
-    # resolver's fixture identity rather than declaring it.
+    # Premise 2: the proof reads the real state before and after, both readings
+    # must be complete, and the resolver is proved from fixture-only evidence.
     setup_source = inspect.getsource(Proof.setup)
-    if "real_state_digest()" not in setup_source:
+    if "real_state_observation()" not in setup_source:
         problems.append("setup does not observe the real account state before the run")
     main_source = inspect.getsource(main)
-    if "real_state_digest()" not in main_source or "unchanged" not in main_source:
+    if "real_state_observation()" not in main_source or "unchanged" not in main_source:
         problems.append("main does not observe and compare the real account state after the run")
     if "the real account state changed during the run" not in main_source:
         problems.append("a changed real account state does not fail the premise")
+    if "incomplete" not in main_source or '"complete"' not in main_source:
+        problems.append("an incomplete real-state observation does not fail the premise")
+    observation_source = inspect.getsource(real_state_observation)
+    for marker in ("O_NOFOLLOW", "O_DIRECTORY", "fstat", "mtime_ns",
+                   "the entry cap", "the byte cap", "the deadline"):
+        if marker not in observation_source:
+            problems.append(f"the real-state observation does not apply `{marker}`")
+    if "follow_symlinks=False" not in observation_source:
+        problems.append("the real-state observation follows symlinks")
     resolver_source = inspect.getsource(Proof.assert_resolver)
-    for fact in RESOLVER_FACTS:
-        if fact not in resolver_source:
-            problems.append(f"the resolver assertion does not read {fact}")
-    if "environment_override" not in resolver_source:
-        problems.append("the resolver assertion does not require the fixture override")
+    if '"describe"' in resolver_source:
+        problems.append("the resolver assertion reads live state through describe")
+    for hook in ("scratch", "BARGE_STATE_DIR", "registry.json", "--revoke"):
+        if hook not in resolver_source:
+            problems.append(f"the resolver assertion does not use `{hook}`")
     if REAL_STATE_RELATIVE != "Library/Application Support/barge/state":
         problems.append("the real state root is not the product's own layout")
 
@@ -1860,10 +2014,18 @@ def preflight_problems():
     if "the proof cleanup raised" not in main_source_cleanup:
         problems.append("main does not record a cleanup that raised")
     pull_source = inspect.getsource(Proof.pull)
-    if 'f"/dev/{self.whole_disk}"' not in pull_source:
-        problems.append("the pull is not the owned image's own whole-disk force")
     if '["hdiutil", "detach", self.mount]' not in pull_source:
-        problems.append("the pull does not attempt the ordinary detach first")
+        problems.append("the pull does not use the ordinary detach")
+    if "-force" in pull_source:
+        problems.append("the pull substitutes a forced detach for the ordinary case")
+    for source in (
+        pull_source,
+        inspect.getsource(Proof.detach),
+        inspect.getsource(Proof.cleanup),
+        inspect.getsource(Proof.create_image),
+    ):
+        if "-force" in source:
+            problems.append("a proof detach uses a forced detach")
     return problems
 
 
@@ -2009,7 +2171,8 @@ def main(argv):
                 "real_state": REAL_STATE_RELATIVE,
                 "entries": REAL_STATE_ENTRIES,
                 "bytes": REAL_STATE_BYTES,
-                "resolver_facts": RESOLVER_FACTS,
+                "deadline_s": REAL_STATE_SECONDS,
+                "resolver_proof": "scratch.delegate/scratch.revoke against the fixture registry",
             },
             "supervisor_sha256": SUPERVISOR_SHA256,
             "problems": problems,
@@ -2064,17 +2227,36 @@ def main(argv):
         except Exception as error:
             cancelled = f"the proof cleanup raised: {type(error).__name__}: {error}"
     # Premise 2's after-observation, and its assertion: the real account state is
-    # exactly what it was, and the resolver's fixture identity was already proved.
+    # exactly what it was, both observations are complete, and the resolver's
+    # fixture identity was already proved from fixture-only evidence.
     if proof.real_state is not None:
-        proof.real_state["after"] = real_state_digest()
-        proof.real_state["unchanged"] = (
-            proof.real_state["after"] == proof.real_state["before"]
+        before = proof.real_state["before"]
+        after = real_state_observation()
+        proof.real_state["after"] = after
+        # Two incomplete observations are never equality: a cap, a deadline, a
+        # short read or a raced entry leaves the premise unproven.
+        complete = before["status"] in ("absent", "complete") and after["status"] in (
+            "absent",
+            "complete",
         )
-        if not proof.real_state["unchanged"]:
+        proof.real_state["complete"] = complete
+        if not complete:
             premise_failure = (
-                "the real account state changed during the run: "
-                f"{proof.real_state['before']} -> {proof.real_state['after']}"
+                "the real account state observation is incomplete: "
+                f"before {before['status']} ({before['reason']}), after "
+                f"{after['status']} ({after['reason']})"
             )
+            proof.real_state["unchanged"] = False
+        else:
+            proof.real_state["unchanged"] = (
+                before["status"] == after["status"] and before["digest"] == after["digest"]
+            )
+            if not proof.real_state["unchanged"]:
+                premise_failure = (
+                    "the real account state changed during the run: "
+                    f"{before['status']}:{before['digest']} -> "
+                    f"{after['status']}:{after['digest']}"
+                )
     else:
         premise_failure = "the real account state was never observed before the run"
     if proof.resolver is None:
