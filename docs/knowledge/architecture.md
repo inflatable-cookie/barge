@@ -161,6 +161,22 @@ macOS on APFS only for now (Tom, 2026-10-26, Q-005). Every platform-specific fac
 - A command that will refuse changes nothing first.
 - Unknown is never treated as absent, idle or empty.
 
+## Space policy (carried from Oxide, Tom 2026-10-25 and 2026-10-26)
+
+- A consumer area's soft cap counts only that area's own bytes.
+- The volume reserve is a prune trigger: below it, Barge prunes the
+  least-recently-used idle owned roots, by each area's declared policy, at
+  admission and while work runs.
+- Only a hard floor (default 10 GiB) stops work, and only once nothing idle is
+  left. Low space never sends work to the internal drive; the drive-absent
+  fallback is a separate, declared per-area policy.
+- Idleness comes only from Barge's own hold and release, never from a
+  consumer's internals. Unknown is never idle.
+- Owned-root identity must survive remounts: volume UUID plus a stable
+  per-root identity, never the raw device number alone.
+
+These are designed in stages 3 and 4 (Queue leads a077df77 and 6dd31d9e).
+
 ## Boundary with Oxide
 
 **Moves to Barge**, staged so Oxide never loses a working path:
