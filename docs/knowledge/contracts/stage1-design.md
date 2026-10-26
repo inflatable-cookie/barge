@@ -2271,13 +2271,17 @@ Choices S4 made where this design left the mechanic to the slice:
   descriptor with `O_NOFOLLOW`, so a symlinked or swapped path is an incomplete
   observation and never a followed one, and each entry's name, kind, mode, size,
   mtime and bytes are hashed. The entry cap, the byte cap, the deadline, a short
-  read or an entry whose identity changed under the walk make the observation
-  `incomplete`; two incomplete observations never prove equality, and an
-  incomplete or changed reading makes the receipt unqualified. The resolver is
-  proved from fixture-only evidence, never from `describe` (which observes live
-  Oxide state): a delegation recorded through a state-only verb must land in the
-  proof's fixture registry, and its withdrawal must remove it, while the account
-  home is the password database's and this proof's `HOME` is its private fixture.
+  read (fewer bytes than the file's own facts report), a file that grew, or any
+  size or mtime change between the entry's facts, its open and the end of its
+  read make the observation `incomplete`; two incomplete observations never prove
+  equality, and an incomplete or changed reading makes the receipt unqualified.
+  The resolver is proved from fixture-only evidence, never from `describe` (which
+  observes live Oxide state), and from the environment the **child commands** run
+  with rather than the proof process's own: the child's `BARGE_STATE_DIR` must be
+  the fixture state directory and its `HOME` the private fixture home, distinct
+  from the password-database account home, and a delegation recorded through a
+  state-only verb must land in the proof's fixture registry with its withdrawal
+  removing it.
 - **A failed ordinary detach keeps the backing.** Cleanup detaches ordinarily and
   stops there: it never force-detaches by mount path, and a failed detach leaves
   the image attached and its backing in place and makes the receipt unqualified.

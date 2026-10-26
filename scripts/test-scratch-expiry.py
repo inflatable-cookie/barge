@@ -192,6 +192,61 @@ def account_home():
     return pwd.getpwuid(os.geteuid()).pw_dir
 
 
+def child_environment_problems(env, state_dir, fixture_home, account_home):
+    """Why a child command's environment cannot prove fixture state resolution.
+
+    The proof hands its child barge commands `self.env`; the guard's own
+    environment is not what the product sees, so only the child's variables are
+    evidence. An empty list means the child can resolve state only through this
+    proof's fixture state directory, and the account home cannot be confused with
+    the fixture home.
+    """
+    problems = []
+    override = env.get("BARGE_STATE_DIR")
+    if override != state_dir:
+        problems.append(
+            f"the child's BARGE_STATE_DIR is {override!r}, not the fixture {state_dir!r}"
+        )
+    elif not os.path.isabs(override):
+        problems.append(
+            f"the child's BARGE_STATE_DIR is not an absolute path: {override!r}"
+        )
+    if env.get("HOME") != fixture_home:
+        problems.append(
+            f"the child's HOME is {env.get('HOME')!r}, not the fixture {fixture_home!r}"
+        )
+    if account_home == fixture_home:
+        problems.append(
+            "the fixture HOME is also the password-database account home, so the "
+            "proof cannot separate the two state sources"
+        )
+    return problems
+
+
+def file_read_complete(
+    *,
+    expected_size,
+    expected_mtime_ns,
+    opened_size,
+    opened_mtime_ns,
+    read_total,
+    after_size,
+    after_mtime_ns,
+):
+    """Whether one file's bytes are a complete, stable reading.
+
+    A short read (the file truncated between its facts and its bytes), an extra
+    byte (a file that grew under the read), or any size or mtime change from the
+    entry's own facts through the read to its end leaves the content equality
+    premise unproven, however plausible the digest looks.
+    """
+    return (
+        expected_size == opened_size == after_size
+        and expected_mtime_ns == opened_mtime_ns == after_mtime_ns
+        and read_total == expected_size
+    )
+
+
 def _incomplete(reason, entries=0, total=0):
     """An observation that cannot prove the state's content: never a pass."""
     return {
@@ -297,10 +352,12 @@ def real_state_observation(deadline_seconds=REAL_STATE_SECONDS):
                                         entries,
                                         total,
                                     )
+                                read_total = 0
                                 while True:
                                     block = os.read(file_fd, 1 << 20)
                                     if not block:
                                         break
+                                    read_total += len(block)
                                     total += len(block)
                                     if total > REAL_STATE_BYTES:
                                         return _incomplete(
@@ -309,6 +366,22 @@ def real_state_observation(deadline_seconds=REAL_STATE_SECONDS):
                                             total,
                                         )
                                     digest.update(block)
+                                after = os.fstat(file_fd)
+                                if not file_read_complete(
+                                    expected_size=info.st_size,
+                                    expected_mtime_ns=info.st_mtime_ns,
+                                    opened_size=opened.st_size,
+                                    opened_mtime_ns=opened.st_mtime_ns,
+                                    read_total=read_total,
+                                    after_size=after.st_size,
+                                    after_mtime_ns=after.st_mtime_ns,
+                                ):
+                                    return _incomplete(
+                                        f"`{name}` was truncated or changed during its read "
+                                        f"({read_total} bytes read, {info.st_size} expected)",
+                                        entries,
+                                        total,
+                                    )
                             finally:
                                 os.close(file_fd)
                         else:
@@ -1474,23 +1547,15 @@ class Proof:
         could have moved state, and premise 2's before/after observation covers
         the real directory.
         """
-        if os.environ.get("BARGE_STATE_DIR") != self.state:
-            raise Fault(
-                "premise",
-                "BARGE_STATE_DIR is not this proof's fixture state directory",
-            )
+        home = account_home()
+        # The evidence is the environment the *child* commands run with, not this
+        # process's: the guard's environment is not what the product reads.
+        problems = child_environment_problems(self.env, self.state, self.home, home)
+        if problems:
+            raise Fault("premise", "; ".join(problems))
         registry_path = os.path.join(self.state, "registry.json")
         if not os.path.isfile(registry_path):
             raise Fault("premise", "the fixture state directory holds no registry")
-        home = account_home()
-        if os.environ.get("HOME") != self.home:
-            raise Fault("premise", "HOME is not this proof's private fixture home")
-        if home == self.home:
-            raise Fault(
-                "premise",
-                "the fixture HOME is also the account home, so the proof cannot "
-                "separate the two",
-            )
         resolver = "barge-proof-resolver"
         self.barge(
             "scratch", "delegate", "--volume", self.uuid, "--family",
@@ -1516,8 +1581,9 @@ class Proof:
             )
         self.resolver = {
             "command": "scratch.delegate/scratch.revoke",
+            "environment": "the child commands' own environment, not this process's",
             "state_dir": self.state,
-            "source": "BARGE_STATE_DIR override (the only path that moves state)",
+            "source": "the child's BARGE_STATE_DIR override (the only path that moves state)",
             "account_home": home,
             "fixture_home": self.home,
             "observed": "the delegation was recorded in and withdrawn from the fixture registry",
@@ -1993,9 +2059,73 @@ def preflight_problems():
     resolver_source = inspect.getsource(Proof.assert_resolver)
     if '"describe"' in resolver_source:
         problems.append("the resolver assertion reads live state through describe")
-    for hook in ("scratch", "BARGE_STATE_DIR", "registry.json", "--revoke"):
+    for hook in ("scratch", "registry.json", "--revoke"):
         if hook not in resolver_source:
             problems.append(f"the resolver assertion does not use `{hook}`")
+    if "os.environ" in resolver_source:
+        problems.append("the resolver assertion reads this process's environment, not the child's")
+    if "child_environment_problems(self.env" not in resolver_source:
+        problems.append("the resolver assertion does not verify the child's environment")
+
+    # The child environment is the one the product sees; the guard's parent
+    # environment must never satisfy the assertion.
+    state_dir, fixture_home, real_home = "/fixture/state", "/fixture/home", "/Users/someone"
+    good = {"BARGE_STATE_DIR": state_dir, "HOME": fixture_home}
+    if child_environment_problems(good, state_dir, fixture_home, real_home):
+        problems.append("a fixture child environment was refused")
+    guard_like = {"HOME": real_home}
+    named = " ".join(child_environment_problems(guard_like, state_dir, fixture_home, real_home))
+    if "BARGE_STATE_DIR" not in named or "HOME" not in named:
+        problems.append(f"a parent-style environment is not refused by name: {named}")
+    elsewhere = {"BARGE_STATE_DIR": "/real/state", "HOME": real_home}
+    if not any(
+        "BARGE_STATE_DIR" in problem
+        for problem in child_environment_problems(
+            elsewhere, state_dir, fixture_home, real_home
+        )
+    ):
+        problems.append("a child pointed at another state directory was accepted")
+    if not child_environment_problems(
+        {"BARGE_STATE_DIR": "relative/state", "HOME": fixture_home},
+        state_dir,
+        fixture_home,
+        real_home,
+    ):
+        problems.append("a relative child state directory was accepted")
+    if not any(
+        "account home" in problem
+        for problem in child_environment_problems(good, state_dir, fixture_home, fixture_home)
+    ):
+        problems.append("a fixture HOME that is also the account home was accepted")
+
+    # A short or unstable file read is incomplete, however plausible the digest.
+    complete_read = {
+        "expected_size": 7,
+        "expected_mtime_ns": 11,
+        "opened_size": 7,
+        "opened_mtime_ns": 11,
+        "read_total": 7,
+        "after_size": 7,
+        "after_mtime_ns": 11,
+    }
+    if not file_read_complete(**complete_read):
+        problems.append("a complete file read was refused")
+    for field, value, why in (
+        ("read_total", 0, "a truncated read (the reported counterexample)"),
+        ("read_total", 8, "a read that produced more bytes than the file holds"),
+        ("after_size", 6, "a file that shrank after the read"),
+        ("after_mtime_ns", 12, "a file whose mtime moved after the read"),
+        ("opened_size", 6, "a file whose size moved between its facts and its open"),
+    ):
+        broken = dict(complete_read)
+        broken[field] = value
+        if file_read_complete(**broken):
+            problems.append(f"{why} was accepted as complete")
+    observation_source = inspect.getsource(real_state_observation)
+    if "file_read_complete(" not in observation_source:
+        problems.append("the real-state observation does not check a complete file read")
+    if "read_total" not in observation_source:
+        problems.append("the real-state observation does not count the bytes it read")
     if REAL_STATE_RELATIVE != "Library/Application Support/barge/state":
         problems.append("the real state root is not the product's own layout")
 
