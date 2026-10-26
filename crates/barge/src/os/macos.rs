@@ -21,8 +21,8 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::os::facts::{
     AccountFacts, ChildEntry, ChildListing, ChildRemoval, DescriptorScan, DescriptorScanRequest,
     DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, FileSystem, MountPoint, MountRoot,
-    OpenDescriptor, ProcessIdentity, ProcessObserver, RemoveKind, RetriedUnreadable,
-    RetryResolution, VolumeFacts, VolumeIdentity, VolumeUuid, RETRY_RECORDS,
+    OpenDescriptor, ProcessIdentity, ProcessObserver, RemoveKind, RetriedUnreadable, RetryEvidence,
+    RetryResolution, VolumeFacts, VolumeIdentity, VolumeUuid,
 };
 
 /// The parent every managed volume mounts directly under.
@@ -260,6 +260,7 @@ impl ProcessObserver for MacOs {
                 processes: 0,
                 descriptors: 0,
                 bound: "process list",
+                retry: RetryEvidence::default(),
             });
         };
         let table: Vec<ProcessIdentity> = table.into_iter().map(|row| row.identity).collect();
@@ -313,7 +314,26 @@ impl MacOs {
         backoffs: &[Duration],
         faults: &mut [StatedListing],
     ) -> Result<DescriptorScan> {
+        // The only fact the scan cannot begin with: this account's own uid. Every
+        // later failure is an answer, so the bounded retry record reaches the
+        // refusal that carries it.
         let uid = self.effective_uid()?;
+        let mut retry = RetryEvidence::default();
+        self.scan_table(request, table, backoffs, faults, uid, &mut retry)
+    }
+
+    /// One scan of a known process table, recording its bounded `EPERM`
+    /// re-observation in `retry` so every answer carries it.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_table(
+        &self,
+        request: &DescriptorScanRequest<'_>,
+        table: &[ProcessIdentity],
+        backoffs: &[Duration],
+        faults: &mut [StatedListing],
+        uid: u32,
+        retry: &mut RetryEvidence,
+    ) -> Result<DescriptorScan> {
         let started = Instant::now();
         // The kernel reports canonical paths, so the root is matched under both
         // the spelling the walk reached and the one the filesystem resolves.
@@ -327,8 +347,6 @@ impl MacOs {
         let mut processes = 0usize;
         let mut descriptors = 0usize;
         let mut foreign = 0usize;
-        let mut retried_unreadable = 0usize;
-        let mut retried: Vec<RetriedUnreadable> = Vec::new();
         let mut open = Vec::new();
         // Whether the process the request names as the calling one was found and
         // skipped. An exclusion that never matched proves nothing about what it
@@ -340,6 +358,7 @@ impl MacOs {
                     processes,
                     descriptors,
                     bound: "time",
+                    retry: retry.clone(),
                 });
             }
             let pid = identity.pid;
@@ -350,11 +369,12 @@ impl MacOs {
             // may not read its facts at all.
             match identity.effective_uid {
                 None => {
-                    let reason = format!(
-                        "pid {pid} has no readable effective uid, so the scan cannot classify it"
-                    );
-                    return Err(Error::new(ErrorKind::UnknownState, reason)
-                        .with_detail("pid", u64::from(pid).into()));
+                    return Ok(DescriptorScan::Unreadable {
+                        reason: format!(
+                            "pid {pid} has no readable effective uid, so the scan cannot classify it"
+                        ),
+                        retry: retry.clone(),
+                    });
                 }
                 Some(other) if other != uid => {
                     foreign = foreign.saturating_add(1);
@@ -369,16 +389,13 @@ impl MacOs {
                     // skip is conditional on the identity custody read when it
                     // asked for the scan: a reused pid is a different process.
                     if identity.start != exclusion.start {
-                        return Err(Error::new(
-                            ErrorKind::UnknownState,
-                            format!(
+                        return Ok(DescriptorScan::Unreadable {
+                            reason: format!(
                                 "pid {pid} is the calling process, but its start identity is {}, not the recorded {}; the scan cannot exclude itself",
                                 identity.start, exclusion.start
                             ),
-                        )
-                        .with_detail("pid", u64::from(pid).into())
-                        .with_detail("recorded_start", exclusion.start.into())
-                        .with_detail("actual_start", identity.start.into()));
+                            retry: retry.clone(),
+                        });
                     }
                     self_excluded = true;
                     continue;
@@ -389,12 +406,9 @@ impl MacOs {
             // many processes needed it and the bounded record says which ones
             // and how each resolved.
             let settled =
-                self.settle_descriptors(identity, uid, started, request.timeout, backoffs, faults)?;
+                self.settle_descriptors(identity, uid, started, request.timeout, backoffs, faults);
             if let Some(record) = settled.record {
-                retried_unreadable = retried_unreadable.saturating_add(1);
-                if retried.len() < RETRY_RECORDS {
-                    retried.push(record);
-                }
+                retry.record(record);
             }
             let fds = match settled.listing {
                 SettledListing::Listed(fds) => fds,
@@ -414,6 +428,15 @@ impl MacOs {
                         processes,
                         descriptors,
                         bound: "time",
+                        retry: retry.clone(),
+                    })
+                }
+                // The observation itself cannot be completed. The record of the
+                // re-observation travels with the refusal.
+                SettledListing::Unreadable(reason) => {
+                    return Ok(DescriptorScan::Unreadable {
+                        reason,
+                        retry: retry.clone(),
                     })
                 }
             };
@@ -423,6 +446,7 @@ impl MacOs {
                     processes,
                     descriptors,
                     bound: "processes",
+                    retry: retry.clone(),
                 });
             }
             if fds.len() >= SCAN_DESCRIPTORS_PER_PROCESS {
@@ -430,6 +454,7 @@ impl MacOs {
                     processes,
                     descriptors,
                     bound: "descriptors per process",
+                    retry: retry.clone(),
                 });
             }
             for fd in fds {
@@ -438,6 +463,7 @@ impl MacOs {
                         processes,
                         descriptors,
                         bound: "time",
+                        retry: retry.clone(),
                     });
                 }
                 descriptors = descriptors.saturating_add(1);
@@ -446,13 +472,21 @@ impl MacOs {
                         processes,
                         descriptors,
                         bound: "descriptors",
+                        retry: retry.clone(),
                     });
                 }
                 if libc::c_int::try_from(fd.proc_fdtype).ok() != Some(libc::PROX_FDTYPE_VNODE) {
                     continue;
                 }
-                let Some(path) = descriptor_path(pid, fd.proc_fd)? else {
-                    continue;
+                let path = match descriptor_path(pid, fd.proc_fd) {
+                    Ok(Some(path)) => path,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        return Ok(DescriptorScan::Unreadable {
+                            reason: error.message().to_owned(),
+                            retry: retry.clone(),
+                        })
+                    }
                 };
                 if roots.iter().any(|root| path_is_at_or_under(&path, root)) {
                     open.push(OpenDescriptor {
@@ -465,22 +499,20 @@ impl MacOs {
         }
         if let Some(exclusion) = request.self_exclusion {
             if !self_excluded {
-                return Err(Error::new(
-                    ErrorKind::UnknownState,
-                    format!(
+                return Ok(DescriptorScan::Unreadable {
+                    reason: format!(
                         "the calling process pid {} was not observed as this account's own in the process table, so the scan cannot prove what it excluded",
                         exclusion.pid
                     ),
-                )
-                .with_detail("pid", u64::from(exclusion.pid).into()));
+                    retry: retry.clone(),
+                });
             }
         }
         Ok(DescriptorScan::Complete {
             processes,
             descriptors,
             foreign,
-            retried_unreadable,
-            retried,
+            retry: retry.clone(),
             open,
         })
     }
@@ -508,7 +540,7 @@ impl MacOs {
         timeout: Duration,
         backoffs: &[Duration],
         faults: &mut [StatedListing],
-    ) -> Result<Settled> {
+    ) -> Settled {
         let pid = classified.pid;
         let settle_started = Instant::now();
         let mut start = classified.start;
@@ -523,54 +555,55 @@ impl MacOs {
         };
         loop {
             let listing = match stated_errno(faults, pid) {
-                Some(errno) => DescriptorListing::Unreadable(io::Error::from_raw_os_error(errno)),
+                Some(errno) => DescriptorListing::from_errno(errno),
                 None => self.list_descriptors(pid),
             };
             match listing {
                 DescriptorListing::Listed(fds) => {
-                    if record.errnos.is_empty() {
-                        return Ok(Settled {
-                            listing: SettledListing::Listed(fds),
-                            record: None,
-                        });
-                    }
                     record.resolution = RetryResolution::Listed;
-                    return Ok(Settled {
-                        listing: SettledListing::Listed(fds),
-                        record: Some(record),
-                    });
+                    return settle(record, SettledListing::Listed(fds), started, timeout);
                 }
-                DescriptorListing::Gone => {
-                    if record.errnos.is_empty() {
-                        return Ok(Settled {
-                            listing: SettledListing::Gone,
-                            record: None,
-                        });
+                DescriptorListing::Gone { errno } => {
+                    // A retried listing that answers `ESRCH` is the positive fact
+                    // that ended the settle, so the sequence records it. A first
+                    // listing that answers it never made a retry record at all.
+                    if !record.errnos.is_empty() {
+                        if let Some(errno) = errno {
+                            record.errnos.push(errno);
+                        }
                     }
                     record.resolution = RetryResolution::Gone;
-                    return Ok(Settled {
-                        listing: SettledListing::Gone,
-                        record: Some(record),
-                    });
+                    return settle(record, SettledListing::Gone, started, timeout);
                 }
                 DescriptorListing::Unreadable(error) => {
                     // Only `EPERM` is the intermittent answer this rule is about.
                     // Every other unreadable listing is unknown immediately, as
                     // it was before.
                     if error.raw_os_error() != Some(libc::EPERM) {
-                        return Err(unreadable_descriptors(pid, &error));
+                        return Settled {
+                            listing: SettledListing::Unreadable(
+                                unreadable_descriptors(pid, &error).message().to_owned(),
+                            ),
+                            record: retried(record),
+                        };
                     }
                     record.errnos.push(libc::EPERM);
                     // The positive fact: what the kernel's own table reports for
                     // this pid now. Elapsed time decides nothing here.
-                    let Some(now) = self.reobserve_identity(pid, faults)? else {
+                    let now = match self.reobserve_identity(pid, faults) {
+                        Ok(Some(now)) => now,
                         // The kernel reports no such pid: it is positively gone,
                         // and a gone process holds no descriptors.
-                        record.resolution = RetryResolution::Gone;
-                        return Ok(Settled {
-                            listing: SettledListing::Gone,
-                            record: Some(record),
-                        });
+                        Ok(None) => {
+                            record.resolution = RetryResolution::Gone;
+                            return settle(record, SettledListing::Gone, started, timeout);
+                        }
+                        Err(error) => {
+                            return Settled {
+                                listing: SettledListing::Unreadable(error.message().to_owned()),
+                                record: retried(record),
+                            }
+                        }
                     };
                     if record.command.is_none() {
                         record.command = Some(now.command);
@@ -581,20 +614,16 @@ impl MacOs {
                             // named blind spot, counted and reported, never
                             // inspected (Tom, 2026-10-26, ruling bcaa83d8).
                             record.resolution = RetryResolution::Foreign;
-                            return Ok(Settled {
-                                listing: SettledListing::Foreign,
-                                record: Some(record),
-                            });
+                            return settle(record, SettledListing::Foreign, started, timeout);
                         }
                         Some(_) => {}
                         None => {
-                            return Err(Error::new(
-                                ErrorKind::UnknownState,
-                                format!(
+                            return Settled {
+                                listing: SettledListing::Unreadable(format!(
                                     "pid {pid} has no readable effective uid, so its unreadable descriptors cannot be settled"
-                                ),
-                            )
-                            .with_detail("pid", u64::from(pid).into()));
+                                )),
+                                record: retried(record),
+                            };
                         }
                     }
                     // A changed start identity means a different process now has
@@ -605,23 +634,42 @@ impl MacOs {
                         record.identity_changes = record.identity_changes.saturating_add(1);
                         start = now.identity.start;
                     }
+                    // The projected end of the next attempt is checked before the
+                    // backoff is taken, and both bounds are checked again after
+                    // it: a delayed wake must not buy one more listing past the
+                    // settle window or past the scan's own deadline.
                     let Some(backoff) = backoffs.get(retries).copied() else {
-                        record.resolution = RetryResolution::Unreadable;
-                        return Err(still_unreadable(&record, &error));
+                        return still_unreadable(record, &error);
                     };
-                    if settle_started.elapsed().saturating_add(backoff) >= EPERM_SETTLE_WINDOW {
-                        record.resolution = RetryResolution::Unreadable;
-                        return Err(still_unreadable(&record, &error));
-                    }
-                    if started.elapsed().saturating_add(backoff) >= timeout {
-                        record.resolution = RetryResolution::Bounded;
-                        return Ok(Settled {
-                            listing: SettledListing::Bounded,
-                            record: Some(record),
-                        });
+                    match stop_before_backoff(
+                        settle_started.elapsed(),
+                        started.elapsed(),
+                        backoff,
+                        timeout,
+                    ) {
+                        Some(RetryStop::Unreadable) => return still_unreadable(record, &error),
+                        Some(RetryStop::Bounded) => {
+                            record.resolution = RetryResolution::Bounded;
+                            return Settled {
+                                listing: SettledListing::Bounded,
+                                record: retried(record),
+                            };
+                        }
+                        None => {}
                     }
                     std::thread::sleep(backoff);
                     retries = retries.saturating_add(1);
+                    match stop_after_backoff(settle_started.elapsed(), started.elapsed(), timeout) {
+                        Some(RetryStop::Unreadable) => return still_unreadable(record, &error),
+                        Some(RetryStop::Bounded) => {
+                            record.resolution = RetryResolution::Bounded;
+                            return Settled {
+                                listing: SettledListing::Bounded,
+                                record: retried(record),
+                            };
+                        }
+                        None => {}
+                    }
                 }
             }
         }
@@ -686,7 +734,9 @@ impl MacOs {
             return match error.raw_os_error() {
                 // The kernel reports no such process: it is positively gone, so
                 // nothing it held is open.
-                Some(libc::ESRCH) => DescriptorListing::Gone,
+                Some(libc::ESRCH) => DescriptorListing::Gone {
+                    errno: Some(libc::ESRCH),
+                },
                 // No error at all: the process genuinely holds no descriptors.
                 Some(0) | None => DescriptorListing::Listed(Vec::new()),
                 _ => DescriptorListing::Unreadable(error),
@@ -708,12 +758,34 @@ impl MacOs {
 enum DescriptorListing {
     /// The process's descriptors, listed inside the per-process buffer.
     Listed(Vec<libc::proc_fdinfo>),
-    /// The kernel reports no such process.
-    Gone,
+    /// The kernel reports no such process, with the errno that said so when the
+    /// listing itself answered it.
+    Gone {
+        /// `ESRCH`, when the listing answered it, so a retried sequence records
+        /// the fact that ended it. `None` is a pid the kernel's own table no
+        /// longer reports.
+        errno: Option<i32>,
+    },
     /// The listing could not be read, with the kernel's own reason. `EPERM` is
     /// the intermittent answer the scan re-observes; every other reason is
     /// unknown at once.
     Unreadable(io::Error),
+}
+
+impl DescriptorListing {
+    /// The listing one errno stands for, classified the way `PROC_PIDLISTFDS` is
+    /// classified, so a stated answer means exactly what the kernel's own would.
+    fn from_errno(errno: i32) -> Self {
+        match errno {
+            // The kernel reports no such process: positively gone.
+            libc::ESRCH => Self::Gone {
+                errno: Some(libc::ESRCH),
+            },
+            // No error at all: the process holds no descriptors.
+            0 => Self::Listed(Vec::new()),
+            _ => Self::Unreadable(io::Error::from_raw_os_error(errno)),
+        }
+    }
 }
 
 /// What one same-uid process's descriptor listing settled to, and the bounded
@@ -732,6 +804,9 @@ enum SettledListing {
     Gone,
     Foreign,
     Bounded,
+    /// The observation cannot be completed, for this reason. The bounded retry
+    /// record travels beside it.
+    Unreadable(String),
 }
 
 /// What a test states about one process's descriptor listing.
@@ -767,44 +842,106 @@ fn stated_errno(faults: &mut [StatedListing], pid: u32) -> Option<i32> {
     Some(stated.errnos.remove(0))
 }
 
+/// Why one process's bounded re-observation has to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryStop {
+    /// The same identity is still unreadable after the retries it was given.
+    Unreadable,
+    /// One of the two deadlines would be crossed: the observation is bounded.
+    Bounded,
+}
+
+/// Whether the backoff before the next listing may be taken.
+///
+/// Both deadlines are projected forward, not only the retry count: the settle
+/// window must still hold when the backoff ends, and so must the scan's own time
+/// bound.
+fn stop_before_backoff(
+    settle_elapsed: Duration,
+    scan_elapsed: Duration,
+    backoff: Duration,
+    timeout: Duration,
+) -> Option<RetryStop> {
+    if settle_elapsed.saturating_add(backoff) >= EPERM_SETTLE_WINDOW {
+        return Some(RetryStop::Unreadable);
+    }
+    if scan_elapsed.saturating_add(backoff) >= timeout {
+        return Some(RetryStop::Bounded);
+    }
+    None
+}
+
+/// Whether the next listing may run after the backoff.
+///
+/// A wake that arrives late is checked against both deadlines again, so a
+/// delayed sleep never buys one more listing past the settle window or past the
+/// scan's own time bound.
+fn stop_after_backoff(
+    settle_elapsed: Duration,
+    scan_elapsed: Duration,
+    timeout: Duration,
+) -> Option<RetryStop> {
+    if settle_elapsed >= EPERM_SETTLE_WINDOW {
+        return Some(RetryStop::Unreadable);
+    }
+    if scan_elapsed >= timeout {
+        return Some(RetryStop::Bounded);
+    }
+    None
+}
+
+/// One terminal answer from [`MacOs::settle_descriptors`], turned into bounded
+/// when the scan's own deadline has passed while it was read: the scan never
+/// completes an observation beyond its time bound, and never returns a terminal
+/// answer for a candidate whose reading crossed it.
+fn settle(
+    mut record: RetriedUnreadable,
+    listing: SettledListing,
+    started: Instant,
+    timeout: Duration,
+) -> Settled {
+    if started.elapsed() >= timeout {
+        record.resolution = RetryResolution::Bounded;
+        return Settled {
+            listing: SettledListing::Bounded,
+            record: retried(record),
+        };
+    }
+    Settled {
+        listing,
+        record: retried(record),
+    }
+}
+
+/// The bounded record of one process's re-observation, or `None` when its
+/// listing never answered `EPERM`.
+fn retried(record: RetriedUnreadable) -> Option<RetriedUnreadable> {
+    (!record.errnos.is_empty()).then_some(record)
+}
+
 /// The refusal for a same-uid process whose descriptor listing still answers
 /// `EPERM` after its bounded re-observation.
 ///
 /// The errno sequence it was given, the identity it belongs to and the command
-/// are recorded, because unknown is a refusal and its evidence is what lets the
-/// next native diagnostic tell an intermittent answer from a persistent one.
-fn still_unreadable(record: &RetriedUnreadable, error: &io::Error) -> Error {
+/// are in the message and in the record beside it, because unknown is a refusal
+/// and its evidence is what lets the next native diagnostic tell an intermittent
+/// answer from a persistent one.
+fn still_unreadable(record: RetriedUnreadable, error: &io::Error) -> Settled {
     let described = match record.command.as_deref() {
         Some(command) => format!("`{command}`"),
         None => "an unnamed process".to_owned(),
     };
     let retries = record.errnos.len().saturating_sub(1);
-    Error::new(
-        ErrorKind::UnknownState,
-        format!(
-            "the open descriptors of {described} (pid {}, start {}) are still unreadable: {error} on {} attempts (retries: {retries})",
-            record.pid,
-            record.start,
-            record.errnos.len()
-        ),
-    )
-    .with_detail("pid", u64::from(record.pid).into())
-    .with_detail("command", record.command.clone().unwrap_or_default().into())
-    .with_detail("start", record.start.into())
-    .with_detail(
-        "errnos",
-        record
-            .errnos
-            .iter()
-            .map(i32::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
-            .into(),
-    )
-    .with_detail(
-        "identity_changes",
-        u64::try_from(record.identity_changes).unwrap_or(u64::MAX).into(),
-    )
+    let reason = format!(
+        "the open descriptors of {described} (pid {}, start {}) are still unreadable: {error} on {} attempts (retries: {retries})",
+        record.pid,
+        record.start,
+        record.errnos.len()
+    );
+    Settled {
+        listing: SettledListing::Unreadable(reason),
+        record: retried(record),
+    }
 }
 
 /// How many processes the scan reads from the kernel's table before it answers
@@ -2132,4 +2269,85 @@ fn removal_error(name: &str, kind: RemoveKind, error: io::Error) -> Error {
     Error::new(error_kind, message)
         .with_detail("name", name.into())
         .with_detail("os_error", error.to_string().into())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::time::Duration;
+
+    use super::{stop_after_backoff, stop_before_backoff, RetryStop, EPERM_SETTLE_WINDOW};
+
+    /// A scan deadline well clear of the settle window, so the two bounds are
+    /// told apart.
+    const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn the_first_retry_is_taken_inside_both_bounds() {
+        assert_eq!(
+            stop_before_backoff(
+                Duration::ZERO,
+                Duration::from_millis(3),
+                Duration::from_millis(25),
+                SCAN_TIMEOUT
+            ),
+            None
+        );
+        assert_eq!(
+            stop_after_backoff(
+                Duration::from_millis(25),
+                Duration::from_millis(28),
+                SCAN_TIMEOUT
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_backoff_that_would_end_past_the_settle_window_is_not_taken() {
+        // The projection is checked before the sleep: a retry that cannot finish
+        // inside the window is not started.
+        assert_eq!(
+            stop_before_backoff(
+                EPERM_SETTLE_WINDOW.saturating_sub(Duration::from_millis(10)),
+                Duration::ZERO,
+                Duration::from_millis(25),
+                SCAN_TIMEOUT
+            ),
+            Some(RetryStop::Unreadable)
+        );
+    }
+
+    #[test]
+    fn a_backoff_that_would_end_past_the_scan_deadline_is_not_taken() {
+        assert_eq!(
+            stop_before_backoff(
+                Duration::ZERO,
+                Duration::from_millis(9_990),
+                Duration::from_millis(25),
+                SCAN_TIMEOUT
+            ),
+            Some(RetryStop::Bounded)
+        );
+    }
+
+    #[test]
+    fn a_delayed_wake_past_the_settle_window_stops_the_retry() {
+        // The wake is checked again: a sleep that returned after the window had
+        // closed must not buy one more listing, even though the projection
+        // before it passed.
+        assert_eq!(
+            stop_after_backoff(EPERM_SETTLE_WINDOW, Duration::from_millis(30), SCAN_TIMEOUT),
+            Some(RetryStop::Unreadable)
+        );
+    }
+
+    #[test]
+    fn a_delayed_wake_past_the_scan_deadline_is_bounded() {
+        assert_eq!(
+            stop_after_backoff(Duration::from_millis(100), SCAN_TIMEOUT, SCAN_TIMEOUT),
+            Some(RetryStop::Bounded)
+        );
+    }
 }

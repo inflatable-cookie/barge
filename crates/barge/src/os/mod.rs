@@ -18,8 +18,8 @@ pub use facts::{
     AccountFacts, ChildEntry, ChildListing, ChildRemoval, DescriptorScan, DescriptorScanRequest,
     DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, ExpectedVolume, FileSystem,
     MountPoint, MountRoot, OpenDescriptor, ProcessIdentity, ProcessObserver, RemoveKind,
-    RetriedUnreadable, RetryResolution, SelfExclusion, VerifiedVolume, VolumeFacts, VolumeIdentity,
-    VolumeUuid, RETRY_RECORDS,
+    RetriedUnreadable, RetryEvidence, RetryResolution, SelfExclusion, VerifiedVolume, VolumeFacts,
+    VolumeIdentity, VolumeUuid, RETRY_RECORDS,
 };
 
 #[cfg(target_os = "macos")]

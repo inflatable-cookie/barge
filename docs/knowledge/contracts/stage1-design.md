@@ -1297,42 +1297,57 @@ Choices S5 made where this design left the mechanic to the slice:
   `KERN_PROC_PID` — pid, start time and effective uid, which the kernel's table
   reports for every process without inspecting one — and lists again after a
   short backoff: three retries of 25, 75 and 100 ms, a settle window of at most
-  250 ms per process, always inside the scan's own 10 s bound. It settles only on
-  a positive fact: a later listing succeeds; the kernel reports no such pid, and
-  a gone process holds no descriptors; the start identity changed, so a different
-  process now has the pid and is re-evaluated from scratch under the same rule
-  and inside the same budget; or the effective uid changed, so the pid now names
-  another account's process and is classified as the named blind spot above
-  instead of refused. The same identity still answering `EPERM` after its
-  retries is `Unknown` and refuses, with the errno sequence, the kernel start
-  identity and the command recorded in the error's detail. An unreadable listing
-  for any other reason refuses at once. Nothing here infers safety from elapsed
-  time: a process the scan cannot read still refuses.
-- **What the evidence says.** The `Safe` evidence records `self_excluded: <pid>`
-  (the one process it excluded), `foreign_uid_processes` (how many processes of
-  another effective uid it classified and did not inspect), `retried_unreadable`
-  (how many same-uid processes' listings answered `EPERM` and were re-observed
-  rather than refused) and `retried` (at most eight bounded records, each with
+  250 ms per process, always inside the scan's own 10 s bound. Both deadlines are
+  projected before each backoff and **checked again after it**, so a late wake
+  never buys one more listing past either, and a terminal answer whose reading
+  crossed the scan's deadline is answered bounded rather than complete. It
+  settles only on a positive fact: a later listing succeeds; the kernel reports
+  no such pid, or a retried listing answers `ESRCH`, and a gone process holds no
+  descriptors; the start identity changed, so a different process now has the pid
+  and is re-evaluated from scratch under the same rule and inside the same
+  budget; or the effective uid changed, so the pid now names another account's
+  process and is classified as the named blind spot above instead of refused. The
+  same identity still answering `EPERM` after its retries is `Unknown` and
+  refuses. An unreadable listing for any other reason refuses at once. Nothing
+  here infers safety from elapsed time: a process the scan cannot read still
+  refuses.
+- **What the evidence says.** The evidence records `self_excluded: <pid>` (the one
+  process the scan excluded), `foreign_uid_processes` (how many processes of
+  another effective uid it classified and did not inspect) and `retry`: how many
+  same-uid processes' listings answered `EPERM` and were re-observed
+  (`retried_unreadable`), and at most eight bounded records of them, each with
   the pid, command, kernel start identity, errno sequence, identity changes and
   resolution, so the next native diagnostic can tell an intermittent answer from
-  a persistent one). `describe.custody` names all of it: the exclusion, the
-  foreign-uid blind spot that is reported rather than observed, and the retry
-  rule and its positive facts. The tests run the real macOS observer on a fixture
-  root under scratch: the caller's own open handles stay open and the verdict is
-  `safe`; a same-uid child holding the payload open is `unsafe`; real
-  `/usr/bin/login` identities, read-only from the kernel's table, are counted as
-  foreign and do not block; an unreadable uid, a same-uid descriptor the kernel
-  will not show, a mismatched start identity and a forced bound are `unknown`;
-  and the counterfactuals refuse — the exclusion removed refuses the caller's own
-  descriptor, identification through the process's own facts refuses the real
-  login process, and a stated `EPERM` refuses at once with the retry schedule
-  removed. The retry rule's own cases are stated with an injected answer
-  sequence: `EPERM` then success is `safe` with the retried pid recorded, `EPERM`
-  then no such pid is resolved as gone, `EPERM` with a changed start identity is
-  re-evaluated and its descriptors read, `EPERM` with a changed effective uid is
-  foreign, `EPERM` through all three retries stays `unknown` with the bounded
-  errno sequence, and a scan time bound shorter than the first backoff answers
-  `bounded` rather than retrying past it.
+  a persistent one. **Every** verdict carries that record, not only `Safe`: an
+  `Unsafe` or `Unknown` verdict keeps it, and the `custody_not_proven` failure
+  puts it in its `detail` (`retried_unreadable` and `retried`), because a refusal
+  is exactly where a diagnostic needs it. A pending deletion's report keeps it
+  too (`custody_retry`) when custody refuses after the intent was written. The
+  scan's own answers carry it as well: `Complete`, `Bounded` and `Unreadable`. `describe.custody` names all of it: the
+  exclusion, the foreign-uid blind spot that is reported rather than observed, and
+  the retry rule with its positive facts and its two rechecked deadlines. A
+  same-uid process the scan cannot read is an `Unreadable` answer rather than a
+  returned error, so the record reaches the refusal; a returned error is only a
+  fact the scan cannot begin with (this account's uid, or the kernel's process
+  table). The tests run the real macOS observer on a fixture root under scratch:
+  the caller's own open handles stay open and the verdict is `safe`; a same-uid
+  child holding the payload open is `unsafe`; real `/usr/bin/login` identities,
+  read-only from the kernel's table, are counted as foreign and do not block; an
+  unreadable uid, a same-uid descriptor the kernel will not show, a mismatched
+  start identity and a forced bound are `unknown`; and the counterfactuals refuse
+  — the exclusion removed refuses the caller's own descriptor, identification
+  through the process's own facts refuses the real login process, and a stated
+  `EPERM` refuses at once with the retry schedule removed. The retry rule's own
+  cases are stated with an injected answer sequence: `EPERM` then success is
+  `safe` with the retried pid recorded, `EPERM` then `ESRCH` is resolved as gone
+  with both errnos in the sequence, `EPERM` then no such pid is resolved as gone,
+  `EPERM` with a changed start identity is re-evaluated and its descriptors read,
+  `EPERM` with a changed effective uid is foreign, `EPERM` through all three
+  retries stays `unknown` with the bounded errno sequence kept on the refusal, and
+  a scan time bound shorter than the first backoff answers `bounded` with the
+  record kept. The backoff deadline checks are also unit-tested on their own: a
+  projection that would end past either bound is not taken, and a delayed wake
+  past either bound stops the retry instead of listing again.
 - **The residual this correction does not touch.** On a real session, a handful
   of this account's own system daemons refuse `PROC_PIDFDVNODEPATHINFO` for some
   of their descriptors (measured on macOS 26.6.2: 8 of 1004), which the rule

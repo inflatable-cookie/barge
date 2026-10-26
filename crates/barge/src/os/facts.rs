@@ -495,7 +495,10 @@ pub trait ProcessObserver {
     /// process, descriptor or time bound answers [`DescriptorScan::Bounded`],
     /// which is unknown and never safe. An unreadable effective uid, and an
     /// unreadable descriptor entry of this account's process that is not a
-    /// retried `EPERM`, is an error, also never safe.
+    /// retried `EPERM`, answers [`DescriptorScan::Unreadable`], which is also
+    /// unknown and never safe and carries the bounded retry record with it. A
+    /// returned error is a fact the scan could not begin with: this account's own
+    /// effective uid or the kernel's process table.
     fn scan_open_descriptors(&self, request: &DescriptorScanRequest<'_>) -> Result<DescriptorScan>;
 }
 
@@ -561,6 +564,34 @@ pub struct DescriptorScanRequest<'a> {
 /// The scan counts every retried pid and records the first [`RETRY_RECORDS`] of
 /// them, so the record stays bounded without hiding that more were retried.
 pub const RETRY_RECORDS: usize = 8;
+
+/// The bounded record of the `EPERM` re-observation one scan performed.
+///
+/// Every answer a scan gives carries it — complete, bounded and unreadable — and
+/// so does every custody verdict that is not `Safe`, because the record exists so
+/// a native diagnostic can tell an intermittent answer from a persistent one on
+/// the refusal it is diagnosing, not only on a `Safe` one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryEvidence {
+    /// How many same-uid processes' descriptor listings the kernel answered
+    /// `EPERM` for and the scan re-observed by identity instead of refusing.
+    pub retried_unreadable: usize,
+    /// The bounded record of those processes, in scan order: at most
+    /// [`RETRY_RECORDS`] entries, each with at most one errno per attempt.
+    pub retried: Vec<RetriedUnreadable>,
+}
+
+impl RetryEvidence {
+    /// Record one re-observed process: the count always grows, the record list
+    /// stays bounded.
+    pub fn record(&mut self, record: RetriedUnreadable) {
+        self.retried_unreadable = self.retried_unreadable.saturating_add(1);
+        if self.retried.len() < RETRY_RECORDS {
+            self.retried.push(record);
+        }
+    }
+}
 
 /// One same-uid process whose descriptor listing the kernel answered `EPERM`
 /// for, and how the scan resolved it.
@@ -635,12 +666,8 @@ pub enum DescriptorScan {
         /// They were classified, not inspected: this is the named blind spot,
         /// reported so no reader mistakes it for an observation.
         foreign: usize,
-        /// How many same-uid processes' listings the kernel answered `EPERM`
-        /// for and the scan re-observed instead of refusing.
-        retried_unreadable: usize,
-        /// The bounded record of those processes, in scan order: at most
-        /// [`RETRY_RECORDS`] entries, each with at most one errno per retry.
-        retried: Vec<RetriedUnreadable>,
+        /// The bounded record of every same-uid `EPERM` the scan re-observed.
+        retry: RetryEvidence,
         /// The open descriptors at or under the root.
         open: Vec<OpenDescriptor>,
     },
@@ -653,6 +680,21 @@ pub enum DescriptorScan {
         descriptors: usize,
         /// Which bound stopped the scan.
         bound: &'static str,
+        /// The bounded record of every same-uid `EPERM` the scan re-observed
+        /// before the bound.
+        retry: RetryEvidence,
+    },
+    /// A same-uid process could not be observed: its descriptor listing stayed
+    /// unreadable after its bounded re-observation, or a fact about it could not
+    /// be read. It is unknown and refuses.
+    ///
+    /// It is an answer rather than an error so the bounded record of the
+    /// re-observation reaches the refusal with it; an error would drop it.
+    Unreadable {
+        /// Why the observation cannot be completed, for a human.
+        reason: String,
+        /// The bounded record of every same-uid `EPERM` the scan re-observed.
+        retry: RetryEvidence,
     },
 }
 

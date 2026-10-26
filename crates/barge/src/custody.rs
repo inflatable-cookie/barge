@@ -15,7 +15,8 @@
 //! - every same-uid process whose descriptor listing the kernel answered `EPERM`
 //!   for re-observed by kernel identity until it settled on a positive fact — a
 //!   later listing, a gone process, a changed start identity or a changed
-//!   effective uid — never on elapsed time (barge#012);
+//!   effective uid — never on elapsed time (barge#012), with that bounded record
+//!   carried on every verdict, refusals included;
 //! - the root's device, inode and marker digest equal to the observation the
 //!   caller was given;
 //! - the volume still verified; and
@@ -44,7 +45,7 @@ use crate::contract::HOLD_ROWS;
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
     DescriptorScan, DescriptorScanRequest, DeviceId, DirOps, MountRoot, ProcessObserver,
-    RetriedUnreadable, SelfExclusion, VolumeFacts, VolumeUuid,
+    RetryEvidence, SelfExclusion, VolumeFacts, VolumeUuid,
 };
 use crate::registry;
 use crate::state::{self, IntentRecord, StatePaths};
@@ -205,20 +206,21 @@ pub struct CustodyEvidence {
     /// named blind spot, reported so the evidence never implies they were
     /// observed.
     pub foreign_uid_processes: usize,
-    /// How many same-uid processes' descriptor listings the kernel answered
-    /// `EPERM` for and the scan re-observed by identity instead of refusing.
-    /// Each one settled on a positive fact, never on elapsed time.
-    pub retried_unreadable: usize,
-    /// The bounded record of those processes: at most
-    /// [`crate::os::RETRY_RECORDS`] entries, each with the command, start
-    /// identity, errno sequence and resolution, so a native diagnostic can tell
-    /// an intermittent answer from a persistent one.
-    pub retried: Vec<RetriedUnreadable>,
+    /// The bounded record of every same-uid `EPERM` the scan re-observed: how
+    /// many there were, and for the first [`crate::os::RETRY_RECORDS`] of them
+    /// the command, start identity, errno sequence and resolution, so a native
+    /// diagnostic can tell an intermittent answer from a persistent one.
+    pub retry: RetryEvidence,
     /// When the verdict was decided.
     pub checked_ms: u64,
 }
 
 /// The three verdicts. Only [`Safe`](Self::Safe) authorises an effect.
+///
+/// Every verdict carries the bounded record of the scan's `EPERM`
+/// re-observation, including the refusals: that is where a native diagnostic
+/// needs it, and [`into_evidence`](Self::into_evidence) puts it in the failure's
+/// detail so a refusal does not discard it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CustodyVerdict {
     /// Every fact Barge can establish agrees: a swap or delete may proceed.
@@ -227,12 +229,16 @@ pub enum CustodyVerdict {
     Unsafe {
         /// What was found, for a human.
         reason: String,
+        /// The bounded record of the scan's `EPERM` re-observation.
+        retry: RetryEvidence,
     },
     /// A fact could not be read or could not be completed within its bound.
     /// Unknown is a refusal and is never read as safe.
     Unknown {
         /// Why the verdict cannot be decided.
         reason: String,
+        /// The bounded record of the scan's `EPERM` re-observation.
+        retry: RetryEvidence,
     },
 }
 
@@ -263,21 +269,33 @@ impl CustodyVerdict {
     pub fn reason(&self) -> Option<&str> {
         match self {
             Self::Safe(_) => None,
-            Self::Unsafe { reason } | Self::Unknown { reason } => Some(reason),
+            Self::Unsafe { reason, .. } | Self::Unknown { reason, .. } => Some(reason),
+        }
+    }
+
+    /// The bounded record of the scan's `EPERM` re-observation, on every verdict.
+    pub fn retry(&self) -> &RetryEvidence {
+        match self {
+            Self::Safe(evidence) => &evidence.retry,
+            Self::Unsafe { retry, .. } | Self::Unknown { retry, .. } => retry,
         }
     }
 
     /// The authority an effect needs, or the refusal that replaces it.
     ///
     /// This is the type-level gate: [`crate::delete`] takes the evidence a
-    /// `Safe` verdict produced and nothing else.
+    /// `Safe` verdict produced and nothing else. A refusal's bounded retry
+    /// record travels in the failure's detail rather than being discarded with
+    /// the verdict.
     pub fn into_evidence(self) -> Result<CustodyEvidence> {
         match self {
             Self::Safe(evidence) => Ok(*evidence),
-            Self::Unsafe { reason } | Self::Unknown { reason } => Err(Error::new(
+            Self::Unsafe { reason, retry } | Self::Unknown { reason, retry } => Err(Error::new(
                 ErrorKind::CustodyNotProven,
                 format!("custody is not proven: {reason}"),
-            )),
+            )
+            .with_detail("retried_unreadable", retry.retried_unreadable.into())
+            .with_detail("retried", serde_json::json!(retry.retried))),
         }
     }
 }
@@ -310,15 +328,51 @@ pub fn take_custody(
         bounds,
     ) {
         Ok(evidence) => CustodyVerdict::Safe(Box::new(evidence)),
-        Err(Refusal::Unsafe(reason)) => CustodyVerdict::Unsafe { reason },
-        Err(Refusal::Unknown(reason)) => CustodyVerdict::Unknown { reason },
+        Err(Refusal::Unsafe { reason, retry }) => CustodyVerdict::Unsafe { reason, retry },
+        Err(Refusal::Unknown { reason, retry }) => CustodyVerdict::Unknown { reason, retry },
     }
 }
 
 /// A non-safe verdict, before it becomes a [`CustodyVerdict`].
+///
+/// A refusal raised before the scan states no retry evidence; a refusal the scan
+/// produced carries its bounded record, which is what keeps that record on the
+/// refusal path too.
 enum Refusal {
-    Unsafe(String),
-    Unknown(String),
+    Unsafe {
+        reason: String,
+        retry: RetryEvidence,
+    },
+    Unknown {
+        reason: String,
+        retry: RetryEvidence,
+    },
+}
+
+impl Refusal {
+    /// A refusal for a fact that is not safe, before any scan was taken.
+    fn refuse_unsafe(reason: impl Into<String>) -> Self {
+        Self::Unsafe {
+            reason: reason.into(),
+            retry: RetryEvidence::default(),
+        }
+    }
+
+    /// An unknown, before any scan was taken. Unknown is a refusal.
+    fn refuse_unknown(reason: impl Into<String>) -> Self {
+        Self::Unknown {
+            reason: reason.into(),
+            retry: RetryEvidence::default(),
+        }
+    }
+
+    /// The same refusal, with the bounded retry record the scan produced.
+    fn with_retry(self, retry: RetryEvidence) -> Self {
+        match self {
+            Self::Unsafe { reason, .. } => Self::Unsafe { reason, retry },
+            Self::Unknown { reason, .. } => Self::Unknown { reason, retry },
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -333,10 +387,11 @@ fn decide(
     bounds: CustodyBounds,
 ) -> std::result::Result<CustodyEvidence, Refusal> {
     // 1. Holds: released, or positively stale. Anything else is a refusal.
-    let holds = area::read_holds(state_paths, observer, &observed.root_id)
-        .map_err(|error| Refusal::Unknown(format!("the root's holds are unreadable: {error}")))?;
+    let holds = area::read_holds(state_paths, observer, &observed.root_id).map_err(|error| {
+        Refusal::refuse_unknown(format!("the root's holds are unreadable: {error}"))
+    })?;
     if holds.total > bounds.holds || holds.truncated {
-        return Err(Refusal::Unknown(format!(
+        return Err(Refusal::refuse_unknown(format!(
             "the root carries {} hold files, over the {}-hold bound",
             holds.total, bounds.holds
         )));
@@ -345,13 +400,13 @@ fn decide(
     for (record, hold_state, reason) in &holds.holds {
         match hold_state {
             HoldState::Live => {
-                return Err(Refusal::Unsafe(format!(
+                return Err(Refusal::refuse_unsafe(format!(
                     "the holder `{}` on pid {} is live",
                     record.holder, record.pid
                 )))
             }
             HoldState::Unknown => {
-                return Err(Refusal::Unknown(format!(
+                return Err(Refusal::refuse_unknown(format!(
                     "the hold `{}` cannot be decided: {}",
                     record.holder,
                     reason.as_deref().unwrap_or("no reason was recorded")
@@ -365,12 +420,12 @@ fn decide(
     //    be mid-delete.
     if let Some(intent) = pending.first() {
         if intent.root_id == observed.root_id {
-            return Err(Refusal::Unknown(format!(
+            return Err(Refusal::refuse_unknown(format!(
                 "the pending intent {} already names this root",
                 intent.intent_id
             )));
         }
-        return Err(Refusal::Unknown(format!(
+        return Err(Refusal::refuse_unknown(format!(
             "the pending intent {} names root {}, so this deletion must wait",
             intent.intent_id, intent.root_id
         )));
@@ -379,11 +434,11 @@ fn decide(
     // 3. The volume still verifies, and the root is still the inode and the
     //    marker bytes the caller observed.
     let record = registry::read(state_paths)
-        .map_err(|error| Refusal::Unknown(format!("the registry is unreadable: {error}")))?
+        .map_err(|error| Refusal::refuse_unknown(format!("the registry is unreadable: {error}")))?
         .volume(&observed.volume_uuid)
         .cloned()
         .ok_or_else(|| {
-            Refusal::Unknown(format!("volume {} is not registered", observed.volume_uuid))
+            Refusal::refuse_unknown(format!("volume {} is not registered", observed.volume_uuid))
         })?;
     let opened = area::open_folder(
         dirs,
@@ -394,18 +449,20 @@ fn decide(
         &observed.root_dir,
         &observed.folder,
     )
-    .map_err(|error| Refusal::Unknown(format!("the area folder does not verify: {error}")))?;
+    .map_err(|error| {
+        Refusal::refuse_unknown(format!("the area folder does not verify: {error}"))
+    })?;
     let Some((area_path, area_handle)) = opened else {
-        return Err(Refusal::Unknown(format!(
+        return Err(Refusal::refuse_unknown(format!(
             "the area folder for {} is not there",
             observed.root_id
         )));
     };
     let root = dirs
         .open_child_dir(&area_handle, &observed.root_id)
-        .map_err(|error| Refusal::Unknown(format!("the root cannot be opened: {error}")))?;
+        .map_err(|error| Refusal::refuse_unknown(format!("the root cannot be opened: {error}")))?;
     if root.identity().device != observed.device || root.identity().inode != observed.inode {
-        return Err(Refusal::Unknown(format!(
+        return Err(Refusal::refuse_unknown(format!(
             "the root at {} is device {} inode {}, not the observed {} / {}",
             area_path.join(&observed.root_id).display(),
             root.identity().device,
@@ -418,35 +475,36 @@ fn decide(
     let expectation = MarkerExpectation {
         volume_uuid: &observed.volume_uuid,
         resolved_path: &root_path,
-        effective_uid: observer
-            .effective_uid()
-            .map_err(|error| Refusal::Unknown(format!("the account uid is unreadable: {error}")))?,
+        effective_uid: observer.effective_uid().map_err(|error| {
+            Refusal::refuse_unknown(format!("the account uid is unreadable: {error}"))
+        })?,
         now_ms: state::now_ms(),
     };
     let (marker, digest) = area::read_marker_with_digest(dirs, &root, &expectation);
     match marker {
         MarkerState::Owned(owned) if owned.root_id == observed.root_id => {}
         MarkerState::Owned(other) => {
-            return Err(Refusal::Unknown(format!(
+            return Err(Refusal::refuse_unknown(format!(
                 "the marker names root {}, not the observed {}",
                 other.root_id, observed.root_id
             )))
         }
         MarkerState::Absent => {
-            return Err(Refusal::Unknown(
+            return Err(Refusal::refuse_unknown(
                 "the root carries no marker, so it is not owned".to_owned(),
             ))
         }
         MarkerState::Unknown { reason } => {
-            return Err(Refusal::Unknown(format!(
+            return Err(Refusal::refuse_unknown(format!(
                 "the root's marker is not owned: {reason}"
             )))
         }
     }
-    let digest = digest
-        .ok_or_else(|| Refusal::Unknown("the root's marker digest could not be read".to_owned()))?;
+    let digest = digest.ok_or_else(|| {
+        Refusal::refuse_unknown("the root's marker digest could not be read".to_owned())
+    })?;
     if digest != observed.marker_digest {
-        return Err(Refusal::Unknown(format!(
+        return Err(Refusal::refuse_unknown(format!(
             "the marker at {} is digest {digest}, not the observed {}",
             root_path.display(),
             observed.marker_digest
@@ -465,12 +523,12 @@ fn decide(
     let self_start = observer
         .process_start(self_pid)
         .map_err(|error| {
-            Refusal::Unknown(format!(
+            Refusal::refuse_unknown(format!(
                 "the calling process's start identity is unreadable: {error}"
             ))
         })?
         .ok_or_else(|| {
-            Refusal::Unknown(format!(
+            Refusal::refuse_unknown(format!(
                 "the calling process pid {self_pid} has no start identity, so its own descriptors cannot be excluded"
             ))
         })?;
@@ -486,38 +544,50 @@ fn decide(
             start: self_start,
         }),
     });
-    let (processes, descriptors, foreign, retried_unreadable, retried) = match scan {
+    let (processes, descriptors, foreign, retry) = match scan {
         Err(error) => {
-            return Err(Refusal::Unknown(format!(
+            return Err(Refusal::refuse_unknown(format!(
                 "the open-descriptor scan is unreadable: {error}"
             )))
         }
+        // A bounded scan proves nothing, and the bounded record of the `EPERM`
+        // re-observation it did perform travels with the refusal.
         Ok(DescriptorScan::Bounded {
             processes,
             descriptors,
             bound,
+            retry,
         }) => {
-            return Err(Refusal::Unknown(format!(
+            return Err(Refusal::refuse_unknown(format!(
                 "the open-descriptor scan reached its {bound} bound after {processes} processes and {descriptors} descriptors"
-            )))
+            ))
+            .with_retry(retry))
+        }
+        // The observation of a same-uid process could not be completed: unknown,
+        // never a skip, with the bounded retry record that led to it.
+        Ok(DescriptorScan::Unreadable { reason, retry }) => {
+            return Err(Refusal::refuse_unknown(format!(
+                "the open-descriptor scan is unreadable: {reason}"
+            ))
+            .with_retry(retry))
         }
         Ok(DescriptorScan::Complete {
             processes,
             descriptors,
             foreign,
-            retried_unreadable,
-            retried,
+            retry,
             open,
         }) => {
             if let Some(first) = open.first() {
-                return Err(Refusal::Unsafe(format!(
+                return Err(Refusal::refuse_unsafe(format!(
                     "pid {} holds descriptor {} open at {}",
                     first.pid,
                     first.descriptor,
                     first.path.display()
-                )));
+                ))
+                .with_retry(retry));
             }
-            (processes, descriptors, foreign, retried_unreadable, retried)
+            (processes, descriptors, foreign, retry)
         }
     };
 
@@ -533,8 +603,7 @@ fn decide(
         descriptors,
         self_excluded: self_pid,
         foreign_uid_processes: foreign,
-        retried_unreadable,
-        retried,
+        retry,
         checked_ms: state::now_ms(),
     })
 }
@@ -571,8 +640,8 @@ pub fn capability_report() -> CustodyReport {
             "a bounded scan of this account's open descriptors is complete and finds none at or under the root".to_owned(),
             "that scan classifies each process by the effective uid the kernel's own process table reports, before it inspects any descriptor, and reports how many processes of another effective uid it classified".to_owned(),
             "that scan excludes the calling barge process's own descriptors, by its pid and the start identity read once and verified, and no other process: another barge process, its child or its parent is observed like any other same-uid writer".to_owned(),
-            "that scan re-observes a same-uid process whose descriptor listing the kernel answers EPERM for, by re-reading the kernel's pid, start identity and effective uid and listing again at most three times inside a 250 ms settle window, and settles it only on a positive fact: a later listing, a process the kernel reports gone, a changed start identity re-evaluated as the different process it now names, or a changed effective uid counted as the named blind spot; the same identity still answering EPERM is unknown and refuses, and elapsed time is never taken as proof".to_owned(),
-            "the evidence counts how many processes that re-observation settled, and records for up to eight of them the command, kernel start identity, errno sequence and resolution".to_owned(),
+            "that scan re-observes a same-uid process whose descriptor listing the kernel answers EPERM for, by re-reading the kernel's pid, start identity and effective uid and listing again at most three times inside a 250 ms settle window, with both that window and the scan's own deadline rechecked after every backoff, and settles it only on a positive fact: a later listing, a process the kernel reports gone, a changed start identity re-evaluated as the different process it now names, or a changed effective uid counted as the named blind spot; the same identity still answering EPERM is unknown and refuses, and elapsed time is never taken as proof".to_owned(),
+            "the bounded record of that re-observation — how many processes it re-observed, and for up to eight of them the command, kernel start identity, errno sequence, identity changes and resolution — is reported on every verdict and in every refusal's failure detail, so a diagnostic of a refusal sees it too".to_owned(),
             "the root's device, inode and marker digest equal the observation the caller was given".to_owned(),
             "the volume still verifies as the registered one".to_owned(),
             "no pending intent names another root".to_owned(),
@@ -610,6 +679,7 @@ mod tests {
     /// listing it will not show, and `EACCES`, an answer the retry rule does not
     /// settle. The scan reports both exactly as the kernel does.
     const EPERM: i32 = 1;
+    const ESRCH: i32 = 3;
     const EACCES: i32 = 13;
 
     struct Holder {
@@ -1367,9 +1437,10 @@ mod tests {
         assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
         let evidence = verdict.evidence().expect("the evidence");
         assert_eq!(evidence.foreign_uid_processes, 1);
-        assert_eq!(evidence.retried_unreadable, 1);
+        assert_eq!(evidence.retry.retried_unreadable, 1);
         assert_eq!(
             evidence
+                .retry
                 .retried
                 .first()
                 .expect("the retried pid")
@@ -1479,8 +1550,9 @@ mod tests {
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
         assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
         let evidence = verdict.evidence().expect("the evidence");
-        assert_eq!(evidence.retried_unreadable, 1);
+        assert_eq!(evidence.retry.retried_unreadable, 1);
         let record = evidence
+            .retry
             .retried
             .first()
             .expect("the retried pid is recorded");
@@ -1514,8 +1586,9 @@ mod tests {
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
         assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
         let evidence = verdict.evidence().expect("the evidence");
-        assert_eq!(evidence.retried_unreadable, 1);
+        assert_eq!(evidence.retry.retried_unreadable, 1);
         let record = evidence
+            .retry
             .retried
             .first()
             .expect("the retried pid is recorded");
@@ -1579,13 +1652,34 @@ mod tests {
         assert!(reason.contains(&identity.pid.to_string()), "{reason}");
         assert!(reason.contains("retries: 3"), "{reason}");
         assert!(reason.contains("on 4 attempts"), "{reason}");
-        assert!(verdict.clone().into_evidence().is_err(), "unknown refuses");
+        // The refusal keeps the bounded record: it is what the next native
+        // diagnostic reads, so it survives the failed scan.
+        let retry = verdict.retry();
+        assert_eq!(retry.retried_unreadable, 1);
+        let record = retry.retried.first().expect("the retried pid is recorded");
+        assert_eq!(record.pid, identity.pid);
+        assert_eq!(record.errnos, vec![EPERM; 4]);
+        assert_eq!(record.resolution, RetryResolution::Unreadable);
+        let error = verdict.into_evidence().expect_err("unknown refuses");
+        assert_eq!(
+            error.detail().get("retried_unreadable"),
+            Some(&serde_json::Value::from(1u64))
+        );
+        assert!(
+            error
+                .detail()
+                .get("retried")
+                .is_some_and(|records| records.to_string().contains(&identity.pid.to_string())),
+            "the refusal's failure detail carries the records: {:?}",
+            error.detail()
+        );
     }
 
     #[test]
-    fn a_persistent_eperm_records_its_errno_sequence_in_the_scan_error() {
+    fn a_persistent_eperm_records_its_bounded_errno_sequence_in_the_scan_answer() {
         // The bounded sequence the scan records for a pid that stays unreadable,
-        // read where it is structured: the error's detail, not only its message.
+        // read where it is structured: on the scan's own answer, which is what
+        // the refusal is built from.
         let request = DescriptorScanRequest {
             root: std::path::Path::new("/nonexistent"),
             root_device: crate::os::DeviceId::new(1),
@@ -1601,22 +1695,51 @@ mod tests {
             errnos: vec![EPERM; 9],
             ..StatedListing::default()
         }];
-        let error = platform()
+        let answer = platform()
             .scan_open_descriptors_with(&request, &[identity], retry_schedule(), &mut faults)
-            .expect_err("a persistent EPERM refuses");
-        assert_eq!(error.kind(), ErrorKind::UnknownState);
-        assert!(error.message().contains("retries: 3"), "{error}");
-        assert!(error.message().contains("on 4 attempts"), "{error}");
-        assert_eq!(
-            error.detail().get("errnos"),
-            Some(&serde_json::Value::from("1,1,1,1")),
-            "the errno sequence is recorded: {:?}",
-            error.detail()
+            .expect("an unreadable same-uid process is an answer, not a scan failure");
+        let DescriptorScan::Unreadable { reason, retry } = answer else {
+            panic!("a persistent EPERM is unreadable, not {answer:?}");
+        };
+        assert!(reason.contains("retries: 3"), "{reason}");
+        assert!(reason.contains("on 4 attempts"), "{reason}");
+        assert_eq!(retry.retried_unreadable, 1);
+        let record = retry.retried.first().expect("the retried pid is recorded");
+        assert_eq!(record.pid, identity.pid);
+        assert_eq!(record.start, identity.start);
+        assert_eq!(record.errnos, vec![EPERM; 4]);
+        assert_eq!(record.resolution, RetryResolution::Unreadable);
+    }
+
+    #[test]
+    fn an_eperm_then_esrch_listing_is_resolved_as_gone() {
+        // The brief's second sequence: the first listing is unreadable, the retry
+        // is answered "no such process". The kernel's identity still reports the
+        // live process, so the gone answer is the listing's own positive fact.
+        let holder = real_holder("custody-012-esrch");
+        holder.payload();
+        let child = Child::idle();
+        let identity = child.identity();
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                errnos: vec![EPERM, ESRCH],
+                ..StatedListing::default()
+            }],
         );
-        assert_eq!(
-            error.detail().get("pid"),
-            Some(&serde_json::Value::from(u64::from(identity.pid)))
-        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+        let evidence = verdict.evidence().expect("the evidence");
+        assert_eq!(evidence.retry.retried_unreadable, 1);
+        let record = evidence
+            .retry
+            .retried
+            .first()
+            .expect("the retried pid is recorded");
+        assert_eq!(record.pid, identity.pid);
+        assert_eq!(record.errnos, vec![EPERM, ESRCH]);
+        assert_eq!(record.resolution, RetryResolution::Gone);
     }
 
     #[test]
@@ -1642,6 +1765,11 @@ mod tests {
             .reason()
             .unwrap_or_default()
             .contains("descriptors of pid"));
+        assert_eq!(
+            verdict.retry().retried_unreadable,
+            0,
+            "no `EPERM` was re-observed, so there is no retry record"
+        );
         assert!(verdict.into_evidence().is_err(), "unknown refuses");
     }
 
@@ -1672,9 +1800,10 @@ mod tests {
         assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
         let evidence = verdict.evidence().expect("the evidence");
         assert_eq!(evidence.foreign_uid_processes, 1);
-        assert_eq!(evidence.retried_unreadable, 1);
+        assert_eq!(evidence.retry.retried_unreadable, 1);
         assert_eq!(evidence.processes, 0, "it was classified, never inspected");
         let record = evidence
+            .retry
             .retried
             .first()
             .expect("the retried pid is recorded");
@@ -1704,6 +1833,13 @@ mod tests {
         let verdict = holder.take_with(&[], &observer, bounds);
         assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
         assert!(verdict.reason().unwrap_or_default().contains("bound"));
+        // The record of the pid that was mid-re-observation when the bound
+        // stopped the scan is not discarded with the bounded answer.
+        let retry = verdict.retry();
+        assert_eq!(retry.retried_unreadable, 1);
+        let record = retry.retried.first().expect("the retried pid is recorded");
+        assert_eq!(record.pid, identity.pid);
+        assert_eq!(record.resolution, RetryResolution::Bounded);
     }
 
     #[test]
@@ -1726,6 +1862,13 @@ mod tests {
         assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
         let reason = verdict.reason().unwrap_or_default();
         assert!(reason.contains("retries: 0"), "{reason}");
+        let record = verdict
+            .retry()
+            .retried
+            .first()
+            .expect("the retried pid is recorded on the refusal");
+        assert_eq!(record.errnos, vec![EPERM]);
+        assert_eq!(record.resolution, RetryResolution::Unreadable);
         assert!(verdict.into_evidence().is_err(), "unknown refuses");
     }
 }
