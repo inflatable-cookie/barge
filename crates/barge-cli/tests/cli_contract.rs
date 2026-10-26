@@ -63,7 +63,8 @@ fn stdout_document(output: &Output) -> Value {
     })
 }
 
-const USAGE: &str = "usage: barge <describe|inspect> [--json]";
+/// The usage's first line; the full text names every area verb too.
+const USAGE: &str = "usage: barge <describe|inspect|area> [--json]";
 
 #[test]
 fn describe_json_prints_one_document_and_creates_nothing() {
@@ -312,7 +313,12 @@ fn an_unknown_command_is_a_usage_refusal_that_names_the_usage() {
     assert_eq!(document["schema"], "barge.error/1");
     assert_eq!(document["ok"], false);
     assert_eq!(document["error"]["kind"], "usage");
-    assert_eq!(document["error"]["detail"]["usage"], USAGE);
+    assert!(
+        document["error"]["detail"]["usage"]
+            .as_str()
+            .is_some_and(|usage| usage.starts_with(USAGE)),
+        "the refusal names the usage: {document}"
+    );
     assert!(!state_dir.exists());
 }
 
@@ -366,9 +372,286 @@ fn help_prints_the_usage_and_changes_nothing() {
     let (_fixture, state_dir) = absent_state_dir("help");
     let output = run_in(&["--help"], &state_dir);
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(
-        String::from_utf8(output.stdout).expect("usage is text"),
-        format!("{USAGE}\n")
-    );
+    let text = String::from_utf8(output.stdout).expect("usage is text");
+    assert!(text.starts_with(USAGE), "{text}");
+    assert!(text.contains("barge area declare"), "{text}");
     assert!(!state_dir.exists());
+}
+
+// ---- the area verbs (slice S3) -------------------------------------------
+
+/// Run one `area` command with a fixture state directory and the design's
+/// bounded, contained argument set.
+fn run_area(args: &[&str], state_dir: &Path) -> Output {
+    let mut full = vec!["area"];
+    full.extend_from_slice(args);
+    full.push("--json");
+    run_in(&full, state_dir)
+}
+
+fn assert_area_refusal(output: &Output, code: i32, kind: &str) {
+    assert_eq!(output.status.code(), Some(code), "exit code");
+    let document = stdout_document(output);
+    assert_eq!(document["schema"], "barge.error/1");
+    assert_eq!(document["ok"], false);
+    assert_eq!(document["error"]["kind"], kind, "{document}");
+}
+
+fn declare_args<'a>(namespace: &'a str, area: &'a str, folder: &'a str) -> Vec<&'a str> {
+    vec![
+        "declare",
+        "--namespace",
+        namespace,
+        "--area",
+        area,
+        "--folder",
+        folder,
+        "--absent",
+        "fail:the build volume",
+        "--prune",
+        "none",
+        "--reserve",
+        "counts",
+    ]
+}
+
+#[test]
+fn area_declare_show_and_list_round_trip_through_one_document_each() {
+    let (_fixture, state_dir) = absent_state_dir("area-round-trip");
+    let output = run_area(&declare_args("example", "pool", "example/pool"), &state_dir);
+    assert_eq!(output.status.code(), Some(0), "declare succeeds");
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.area.declare/1");
+    assert_eq!(document["command"], "area.declare");
+    assert_eq!(document["ok"], true);
+    assert_eq!(document["data"]["declaration"]["schema"], "barge.area/1");
+    assert_eq!(document["data"]["declaration"]["namespace"], "example");
+    assert_eq!(document["data"]["declaration"]["folder"], "example/pool");
+    assert_eq!(document["data"]["declaration"]["generation"], 1);
+    assert!(
+        document["data"]["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("areas/example/pool.json")),
+        "{document}"
+    );
+    assert!(state_dir.join("areas/example/pool.json").is_file());
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(state_dir.join("areas/example/pool.json"))
+            .expect("the declaration exists")
+            .permissions(),
+    ) & 0o777;
+    assert_eq!(mode, 0o600, "a declaration is a private record");
+    assert!(
+        !state_dir.join("registry.json").exists(),
+        "declaring an area writes no registry"
+    );
+
+    let output = run_area(
+        &["show", "--namespace", "example", "--area", "pool"],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.area.show/1");
+    assert_eq!(document["data"]["declaration"]["area"], "pool");
+
+    let output = run_area(&["list"], &state_dir);
+    assert_eq!(output.status.code(), Some(0));
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.area.list/1");
+    assert_eq!(document["data"]["areas"]["count"], 1);
+    assert_eq!(document["data"]["areas"]["total"], 1);
+    assert_eq!(document["data"]["areas"]["truncated"], false);
+}
+
+#[test]
+fn area_declare_refuses_a_collision_and_writes_nothing_for_it() {
+    let (_fixture, state_dir) = absent_state_dir("area-collision");
+    let output = run_area(&declare_args("example", "pool", "example/pool"), &state_dir);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_area(
+        &declare_args("example", "other", "example/pool"),
+        &state_dir,
+    );
+    assert_area_refusal(&output, 2, "refused_containment");
+    assert!(!state_dir.join("areas/example/other.json").exists());
+}
+
+#[test]
+fn area_show_of_an_absent_declaration_is_unknown_state() {
+    let (_fixture, state_dir) = absent_state_dir("area-absent");
+    let output = run_area(
+        &["show", "--namespace", "example", "--area", "pool"],
+        &state_dir,
+    );
+    assert_area_refusal(&output, 3, "unknown_state");
+    assert!(!state_dir.exists(), "a read creates no state directory");
+}
+
+#[test]
+fn an_invalid_declaration_argument_is_a_usage_refusal() {
+    let (_fixture, state_dir) = absent_state_dir("area-usage");
+    for args in [
+        vec!["declare", "--namespace", "example"],
+        vec!["declare", "--namespace", "../x"],
+        vec!["root"],
+        vec!["frobnicate"],
+    ] {
+        let output = run_area(&args, &state_dir);
+        let kind = stdout_document(&output)["error"]["kind"].clone();
+        assert!(
+            kind == "usage" || kind == "refused_containment",
+            "{args:?} refused: {kind}"
+        );
+    }
+}
+
+#[test]
+fn an_invalid_registry_refuses_every_mutating_area_verb() {
+    let (fixture, state_dir) = absent_state_dir("area-invalid-registry");
+    std::fs::create_dir_all(&state_dir).expect("the fixture state directory exists");
+    let _ = &fixture;
+    std::fs::write(state_dir.join("registry.json"), b"{ not a registry")
+        .expect("the invalid registry is written");
+    let root = "0".repeat(32);
+    let pid = std::process::id().to_string();
+    let mutating = [
+        declare_args("example", "pool", "example/pool"),
+        vec![
+            "root",
+            "create",
+            "--namespace",
+            "example",
+            "--area",
+            "pool",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "--kind",
+            "area_root",
+        ],
+        vec![
+            "hold",
+            "--root",
+            &root,
+            "--holder",
+            "h",
+            "--pid",
+            &pid,
+            "--scope",
+            "read",
+            "--purpose",
+            "test",
+        ],
+        vec!["release", "--root", &root, "--holder", "h"],
+    ];
+    for args in mutating {
+        let output = run_area(&args, &state_dir);
+        assert_area_refusal(&output, 3, "unknown_state");
+        assert_eq!(
+            std::fs::read(state_dir.join("registry.json")).expect("the registry is unchanged"),
+            b"{ not a registry",
+            "the invalid registry is never rebuilt"
+        );
+        assert!(
+            !state_dir.join("areas").exists(),
+            "a refused declaration writes nothing"
+        );
+    }
+    // The read-only verbs do not need the registry: listing reports what is
+    // declared, and showing an undeclared area is unknown state.
+    let output = run_area(&["list"], &state_dir);
+    assert_eq!(output.status.code(), Some(0), "listing areas is read-only");
+    let output = run_area(
+        &["show", "--namespace", "example", "--area", "pool"],
+        &state_dir,
+    );
+    assert_area_refusal(&output, 3, "unknown_state");
+}
+
+#[test]
+fn area_root_create_on_an_unregistered_volume_refuses_before_any_effect() {
+    let (_fixture, state_dir) = absent_state_dir("area-unregistered");
+    let output = run_area(&declare_args("example", "pool", "example/pool"), &state_dir);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_area(
+        &[
+            "root",
+            "create",
+            "--namespace",
+            "example",
+            "--area",
+            "pool",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "--kind",
+            "area_root",
+        ],
+        &state_dir,
+    );
+    assert_area_refusal(&output, 3, "unknown_state");
+    assert!(
+        !state_dir
+            .join("locks")
+            .join("volume-A6AC3ED7-33EA-46B4-8082-7254CF291ED2.lock")
+            .exists(),
+        "an unregistered volume creates no lock file and no folder"
+    );
+}
+
+#[test]
+fn area_hold_and_release_record_and_remove_one_hold() {
+    let (_fixture, state_dir) = absent_state_dir("area-hold");
+    let root = "0123456789abcdef0123456789abcdef";
+    let pid = std::process::id().to_string();
+    let output = run_area(
+        &[
+            "hold",
+            "--root",
+            root,
+            "--holder",
+            "prover",
+            "--pid",
+            &pid,
+            "--scope",
+            "write",
+            "--purpose",
+            "a fixture hold",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(0), "hold succeeds");
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.area.hold/1");
+    assert_eq!(document["data"]["hold"]["holder"], "prover");
+    assert_eq!(document["data"]["hold"]["state"], "live");
+    assert_eq!(document["data"]["hold"]["pid"], std::process::id());
+    let path = state_dir.join(format!("holds/{root}/prover.json"));
+    assert!(path.is_file());
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(&path)
+            .expect("the hold exists")
+            .permissions(),
+    ) & 0o777;
+    assert_eq!(mode, 0o600, "a hold is a private record");
+
+    let output = run_area(
+        &["release", "--root", root, "--holder", "prover"],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.area.release/1");
+    assert_eq!(document["data"]["released"], true);
+    assert!(!path.exists());
+
+    let output = run_area(
+        &["release", "--root", root, "--holder", "prover"],
+        &state_dir,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a second release is not an error"
+    );
+    assert_eq!(stdout_document(&output)["data"]["released"], false);
 }

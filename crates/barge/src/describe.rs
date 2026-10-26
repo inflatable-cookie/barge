@@ -30,15 +30,16 @@ pub use crate::inspect::{ObservationRow, ObservationState};
 pub use crate::registry::{Availability, Durability, FolderOverrides, RecordOrigin};
 pub use crate::state::StateDirSource;
 
+use crate::area::{self, AreaDocument, RootObservation};
 use crate::contract::{
-    parse_document, FormatVersions, RowSet, DESCRIBE_SCHEMA, DESCRIBE_SCHEMA_PREFIX,
-    INSPECT_SCHEMA, INSPECT_SCHEMA_PREFIX, OBSERVATION_ROWS, VOLUME_ROWS,
+    parse_document, FormatVersions, RowSet, AREA_ROWS, DESCRIBE_SCHEMA, DESCRIBE_SCHEMA_PREFIX,
+    INSPECT_SCHEMA, INSPECT_SCHEMA_PREFIX, OBSERVATION_ROWS, ROOT_ROWS, VOLUME_ROWS,
 };
 use crate::error::{Error, ErrorKind, Result};
 use crate::inspect::{
     self, Observation, ObservedVolume, OxideObservations, OxideRegistration, OXIDE_POOL_ROWS,
 };
-use crate::os::AccountFacts;
+use crate::os::{AccountFacts, DirOps, MountRoot, ProcessObserver, VolumeFacts};
 use crate::registry::{self, Registry, VolumeRecord};
 use crate::state::{LockSet, StatePaths};
 
@@ -66,6 +67,16 @@ pub struct DescribeRequest<'a> {
     pub state_dir_override: Option<&'a Path>,
     /// The tool version the document reports.
     pub tool_version: &'a str,
+    /// The platform's directory operations, used to read owned roots without
+    /// creating or changing anything.
+    pub dirs: &'a dyn DirOps,
+    /// The platform's volume facts, used to verify each volume before its areas
+    /// are walked.
+    pub facts: &'a dyn VolumeFacts,
+    /// The platform's mount-root proof.
+    pub mounts: &'a dyn MountRoot,
+    /// The platform's process observations, for a root's holds.
+    pub observer: &'a dyn ProcessObserver,
 }
 
 impl fmt::Debug for DescribeRequest<'_> {
@@ -118,6 +129,12 @@ pub struct DescribeData {
     pub areas: RowSet<AreaRow>,
     /// Placements, bounded to the placement row cap.
     pub placements: RowSet<PlacementRow>,
+    /// Owned roots found under every declared area of every present volume,
+    /// bounded to the root row cap. Each row reports the path its marker
+    /// recorded and the path the current configuration resolves, so a
+    /// `root_dir` change is visible without anything having moved.
+    #[serde(default)]
+    pub roots: RowSet<RootObservation>,
     /// Foreign observations, bounded to the observation row cap.
     pub observations: RowSet<ObservationRow>,
 }
@@ -195,6 +212,18 @@ pub struct VolumeRow {
     pub folders: FolderOverrides,
     /// Whether an operator declared the record or it was imported.
     pub origin: RecordOrigin,
+}
+
+impl AreaRow {
+    /// Project one stored declaration into the document's row shape.
+    pub fn from_document(document: &AreaDocument) -> Self {
+        Self {
+            namespace: document.namespace.clone(),
+            area: document.area.clone(),
+            folder: document.folder.clone(),
+            overrides: document.overrides.clone(),
+        }
+    }
 }
 
 impl VolumeRow {
@@ -368,6 +397,7 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
     let state = state_report(request.account, request.environment_home, &paths)?;
     let registry = read_registry_observed(&paths)?;
     let observations = inspect::observe_oxide(request.account)?;
+    let declarations = area::read_declarations(&paths)?;
 
     let volume_rows: Vec<VolumeRow> = registry
         .volumes()
@@ -375,6 +405,13 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
         .map(VolumeRow::from_record)
         .collect();
     let volume_total = volume_rows.len();
+    let area_rows: Vec<AreaRow> = declarations
+        .documents
+        .iter()
+        .map(AreaRow::from_document)
+        .collect();
+    let area_total = area_rows.len();
+    let roots = collect_roots(request, &paths, registry.volumes(), &declarations);
     let observation_rows = observations.rows().to_vec();
     let observation_total = observation_rows.len();
 
@@ -386,10 +423,58 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
         formats: FormatVersions::current(),
         state,
         volumes: RowSet::bounded(volume_rows, volume_total, VOLUME_ROWS),
-        areas: RowSet::empty(),
+        areas: RowSet::bounded(area_rows, area_total, AREA_ROWS),
         placements: RowSet::empty(),
+        roots,
         observations: RowSet::bounded(observation_rows, observation_total, OBSERVATION_ROWS),
     })
+}
+
+/// Read every owned root of every declared area on every present volume.
+///
+/// This is a read-only walk: it creates nothing, takes only the shared registry
+/// lock the caller already holds, and skips a volume it cannot verify (an
+/// unplugged drive is reported by its volume row, and `describe` stays usable).
+/// The reported paths are the marker's recorded path and the path the current
+/// configuration resolves, which is how a `root_dir` change is visible.
+fn collect_roots(
+    request: &DescribeRequest<'_>,
+    paths: &StatePaths,
+    volumes: &[VolumeRecord],
+    declarations: &area::DeclarationSet,
+) -> RowSet<RootObservation> {
+    let mut rows = Vec::new();
+    let mut total = 0usize;
+    for record in volumes {
+        if record.mount_hint.is_none() {
+            continue;
+        }
+        for document in &declarations.documents {
+            let caller = document.declaration();
+            let Ok(resolved) = area::resolve(
+                request.dirs,
+                request.facts,
+                request.mounts,
+                request.observer,
+                record,
+                &caller,
+                Some(document),
+            ) else {
+                continue;
+            };
+            let Ok(listing) =
+                area::list_roots(request.dirs, request.observer, paths, &resolved, ROOT_ROWS)
+            else {
+                continue;
+            };
+            total = total.saturating_add(listing.roots.len());
+            rows.extend(listing.roots);
+            if rows.len() >= ROOT_ROWS {
+                return RowSet::bounded(rows, total, ROOT_ROWS);
+            }
+        }
+    }
+    RowSet::bounded(rows, total, ROOT_ROWS)
 }
 
 /// Build the `barge.inspect/1` data.
@@ -558,6 +643,7 @@ pub fn read_describe_document(bytes: &[u8]) -> Result<DescribeData> {
     data.volumes.validate()?;
     data.areas.validate()?;
     data.placements.validate()?;
+    data.roots.validate()?;
     data.observations.validate()?;
     Ok(data)
 }
@@ -635,7 +721,7 @@ mod tests {
     };
     use crate::contract::{success_bytes, RowSet, DESCRIBE_SCHEMA, INSPECT_SCHEMA};
     use crate::error::{Error, ErrorKind, Result};
-    use crate::os::AccountFacts;
+    use crate::os::{AccountFacts, DirOps};
     use crate::registry::{
         Availability, Durability, FolderOverrides, RecordOrigin, RegistryDocument, RegistryWriter,
         ScratchGrants, VolumeRecord,
@@ -681,6 +767,7 @@ mod tests {
         dir: TempDir,
         account: FakeAccount,
         state_dir: PathBuf,
+        platform: crate::os::MacOs,
     }
 
     impl Fixture {
@@ -694,6 +781,7 @@ mod tests {
                 dir,
                 account,
                 state_dir,
+                platform: crate::os::platform(),
             }
         }
 
@@ -707,6 +795,10 @@ mod tests {
                 environment_home: None,
                 state_dir_override: Some(self.state_override()),
                 tool_version: "0.1.0",
+                dirs: &self.platform,
+                facts: &self.platform,
+                mounts: &self.platform,
+                observer: &self.platform,
             }
         }
 
@@ -793,6 +885,10 @@ mod tests {
             environment_home: None,
             state_dir_override: None,
             tool_version: "0.1.0",
+            dirs: &fixture.platform,
+            facts: &fixture.platform,
+            mounts: &fixture.platform,
+            observer: &fixture.platform,
         })
         .expect("describe reads");
         assert_eq!(
@@ -816,6 +912,10 @@ mod tests {
             environment_home: Some(&other),
             state_dir_override: None,
             tool_version: "0.1.0",
+            dirs: &fixture.platform,
+            facts: &fixture.platform,
+            mounts: &fixture.platform,
+            observer: &fixture.platform,
         })
         .expect("describe reads");
         assert!(data.state.home.mismatch);
@@ -834,6 +934,10 @@ mod tests {
             environment_home: Some(&fixture.account.home),
             state_dir_override: None,
             tool_version: "0.1.0",
+            dirs: &fixture.platform,
+            facts: &fixture.platform,
+            mounts: &fixture.platform,
+            observer: &fixture.platform,
         })
         .expect("describe reads");
         assert!(!same.state.home.mismatch);
@@ -1226,11 +1330,16 @@ mod tests {
             }
         }
 
+        let platform = crate::os::platform();
         let error = describe(&DescribeRequest {
             account: &FailingAccount,
             environment_home: None,
             state_dir_override: None,
             tool_version: "0.1.0",
+            dirs: &platform,
+            facts: &platform,
+            mounts: &platform,
+            observer: &platform,
         })
         .expect_err("an unreadable account home refuses");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
@@ -1302,6 +1411,10 @@ mod tests {
             environment_home: None,
             state_dir_override: Some(Path::new("relative/state")),
             tool_version: "0.1.0",
+            dirs: &fixture.platform,
+            facts: &fixture.platform,
+            mounts: &fixture.platform,
+            observer: &fixture.platform,
         })
         .expect_err("a relative override is refused");
         assert_eq!(error.kind(), ErrorKind::Usage);
@@ -1317,5 +1430,176 @@ mod tests {
             tool_version: "0.1.0",
         })
         .is_err());
+    }
+    /// Injected volume facts for one fixture directory standing in for a mounted
+    /// volume, so `describe` can walk an area without a real drive.
+    struct FixtureVolume {
+        root: PathBuf,
+        uuid: crate::os::VolumeUuid,
+        device: crate::os::DeviceId,
+    }
+
+    impl crate::os::VolumeFacts for FixtureVolume {
+        fn identify(&self, _path: &Path) -> Result<crate::os::VolumeIdentity> {
+            Ok(crate::os::VolumeIdentity {
+                mount_point: self.root.clone(),
+                filesystem: crate::os::FileSystem::Apfs,
+                device: self.device,
+                volume_uuid: Some(self.uuid.clone()),
+                boot_volume: false,
+            })
+        }
+    }
+
+    impl crate::os::MountRoot for FixtureVolume {
+        fn mount_root(&self, path: &Path) -> Result<crate::os::MountPoint> {
+            if path != self.root {
+                return Err(Error::new(
+                    ErrorKind::VolumeMismatch,
+                    "not the fixture mount root",
+                ));
+            }
+            Ok(crate::os::MountPoint::new(self.root.clone()))
+        }
+    }
+
+    impl crate::os::ProcessObserver for FixtureVolume {
+        fn effective_uid(&self) -> Result<u32> {
+            crate::os::platform().effective_uid()
+        }
+
+        fn boot_identity(&self) -> Result<String> {
+            Ok("1700000000.0".to_owned())
+        }
+
+        fn process_start(&self, _pid: u32) -> Result<Option<u64>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn describe_reports_each_roots_recorded_and_configured_path() {
+        let fixture = Fixture::new("describe-roots");
+        let volume_dir = fixture.dir.join("volume");
+        std::fs::create_dir(&volume_dir).expect("the fixture volume root is created");
+        let platform = &fixture.platform;
+        let device = platform
+            .open_path(&volume_dir)
+            .expect("the fixture volume opens")
+            .identity()
+            .device;
+        let uuid = crate::os::VolumeUuid::parse(UUID).expect("a UUID");
+        let record = VolumeRecord {
+            volume_uuid: uuid.clone(),
+            mount_hint: Some(volume_dir.clone()),
+            availability: Availability::Permanent,
+            durability: Durability::Expendable,
+            root_dir: String::new(),
+            folders: FolderOverrides::none(),
+            origin: RecordOrigin::Declared,
+            scratch_grants: ScratchGrants::none(),
+            generation: 1,
+            registered_ms: 1_792_525_019_847,
+        };
+        let state = fixture.state();
+        state.initialize().expect("the layout exists");
+        {
+            let mut locks =
+                LockSet::with_deadline(state.clone(), Deadline::after(Duration::from_secs(5)));
+            let lock = locks.lock_registry().expect("the registry lock");
+            RegistryWriter::new(&state)
+                .publish(&lock, &RegistryDocument::new(vec![record.clone()]))
+                .expect("the volume is registered");
+        }
+        let volume = FixtureVolume {
+            root: volume_dir.clone(),
+            uuid,
+            device,
+        };
+        let declaration = crate::area::AreaDeclaration {
+            namespace: "example".to_owned(),
+            area: "pool".to_owned(),
+            folder: "example/pool".to_owned(),
+            overrides: std::collections::BTreeMap::new(),
+            absent: crate::area::AbsentPolicy::Fail {
+                attach: "the build volume".to_owned(),
+            },
+            prune: crate::area::PrunePolicy::None,
+            reserve: crate::area::ReserveParticipation::Counts,
+        };
+        crate::area::declare(&state, &declaration, 1_000).expect("the area is declared");
+        let resolved = crate::area::resolve(
+            platform,
+            &volume,
+            &volume,
+            &volume,
+            &record,
+            &declaration,
+            None,
+        )
+        .expect("the area resolves");
+        let root = crate::area::create_root(
+            platform,
+            &volume,
+            &resolved,
+            crate::area::RootSpec {
+                kind: crate::area::RootKind::AreaRoot,
+            },
+        )
+        .expect("the root is created");
+
+        let request = DescribeRequest {
+            account: &fixture.account,
+            environment_home: None,
+            state_dir_override: Some(fixture.state_override()),
+            tool_version: "0.1.0",
+            dirs: platform,
+            facts: &volume,
+            mounts: &volume,
+            observer: &volume,
+        };
+        let data = describe(&request).expect("describe reads");
+        assert_eq!(data.areas.count, 1, "the declared area is reported");
+        assert_eq!(data.roots.count, 1, "the owned root is reported");
+        let row = &data.roots.rows[0];
+        assert_eq!(row.state, crate::area::MarkerStateName::Owned);
+        assert_eq!(row.recorded_path.as_deref(), Some(root.path.as_path()));
+        assert_eq!(row.configured_path, root.path);
+        assert_eq!(row.root_id.as_deref(), Some(root.root_id.as_str()));
+
+        // Changing root_dir moves nothing: the volume row reports the new value,
+        // the old root is still there, and the new configuration finds no root.
+        let mut moved = record.clone();
+        moved.root_dir = "managed".to_owned();
+        let mut locks =
+            LockSet::with_deadline(state.clone(), Deadline::after(Duration::from_secs(5)));
+        let lock = locks.lock_registry().expect("the registry lock");
+        RegistryWriter::new(&state)
+            .publish(&lock, &RegistryDocument::new(vec![moved]))
+            .expect("the registry is rewritten");
+        drop(lock);
+        let data = describe(&request).expect("describe reads");
+        assert_eq!(data.volumes.rows[0].root_dir, "managed");
+        assert_eq!(data.roots.count, 0, "nothing is reported at the new path");
+        assert!(
+            root.path.join(crate::area::ROOT_MARKER_FILE).is_file(),
+            "the root stays where it was created"
+        );
+    }
+
+    #[test]
+    fn a_describe_document_without_roots_still_reads() {
+        let fixture = Fixture::new("describe-roots-compatible");
+        let data = describe(&fixture.request()).expect("describe reads");
+        let bytes = document(&data);
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("the document");
+        let data_object = value["data"]
+            .as_object_mut()
+            .expect("the data is an object");
+        data_object.remove("roots");
+        let mut without = serde_json::to_vec(&value).expect("the document encodes");
+        without.push(b'\n');
+        let read = read_describe_document(&without).expect("an older document reads");
+        assert_eq!(read.roots.count, 0, "a missing optional list is empty");
     }
 }

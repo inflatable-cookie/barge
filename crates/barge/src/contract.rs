@@ -27,6 +27,20 @@ pub const PLACEMENT_ROWS: usize = 4096;
 /// The row cap for foreign observations. The design publishes no separate cap,
 /// so the largest declared cap is used and a report cannot grow without limit.
 pub const OBSERVATION_ROWS: usize = 4096;
+/// The row cap for owned roots reported in one listing. The design bounds a
+/// listing by examined names rather than rows, so roots use the largest
+/// declared row cap and the listing reports truncation.
+pub const ROOT_ROWS: usize = 4096;
+/// The most hold files one root may carry (design, "Bounded resources").
+pub const HOLD_ROWS: usize = 64;
+/// The per-directory name bound for one listing (design, "Bounded resources").
+pub const LISTING_NAME_ROWS: usize = 200_000;
+/// The largest area declaration document (design, "Bounded resources").
+pub const AREA_DECLARATION_CAP_BYTES: usize = 64 * 1024;
+/// The largest owned-root marker (design, "Bounded resources").
+pub const MARKER_CAP_BYTES: usize = 4 * 1024;
+/// The largest hold record. Every authoritative record is private and small.
+pub const HOLD_CAP_BYTES: usize = 4 * 1024;
 
 /// The describe document's schema string.
 pub const DESCRIBE_SCHEMA: &str = "barge.describe/1";
@@ -38,6 +52,20 @@ pub const ERROR_SCHEMA: &str = "barge.error/1";
 pub const INSPECT_SCHEMA: &str = "barge.inspect/1";
 /// The prefix every major of the inspect document shares.
 pub const INSPECT_SCHEMA_PREFIX: &str = "barge.inspect/";
+/// The area declaration command documents (slice S3).
+pub const AREA_DECLARE_SCHEMA: &str = "barge.area.declare/1";
+/// The area show command document.
+pub const AREA_SHOW_SCHEMA: &str = "barge.area.show/1";
+/// The area list command document.
+pub const AREA_LIST_SCHEMA: &str = "barge.area.list/1";
+/// The owned-root create command document.
+pub const AREA_ROOT_CREATE_SCHEMA: &str = "barge.area.root.create/1";
+/// The owned-root listing command document.
+pub const AREA_ROOT_LIST_SCHEMA: &str = "barge.area.root.list/1";
+/// The hold command document.
+pub const AREA_HOLD_SCHEMA: &str = "barge.area.hold/1";
+/// The hold release command document.
+pub const AREA_RELEASE_SCHEMA: &str = "barge.area.release/1";
 /// The account volume registry's format (written from slice S2).
 pub const REGISTRY_SCHEMA: &str = "barge.registry/1";
 /// One area declaration's format.
@@ -106,6 +134,14 @@ pub struct RowSet<T> {
     pub total: usize,
     /// Whether `total` exceeded the row cap.
     pub truncated: bool,
+}
+
+impl<T> Default for RowSet<T> {
+    /// A list with no rows, so a document field can be added inside a major
+    /// version and an older document still reads.
+    fn default() -> Self {
+        Self::empty()
+    }
 }
 
 impl<T> RowSet<T> {

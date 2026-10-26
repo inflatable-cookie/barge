@@ -7,8 +7,11 @@
 //! JSON contract. Slice S2 adds the account state directory with its atomic
 //! publish, bounded reads and fixed lock order, the `barge.registry/1` reader
 //! and its fixture-tested writer, the read-only Oxide observations and
-//! `barge inspect`. Every other module states its job and carries no placeholder
-//! logic for a later slice to undo.
+//! `barge inspect`. Slice S3 adds `area`: path containment and the descriptor
+//! walk, `barge.area/1` declarations, owned roots and their `barge.root/1`
+//! markers, cooperative holds and bounded root listing, with `barge area` verbs
+//! as the CLI's form of them. Every other module states its job and carries no
+//! placeholder logic for a later slice to undo.
 //!
 //! `unsafe` is denied for the whole crate and allowed only in the macOS
 //! implementation of the [`os`] layer, which is the one FFI seam.
@@ -24,6 +27,7 @@ pub mod contract;
 pub mod custody;
 pub mod delete;
 pub mod describe;
+pub mod digest;
 pub mod error;
 pub mod inspect;
 pub mod os;

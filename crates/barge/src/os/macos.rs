@@ -10,14 +10,16 @@
 
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::facts::{
-    AccountFacts, DeviceId, FileSystem, MountPoint, MountRoot, VolumeFacts, VolumeIdentity,
+    AccountFacts, ChildEntry, ChildListing, DeviceId, DirHandle, DirId, DirOps, EntryFacts,
+    EntryKind, FileSystem, MountPoint, MountRoot, ProcessObserver, VolumeFacts, VolumeIdentity,
     VolumeUuid,
 };
 
@@ -37,6 +39,13 @@ const CACHES_RELATIVE: &str = "Library/Caches";
 
 /// The largest password-database buffer Barge will grow to before refusing.
 const MAX_PASSWD_BUFFER_BYTES: usize = 64 * 1024;
+
+/// The most names one listing examines, even when the caller asks for more.
+/// It is the design's per-directory name bound ("Directory names per listing").
+const LIST_ENTRY_LIMIT: usize = 200_000;
+
+/// Distinguishes temporary names issued in one process.
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A generous fixed buffer for one `fgetattrlist` volume attribute: the kernel
 /// writes a 4-byte length followed by the attribute's value.
@@ -123,6 +132,416 @@ impl AccountFacts for MacOs {
 
     fn tool_cache_dir(&self, tool: &str) -> Result<PathBuf> {
         Ok(account_home()?.join(CACHES_RELATIVE).join(tool))
+    }
+}
+
+impl ProcessObserver for MacOs {
+    fn effective_uid(&self) -> Result<u32> {
+        // SAFETY: `geteuid` takes no arguments, cannot fail and has no
+        // preconditions.
+        Ok(unsafe { libc::geteuid() })
+    }
+
+    fn boot_identity(&self) -> Result<String> {
+        // SAFETY: `timeval` is a plain-old-data C struct, so an all-zero value
+        // is a valid initial buffer that `sysctl` overwrites on success.
+        let mut value: libc::timeval = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<libc::timeval>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+        // SAFETY: `mib` and `size` describe the request, and `value` is a
+        // writable `timeval` whose exact size is passed, so the kernel writes
+        // only inside it.
+        let status = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                std::ptr::addr_of_mut!(value).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status != 0 || size != std::mem::size_of::<libc::timeval>() {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "the boot identity could not be read: {}",
+                    io::Error::last_os_error()
+                ),
+            )
+            .with_detail("fact", "boot identity".into()));
+        }
+        Ok(format!("{}.{}", value.tv_sec, value.tv_usec))
+    }
+
+    fn process_start(&self, pid: u32) -> Result<Option<u64>> {
+        if pid == 0 {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "pid 0 has no process start identity",
+            )
+            .with_detail("pid", u64::from(pid).into()));
+        }
+        // SAFETY: `proc_bsdinfo` is a plain-old-data C struct, so an all-zero
+        // value is a valid initial buffer that `proc_pidinfo` overwrites.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>();
+        // SAFETY: `info` is a writable buffer of exactly the size passed, so the
+        // kernel writes only inside it and returns how much it wrote.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                std::ptr::addr_of_mut!(info).cast(),
+                size as libc::c_int,
+            )
+        };
+        if written as usize == size {
+            return Ok(Some(
+                info.pbi_start_tvsec
+                    .saturating_mul(1_000_000)
+                    .saturating_add(info.pbi_start_tvusec),
+            ));
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            // The kernel reports no such process: it is positively gone.
+            Some(libc::ESRCH) => Ok(None),
+            _ => Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("the start identity of pid {pid} is unreadable: {error}"),
+            )
+            .with_detail("pid", u64::from(pid).into())
+            .with_detail("os_error", error.to_string().into())),
+        }
+    }
+}
+
+impl DirOps for MacOs {
+    fn open_path(&self, path: &Path) -> Result<DirHandle> {
+        let descriptor = open_directory(path)?;
+        let identity = read_dir_identity(&descriptor, path)?;
+        Ok(DirHandle::from_descriptor(descriptor, identity))
+    }
+
+    fn path_facts(&self, path: &Path) -> Result<Option<EntryFacts>> {
+        let raw = path_cstring(path)?;
+        // SAFETY: `stat` is a plain-old-data C struct, so an all-zero value is a
+        // valid initial buffer, and `lstat` writes it on success.
+        let mut status: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `raw` is a NUL-terminated path that outlives the call and
+        // `status` is a writable `stat` of exactly the size the call expects.
+        if unsafe { libc::lstat(raw.as_ptr(), &mut status) } != 0 {
+            return entry_result(path, "entry", io::Error::last_os_error());
+        }
+        Ok(Some(entry_facts(&status)))
+    }
+
+    fn open_child_dir(&self, parent: &DirHandle, name: &str) -> Result<DirHandle> {
+        let directory = parent_descriptor(parent, name)?;
+        let raw = name_cstring(name)?;
+        // SAFETY: `directory` is open for this call, `raw` is one NUL-terminated
+        // component, and the flags are libc's own constants. `openat` returns
+        // either -1 or a fresh descriptor this function then owns.
+        let descriptor = unsafe {
+            libc::openat(
+                directory,
+                raw.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(child_error(
+                name,
+                "cannot open the child directory",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `descriptor` is a fresh non-negative descriptor from `openat`
+        // and no other owner exists, so `File` may take ownership of it.
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        let identity = read_dir_identity(&file, Path::new(name))?;
+        Ok(DirHandle::from_descriptor(file, identity))
+    }
+
+    fn duplicate_dir(&self, handle: &DirHandle) -> Result<DirHandle> {
+        let directory = parent_descriptor(handle, "duplicate")?;
+        // SAFETY: `directory` is open for this call; `dup` returns either -1 or
+        // a fresh descriptor this function then owns.
+        let duplicate = unsafe { libc::dup(directory) };
+        if duplicate < 0 {
+            return Err(child_error(
+                "duplicate",
+                "cannot duplicate the directory",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `duplicate` is a fresh non-negative descriptor from `dup` and
+        // no other owner exists, so `File` may take ownership of it.
+        let file = unsafe { File::from_raw_fd(duplicate) };
+        Ok(DirHandle::from_descriptor(file, handle.identity()))
+    }
+
+    fn child_facts(&self, parent: &DirHandle, name: &str) -> Result<Option<EntryFacts>> {
+        let directory = parent_descriptor(parent, name)?;
+        let raw = name_cstring(name)?;
+        // SAFETY: `stat` is a plain-old-data C struct, so an all-zero value is a
+        // valid initial buffer, and `fstatat` writes it on success.
+        let mut status: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `directory` is open for this call, `raw` is one NUL-terminated
+        // component and `status` is a writable `stat` of the size the call
+        // expects. `AT_SYMLINK_NOFOLLOW` means the link itself is reported.
+        if unsafe {
+            libc::fstatat(
+                directory,
+                raw.as_ptr(),
+                &mut status,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return child_entry_result(name, io::Error::last_os_error());
+        }
+        Ok(Some(entry_facts(&status)))
+    }
+
+    fn create_child_dir(&self, parent: &DirHandle, name: &str, mode: u32) -> Result<DirId> {
+        let directory = parent_descriptor(parent, name)?;
+        let raw = name_cstring(name)?;
+        // SAFETY: `directory` is open for this call, `raw` is one NUL-terminated
+        // component, and `mode` is passed with the default argument promotion a
+        // variadic C function expects.
+        if unsafe { libc::mkdirat(directory, raw.as_ptr(), mode as libc::mode_t) } != 0 {
+            return Err(child_error(
+                name,
+                "cannot create the child directory",
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(self.open_child_dir(parent, name)?.identity())
+    }
+
+    fn publish_child_file(
+        &self,
+        parent: &DirHandle,
+        name: &str,
+        bytes: &[u8],
+        mode: u32,
+    ) -> Result<()> {
+        let directory = parent_descriptor(parent, name)?;
+        let target = name_cstring(name)?;
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = format!(".barge-tmp-{}-{sequence}", std::process::id());
+        let temporary_raw = name_cstring(&temporary)?;
+        // SAFETY: `directory` is open, `temporary_raw` is one NUL-terminated
+        // component, the flags are libc's own constants and the variadic mode is
+        // passed with the promotion C expects. The result is either -1 or a
+        // fresh descriptor this function owns.
+        let descriptor = unsafe {
+            libc::openat(
+                directory,
+                temporary_raw.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                mode as libc::c_int,
+            )
+        };
+        if descriptor < 0 {
+            return Err(child_error(
+                name,
+                "cannot create a temporary file",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `descriptor` is a fresh non-negative descriptor from `openat`
+        // and no other owner exists, so `File` may take ownership of it.
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        let published = (|| -> Result<()> {
+            file.write_all(bytes)
+                .map_err(|error| child_error(name, "cannot write the temporary file", error))?;
+            file.sync_all()
+                .map_err(|error| child_error(name, "cannot sync the temporary file", error))?;
+            // SAFETY: both names are NUL-terminated components inside the same
+            // open directory, which is what makes the rename atomic.
+            if unsafe {
+                libc::renameat(
+                    directory,
+                    temporary_raw.as_ptr(),
+                    directory,
+                    target.as_ptr(),
+                )
+            } != 0
+            {
+                return Err(child_error(
+                    name,
+                    "cannot publish the file",
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `directory` is the open directory the rename happened in.
+            if unsafe { libc::fsync(directory) } != 0 {
+                return Err(child_error(
+                    name,
+                    "cannot sync the directory",
+                    io::Error::last_os_error(),
+                ));
+            }
+            Ok(())
+        })();
+        if published.is_err() {
+            // Best effort: a leftover temporary file is never read as the
+            // target, and reporting the original failure matters more.
+            // SAFETY: `temporary_raw` names the file this call created.
+            unsafe {
+                libc::unlinkat(directory, temporary_raw.as_ptr(), 0);
+            }
+        }
+        published
+    }
+
+    fn read_child_file(
+        &self,
+        parent: &DirHandle,
+        name: &str,
+        cap: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let directory = parent_descriptor(parent, name)?;
+        let raw = name_cstring(name)?;
+        // SAFETY: `directory` is open, `raw` is one NUL-terminated component and
+        // the flags are libc's own constants. The result is either -1 or a fresh
+        // descriptor this function owns.
+        let descriptor = unsafe {
+            libc::openat(
+                directory,
+                raw.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return child_read_result(name, io::Error::last_os_error());
+        }
+        // SAFETY: `descriptor` is a fresh non-negative descriptor from `openat`
+        // and no other owner exists, so `File` may take ownership of it.
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        let facts = entry_facts(&fstat(&file, Path::new(name))?);
+        if facts.kind != EntryKind::File {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("`{name}` is a {}, not a regular file", facts.kind.as_str()),
+            )
+            .with_detail("name", name.into()));
+        }
+        if facts.size > cap as u64 {
+            return Err(child_bound_error(name, facts.size, cap));
+        }
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let read = file
+                .read(&mut chunk)
+                .map_err(|error| child_error(name, "cannot read the file", error))?;
+            if read == 0 {
+                return Ok(Some(buffer));
+            }
+            if buffer.len() + read > cap {
+                return Err(child_bound_error(name, (buffer.len() + read) as u64, cap));
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    fn list_children(&self, parent: &DirHandle, max_names: usize) -> Result<ChildListing> {
+        let directory = parent_descriptor(parent, "listing")?;
+        // `fdopendir` takes ownership of the descriptor it is given, so the
+        // caller's handle is duplicated rather than closed under it.
+        // SAFETY: `directory` is open for this call.
+        let duplicate = unsafe { libc::dup(directory) };
+        if duplicate < 0 {
+            return Err(listing_error(io::Error::last_os_error()));
+        }
+        // SAFETY: `duplicate` is a fresh descriptor this function owns and
+        // `fdopendir` returns either null or a directory stream that owns it.
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            // SAFETY: the stream was not created, so the descriptor is still
+            // this function's to close.
+            unsafe {
+                libc::close(duplicate);
+            }
+            return Err(listing_error(io::Error::last_os_error()));
+        }
+        let mut entries = Vec::new();
+        let mut total = 0usize;
+        let mut truncated = false;
+        loop {
+            // SAFETY: `__error` returns this thread's errno location.
+            unsafe {
+                *libc::__error() = 0;
+            }
+            // SAFETY: `stream` is the directory stream created above.
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                // SAFETY: `__error` returns this thread's errno location.
+                let errno = unsafe { *libc::__error() };
+                if errno != 0 {
+                    // SAFETY: `stream` is owned by this function.
+                    unsafe {
+                        libc::closedir(stream);
+                    }
+                    return Err(listing_error(io::Error::from_raw_os_error(errno)));
+                }
+                break;
+            }
+            // SAFETY: `entry` points at the live directory entry `readdir`
+            // returned, and is read before the next call changes it.
+            let name = entry_name(entry);
+            let Some(name) = name else {
+                continue;
+            };
+            if name == "." || name == ".." {
+                continue;
+            }
+            total = total.saturating_add(1);
+            if entries.len() < max_names && total <= LIST_ENTRY_LIMIT {
+                if let Some(facts) = self.child_facts(parent, &name)? {
+                    entries.push(ChildEntry { name, facts });
+                }
+            } else {
+                truncated = true;
+            }
+            if total >= LIST_ENTRY_LIMIT {
+                truncated = true;
+                break;
+            }
+        }
+        // SAFETY: `stream` is owned by this function and is not used again.
+        unsafe {
+            libc::closedir(stream);
+        }
+        Ok(ChildListing {
+            entries,
+            total,
+            truncated,
+        })
+    }
+
+    fn random_bytes(&self, length: usize) -> Result<Vec<u8>> {
+        let mut source = File::open("/dev/urandom").map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("cannot open the platform entropy source: {error}"),
+            )
+            .with_detail("os_error", error.to_string().into())
+        })?;
+        let mut buffer = vec![0u8; length];
+        source.read_exact(&mut buffer).map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("cannot read the platform entropy source: {error}"),
+            )
+            .with_detail("os_error", error.to_string().into())
+        })?;
+        Ok(buffer)
     }
 }
 
@@ -270,9 +689,12 @@ fn read_device(descriptor: RawFd, path: &Path) -> Result<DeviceId> {
     }
     // `dev_t` is signed on macOS; keep its bit pattern so two readings of one
     // volume compare equal without a sign-dependent conversion.
-    Ok(DeviceId::new(u64::from(u32::from_ne_bytes(
-        status.st_dev.to_ne_bytes(),
-    ))))
+    Ok(device_of(status.st_dev))
+}
+
+/// A device number as the platform reports it, kept as its bit pattern.
+fn device_of(device: libc::dev_t) -> DeviceId {
+    DeviceId::new(u64::from(u32::from_ne_bytes(device.to_ne_bytes())))
 }
 
 /// The kernel's APFS volume UUID through `fgetattrlist(ATTR_VOL_UUID)`.
@@ -405,4 +827,200 @@ fn passwd_error(uid: libc::uid_t, error: io::Error) -> Error {
     )
     .with_detail("uid", u64::from(uid).into())
     .with_detail("os_error", error.to_string().into())
+}
+
+/// One absolute path as a NUL-terminated C string. A path with a NUL byte is a
+/// usage failure, never a truncated path.
+fn path_cstring(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        Error::new(
+            ErrorKind::Usage,
+            format!("{} contains a NUL byte", path.display()),
+        )
+        .with_detail("path", path.display().to_string().into())
+    })
+}
+
+/// One child name as a NUL-terminated C string. A name that is not exactly one
+/// path component is refused, so the platform layer cannot be asked to walk a
+/// path by name.
+fn name_cstring(name: &str) -> Result<CString> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            format!("`{name}` is not one path component"),
+        )
+        .with_detail("name", name.into()));
+    }
+    CString::new(name.as_bytes()).map_err(|_| {
+        Error::new(ErrorKind::Usage, "a child name contains a NUL byte")
+            .with_detail("name", name.into())
+    })
+}
+
+/// The descriptor behind a parent handle.
+fn parent_descriptor(parent: &DirHandle, name: &str) -> Result<RawFd> {
+    parent.descriptor().map(AsRawFd::as_raw_fd).ok_or_else(|| {
+        Error::new(
+            ErrorKind::Usage,
+            format!("the handle for `{name}` has no open descriptor"),
+        )
+        .with_detail("name", name.into())
+    })
+}
+
+/// The identity of an opened directory.
+fn read_dir_identity(descriptor: &File, path: &Path) -> Result<DirId> {
+    let status = fstat(descriptor, path)?;
+    Ok(DirId {
+        device: device_of(status.st_dev),
+        inode: status.st_ino,
+    })
+}
+
+fn fstat(descriptor: &File, path: &Path) -> Result<libc::stat> {
+    // SAFETY: `stat` is a plain-old-data C struct, so an all-zero value is a
+    // valid initial buffer, and `fstat` writes it on success.
+    let mut status: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: the descriptor is open for this call and `status` is a writable
+    // `stat` of exactly the size the call expects.
+    if unsafe { libc::fstat(descriptor.as_raw_fd(), &mut status) } != 0 {
+        return Err(fact_error(
+            path,
+            "device and inode",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(status)
+}
+
+/// One `stat` as the facts a module above `os` may use. Nothing is followed and
+/// nothing is inferred: the kind, device, inode, owner and mode are the entry's
+/// own.
+fn entry_facts(status: &libc::stat) -> EntryFacts {
+    let kind = match status.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => EntryKind::Directory,
+        libc::S_IFREG => EntryKind::File,
+        libc::S_IFLNK => EntryKind::Symlink,
+        _ => EntryKind::Other,
+    };
+    EntryFacts {
+        kind,
+        device: device_of(status.st_dev),
+        inode: status.st_ino,
+        uid: status.st_uid,
+        mode: u32::from(status.st_mode) & 0o7777,
+        size: u64::try_from(status.st_size).unwrap_or(0),
+        modified_ms: modified_ms(status),
+    }
+}
+
+/// The modification time in milliseconds since the Unix epoch, when the
+/// platform's two fields convert cleanly.
+fn modified_ms(status: &libc::stat) -> Option<u64> {
+    let seconds = u64::try_from(status.st_mtime).ok()?;
+    let nanos = u64::try_from(status.st_mtime_nsec).ok()?;
+    seconds.checked_mul(1000)?.checked_add(nanos / 1_000_000)
+}
+
+/// The name of one directory entry, lossily decoded: a listing reports names,
+/// and a name that is not UTF-8 is still counted.
+fn entry_name(entry: *const libc::dirent) -> Option<String> {
+    // SAFETY: `entry` points at a live directory entry, whose `d_name` is a
+    // NUL-terminated array inside it.
+    let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+    let bytes = name.to_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(OsStr::from_bytes(bytes).to_string_lossy().into_owned())
+}
+
+/// An absent entry is `Ok(None)`; anything else is the platform's own failure,
+/// mapped to the contract's kinds.
+fn entry_result(path: &Path, action: &str, error: io::Error) -> Result<Option<EntryFacts>> {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => Ok(None),
+        Some(libc::ELOOP) => Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "{} is a symbolic link, which is never followed",
+                path.display()
+            ),
+        )
+        .with_detail("path", path.display().to_string().into())),
+        Some(libc::ENOTDIR) => Err(Error::new(
+            ErrorKind::RefusedContainment,
+            format!("{} is not inside a directory", path.display()),
+        )
+        .with_detail("path", path.display().to_string().into())),
+        _ => Err(Error::new(
+            ErrorKind::Io,
+            format!("{action} {}: {error}", path.display()),
+        )
+        .with_detail("path", path.display().to_string().into())
+        .with_detail("os_error", error.to_string().into())),
+    }
+}
+
+/// The result of opening a child for reading: absent is `Ok(None)`, a symlink is
+/// unknown state and anything else is the platform's own failure.
+fn child_read_result(name: &str, error: io::Error) -> Result<Option<Vec<u8>>> {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => Ok(None),
+        Some(libc::ELOOP) => Err(Error::new(
+            ErrorKind::UnknownState,
+            format!("`{name}` is a symbolic link, which is never followed"),
+        )
+        .with_detail("name", name.into())),
+        _ => Err(Error::new(
+            ErrorKind::Io,
+            format!("cannot open the child `{name}`: {error}"),
+        )
+        .with_detail("name", name.into())
+        .with_detail("os_error", error.to_string().into())),
+    }
+}
+
+fn child_entry_result(name: &str, error: io::Error) -> Result<Option<EntryFacts>> {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => Ok(None),
+        Some(libc::ELOOP) => Err(Error::new(
+            ErrorKind::UnknownState,
+            format!("`{name}` is a symbolic link, which is never followed"),
+        )
+        .with_detail("name", name.into())),
+        _ => Err(Error::new(
+            ErrorKind::Io,
+            format!("cannot read the child `{name}`: {error}"),
+        )
+        .with_detail("name", name.into())
+        .with_detail("os_error", error.to_string().into())),
+    }
+}
+
+fn child_error(name: &str, action: &str, error: io::Error) -> Error {
+    let kind = match error.raw_os_error() {
+        Some(libc::ENOENT | libc::ENXIO | libc::EIO | libc::ENODEV) => ErrorKind::VolumeAbsent,
+        Some(libc::ELOOP) => ErrorKind::RefusedContainment,
+        _ => ErrorKind::Io,
+    };
+    Error::new(kind, format!("{action} `{name}`: {error}"))
+        .with_detail("name", name.into())
+        .with_detail("os_error", error.to_string().into())
+}
+
+fn child_bound_error(name: &str, bytes: u64, cap: usize) -> Error {
+    Error::new(
+        ErrorKind::ResourceBound,
+        format!("`{name}` is {bytes} bytes, over the {cap}-byte cap"),
+    )
+    .with_detail("name", name.into())
+    .with_detail("bytes", bytes.into())
+    .with_detail("cap", cap.into())
+}
+
+fn listing_error(error: io::Error) -> Error {
+    Error::new(ErrorKind::Io, format!("cannot list the directory: {error}"))
+        .with_detail("os_error", error.to_string().into())
 }
