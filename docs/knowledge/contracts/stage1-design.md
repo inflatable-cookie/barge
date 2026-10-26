@@ -1256,8 +1256,11 @@ Choices S5 made where this design left the mechanic to the slice:
   removed, and `deleted` settles the intent. The two-pass walk is what makes "an
   unknown entry stops the delete and keeps the root" literal: nothing is
   unlinked until every entry is classified, and the delete pass removes only what
-  was classified plus Finder metadata that appeared again. Anything else that
-  appears mid-delete stops it, so the delete never widens.
+  was classified plus Finder metadata that appeared again. Finder metadata is the
+  two named forms *as a regular file* of this user on this device: a directory, a
+  link or anything else that happens to be named `.DS_Store` or `._name` is not
+  Finder metadata and stops the delete. Anything else that appears mid-delete
+  stops it too, so the delete never widens.
 - **A settled intent is kept.** `deleted` is the settlement; the record stays in
   `state/intents/` as the journal's own account of what happened, and replay
   treats it as non-pending work. A rolled-back `intent` phase is the one record

@@ -307,6 +307,22 @@ pub struct Faults {
     pub not_empty_prefix: RefCell<Vec<(String, usize)>>,
     /// A volume to shift when its rename succeeds.
     pub volume: Option<std::rc::Rc<FakeVolume>>,
+    /// A directory planted inside the quarantine leaf after a number of file
+    /// removals, so a test can prove what happens to Finder-shaped metadata that
+    /// appears after the classification.
+    pub plant: RefCell<Option<Plant>>,
+}
+
+/// A directory to create inside the quarantine leaf mid-delete.
+pub struct Plant {
+    /// The area folder that holds the quarantine leaf.
+    pub area: PathBuf,
+    /// The name to create, which is why a Finder-shaped name is interesting.
+    pub name: String,
+    /// After how many successful file removals it is created.
+    pub after_removals: usize,
+    removed: usize,
+    done: bool,
 }
 
 impl Faults {
@@ -347,6 +363,48 @@ impl Faults {
     pub fn shifting_volume(mut self, volume: std::rc::Rc<FakeVolume>) -> Self {
         self.volume = Some(volume);
         self
+    }
+
+    /// Create a directory named `name` inside the quarantine leaf after
+    /// `after_removals` successful file removals.
+    pub fn planting_directory(&self, area: &Path, name: &str, after_removals: usize) {
+        *self.plant.borrow_mut() = Some(Plant {
+            area: area.to_path_buf(),
+            name: name.to_owned(),
+            after_removals,
+            removed: 0,
+            done: false,
+        });
+    }
+
+    /// Create the planted entry once enough removals have happened.
+    fn maybe_plant(&self) {
+        let mut guard = self.plant.borrow_mut();
+        let Some(plant) = guard.as_mut() else {
+            return;
+        };
+        if plant.done {
+            return;
+        }
+        plant.removed = plant.removed.saturating_add(1);
+        if plant.removed < plant.after_removals {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(&plant.area) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(crate::state::QUARANTINE_PREFIX)
+            {
+                if std::fs::create_dir(entry.path().join(&plant.name)).is_ok() {
+                    plant.done = true;
+                }
+                break;
+            }
+        }
     }
 }
 
@@ -432,7 +490,11 @@ impl DirOps for Faults {
             }
         }
         drop(remaining);
-        self.inner.remove_child(parent, name, kind)
+        let removal = self.inner.remove_child(parent, name, kind);
+        if matches!(removal, Ok(ChildRemoval::Removed)) {
+            self.maybe_plant();
+        }
+        removal
     }
 
     fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<()> {

@@ -897,8 +897,14 @@ impl<'a> WalkState<'a> {
 
     /// Whether one entry may be removed: it was classified, or it is Finder
     /// metadata that appeared again. Nothing else is ever removed.
-    fn may_remove(&self, relative: &Path, name: &str) -> bool {
-        self.expected.contains(relative) || is_finder_metadata(name)
+    ///
+    /// Finder tolerance is exactly Oxide's two forms *and* a regular file: a
+    /// directory, a link or anything else that happens to be named `.DS_Store`
+    /// or `._name` is not Finder metadata, stops the delete and keeps the root.
+    /// The owner and device are already checked by the classification.
+    fn may_remove(&self, relative: &Path, name: &str, facts: &EntryFacts) -> bool {
+        self.expected.contains(relative)
+            || (facts.kind == EntryKind::File && is_finder_metadata(name))
     }
 
     /// Delete every entry of one directory except, at the top level, the marker.
@@ -937,7 +943,7 @@ impl<'a> WalkState<'a> {
                 return Ok(Walk::Stop(reason));
             }
             let path = relative.join(&entry.name);
-            if !self.may_remove(&path, &entry.name) {
+            if !self.may_remove(&path, &entry.name, &facts) {
                 return Ok(Walk::Stop(format!(
                     "`{}` appeared after the classification, so the delete stops",
                     path.display()
@@ -1719,6 +1725,40 @@ mod tests {
         assert_eq!(report.pending.len(), 1, "{report:?}");
         assert!(report.pending[0].reason.contains("do not match"));
         assert!(leaf.is_dir(), "the leaf stays pending");
+    }
+
+    #[test]
+    fn a_finder_shaped_directory_that_appears_after_classification_stops_the_delete() {
+        // Finder tolerance is `.DS_Store` or `._name` as a regular file of this
+        // user on this device. A directory that happens to carry that name is
+        // not Finder metadata: it stops the delete and never widens it.
+        let prepared = prepared("delete-finder-directory");
+        let root = prepared.observed.path.clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+
+        let faults = Faults::new();
+        faults.planting_directory(root.parent().expect("the area folder"), ".DS_Store", 1);
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(report.phase, IntentPhase::MarkerLast, "{report:?}");
+        assert!(
+            report
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("appeared after the classification"),
+            "{report:?}"
+        );
+        let planted = report.quarantine.join(".DS_Store");
+        assert!(
+            std::fs::symlink_metadata(&planted)
+                .expect("the planted entry is still there")
+                .file_type()
+                .is_dir(),
+            "the Finder-shaped directory is never recursively deleted"
+        );
+        assert!(report.quarantine.is_dir(), "the leaf is kept");
     }
 
     #[test]
