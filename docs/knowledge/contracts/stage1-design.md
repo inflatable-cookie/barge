@@ -1513,6 +1513,20 @@ through recorded grants, and must be at least as conservative on every one of
 those conditions; the test asserts both the equivalence under grants and the
 difference without them (nothing deleted, everything reported).
 
+### Test fixtures on the real OS
+
+A test that exercises the real OS layer needs a real APFS path, so it cannot use
+an injected fact. Those fixtures live inside one **run root**: the fresh
+`/Volumes/Builds/scratch/barge/run.*` directory the invocation names in
+`BARGE_TEST_SCRATCH_ROOT`, or a `run.*` directory the test process creates and
+removes for itself. Nothing is ever created directly in the shared scratch parent
+(`/Volumes/Builds/scratch/barge`), a supplied root is never removed by the test,
+and every fixture removes itself, so a task that must confine its writes to one
+fresh directory can supply that directory and hold the whole suite inside it.
+The containment control proves the three properties directly: a supplied root
+holds the fixture and survives it, a self-created root is removed with its
+fixture, and the fixture base is a run root rather than the shared parent.
+
 ### One bounded native
 
 One focused native design proof, proposed for the scratch and deletion slices
