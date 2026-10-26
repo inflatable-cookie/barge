@@ -1,9 +1,10 @@
 # S6 native proof: plan and case bodies
 
-Status: **plan only, not executed.** The native proof is owner-gated: this
-document, the fixed script it names and the two Effigy selectors exist so the
-owner can activate the elevated run at one exact head. No receipt exists yet,
-and a missing receipt is a missing proof.
+Native qualification is owner-gated. The fixed script and two Effigy selectors
+let the owner activate an elevated run at one exact head. Failed uncounted
+diagnostics are recorded below; they do not qualify a head. The apparatus
+corrections here require independent exact-head review before a separately
+activated fresh diagnostic. A missing or failed receipt is a missing proof.
 
 The design's elevation path is [in the stage 1
 design](stage1-design.md#high-premise-checklist-and-elevation-path): a HIGH
@@ -122,7 +123,7 @@ Each case runs in its own private home, state directory and case-scoped
 | `setting-written` | `~/.npmrc` sets `cache=/old/cache` and an unrelated line | adopt without `--write-setting` would refuse (covered by the unit suite); with it, `changed: true`, the exact new value is in the file, the unrelated line survives, and the report names the change; undo restores the original digest exactly | "tool settings are written only during an explicit adopt, the exact change is reported, and undo reverts it" | 1, 4, 6, 9 |
 | `diverged-undo` | a written setting, then the file is edited by hand | undo exits 3 with `unknown_state`, the edited file's digest is unchanged and the record is still listed | "a file that diverged after adopt refuses undo" | 9 |
 | `non-empty-refused` | `~/.cargo/registry` is a real directory with a payload | adopt exits 2 with `refused_boundary`, `changed: false` and a plan of at least two options; the directory's tree digest is identical; nothing became a link; no record exists | "a non-empty real directory refuses with a plan, and nothing is renamed or deleted" | 9 |
-| `hand-made-in-place` | today's layout: `caches/cargo/registry` holds data and `~/.cargo/registry` is a symlink to it | adopt with `--adopt-existing-root` records `form: held_root`, whose publication link and target are the original path and the adopted directory; the tree digest ignoring `.barge-root.json` is identical; the link text is unchanged; the marker exists; undo removes only the marker and leaves the data and the link byte-identical | "in-place adoption of today's hand-made placements moves nothing"; held-root undo | 1, 4, 6, 7, 8, 9 |
+| `hand-made-in-place` | today's layout: `caches/cargo/registry` holds data and `~/.cargo/registry` is a symlink to it | adopt with `--adopt-existing-root` records `form: held_root`, whose publication link and target are the original path and the adopted directory; the payload/layout digest excludes only the root marker and the containing directory's expected metadata changes; the root and payload identities, bytes, names and link text are unchanged; the original link identity is unchanged; the marker exists; undo removes only the marker and leaves the data and the link byte-identical | "in-place adoption of today's hand-made placements moves nothing"; held-root undo | 1, 4, 6, 7, 8, 9 |
 | `plan-effect-free` | `~/.cargo/` exists, nothing adopted | `describe` reports the fixture account home and the fixture state directory; `--plan` exits 0 with `plan: true`, `placement: null` and reported changes; the case's `caches/` folder was not created, the tool's path was not created, and no record exists | "`--plan` effect-free", the fixture account home | 1, 2, 3, 4, 6, 7, 8, 9 |
 | `ordinary-detach` | one adopted link, then an ordinary `hdiutil detach` | with the volume away, undo and adopt both exit 2 with `volume_absent`, the detail's `attach` and the message name `/Volumes/BargeProof…`, and the published link is unchanged; after an ordinary re-attach, `cache list` exits 0 and reports `link: linked` | Q-001: a cache fails clearly naming the drive, and works again after re-attach | 2, 5, 9 |
 
@@ -170,10 +171,14 @@ The script always writes `$OXIDE_PROOF_EVIDENCE/s6-cache-placement-receipt.json`
 - `preflight` — the probe names, the descriptor primitive, the guarded session,
   the sentinel's 2 s bound, how many preflights ran, the failure (or `null`),
   `status` (`passed`, or `infrastructure` on an abort), `aborted`, and one
-  bounded observation row per probe per case: the sentinel
-  and existing-process listings print `<kind> <uid> <descriptors> <vnodes>
-  <identity-fd> <identity-vnode>`, and the supervisor row names the session and
-  pin it re-checked;
+  bounded observation row per probe per case: the sentinel prints
+  `<kind> <uid> <descriptors> <vnodes> <identity-fd> <identity-vnode>`, and the
+  supervisor row names the session and pin it re-checked. `censuses` retains
+  each full census's case, result, enumerated/process/descriptor counts,
+  foreign/exited/self-excluded counts and, on failure, pid, command and reason.
+  `census_bounds` names the fixed bounds. A counted receipt additionally needs
+  exactly one passed census for every case; failed census evidence is retained
+  even when its case never runs;
 - `mode`, `head`, `repo`, `binary`, `supervisor`, `supervisor_sha256`,
   `evidence`, the volume block (name, mount, backing, `size_mib`, `owners: true`),
   the `real_state` block (path, before, after, unchanged), the nine `premises`
@@ -188,10 +193,11 @@ its cases. It never counts as a pass.
 ## The harness preflight
 
 Every case that runs is preceded by one preflight of **two required descriptor
-probes**, made through the same macOS primitive Barge's own observer uses:
-`proc_pidinfo(PROC_PIDLISTFDS)` for the listing, and
-`proc_pidinfo(PROC_PIDTBSDINFO)` for the *kinfo* fact that a process's effective
-uid is this account's own. A valid supervisor pin and session say nothing about
+probes**. The sentinel uses `proc_pidinfo(PROC_PIDLISTFDS)` and
+`proc_pidinfo(PROC_PIDTBSDINFO)`. The full census enumerates the kernel's
+`sysctl(KERN_PROC_ALL)` table, classifying effective uid and start identity
+at the same checked kinfo offsets as the product, before listing descriptors.
+A valid supervisor pin and session say nothing about
 whether this account can read descriptor evidence at all, so they are not
 substitutes: they are only a supplemental check.
 
@@ -206,10 +212,23 @@ substitutes: they are only a supplemental check.
   sentinel exited before its bound, if the listing is unavailable or does not
   show the live identity descriptor, if it ran in a different session, or if it
   survived the reap.
-- **The existing-process probe** makes the same two calls on at least one
-  pre-existing process of this account — this shell first, then its parent —
-  after confirming the kinfo fact. A process whose effective uid is not this
-  account's is skipped, never inspected.
+- **The full census** attempts `PROC_PIDLISTFDS` for every enumerated process
+  of this effective uid, excluding only the observer itself after checking its
+  pid, effective uid and start identity against independent kernel facts.
+  Foreign effective uids are counted and skipped under ruling bcaa83d8.
+  `ESRCH` means the process exited and is counted as skipped; zero bytes with
+  errno zero means no descriptors. Any other unreadable same-uid listing
+  (including `EPERM`) aborts as infrastructure, naming pid and kinfo command.
+  Bounds match the product: 8192 table rows, 4096 same-uid processes, 4096
+  descriptors per process (a full buffer refuses), 65,536 total descriptors
+  and 10 s. A bound hit refuses with the current pid/command and counts.
+  Fixture tests inject the table, listing results and clock into the shipped
+  census definitions; no real census runs in those tests.
+
+The census proves listing capability for that snapshot, not that every vnode
+path is readable or that a later process set is identical. Product custody
+still reads vnode paths and treats unreadable same-effective-uid evidence as
+`Unknown`/refusal. No preflight result bypasses that decision.
 
 When either descriptor-listing capability is unavailable, or either probe
 otherwise fails, the run **records INFRASTRUCTURE, stays unqualified, and aborts
@@ -259,10 +278,56 @@ A later source review at `0e7926d` found the harness preflight was still only a
 plan and that its proposed form could not establish the descriptor capability the
 custody decisions depend on. The apparatus correction replaces it with the
 two-probe, per-case preflight above: the sentinel descriptor listing and an
-existing-process listing, both through
+existing-process listing at that revision, both through
 `proc_pidinfo(PROC_PIDLISTFDS)`/`proc_pidinfo(PROC_PIDTBSDINFO)`, both required
 before every case, with an infrastructure abort when either fails. It changes no
-selector, bound, case or product code, and no receipt exists yet at the new head.
+selector, bound, case or product code. That revision did not execute native.
+
+### Failed diagnostic at 6fa5a58d
+
+The Queue worker's owner-activated full-access diagnostic at
+`6fa5a58d561407f3a44ad958a0fa52abf77b06ff` (run
+`b90e6656-6dab-4ed9-8c39-3540a1fcf973`) completed exit 1: five cases passed,
+`absent-path`, `empty-directory` and `hand-made-in-place` failed, and
+`ordinary-detach` was dependency-skipped. The receipt was unqualified, with
+zero of nine premises covered. Its historical evidence directory is
+`/Volumes/Builds/scratch/barge/run.Utx2it/scratch/supervisor-evidence.87slaczg`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `s6-cache-placement-receipt.json` | `e88223c592ed088069d4310eac2c0bf36b0ec536d6bac7b18375781aa9be29f1` |
+| Guard `receipt.json` | `b1e824bc30d6266dcb1556a74723aec3518bca57cc8a7c5016fbd2e88d79c471` |
+
+These identify historical evidence, not a claim that the files remain present.
+The guard reported closure, no fault or deadline, and a certain empty census;
+its signal records also reported `EPERM` before leader reap. Reserve minimum
+was 548,209,954,816 bytes over 51 samples; scratch peak was 12,652,544 bytes
+of 512 MiB. The real-state before/after observations were both `absent`.
+Post-run inspection found no matching attached image, mount or backing file.
+Cleanup did not record its ordinary-versus-forced detach branch, and the
+detach/re-attach case was skipped: ordinary detach acceptance was not proved.
+
+The worker's product custody scans could not inspect same-uid pid 1299
+(`EPERM`), although all eight narrow sentinel/existing-process preflights
+passed. The Oxide Supervisor separately reported an owner host-shell read-only
+`proc_pidinfo` check returning 48 bytes, errno 0, for that pid. Both are
+context-specific observations; neither promises a later scan will succeed.
+The architect therefore replaced the narrow existing-process sample with the
+full same-effective-uid listing census described above. Product custody and
+its `Unknown`/refusal rule are unchanged.
+
+The hand-made case compared directory mtime/size across marker publication.
+Its digest failure alone did not establish moved data. Its oracle now uses the
+same basis before adopt, after adopt and after undo: exclude only the root
+marker and the containing directory's expected metadata changes; retain root
+device/inode/mode, payload names, identities, modes, sizes, mtimes and bytes,
+and symlink text. The original publication link must also retain its identity
+and text. Pure fixtures allow marker publication/removal and root mtime
+changes, but reject changed bytes with preserved size/mtime, renamed payload,
+changed nested marker, retargeted or replaced links, and changed undo payload.
+The stray verdict prose that executed as shell commands is now commented;
+pure fixtures execute the shipped verdict's pass, case-failure and
+infrastructure-failure paths without a native run.
 
 ## Activation order
 

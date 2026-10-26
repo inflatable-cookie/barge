@@ -322,7 +322,7 @@ fn run_probe_block(label: &str, pinned: Option<&str>, body: &str) -> ProbeRun {
          PREFLIGHT_RUNS=0\n\
          PREFLIGHT_FAILURE=\"\"\n\
          PREFLIGHT_LAST_SENTINEL=\"\"\n\
-         PREFLIGHT_LAST_EXISTING=\"\"\n\
+         PREFLIGHT_LAST_CENSUS=\"\"\n\
          PREFLIGHT_TSV=\"$ROOT/observations.tsv\"\n\
          : >\"$PREFLIGHT_TSV\"\n\
          SUPERVISOR=\"$ROOT/supervisor.py\"\n\
@@ -330,6 +330,9 @@ fn run_probe_block(label: &str, pinned: Option<&str>, body: &str) -> ProbeRun {
          OXIDE_TASK_SCRATCH_ROOT=\"$ROOT/scratch\"\n\
          TMPDIR=\"$ROOT/scratch\"\n\
          source \"$ROOT/preflight-block.sh\"\n\
+         preflight_existing_descriptors() {{\n\
+         \x20 PREFLIGHT_LAST_CENSUS='{{\"status\":\"passed\",\"processes\":2,\"descriptors\":5}}'\n\
+         }}\n\
          printf 'HARNESS_SESSION=%s\\n' \"$PREFLIGHT_SESSION\"\n\
          {body}\n",
         root = root.display(),
@@ -458,15 +461,14 @@ fn a_successful_preflight_proves_both_descriptor_listings() {
     assert_eq!(fields[4], "9", "the identity descriptor is observed");
     assert_eq!(fields[5], "1", "the identity descriptor is a live vnode");
 
+    // Full-census policy is exercised separately against injected kernel facts;
+    // the preflight wrapper must record its result alongside the live sentinel.
     let existing = run
-        .observation("existing-descriptors")
-        .expect("the pre-existing process listing is recorded");
-    let fields: Vec<&str> = existing[2].split_whitespace().collect();
-    assert_eq!(fields.first().copied(), Some("existing"), "{existing:?}");
-    assert!(
-        fields[2].parse::<u32>().expect("a descriptor count") >= 1,
-        "a pre-existing same-uid process was listed: {existing:?}"
-    );
+        .observation("full-census")
+        .expect("the census is recorded");
+    let census: serde_json::Value = serde_json::from_str(&existing[2]).expect("census JSON");
+    assert_eq!(census["status"], "passed");
+    assert_eq!(census["processes"], 2);
 
     assert!(
         run.observation("supervisor").is_some(),
@@ -559,21 +561,22 @@ fn an_unavailable_existing_process_listing_aborts_the_case() {
     let run = run_probe_block(
         "preflight-existing-fail",
         None,
-        "if preflight_existing_descriptors 999999; then\n\
+        "preflight_existing_descriptors() {\n\
+         \x20 PREFLIGHT_LAST_CENSUS='{\"status\":\"infrastructure\",\"pid\":1299,\"command\":\"fixture\",\"problem\":\"EPERM\"}'\n\
+         \x20 return 1\n\
+         }\n\
+         if preflight case-z \"$ROOT/case-z/preflight\"; then\n\
          \x20 printf 'EXISTING=unexpected\\n'\n\
          else\n\
          \x20 printf 'EXISTING=failed\\n'\n\
          fi",
     );
     assert!(run.stdout().contains("EXISTING=failed"), "{}", run.stderr());
-    assert!(
-        run.stderr().contains("kinfo fact of pid 999999")
-            || run
-                .stderr()
-                .contains("no pre-existing same-uid descriptor listing"),
-        "the refusal names the fact it could not read: {}",
-        run.stderr()
-    );
+    let census = run
+        .observation("full-census")
+        .expect("failed census retained");
+    assert!(census[2].contains("1299") && census[2].contains("EPERM"));
+    assert!(census[2].contains("fixture"));
 }
 
 #[test]
@@ -633,6 +636,284 @@ fn every_case_is_preflighted_before_its_body_and_aborts_the_run() {
             && source.contains("and int(os.environ[\"S6_PREFLIGHT_RUNS\"]) == len(cases)"),
         "the receipt records the abort and can never be qualified by it"
     );
+}
+
+/// Extract only the shipped oracle or case under test; never start the proof.
+fn source_between(begin: &str, end: &str) -> String {
+    let source = proof_source();
+    let start = source.find(begin).expect("the block begins") + begin.len();
+    let rest = &source[start..];
+    rest[..rest.find(end).expect("the block ends")].to_string()
+}
+
+#[test]
+fn the_full_census_classifies_every_same_uid_process_and_preserves_its_bounds() {
+    let fixture = Fixture::new("full-census");
+    let census = source_between("# >>> s6-descriptor-census", "# <<< s6-descriptor-census");
+    let body = r#"
+import errno, os
+uid = os.geteuid()
+def row(pid, owner=uid):
+    return {"pid": pid, "uid": owner, "command": "fixture-" + str(pid)}
+
+# Inject at the kernel boundary, never invoke sysctl or proc_pidinfo.
+calls = []
+def listing(pid):
+    calls.append(pid)
+    return 2
+descriptor_count = listing
+process_table = lambda: [row(100001), row(100002), row(100003, uid + 1), row(os.getpid())]
+result = census()
+assert result["status"] == "passed", result
+assert calls == [100001, 100002], calls
+assert result["processes"] == 2 and result["descriptors"] == 4, result
+assert result["foreign"] == 1 and result["self_excluded"] == 1, result
+
+def denied(pid):
+    raise OSError(errno.EPERM, "listing denied")
+descriptor_count = denied
+process_table = lambda: [row(1299)]
+result = census()
+assert result["status"] == "infrastructure" and result["pid"] == 1299, result
+assert result["command"] == "fixture-1299" and "listing denied" in result["problem"], result
+
+def exited(pid):
+    if pid == 100001:
+        raise OSError(errno.ESRCH, "exited")
+    return 0
+descriptor_count = exited
+process_table = lambda: [row(100001), row(100002)]
+result = census()
+assert result["status"] == "passed" and result["exited"] == 1, result
+assert result["processes"] == 2 and result["descriptors"] == 0, result
+
+# Every fixed bound must refuse instead of publishing a partial pass.
+for count, descriptors, problem in [
+    (8193, 0, "process list"), (4097, 0, "processes"),
+    (1, 4096, "descriptors per process"), (17, 4095, "descriptors"),
+]:
+    process_table = lambda: [row(100000 + i) for i in range(count)]
+    descriptor_count = lambda pid: descriptors
+    result = census()
+    assert result["status"] == "infrastructure" and problem in result["problem"], result
+    assert "pid" in result and "command" in result, result
+
+process_table = lambda: [row(100001)]
+clock = iter([0, 10])
+time.monotonic = lambda: next(clock)
+result = census()
+assert result["status"] == "infrastructure" and result["problem"] == "time bound", result
+assert result["pid"] == 100001 and result["command"] == "fixture-100001", result
+"#;
+    // Execute the definitions as a fixture module: the native main never runs.
+    let script = fixture.write("census.py", format!("{census}\n{body}").as_bytes(), 0o644);
+    let output = Command::new("/usr/bin/python3")
+        .args([
+            "-c",
+            "import runpy,sys; runpy.run_path(sys.argv[1], run_name='fixture')",
+        ])
+        .arg(script)
+        .output()
+        .expect("the pure census fixture runs");
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    // Drift from the product's process set or limits is a harness defect.
+    let source = proof_source();
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let custody = std::fs::read_to_string(package.join("src/custody.rs")).expect("custody source");
+    let platform = std::fs::read_to_string(package.join("src/os/macos.rs")).expect("OS source");
+    for (python, rust) in [
+        ("SCAN_PROCESSES = 4096", "SCAN_PROCESSES: usize = 4096"),
+        (
+            "SCAN_DESCRIPTORS = 65_536",
+            "SCAN_DESCRIPTORS: usize = 65_536",
+        ),
+        ("SCAN_TIMEOUT = 10", "Duration::from_secs(10)"),
+    ] {
+        assert!(source.contains(python) && custody.contains(rust));
+    }
+    for (python, rust) in [
+        ("SCAN_PID_CAP = 8192", "SCAN_PID_CAP: usize = 8192"),
+        ("KINFO_PROC_SIZE = 648", "KINFO_PROC_SIZE: usize = 648"),
+        (
+            "SCAN_DESCRIPTORS_PER_PROCESS = 4096",
+            "SCAN_DESCRIPTORS_PER_PROCESS: usize = 4096",
+        ),
+    ] {
+        assert!(source.contains(python) && platform.contains(rust));
+    }
+    assert!(source.contains("(1, 14, 0)  # CTL_KERN/KERN_PROC/KERN_PROC_ALL"));
+    assert!(source.contains("libc.proc_pidinfo(pid, 1, 0, buf, len(buf))"));
+}
+
+#[test]
+fn the_adopted_tree_oracle_tolerates_only_the_root_marker_metadata_changes() {
+    let fixture = Fixture::new("adopted-tree-oracle");
+    let oracle = source_between(
+        "# >>> s6-adopted-tree-digest",
+        "# <<< s6-adopted-tree-digest",
+    );
+    let body = r#"
+mkdir -p cache/nested
+printf 'registry data' >cache/payload
+printf 'nested marker is payload' >cache/nested/.barge-root.json
+ln -s payload cache/payload-link
+before="$(digest_tree_excluding cache .barge-root.json)"
+printf marker >cache/.barge-root.json
+touch -mt 200001010000 cache
+[[ "$(digest_tree_excluding cache .barge-root.json)" == "$before" ]]
+rm cache/.barge-root.json
+touch -mt 200101010000 cache
+[[ "$(digest_tree_excluding cache .barge-root.json)" == "$before" ]]
+
+# Same-size changed bytes with the original mtime still have to be noticed.
+/usr/bin/python3 - <<'PY'
+import os
+p = 'cache/payload'
+s = os.stat(p)
+with open(p, 'wb') as f:
+    f.write(b'registry DATA')
+os.utime(p, ns=(s.st_atime_ns, s.st_mtime_ns))
+PY
+[[ "$(digest_tree_excluding cache .barge-root.json)" != "$before" ]]
+before="$(digest_tree_excluding cache .barge-root.json)"
+mv cache/payload cache/renamed
+[[ "$(digest_tree_excluding cache .barge-root.json)" != "$before" ]]
+mv cache/renamed cache/payload
+[[ "$(digest_tree_excluding cache .barge-root.json)" == "$before" ]]
+
+rm cache/payload-link
+ln -s other-payload cache/payload-link
+[[ "$(digest_tree_excluding cache .barge-root.json)" != "$before" ]]
+before="$(digest_tree_excluding cache .barge-root.json)"
+printf changed >cache/nested/.barge-root.json
+[[ "$(digest_tree_excluding cache .barge-root.json)" != "$before" ]]
+if digest_tree_excluding missing .barge-root.json; then
+  echo 'an unreadable tree was accepted' >&2
+  exit 1
+fi
+"#;
+    let script = fixture.write(
+        "oracle.sh",
+        format!("set -euo pipefail\n{oracle}\n{body}").as_bytes(),
+        0o644,
+    );
+    let output = Command::new("/bin/bash")
+        .arg(script)
+        .current_dir(&fixture.path)
+        .output()
+        .expect("the pure oracle fixture runs");
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
+fn the_hand_made_case_uses_one_oracle_for_adopt_and_undo_and_keeps_the_link() {
+    let oracle = source_between(
+        "# >>> s6-adopted-tree-digest",
+        "# <<< s6-adopted-tree-digest",
+    );
+    let case = source_between(
+        "\ncase_hand_made_in_place() {",
+        "\ncase_plan_effect_free() {",
+    );
+    // Model only marker publication/removal, without a CLI, supervisor or image.
+    // JSON conformance belongs to the product tests; here the shipped case must
+    // tolerate the expected root changes and refuse payload/link changes.
+    let body = r#"
+export HOME="$PWD/home"
+CASE_CACHES="$PWD/caches"
+CASE_OUT="$PWD/out"
+UUID=fixture
+mkdir -p "$HOME" "$CASE_OUT"
+assert_json() { return 0; }
+barge_cli() {
+  local target="$CASE_CACHES/cargo/registry"
+  if [[ "$3" == adopt ]]; then
+    printf marker >"$target/.barge-root.json"
+    touch -mt 200001010000 "$target"
+    case "$S6_FIXTURE_CHANGE" in
+      payload) printf changed >"$target/payload" ;;
+      moved) mv "$target/payload" "$target/renamed" ;;
+      link)
+        rm "$HOME/.cargo/registry"
+        ln -s "$CASE_CACHES/other" "$HOME/.cargo/registry"
+        ;;
+      swapped-link)
+        mv "$HOME/.cargo/registry" "$HOME/.cargo/old-link"
+        ln -s "$target" "$HOME/.cargo/registry"
+        ;;
+    esac
+  else
+    rm "$target/.barge-root.json"
+    touch -mt 200101010000 "$target"
+    if [[ "$S6_FIXTURE_CHANGE" == undo-payload ]]; then
+      printf changed >"$target/payload"
+    fi
+  fi
+}
+case_hand_made_in_place
+"#;
+    for (change, expected) in [
+        ("none", 0),
+        ("payload", 1),
+        ("moved", 1),
+        ("link", 1),
+        ("swapped-link", 1),
+        ("undo-payload", 1),
+    ] {
+        let fixture = Fixture::new(&format!("hand-made-{change}"));
+        let script = fixture.write(
+            "case.sh",
+            format!("set -uo pipefail\n{oracle}\ncase_hand_made_in_place() {{{case}\n{body}")
+                .as_bytes(),
+            0o644,
+        );
+        let output = Command::new("/bin/bash")
+            .arg(script)
+            .current_dir(&fixture.path)
+            .env("S6_FIXTURE_CHANGE", change)
+            .output()
+            .expect("the pure hand-made case fixture runs");
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{change}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn the_shipped_verdict_executes_without_stray_prose_and_preserves_failures() {
+    let source = proof_source();
+    let start = source
+        .find("# The run's own verdict:")
+        .expect("the verdict begins");
+    let verdict = &source[start..];
+    for (preflight, fault, expected) in [("", "", 0), ("", "case", 1), ("probe", "", 125)] {
+        let fixture = Fixture::new("verdict");
+        let script = fixture.write(
+            "verdict.sh",
+            format!(
+                "set -uo pipefail\nrefuse() {{ exit 125; }}\nMODE=diagnostic\nRECEIPT=fixture\n{verdict}"
+            )
+            .as_bytes(),
+            0o644,
+        );
+        let output = Command::new("/bin/bash")
+            .arg(script)
+            .env("PREFLIGHT_FAILURE", preflight)
+            .env("FIRST_FAULT", fault)
+            .output()
+            .expect("the pure verdict fixture runs");
+        assert_eq!(output.status.code(), Some(expected), "{}", stderr(&output));
+        assert!(
+            !stderr(&output).contains("command not found"),
+            "only verdict commands execute: {}",
+            stderr(&output)
+        );
+    }
 }
 
 // ---- the nine-premise trace ------------------------------------------------
@@ -897,6 +1178,7 @@ fn the_premise_trace_maps_every_premise_to_a_case_body() {
 fn fabricated_receipt(
     label: &str,
     statuses: &BTreeMap<String, &str>,
+    census_passed: bool,
 ) -> (Fixture, serde_json::Value) {
     let (trace_fixture, rows) = shipped_premise_rows();
     let fixture = Fixture::new(label);
@@ -928,8 +1210,13 @@ fn fabricated_receipt(
         preflight.push_str(&format!(
             "{case}\tsentinel-descriptors\tsentinel 501 4 2 9 1\n"
         ));
+        let status = if census_passed {
+            "passed"
+        } else {
+            "infrastructure"
+        };
         preflight.push_str(&format!(
-            "{case}\texisting-descriptors\texisting 501 5 2 0 0\n"
+            "{case}\tfull-census\t{{\"status\":\"{status}\",\"processes\":2,\"descriptors\":5}}\n"
         ));
     }
     std::fs::write(root.join("preflight.tsv"), preflight)
@@ -988,7 +1275,7 @@ fn fabricated_receipt(
 #[test]
 fn the_receipt_folds_the_premise_trace_against_case_results() {
     let mut statuses = BTreeMap::new();
-    let (_fixture, document) = fabricated_receipt("premise-receipt-pass", &statuses);
+    let (_fixture, document) = fabricated_receipt("premise-receipt-pass", &statuses, true);
     assert_eq!(
         document["qualified"], true,
         "a clean fixture receipt qualifies"
@@ -996,6 +1283,13 @@ fn the_receipt_folds_the_premise_trace_against_case_results() {
     assert_eq!(document["premise_trace"]["premises"], 9);
     assert_eq!(document["premise_trace"]["covered"], 9);
     assert_eq!(document["premise_trace"]["complete"].as_bool(), Some(true));
+    let censuses = document["preflight"]["censuses"]
+        .as_array()
+        .expect("censuses retained");
+    assert_eq!(censuses.len(), 9);
+    assert!(censuses
+        .iter()
+        .all(|row| row["status"] == "passed" && row["processes"] == 2));
     let premises = document["premises"]
         .as_array()
         .expect("the receipt lists the premises");
@@ -1032,8 +1326,13 @@ fn the_receipt_folds_the_premise_trace_against_case_results() {
         );
     }
 
+    let (_fixture, document) = fabricated_receipt("census-receipt-fail", &statuses, false);
+    assert_eq!(
+        document["qualified"], false,
+        "failed censuses cannot qualify passing cases"
+    );
     statuses.insert("ordinary-detach".to_string(), "fail");
-    let (_fixture, document) = fabricated_receipt("premise-receipt-fail", &statuses);
+    let (_fixture, document) = fabricated_receipt("premise-receipt-fail", &statuses, true);
     assert_eq!(
         document["qualified"], false,
         "a failed case never qualifies"

@@ -145,7 +145,7 @@ readonly PREFLIGHT_SESSION
 PREFLIGHT_RUNS=0
 PREFLIGHT_FAILURE=""
 PREFLIGHT_LAST_SENTINEL=""
-PREFLIGHT_LAST_EXISTING=""
+PREFLIGHT_LAST_CENSUS=""
 
 STARTED_MS="$(/usr/bin/python3 -c 'import time;print(int(time.time()*1000))')"
 readonly STARTED_MS
@@ -195,17 +195,45 @@ digest_tree() {
   ) | shasum -a 256 | awk '{print $1}'
 }
 
+# >>> s6-adopted-tree-digest
 digest_tree_excluding() {
-  # The same digest with one basename left out, for a tree whose only new entry
-  # is the marker Barge writes.
-  local path="$1" excluded="$2"
-  (
-    cd "$path" || exit 1
-    find . ! -name "$excluded" -exec stat -f 'S %N %HT %z %m' {} \; 2>/dev/null | LC_ALL=C sort
-    find . -type f ! -name "$excluded" -print0 2>/dev/null |
-      xargs -0 shasum -a 256 2>/dev/null | LC_ALL=C sort
-  ) | shasum -a 256 | awk '{print $1}'
+  # Marker publication changes the containing directory's mtime and size. Keep
+  # its identity and mode, every payload entry and byte, and every link's text;
+  # exclude only the root marker and the root's expected metadata changes.
+  /usr/bin/python3 - "$1" "$2" <<'PY'
+import hashlib, json, os, stat, sys
+
+root, excluded = sys.argv[1:]
+rows = []
+
+def visit(relative):
+    path = os.path.join(root, relative)
+    facts = os.lstat(path)
+    row = [relative, facts.st_dev, facts.st_ino, facts.st_mode]
+    if relative != ".":
+        row.extend([facts.st_size, facts.st_mtime_ns])
+    if stat.S_ISLNK(facts.st_mode):
+        row.append(os.readlink(path))
+    elif stat.S_ISREG(facts.st_mode):
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+        row.append(digest.hexdigest())
+    elif not stat.S_ISDIR(facts.st_mode):
+        raise ValueError("unexpected payload kind: " + path)
+    rows.append(row)
+    if stat.S_ISDIR(facts.st_mode):
+        for name in sorted(os.listdir(path)):
+            if relative == "." and name == excluded:
+                continue
+            visit(os.path.join(relative, name))
+
+visit(".")
+print(hashlib.sha256(json.dumps(rows, separators=(",", ":")).encode()).hexdigest())
+PY
 }
+# <<< s6-adopted-tree-digest
 
 REAL_STATE_BEFORE="$(digest_tree "$REAL_STATE")"
 readonly REAL_STATE_BEFORE
@@ -407,14 +435,14 @@ premises = [
     {
         "id": 9,
         "premise": "The qualified runner bytes and selector are named and hash-pinned; Barge adds no second supervisor, session or accounting harness.",
-        "trace": ["startup supervisor pin", "per-case preflight: sentinel and existing-process descriptor probes", "effigy selector cache:native / cache:native:diagnostic"],
+        "trace": ["startup supervisor pin", "per-case preflight: sentinel and full same-uid descriptor census", "effigy selector cache:native / cache:native:diagnostic"],
         "evidence": {
             "supervisor": os.environ["S6_SUPERVISOR"],
             "supervisor_sha256": os.environ["S6_SUPERVISOR_SHA"],
             "limit_seconds": int(os.environ["S6_LIMIT"]),
             "scratch_budget_mib": int(os.environ["S6_SCRATCH_MIB"]),
             "second_supervisor": False,
-            "preflight_probes": ["supervisor", "sentinel-descriptors", "existing-descriptors"],
+            "preflight_probes": ["supervisor", "sentinel-descriptors", "full-census"],
             "descriptor_primitive": "proc_pidinfo(PROC_PIDLISTFDS) with a proc_pidinfo(PROC_PIDTBSDINFO) same-uid fact",
         },
     },
@@ -463,20 +491,32 @@ premise_trace = {
 
 preflight_failure = os.environ.get("S6_PREFLIGHT_FAILURE") or None
 preflight_observations = []
+censuses = []
 preflight_path = os.environ.get("S6_PREFLIGHT_TSV")
 if preflight_path and os.path.exists(preflight_path):
     with open(preflight_path, encoding="utf-8") as handle:
         for line in handle:
             parts = line.rstrip("\n").split("\t")
             if len(parts) >= 3:
+                if parts[1] == "full-census":
+                    try:
+                        census = json.loads(parts[2])
+                        if not isinstance(census, dict) or "status" not in census:
+                            raise ValueError("invalid census result")
+                    except ValueError:
+                        census = {"status": "infrastructure", "problem": "missing or malformed census result"}
+                    censuses.append({"case": parts[0], **census})
                 preflight_observations.append({
                     "case": parts[0],
                     "probe": parts[1],
                     "detail": parts[2][:400],
                 })
 preflight = {
-    "probes": ["supervisor", "sentinel-descriptors", "existing-descriptors"],
-    "primitive": "proc_pidinfo(PROC_PIDLISTFDS) with proc_pidinfo(PROC_PIDTBSDINFO) kinfo facts",
+    "probes": ["supervisor", "sentinel-descriptors", "full-census"],
+    "primitive": "sysctl(KERN_PROC_ALL) effective uid/start; proc_pidinfo(PROC_PIDLISTFDS)",
+    "censuses": censuses,
+    "census_bounds": {"table": 8192, "processes": 4096, "descriptors": 65536,
+                      "descriptors_per_process": 4096, "seconds": 10},
     "session": os.environ["S6_PREFLIGHT_SESSION"],
     "sentinel_bound_seconds": int(os.environ["S6_PREFLIGHT_BOUND"]),
     "runs": int(os.environ["S6_PREFLIGHT_RUNS"]),
@@ -510,6 +550,8 @@ qualified = (
     and not_run == []
     and unchanged
     and preflight_failure is None
+    and {item["case"] for item in censuses if item["status"] == "passed"} == all_cases
+    and len(censuses) == len(cases)
     and premise_trace["complete"]
     and int(os.environ["S6_PREFLIGHT_RUNS"]) == len(cases)
     and int(os.environ["S6_EXIT"]) == 0
@@ -654,8 +696,8 @@ PY
 #  - the sentinel probe starts one sentinel child in this run's session - the
 #    shared supervisor's guarded session - lists its descriptors while it is
 #    alive, then terminates and reaps it inside one fixed bound;
-#  - the existing-process probe lists at least one pre-existing process of this
-#    account (this shell, then its parent), after the same kinfo fact.
+#  - the full census lists every enumerated same-effective-uid process, using
+#    the product kinfo classification and scan bounds.
 #
 # Either descriptor-listing capability being unavailable is an infrastructure
 # fault: the run is unqualified and aborts before any case body. The probes
@@ -879,32 +921,141 @@ preflight_sentinel() {
 }
 
 preflight_existing_descriptors() {
-  # Required probe two: the same primitive on at least one pre-existing process
-  # of this account, whose effective uid the kinfo fact confirms first. This
-  # shell is the first candidate and its parent the second.
-  local candidates pid observation problem=""
-  if [[ "$#" -gt 0 ]]; then
-    candidates=("$@")
-  else
-    candidates=("$$" "${PPID:-}")
-  fi
-  for pid in "${candidates[@]}"; do
-    [[ -n "$pid" ]] || continue
-    if observation="$(descriptor_observation existing "$pid")"; then
-      local kind_out uid_out descriptors
-      read -r kind_out uid_out descriptors _ _ _ <<<"$observation"
-      if [[ "$descriptors" -ge 1 ]]; then
-        PREFLIGHT_LAST_EXISTING="$observation"
+  # Required probe two: the full kinfo same-effective-uid process set, with the
+  # product's process/descriptor/time bounds. This checks listing capability,
+  # not custody or the readability of every vnode path in a later product scan.
+  local observation status=0
+  observation="$(/usr/bin/python3 - <<'PY'
+# >>> s6-descriptor-census
+import ctypes, errno, json, os, struct, time
+
+KINFO_PROC_SIZE = 648
+SCAN_PID_CAP = 8192
+SCAN_PROCESSES = 4096
+SCAN_DESCRIPTORS = 65_536
+SCAN_DESCRIPTORS_PER_PROCESS = 4096
+SCAN_TIMEOUT = 10
+libc = ctypes.CDLL(None, use_errno=True)
+libc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                            ctypes.c_void_p, ctypes.c_int]
+libc.proc_pidinfo.restype = ctypes.c_int
+libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint,
+                       ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+                       ctypes.c_void_p, ctypes.c_size_t]
+libc.sysctl.restype = ctypes.c_int
+
+def process_table():
+    mib = (ctypes.c_int * 3)(1, 14, 0)  # CTL_KERN/KERN_PROC/KERN_PROC_ALL
+    size = ctypes.c_size_t()
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0):
+        raise OSError(ctypes.get_errno(), "kinfo size")
+    if not size.value or size.value % KINFO_PROC_SIZE:
+        raise ValueError("invalid kinfo table size")
+    if size.value // KINFO_PROC_SIZE > SCAN_PID_CAP:
+        raise ValueError("process list bound")
+    buf = ctypes.create_string_buffer(size.value + 64 * KINFO_PROC_SIZE)
+    size.value = len(buf)
+    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0):
+        raise OSError(ctypes.get_errno(), "kinfo read")
+    if size.value > len(buf) or size.value % KINFO_PROC_SIZE:
+        raise ValueError("invalid returned kinfo table size")
+    if size.value // KINFO_PROC_SIZE > SCAN_PID_CAP:
+        raise ValueError("process list bound")
+    rows = []
+    for offset in range(0, size.value, KINFO_PROC_SIZE):
+        pid = struct.unpack_from("<i", buf.raw, offset + 40)[0]
+        if pid == 0:
+            continue
+        sec, usec = struct.unpack_from("<qi", buf.raw, offset)
+        if pid < 0 or sec < 0 or not 0 <= usec < 1_000_000:
+            raise ValueError("invalid kinfo identity")
+        rows.append({"pid": pid, "uid": struct.unpack_from("<I", buf.raw, offset + 420)[0],
+                     "start": sec * 1_000_000 + usec,
+                     "command": buf.raw[offset + 243:offset + 260].split(b"\0", 1)[0].decode(errors="replace")})
+    # Check the ABI against independent facts, as the product does.
+    own = next((row for row in rows if row["pid"] == os.getpid()), None)
+    bsd = ctypes.create_string_buffer(136)
+    if libc.proc_pidinfo(os.getpid(), 3, 0, bsd, len(bsd)) != len(bsd):
+        raise ValueError("own process identity unavailable")
+    sec, usec = struct.unpack_from("<QQ", bsd.raw, 120)
+    if (own is None or own["uid"] != os.geteuid()
+            or struct.unpack_from("<I", bsd.raw, 12)[0] != os.getpid()
+            or struct.unpack_from("<I", bsd.raw, 20)[0] != own["uid"]
+            or own["start"] != sec * 1_000_000 + usec):
+        raise ValueError("kinfo layout does not match this process")
+    return rows
+
+def descriptor_count(pid):
+    buf = ctypes.create_string_buffer(SCAN_DESCRIPTORS_PER_PROCESS * 8)
+    ctypes.set_errno(0)
+    written = libc.proc_pidinfo(pid, 1, 0, buf, len(buf))  # PROC_PIDLISTFDS
+    error = ctypes.get_errno()
+    if written <= 0:
+        if error:
+            raise OSError(error, "PROC_PIDLISTFDS")
         return 0
-      fi
-      problem="pid $pid listed no descriptors"
-    else
-      problem="pid $pid: $observation"
-    fi
-  done
-  printf 'preflight: no pre-existing same-uid descriptor listing is available: %s\n' \
-    "${problem:-no candidate process}" >&2
-  return 1
+    if written >= len(buf):
+        raise ValueError("descriptors per process bound")
+    if written % 8:
+        raise ValueError("partial descriptor listing")
+    return written // 8
+
+def census():
+    result = {"status": "infrastructure", "enumerated": 0, "processes": 0,
+              "descriptors": 0, "foreign": 0, "exited": 0, "self_excluded": 0}
+    started = time.monotonic()
+    row = {"pid": None, "command": "kinfo table"}
+    try:
+        rows = process_table()
+        result["enumerated"] = len(rows)
+        if len(rows) > SCAN_PID_CAP:
+            raise ValueError("process list bound")
+        for row in rows:
+            if time.monotonic() - started >= SCAN_TIMEOUT:
+                raise ValueError("time bound")
+            if row["uid"] != os.geteuid():
+                result["foreign"] += 1
+                continue
+            if row["pid"] == os.getpid():
+                result["self_excluded"] += 1
+                continue
+            result["processes"] += 1
+            if result["processes"] > SCAN_PROCESSES:
+                raise ValueError("processes bound")
+            try:
+                count = descriptor_count(row["pid"])
+            except OSError as error:
+                if error.errno == errno.ESRCH:
+                    result["exited"] += 1
+                    continue
+                raise
+            if count >= SCAN_DESCRIPTORS_PER_PROCESS:
+                raise ValueError("descriptors per process bound")
+            result["descriptors"] += count
+            if result["descriptors"] > SCAN_DESCRIPTORS:
+                raise ValueError("descriptors bound")
+        if time.monotonic() - started >= SCAN_TIMEOUT:
+            raise ValueError("time bound")
+        result["status"] = "passed"
+    except (OSError, ValueError) as error:
+        result.update(pid=row["pid"], command=row["command"], problem=str(error))
+        if isinstance(error, OSError):
+            result["errno"] = error.errno
+    return result
+
+if __name__ == "__main__":
+    result = census()
+    print(json.dumps(result, separators=(",", ":")))
+    raise SystemExit(0 if result["status"] == "passed" else 3)
+# <<< s6-descriptor-census
+PY
+)" || status=$?
+  PREFLIGHT_LAST_CENSUS="$observation"
+  if [[ "$status" != 0 ]]; then
+    printf 'preflight: full same-uid census unavailable: %s\n' "$observation" >&2
+    return 1
+  fi
+  return 0
 }
 
 preflight() {
@@ -922,7 +1073,8 @@ preflight() {
     return 1
   fi
   if ! preflight_existing_descriptors; then
-    PREFLIGHT_FAILURE="existing-process descriptor probe failed before $case_id"
+    printf '%s\tfull-census\t%s\n' "$case_id" "$PREFLIGHT_LAST_CENSUS" >>"$PREFLIGHT_TSV"
+    PREFLIGHT_FAILURE="full same-uid descriptor census failed before $case_id: $PREFLIGHT_LAST_CENSUS"
     return 1
   fi
   PREFLIGHT_RUNS=$((PREFLIGHT_RUNS + 1))
@@ -930,8 +1082,8 @@ preflight() {
     "$case_id" "$PREFLIGHT_SESSION" "$SUPERVISOR_SHA256" >>"$PREFLIGHT_TSV"
   printf '%s\tsentinel-descriptors\t%s\n' \
     "$case_id" "$PREFLIGHT_LAST_SENTINEL" >>"$PREFLIGHT_TSV"
-  printf '%s\texisting-descriptors\t%s\n' \
-    "$case_id" "$PREFLIGHT_LAST_EXISTING" >>"$PREFLIGHT_TSV"
+  printf '%s\tfull-census\t%s\n' \
+    "$case_id" "$PREFLIGHT_LAST_CENSUS" >>"$PREFLIGHT_TSV"
   return 0
 }
 # <<< s6-preflight
@@ -1096,22 +1248,26 @@ case_hand_made_in_place() {
   printf 'registry data' >"$target/payload"
   mkdir -p "$HOME/.cargo"
   ln -s "$target" "$HOME/.cargo/registry"
-  local before before_link after
-  before="$(digest_tree "$target")"
+  local before before_link before_link_identity after
+  before="$(digest_tree_excluding "$target" .barge-root.json)" || return 1
   before_link="$(readlink "$HOME/.cargo/registry")"
+  before_link_identity="$(stat -f '%d:%i' "$HOME/.cargo/registry")"
   barge_cli "$CASE_OUT/adopt.json" cache adopt --kind cargo-registry --volume "$UUID" --adopt-existing-root --json || return 1
   assert_json "$CASE_OUT/adopt.json" \
     'doc["ok"] and doc["data"]["placement"]["form"]["form"] == "held_root" and doc["data"]["placement"]["form"]["path"] == doc["data"]["placement"]["recorded_path"]' || return 1
   assert_json "$CASE_OUT/adopt.json" \
     'doc["data"]["placement"]["form"]["publication"]["link_path"] == doc["data"]["placement"]["original_path"] and doc["data"]["placement"]["form"]["publication"]["target"] == doc["data"]["placement"]["form"]["path"]' || return 1
-  after="$(digest_tree_excluding "$target" .barge-root.json)"
-  [[ "$after" == "$before" ]] || { echo "the hand-made layout moved"; return 1; }
+  after="$(digest_tree_excluding "$target" .barge-root.json)" || return 1
+  [[ "$after" == "$before" ]] || { echo "the hand-made payload or layout changed"; return 1; }
   [[ "$(readlink "$HOME/.cargo/registry")" == "$before_link" ]] || { echo "the pre-existing link was swapped"; return 1; }
+  [[ "$(stat -f '%d:%i' "$HOME/.cargo/registry")" == "$before_link_identity" ]] || { echo "the pre-existing link identity changed"; return 1; }
   [[ -f "$target/.barge-root.json" ]] || { echo "no marker was written"; return 1; }
   barge_cli "$CASE_OUT/undo.json" cache undo --kind cargo-registry --json || return 1
   [[ ! -e "$target/.barge-root.json" ]] || { echo "undo left the marker"; return 1; }
-  [[ "$(digest_tree "$target")" == "$before" ]] || { echo "undo changed the cache data"; return 1; }
+  after="$(digest_tree_excluding "$target" .barge-root.json)" || return 1
+  [[ "$after" == "$before" ]] || { echo "undo changed the cache data"; return 1; }
   [[ "$(readlink "$HOME/.cargo/registry")" == "$before_link" ]] || { echo "undo changed the pre-existing link"; return 1; }
+  [[ "$(stat -f '%d:%i' "$HOME/.cargo/registry")" == "$before_link_identity" ]] || { echo "undo changed the pre-existing link identity"; return 1; }
   echo "today's hand-made placement was adopted in place, nothing moved, and undo removed only the marker"
 }
 
@@ -1232,9 +1388,9 @@ run_case plan-effect-free "" case_plan_effect_free "1,2,3,4,6,7,8,9"
 run_case ordinary-detach absent-path case_ordinary_detach "2,5,9"
 
 # The run's own verdict: a counted pass needs every case, a preflight before
-every case, safe custody and an untouched real account state; the diagnostic
-twin never qualifies. A failed preflight is an infrastructure abort: the harness
-is unsound, so nothing the run did counts and the receipt is refused.
+# every case, safe custody and an untouched real account state; the diagnostic
+# twin never qualifies. A failed preflight is an infrastructure abort: the harness
+# is unsound, so nothing the run did counts and the receipt is refused.
 if [[ -n "$PREFLIGHT_FAILURE" ]]; then
   refuse "preflight infrastructure abort: $PREFLIGHT_FAILURE; no case result counts"
 fi
