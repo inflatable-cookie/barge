@@ -150,6 +150,31 @@ removed. The preflight runs no image, no proof case and no selector, and it is
 sequenced after the harness correction's review. A preflight that is uncertain
 about custody stops, and it is never retried.
 
+## Diagnostic history
+
+The first uncounted diagnostic ran at `4c1d6743cd67beb58c0c268ac1061a2b695b6d49`
+and failed: five cases passed, `absent-path` and `empty-directory` failed,
+`hand-made-in-place` failed on a missing `$HOME/.cargo`, and `ordinary-detach`
+was skipped by its dependency. The guard closed cleanly (fault none, 11.1 MiB of
+its 512 MiB budget, evidence kept), the image was detached, and the real account
+state's before/after digests were equal. Its receipt is `barge.s6.native/1` with
+`qualified: false`.
+
+It found three things, all since closed:
+
+- the same-uid observation counted the caller's own held descriptors, so custody
+  refused; #011 (`0d9301b`) excludes the calling process by pid and start
+  identity, and the empty-directory proof in `cache` names its own exclusion;
+- the case bodies redirected the CLI's `--json` document, so those two refusals
+  left the case log empty; every CLI call now goes through `barge_cli`, which
+  echoes the invocation, the document and its stderr into the case log, and every
+  case log is retained under `$OXIDE_PROOF_EVIDENCE/cases/` and named by the
+  receipt;
+- `hand-made-in-place` never created `$HOME/.cargo` before linking the registry.
+
+The failed receipt is history, not a proof: a fresh diagnostic is required at the
+new head, then the counted author and independent reviewer natives.
+
 ## Activation order
 
 1. **Uncounted diagnostic** — `effigy cache:native:diagnostic` at head `H`.

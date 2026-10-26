@@ -111,6 +111,9 @@ fi
 
 readonly EVIDENCE="$OXIDE_PROOF_EVIDENCE"
 readonly RECEIPT="$EVIDENCE/s6-cache-placement-receipt.json"
+# Every case's full log is retained beside the receipt, so a failed case is
+# identified by its CLI error document long after the guard's scratch is gone.
+readonly CASE_LOGS="$EVIDENCE/cases"
 
 refuse() {
   printf 's6: %s\n' "$*" >&2
@@ -143,7 +146,7 @@ export BARGE_ACCOUNT_HOME="$RUN/home"
 export TMP="$TMPDIR"
 export TEMP="$TMPDIR"
 unset CARGO_TARGET_DIR || true
-mkdir -p "$HOME" "$CARGO_HOME" "$BARGE_STATE_DIR" "$RUN/backing" "$RUN/cases"
+mkdir -p "$HOME" "$CARGO_HOME" "$BARGE_STATE_DIR" "$RUN/backing" "$RUN/cases" "$CASE_LOGS"
 
 # Premise 2: the real account state, read once before and once after, so the
 # receipt proves it was not touched. It is only ever read.
@@ -236,6 +239,7 @@ write_receipt() {
   S6_RECEIPT="$RECEIPT" \
   S6_EVIDENCE="$EVIDENCE" \
   S6_CASES="$CASES_TSV" \
+  S6_CASE_LOGS="$CASE_LOGS" \
   S6_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')" \
   S6_REPO="$REPO_ROOT" \
   S6_BINARY="$BARGE_BIN" \
@@ -267,7 +271,13 @@ if os.path.exists(path):
         for line in handle:
             parts = line.rstrip("\n").split("\t")
             if len(parts) >= 3:
-                cases.append({"id": parts[0], "status": parts[1], "evidence": parts[2]})
+                log = os.path.join(os.environ["S6_CASE_LOGS"], parts[0] + ".log")
+                cases.append({
+                    "id": parts[0],
+                    "status": parts[1],
+                    "evidence": parts[2],
+                    "log": log if os.path.exists(log) else None,
+                })
 
 passed = sum(1 for case in cases if case["status"] == "pass")
 failed = sum(1 for case in cases if case["status"] == "fail")
@@ -469,6 +479,30 @@ write_registry() {
 JSON
 }
 
+# One CLI call whose document goes to `$1`; on a non-zero exit the document, its
+# stderr and the invocation are echoed into the case log, so the retained log and
+# the receipt identify the failure instead of recording an empty line.
+barge_cli() {
+  local out="$1"
+  shift
+  local status=0
+  "$BARGE_BIN" "$@" >"$out" 2>"$out.stderr" || status=$?
+  if [[ "$status" -ne 0 ]]; then
+    printf 'barge %s exited %s\n' "$*" "$status"
+    if [[ -s "$out" ]]; then
+      printf 'stdout: '
+      head -c 16384 "$out"
+      printf '\n'
+    fi
+    if [[ -s "$out.stderr" ]]; then
+      printf 'stderr: '
+      head -c 16384 "$out.stderr"
+      printf '\n'
+    fi
+  fi
+  return "$status"
+}
+
 assert_json() {
   local file="$1" expression="$2"
   /usr/bin/python3 - "$file" "$expression" <<'PY'
@@ -504,7 +538,7 @@ PY
 
 case_absent_path() {
   mkdir -p "$HOME/.cargo"
-  "$BARGE_BIN" cache adopt --kind cargo-registry --volume "$UUID" --json >"$CASE_OUT/adopt.json" || return 1
+  barge_cli "$CASE_OUT/adopt.json" cache adopt --kind cargo-registry --volume "$UUID" --json || return 1
   assert_json "$CASE_OUT/adopt.json" \
     'doc["ok"] and doc["data"]["plan"] is False and doc["data"]["placement"]["form"]["form"] == "link" and doc["data"]["placement"]["form"]["restore"] == "absent"' || return 1
   local target
@@ -512,9 +546,9 @@ case_absent_path() {
   [[ -L "$HOME/.cargo/registry" ]] || { echo "no link at the tool's path"; return 1; }
   [[ "$(readlink "$HOME/.cargo/registry")" == "$target" ]] || { echo "the link text is not the recorded target"; return 1; }
   [[ "$target" == "$CASE_CACHES/"* ]] || { echo "the target $target is not under $CASE_CACHES"; return 1; }
-  "$BARGE_BIN" cache list --json >"$CASE_OUT/list.json" || return 1
+  barge_cli "$CASE_OUT/list.json" cache list --json || return 1
   assert_json "$CASE_OUT/list.json" 'doc["data"]["placements"]["count"] == 1 and doc["data"]["placements"]["rows"][0]["link"] == "linked"' || return 1
-  "$BARGE_BIN" cache undo --kind cargo-registry --json >"$CASE_OUT/undo.json" || return 1
+  barge_cli "$CASE_OUT/undo.json" cache undo --kind cargo-registry --json || return 1
   assert_json "$CASE_OUT/undo.json" 'doc["ok"] and doc["data"]["removed"] is True' || return 1
   [[ ! -e "$HOME/.cargo/registry" && ! -L "$HOME/.cargo/registry" ]] || { echo "the path is not absent again"; return 1; }
   [[ -d "$target" ]] || { echo "undo deleted the owned root"; return 1; }
@@ -523,11 +557,11 @@ case_absent_path() {
 
 case_empty_directory() {
   mkdir -p "$HOME/.cargo/git"
-  "$BARGE_BIN" cache adopt --kind cargo-git --volume "$UUID" --json >"$CASE_OUT/adopt.json" || return 1
+  barge_cli "$CASE_OUT/adopt.json" cache adopt --kind cargo-git --volume "$UUID" --json || return 1
   assert_json "$CASE_OUT/adopt.json" \
     'doc["ok"] and doc["data"]["placement"]["form"]["form"] == "link" and doc["data"]["placement"]["form"]["restore"] == "empty_directory"' || return 1
   [[ -L "$HOME/.cargo/git" ]] || { echo "the empty directory was not replaced by a link"; return 1; }
-  "$BARGE_BIN" cache undo --kind cargo-git --json >"$CASE_OUT/undo.json" || return 1
+  barge_cli "$CASE_OUT/undo.json" cache undo --kind cargo-git --json || return 1
   [[ -d "$HOME/.cargo/git" && ! -L "$HOME/.cargo/git" ]] || { echo "the directory was not restored"; return 1; }
   [[ -z "$(ls -A "$HOME/.cargo/git")" ]] || { echo "the restored directory is not empty"; return 1; }
   echo "an empty directory became a link and was restored empty"
@@ -538,13 +572,13 @@ case_setting_unchanged() {
   printf 'cache=%s\n' "$CASE_CACHES/npm" >"$HOME/.npmrc"
   local before after
   before="$(shasum -a 256 "$HOME/.npmrc" | awk '{print $1}')"
-  "$BARGE_BIN" cache adopt --kind npm-cache --volume "$UUID" --json >"$CASE_OUT/adopt.json" || return 1
+  barge_cli "$CASE_OUT/adopt.json" cache adopt --kind npm-cache --volume "$UUID" --json || return 1
   assert_json "$CASE_OUT/adopt.json" \
     'doc["ok"] and doc["data"]["placement"]["form"]["form"] == "setting" and doc["data"]["placement"]["form"]["changed"] is False' || return 1
   after="$(shasum -a 256 "$HOME/.npmrc" | awk '{print $1}')"
   [[ "$after" == "$before" ]] || { echo "adopt changed a byte of an already-pointing setting"; return 1; }
   [[ ! -e "$HOME/.npmrc.barge-backup" ]] || { echo "adopt wrote a backup for an unchanged setting"; return 1; }
-  "$BARGE_BIN" cache undo --kind npm-cache --json >"$CASE_OUT/undo.json" || return 1
+  barge_cli "$CASE_OUT/undo.json" cache undo --kind npm-cache --json || return 1
   after="$(shasum -a 256 "$HOME/.npmrc" | awk '{print $1}')"
   [[ "$after" == "$before" ]] || { echo "undo changed the unchanged setting"; return 1; }
   echo "a setting that already names the owned root is recorded with no byte written"
@@ -554,14 +588,14 @@ case_setting_written() {
   printf 'cache=/old/cache\nregistry=https://example.invalid\n' >"$HOME/.npmrc"
   local before after
   before="$(shasum -a 256 "$HOME/.npmrc" | awk '{print $1}')"
-  "$BARGE_BIN" cache adopt --kind npm-cache --volume "$UUID" --write-setting --json >"$CASE_OUT/adopt.json" || return 1
+  barge_cli "$CASE_OUT/adopt.json" cache adopt --kind npm-cache --volume "$UUID" --write-setting --json || return 1
   assert_json "$CASE_OUT/adopt.json" \
     'doc["ok"] and doc["data"]["placement"]["form"]["form"] == "setting" and doc["data"]["placement"]["form"]["changed"] is True and any("cache" in change for change in doc["data"]["changes"])' || return 1
   grep -q "cache=${CASE_CACHES}/npm" "$HOME/.npmrc" || { echo "the new value is not in the setting"; return 1; }
   grep -q "registry=https://example.invalid" "$HOME/.npmrc" || { echo "an unrelated line was lost"; return 1; }
   after="$(shasum -a 256 "$HOME/.npmrc" | awk '{print $1}')"
   [[ "$after" != "$before" ]] || { echo "the setting was not written"; return 1; }
-  "$BARGE_BIN" cache undo --kind npm-cache --json >"$CASE_OUT/undo.json" || return 1
+  barge_cli "$CASE_OUT/undo.json" cache undo --kind npm-cache --json || return 1
   after="$(shasum -a 256 "$HOME/.npmrc" | awk '{print $1}')"
   [[ "$after" == "$before" ]] || { echo "undo did not restore the exact bytes"; return 1; }
   echo "the tool setting was written only by the explicit adopt, reported, and undone byte for byte"
@@ -569,16 +603,16 @@ case_setting_written() {
 
 case_diverged_undo() {
   printf 'cache=/old/cache\n' >"$HOME/.npmrc"
-  "$BARGE_BIN" cache adopt --kind npm-cache --volume "$UUID" --write-setting --json >"$CASE_OUT/adopt.json" || return 1
+  barge_cli "$CASE_OUT/adopt.json" cache adopt --kind npm-cache --volume "$UUID" --write-setting --json || return 1
   printf 'cache=/someone/else\n' >"$HOME/.npmrc"
   local before
   before="$(shasum -a 256 "$HOME/.npmrc" | awk '{print $1}')"
   local status=0
-  "$BARGE_BIN" cache undo --kind npm-cache --json >"$CASE_OUT/undo.json" 2>/dev/null || status=$?
+  barge_cli "$CASE_OUT/undo.json" cache undo --kind npm-cache --json || status=$?
   [[ "$status" == 3 ]] || { echo "a diverged undo exited $status, not 3"; return 1; }
   assert_json "$CASE_OUT/undo.json" 'doc["error"]["kind"] == "unknown_state"' || return 1
   [[ "$(shasum -a 256 "$HOME/.npmrc" | awk '{print $1}')" == "$before" ]] || { echo "the diverged file was changed"; return 1; }
-  "$BARGE_BIN" cache list --json >"$CASE_OUT/list.json" || return 1
+  barge_cli "$CASE_OUT/list.json" cache list --json || return 1
   assert_json "$CASE_OUT/list.json" 'doc["data"]["placements"]["count"] == 1' || return 1
   echo "a file that diverged after adopt refuses undo and is left exactly as it is"
 }
@@ -588,14 +622,14 @@ case_non_empty_refused() {
   printf 'registry payload' >"$HOME/.cargo/registry/payload"
   local before after status=0
   before="$(digest_tree "$HOME/.cargo/registry")"
-  "$BARGE_BIN" cache adopt --kind cargo-registry --volume "$UUID" --json >"$CASE_OUT/adopt.json" 2>/dev/null || status=$?
+  barge_cli "$CASE_OUT/adopt.json" cache adopt --kind cargo-registry --volume "$UUID" --json || status=$?
   [[ "$status" == 2 ]] || { echo "a non-empty directory exited $status, not 2"; return 1; }
   assert_json "$CASE_OUT/adopt.json" \
     'doc["error"]["kind"] == "refused_boundary" and doc["error"]["detail"]["changed"] is False and isinstance(doc["error"]["detail"]["plan"], list) and len(doc["error"]["detail"]["plan"]) >= 2' || return 1
   after="$(digest_tree "$HOME/.cargo/registry")"
   [[ "$after" == "$before" ]] || { echo "the refused directory changed"; return 1; }
   [[ ! -L "$HOME/.cargo/registry" ]] || { echo "the directory became a link"; return 1; }
-  "$BARGE_BIN" cache list --json >"$CASE_OUT/list.json" || return 1
+  barge_cli "$CASE_OUT/list.json" cache list --json || return 1
   assert_json "$CASE_OUT/list.json" 'doc["data"]["placements"]["count"] == 0' || return 1
   echo "a non-empty real directory refused with a plan and nothing was renamed or deleted"
 }
@@ -604,11 +638,12 @@ case_hand_made_in_place() {
   local target="$CASE_CACHES/cargo/registry"
   mkdir -p "$target"
   printf 'registry data' >"$target/payload"
+  mkdir -p "$HOME/.cargo"
   ln -s "$target" "$HOME/.cargo/registry"
   local before before_link after
   before="$(digest_tree "$target")"
   before_link="$(readlink "$HOME/.cargo/registry")"
-  "$BARGE_BIN" cache adopt --kind cargo-registry --volume "$UUID" --adopt-existing-root --json >"$CASE_OUT/adopt.json" || return 1
+  barge_cli "$CASE_OUT/adopt.json" cache adopt --kind cargo-registry --volume "$UUID" --adopt-existing-root --json || return 1
   assert_json "$CASE_OUT/adopt.json" \
     'doc["ok"] and doc["data"]["placement"]["form"]["form"] == "held_root" and doc["data"]["placement"]["form"]["path"] == doc["data"]["placement"]["recorded_path"]' || return 1
   assert_json "$CASE_OUT/adopt.json" \
@@ -617,7 +652,7 @@ case_hand_made_in_place() {
   [[ "$after" == "$before" ]] || { echo "the hand-made layout moved"; return 1; }
   [[ "$(readlink "$HOME/.cargo/registry")" == "$before_link" ]] || { echo "the pre-existing link was swapped"; return 1; }
   [[ -f "$target/.barge-root.json" ]] || { echo "no marker was written"; return 1; }
-  "$BARGE_BIN" cache undo --kind cargo-registry --json >"$CASE_OUT/undo.json" || return 1
+  barge_cli "$CASE_OUT/undo.json" cache undo --kind cargo-registry --json || return 1
   [[ ! -e "$target/.barge-root.json" ]] || { echo "undo left the marker"; return 1; }
   [[ "$(digest_tree "$target")" == "$before" ]] || { echo "undo changed the cache data"; return 1; }
   [[ "$(readlink "$HOME/.cargo/registry")" == "$before_link" ]] || { echo "undo changed the pre-existing link"; return 1; }
@@ -627,36 +662,36 @@ case_hand_made_in_place() {
 case_plan_effect_free() {
   mkdir -p "$HOME/.cargo"
   # The account home and the state directory the CLI used are the fixtures'.
-  "$BARGE_BIN" describe --json >"$CASE_OUT/describe.json" || return 1
+  barge_cli "$CASE_OUT/describe.json" describe --json || return 1
   assert_json "$CASE_OUT/describe.json" \
     'doc["data"]["state"]["home"]["account"] == "'"$HOME"'" and doc["data"]["state"]["dir"] == "'"$BARGE_STATE_DIR"'"' || return 1
-  "$BARGE_BIN" cache adopt --kind cargo-registry --volume "$UUID" --plan --json >"$CASE_OUT/plan.json" || return 1
+  barge_cli "$CASE_OUT/plan.json" cache adopt --kind cargo-registry --volume "$UUID" --plan --json || return 1
   assert_json "$CASE_OUT/plan.json" \
     'doc["ok"] and doc["data"]["plan"] is True and doc["data"]["placement"] is None and len(doc["data"]["changes"]) > 0' || return 1
   [[ ! -e "$CASE_CACHES" ]] || { echo "the plan created the caches folder"; return 1; }
   [[ ! -e "$HOME/.cargo/registry" ]] || { echo "the plan created the tool's path"; return 1; }
-  "$BARGE_BIN" cache list --json >"$CASE_OUT/list.json" || return 1
+  barge_cli "$CASE_OUT/list.json" cache list --json || return 1
   assert_json "$CASE_OUT/list.json" 'doc["data"]["placements"]["count"] == 0' || return 1
   echo "--plan reported the intended effects and wrote nothing; describe reports the fixture home $HOME and state $BARGE_STATE_DIR"
 }
 
 case_ordinary_detach() {
   mkdir -p "$HOME/.cargo"
-  "$BARGE_BIN" cache adopt --kind cargo-registry --volume "$UUID" --json >"$CASE_OUT/adopt.json" || return 1
+  barge_cli "$CASE_OUT/adopt.json" cache adopt --kind cargo-registry --volume "$UUID" --json || return 1
   detach_image || return 1
   local status=0
-  "$BARGE_BIN" cache undo --kind cargo-registry --json >"$CASE_OUT/undo.json" 2>/dev/null || status=$?
+  barge_cli "$CASE_OUT/undo.json" cache undo --kind cargo-registry --json || status=$?
   [[ "$status" == 2 ]] || { echo "an absent volume's undo exited $status, not 2"; return 1; }
   assert_json "$CASE_OUT/undo.json" \
     'doc["error"]["kind"] == "volume_absent" and doc["error"]["detail"]["attach"] == "'"$MOUNT"'"' || return 1
   grep -q "$MOUNT" "$CASE_OUT/undo.json" || { echo "the refusal does not name the drive"; return 1; }
   status=0
-  "$BARGE_BIN" cache adopt --kind cargo-git --volume "$UUID" --json >"$CASE_OUT/adopt-absent.json" 2>/dev/null || status=$?
+  barge_cli "$CASE_OUT/adopt-absent.json" cache adopt --kind cargo-git --volume "$UUID" --json || status=$?
   [[ "$status" == 2 ]] || { echo "an absent volume's adopt exited $status, not 2"; return 1; }
   assert_json "$CASE_OUT/adopt-absent.json" 'doc["error"]["kind"] == "volume_absent"' || return 1
   [[ -L "$HOME/.cargo/registry" ]] || { echo "the refusal changed the published link"; return 1; }
   attach_image || return 1
-  "$BARGE_BIN" cache list --json >"$CASE_OUT/list.json" || return 1
+  barge_cli "$CASE_OUT/list.json" cache list --json || return 1
   assert_json "$CASE_OUT/list.json" 'doc["data"]["placements"]["count"] == 1 and doc["data"]["placements"]["rows"][0]["link"] == "linked"' || return 1
   echo "an ordinary detach made the cache unavailable naming $MOUNT; re-attach made it work again"
 }
@@ -677,7 +712,7 @@ STOPPED=""
 run_case() {
   local id="$1" depends="$2" body="$3"
   local dir="$RUN/cases/$id"
-  local log="$dir/out/case.log"
+  local log="$CASE_LOGS/$id.log"
   mkdir -p "$dir/home" "$dir/state" "$dir/out"
   if [[ -n "$STOPPED" ]]; then
     record "$id" "skipped" "the counted run stopped at $STOPPED"

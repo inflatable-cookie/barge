@@ -127,6 +127,30 @@ fn the_script_pins_the_supervisor_bytes_and_runs_them_with_python() {
             && source.contains("--scratch-budget-mib \"$SCRATCH_BUDGET_MIB\""),
         "both bounds are passed to the pinned supervisor"
     );
+    // A failing CLI call must name itself: every case goes through the wrapper,
+    // which echoes the invocation, the document and its stderr into the case log.
+    assert!(
+        source.contains("barge_cli() {") && !source.contains("\"$BARGE_BIN\" cache"),
+        "every case's CLI call goes through the evidence-capturing wrapper"
+    );
+    assert!(
+        source.contains("stdout: ") && source.contains("stderr: "),
+        "the wrapper echoes the CLI document and its stderr"
+    );
+    // Every case log is retained beside the receipt, and the receipt names it.
+    assert!(
+        source.contains("readonly CASE_LOGS=\"$EVIDENCE/cases\""),
+        "case logs are retained in the supervisor's evidence directory"
+    );
+    assert!(
+        source.contains("\"log\": log if os.path.exists(log) else None"),
+        "the receipt names each retained case log"
+    );
+    // The hand-made layout case creates its tool directory before linking.
+    assert!(
+        source.contains("mkdir -p \"$HOME/.cargo\"\n  ln -s \"$target\""),
+        "the hand-made case creates $HOME/.cargo before linking"
+    );
 }
 
 #[test]

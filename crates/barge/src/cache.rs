@@ -57,7 +57,7 @@ use crate::digest::sha256_hex;
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
     AccountFacts, DescriptorScan, DescriptorScanRequest, DeviceId, DirHandle, DirOps, EntryFacts,
-    EntryKind, MountRoot, ProcessObserver, RemoveKind, VolumeFacts, VolumeUuid,
+    EntryKind, MountRoot, ProcessObserver, RemoveKind, SelfExclusion, VolumeFacts, VolumeUuid,
 };
 use crate::registry::VolumeRecord;
 use crate::state::{self, Bounds, Deadline, LockSet, ReadOutcome, StatePaths, READ_DEADLINE};
@@ -2097,6 +2097,30 @@ fn confirm_empty_directory(
         .with_detail("path", original.display().to_string().into())
         .with_detail("entries", listing.total.into()));
     }
+    // The calling process holds this directory open for the listing above, so
+    // its own pid is excluded from the evidence: read once here, with the start
+    // identity the kernel reports for it, and verified by the platform as it
+    // scans. Nothing else is excluded, and an identity that cannot be read or is
+    // absent is a refusal, never a skip.
+    let self_pid = std::process::id();
+    let self_start = observer
+        .process_start(self_pid)
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::CustodyNotProven,
+                format!(
+                    "the calling process's start identity is unreadable, so its own descriptors cannot be excluded: {error}"
+                ),
+            )
+        })?
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::CustodyNotProven,
+                format!(
+                    "the calling process pid {self_pid} has no start identity, so its own descriptors cannot be excluded"
+                ),
+            )
+        })?;
     let scan = observer.scan_open_descriptors(&DescriptorScanRequest {
         root: original,
         root_device: checked.device,
@@ -2104,6 +2128,10 @@ fn confirm_empty_directory(
         max_processes: SCAN_PROCESSES,
         max_descriptors: SCAN_DESCRIPTORS,
         timeout: SCAN_TIMEOUT,
+        self_exclusion: Some(SelfExclusion {
+            pid: self_pid,
+            start: self_start,
+        }),
     })?;
     match scan {
         DescriptorScan::Complete { open, .. } if open.is_empty() => Ok(()),
