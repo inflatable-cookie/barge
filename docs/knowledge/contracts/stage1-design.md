@@ -2079,6 +2079,119 @@ It grants no custody authority, writes nothing and never substitutes for the
 operation's own scan. The [proof contract](s6-native-proof.md#the-harness-preflight)
 owns its apparatus use, receipt interpretation and activation limits.
 
+- **S4** is this slice: project scratch allocation and conclusion, the expiry
+  sweep with its plan and digest, the recorded grants (foreign-family
+  delegations and legacy claims) with their declaration verbs, and the
+  `barge scratch` documents. It deletes only through S5's custody and delete
+  path, and its one bounded native carries the scratch and deletion cases
+  together. Its tests use injected volume facts over real local directories and
+  never read or write a real drive or the real account state.
+
+Choices S4 made where this design left the mechanic to the slice:
+
+- **Family field sets, pinned.** The Oxide marker is exactly the twelve fields
+  its supervisor's `MARKER_KEYS` names, all required: `version` (integer 1),
+  `run_id` (32 lowercase hex), `root` (the absolute root path), `owner_uid`,
+  `device`, `inode`, `created_unix` and `concluded_unix` in seconds,
+  `outcome`/`closure`/`kept_reason`/`nested_scope` as their pinned value sets,
+  plus the source's own conclusion consistency (a concluded root is `closed`
+  with a positive closure). The file must be a private regular file of this user
+  at most 4 KiB, only `version` 1 is read, and the marker's `root`, `owner_uid`,
+  `device` and `inode` must equal the unit the walk reached. The Effigy marker is
+  exactly its `Marker` fields, with `task`, `checkout`, `pid`, `pid_start`, and
+  the optional `keep`/`concluded_ms` defaulted as that struct defaults them;
+  `run` and `created_ms` are required, `pid_start` is text, and an extra field is
+  refused. Every strict-parse failure keeps the unit and is reported with its
+  reason, never as absent.
+- **The unit vocabulary.** The sweep recognises both layouts: a marked
+  directory directly under the scratch root is one unit, and a child of an
+  unmarked project folder is one unit. `oxide-validation/` is never a unit and no
+  claim may cover it; the `oxide` project and a bare `[a-z0-9]{8}` directory are
+  never *claimed*, though a marked family root inside either is still classified
+  (that is where Oxide's proof roots live) and a delegation covers it. A dotted
+  or non-directory top-level entry is one `top_level_adhoc` entry. An entry named
+  `.barge-prune-*` is a pending deletion's quarantine leaf, is never a unit, and
+  is settled only by a replay.
+- **The policy constants.** Scratch is Barge's own folder, not a declared area,
+  and `barge.registry/1`'s frozen field set has no scratch knob, so the design's
+  ages are constants the plan reports: native and Oxide seven days, Effigy's keep
+  retention 24 hours and its undecidable-liveness age seven days. Adding an
+  override needs a registry field and its own slice; a flag would be an
+  unrecorded policy.
+- **Effigy eligibility is at least as conservative as Effigy's own sweep.** A
+  recorded `pid` that is positively alive keeps the directory however old it is,
+  because Barge cannot prove it is a different process from the marker's text
+  start identity (and a live pid whose identity is unreadable is kept the same
+  way). Eligible is a kept conclusion older than 24 hours, or an *unconcluded*
+  run whose recorded process is positively gone, or one whose liveness cannot be
+  decided and whose creation is older than seven days. Barge thus deletes a
+  subset of what that family's own sweep would.
+- **The plan is the authorization.** `barge.scratch.plan/1` holds only stable
+  facts (the volume, folder, policy constants, the candidate rows with their
+  marker identity, and the kept rows with their reasons) and its SHA-256 is the
+  digest. A real run requires `--plan-sha256`; it recomputes the plan and refuses
+  when the digest differs, changing nothing else. Because a change to any unit's
+  eligibility changes the plan, that is a whole-run refusal rather than a
+  partial run, which is the conservative reading of "the real run takes exactly
+  that plan". A change *inside* the run's own plan-to-effect window is caught by
+  the per-candidate re-verification, which abandons only the affected unit.
+- **Order of a real run.** Replay first would make the preview's digest
+  unreproducible, so the order is: compute the plan, require its digest, replay
+  every pending intent from its recorded identity, then for each candidate
+  re-read the grant under the volume, re-assess the unit and delete it. A preview
+  never replays.
+- **Grant declaration verbs (O-009).** `barge scratch delegate` records one
+  family's delegation and `barge scratch claim` one scope's legacy claim, each
+  with the declared-by name and time, into the volume's `scratch_grants`; either
+  can be withdrawn without touching data. Barge records the declaration and
+  cannot authenticate its author, so the review is the operator's; the verbs
+  refuse a claim naming `oxide`, a run-shaped name or a dotted name, and refuse a
+  unit shape that does not match its scope.
+- **The foreign and unmarked deletion proof.** S5's custody takes an
+  `IdentityProof`: an owned root's `barge.root/1` marker, a delegated family's
+  marker bytes, or — for a claimed unmarked unit — a provenance digest over the
+  volume, the unit name, its device and inode, which replay recomputes from the
+  intent's own fields. A unit that acquired any recognised marker since the
+  observation is `unknown` and never deleted on the older authority. The
+  `barge.intent/1` field set is unchanged; `root_id`/`root_name` and the hold and
+  lock keys accept a bounded single-component unit name as well as a Barge root
+  id, because a granted unit's name is whatever the filesystem gave it. The
+  marker a proof names is unlinked last; a claimed unmarked unit has none, so its
+  emptied leaf is removed last. A claimed `top_level_adhoc` unit may be a regular
+  file (the host reaper's own unit shape): custody proves it by the provenance
+  digest over its own device and inode, the quarantine rename moves it, the
+  marker-last phase is recorded with nothing to unlink, and the leaf file is
+  removed — the same phase machine, journal and replay, with no contents walk.
+- **Custody drops its own descriptor.** S5's identity check opened the root to
+  read its device and inode, and the same-uid scan then matched that descriptor,
+  so every real deletion would have been refused. The handle is dropped before
+  the scan. A caller's own open handle, including an Oxide-linked caller's, is
+  still observed and still blocks the delete.
+- **Conclusion and the owner hold.** Allocation records the consumer as the
+  root's owner in a `barge.hold/1` whose purpose is the fixed owner string, so
+  "the recorded owner" is a recorded fact. Conclusion requires that hold to be
+  live, re-reads the marker immediately before writing, refuses a second
+  conclusion (terminal), and records a positive closure only when no other hold
+  on the root is live or undecidable and no pending intent names it.
+- **Volume absence.** `barge scratch expire` on a permanent volume refuses
+  `volume_absent` loudly and writes nothing; on an ephemeral volume it reports
+  `volume_present: false`, an empty plan and no effect. Neither recreates or
+  writes a stale mount point.
+- **Command documents.** `barge.scratch.alloc/1`, `barge.scratch.conclude/1`,
+  `barge.scratch.expire/1` (with `barge.scratch.plan/1` inside it),
+  `barge.scratch.grants/1`, `barge.scratch.delegate/1`, `barge.scratch.claim/1`
+  and `barge.scratch.revoke/1`. They are command documents and are not added to
+  `barge.describe/1`'s `formats` list.
+- **Bounds as applied.** A sweep examines 4096 entries within 1 s, reports
+  `truncated` and counts when it stops, lists a directory to 200 000 names, walks
+  a claimed unit to 12 levels for its newest entry, and keeps the deletion's own
+  120 s per-root deadline and three `ENOTEMPTY` attempts. The plan and its rows
+  use the root row cap.
+- **What S4 does not claim.** No real-drive sweep, no reaper or LaunchAgent
+  change, no Oxide or Effigy adoption, and no native receipt until the owner
+  activates the runs. `scratch:expiry:native` and its `:diagnostic` twin are
+  declared and held.
+
 ## Proposed validation
 
 Design-only validation for this contract is `effigy docs:check` once, run from
