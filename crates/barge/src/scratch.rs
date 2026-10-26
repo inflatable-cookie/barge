@@ -1212,13 +1212,8 @@ where
     state_paths.initialize()?;
     let mut locks = state::LockSet::new(state_paths.clone());
     let lock = locks.lock_registry()?;
-    // A grant change is serialized with a deletion's locked authorization
-    // window, so it takes the volume lock too, in the documented order. A
-    // deletion re-verifies the grant under that same lock, so a withdrawal can
-    // never land between the verification and the effect.
-    let _volume_lock = locks.lock_volume(volume_uuid)?;
-    // Reread under both locks and modify *that* document: reading before the
-    // lock and publishing the stale object silently discarded a concurrent
+    // Reread under the registry lock and modify *that* document: reading before
+    // the lock and publishing the stale object silently discarded a concurrent
     // writer's change, and could restore authority another writer withdrew.
     let mut document = match registry::read(state_paths)? {
         registry::Registry::Present(document) => document,
@@ -1234,12 +1229,21 @@ where
         .iter_mut()
         .find(|volume| volume.volume_uuid == *volume_uuid)
     else {
+        // A volume that is not registered is never granted anything, and the
+        // refusal creates no lock for a volume that does not exist.
         return Err(Error::new(
             ErrorKind::UnknownState,
             format!("volume {volume_uuid} is not registered"),
         )
         .with_detail("volume_uuid", volume_uuid.as_str().into()));
     };
+    // A grant change is serialized with a deletion's locked authorization
+    // window, so it takes the volume lock too, in the documented order. A
+    // deletion re-verifies the grant under that same lock, so a withdrawal can
+    // never land between the verification and the effect. The document read
+    // above stays current while the registry lock is held, so the wait changes
+    // no decision.
+    let _volume_lock = locks.lock_volume(volume_uuid)?;
     let mut grants = slot.scratch_grants.clone();
     let changed = change(&mut grants)?;
     if !changed {
