@@ -16,12 +16,13 @@ never lands outside the guard's own root.
 The owner activates each run separately: one uncounted `--diagnostic` pass, then
 the counted pass at the exact head. A counted pass with a missing receipt is a
 missing proof. The case script's own preflight runs first, inside this
-supervisor: a host that cannot list the descriptors of its own same-uid sentinel
-and of every process the kernel table reports as this account's classifies itself
-`infrastructure` and aborts unqualified (exit 4) before any case, naming the pid
-and command it could not read; a descriptor table that fills its cap is the same
-incomplete evidence. The proof uses no forced detach: the pull case is the
-brief's ordinary detach, and a refusal leaves it unproved.
+supervisor, and it is the product's census, not Python's: one probe root in the
+guard's image is really deleted by `barge scratch expire`, so the custody scan
+that decides it is the Barge binary's own same-uid scan with the product's bounds
+and barge#012's bounded EPERM re-observation. A product custody refusal
+classifies the run `infrastructure` and aborts unqualified (exit 4) before any
+case. The proof uses no forced detach: the pull case is the brief's ordinary
+detach, and a refusal leaves it unproved.
 """
 
 import argparse

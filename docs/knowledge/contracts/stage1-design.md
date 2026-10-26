@@ -2196,25 +2196,26 @@ Choices S4 made where this design left the mechanic to the slice:
   case asserts the design's observable — one pending intent and the kept leaf,
   whichever conservative stop the race produces — and the marker-last
   `ENOTEMPTY` retry itself stays proved by the counted unit counterfactual.
-- **The native's same-uid observability preflight (owner ruling).** Some hosts
-  refuse `proc_pidinfo` on processes of their own effective user — observed here
-  as `EPERM` on two `/usr/bin/login` processes — and custody correctly reads an
-  unreadable process as `Unknown` and refuses. Whether this account may read its
-  own processes is an environment capability, not a product fact, so before any
-  case, inside the same qualified supervisor, the proof performs the two
-  descriptor observations the gate requires and nothing else replaces them:
-  it launches one same-uid sentinel child that stays in the supervisor's
-  session, lists that child's descriptors with
-  `proc_pidinfo(PROC_PIDLISTFDS)` — the primitive the custody scan uses — then
-  terminates and reaps it within a fixed bound; and it lists the descriptors of
-  a pre-existing process whose effective uid it has verified as its own from the
-  kernel process table (`sysctl KERN_PROC_ALL`), preferring the supervisor that
-  runs it, excluding itself and the sentinel. If either listing is unavailable,
-  the run classifies itself `infrastructure`, unqualified, and aborts before any
-  case (exit 4): a missing capability is never a case failure and never a pass.
-  Identity, session and supervisor-pin checks stay, as supplemental checks. No
-  product rule, path exception or case oracle changes; an unreadable
-  same-effective-uid descriptor is still `Unknown` and still refuses.
+- **The native's same-uid observability preflight (owner ruling, then the
+  Supervisor's execution-identity correction).** Some hosts refuse
+  `proc_pidinfo` on processes of their own effective user — observed here as
+  `EPERM` on system daemons — and custody correctly reads an unreadable process as
+  `Unknown` and refuses. Whether this account may read its own processes is an
+  environment capability, not a product fact, so before any case, inside the same
+  qualified supervisor, the census is taken by **Barge's own binary, never by the
+  proof's Python**: one probe root is allocated, positively concluded, released
+  and aged in the guard's owned image, then really deleted by
+  `barge scratch expire`. That deletion's custody runs the product's
+  same-effective-uid descriptor scan — the same observer, the same bounds, the
+  same foreign-uid classification and exited-process handling, and barge#012's
+  bounded same-uid `EPERM` re-observation — so the scan's execution identity is
+  exactly the one every case's deletion uses. A product custody refusal (an
+  unreadable same-uid process after its bounded re-observation, or a scan bound)
+  makes the run `infrastructure`, unqualified, aborted before any case (exit 4),
+  with the product's own reason recorded in the receipt; any other probe outcome
+  is an apparatus defect, never a pass. No product rule, path exception or case
+  oracle changes; an unreadable same-effective-uid descriptor is still `Unknown`
+  and still refuses.
 - **Grants are re-verified in the deletion's window, policy included.** The
   plan's assessment reads the grants, but the authority that matters is read
   again inside S5's locked deletion: `delete_unit_on_volume` takes the volume
@@ -2255,16 +2256,15 @@ Choices S4 made where this design left the mechanic to the slice:
   deadline is checked by the same spend. A project folder whose listing stopped
   at the name bound sets the plan's `truncated` flag instead of presenting a
   partial plan as whole.
-- **The native's same-uid census.** The preflight observes every process the
-  kernel table reports as this effective uid — not a sample — with
-  `proc_pidinfo(PROC_PIDLISTFDS)`; a process that exited is tolerated, a foreign
-  uid is never inspected, and one refusal (`EPERM`) or a bound hit makes the run
-  `infrastructure`, unqualified, with the pid, command and count in the receipt.
-  A descriptor table that fills its own cap is the same refusal: a full buffer is
-  incomplete evidence, never a complete listing. Under the Supervisor's
-  sequencing this census moves to Barge's own observer (with the custody
-  correction in barge#012) so the proof's execution identity matches the product;
-  that is apparatus-only and awaits the rebase.
+- **The native's same-uid census is the product's own.** The preflight no longer
+  observes the host from Python at all: the Barge binary runs the scan through a
+  real probe deletion, so the census is the product's `MacOs` custody scan with
+  its own declared bounds (4096 processes, 65 536 descriptors, 10 s per scan, and
+  barge#012's three retries inside a 250 ms settle window), its foreign-effective-
+  uid exclusion, its exited-process handling and its bounded `EPERM`
+  re-observation. An unreadable same-uid process or a bound is `infrastructure`,
+  unqualified, before any case, and the receipt records the census outcome and the
+  product's reason.
 - **Premise 2 is a complete-content assertion.** The proof observes the real
   account state before the run and after it through descriptors: the state
   directory is opened with `O_NOFOLLOW` and every name relative to its parent's

@@ -69,11 +69,12 @@ admission = "heavy"
 run = "python3 scripts/run-scratch-expiry-native.py --diagnostic"
 
 # Pure apparatus regression of the proof itself: the case map, the pinned
-# supervisor digest, the nine-premise record, the same-uid observability
-# preflight (the sentinel probe, the bounded full same-uid census, and an
-# infrastructure abort on either failure, including a cap-filled descriptor
-# table), premise 2's complete-content real-state observation and fixture-only
-# resolver proof, the ordinary-detach rules and the environment hook list.
+# supervisor digest, the nine-premise record, the product-census preflight (a
+# real probe deletion whose custody is the Barge binary's own same-uid scan, with
+# an infrastructure abort for a custody refusal and an apparatus-defect refusal
+# for any other outcome), premise 2's complete-content real-state observation and
+# fixture-only resolver proof, the ordinary-detach rules and the environment
+# hook list.
 # No image, no scratch, no child process.
 [tasks."scratch:expiry:test"]
 run = "python3 scripts/test-scratch-expiry.py --self-check"
