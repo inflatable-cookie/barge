@@ -441,6 +441,15 @@ pub trait DirOps {
     /// copy.
     fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<RenameOutcome>;
 
+    /// Set one opened directory's permission mode through its own descriptor.
+    ///
+    /// It is how a deletion reaches what is inside a captured directory that its
+    /// owner cannot write to, and it is descriptor-based, so no name is resolved
+    /// again: the mode is applied to the object the handle was opened as, never to
+    /// whatever a racer may have put at the name. The caller records the original
+    /// mode durably before it calls this.
+    fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> Result<()>;
+
     /// Re-read one opened directory's own identity through its descriptor: the
     /// parent binding a capture or an unlink relies on.
     ///

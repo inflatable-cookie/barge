@@ -417,6 +417,14 @@ impl ProcessObserver for FakeObserver {
     }
 }
 
+/// A probe the test installs at one moment of a walk: it is handed the entry
+/// name and may change the fixture in that window.
+pub type ObserveProbe = Box<dyn Fn(&str)>;
+
+/// A probe the test installs at a put-back: it is handed the private name and
+/// answers one fact about the state at that moment.
+pub type PutBackProbe = Box<dyn Fn(&str) -> bool>;
+
 /// The platform's directory operations with the faults a platform cannot be
 /// asked to produce: a foreign owner, an entry on another device, an
 /// `ENOTEMPTY` that keeps coming back, a racer that replaces an entry after the
@@ -445,9 +453,44 @@ pub struct Faults {
     /// Entries a racer replaces after the deletion observed them, which is the
     /// window between a check and the capture that follows it.
     pub races: RefCell<Vec<Race>>,
-    /// Entries a racer takes back as soon as they are captured, so a put-back
-    /// finds its own name occupied.
-    pub occupy_after_capture: RefCell<Vec<(PathBuf, PathBuf)>>,
+    /// Names a racer takes back as soon as they are captured, so a put-back finds
+    /// its own name occupied.
+    pub occupy_after_capture: RefCell<Vec<String>>,
+    /// A probe the test runs the moment the walk observes an entry, so it can
+    /// change the fixture in the window a real fault would happen in.
+    pub observe_probe: RefCell<Option<ObserveProbe>>,
+    /// A probe the test runs the moment an entry is put back: it is handed the
+    /// private name and answers one fact about the state at that moment, which
+    /// [`Faults::put_back_result`] returns.
+    pub put_back_probe: RefCell<Option<PutBackProbe>>,
+    put_back_result: RefCell<Option<bool>>,
+    /// Whether a put-back rename fails: the captured object then stays under its
+    /// private name, as it does when the process stops between the record and the
+    /// put-back.
+    pub fail_put_back: Cell<bool>,
+    /// Whether the next private-name removal answers "already gone", as it does
+    /// when another process moves the captured object mid-run.
+    pub vanishing: Cell<bool>,
+    /// A device the descriptor a capture is verified through reports, so the
+    /// parent binding fails and the captured facts cannot be read.
+    pub parent_device_shift: Cell<Option<DeviceId>>,
+    /// A name whose entry read fails, so the walk aborts where a real read error
+    /// would abort it.
+    pub failing_facts_name: Option<String>,
+    /// Which observation of that name fails, counted from one.
+    pub failing_facts_observation: usize,
+    /// How many times the wrapper has been asked for that name.
+    facts_seen: Cell<usize>,
+    /// Every mode this wrapper set on a directory, in order.
+    pub mode_changes: RefCell<Vec<u32>>,
+    /// Fail a mode change back to a mode without owner write: the restore fails.
+    pub fail_mode_restore: Cell<bool>,
+    /// Fail the listing that follows a mode change: an abort after the chmod.
+    pub fail_listing_after_mode: Cell<bool>,
+    /// Set once a mode change has happened and a failure is armed for it.
+    arm_after_mode: Cell<bool>,
+    /// Fail the entry read that follows a mode change.
+    pub fail_facts_after_mode: Cell<bool>,
 }
 
 /// What a racer puts at a name after the deletion observed the entry there.
@@ -611,12 +654,70 @@ impl Faults {
             .push(Race::after(holder, relative, observation, replacement));
     }
 
-    /// Take the entry at `relative` back as soon as it is captured away from its
+    /// Run `probe` the moment the walk observes an entry.
+    pub fn observing(&self, probe: ObserveProbe) {
+        *self.observe_probe.borrow_mut() = Some(probe);
+    }
+
+    /// Run `probe` the moment an entry is put back, and keep its answer.
+    pub fn probing_put_back(&self, probe: PutBackProbe) {
+        *self.put_back_probe.borrow_mut() = Some(probe);
+    }
+
+    /// What the put-back probe answered, when it ran.
+    pub fn put_back_result(&self) -> Option<bool> {
+        *self.put_back_result.borrow()
+    }
+
+    /// Fail every put-back rename: the captured object never returns to its
+    /// ordinary name.
+    pub fn failing_put_back(&self) {
+        self.fail_put_back.set(true);
+    }
+
+    /// Let other processes move the first private name away before Barge unlinks
+    /// it: the removal answers "already gone", as it does mid-run.
+    pub fn vanishing_capture(&self) {
+        self.vanishing.set(true);
+    }
+
+    /// Fail the `observation`-th entry read of `name`, aborting the walk where a
+    /// real read error would. Counting from one is how a test lands the abort in
+    /// the delete pass rather than in the classification.
+    pub fn failing_facts_at(&mut self, name: &str, observation: usize) {
+        self.failing_facts_name = Some(name.to_owned());
+        self.failing_facts_observation = observation;
+    }
+
+    /// Report another device for the descriptor a capture is verified through.
+    pub fn shifting_parent(&self, device: DeviceId) {
+        self.parent_device_shift.set(Some(device));
+    }
+
+    /// The modes this wrapper set on directories, in order.
+    pub fn modes_set(&self) -> Vec<u32> {
+        self.mode_changes.borrow().clone()
+    }
+
+    /// Fail every mode restore, so the recorded mode is never put back.
+    pub fn failing_mode_restore(&self) {
+        self.fail_mode_restore.set(true);
+    }
+
+    /// Fail the listing after a mode change: an abort after the chmod.
+    pub fn failing_listing_after_mode(&self) {
+        self.fail_listing_after_mode.set(true);
+    }
+
+    /// Fail the entry read after a mode change: an abort after the chmod.
+    pub fn failing_facts_after_mode(&self) {
+        self.fail_facts_after_mode.set(true);
+    }
+
+    /// Take the entry named `name` back as soon as it is captured away from its
     /// name, so a put-back finds its original name occupied.
-    pub fn occupying_after_capture(&self, holder: &Path, relative: &str) {
-        self.occupy_after_capture
-            .borrow_mut()
-            .push((holder.to_path_buf(), PathBuf::from(relative)));
+    pub fn occupying_after_capture(&self, name: &str) {
+        self.occupy_after_capture.borrow_mut().push(name.to_owned());
     }
 
     /// Run the racers whose name was just observed.
@@ -667,17 +768,19 @@ impl Faults {
         }
     }
 
-    /// Take back a captured entry's original name.
-    fn maybe_occupy(&self, from: &str) {
-        for (holder, relative) in self.occupy_after_capture.borrow().iter() {
-            if relative.file_name().and_then(|part| part.to_str()) != Some(from) {
+    /// Take back a captured entry's original name, in the directory the capture
+    /// happened in, so a put-back there finds it occupied at any depth.
+    fn maybe_occupy(&self, parent: &DirHandle, from: &str, to: &str) {
+        if !to.starts_with(crate::state::CAPTURE_PREFIX) {
+            return;
+        }
+        for name in self.occupy_after_capture.borrow().iter() {
+            if name != from {
                 continue;
             }
-            let path = raced_path(holder, relative);
-            if path.exists() {
-                continue;
-            }
-            let _ = std::fs::write(path, b"a racer took this name back");
+            let _ =
+                self.inner
+                    .publish_child_file(parent, from, b"a racer took this name back", 0o644);
         }
     }
 
@@ -755,6 +858,23 @@ impl DirOps for Faults {
     }
 
     fn child_facts(&self, parent: &DirHandle, name: &str) -> Result<Option<EntryFacts>> {
+        if self.failing_facts_name.as_deref() == Some(name) {
+            let seen = self.facts_seen.get().saturating_add(1);
+            self.facts_seen.set(seen);
+            if seen == self.failing_facts_observation {
+                return Err(Error::new(
+                    ErrorKind::Io,
+                    format!("the entry read of `{name}` did not happen"),
+                ));
+            }
+        }
+        if self.arm_after_mode.get() && self.fail_facts_after_mode.get() {
+            self.arm_after_mode.set(false);
+            return Err(Error::new(
+                ErrorKind::Io,
+                "the entry read after the mode change did not happen",
+            ));
+        }
         let Some(mut facts) = self.inner.child_facts(parent, name)? else {
             return Ok(None);
         };
@@ -770,6 +890,9 @@ impl DirOps for Faults {
         // facts, so the returned observation describes an object that is no
         // longer at the name: the exact window a check-then-unlink by name loses.
         self.maybe_race(parent, name);
+        if let Some(probe) = self.observe_probe.borrow().as_ref() {
+            probe(name);
+        }
         Ok(Some(facts))
     }
 
@@ -797,6 +920,13 @@ impl DirOps for Faults {
     }
 
     fn list_children(&self, parent: &DirHandle, max_names: usize) -> Result<ChildListing> {
+        if self.arm_after_mode.get() && self.fail_listing_after_mode.get() {
+            self.arm_after_mode.set(false);
+            return Err(Error::new(
+                ErrorKind::Io,
+                "the listing after the mode change did not happen",
+            ));
+        }
         self.inner.list_children(parent, max_names)
     }
 
@@ -806,6 +936,13 @@ impl DirOps for Faults {
         name: &str,
         kind: RemoveKind,
     ) -> Result<ChildRemoval> {
+        if self.vanishing.get() && name.starts_with(crate::state::CAPTURE_PREFIX) {
+            self.vanishing.set(false);
+            // Another process moved the captured object away between Barge's check
+            // and its unlink: the removal answers "already gone".
+            let _ = self.inner.remove_child(parent, name, kind);
+            return Ok(ChildRemoval::Absent);
+        }
         if kind == RemoveKind::Directory {
             let mut prefixes = self.not_empty_prefix.borrow_mut();
             for (prefix, remaining) in prefixes.iter_mut() {
@@ -831,9 +968,21 @@ impl DirOps for Faults {
     }
 
     fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<RenameOutcome> {
+        if from.starts_with(crate::state::CAPTURE_PREFIX) {
+            if self.fail_put_back.get() {
+                return Err(Error::new(
+                    ErrorKind::Io,
+                    format!("the put-back of `{from}` did not happen"),
+                ));
+            }
+            if let Some(probe) = self.put_back_probe.borrow().as_ref() {
+                let answer = probe(from);
+                *self.put_back_result.borrow_mut() = Some(answer);
+            }
+        }
         let outcome = self.inner.rename_child(parent, from, to)?;
         if outcome == RenameOutcome::Renamed {
-            self.maybe_occupy(from);
+            self.maybe_occupy(parent, from, to);
             if let Some(volume) = &self.volume {
                 volume.shift_device();
             }
@@ -841,8 +990,28 @@ impl DirOps for Faults {
         Ok(outcome)
     }
 
+    fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> Result<()> {
+        if self.fail_mode_restore.get() && mode & 0o200 == 0 {
+            // The restore never reaches the platform: the mode stays changed.
+            return Err(Error::new(ErrorKind::Io, "the mode restore did not happen"));
+        }
+        self.inner.set_dir_mode(handle, mode)?;
+        self.mode_changes.borrow_mut().push(mode);
+        if self.fail_listing_after_mode.get() {
+            self.arm_after_mode.set(true);
+        }
+        Ok(())
+    }
+
     fn recheck_dir(&self, handle: &DirHandle) -> Result<DirId> {
-        self.inner.recheck_dir(handle)
+        let identity = self.inner.recheck_dir(handle)?;
+        if let Some(device) = self.parent_device_shift.get() {
+            return Ok(DirId {
+                device,
+                inode: identity.inode,
+            });
+        }
+        Ok(identity)
     }
 
     fn random_bytes(&self, length: usize) -> Result<Vec<u8>> {

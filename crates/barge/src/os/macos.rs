@@ -1873,6 +1873,27 @@ impl DirOps for MacOs {
         )
     }
 
+    fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> Result<()> {
+        let descriptor = handle.descriptor().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Usage,
+                "the handle has no open descriptor to chmod".to_owned(),
+            )
+        })?;
+        // SAFETY: the descriptor is open for this call and `mode` is one of the
+        // permission bits `fchmod` takes. It acts on the opened directory itself,
+        // so no link is followed and no name is resolved again.
+        if unsafe { libc::fchmod(descriptor.as_raw_fd(), mode as libc::mode_t) } != 0 {
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!("cannot set the directory mode to {mode:#o}"),
+            )
+            .with_detail("mode", mode.to_string().into())
+            .with_detail("os_error", io::Error::last_os_error().to_string().into()));
+        }
+        Ok(())
+    }
+
     fn recheck_dir(&self, handle: &DirHandle) -> Result<DirId> {
         let descriptor = handle.descriptor().ok_or_else(|| {
             Error::new(

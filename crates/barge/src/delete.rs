@@ -14,7 +14,9 @@
 //! 2. `renamed` before the first unlink;
 //! 3. `marker_last` after the marker is unlinked last and before the quarantine
 //!    leaf is removed;
-//! 4. `deleted` once the leaf is gone, which settles the intent.
+//! 4. `removed` once Barge's own final unlink of the leaf succeeded, which is the
+//!    durable completion evidence;
+//! 5. `deleted` once the leaf is gone, which settles the intent.
 //!
 //! A stop after the first effect leaves the intent pending and the quarantine
 //! leaf in place; a later replay resolves that intent only from its recorded
@@ -24,19 +26,36 @@
 //! directory, nor Finder metadata stops it too. No rule ever widens what is
 //! deleted.
 //!
-//! Every entry is removed through one rule: **capture, verify, unlink**. The name
-//! is exclusively renamed to `.barge-del-<random 128-bit nonce>` in the same
-//! directory, the captured object's own facts are re-read under that private name
-//! and compared with the observation the walk took of it, and only a match is
-//! unlinked. A mismatch never unlinks: the object goes back under its original
-//! name, or, when that name is taken, stays under the private name with both names
-//! reported, and the deletion stops with the intent pending. That closes the
-//! check-then-unlink-by-name race, in which a same-uid racer replaces each entry
-//! after its check and the next check passes. A `.barge-del-*` name a stop left
-//! behind is recorded with the observation its capture failed to match, and no run
-//! and no replay ever unlinks one: it is unverifiable, so it keeps the intent
-//! pending for an operator instead.
+//! Every entry is removed through one rule: **capture, verify, record, unlink**.
+//! The name is exclusively renamed to `.barge-del-<random 128-bit nonce>` in the
+//! same directory, the captured object's own facts are re-read under that private
+//! name and compared with the observation the walk took of it, the capture and its
+//! verdict are published into the intent, and only then is the private name
+//! unlinked. A mismatch never unlinks: it is published as a `foreign_capture`
+//! **before** anything puts the object back, and then the object goes back under
+//! its original name, or, when that name is taken, stays under the private name
+//! with both names reported. That closes the check-then-unlink-by-name race, in
+//! which a same-uid racer replaces each entry after its check and the next check
+//! passes.
+//!
+//! The durable facts that carry the rule across a stop - so an absent name is never
+//! proof that Barge deleted its object (stage 1 design, "Durable custody of
+//! captured objects") - are:
+//!
+//! - a `.barge-del-*` name is unlinked only while the intent records its capture,
+//!   its verdict and its device, inode and kind, and a replay re-verifies the same
+//!   identity before it deletes anything; an unrecorded, collided or unverifiable
+//!   private name is never unlinked and keeps the intent pending;
+//! - a capture whose verification failed is recorded in `foreign_captures` before
+//!   its put-back, so a replay never mistakes the object for content of the root;
+//! - a captured directory whose owner cannot write or search it has its original
+//!   permission mode recorded before the mode is changed, a scope guard restores it
+//!   on every return, `?` error and panic, and a replay restores recorded modes
+//!   first;
+//! - the `removed` phase is published after Barge's own final unlink and before the
+//!   intent settles, and an absent leaf without it stays unknown and pending.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -53,8 +72,9 @@ use crate::os::{
 };
 use crate::registry;
 use crate::state::{
-    self, is_capture_name, IntentPhase, IntentRecord, IntentWrite, LeftoverRecord, LockSet,
-    PutBackOutcome, StatePaths, CAPTURE_PREFIX, LEFTOVER_REASON_BYTES, QUARANTINE_PREFIX,
+    self, is_capture_name, CaptureRecord, CaptureVerdict, CapturedObject, ForeignCapture,
+    IntentPhase, IntentRecord, IntentWrite, LockSet, PutBackOutcome, StatePaths, CAPTURE_PREFIX,
+    FOREIGN_REASON_BYTES, QUARANTINE_PREFIX,
 };
 
 /// How deep a whole-root delete walks (design, "Bounded resources").
@@ -397,7 +417,8 @@ pub fn delete_root_on_volume(
         generation: 1,
         recorded_ms: now,
         phase_ms: now,
-        leftovers: Vec::new(),
+        captures: Vec::new(),
+        foreign_captures: Vec::new(),
     };
     let write = locks.begin_intent_write()?;
     state::publish_intent(&write, state_paths, &intent)?;
@@ -575,6 +596,59 @@ fn finish_deletion(
         }
     }
 
+    let journal = CaptureJournal::new(write, state_paths, &current);
+    // The leaf's own mode: a root whose directory this account cannot write into
+    // cannot have its contents removed. Its mode is published before the change and
+    // a guard puts it back on every abort, and a replay restores it first.
+    let mut base_chain: Vec<CaptureRecord> = Vec::new();
+    let leaf_facts = match dirs.child_facts(area_handle, &intent.quarantine_name) {
+        Ok(facts) => facts,
+        Err(error) => {
+            return pending_report(
+                &journal.intent(),
+                quarantine,
+                counts,
+                format!("the quarantine leaf cannot be read: {error}"),
+                None,
+            )
+        }
+    };
+    let leaf_custody = match leaf_facts {
+        Some(leaf_facts)
+            if leaf_facts.kind == EntryKind::Directory && leaf_facts.mode & 0o300 != 0o300 =>
+        {
+            base_chain.push(CaptureRecord {
+                private: intent.quarantine_name.clone(),
+                original: intent.root_name.clone(),
+                device: intent.device,
+                inode: intent.inode,
+                kind: "directory".to_owned(),
+                verdict: CaptureVerdict::Observed,
+                mode: Some(leaf_facts.mode),
+            });
+            if let Err(error) = journal.record_captures(&base_chain) {
+                return pending_report(
+                    &journal.intent(),
+                    quarantine,
+                    counts,
+                    format!("the quarantine leaf's mode could not be recorded: {error}"),
+                    None,
+                );
+            }
+            if let Err(error) = dirs.set_dir_mode(&leaf, leaf_facts.mode | 0o300) {
+                return pending_report(
+                    &journal.intent(),
+                    quarantine,
+                    counts,
+                    format!("the quarantine leaf's recorded mode could not be applied: {error}"),
+                    None,
+                );
+            }
+            Some(ModeCustody::new(dirs, &leaf, leaf_facts.mode))
+        }
+        _ => None,
+    };
+
     let mut walk = match WalkState::new(
         dirs,
         facts,
@@ -583,7 +657,8 @@ fn finish_deletion(
         DeviceId::new(intent.device),
         intent.mount_hint.clone(),
         bounds,
-        &intent.leftovers,
+        &journal,
+        base_chain,
     ) {
         Ok(walk) => walk,
         Err(error) => {
@@ -622,27 +697,11 @@ fn finish_deletion(
             }
         };
         if let Walk::Stop(reason) = classified {
-            return pending_with_leftovers(
-                write,
-                state_paths,
-                intent,
-                &walk.leftovers,
-                quarantine,
-                counts,
-                reason,
-            );
+            return pending_report(&journal.intent(), quarantine, counts, reason, None);
         }
         match walk.delete_contents(&leaf, 0, Path::new(""), true, &mut counts) {
             Ok(Walk::Stop(reason)) => {
-                return pending_with_leftovers(
-                    write,
-                    state_paths,
-                    intent,
-                    &walk.leftovers,
-                    quarantine,
-                    counts,
-                    reason,
-                )
+                return pending_report(&journal.intent(), quarantine, counts, reason, None)
             }
             Ok(Walk::Clean) => {}
             Err(error) => {
@@ -660,15 +719,7 @@ fn finish_deletion(
         match walk.remove_marker_last(&leaf, &mut counts) {
             Ok(Walk::Clean) => {}
             Ok(Walk::Stop(reason)) => {
-                return pending_with_leftovers(
-                    write,
-                    state_paths,
-                    intent,
-                    &walk.leftovers,
-                    quarantine,
-                    counts,
-                    reason,
-                )
+                return pending_report(&journal.intent(), quarantine, counts, reason, None)
             }
             Err(error) => {
                 return pending_report(
@@ -680,8 +731,16 @@ fn finish_deletion(
                 )
             }
         }
-        match state::advance_intent(write, state_paths, &current, IntentPhase::MarkerLast) {
-            Ok(next) => current = next,
+        match state::advance_intent(
+            write,
+            state_paths,
+            &journal.intent(),
+            IntentPhase::MarkerLast,
+        ) {
+            Ok(next) => {
+                current = next;
+                journal.advanced(current.clone());
+            }
             Err(error) => {
                 return pending_report(
                     &current,
@@ -706,15 +765,7 @@ fn finish_deletion(
     ) {
         Ok(Removal::Gone) => {}
         Ok(Removal::Stopped(reason)) => {
-            return pending_with_leftovers(
-                write,
-                state_paths,
-                &current,
-                &walk.leftovers,
-                quarantine,
-                counts,
-                reason,
-            )
+            return pending_report(&journal.intent(), quarantine, counts, reason, None)
         }
         Err(error) => {
             return pending_report(
@@ -727,6 +778,27 @@ fn finish_deletion(
         }
     }
     counts.directories = counts.directories.saturating_add(1);
+    if let Some(custody) = &leaf_custody {
+        custody.settled();
+    }
+    // The durable completion evidence: Barge's own final unlink of a verified
+    // captured private name succeeded. A replay may settle the intent only after
+    // this phase; without it, an absence is unknown, never a completion.
+    match state::advance_intent(write, state_paths, &journal.intent(), IntentPhase::Removed) {
+        Ok(removed) => {
+            current = removed.clone();
+            journal.advanced(removed);
+        }
+        Err(error) => {
+            return pending_report(
+                &journal.intent(),
+                quarantine,
+                counts,
+                format!("the removed phase could not be recorded: {error}"),
+                None,
+            )
+        }
+    }
     match state::advance_intent(write, state_paths, &current, IntentPhase::Deleted) {
         Ok(settled) => DeleteReport {
             volume_uuid: settled.volume_uuid.to_string(),
@@ -789,39 +861,6 @@ fn leaf_marker_digest(
     }
 }
 
-/// Report a stop, publishing the unverified captures the walk could not put back.
-///
-/// The record is durable before the report, so a later run and a replay know which
-/// private names hold objects whose capture never verified. A record that cannot be
-/// written does not weaken the stop: the intent stays pending either way, and an
-/// unrecorded private name is still unverifiable and still never unlinked.
-fn pending_with_leftovers(
-    write: &IntentWrite,
-    state_paths: &StatePaths,
-    intent: &IntentRecord,
-    leftovers: &[LeftoverRecord],
-    quarantine: PathBuf,
-    counts: Counts,
-    reason: String,
-) -> DeleteReport {
-    let mut recorded = intent.clone();
-    if !leftovers.is_empty() {
-        match state::record_leftovers(write, state_paths, intent, leftovers) {
-            Ok(next) => recorded = next,
-            Err(error) => {
-                return pending_report(
-                    &recorded,
-                    quarantine,
-                    counts,
-                    format!("{reason}; the unverified capture could not be recorded: {error}"),
-                    None,
-                )
-            }
-        }
-    }
-    pending_report(&recorded, quarantine, counts, reason, None)
-}
-
 fn pending_report(
     intent: &IntentRecord,
     quarantine: PathBuf,
@@ -846,6 +885,79 @@ fn pending_report(
     }
 }
 
+/// The intent journal a deletion walk publishes into.
+///
+/// Two durable facts make the walk safe, and both are published **before** the
+/// effect they protect:
+///
+/// - the in-flight captures, with their verdict and any mode Barge is about to
+///   change, so a private name is only ever unlinked while the intent records its
+///   capture and a replay re-verifies the same identity;
+/// - every capture whose verification failed, before its put-back, because a
+///   put-back returns an object Barge never observed to a name a later walk would
+///   treat as an ordinary entry.
+///
+/// A record that cannot be written therefore stops the deletion with the object
+/// still under its private name, which no run and no replay ever unlinks.
+struct CaptureJournal<'a> {
+    write: &'a IntentWrite,
+    state_paths: &'a StatePaths,
+    intent: RefCell<IntentRecord>,
+}
+
+impl<'a> CaptureJournal<'a> {
+    /// The journal the walk publishes into.
+    fn new(
+        write: &'a IntentWrite,
+        state_paths: &'a StatePaths,
+        intent: &IntentRecord,
+    ) -> CaptureJournal<'a> {
+        Self {
+            write,
+            state_paths,
+            intent: RefCell::new(intent.clone()),
+        }
+    }
+
+    /// Publish one capture whose verification failed, before its put-back.
+    ///
+    /// A later record of the same capture replaces the earlier one, so the
+    /// put-back answer is added rather than duplicated.
+    fn record_foreign(&self, foreign: ForeignCapture) -> Result<()> {
+        let next = {
+            let current = self.intent.borrow();
+            state::record_foreign_capture(self.write, self.state_paths, &current, &foreign)?
+        };
+        *self.intent.borrow_mut() = next;
+        Ok(())
+    }
+
+    /// Publish the in-flight captures durably.
+    ///
+    /// This is what makes a private name deletable: a `.barge-del-*` name is
+    /// unlinked only while the intent records its capture and verification, with
+    /// the mode Barge is about to change, so a replay re-verifies the same object.
+    fn record_captures(&self, captures: &[CaptureRecord]) -> Result<()> {
+        let next = {
+            let current = self.intent.borrow();
+            state::record_captures(self.write, self.state_paths, &current, captures)?
+        };
+        *self.intent.borrow_mut() = next;
+        Ok(())
+    }
+
+    /// The intent as the journal has it now.
+    fn intent(&self) -> IntentRecord {
+        self.intent.borrow().clone()
+    }
+
+    /// Take a phase the caller published through the journal's own token, so a
+    /// later report from the journal names the phase that is actually durable.
+    fn advanced(&self, intent: IntentRecord) {
+        *self.intent.borrow_mut() = intent;
+    }
+}
+
 /// One deletion walk: the bounds, the accumulated facts and the volume
 /// re-verification that a long walk needs.
 struct WalkState<'a> {
@@ -862,12 +974,13 @@ struct WalkState<'a> {
     /// what was classified and Finder metadata that appeared again; anything
     /// else is a new entry, which stops the deletion rather than widening it.
     expected: HashSet<PathBuf>,
-    /// The unverified captures the intent already records, so a stop can name the
-    /// object's original name and why its capture did not verify.
-    recorded: Vec<LeftoverRecord>,
-    /// The unverified captures this run could not put back, which the caller
-    /// publishes into the intent before it reports the stop.
-    leftovers: Vec<LeftoverRecord>,
+    /// The journal every capture is published into before it is unlinked, so the
+    /// record is durable even if the process stops immediately afterwards.
+    journal: &'a CaptureJournal<'a>,
+    /// The captures currently in flight, outermost first. It is the durable list a
+    /// private name must appear in before anything unlinks it, and it is bounded
+    /// by the depth bound.
+    chain: Vec<CaptureRecord>,
 }
 
 impl<'a> WalkState<'a> {
@@ -880,7 +993,8 @@ impl<'a> WalkState<'a> {
         device: DeviceId,
         mount: PathBuf,
         bounds: DeleteBounds,
-        recorded: &[LeftoverRecord],
+        journal: &'a CaptureJournal<'a>,
+        base_chain: Vec<CaptureRecord>,
     ) -> Result<Self> {
         Ok(Self {
             dirs,
@@ -893,35 +1007,73 @@ impl<'a> WalkState<'a> {
             deadline: Instant::now() + bounds.timeout,
             examined: 0,
             expected: HashSet::new(),
-            recorded: recorded.to_vec(),
-            leftovers: Vec::new(),
+            journal,
+            chain: base_chain,
         })
     }
 
-    /// The stop for a private name this run did not capture.
+    /// Publish the in-flight captures, which is the durable list a private name
+    /// must be in before anything unlinks it.
+    fn publish_chain(&self) -> Result<()> {
+        self.journal.record_captures(&self.chain)
+    }
+
+    /// Whether `facts` is the object one recorded capture names.
+    fn matches_capture(record: &CaptureRecord, facts: &EntryFacts) -> bool {
+        facts.device.get() == record.device
+            && facts.inode == record.inode
+            && facts.kind.as_str() == record.kind
+    }
+
+    /// The stop for a private name this operation did not record and verify.
     ///
-    /// A leftover is unverifiable: nothing recorded the identity of the object
-    /// under the private name for the walk to check it against, so no run and no
-    /// replay may unlink it. A recorded capture additionally names what it was
-    /// and why its verification failed.
-    fn leftover_stop(&self, private: &str) -> String {
-        match self
-            .recorded
+    /// A `.barge-del-*` name is deletable only while the intent records its capture
+    /// and verification with the same identity. Anything else - an unrecorded name,
+    /// a record whose identity no longer matches, or a name recorded as a foreign
+    /// capture - is unverifiable: it is never unlinked, it is reported, and the
+    /// intent stays pending.
+    fn unrecorded_stop(&self, private: &str, facts: Option<&EntryFacts>) -> String {
+        let recorded = self.journal.intent();
+        if let Some(foreign) = recorded
+            .foreign_captures
             .iter()
-            .find(|leftover| leftover.private == private)
+            .find(|foreign| foreign.private == private)
         {
-            Some(record) => format!(
-                "`{private}` holds the unverified capture of `{}`, whose put back {}: {}; it is never unlinked, so the intent stays pending",
-                record.original,
-                match record.put_back {
+            return format!(
+                "`{private}` holds the foreign capture of `{}`, whose put back {}: {}; it is never unlinked, so the intent stays pending",
+                foreign.original,
+                match foreign.put_back {
+                    PutBackOutcome::Pending => "was not recorded",
                     PutBackOutcome::Renamed => "put it back under its own name",
                     PutBackOutcome::Taken => "was refused because the name was taken",
                     PutBackOutcome::Failed => "failed",
                 },
-                record.reason
+                foreign.reason
+            );
+        }
+        match recorded
+            .captures
+            .iter()
+            .find(|capture| capture.private == private)
+        {
+            Some(capture) => format!(
+                "`{private}` was recorded as this operation's capture of `{}` ({} on device {} inode {}), but {} is there now, so it is not unlinked and the intent stays pending",
+                capture.original,
+                capture.kind,
+                capture.device,
+                capture.inode,
+                match facts {
+                    Some(facts) => format!(
+                        "a {} on device {} inode {}",
+                        facts.kind.as_str(),
+                        facts.device,
+                        facts.inode
+                    ),
+                    None => "nothing".to_owned(),
+                }
             ),
             None => format!(
-                "`{private}` is a private capture name this deletion did not create, so its object is unverifiable and nothing is unlinked"
+                "`{private}` is a private capture name this operation did not record, so its object is unverifiable and nothing is unlinked"
             ),
         }
     }
@@ -1029,10 +1181,29 @@ impl<'a> WalkState<'a> {
                 return Ok(Walk::Stop(reason));
             }
             if is_capture_name(&entry.name) {
-                // A private name is never an ordinary entry: it holds an object
-                // whose capture this walk cannot verify, so it stops the deletion
-                // and is never recorded as something the delete pass may remove.
-                return Ok(Walk::Stop(self.leftover_stop(&entry.name)));
+                // A private name is never an ordinary entry of the tree: it is this
+                // operation's own capture under its private name, or it stops the
+                // deletion. Its contents are classified as the tree they were, under
+                // the captured object's original path.
+                let recorded = self.journal.intent();
+                let ours = recorded
+                    .captures
+                    .iter()
+                    .find(|capture| {
+                        capture.private == entry.name && Self::matches_capture(capture, &facts)
+                    })
+                    .cloned();
+                let Some(capture) = ours else {
+                    return Ok(Walk::Stop(self.unrecorded_stop(&entry.name, Some(&facts))));
+                };
+                if facts.kind == EntryKind::Directory {
+                    let original = relative.join(&capture.original);
+                    let child = self.dirs.open_child_dir(handle, &entry.name)?;
+                    if let Walk::Stop(reason) = self.classify(&child, depth + 1, &original)? {
+                        return Ok(Walk::Stop(reason));
+                    }
+                }
+                continue;
             }
             let path = relative.join(&entry.name);
             self.expected.insert(path.clone());
@@ -1072,9 +1243,9 @@ impl<'a> WalkState<'a> {
     /// kind as the observation the walk took, and still belong to this account. A
     /// Finder-named regular file is verified by class instead, whether the
     /// classification recorded it or it was recreated: a regular file of this user
-    /// on this device, inside the size bound. The
-    /// parent binding is re-read through the descriptor the capture went through,
-    /// so a volume that changed under it stops the deletion before any unlink.
+    /// on this device, inside the size bound. The parent binding is re-read through
+    /// the descriptor the capture went through, so a volume that changed under it
+    /// stops the deletion before any unlink.
     fn verify_capture(
         &mut self,
         handle: &DirHandle,
@@ -1121,7 +1292,7 @@ impl<'a> WalkState<'a> {
             }
         };
         if matched {
-            return Ok(Verify::Verified);
+            return Ok(Verify::Verified(facts));
         }
         Ok(Verify::Mismatch {
             reason: format!(
@@ -1139,14 +1310,14 @@ impl<'a> WalkState<'a> {
     }
 
     /// Capture one entry under a private name, verify the captured object, then
-    /// unlink only on a match.
+    /// record and unlink it only on a match.
     ///
-    /// This is the whole deletion rule: the object that is unlinked is the object
-    /// that was verified after it was captured, so a same-uid racer that replaces
-    /// the name between the check and the capture cannot have its own object
-    /// removed. A mismatch never unlinks; the object is put back under its
-    /// original name, or, when that name is taken, left under the private name
-    /// with both names reported, and the deletion stops.
+    /// Nothing is unlinked before it is durably recorded: the captured identity,
+    /// the verdict and any mode Barge is about to change are published first, so a
+    /// replay re-verifies the same object and can restore the recorded mode. A
+    /// mismatch is recorded as a foreign capture **before** anything puts the
+    /// object back, and a record that cannot be written means the object is never
+    /// put back.
     #[allow(clippy::too_many_arguments)]
     fn capture_and_remove(
         &mut self,
@@ -1162,127 +1333,271 @@ impl<'a> WalkState<'a> {
             Capture::Held(private) => private,
             Capture::Stopped(reason) => return Ok(Walk::Stop(reason)),
         };
-        if let Verify::Mismatch { reason, captured } =
-            self.verify_capture(handle, &private, observed, allowance)?
-        {
-            // Never unlink. A put-back that itself fails still reports both the
-            // original and the private name, because the operator has to decide
-            // what happens to the object left under the private one.
-            let (put_back, stopped) = match self.put_back(handle, name, &private, &reason) {
-                Ok((put_back, stopped)) => (put_back, stopped),
-                Err(error) => (
-                    PutBack::Failed,
-                    format!(
-                        "`{name}` changed after its check and could not be put back from `{private}`: {error}"
-                    ),
-                ),
-            };
-            // Record the mismatch whatever the put-back answered. A successful
-            // put-back leaves the captured object under its original name, where
-            // an ordinary walk would find it again and unlink it; the record is
-            // what tells a later run and a replay that Barge never observed it.
-            if let Some(captured) = captured {
-                self.leftovers.push(LeftoverRecord {
-                    private,
-                    original: name.to_owned(),
-                    device: observed.device.get(),
-                    inode: observed.inode,
-                    kind: observed.kind.as_str().to_owned(),
-                    captured_device: captured.device.get(),
-                    captured_inode: captured.inode,
-                    captured_kind: captured.kind.as_str().to_owned(),
-                    put_back: match put_back {
-                        PutBack::Renamed => PutBackOutcome::Renamed,
-                        PutBack::Taken => PutBackOutcome::Taken,
-                        PutBack::Failed => PutBackOutcome::Failed,
-                    },
-                    reason: bounded_reason(&reason),
-                });
+        let captured = match self.verify_capture(handle, &private, observed, allowance)? {
+            Verify::Verified(facts) => facts,
+            Verify::Mismatch { reason, captured } => {
+                let stopped =
+                    self.record_foreign(handle, observed, name, &private, &reason, captured)?;
+                return Ok(Walk::Stop(stopped));
             }
-            return Ok(Walk::Stop(stopped));
+        };
+        let verdict = match allowance {
+            Allowance::Finder => CaptureVerdict::Finder,
+            Allowance::Observed => CaptureVerdict::Observed,
+        };
+        let mut record = CaptureRecord {
+            private: private.clone(),
+            original: name.to_owned(),
+            device: captured.device.get(),
+            inode: captured.inode,
+            kind: captured.kind.as_str().to_owned(),
+            verdict,
+            mode: None,
+        };
+        // A directory this account cannot write or search cannot have its contents
+        // removed. Its mode is recorded before it is changed, so an abort and a
+        // replay put back exactly what was there.
+        let changed_mode =
+            if captured.kind == EntryKind::Directory && captured.mode & 0o300 != 0o300 {
+                record.mode = Some(captured.mode);
+                Some(captured.mode)
+            } else {
+                None
+            };
+        self.remove_recorded(handle, &record, changed_mode, depth, relative, counts)
+    }
+
+    /// Publish one foreign capture durably, put the object back, and report how the
+    /// deletion stops.
+    ///
+    /// The record is written before the put-back, and it is the record that
+    /// protects the object: a put-back returns the captured object to an ordinary
+    /// name, where a later walk would treat it as an ordinary entry and unlink it.
+    fn record_foreign(
+        &mut self,
+        handle: &DirHandle,
+        observed: &EntryFacts,
+        name: &str,
+        private: &str,
+        reason: &str,
+        captured: Option<EntryFacts>,
+    ) -> Result<String> {
+        // `observed` is what the walk expected at the name (the identity it
+        // checked), and `captured` is what the capture found instead; both are
+        // recorded, so a later run can tell them apart.
+        let mut foreign = ForeignCapture {
+            private: private.to_owned(),
+            original: name.to_owned(),
+            device: observed.device.get(),
+            inode: observed.inode,
+            kind: observed.kind.as_str().to_owned(),
+            captured: captured.map(|facts| CapturedObject {
+                device: facts.device.get(),
+                inode: facts.inode,
+                kind: facts.kind.as_str().to_owned(),
+            }),
+            put_back: PutBackOutcome::Pending,
+            reason: bounded_reason(reason),
+        };
+        if let Err(error) = self.journal.record_foreign(foreign.clone()) {
+            // Without the record a put-back would expose the object, so it is not
+            // attempted: the object stays under its private name, which no run and
+            // no replay ever unlinks, and the intent stays pending.
+            return Ok(format!(
+                "`{name}` changed after its check and is kept under `{private}` because the mismatch could not be recorded: {error}"
+            ));
         }
-        match observed.kind {
-            EntryKind::File => {
-                match self.dirs.remove_child(handle, &private, RemoveKind::File)? {
-                    ChildRemoval::Removed => counts.entries = counts.entries.saturating_add(1),
-                    ChildRemoval::Absent => {
-                        return Ok(Walk::Stop(format!(
-                            "the verified `{name}` vanished from `{private}` before it was unlinked"
-                        )))
-                    }
-                    ChildRemoval::NotEmpty => {
-                        return Ok(Walk::Stop(format!(
-                            "`{private}` reported not-empty as a file"
-                        )))
-                    }
-                }
+        // Never unlink. A put-back that itself fails still reports both the
+        // original and the private name, because the operator has to decide what
+        // happens to the object left under the private one.
+        let (put_back, stopped) = match self.put_back(handle, name, private, reason) {
+            Ok((put_back, stopped)) => (put_back, stopped),
+            Err(error) => (
+                PutBack::Failed,
+                format!(
+                    "`{name}` changed after its check and could not be put back from `{private}`: {error}"
+                ),
+            ),
+        };
+        // The answer is evidence, not the protection: the record written before the
+        // put-back already stops a replay from resuming, so an update that fails is
+        // not fatal. The record keeps saying `pending`, which is true.
+        foreign.put_back = match put_back {
+            PutBack::Renamed => PutBackOutcome::Renamed,
+            PutBack::Taken => PutBackOutcome::Taken,
+            PutBack::Failed => PutBackOutcome::Failed,
+        };
+        let _ = self.journal.record_foreign(foreign);
+        Ok(stopped)
+    }
+
+    /// Publish one recorded capture, change its mode when the record says so, and
+    /// unlink it - or recurse into it and remove it.
+    ///
+    /// The record is durable before either the chmod or the unlink, so a replay
+    /// re-verifies the same object and restores the recorded mode.
+    fn remove_recorded(
+        &mut self,
+        parent: &DirHandle,
+        record: &CaptureRecord,
+        changed_mode: Option<u32>,
+        depth: usize,
+        relative: &Path,
+        counts: &mut Counts,
+    ) -> Result<Walk> {
+        self.chain.push(record.clone());
+        if let Err(error) = self.publish_chain() {
+            self.chain.pop();
+            return Ok(Walk::Stop(format!(
+                "the capture of `{}` could not be recorded, so it is not unlinked: {error}",
+                record.original
+            )));
+        }
+        let outcome = if record.kind == "file" {
+            self.unlink_recorded_file(parent, record, counts)
+        } else {
+            self.remove_recorded_directory(parent, record, changed_mode, depth, relative, counts)
+        };
+        self.chain.pop();
+        outcome
+    }
+
+    /// Unlink one recorded file under its private name.
+    fn unlink_recorded_file(
+        &mut self,
+        parent: &DirHandle,
+        record: &CaptureRecord,
+        counts: &mut Counts,
+    ) -> Result<Walk> {
+        match self
+            .dirs
+            .remove_child(parent, &record.private, RemoveKind::File)?
+        {
+            ChildRemoval::Removed => {
+                counts.entries = counts.entries.saturating_add(1);
                 Ok(Walk::Clean)
             }
-            EntryKind::Directory => {
-                let child = match self.dirs.open_child_dir(handle, &private) {
-                    Ok(child) => child,
-                    Err(error) => {
-                        return Ok(Walk::Stop(format!(
-                            "the verified `{name}` could not be opened under `{private}`: {error}"
-                        )))
-                    }
-                };
-                let opened = child.identity();
-                if opened.device != observed.device || opened.inode != observed.inode {
-                    return Ok(Walk::Stop(format!(
-                        "`{name}` under `{private}` opened as device {} inode {}, not the verified {} / {}, so nothing is removed",
-                        opened.device, opened.inode, observed.device, observed.inode
-                    )));
-                }
-                if let Walk::Stop(reason) =
-                    self.delete_contents(&child, depth + 1, relative, false, counts)?
-                {
-                    return Ok(Walk::Stop(reason));
-                }
-                // The private name can only be replaced once the directory is
-                // empty; the verified inode is what is removed, and nothing else.
-                let still_verified =
-                    self.dirs
-                        .child_facts(handle, &private)?
-                        .is_some_and(|facts| {
-                            facts.kind == EntryKind::Directory
-                                && facts.device == observed.device
-                                && facts.inode == observed.inode
-                        });
-                if !still_verified {
-                    return Ok(Walk::Stop(format!(
-                        "`{private}` is no longer the verified directory, so it is not removed"
-                    )));
-                }
-                match self.remove_directory(
-                    handle,
-                    &child,
-                    &private,
-                    depth + 1,
-                    relative,
-                    counts,
-                )? {
-                    Removal::Gone => {
-                        counts.directories = counts.directories.saturating_add(1);
-                        Ok(Walk::Clean)
-                    }
-                    Removal::Stopped(reason) => Ok(Walk::Stop(reason)),
-                }
-            }
-            EntryKind::Symlink | EntryKind::Other => Ok(Walk::Stop(format!(
-                "`{name}` is a {}, which the deletion never captures",
-                observed.kind.as_str()
+            ChildRemoval::Absent => Ok(Walk::Stop(format!(
+                "`{}` vanished before Barge unlinked it, so another process may have moved the captured object; the intent stays pending",
+                record.private
+            ))),
+            ChildRemoval::NotEmpty => Ok(Walk::Stop(format!(
+                "`{}` reported not-empty as a file",
+                record.private
             ))),
         }
+    }
+
+    /// Remove one recorded directory: open it through its private name, change its
+    /// recorded mode when it has to, delete its contents through that descriptor,
+    /// and only then remove the private name.
+    fn remove_recorded_directory(
+        &mut self,
+        parent: &DirHandle,
+        record: &CaptureRecord,
+        changed_mode: Option<u32>,
+        depth: usize,
+        relative: &Path,
+        counts: &mut Counts,
+    ) -> Result<Walk> {
+        let child = match self.dirs.open_child_dir(parent, &record.private) {
+            Ok(child) => child,
+            Err(error) => {
+                return Ok(Walk::Stop(format!(
+                    "the captured `{}` could not be opened: {error}",
+                    record.private
+                )))
+            }
+        };
+        let opened = child.identity();
+        if opened.device.get() != record.device || opened.inode != record.inode {
+            return Ok(Walk::Stop(format!(
+                "`{}` opened as device {} inode {}, not the recorded {} / {}",
+                record.private, opened.device, opened.inode, record.device, record.inode
+            )));
+        }
+        // The recorded mode was published before this change; the guard puts it
+        // back on every return, `?` error and panic that aborts or puts back.
+        let custody = match changed_mode {
+            Some(mode) => match self.dirs.set_dir_mode(&child, mode | 0o300) {
+                Ok(()) => Some(ModeCustody::new(self.dirs, &child, mode)),
+                Err(error) => {
+                    return Ok(Walk::Stop(format!(
+                        "the recorded mode of `{}` could not be applied, so nothing inside it is removed: {error}",
+                        record.private
+                    )))
+                }
+            },
+            None => None,
+        };
+        if let Walk::Stop(reason) =
+            self.delete_contents(&child, depth + 1, relative, false, counts)?
+        {
+            return Ok(Walk::Stop(restore_custody(custody, reason)));
+        }
+        // The private name can only be replaced once the directory is empty; the
+        // recorded inode is what is removed, and nothing else.
+        let still_recorded = self
+            .dirs
+            .child_facts(parent, &record.private)?
+            .is_some_and(|facts| Self::matches_capture(record, &facts));
+        if !still_recorded {
+            return Ok(Walk::Stop(restore_custody(
+                custody,
+                format!(
+                    "`{}` is no longer the recorded capture, so it is not removed",
+                    record.private
+                ),
+            )));
+        }
+        // The recursion refreshed the chain; make this directory the last recorded
+        // entry before its own removal.
+        if let Err(error) = self.publish_chain() {
+            return Ok(Walk::Stop(restore_custody(
+                custody,
+                format!(
+                    "the capture of `{}` could not be re-recorded before its removal: {error}",
+                    record.original
+                ),
+            )));
+        }
+        match self.remove_directory(parent, &child, &record.private, depth + 1, relative, counts)? {
+            Removal::Gone => {
+                if let Some(custody) = &custody {
+                    custody.settled();
+                }
+                counts.directories = counts.directories.saturating_add(1);
+                Ok(Walk::Clean)
+            }
+            Removal::Stopped(reason) => Ok(Walk::Stop(restore_custody(custody, reason))),
+        }
+    }
+
+    /// Resume one recorded capture the walk found under its private name.
+    ///
+    /// It is this operation's own captured object, recorded and verified before the
+    /// stop: the same identity is re-verified and the recorded mode is applied
+    /// again where it was changed, so deleting it is the continuation of the same
+    /// capture, not a new decision about an ordinary entry.
+    fn resume_recorded(
+        &mut self,
+        parent: &DirHandle,
+        record: CaptureRecord,
+        depth: usize,
+        relative: &Path,
+        counts: &mut Counts,
+    ) -> Result<Walk> {
+        let changed_mode = record.mode;
+        self.remove_recorded(parent, &record, changed_mode, depth, relative, counts)
     }
 
     /// Put a captured object back under its original name after a failed
     /// verification, and report how the deletion stops.
     ///
-    /// Nothing is unlinked on this path. When the original name is taken the
-    /// object stays under its private name and both names are reported, because
-    /// an operator has to decide which of the two should exist; that is the case
-    /// the caller records as an unverified leftover.
+    /// Nothing is unlinked on this path. When the original name is taken the object
+    /// stays under its private name and both names are reported, because an
+    /// operator has to decide which of the two should exist; that is the case the
+    /// caller records as a foreign capture.
     fn put_back(
         &mut self,
         handle: &DirHandle,
@@ -1345,9 +1660,8 @@ impl<'a> WalkState<'a> {
     /// Every entry is captured under a private name and verified before it is
     /// unlinked, so what is removed is what was verified. The pass removes what
     /// the classification recorded, Finder metadata that appeared again (by
-    /// class), and a private name a stopped deletion left behind (re-verified
-    /// against its own observation); a new entry that is none of those stops the
-    /// deletion rather than widening it.
+    /// class), and a recorded capture of this operation under its private name; a
+    /// new entry that is none of those stops the deletion rather than widening it.
     fn delete_contents(
         &mut self,
         handle: &DirHandle,
@@ -1383,13 +1697,31 @@ impl<'a> WalkState<'a> {
             if let Walk::Stop(reason) = self.classify_entry(&entry.name, &facts) {
                 return Ok(Walk::Stop(reason));
             }
-            if is_capture_name(&entry.name) {
-                // Nothing recorded the identity of the object under this private
-                // name for the walk to verify, so it is never captured again and
-                // never unlinked: it keeps the intent pending.
-                return Ok(Walk::Stop(self.leftover_stop(&entry.name)));
-            }
             let path = relative.join(&entry.name);
+            if is_capture_name(&entry.name) {
+                // Only a recorded, verified capture of this operation may be
+                // removed, and only while the object is the recorded one.
+                let recorded = self.journal.intent();
+                let Some(record) = recorded
+                    .captures
+                    .iter()
+                    .find(|capture| {
+                        capture.private == entry.name && Self::matches_capture(capture, &facts)
+                    })
+                    .cloned()
+                else {
+                    return Ok(Walk::Stop(self.unrecorded_stop(&entry.name, Some(&facts))));
+                };
+                // Its contents are the tree they were, so the path the walk
+                // expects them under is the captured object's original one.
+                let original = relative.join(&record.original);
+                if let Walk::Stop(reason) =
+                    self.resume_recorded(handle, record, depth, &original, counts)?
+                {
+                    return Ok(Walk::Stop(reason));
+                }
+                continue;
+            }
             let allowance = if is_finder_metadata(&entry.name) && facts.kind == EntryKind::File {
                 // Finder metadata is verified by class whether the classification
                 // recorded it or Finder rebuilt it between the observation and the
@@ -1418,11 +1750,11 @@ impl<'a> WalkState<'a> {
         Ok(Walk::Clean)
     }
 
-    /// Remove one verified directory by its captured name, retrying `ENOTEMPTY`
-    /// at most the declared number of times because Finder can recreate
-    /// `.DS_Store` mid-delete. Each retry re-deletes only what the walk already
-    /// recognises, through the descriptor of the directory that was verified as
-    /// the captured one; it never re-opens the name to widen the walk.
+    /// Remove one verified directory by its recorded name, retrying `ENOTEMPTY` at
+    /// most the declared number of times because Finder can recreate `.DS_Store`
+    /// mid-delete. Each retry re-deletes only what the walk already recognises,
+    /// through the descriptor of the directory that was verified as the captured
+    /// one; it never re-opens the name to widen the walk.
     fn remove_directory(
         &mut self,
         parent: &DirHandle,
@@ -1438,7 +1770,12 @@ impl<'a> WalkState<'a> {
                 .dirs
                 .remove_child(parent, name, RemoveKind::Directory)?
             {
-                ChildRemoval::Removed | ChildRemoval::Absent => return Ok(Removal::Gone),
+                ChildRemoval::Removed => return Ok(Removal::Gone),
+                ChildRemoval::Absent => {
+                    return Ok(Removal::Stopped(format!(
+                        "`{name}` vanished before Barge removed it, so another process may have moved the captured object; the intent stays pending"
+                    )))
+                }
                 ChildRemoval::NotEmpty => {
                     if attempt + 1 == attempts {
                         return Ok(Removal::Stopped(format!(
@@ -1460,11 +1797,72 @@ impl<'a> WalkState<'a> {
     }
 }
 
+/// One captured directory whose recorded mode Barge changed.
+///
+/// The recorded mode is published before the change. The guard puts it back on
+/// every return, `?` error and panic that aborts or puts back, so an object is
+/// never left with a changed mode without the intent recording the original.
+struct ModeCustody<'a> {
+    dirs: &'a dyn DirOps,
+    handle: &'a DirHandle,
+    mode: u32,
+    settled: Cell<bool>,
+}
+
+impl<'a> ModeCustody<'a> {
+    /// The guard over one changed mode.
+    fn new(dirs: &'a dyn DirOps, handle: &'a DirHandle, mode: u32) -> Self {
+        Self {
+            dirs,
+            handle,
+            mode,
+            settled: Cell::new(false),
+        }
+    }
+
+    /// The recorded object is gone, so there is no mode to put back.
+    fn settled(&self) {
+        self.settled.set(true);
+    }
+
+    /// Put the recorded mode back now, and report whether it happened.
+    fn restore(&self) -> Result<()> {
+        if self.settled.replace(true) {
+            return Ok(());
+        }
+        self.dirs.set_dir_mode(self.handle, self.mode)
+    }
+}
+
+impl Drop for ModeCustody<'_> {
+    fn drop(&mut self) {
+        if !self.settled.replace(true) {
+            // Every return, `?` error and panic restores the recorded mode. A
+            // failure here keeps the intent pending, and the intent keeps the mode
+            // recorded, so a replay restores it first.
+            let _ = self.dirs.set_dir_mode(self.handle, self.mode);
+        }
+    }
+}
+
+/// Give one captured directory's recorded mode back, folding a failure into the
+/// reason the deletion stops with.
+fn restore_custody(custody: Option<ModeCustody<'_>>, reason: String) -> String {
+    match custody {
+        Some(custody) => match custody.restore() {
+            Ok(()) => reason,
+            Err(error) => format!(
+                "{reason}; the recorded mode of the captured directory could not be restored: {error}"
+            ),
+        },
+        None => reason,
+    }
+}
+
 /// Why one entry may be removed at all.
 ///
-/// A private capture name is never on this list: nothing recorded the identity of
-/// the object under it for the walk to verify, so it is unverifiable and stops the
-/// deletion instead of being captured again.
+/// A private capture name is never on this list: it is removed only as a recorded
+/// capture of this operation, through the record the intent holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Allowance {
     /// The entry the classification pass recorded, verified against the
@@ -1489,8 +1887,8 @@ enum Capture {
 /// One capture verification's answer.
 enum Verify {
     /// The captured object is the observed one, or Finder metadata of the allowed
-    /// class.
-    Verified,
+    /// class. It carries the captured facts, which are what the intent records.
+    Verified(EntryFacts),
     /// The object is not the observed one, so it is never unlinked. The captured
     /// facts are carried when they could be read, so the record says what was
     /// there instead.
@@ -1520,10 +1918,10 @@ enum PutBack {
 /// mistaken for the complete one because the stop's own reason is reported beside
 /// it.
 fn bounded_reason(reason: &str) -> String {
-    if reason.len() <= LEFTOVER_REASON_BYTES {
+    if reason.len() <= FOREIGN_REASON_BYTES {
         return reason.to_owned();
     }
-    let mut end = LEFTOVER_REASON_BYTES;
+    let mut end = FOREIGN_REASON_BYTES;
     while end > 0 && !reason.is_char_boundary(end) {
         end -= 1;
     }
@@ -1644,14 +2042,16 @@ fn replay_one(
         &intent.folder,
     )?;
     let Some((area_path, area_handle)) = opened else {
-        // The area folder is positively gone, so the leaf and the marker are
-        // too. Only a completed `marker_last` phase proves that.
-        if intent.phase == IntentPhase::MarkerLast {
+        // The area folder is positively gone, so the leaf and the marker are too.
+        // Only the durable `removed` phase - recorded after Barge's own final
+        // unlink succeeded - proves completion; an absence without it is unknown.
+        if intent.phase == IntentPhase::Removed {
             settle(state_paths, intent)?;
             return Ok(ReplayOutcome::Settled);
         }
         return Ok(ReplayOutcome::Pending(
-            "the area folder is gone but the marker-last phase was not recorded".to_owned(),
+            "the area folder is gone but the removed phase was not recorded, so completion is unknown"
+                .to_owned(),
         ));
     };
 
@@ -1685,6 +2085,23 @@ fn replay_one(
         None => None,
     };
 
+    // The modes this deletion recorded come back first, before any other deletion
+    // or reconciliation action, so no object is left with a changed mode while a
+    // replay decides what to do next.
+    if intent.phase != IntentPhase::Deleted {
+        if let Some(leaf) = leaf_handle.as_ref() {
+            match restore_recorded_modes(dirs, leaf, intent) {
+                Ok(None) => {}
+                Ok(Some(reason)) => return Ok(ReplayOutcome::Pending(reason)),
+                Err(error) => {
+                    return Ok(ReplayOutcome::Pending(format!(
+                        "the recorded modes could not be restored: {error}"
+                    )))
+                }
+            }
+        }
+    }
+
     match intent.phase {
         IntentPhase::Intent => {
             // The rename may not have happened: if the root is still in place
@@ -1694,7 +2111,7 @@ fn replay_one(
                 return Ok(ReplayOutcome::RolledBack);
             }
             if leaf_matches && marker_matches(&marker_digest, intent) {
-                if let Some(reason) = recorded_mismatch(&intent.leftovers) {
+                if let Some(reason) = recorded_mismatch(&intent.foreign_captures) {
                     return Ok(ReplayOutcome::Pending(reason));
                 }
                 // The rename happened before its phase was recorded: resume.
@@ -1726,7 +2143,7 @@ fn replay_one(
             ))
         }
         IntentPhase::Renamed => {
-            if let Some(reason) = recorded_mismatch(&intent.leftovers) {
+            if let Some(reason) = recorded_mismatch(&intent.foreign_captures) {
                 return Ok(ReplayOutcome::Pending(reason));
             }
             if leaf_matches && marker_matches(&marker_digest, intent) {
@@ -1755,15 +2172,30 @@ fn replay_one(
                 "the quarantine leaf's recorded identity and marker bytes do not match".to_owned(),
             ))
         }
+        IntentPhase::Removed => {
+            // Barge's own final unlink was recorded. The leaf must be positively
+            // absent for the intent to settle; a leaf that is there again is a new
+            // object at the quarantine name, which is unknown.
+            if leaf_facts.is_none() {
+                state::advance_intent(&write, state_paths, intent, IntentPhase::Deleted)?;
+                return Ok(ReplayOutcome::Settled);
+            }
+            Ok(ReplayOutcome::Pending(
+                "the removed phase was recorded but the quarantine leaf is there again, so completion is unknown"
+                    .to_owned(),
+            ))
+        }
         IntentPhase::MarkerLast => {
-            if let Some(reason) = recorded_mismatch(&intent.leftovers) {
+            if let Some(reason) = recorded_mismatch(&intent.foreign_captures) {
                 return Ok(ReplayOutcome::Pending(reason));
             }
             if leaf_facts.is_none() {
-                // Both the leaf and the marker are positively absent, and the
-                // marker-last phase was recorded: that is the proof.
-                state::advance_intent(&write, state_paths, intent, IntentPhase::Deleted)?;
-                return Ok(ReplayOutcome::Settled);
+                // The leaf is absent, but the durable completion evidence - Barge's
+                // own final unlink - was not recorded: an absence alone is unknown.
+                return Ok(ReplayOutcome::Pending(
+                    "the quarantine leaf is gone but the removed phase was not recorded, so completion is unknown"
+                        .to_owned(),
+                ));
             }
             let Some(leaf) = leaf_handle.as_ref() else {
                 return Ok(ReplayOutcome::Pending(
@@ -1775,6 +2207,7 @@ fn replay_one(
                     "the leaf and marker do not prove completion".to_owned(),
                 ));
             }
+            let journal = CaptureJournal::new(&write, state_paths, intent);
             let mut walk = WalkState::new(
                 dirs,
                 facts,
@@ -1783,7 +2216,8 @@ fn replay_one(
                 DeviceId::new(intent.device),
                 intent.mount_hint.clone(),
                 bounds,
-                &intent.leftovers,
+                &journal,
+                Vec::new(),
             )?;
             walk.verify_volume()?;
             let mut counts = Counts::default();
@@ -1796,22 +2230,14 @@ fn replay_one(
                 &mut counts,
             )? {
                 Removal::Gone => {
-                    state::advance_intent(&write, state_paths, intent, IntentPhase::Deleted)?;
+                    // The replay's own final unlink is the durable completion
+                    // evidence, recorded before the intent settles.
+                    let removed =
+                        state::advance_intent(&write, state_paths, intent, IntentPhase::Removed)?;
+                    state::advance_intent(&write, state_paths, &removed, IntentPhase::Deleted)?;
                     Ok(ReplayOutcome::Settled)
                 }
-                Removal::Stopped(reason) => {
-                    // The retry may have captured an object it could not put back;
-                    // record it before the pending answer is reported.
-                    if walk.leftovers.is_empty() {
-                        return Ok(ReplayOutcome::Pending(reason));
-                    }
-                    match state::record_leftovers(&write, state_paths, intent, &walk.leftovers) {
-                        Ok(_) => Ok(ReplayOutcome::Pending(reason)),
-                        Err(error) => Ok(ReplayOutcome::Pending(format!(
-                            "{reason}; the unverified capture could not be recorded: {error}"
-                        ))),
-                    }
-                }
+                Removal::Stopped(reason) => Ok(ReplayOutcome::Pending(reason)),
             }
         }
         IntentPhase::Deleted => Ok(ReplayOutcome::Settled),
@@ -1848,13 +2274,69 @@ fn marker_matches(digest: &Option<MarkerBytes>, intent: &IntentRecord) -> bool {
     matches!(digest, Some(MarkerBytes::Digest(bytes)) if bytes == &intent.marker_digest)
 }
 
+/// Restore the modes a stopped deletion recorded, before anything else is done.
+///
+/// The captures are the in-flight chain, outermost first, so each recorded private
+/// name is resolved under the one before it: a chain link that is gone ends the
+/// walk (nothing deeper can be reached), and a link whose identity no longer
+/// matches is unknown, never something to chmod or delete.
+fn restore_recorded_modes(
+    dirs: &dyn DirOps,
+    leaf: &DirHandle,
+    intent: &IntentRecord,
+) -> Result<Option<String>> {
+    let mut current: Option<DirHandle> = None;
+    for record in &intent.captures {
+        if record.private == intent.quarantine_name {
+            // The quarantine leaf's own recorded mode.
+            let Some(mode) = record.mode else {
+                continue;
+            };
+            if let Err(error) = dirs.set_dir_mode(leaf, mode) {
+                return Ok(Some(format!(
+                    "the recorded mode of the quarantine leaf could not be restored: {error}"
+                )));
+            }
+            continue;
+        }
+        let parent: &DirHandle = match &current {
+            Some(handle) => handle,
+            None => leaf,
+        };
+        let Some(facts) = dirs.child_facts(parent, &record.private)? else {
+            // The recorded object is gone, so nothing it held is reachable either.
+            break;
+        };
+        if !WalkState::matches_capture(record, &facts) {
+            return Ok(Some(format!(
+                "`{}` is no longer the recorded capture of `{}`, so its recorded mode is not restored and nothing else is done",
+                record.private, record.original
+            )));
+        }
+        if facts.kind != EntryKind::Directory {
+            break;
+        }
+        let child = dirs.open_child_dir(parent, &record.private)?;
+        if let Some(mode) = record.mode {
+            if let Err(error) = dirs.set_dir_mode(&child, mode) {
+                return Ok(Some(format!(
+                    "the recorded mode of `{}` could not be restored: {error}",
+                    record.private
+                )));
+            }
+        }
+        current = Some(child);
+    }
+    Ok(None)
+}
+
 /// The replay stop naming every capture whose verification failed.
 ///
 /// A recorded mismatch proves an object Barge never observed is somewhere in the
 /// leaf: under its private name, or back under its original name when the put-back
 /// succeeded. No replay resumes such an intent, because resuming would walk that
 /// object as an ordinary entry of the root and unlink it.
-fn recorded_mismatch(leftovers: &[LeftoverRecord]) -> Option<String> {
+fn recorded_mismatch(leftovers: &[ForeignCapture]) -> Option<String> {
     if leftovers.is_empty() {
         return None;
     }
@@ -1866,6 +2348,7 @@ fn recorded_mismatch(leftovers: &[LeftoverRecord]) -> Option<String> {
                 record.original,
                 record.private,
                 match record.put_back {
+                    PutBackOutcome::Pending => "not recorded",
                     PutBackOutcome::Renamed => "under its own name",
                     PutBackOutcome::Taken => "refused, the name was taken",
                     PutBackOutcome::Failed => "failed",
@@ -2115,7 +2598,8 @@ mod tests {
             generation: 1,
             recorded_ms: now,
             phase_ms: now,
-            leftovers: Vec::new(),
+            captures: Vec::new(),
+            foreign_captures: Vec::new(),
         };
         let mut locks = LockSet::new(prepared.fixture.state.clone());
         let _volume = locks
@@ -2363,7 +2847,9 @@ mod tests {
     }
 
     #[test]
-    fn replay_settles_a_marker_last_intent_whose_leaf_and_marker_are_absent() {
+    fn replay_keeps_an_absent_leaf_without_removed_pending() {
+        // An absence is never proof: without the durable `removed` phase - written
+        // only after Barge's own final unlink succeeded - a gone leaf is unknown.
         let prepared = prepared("replay-both-absent");
         let root = prepared.observed.path.clone();
         VolumeFixture::payload(&root, "payload.txt", b"bytes");
@@ -2371,6 +2857,36 @@ mod tests {
         rename_to_quarantine(&prepared);
         std::fs::remove_dir_all(prepared.quarantine()).expect("the leaf is removed");
         publish(&prepared, &[IntentPhase::Renamed, IntentPhase::MarkerLast]);
+
+        let report = prepared.replay();
+        assert_eq!(report.settled, 0, "{report:?}");
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(
+            report.pending[0].reason.contains("unknown"),
+            "{:?}",
+            report.pending[0].reason
+        );
+        assert_eq!(prepared.pending_intents().len(), 1);
+    }
+
+    #[test]
+    fn replay_settles_an_absent_leaf_with_the_removed_phase() {
+        // The completion evidence: Barge's own final unlink was recorded, and the
+        // leaf is positively absent, so the intent settles.
+        let prepared = prepared("replay-removed-absent");
+        let root = prepared.observed.path.clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        publish(&prepared, &[]);
+        rename_to_quarantine(&prepared);
+        std::fs::remove_dir_all(prepared.quarantine()).expect("the leaf is removed");
+        publish(
+            &prepared,
+            &[
+                IntentPhase::Renamed,
+                IntentPhase::MarkerLast,
+                IntentPhase::Removed,
+            ],
+        );
 
         let report = prepared.replay();
         assert_eq!(report.settled, 1, "{report:?}");
@@ -2623,6 +3139,25 @@ mod tests {
             .find_map(|directory| find_entry(directory, name))
     }
 
+    /// Find a private name whose object holds `bytes`, anywhere under `directory`.
+    fn find_private_with(directory: &Path, bytes: &[u8]) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(directory).ok()?.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(CAPTURE_PREFIX)
+                && std::fs::read(&path).ok().as_deref() == Some(bytes)
+            {
+                return Some(path);
+            }
+            if path.is_dir() {
+                if let Some(found) = find_private_with(&path, bytes) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
     /// The file name of one raced entry.
     fn raced_name(raced: &str) -> &str {
         raced.rsplit('/').next().unwrap_or(raced)
@@ -2794,7 +3329,7 @@ mod tests {
         let faults = Faults::new();
         let foreign = b"the racer's object";
         faults.racing(&area, "payload.txt", 2, Replacement::File(foreign.to_vec()));
-        faults.occupying_after_capture(&area, "payload.txt");
+        faults.occupying_after_capture("payload.txt");
         let facts = prepared.fixture.facts();
         let report = prepared.delete(&faults, &facts);
         assert!(report.is_pending(), "{report:?}");
@@ -2826,7 +3361,7 @@ mod tests {
         // it came from, the observation it failed to match and why.
         let pending = prepared.pending_intents();
         assert_eq!(pending.len(), 1);
-        let recorded = &pending[0].leftovers;
+        let recorded = &pending[0].foreign_captures;
         assert_eq!(recorded.len(), 1, "{recorded:?}");
         assert_eq!(recorded[0].original, "payload.txt");
         assert_eq!(
@@ -2838,9 +3373,13 @@ mod tests {
                 .expect("an ASCII name")
         );
         assert_eq!(recorded[0].kind, "file");
-        assert_eq!(recorded[0].captured_kind, "file");
+        let captured = recorded[0]
+            .captured
+            .as_ref()
+            .expect("the record keeps what the captured object was");
+        assert_eq!(captured.kind, "file");
         assert_ne!(
-            recorded[0].captured_inode, recorded[0].inode,
+            captured.inode, recorded[0].inode,
             "the record keeps the identity that did not match"
         );
         assert_eq!(recorded[0].put_back, state::PutBackOutcome::Taken);
@@ -2933,6 +3472,540 @@ mod tests {
         assert_eq!(prepared.pending_intents().len(), 1);
     }
 
+    /// The mode a path has, as the tests read it.
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .expect("the path has metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[test]
+    fn a_private_name_that_vanishes_mid_run_leaves_the_intent_pending() {
+        // Rule 1: another process moving the captured object between Barge's check
+        // and its unlink is never a completion. The removal answers "already gone",
+        // the intent stays pending and both names are reported.
+        let prepared = prepared("delete-capture-vanishes");
+        let root = prepared.observed.path.clone();
+        std::fs::create_dir(root.join("sub")).expect("the directory exists");
+        let faults = Faults::new();
+        faults.vanishing_capture();
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert!(
+            report
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("another process may have moved"),
+            "{:?}",
+            report.reason
+        );
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].phase.is_pending());
+        assert!(
+            capture_names(&report.quarantine).is_empty(),
+            "the object was moved away, so no private name holds it"
+        );
+        // The vanished object is gone and the leaf holds nothing of it, so the
+        // intent is the only record that it was captured and never unlinked by
+        // Barge.
+        let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
+        assert_eq!(intents.records[0].captures[0].original, "sub");
+        assert!(intents.records[0].captures[0].kind == "directory");
+    }
+
+    #[test]
+    fn a_replay_resumes_a_captured_nested_directory_and_finishes_the_delete() {
+        // The crash lands after `sub` was captured and recorded, inside it. The
+        // replay re-verifies the recorded capture, resumes it as the tree it was,
+        // and finishes - recording `removed` before it settles.
+        let prepared = prepared("replay-resume-nested");
+        let root = prepared.observed.path.clone();
+        VolumeFixture::payload(&root, "sub/nested/deep.txt", b"bytes");
+        VolumeFixture::payload(&root, "sub/other.txt", b"bytes");
+        let mut faults = Faults::new();
+        faults.failing_facts_at("nested", 2);
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        let leaf = report.quarantine.clone();
+        assert_eq!(
+            capture_names(&leaf).len(),
+            1,
+            "the captured subdirectory is still there"
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 1, "{replay:?}");
+        assert!(replay.is_settled());
+        assert!(!leaf.exists(), "the leaf is gone");
+        let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
+        assert_eq!(intents.records[0].phase, IntentPhase::Deleted);
+    }
+
+    #[test]
+    fn a_delete_records_the_removed_phase_before_it_settles() {
+        // The durable completion evidence is written after Barge's own final unlink
+        // and before the intent settles.
+        let prepared = prepared("delete-removed-phase");
+        let root = prepared.observed.path.clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        let faults = Faults::new();
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_deleted(), "{:?}", report.reason);
+        assert_eq!(report.phase, IntentPhase::Deleted);
+        let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
+        assert_eq!(intents.records[0].phase, IntentPhase::Deleted);
+        assert!(
+            report.entries_removed >= 2,
+            "the payload and the marker were unlinked: {report:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_only_captured_directory_is_removed_and_its_mode_restored_on_abort() {
+        // Mode custody: the recorded mode is applied to delete the contents, and
+        // the guard puts it back when the walk aborts after the chmod.
+        let prepared = prepared("delete-mode-abort");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).expect("the directory exists");
+        VolumeFixture::payload(&locked, "inside.txt", b"bytes");
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+                .expect("the directory is read-only");
+        }
+        let faults = Faults::new();
+        faults.failing_listing_after_mode();
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(
+            faults.modes_set().first().map(|mode| mode & 0o777),
+            Some(0o700),
+            "the deletion applied the owner write and search bits: {:?}",
+            faults.modes_set()
+        );
+        let leaf = report.quarantine.clone();
+        let private = capture_names(&leaf);
+        assert_eq!(private.len(), 1, "the captured directory is still there");
+        assert_eq!(
+            mode_of(&private[0]),
+            0o500,
+            "the guard put the recorded mode back"
+        );
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1, "the abort is recorded");
+        assert_eq!(pending[0].captures[0].mode, Some(0o500));
+        let _ = area;
+    }
+
+    #[test]
+    fn a_read_only_captured_directory_is_removed_whole() {
+        // The recorded mode is applied so the contents can be unlinked, and the
+        // whole root is deleted.
+        let prepared = prepared("delete-read-only-directory");
+        let root = prepared.observed.path.clone();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).expect("the directory exists");
+        VolumeFixture::payload(&locked, "inside.txt", b"bytes");
+        VolumeFixture::payload(&locked, "deeper/item.bin", b"more");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+                .expect("the directory is read-only");
+            std::fs::set_permissions(
+                locked.join("deeper"),
+                std::fs::Permissions::from_mode(0o500),
+            )
+            .expect("the nested directory is read-only");
+        }
+        let faults = Faults::new();
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_deleted(), "{:?}", report.reason);
+        assert!(!root.exists(), "the whole root is gone");
+        assert!(
+            faults.modes_set().iter().any(|mode| mode & 0o777 == 0o700),
+            "a read-only directory had its owner write and search bits applied: {:?}",
+            faults.modes_set()
+        );
+    }
+
+    #[test]
+    fn a_read_only_root_directory_is_removed_whole() {
+        // The quarantine leaf itself can be read-only: its mode is recorded before
+        // the change, applied so the contents can be removed, and the deletion
+        // completes.
+        let prepared = prepared("delete-read-only-leaf");
+        let root = prepared.observed.path.clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500))
+                .expect("the root is read-only");
+        }
+        let faults = Faults::new();
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_deleted(), "{:?}", report.reason);
+        assert!(!root.exists(), "the whole root is gone");
+        assert!(
+            faults.modes_set().iter().any(|mode| mode & 0o777 == 0o700),
+            "the leaf's owner write and search bits were applied: {:?}",
+            faults.modes_set()
+        );
+    }
+
+    #[test]
+    fn a_failed_mode_restore_stays_pending_and_a_replay_restores_it_first() {
+        // A restore that fails leaves the intent pending with the mode recorded; a
+        // replay restores the recorded mode before it does anything else.
+        let prepared = prepared("delete-mode-restore");
+        let root = prepared.observed.path.clone();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).expect("the directory exists");
+        VolumeFixture::payload(&locked, "inside.txt", b"bytes");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+                .expect("the directory is read-only");
+        }
+        let faults = Faults::new();
+        faults.failing_mode_restore();
+        faults.failing_listing_after_mode();
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        let leaf = report.quarantine.clone();
+        let private = capture_names(&leaf);
+        assert_eq!(private.len(), 1);
+        assert_eq!(
+            mode_of(&private[0]),
+            0o700,
+            "the failed restore left the recorded mode changed"
+        );
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1, "the failed restore stays pending");
+        assert_eq!(
+            pending[0].captures[0].mode,
+            Some(0o500),
+            "the mode is recorded"
+        );
+
+        // A replay restores the recorded mode first. The marker is removed here so
+        // the replay stops after the restore, which proves the order.
+        std::fs::remove_file(leaf.join(ROOT_MARKER_FILE)).expect("the marker is removed");
+        let replay = prepared.replay();
+        assert_eq!(
+            mode_of(&private[0]),
+            0o500,
+            "the replay restored the recorded mode first"
+        );
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0].reason.contains("marker"),
+            "{:?}",
+            replay.pending[0].reason
+        );
+    }
+
+    #[test]
+    fn a_nested_mismatch_with_a_putback_collision_keeps_the_foreign_object_pending() {
+        // Rule 2: a nested foreign capture is recorded before its put-back, a
+        // put-back collision keeps it under its private name inside the captured
+        // parent, and the root's abort never relabels it as an ordinary entry.
+        let prepared = prepared("delete-nested-foreign-capture");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        VolumeFixture::payload(&root, "sub/nested.txt", b"mine");
+        let foreign = b"the racer's object";
+        let faults = Faults::new();
+        faults.racing(
+            &area,
+            "sub/nested.txt",
+            2,
+            Replacement::File(foreign.to_vec()),
+        );
+        faults.occupying_after_capture("nested.txt");
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        let leaf = report.quarantine.clone();
+        let occupant = find_entry(&leaf, "nested.txt").expect("the taken name is kept");
+        assert_eq!(
+            std::fs::read(&occupant).expect("the occupant reads"),
+            b"a racer took this name back",
+            "the collided name is kept as the racer left it"
+        );
+        assert!(
+            find_private_with(&leaf, foreign).is_some(),
+            "a put-back collision keeps the foreign object under its private name"
+        );
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1);
+        let recorded = &pending[0].foreign_captures;
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].original, "nested.txt");
+        assert_eq!(recorded[0].put_back, state::PutBackOutcome::Taken);
+        assert!(
+            pending[0].captures.len() <= 2,
+            "the chain is the in-flight stack"
+        );
+
+        // The replay keeps it, and never treats it as content of the root.
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            find_private_with(&leaf, foreign).is_some(),
+            "the replay keeps the foreign object under its private name"
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_private_name_planted_before_a_replay_is_never_unlinked() {
+        let prepared = prepared("delete-unrecorded-private");
+        let root = prepared.observed.path.clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        publish(&prepared, &[]);
+        rename_to_quarantine(&prepared);
+        let leaf = prepared.quarantine();
+        let planted = leaf.join(format!("{CAPTURE_PREFIX}{}", "ef".repeat(16)));
+        std::fs::write(&planted, b"not this operation's capture").expect("the name is planted");
+
+        let report = prepared.replay();
+        assert_eq!(report.resumed, 0, "{report:?}");
+        assert_eq!(report.settled, 0, "{report:?}");
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(
+            report.pending[0].reason.contains("did not record"),
+            "{:?}",
+            report.pending[0].reason
+        );
+        assert_eq!(
+            std::fs::read(&planted).expect("the planted name is never unlinked"),
+            b"not this operation's capture"
+        );
+        assert!(leaf.join(ROOT_MARKER_FILE).is_file(), "the root is kept");
+    }
+
+    #[test]
+    fn the_mismatch_is_durable_before_the_object_is_put_back() {
+        // The record is what protects the object, so it must be on disk before the
+        // put-back returns the object to an ordinary name. The probe reads the
+        // journal at the moment of the put-back, which is the window a crash would
+        // lose if the order were the other way round.
+        let prepared = prepared("delete-mismatch-before-put-back");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"mine");
+        let state_paths = prepared.fixture.state.clone();
+        let faults = Faults::new();
+        faults.racing(
+            &area,
+            "payload.txt",
+            2,
+            Replacement::File(b"the racer's object".to_vec()),
+        );
+        faults.probing_put_back(Box::new(move |private: &str| {
+            let intents = state::read_intents(&state_paths, 64).expect("the journal reads");
+            intents.records.iter().any(|record| {
+                record
+                    .foreign_captures
+                    .iter()
+                    .any(|held| held.private == private)
+            })
+        }));
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(
+            faults.put_back_result(),
+            Some(true),
+            "the mismatch is durable before the put-back"
+        );
+        let leaf = report.quarantine.clone();
+        assert_eq!(
+            std::fs::read(leaf.join("payload.txt")).expect("the object was put back"),
+            b"the racer's object"
+        );
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].foreign_captures.len(), 1);
+        assert_eq!(
+            pending[0].foreign_captures[0].put_back,
+            state::PutBackOutcome::Renamed,
+            "the answer is recorded after the put-back"
+        );
+    }
+
+    #[test]
+    fn a_put_back_that_never_lands_keeps_the_object_private_and_the_intent_pending() {
+        // The crash between the durable record and the put-back: the record is
+        // there, the object is still under its private name, and nothing is
+        // unlinked by the run or by a replay.
+        let prepared = prepared("delete-mismatch-put-back-lost");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"mine");
+        let foreign = b"the racer's object";
+        let faults = Faults::new();
+        faults.racing(&area, "payload.txt", 2, Replacement::File(foreign.to_vec()));
+        faults.failing_put_back();
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        let leaf = report.quarantine.clone();
+        let private = capture_names(&leaf);
+        assert_eq!(private.len(), 1, "the object stays under its private name");
+        assert_eq!(
+            std::fs::read(&private[0]).expect("the object is kept"),
+            foreign
+        );
+        assert!(
+            !leaf.join("payload.txt").exists(),
+            "the put-back never landed"
+        );
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].foreign_captures.len(), 1);
+        assert_eq!(
+            pending[0].foreign_captures[0].put_back,
+            state::PutBackOutcome::Failed
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert_eq!(
+            std::fs::read(&private[0]).expect("the replay never unlinks it"),
+            foreign
+        );
+        assert!(leaf.join(ROOT_MARKER_FILE).is_file());
+    }
+
+    #[test]
+    fn a_mismatch_that_cannot_be_recorded_does_not_put_the_object_back() {
+        // If the record cannot be written, putting the object back would expose it
+        // to a later walk with nothing to stop it. The deletion leaves it under its
+        // private name instead - which no run and no replay ever unlinks - and
+        // stops with the intent pending.
+        use std::os::unix::fs::PermissionsExt;
+
+        let prepared = prepared("delete-mismatch-unrecordable");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"mine");
+        let foreign = b"the racer's object";
+        let intents_dir = prepared.fixture.state.intents_dir();
+        let original = std::fs::metadata(&intents_dir)
+            .expect("the intents directory")
+            .permissions();
+        let closed = std::fs::Permissions::from_mode(0o500);
+        let blocked = intents_dir.clone();
+        let faults = Faults::new();
+        faults.racing(&area, "payload.txt", 2, Replacement::File(foreign.to_vec()));
+        // The intent is already durable when the walk observes the entry, so this
+        // closes the journal only for the mismatch record.
+        faults.observing(Box::new(move |name: &str| {
+            if name == "payload.txt" {
+                let _ = std::fs::set_permissions(&blocked, closed.clone());
+            }
+        }));
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        std::fs::set_permissions(&intents_dir, original).expect("the journal is writable again");
+
+        assert!(report.is_pending(), "{report:?}");
+        assert!(
+            report
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("could not be recorded"),
+            "{:?}",
+            report.reason
+        );
+        let leaf = report.quarantine.clone();
+        let private = capture_names(&leaf);
+        assert_eq!(private.len(), 1, "the object stays under its private name");
+        assert_eq!(
+            std::fs::read(&private[0]).expect("the object is kept"),
+            foreign
+        );
+        assert!(
+            !leaf.join("payload.txt").exists(),
+            "an unrecorded mismatch is never put back"
+        );
+        assert!(prepared.pending_intents()[0].foreign_captures.is_empty());
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert_eq!(
+            std::fs::read(&private[0]).expect("the replay never unlinks it"),
+            foreign
+        );
+    }
+
+    #[test]
+    fn a_mismatch_without_captured_facts_is_still_recorded_and_never_replayed() {
+        // The parent binding failing is a mismatch whose captured facts cannot be
+        // read: the record is written with no captured identity, and a replay
+        // still refuses to resume.
+        let prepared = prepared("delete-mismatch-no-captured-facts");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"mine");
+        let foreign = b"the racer's object";
+        let faults = Faults::new();
+        faults.racing(&area, "payload.txt", 2, Replacement::File(foreign.to_vec()));
+        faults.shifting_parent(DeviceId::new(
+            prepared.fixture.device.get().saturating_add(11),
+        ));
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        let leaf = report.quarantine.clone();
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1);
+        let recorded = &pending[0].foreign_captures;
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert!(
+            recorded[0].captured.is_none(),
+            "the captured facts could not be read, and that is recorded"
+        );
+        assert!(
+            recorded[0].reason.contains("parent") || recorded[0].reason.contains("directory"),
+            "{:?}",
+            recorded[0].reason
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert_eq!(
+            std::fs::read(leaf.join("payload.txt")).expect("the replay never unlinks it"),
+            foreign
+        );
+        assert!(leaf.join(ROOT_MARKER_FILE).is_file());
+    }
+
     #[test]
     fn replay_after_a_successful_put_back_keeps_the_foreign_object_and_the_intent() {
         // The review's second replay gap: a put-back that succeeds leaves the
@@ -2965,12 +4038,17 @@ mod tests {
         );
         let pending = prepared.pending_intents();
         assert_eq!(pending.len(), 1);
-        let recorded = &pending[0].leftovers;
+        let recorded = &pending[0].foreign_captures;
         assert_eq!(recorded.len(), 1, "the mismatch is recorded: {recorded:?}");
         assert_eq!(recorded[0].original, "payload.txt");
         assert_eq!(recorded[0].put_back, state::PutBackOutcome::Renamed);
         assert_ne!(
-            recorded[0].captured_inode, recorded[0].inode,
+            recorded[0]
+                .captured
+                .as_ref()
+                .expect("the record keeps what the captured object was")
+                .inode,
+            recorded[0].inode,
             "the record keeps the identity that did not match"
         );
 
@@ -3041,7 +4119,11 @@ mod tests {
         );
         let pending = prepared.pending_intents();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].leftovers.len(), 1, "the mismatch is recorded");
+        assert_eq!(
+            pending[0].foreign_captures.len(),
+            1,
+            "the mismatch is recorded"
+        );
     }
 
     #[test]
@@ -3056,7 +4138,7 @@ mod tests {
         let foreign = b"the racer's object";
         let faults = Faults::new();
         faults.racing(&area, "payload.txt", 2, Replacement::File(foreign.to_vec()));
-        faults.occupying_after_capture(&area, "payload.txt");
+        faults.occupying_after_capture("payload.txt");
         let facts = prepared.fixture.facts();
         let report = prepared.delete(&faults, &facts);
         assert!(report.is_pending(), "{report:?}");
@@ -3090,7 +4172,7 @@ mod tests {
         assert!(leaf.join(ROOT_MARKER_FILE).is_file(), "the root is kept");
         let pending = prepared.pending_intents();
         assert_eq!(pending.len(), 1, "the intent stays pending");
-        assert_eq!(pending[0].leftovers.len(), 1);
+        assert_eq!(pending[0].foreign_captures.len(), 1);
     }
 
     #[test]

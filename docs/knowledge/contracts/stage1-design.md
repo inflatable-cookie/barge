@@ -947,18 +947,26 @@ rule, and the marker with them:
    is compared with the verified one, its contents are deleted through that
    descriptor, the private name is re-verified as the same inode, and only then
    is it removed with `AT_REMOVEDIR`, where `ENOTEMPTY` stops.
-4. **On a mismatch, never unlink.** The object is exclusively renamed back to its
-   original name. If that name is taken, or the put-back fails, it stays under its
-   private name; either way both names are reported and the deletion stops with
-   the intent pending (exit `3`). The mismatch is recorded in the intent whatever
-   the put-back answered — the private name, the name it came from, the identity
-   the walk observed there, the identity the captured object actually had, what
-   the put-back answered and why — because a successful put-back leaves an object
-   Barge never observed back under an ordinary name, where a later walk would find
-   it and unlink it. A `.barge-del-*` name is never re-verified from a fresh
-   observation and never unlinked, and no replay resumes an intent that records a
-   mismatch: an unrecorded private name keeps the intent pending too, because
-   nothing proves which object it holds.
+4. **On a mismatch, record first, then never unlink.** The mismatch is published
+   into the intent **before** anything puts the object back: the private name, the
+   name it came from, the identity the walk observed there, the identity the
+   captured object actually had (absent when it could not be read), why the
+   capture did not verify, and a put-back answer of `pending`. Only then is the
+   object exclusively renamed back to its original name, and the answer
+   (`renamed`, `taken` or `failed`) is recorded; a record that still says
+   `pending` is honest about a process that stopped, and blocks a replay just the
+   same. A successful put-back returns an object Barge never observed to an
+   ordinary name, where a later walk would find it and unlink it, so the order is
+   what makes the protection real: a crash between the record and the put-back, or
+   between the put-back and its answer, leaves the intent pending with the
+   evidence. If the record cannot be written at all, the object is **not** put
+   back: it stays under its private name, both names are reported and the deletion
+   stops with the intent pending (exit `3`). Where the put-back is attempted and
+   the original name is taken, or it fails, the object stays under its private
+   name too. A `.barge-del-*` name is never re-verified from a fresh observation
+   and never unlinked, and no replay resumes an intent that records a mismatch: an
+   unrecorded private name keeps the intent pending as well, because nothing
+   proves which object it holds.
 
 The guarantee this states:
 
@@ -968,6 +976,47 @@ The guarantee this states:
 > replaces an existing name. The residual is a same-user process that discovers the
 > private 128-bit name inside Barge's own quarantine within the capture-to-unlink
 > window.
+
+#### Durable custody of captured objects
+
+The capture rule above is only as strong as what survives a stop, so three durable
+facts carry it (Oxide Supervisor's #155 custody ruling, applied here by the amended
+barge#014 brief). An absent name is never proof that Barge deleted its object.
+
+1. **Positive completion.** After Barge's own final `unlinkat` of a verified
+   captured private name - the quarantine leaf's removal - a `removed` phase is
+   published durably before the intent settles. An `ENOENT`/vanished answer during
+   a live run stops the deletion and reports that another process may have moved
+   the captured object. A replay settles an intent whose leaf is absent only when
+   `removed` is already recorded; both names absent without it is `Unknown` and
+   stays pending. Settlement beyond that is an explicit operator route that
+   re-verifies both names absent; this stage adds no new verb. **The crash window
+   between the successful final unlink and the durable `removed` phase is
+   therefore pending, not complete**: the intent names what Barge did, and an
+   operator decides.
+2. **Recorded and verified captures only.** A `.barge-del-*` name is unlinked only
+   while the intent durably records that capture and its post-capture
+   verification - device, inode, kind and verdict (`observed`, or the
+   Finder-metadata class verdict) - and a replay re-verifies the same identity
+   before it deletes anything. The record is published before the unlink (and
+   before any chmod), one atomic publish per entry, so the deletion's practical
+   size inside its 120 s deadline is smaller than the name bound alone suggests; a
+   root that reaches the deadline stops pending. Every capture whose verification
+   failed is durably appended to `foreign_captures` - private name, original name,
+   observed device/inode/type, the identity actually found - **before** its
+   put-back is attempted. A listed, unrecorded, collided or unverifiable private
+   name is never unlinked, stays reported, and keeps the intent pending. A root
+   abort never relabels a nested foreign capture as an ordinary entry: it stays
+   under its private name, inside the captured parent's private name.
+3. **Mode custody.** A captured directory this account cannot write or search
+   cannot have its contents removed, so Barge adds the owner write and search bits
+   - and only after the object's original full permission mode is recorded
+   durably, in the same capture record. A scope guard restores the recorded mode on
+   every return, `?` error and panic that aborts or puts back, so a changed mode is
+   never left behind without the intent recording the original. A restore that
+   fails leaves the intent pending with the mode recorded. **A replay restores the
+   recorded modes first, before any other deletion or reconciliation action**, and
+   refuses to go on when a recorded name no longer holds the recorded object.
 
 Deletion never touches a foreign marker family, a marker-less directory, an
 `adopted_existing` root without an explicit plan entry, a root on another
@@ -1038,7 +1087,15 @@ data, marker and record are left unchanged and reported.
 | Drive pulled mid-adopt | the form's publish step fails | a `setting` adopt leaves either the old or the new bytes and a pending intent that `undo` and replay settle; a `link` adopt publishes through a temporary name, so the original path is never a dangling name in the absent case, and the empty-directory case re-creates the empty directory on replay instead of leaving it missing; a `held-root` adopt either wrote the marker or did not |
 | Finder recreates `.DS_Store` | `ENOTEMPTY`/`EEXIST` from `rmdir` | three attempts, 1 s apart; then keep the pending quarantine and exit `3` |
 | Finder recreates `.DS_Store` while an entry is captured | the captured name is not the observed inode, or the file is not the allowed class | capture, verify by class, unlink; anything that is not a regular file of this user on this device inside the size bound stops the deletion |
-| An entry is replaced between its check and its capture | the captured object's device, inode or kind differs from the observation | never unlink; record the mismatch, put the object back under its original name, and stop with the intent pending, exit `3`; no replay resumes that intent |
+| An entry is replaced between its check and its capture | the captured object's device, inode or kind differs from the observation | never unlink; record the mismatch before any put-back, put the object back under its original name, and stop with the intent pending, exit `3`; no replay resumes that intent |
+| The mismatch record cannot be written | the intent publish fails | never unlink and never put back: the object stays under its private name, both names are reported, and the intent stays pending |
+| The process stops between the mismatch record and its put-back | the record says `pending` and the object is under its private name or at its original one | the intent stays pending; no replay resumes it and nothing is unlinked |
+| The captured object's own facts cannot be read | the parent binding fails, or the private name is already gone | the mismatch is recorded without a captured identity, and the intent stays pending |
+| The captured object vanishes mid-run | the unlink or `rmdir` answers `ENOENT` | stop, report that another process may have moved it, keep the intent pending |
+| A crash lands between the successful final unlink and the `removed` phase | the leaf is absent but `removed` is not recorded | `Unknown`: the intent stays pending, because an absence is not a completion |
+| A `.barge-del-*` name is not recorded, or no longer matches its record | the intent's `captures` chain | never unlink it; report it and keep the intent pending |
+| A captured directory is read-only | its owner write or search bits are missing | record the original mode, apply `mode \| 0o300`, and restore the recorded mode on every abort, `?` error and panic |
+| The recorded mode cannot be restored | the mode change back fails | keep the intent pending with the mode recorded, and restore it first on replay |
 | An entry's original name is taken while it is captured | the put-back rename answers `EEXIST` | keep the object under its private name, report both names, stop with the intent pending, exit `3` |
 | A rename would replace an existing name | the exclusive rename answers `EEXIST` | nothing is renamed; a capture retries with a fresh private name, the quarantine rename stops with the intent pending |
 | A `.barge-del-*` leftover is left by a stopped deletion | the private name is recognised under the intent, with the capture it recorded | never unlink it: the captured object is unverifiable from a fresh observation, so the intent stays pending and both names are reported |
@@ -1443,17 +1500,27 @@ Choices S5 made where this design left the mechanic to the slice:
   `state/intents/<intent-id>.json`, at most 4 KiB, with exactly `schema`,
   `intent_id`, `root_id`, `volume_uuid`, `mount_hint`, `root_dir`, `folder`,
   `root_name`, `quarantine_name`, `device`, `inode`, `marker_digest`,
-  `plan_digest`, `phase`, `generation`, `recorded_ms`, `phase_ms` and an optional
-  `leftovers` list. `leftovers` is empty in the common case and absent from the
-  document then: it records at most four failed captures, each with the private
-  name, the name it was captured from, the identity observed there, the identity
-  the captured object actually had, what the put-back answered (`renamed`,
-  `taken` or `failed`) and a bounded reason. A deletion stops at the first failed
-  capture, so a run adds at most one, and a record that would exceed the bound is
-  refused rather than quietly dropped. A replay that reads any record refuses to
-  resume the intent. Adding the optional
-  field is an addition inside the major version, so a document written before it
-  still reads. The
+  `plan_digest`, `phase`, `generation`, `recorded_ms`, `phase_ms`, an optional
+  `captures` list and an optional `foreign_captures` list. The phases are
+  `intent`, `renamed`, `marker_last`, `removed` and `deleted`. `captures` is the
+  in-flight chain of recorded captures - at most twenty, one per depth level plus
+  headroom, and never more than the record's 4 KiB cap allows - and
+  each entry carries the private name, the original name, the device, inode and
+  kind of the verified object, its verdict (`observed` or `finder`) and, when
+  Barge changed it, the original permission mode. It is a snapshot: a later publish
+  replaces it, so it never grows with the tree, and it is published before each
+  unlink. `foreign_captures` is empty in the common case and absent from the
+  document then: at most four failed captures, each with the private name, the
+  original name, the observed identity, the captured object's own identity
+  (absent when it could not be read), the put-back answer (`pending` before it is
+  attempted, then `renamed`, `taken` or `failed`) and a bounded reason. Each of
+  those is published before its put-back, and a later record of the same capture
+  replaces the earlier one rather than duplicating it. A deletion stops at the
+  first failed capture, so a run adds at most one, and a record that would exceed
+  either bound is refused rather than quietly dropped. A replay that reads any
+  `foreign_captures` entry refuses to resume the intent. Adding the optional
+  fields and the `removed` phase are additions inside the major version, so a
+  document written before them still reads. The
   quarantine leaf's name is `.barge-prune-<intent-id>` and is re-derived and
   checked, never trusted as free text. A phase advances only forward and each
   publish is the atomic state write, so a stale writer cannot rewind an intent it
@@ -1498,10 +1565,32 @@ Choices S5 made where this design left the mechanic to the slice:
   under an ordinary name — could still be walked and unlinked by a replay. Now
   every failed capture is recorded with both identities, no run and no replay
   unlinks a `.barge-del-*` name, and a replay that reads a record stops before it
-  walks. A private name with no record is equally unverifiable. Racer and
-  counterfactual tests replace every successive entry of a three-level fixture,
-  not one payload, and regressions replay both a put-back collision and a
-  successful put-back and prove the foreign object and the intent survive.
+  walks. A private name with no record is equally unverifiable. The third review
+  finding was the order: the record used to be written after the put-back, so a
+  crash or a failed publication could leave the object back at an ordinary name
+  with nothing to stop a replay. The record is now published first, its
+  put-back answer afterwards, and a record that cannot be written means the object
+  is never put back at all. Racer and counterfactual tests replace every successive
+  entry of a three-level fixture, not one payload; regressions replay a put-back
+  collision, a successful put-back, a lost put-back, an unrecordable mismatch and
+  a mismatch with no captured facts, and prove the foreign object and the intent
+  survive each.
+- **Durable custody of captured objects** (added by the amended barge#014 brief,
+  the Oxide Supervisor's #155 ruling applied to Barge). Three durable facts carry
+  the capture rule across a stop: the `removed` phase after Barge's own final
+  unlink, with an absence without it staying `Unknown`; the `captures` chain,
+  published before each unlink and each chmod, with the verdict and the original
+  permission mode, so only this operation's recorded and verified private objects
+  are ever unlinked and a replay re-verifies the same identity; and
+  `foreign_captures`, published before each put-back, so a failed capture is never
+  relabelled as ordinary content by an abort or a replay. A captured directory
+  whose owner cannot write or search it has its mode changed only after the
+  original is recorded, and a scope guard restores it on every return, `?` error
+  and panic, with a replay restoring recorded modes first. The durable record costs
+  one atomic intent publish per entry, which is the deletion's real throughput
+  bound inside its 120 s deadline. The crash window between the final unlink and
+  the `removed` phase is named in "Durable custody of captured objects" and stays
+  pending for an operator.
 - **Finder metadata is verified by class even when it was classified** (corrected
   here under barge#014's second exact-head review). A `.DS_Store` or `._name` file
   the classification recorded used to be verified by inode, so Finder rebuilding
@@ -1574,7 +1663,7 @@ are real by constructing the state each rule must refuse.
 | Scratch | conclusion transitions; eligibility table; sweep bounds; grant lookup per unit | unconcluded root, `closure: none`, `kept_reason: exception`, an Effigy marker with a live pid and no delegation, an Oxide `hosting` root, a plain `oxide-validation` directory and an unmarked unit with no legacy claim all survive a sweep; a delegated Effigy marker past 24 h and a claimed unmarked unit past its idle age are the only foreign/unmarked units that do not |
 | Caches | the three placement forms; adopt/undo records; link and root identity; setting parse | a setting already pointing at the owned root changes no byte; a non-empty real directory refuses with a plan and nothing renamed or deleted; an empty real directory becomes a link and undo restores it empty; an absent path gets a link through a temporary name; a diverged file after adopt refuses undo; a symlinked original is recorded, not swapped |
 | Custody | state machine transitions; `Safe` required by type | unreadable hold, bounded-out scan, live pid with a mismatched start identity, foreign-uid evidence all yield `Unknown` and refuse |
-| Deletion | phase machine; Finder metadata classification; ENOTEMPTY retry; marker last; capture and verify for every entry | unknown entry stops the delete; symlink inside quarantine stops it; injected ENOTEMPTY three times leaves a pending intent; injected device change stops before the first unlink; a racer that replaces each entry after its check removes nothing foreign and leaves the intent pending; a symlink and a directory swap are captured and never followed or recursed into; a recreated Finder file is removed by class; a put-back collision keeps both names and records the failed capture; a successful put-back is recorded too; an exclusive rename onto an existing name refuses; no replay unlinks a leftover private name or resumes a recorded mismatch; replays after a collision and after a successful put-back keep the foreign object and the intent; a classified Finder file rebuilt between observation and capture is removed by class and one over the size bound stops; the old check-then-unlink removes the racer's object where capture-and-verify keeps it |
+| Deletion | phase machine; Finder metadata classification; ENOTEMPTY retry; marker last; capture and verify for every entry | unknown entry stops the delete; symlink inside quarantine stops it; injected ENOTEMPTY three times leaves a pending intent; injected device change stops before the first unlink; a racer that replaces each entry after its check removes nothing foreign and leaves the intent pending; a symlink and a directory swap are captured and never followed or recursed into; a recreated Finder file is removed by class; a put-back collision keeps both names and records the failed capture; a successful put-back is recorded too; the record is durable before the put-back (probed at the put-back itself); a lost put-back and an unrecordable mismatch keep the object private and the intent pending; a mismatch with no captured facts is still recorded; an exclusive rename onto an existing name refuses; no replay unlinks a leftover private name or resumes a recorded mismatch; replays after a collision, a successful put-back, a lost put-back and an unrecordable mismatch keep the foreign object and the intent; a classified Finder file rebuilt between observation and capture is removed by class and one over the size bound stops; a captured private name that vanishes mid-run leaves the intent pending; an absent leaf without `removed` stays pending and settles with it; a nested mismatch with a put-back collision keeps the foreign object under its private name and never relabels it; an unrecorded private name planted before a replay is never unlinked; a read-only captured directory and a read-only leaf are removed whole; a replay resumes a captured nested directory and finishes the delete; an injected failure after the chmod restores the recorded mode and records the abort; a failed restore stays pending with the mode recorded and a replay restores it first; the old check-then-unlink removes the racer's object where capture-and-verify keeps it |
 | Contacts | JSON documents match their schemas; unknown major refuses; optional-field addition accepted | a `barge.describe/1` document with a removed field or a changed type is refused by its own reader |
 | Foreign state | Oxide `removable.json` v1/v2 and `pools.json` parsers; the pinned Oxide and Effigy scratch marker field sets; delegations and legacy claims | unknown field, unknown version, unparsable and unreadable inputs become `unknown_state` observations; an Effigy marker that omits `task`/`checkout`/`pid`/`pid_start` is valid, and one that adds a field is refused; a unit whose family has no delegation or whose scope has no claim is reported, never deleted |
 | Prune/maintain | plan canonicalisation, digest mismatch, ordering | a changed plan digest, a changed root identity, a changed registry revision, a live hold, a revoked claim and a unit that became marked each stop the affected unit only |

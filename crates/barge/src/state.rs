@@ -959,6 +959,11 @@ pub enum IntentPhase {
     Renamed,
     /// The marker was unlinked last and the leaf may be removed.
     MarkerLast,
+    /// Barge's own final `unlinkat` of a verified captured private name
+    /// succeeded. It is the durable completion evidence: a replay may settle the
+    /// intent only after it, and an absence without it is unknown, never a
+    /// completion.
+    Removed,
     /// The leaf is gone and the intent is settled.
     Deleted,
 }
@@ -970,6 +975,7 @@ impl IntentPhase {
             Self::Intent => "intent",
             Self::Renamed => "renamed",
             Self::MarkerLast => "marker_last",
+            Self::Removed => "removed",
             Self::Deleted => "deleted",
         }
     }
@@ -1025,10 +1031,15 @@ pub struct IntentRecord {
     pub recorded_ms: u64,
     /// When this phase was written.
     pub phase_ms: u64,
-    /// The captured objects a deletion could not put back, so a replay keeps them
-    /// and the intent pending instead of unlinking them as ordinary entries.
+    /// The captures this operation recorded and verified, which are the only
+    /// private names it may unlink. The list is the in-flight stack, so it is
+    /// bounded by the deletion's depth bound.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub leftovers: Vec<LeftoverRecord>,
+    pub captures: Vec<CaptureRecord>,
+    /// The captures whose verification failed, which no run and no replay ever
+    /// unlinks. It is written before their put-back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub foreign_captures: Vec<ForeignCapture>,
 }
 
 impl IntentRecord {
@@ -1100,15 +1111,25 @@ impl IntentRecord {
             )
             .with_detail("intent_id", self.intent_id.clone().into()));
         }
-        if self.leftovers.len() > INTENT_LEFTOVERS {
+        if self.captures.len() > INTENT_CAPTURES {
             return Err(Error::new(
                 ErrorKind::UnknownState,
-                format!("the intent records more than {INTENT_LEFTOVERS} unverified captures"),
+                format!("the intent records more than {INTENT_CAPTURES} captures"),
             )
             .with_detail("intent_id", self.intent_id.clone().into()));
         }
-        for leftover in &self.leftovers {
-            leftover.validate()?;
+        for capture in &self.captures {
+            capture.validate(&self.quarantine_name)?;
+        }
+        if self.foreign_captures.len() > INTENT_FOREIGN_CAPTURES {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("the intent records more than {INTENT_FOREIGN_CAPTURES} foreign captures"),
+            )
+            .with_detail("intent_id", self.intent_id.clone().into()));
+        }
+        for foreign in &self.foreign_captures {
+            foreign.validate()?;
         }
         Ok(())
     }
@@ -1121,14 +1142,127 @@ pub const QUARANTINE_PREFIX: &str = ".barge-prune-";
 /// `.barge-del-<128-bit nonce>`.
 pub const CAPTURE_PREFIX: &str = ".barge-del-";
 
+/// How many recorded captures one intent keeps.
+///
+/// It is the in-flight stack of private names - one per depth level, the
+/// quarantine leaf included - with headroom, so it never grows with the tree. A
+/// snapshot that would not fit the intent's own cap is refused when it is
+/// published, and the deletion stops pending rather than unlink something it could
+/// not record.
+pub const INTENT_CAPTURES: usize = 20;
+
+/// The verdict one capture's post-capture verification reached.
+///
+/// Only a capture with a verdict is ever unlinked: the object is this operation's
+/// own captured object, verified under its private name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureVerdict {
+    /// The captured object reported the device, inode and kind the walk observed
+    /// at its name.
+    Observed,
+    /// The captured object is Finder metadata by class: a regular file of this
+    /// user on this device, inside the size bound.
+    Finder,
+}
+
+/// One capture the intent durably records, with its verification.
+///
+/// A `.barge-del-*` name is deletable only while the intent records it here with a
+/// verdict: a name with no record, a record whose identity no longer matches, or a
+/// record for another operation's capture is never unlinked and keeps the intent
+/// pending.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureRecord {
+    /// The private `.barge-del-<nonce>` name the object is held under.
+    pub private: String,
+    /// The name the object was captured from.
+    pub original: String,
+    /// The device the captured object reported.
+    pub device: u64,
+    /// The inode the captured object reported.
+    pub inode: u64,
+    /// The kind the captured object reported: `file` or `directory`.
+    pub kind: String,
+    /// The verification verdict the capture reached.
+    pub verdict: CaptureVerdict,
+    /// The object's original full permission mode, recorded before Barge changed
+    /// it so an abort and a replay can restore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+}
+
+impl CaptureRecord {
+    /// Validate every recorded fact strictly.
+    ///
+    /// `quarantine` is the intent's own leaf name: the leaf is a captured object
+    /// too, so its record legitimately names it instead of a `.barge-del-*` name.
+    pub fn validate(&self, quarantine: &str) -> Result<()> {
+        if !is_capture_name(&self.private) && self.private != quarantine {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "`{}` is not a private `{CAPTURE_PREFIX}<nonce>` name",
+                    self.private
+                ),
+            )
+            .with_detail("private", self.private.clone().into()));
+        }
+        validate_entry_name(&self.original)?;
+        if self.kind != "file" && self.kind != "directory" {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "a capture records the kind `{}`, which is never deletable",
+                    self.kind
+                ),
+            )
+            .with_detail("private", self.private.clone().into()));
+        }
+        if self.mode.is_some_and(|mode| mode > 0o7777) {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "a recorded mode is not a permission mode".to_owned(),
+            )
+            .with_detail("private", self.private.clone().into()));
+        }
+        Ok(())
+    }
+}
+
+/// One entry name as a record keeps it: exactly one component.
+fn validate_entry_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 255 || name == "." || name == ".." || name.contains('/') {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "a record does not name one entry".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// One recorded kind. A foreign capture records whatever the walk saw, including
+/// a link or another object, because that is what it did not expect.
+fn validate_entry_kind(kind: &str, private: &str) -> Result<()> {
+    if !matches!(kind, "file" | "directory" | "symlink" | "other") {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!("a record names the kind `{kind}`"),
+        )
+        .with_detail("private", private.to_owned().into()));
+    }
+    Ok(())
+}
+
 /// How many unverified captures one intent records.
 ///
 /// A deletion stops at the first one, so a run adds at most one; the bound keeps
 /// repeated runs' evidence from growing the record without limit.
-pub const INTENT_LEFTOVERS: usize = 4;
+pub const INTENT_FOREIGN_CAPTURES: usize = 4;
 
 /// The longest reason one unverified-capture record keeps, in bytes.
-pub const LEFTOVER_REASON_BYTES: usize = 160;
+pub const FOREIGN_REASON_BYTES: usize = 160;
 
 /// Whether a name is one of Barge's private capture names.
 ///
@@ -1143,29 +1277,66 @@ pub fn is_capture_name(name: &str) -> bool {
 }
 
 /// What a deletion's put-back of one unverified capture answered.
+///
+/// [`Pending`](Self::Pending) is the answer a record carries when it was written
+/// before the put-back was attempted and the process stopped before recording the
+/// outcome. It is never read as success: the record blocks a replay either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PutBackOutcome {
+    /// The record was written before the put-back, and no later answer was
+    /// recorded.
+    Pending,
     /// The object is back under its original name, and it is still not the
     /// observed one.
     Renamed,
     /// The original name was taken, so the object stays under its private name.
     Taken,
-    /// The put-back could not be attempted or failed, so the object stays too.
+    /// The put-back was not attempted or failed, so the object stays too.
     Failed,
 }
 
-/// One capture whose verification failed.
+/// The identity the captured object actually had, when it could be read.
+///
+/// It is absent when the object could not be read under its private name — it had
+/// been moved away again, or the read failed — which is itself a mismatch worth
+/// recording.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapturedObject {
+    /// The device the captured object was on.
+    pub device: u64,
+    /// The inode the captured object had.
+    pub inode: u64,
+    /// The kind the captured object had.
+    pub kind: String,
+}
+
+impl CapturedObject {
+    /// Validate every recorded fact strictly.
+    pub fn validate(&self) -> Result<()> {
+        if self.kind.is_empty() || self.kind.len() > 16 {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "a captured object does not record its kind".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One capture whose verification failed: a foreign object the deletion captured
+/// by mistake and must never unlink.
 ///
 /// It records the private name the object was captured to, the name it came from,
 /// the identity the walk observed there and the identity the captured object
 /// actually had, what the put-back answered and why the capture did not verify.
-/// The record is written whether or not the put-back succeeded, so a later run and
+/// The record is written **before** the put-back is attempted, so a later run and
 /// a replay know an object Barge never observed is somewhere in the leaf — under
 /// its private name or back under its original one — and never unlink it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct LeftoverRecord {
+pub struct ForeignCapture {
     /// The private `.barge-del-<nonce>` name the object was captured to.
     pub private: String,
     /// The name the object was captured from.
@@ -1176,19 +1347,16 @@ pub struct LeftoverRecord {
     pub inode: u64,
     /// The kind that observation reported: `file` or `directory`.
     pub kind: String,
-    /// The device the captured object actually had.
-    pub captured_device: u64,
-    /// The inode the captured object actually had.
-    pub captured_inode: u64,
-    /// The kind the captured object actually had.
-    pub captured_kind: String,
+    /// What the captured object actually was, when it could be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured: Option<CapturedObject>,
     /// What the put-back attempt answered.
     pub put_back: PutBackOutcome,
     /// Why the captured object was not verified, bounded.
     pub reason: String,
 }
 
-impl LeftoverRecord {
+impl ForeignCapture {
     /// Validate every recorded fact strictly.
     pub fn validate(&self) -> Result<()> {
         if !is_capture_name(&self.private) {
@@ -1201,38 +1369,15 @@ impl LeftoverRecord {
             )
             .with_detail("private", self.private.clone().into()));
         }
-        if self.original.is_empty()
-            || self.original.len() > 255
-            || self.original == "."
-            || self.original == ".."
-            || self.original.contains('/')
-        {
-            return Err(Error::new(
-                ErrorKind::UnknownState,
-                "an unverified capture does not record one entry name".to_owned(),
-            )
-            .with_detail("private", self.private.clone().into()));
+        validate_entry_name(&self.original)?;
+        validate_entry_kind(&self.kind, &self.private)?;
+        if let Some(captured) = &self.captured {
+            captured.validate()?;
         }
-        if self.kind != "file" && self.kind != "directory" {
+        if self.reason.is_empty() || self.reason.len() > FOREIGN_REASON_BYTES {
             return Err(Error::new(
                 ErrorKind::UnknownState,
-                format!("an unverified capture records the kind `{}`", self.kind),
-            )
-            .with_detail("private", self.private.clone().into()));
-        }
-        if self.captured_kind.is_empty() || self.captured_kind.len() > 16 {
-            return Err(Error::new(
-                ErrorKind::UnknownState,
-                "an unverified capture does not record the captured object's kind".to_owned(),
-            )
-            .with_detail("private", self.private.clone().into()));
-        }
-        if self.reason.is_empty() || self.reason.len() > LEFTOVER_REASON_BYTES {
-            return Err(Error::new(
-                ErrorKind::UnknownState,
-                format!(
-                    "an unverified capture's reason must be 1 to {LEFTOVER_REASON_BYTES} bytes"
-                ),
+                format!("an unverified capture's reason must be 1 to {FOREIGN_REASON_BYTES} bytes"),
             )
             .with_detail("private", self.private.clone().into()));
         }
@@ -1342,35 +1487,63 @@ pub fn advance_intent(
 ///
 /// A record names the private name a replay must never unlink and the name the
 /// object came from, with both the observation the capture failed to match and
-/// the identity the captured object actually had. The phase does not change, but
-/// the generation still increases, so a stale writer cannot drop a record it
-/// raced. A caller that records a mismatch stops the deletion, so no phase
-/// advances on a record it has not read back, and a replay that reads one refuses
-/// to resume.
-pub fn record_leftovers(
+/// the identity the captured object actually had. It is written **before** the
+/// put-back is attempted, so a process that stops in between still leaves the
+/// evidence. The phase does not change, but the generation still increases, so a
+/// stale writer cannot drop a record it raced. A caller that records a foreign
+/// capture stops the deletion, so no phase advances on a record it has not read
+/// back, and a replay that reads one refuses to resume.
+pub fn record_foreign_capture(
     write: &IntentWrite,
     state: &StatePaths,
     record: &IntentRecord,
-    leftovers: &[LeftoverRecord],
+    foreign: &ForeignCapture,
 ) -> Result<IntentRecord> {
     let mut next = record.clone();
-    for leftover in leftovers {
-        if next
-            .leftovers
-            .iter()
-            .any(|held| held.private == leftover.private)
-        {
-            continue;
-        }
-        next.leftovers.push(leftover.clone());
+    match next
+        .foreign_captures
+        .iter_mut()
+        .find(|held| held.private == foreign.private)
+    {
+        // A second record of one capture is its later evidence - the put-back
+        // answer - and replaces the first rather than duplicating it.
+        Some(held) => *held = foreign.clone(),
+        None => next.foreign_captures.push(foreign.clone()),
     }
-    if next.leftovers.len() > INTENT_LEFTOVERS {
+    if next.foreign_captures.len() > INTENT_FOREIGN_CAPTURES {
         return Err(Error::new(
             ErrorKind::ResourceBound,
-            format!("the intent would record more than {INTENT_LEFTOVERS} unverified captures"),
+            format!("the intent would record more than {INTENT_FOREIGN_CAPTURES} foreign captures"),
         )
         .with_detail("intent_id", record.intent_id.clone().into()));
     }
+    next.generation = record.generation.saturating_add(1);
+    next.phase_ms = now_ms().max(record.phase_ms);
+    publish_intent(write, state, &next)?;
+    Ok(next)
+}
+
+/// Record the captures this operation has verified and may still unlink.
+///
+/// The list is a snapshot of the in-flight stack, so it is published before each
+/// unlink and stays bounded by the depth bound. A capture must be recorded here,
+/// with its verdict, before its private name is unlinked; a replay re-verifies the
+/// recorded device, inode and kind before it deletes anything.
+pub fn record_captures(
+    write: &IntentWrite,
+    state: &StatePaths,
+    record: &IntentRecord,
+    captures: &[CaptureRecord],
+) -> Result<IntentRecord> {
+    if captures.len() > INTENT_CAPTURES {
+        return Err(Error::new(
+            ErrorKind::ResourceBound,
+            format!("the intent would record more than {INTENT_CAPTURES} captures"),
+        )
+        .with_detail("intent_id", record.intent_id.clone().into()));
+    }
+    let mut next = record.clone();
+    next.captures = captures.to_vec();
     next.generation = record.generation.saturating_add(1);
     next.phase_ms = now_ms().max(record.phase_ms);
     publish_intent(write, state, &next)?;
@@ -1920,9 +2093,9 @@ mod intent_tests {
     use std::path::PathBuf;
 
     use super::{
-        advance_intent, publish_intent, read_intent, read_intents, record_leftovers, IntentPhase,
-        IntentRecord, LeftoverRecord, LockSet, PutBackOutcome, StatePaths, CAPTURE_PREFIX,
-        INTENT_LEFTOVERS, QUARANTINE_PREFIX,
+        advance_intent, publish_intent, read_intent, read_intents, record_foreign_capture,
+        CapturedObject, ForeignCapture, IntentPhase, IntentRecord, LockSet, PutBackOutcome,
+        StatePaths, CAPTURE_PREFIX, INTENT_FOREIGN_CAPTURES, QUARANTINE_PREFIX,
     };
     use crate::error::ErrorKind;
     use crate::os::VolumeUuid;
@@ -1964,7 +2137,8 @@ mod intent_tests {
             generation: 1,
             recorded_ms: now,
             phase_ms: now,
-            leftovers: Vec::new(),
+            captures: Vec::new(),
+            foreign_captures: Vec::new(),
         }
     }
 
@@ -2028,17 +2202,19 @@ mod intent_tests {
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
 
-    fn leftover(original: &str, nonce: u8) -> LeftoverRecord {
-        LeftoverRecord {
+    fn leftover(original: &str, nonce: u8) -> ForeignCapture {
+        ForeignCapture {
             private: format!("{CAPTURE_PREFIX}{}", format!("{nonce:02x}").repeat(16)),
             original: original.to_owned(),
             device: 16_777_219,
             inode: 4_242,
             kind: "file".to_owned(),
-            captured_device: 16_777_219,
-            captured_inode: 4_243,
-            captured_kind: "file".to_owned(),
-            put_back: PutBackOutcome::Renamed,
+            captured: Some(CapturedObject {
+                device: 16_777_219,
+                inode: 4_243,
+                kind: "file".to_owned(),
+            }),
+            put_back: PutBackOutcome::Pending,
             reason: "the captured object is not the observed one".to_owned(),
         }
     }
@@ -2053,7 +2229,7 @@ mod intent_tests {
         let write = locks.begin_intent_write().expect("the intent step");
         publish_intent(&write, &state, &intent).expect("the intent publishes");
 
-        let first = record_leftovers(&write, &state, &intent, &[leftover("payload.txt", 1)])
+        let first = record_foreign_capture(&write, &state, &intent, &leftover("payload.txt", 1))
             .expect("the leftover is recorded");
         assert_eq!(first.generation, intent.generation + 1);
         assert_eq!(
@@ -2062,41 +2238,48 @@ mod intent_tests {
             "the phase does not change"
         );
         let read = read_intent(&state, &intent.intent_id).expect("the intent reads back");
-        assert_eq!(read.leftovers.len(), 1);
-        assert_eq!(read.leftovers[0].original, "payload.txt");
+        assert_eq!(read.foreign_captures.len(), 1);
+        assert_eq!(read.foreign_captures[0].original, "payload.txt");
 
-        // The same capture recorded again is not duplicated, and a different one
-        // is added.
-        let again = record_leftovers(&write, &state, &read, &[leftover("payload.txt", 1)])
-            .expect("the same leftover is recorded again");
-        assert_eq!(again.leftovers.len(), 1);
-        let two = record_leftovers(&write, &state, &again, &[leftover("second.txt", 2)])
+        // The same capture recorded again is its later evidence, not a duplicate,
+        // and a different one is added.
+        let mut answered = leftover("payload.txt", 1);
+        answered.put_back = PutBackOutcome::Renamed;
+        let again = record_foreign_capture(&write, &state, &read, &answered)
+            .expect("the same capture is recorded again");
+        assert_eq!(again.foreign_captures.len(), 1);
+        assert_eq!(
+            again.foreign_captures[0].put_back,
+            PutBackOutcome::Renamed,
+            "the later answer replaces the pending one"
+        );
+        let two = record_foreign_capture(&write, &state, &again, &leftover("second.txt", 2))
             .expect("a second leftover is recorded");
-        assert_eq!(two.leftovers.len(), 2);
+        assert_eq!(two.foreign_captures.len(), 2);
 
         // The record is bounded, and a record over the bound is refused rather
         // than quietly dropped.
         let mut held = two;
-        for index in 0..INTENT_LEFTOVERS {
+        for index in 0..INTENT_FOREIGN_CAPTURES {
             let next = leftover(&format!("entry-{index}.txt"), 3 + index as u8);
-            if held.leftovers.len() == INTENT_LEFTOVERS {
-                let refused = record_leftovers(&write, &state, &held, &[next])
+            if held.foreign_captures.len() == INTENT_FOREIGN_CAPTURES {
+                let refused = record_foreign_capture(&write, &state, &held, &next)
                     .expect_err("a record over the bound is refused");
                 assert_eq!(refused.kind(), ErrorKind::ResourceBound);
                 break;
             }
-            held =
-                record_leftovers(&write, &state, &held, &[next]).expect("the leftover is recorded");
+            held = record_foreign_capture(&write, &state, &held, &next)
+                .expect("the leftover is recorded");
         }
     }
 
     #[test]
-    fn a_leftover_record_that_does_not_validate_is_unknown_state() {
+    fn a_foreign_capture_that_does_not_validate_is_unknown_state() {
         let (_dir, state, uuid) = fixture("intent-leftover-invalid");
         let intent = record(&uuid);
         let base = super::intent_path(&state, &intent.intent_id).expect("the path");
 
-        let mut cases: Vec<(&str, LeftoverRecord)> = Vec::new();
+        let mut cases: Vec<(&str, ForeignCapture)> = Vec::new();
         let mut not_private = leftover("payload.txt", 1);
         not_private.private = ".barge-prune-x".to_owned();
         cases.push(("a private name", not_private));
@@ -2104,20 +2287,108 @@ mod intent_tests {
         not_one_name.original = "sub/name".to_owned();
         cases.push(("one entry name", not_one_name));
         let mut wrong_kind = leftover("payload.txt", 3);
-        wrong_kind.kind = "symlink".to_owned();
+        wrong_kind.kind = "device".to_owned();
         cases.push(("a kind", wrong_kind));
         let mut no_captured_kind = leftover("payload.txt", 5);
-        no_captured_kind.captured_kind = String::new();
+        no_captured_kind.captured = Some(CapturedObject {
+            device: 16_777_219,
+            inode: 4_243,
+            kind: String::new(),
+        });
         cases.push(("the captured object's kind", no_captured_kind));
         let mut long_reason = leftover("payload.txt", 4);
-        long_reason.reason = "x".repeat(super::LEFTOVER_REASON_BYTES + 1);
+        long_reason.reason = "x".repeat(super::FOREIGN_REASON_BYTES + 1);
         cases.push(("a reason", long_reason));
 
         for (label, bad) in cases {
             let mut record = intent.clone();
-            record.leftovers = vec![bad];
+            record.foreign_captures = vec![bad];
             let mut value = serde_json::to_value(&record).expect("the record encodes");
             value["schema"] = serde_json::Value::String(crate::contract::INTENT_SCHEMA.to_owned());
+            std::fs::write(
+                &base,
+                serde_json::to_vec_pretty(&value).expect("the record encodes"),
+            )
+            .expect("the record is written");
+            let error = read_intent(&state, &intent.intent_id).expect_err(label);
+            assert_eq!(error.kind(), ErrorKind::UnknownState, "{label}");
+        }
+    }
+
+    fn capture(original: &str, nonce: u8) -> super::CaptureRecord {
+        super::CaptureRecord {
+            private: format!("{CAPTURE_PREFIX}{}", format!("{nonce:02x}").repeat(16)),
+            original: original.to_owned(),
+            device: 16_777_219,
+            inode: 4_242,
+            kind: "directory".to_owned(),
+            verdict: super::CaptureVerdict::Observed,
+            mode: None,
+        }
+    }
+
+    #[test]
+    fn recorded_captures_and_the_removed_phase_read_back() {
+        let (_dir, state, uuid) = fixture("intent-captures");
+        let intent = record(&uuid);
+        let mut locks = LockSet::new(state.clone());
+        let _volume = locks.lock_volume(&uuid).expect("the volume lock");
+        let _root = locks.lock_root(&intent.root_id).expect("the root lock");
+        let write = locks.begin_intent_write().expect("the intent step");
+        publish_intent(&write, &state, &intent).expect("the intent publishes");
+
+        let mut held = capture("sub", 1);
+        held.mode = Some(0o500);
+        let recorded = super::record_captures(&write, &state, &intent, &[held.clone()])
+            .expect("the capture is recorded");
+        assert_eq!(recorded.captures.len(), 1);
+        assert_eq!(recorded.captures[0].mode, Some(0o500));
+        let read = read_intent(&state, &intent.intent_id).expect("the intent reads back");
+        assert_eq!(read.captures[0].private, held.private);
+        assert_eq!(read.captures[0].verdict, super::CaptureVerdict::Observed);
+
+        // The list is a snapshot: a later one replaces it rather than growing.
+        let none = super::record_captures(&write, &state, &read, &[])
+            .expect("the chain is published empty again");
+        assert!(none.captures.is_empty());
+
+        // The phases run intent, renamed, marker_last, removed, deleted.
+        let removed = advance_intent(&write, &state, &read, IntentPhase::Renamed)
+            .and_then(|next| advance_intent(&write, &state, &next, IntentPhase::MarkerLast))
+            .and_then(|next| advance_intent(&write, &state, &next, IntentPhase::Removed))
+            .expect("the removed phase is recorded");
+        assert_eq!(removed.phase, IntentPhase::Removed);
+        assert!(removed.is_pending());
+        let settled = advance_intent(&write, &state, &removed, IntentPhase::Deleted)
+            .expect("the intent settles");
+        assert_eq!(settled.phase, IntentPhase::Deleted);
+        assert!(!settled.is_pending());
+    }
+
+    #[test]
+    fn a_capture_record_that_does_not_validate_is_unknown_state() {
+        let (_dir, state, uuid) = fixture("intent-capture-invalid");
+        let intent = record(&uuid);
+        let base = super::intent_path(&state, &intent.intent_id).expect("the path");
+
+        let mut cases: Vec<(&str, super::CaptureRecord)> = Vec::new();
+        let mut not_private = capture("sub", 1);
+        not_private.private = ".barge-prune-x".to_owned();
+        cases.push(("a private name", not_private));
+        let mut not_deletable = capture("sub", 2);
+        not_deletable.kind = "symlink".to_owned();
+        cases.push(("a deletable kind", not_deletable));
+        let mut no_original = capture("sub", 3);
+        no_original.original = String::new();
+        cases.push(("one entry name", no_original));
+        let mut wrong_mode = capture("sub", 4);
+        wrong_mode.mode = Some(0o7777 + 1);
+        cases.push(("a permission mode", wrong_mode));
+
+        for (label, bad) in cases {
+            let mut record = intent.clone();
+            record.captures = vec![bad];
+            let value = serde_json::to_value(&record).expect("the record encodes");
             std::fs::write(
                 &base,
                 serde_json::to_vec_pretty(&value).expect("the record encodes"),

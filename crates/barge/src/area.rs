@@ -3235,6 +3235,10 @@ mod tests {
             self.inner.rename_child(parent, from, to)
         }
 
+        fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> Result<()> {
+            self.inner.set_dir_mode(handle, mode)
+        }
+
         fn recheck_dir(&self, handle: &DirHandle) -> Result<DirId> {
             self.inner.recheck_dir(handle)
         }
@@ -4444,6 +4448,9 @@ mod tests {
                 to: &str,
             ) -> Result<crate::os::RenameOutcome> {
                 self.inner.rename_child(parent, from, to)
+            }
+            fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> Result<()> {
+                self.inner.set_dir_mode(handle, mode)
             }
             fn recheck_dir(&self, handle: &DirHandle) -> Result<DirId> {
                 self.inner.recheck_dir(handle)
