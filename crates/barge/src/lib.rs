@@ -4,7 +4,10 @@
 //! the library directly. Module ownership follows the stage 1 design's module
 //! table (`docs/knowledge/contracts/stage1-design.md`, "Crate and CLI
 //! skeleton"). Slice S1 implements `os`, `describe` and the shared error and
-//! JSON contract; every other module states its job and carries no placeholder
+//! JSON contract. Slice S2 adds the account state directory with its atomic
+//! publish, bounded reads and fixed lock order, the `barge.registry/1` reader
+//! and its fixture-tested writer, the read-only Oxide observations and
+//! `barge inspect`. Every other module states its job and carries no placeholder
 //! logic for a later slice to undo.
 //!
 //! `unsafe` is denied for the whole crate and allowed only in the macOS
@@ -28,3 +31,7 @@ pub mod prune;
 pub mod registry;
 pub mod scratch;
 pub mod state;
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) mod testkit;

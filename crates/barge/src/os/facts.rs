@@ -8,6 +8,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Error, ErrorKind, Result};
 
 /// A device identifier as the platform reports it for an opened file.
@@ -66,7 +68,12 @@ impl fmt::Display for FileSystem {
 
 /// The kernel's APFS volume UUID, normalised to one spelling so two readings of
 /// one volume never compare unequal.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// It reads and writes as its canonical text, so a record that holds one cannot
+/// hold a malformed value: parsing is the only way in, and a document with a
+/// malformed UUID is refused rather than repaired.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct VolumeUuid(String);
 
 impl VolumeUuid {
@@ -108,6 +115,20 @@ impl VolumeUuid {
     /// The canonical UUID text.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl TryFrom<String> for VolumeUuid {
+    type Error = Error;
+
+    fn try_from(raw: String) -> Result<Self> {
+        Self::parse(&raw)
+    }
+}
+
+impl From<VolumeUuid> for String {
+    fn from(uuid: VolumeUuid) -> Self {
+        uuid.0
     }
 }
 
@@ -192,8 +213,18 @@ pub trait AccountFacts {
     /// The account's home directory.
     fn account_home(&self) -> Result<PathBuf>;
 
-    /// The account-wide state root this platform defines.
+    /// The account-wide state root this platform defines for Barge.
     fn state_root(&self) -> Result<PathBuf>;
+
+    /// The account-wide state directory this platform gives another tool.
+    ///
+    /// Barge reads a foreign tool's state in place and never writes it, so the
+    /// platform's convention belongs here and the leaf names stay in the module
+    /// that knows that tool's formats.
+    fn tool_state_dir(&self, tool: &str) -> Result<PathBuf>;
+
+    /// The account-wide cache directory this platform gives another tool.
+    fn tool_cache_dir(&self, tool: &str) -> Result<PathBuf>;
 }
 
 /// A volume whose facts were read and matched the expectation.
@@ -289,6 +320,23 @@ mod tests {
             let error = VolumeUuid::parse(raw).expect_err("a malformed UUID is refused");
             assert_eq!(error.kind(), ErrorKind::UnknownState, "{raw}");
         }
+    }
+
+    #[test]
+    fn a_uuid_reads_and_writes_as_its_canonical_text() {
+        let uuid = VolumeUuid::parse("a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d")
+            .expect("a lowercase UUID parses");
+        let json = serde_json::to_value(&uuid).expect("a UUID serialises");
+        assert_eq!(
+            json,
+            serde_json::json!("A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C5D")
+        );
+        let read: VolumeUuid = serde_json::from_value(json).expect("its own text parses back");
+        assert_eq!(read, uuid);
+        assert!(
+            serde_json::from_value::<VolumeUuid>(serde_json::json!("not-a-uuid")).is_err(),
+            "a malformed UUID never becomes a value"
+        );
     }
 
     #[test]

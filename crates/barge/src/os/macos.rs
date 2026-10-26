@@ -28,6 +28,13 @@ const VOLUMES_PARENT: &str = "/Volumes";
 /// "Account-wide state directory").
 const STATE_ROOT_RELATIVE: &str = "Library/Application Support/barge/state";
 
+/// Where this platform keeps an account's application state, relative to its
+/// home. A foreign tool's own leaf names are added by the module that reads it.
+const APPLICATION_SUPPORT_RELATIVE: &str = "Library/Application Support";
+
+/// Where this platform keeps an account's caches, relative to its home.
+const CACHES_RELATIVE: &str = "Library/Caches";
+
 /// The largest password-database buffer Barge will grow to before refusing.
 const MAX_PASSWD_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -105,6 +112,17 @@ impl AccountFacts for MacOs {
 
     fn state_root(&self) -> Result<PathBuf> {
         Ok(account_home()?.join(STATE_ROOT_RELATIVE))
+    }
+
+    fn tool_state_dir(&self, tool: &str) -> Result<PathBuf> {
+        Ok(account_home()?
+            .join(APPLICATION_SUPPORT_RELATIVE)
+            .join(tool)
+            .join("state"))
+    }
+
+    fn tool_cache_dir(&self, tool: &str) -> Result<PathBuf> {
+        Ok(account_home()?.join(CACHES_RELATIVE).join(tool))
     }
 }
 

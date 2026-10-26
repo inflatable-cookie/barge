@@ -9,8 +9,10 @@ on-disk formats a later implementation must read and write, the compatibility
 boundary with Oxide's and Effigy's existing state, the implementation slices in
 dependency order, and the tests those slices must carry.
 
-Stage 1 is design only. No part of this contract authorizes a native run, a host
-or settings change, a data move, a consumer edit, or an Oxide source change.
+This contract is the frozen design; the implementation lands slice by slice, and
+[implementation status](#implementation-status) records what has landed in it.
+No part of this contract authorizes a native run, a host or settings change, a
+data move, a consumer edit, or an Oxide source change.
 [Architecture](../architecture.md) owns the concepts and the boundary with
 Oxide; this file owns the concrete stage 1 formats and interfaces. Where the two
 differ, architecture wins and this file is corrected.
@@ -1053,6 +1055,71 @@ Dependencies that are not slices: a real-drive qualification (later, operator
 gated), Linux (later, additive behind `os`), reserve/floor pruning (later,
 after a qualified space measurement), and the retirement of any foreign format
 (after its owner's adoption).
+
+### Implementation status
+
+The design is frozen and each slice lands with its own brief and independent
+review. This section records what has landed and the concrete choices a slice
+had to make inside these rules. It is a status note, not a change to any rule
+above.
+
+- **S1** landed on `main` (`ad6373e`): the workspace with both crates, the
+  toolchain pin, RustQuality strict activation, the `os` traits with the macOS
+  implementation, volume identity and mount verification, the JSON and error
+  contract, and `barge describe --json`.
+- **S2** landed with this note: the account state directory with its atomic
+  publish, bounded reads and fixed lock order; the `barge.registry/1` strict
+  reader and its fixture-tested writer; the read-only Oxide observations; and
+  `barge inspect --json`. S2 creates and changes no registration: no CLI command
+  writes Barge's state.
+
+Choices S2 made where this design left the mechanic to the slice:
+
+- **Registry document.** `state/registry.json` holds
+  `{"schema": "barge.registry/1", "volumes": [...]}`. Each record carries exactly
+  the fields of [the registry table](#registry-of-volumes), with
+  `deny_unknown_fields` at every level, at most 4 MiB and 64 records.
+  `generation` is per record: a new record starts at 1, a changed one increases
+  by one, and an unchanged one keeps its generation, so a stale reader is
+  detectable. A write needs the exclusive registry lock by argument, so a
+  registry write without the lock cannot happen by accident.
+- **Finding Oxide's registration.** The design names
+  `<internal pool>/oxide-managed/removable.json` but not how the internal pool is
+  found, which Oxide's own configuration decides. S2 looks at
+  `<pool>/oxide-managed/removable.json` for every pool Oxide's `pools.json`
+  records, then at Oxide's current and retired default pools
+  (`Library/Caches/oxide/build-pool` and `Library/Caches/oxide/pool`). The first
+  candidate that is present decides: one that is present but unreadable is
+  `unknown_state` and never a cue to look further. `barge inspect` names every
+  path it looked at. A pool Oxide created but never recorded in `pools.json`, and
+  that is not one of the defaults, is not located by S2.
+- **Absence is a fact.** A foreign file that is not there is reported with
+  `state: absent` and a detail naming the path — never an empty record and never
+  `unknown_state`. `ObservationRow.version` is the version the source states; it
+  is empty when the source states none, which is an absent or unreadable file, or
+  a format without a version field (the pools record is a bare array).
+- **Bounds as applied.** The registry read is 4 MiB, 64 records and 10 s; the
+  registration read uses Oxide's own 16 KiB cap; the pools read uses Oxide's own
+  64 KiB cap and reports at most Oxide's own 16 recorded rows, with counts when
+  the file holds more.
+- **Which command refuses.** An invalid registry refuses `barge describe` with
+  `unknown_state` naming the file, and refuses every mutating path, because a
+  report with no volumes would read as "none registered". `barge inspect` reports
+  it as `registry.state: invalid` with the reason, because diagnosing that state
+  is what the command is for. Neither command creates a file, directory or lock:
+  both take only a shared lock, and only when the lock file already exists.
+- **Lock order.** The order is a checked rank (`state::LockSet`): acquiring a rank
+  at or below one already held refuses with `usage` before any file is touched,
+  the intent write is the last rank and takes no lock file of its own, and the
+  `locks/` directory is created only by a mutating call.
+- **`barge.inspect/1`.** Its `data` is the state report, the registry as absent,
+  valid or invalid with its volume rows, the observation rows, and Oxide's
+  registration and pools in full — including the observed volume an import would
+  describe (`origin: observed_oxide`, availability from the registration's
+  `mode`, durability `undeclared`). That observed volume is a separate type with
+  no conversion into a registry record. `barge.inspect/1` is named by its own
+  `schema`; it is not added to the `formats` list, so S2 leaves
+  `barge.describe/1`'s field set unchanged.
 
 ## Proposed validation
 
