@@ -1203,9 +1203,13 @@ pub fn create_root_on_volume(
     stored: Option<&AreaDocument>,
     spec: RootSpec,
 ) -> Result<(VolumeArea, OwnedRoot)> {
-    // An unregistered volume refuses before any effect, including creating the
-    // state layout or a lock file.
-    registered_volume(state, volume_uuid)?;
+    // Every refusal the volume itself can cause happens before any effect: an
+    // unregistered UUID, an undeclared durability, an absent volume and a
+    // different volume at the recorded mount are all proved here, so a refused
+    // creation leaves no state layout, no lock file and no folder behind.
+    let record = registered_volume(state, volume_uuid)?;
+    record.declared_durability()?;
+    VolumeRoot::open(dirs, facts, mounts, &record)?;
     state.initialize()?;
     let mut locks = state::LockSet::new(state.clone());
     let _volume_lock = locks.lock_volume(volume_uuid)?;
@@ -1250,6 +1254,52 @@ pub fn list_roots_on_volume(
     Ok((volume, listing))
 }
 
+/// Adopt one component that is already there, only when the opened directory is
+/// the one that was checked.
+///
+/// Every adoption path in the folder creation goes through this: the entry must
+/// be a real directory of this account on this device, it is opened without
+/// following a link, and the opened device and inode must equal the checked
+/// ones. An entry that changed between `lstat` and `open` — including one a
+/// competing creator swapped in behind the race — is refused rather than
+/// adopted, so no path creates a root inside a directory the walk did not prove.
+fn adopt_existing_component(
+    dirs: &dyn DirOps,
+    parent: &DirHandle,
+    component: &str,
+    facts: &crate::os::EntryFacts,
+    device: DeviceId,
+    effective_uid: u32,
+) -> Result<DirHandle> {
+    if facts.kind != EntryKind::Directory || facts.device != device || facts.uid != effective_uid {
+        return Err(containment(
+            "folder",
+            component,
+            "an existing component is not this account's directory on this volume",
+        ));
+    }
+    let opened = dirs.open_child_dir(parent, component)?;
+    let checked_identity = DirId {
+        device: facts.device,
+        inode: facts.inode,
+    };
+    if opened.identity() != checked_identity {
+        return Err(containment(
+            "folder",
+            component,
+            "the component changed between the check and the open",
+        ));
+    }
+    if opened.identity().device != device {
+        return Err(containment(
+            "folder",
+            component,
+            "the opened component is on another device",
+        ));
+    }
+    Ok(opened)
+}
+
 /// Create any missing folder component on the way to the area, refusing to
 /// adopt anything that is already there but is not this account's directory.
 fn ensure_area_folder(
@@ -1270,31 +1320,14 @@ fn ensure_area_folder(
                 let component = remaining[position].clone();
                 let existing = dirs.child_facts(&current, &component)?;
                 let handle = match existing {
-                    Some(facts) => {
-                        if facts.kind != EntryKind::Directory
-                            || facts.device != *device
-                            || facts.uid != effective_uid
-                        {
-                            return Err(containment(
-                                "folder",
-                                &component,
-                                "an existing component is not this account's directory on this volume",
-                            ));
-                        }
-                        let opened = dirs.open_child_dir(&current, &component)?;
-                        let checked_identity = DirId {
-                            device: facts.device,
-                            inode: facts.inode,
-                        };
-                        if opened.identity() != checked_identity {
-                            return Err(containment(
-                                "folder",
-                                &component,
-                                "the component changed between the check and the open",
-                            ));
-                        }
-                        opened
-                    }
+                    Some(facts) => adopt_existing_component(
+                        dirs,
+                        &current,
+                        &component,
+                        &facts,
+                        *device,
+                        effective_uid,
+                    )?,
                     None => {
                         match dirs.create_child_dir(&current, &component, AREA_DIRECTORY_MODE) {
                             Ok(identity) => {
@@ -1309,23 +1342,22 @@ fn ensure_area_folder(
                                 opened
                             }
                             Err(error) => {
-                                // A concurrent creator may have won: adopt only this
-                                // account's directory on this volume, never anything
-                                // else, and report the platform's failure otherwise.
+                                // A concurrent creator may have won: adopt the
+                                // component only through the same lstat-then-open
+                                // identity check the named path uses, so a swap
+                                // behind the race is refused, not adopted. With
+                                // nothing there, the platform's failure stands.
                                 let Some(facts) = dirs.child_facts(&current, &component)? else {
                                     return Err(error);
                                 };
-                                if facts.kind != EntryKind::Directory
-                                    || facts.device != *device
-                                    || facts.uid != effective_uid
-                                {
-                                    return Err(containment(
-                                        "folder",
-                                        &component,
-                                        "a competing creator left an entry Barge does not own",
-                                    ));
-                                }
-                                dirs.open_child_dir(&current, &component)?
+                                adopt_existing_component(
+                                    dirs,
+                                    &current,
+                                    &component,
+                                    &facts,
+                                    *device,
+                                    effective_uid,
+                                )?
                             }
                         }
                     }
@@ -1846,6 +1878,7 @@ fn ensure_no_collisions(
         // No volume is registered, so the folder strings themselves are the only
         // thing two declarations could share.
         let candidate_components = folder_components("folder", &candidate.folder)?;
+        let candidate_label = format!("{}/{}", candidate.namespace, candidate.area);
         for document in stored {
             if document.namespace == candidate.namespace && document.area == candidate.area {
                 continue;
@@ -1854,7 +1887,7 @@ fn ensure_no_collisions(
             refuse_overlap(
                 &format!("{}/{}", document.namespace, document.area),
                 &existing,
-                "folder",
+                &candidate_label,
                 &candidate_components,
             )?;
         }
@@ -2972,6 +3005,7 @@ mod tests {
         swap_target: Option<PathBuf>,
         swap_moved: Option<PathBuf>,
         swapped: RefCell<bool>,
+        competing_create: Option<String>,
     }
 
     impl Adjust {
@@ -3000,6 +3034,14 @@ mod tests {
         fn with_device_shift(mut self, name: &str, device: DeviceId) -> Self {
             self.shifted_device_name = Some(name.to_owned());
             self.shifted_device = Some(device);
+            self
+        }
+
+        /// A competing creator wins the `mkdir` race for `name` and the path
+        /// fails with the platform's own error, exactly as a concurrent
+        /// creator's `EEXIST` looks to the loser.
+        fn with_competing_create(mut self, name: &str) -> Self {
+            self.competing_create = Some(name.to_owned());
             self
         }
 
@@ -3062,6 +3104,15 @@ mod tests {
         }
 
         fn create_child_dir(&self, parent: &DirHandle, name: &str, mode: u32) -> Result<DirId> {
+            if self.competing_create.as_deref() == Some(name) {
+                // The competing creator's directory exists; this caller lost the
+                // race and sees the platform's refusal.
+                self.inner.create_child_dir(parent, name, mode)?;
+                return Err(Error::new(
+                    ErrorKind::Io,
+                    "a competing creator already made this directory",
+                ));
+            }
             self.inner.create_child_dir(parent, name, mode)
         }
 
@@ -4388,5 +4439,114 @@ mod tests {
         let reading = read_holds(&fixture.state, &observer, &root.root_id).expect("the holds read");
         assert_eq!(reading.holds[0].1, HoldState::Unknown);
         assert!(!reading.is_idle(), "an unknown hold blocks idleness");
+    }
+    #[test]
+    fn a_component_swapped_behind_a_competing_create_is_refused_not_adopted() {
+        let fixture = Fixture::new("area-competing-create");
+        let declaration = fixture.declaration("example/pool");
+        std::fs::create_dir_all(fixture.root.join("example")).expect("the parent exists");
+        let pool = fixture.root.join("example/pool");
+        let moved = fixture.root.join("example/pool-moved");
+        // The competing creator wins the mkdir, then the entry it left behind is
+        // swapped between the check and the open. The adoption must refuse it.
+        let dirs = Adjust::swapping("pool", &pool, &moved).with_competing_create("pool");
+        let resolved = fixture.resolved(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        let error = super::create_root(
+            &dirs,
+            &observer,
+            &resolved,
+            RootSpec {
+                kind: RootKind::AreaRoot,
+            },
+        )
+        .expect_err("a swapped competing directory is refused");
+        assert_eq!(error.kind(), ErrorKind::RefusedContainment);
+        assert_eq!(
+            error.detail()["reason"],
+            "the component changed between the check and the open"
+        );
+        assert!(moved.is_dir(), "the competing directory is preserved");
+        assert!(pool.is_dir(), "the injected swap really replaced the entry");
+        let roots = std::fs::read_dir(&pool).expect("the area lists");
+        assert_eq!(
+            roots.count(),
+            0,
+            "no root was created inside a directory the walk did not prove"
+        );
+    }
+
+    #[test]
+    fn root_creation_proves_the_volume_before_creating_state_or_a_lock() {
+        let fixture = Fixture::new("root-volume-preflight");
+        fixture.register(&fixture.record);
+        let declaration = fixture.declaration("example/pool");
+        let platform = fixture.platform();
+        let mounts = fixture.mounts();
+        let observer = fixture.observer();
+        let lock = fixture.state.volume_lock_path(&fixture.uuid);
+        assert!(!lock.exists(), "the fixture starts with no volume lock");
+
+        let absent = fixture.absent_facts();
+        let error = super::create_root_on_volume(
+            &fixture.state,
+            &platform,
+            &absent,
+            &mounts,
+            &observer,
+            &fixture.uuid,
+            &declaration,
+            None,
+            RootSpec {
+                kind: RootKind::AreaRoot,
+            },
+        )
+        .expect_err("an absent volume refuses");
+        assert_eq!(error.kind(), ErrorKind::VolumeAbsent);
+        assert!(!lock.exists(), "an absent volume creates no volume lock");
+        assert!(
+            !fixture.root.join("example").exists(),
+            "an absent volume creates no folder"
+        );
+
+        let mismatched = fixture.mismatched_facts();
+        let error = super::create_root_on_volume(
+            &fixture.state,
+            &platform,
+            &mismatched,
+            &mounts,
+            &observer,
+            &fixture.uuid,
+            &declaration,
+            None,
+            RootSpec {
+                kind: RootKind::AreaRoot,
+            },
+        )
+        .expect_err("a different volume refuses");
+        assert_eq!(error.kind(), ErrorKind::VolumeMismatch);
+        assert!(!lock.exists(), "a mismatched volume creates no volume lock");
+        assert!(!fixture.root.join("example").exists());
+
+        // The same call succeeds once the volume is present, which proves the
+        // refusals above were the volume and not the fixture.
+        let present = fixture.facts();
+        let (volume, root) = super::create_root_on_volume(
+            &fixture.state,
+            &platform,
+            &present,
+            &mounts,
+            &observer,
+            &fixture.uuid,
+            &declaration,
+            None,
+            RootSpec {
+                kind: RootKind::AreaRoot,
+            },
+        )
+        .expect("the present volume creates the root");
+        assert_eq!(volume.record.volume_uuid, fixture.uuid);
+        assert!(root.path.is_dir());
+        assert!(lock.exists(), "a successful creation takes the volume lock");
     }
 }

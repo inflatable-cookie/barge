@@ -655,3 +655,70 @@ fn area_hold_and_release_record_and_remove_one_hold() {
     );
     assert_eq!(stdout_document(&output)["data"]["released"], false);
 }
+
+#[test]
+fn a_registered_but_absent_volume_refuses_creation_before_taking_a_lock() {
+    let (fixture, state_dir) = absent_state_dir("area-absent-volume");
+    let mount = fixture.join("absent-volume");
+    let registry = serde_json::json!({
+        "schema": "barge.registry/1",
+        "volumes": [{
+            "volume_uuid": "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "mount_hint": mount,
+            "availability": "permanent",
+            "durability": "expendable",
+            "root_dir": "",
+            "folders": {"scratch": null, "caches": null},
+            "origin": "declared",
+            "scratch_grants": {"delegations": [], "claims": []},
+            "generation": 1,
+            "registered_ms": 1792525019847_u64
+        }]
+    });
+    std::fs::create_dir_all(&state_dir).expect("the fixture state directory exists");
+    std::fs::write(
+        state_dir.join("registry.json"),
+        serde_json::to_vec(&registry).expect("the registry encodes"),
+    )
+    .expect("the registry is written");
+    let output = run_area(&declare_args("example", "pool", "example/pool"), &state_dir);
+    assert_eq!(output.status.code(), Some(0), "the area declares");
+
+    let output = run_area(
+        &[
+            "root",
+            "create",
+            "--namespace",
+            "example",
+            "--area",
+            "pool",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "--kind",
+            "area_root",
+        ],
+        &state_dir,
+    );
+    assert_area_refusal(&output, 2, "volume_absent");
+    let output = run_area(
+        &[
+            "root",
+            "list",
+            "--namespace",
+            "example",
+            "--area",
+            "pool",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+        ],
+        &state_dir,
+    );
+    assert_area_refusal(&output, 2, "volume_absent");
+    assert!(
+        !state_dir
+            .join("locks/volume-A6AC3ED7-33EA-46B4-8082-7254CF291ED2.lock")
+            .exists(),
+        "an absent volume creates no lock file"
+    );
+    assert!(!mount.exists(), "the absent mount point is never recreated");
+}

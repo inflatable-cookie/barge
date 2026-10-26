@@ -1146,10 +1146,11 @@ Choices S3 made where this design left the mechanic to the slice:
   nonce, and the SHA-256 of the exact marker bytes. The digest is computed by one
   small in-crate SHA-256 (`digest`), because the workspace pins its dependencies
   exactly and stage 1 needs one digest rather than a cryptography surface; S5's
-  replay re-reads the same bytes and digest. `read_marker` re-checks the digest
-  by validating the bytes it read, the private mode, the owner, the volume, the
-  walked path, the id and nonce shapes and the timestamps, and reports everything
-  else as `unknown`.
+  replay re-reads the same bytes and digest. `read_marker` validates every field
+  of the bytes it read — the private mode, the owner, the volume, the walked
+  path, the id and nonce shapes and the timestamps — and reports everything else
+  as `unknown`; it compares no digest, because the expected digest belongs to the
+  caller that recorded the root, and S5's replay is that caller.
 - **The walk and folder creation.** Resolution steps from the verified mount
   root through `root_dir` and then the effective folder (an override for the
   volume, else the declared folder). Each component is read with `lstat`, refused
@@ -1157,8 +1158,12 @@ Choices S3 made where this design left the mechanic to the slice:
   no-follow, and its opened identity compared with the checked one. The first
   absent component ends the walk; `create_root` creates the rest as plain `0755`
   directories and the root as `0700`, exclusively. An existing component is only
-  adopted when it is this account's directory on this volume, and a name that is
-  already taken is retried with a fresh id rather than adopted.
+  adopted when it is this account's directory on this volume, and every adoption
+  path — the named one and the one after a lost `mkdir` race — opens the
+  component and compares its opened identity with the checked one, so a
+  directory swapped in behind a competing creator is refused rather than
+  adopted. A root name that is already taken is retried with a fresh id rather
+  than adopted.
 - **Collisions.** A declaration is checked on every registered volume: equality
   and nesting between two declarations and against the resolved `scratch/` and
   `caches/` folders (overrides included) are refused as `refused_containment`;
@@ -1197,7 +1202,9 @@ Choices S3 made where this design left the mechanic to the slice:
   `barge.area.release/1`. The declaration, marker and hold formats stay
   `barge.area/1`, `barge.root/1` and `barge.hold/1`, and are reported in
   `formats`. Every mutating verb reads the registry first and refuses an invalid
-  one before any effect, including creating the state layout.
+  one before any effect, including creating the state layout; a volume-scoped
+  verb also proves the volume is present and is the recorded one, and that its
+  durability is declared, before that layout or any lock file is created.
 - **Bounds as applied.** A declaration is at most 64 KiB with 128 rows; a marker
   and a hold record are 4 KiB each; a root carries at most 64 holds; a root
   listing keeps 4096 rows and examines at most 200 000 names, reporting
