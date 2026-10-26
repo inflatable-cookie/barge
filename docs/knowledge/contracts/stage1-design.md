@@ -1121,6 +1121,95 @@ Choices S2 made where this design left the mechanic to the slice:
   `schema`; it is not added to the `formats` list, so S2 leaves
   `barge.describe/1`'s field set unchanged.
 
+- **S3** landed on `main` with this note: path containment and the
+  descriptor walk from a verified volume root; `barge.area/1` declaration
+  validation and persistence; owned roots with their strict `barge.root/1`
+  markers; cooperative holds (`barge.hold/1`); bounded root listing; and the
+  `barge area` verbs (`declare`, `show`, `list`, `root create`, `root list`,
+  `hold`, `release`). S3 deletes, prunes and moves nothing, and every fixture
+  lives under one temporary directory: the tests use injected volume facts over
+  real local directories, and no test reads or writes a real drive or the real
+  account state.
+
+Choices S3 made where this design left the mechanic to the slice:
+
+- **Marker shape.** The marker's top-level field set is exactly the one above.
+  The nested `area` object carries the pinned `namespace` and `area` and one
+  optional `effective`, which records the effective declaration applied at
+  creation (folder, absent policy, prune policy, reserve participation) exactly
+  as O-003 asks. A marker without `effective` (the pinned two-field form) is
+  valid and owns the root's identity only; a missing value never widens a
+  policy. The effective declaration is the caller's; a stored declaration that
+  differs is reported (`stored_differs: true`) and still never substituted.
+- **Root identity.** `create_root` returns the root directory's device and inode
+  read through the created descriptor, the verified volume UUID, the root id and
+  nonce, and the SHA-256 of the exact marker bytes. The digest is computed by one
+  small in-crate SHA-256 (`digest`), because the workspace pins its dependencies
+  exactly and stage 1 needs one digest rather than a cryptography surface; S5's
+  replay re-reads the same bytes and digest. `read_marker` validates every field
+  of the bytes it read — the private mode, the owner, the volume, the walked
+  path, the id and nonce shapes and the timestamps — and reports everything else
+  as `unknown`; it compares no digest, because the expected digest belongs to the
+  caller that recorded the root, and S5's replay is that caller.
+- **The walk and folder creation.** Resolution steps from the verified mount
+  root through `root_dir` and then the effective folder (an override for the
+  volume, else the declared folder). Each component is read with `lstat`, refused
+  if it is not a real directory of this account on this device, opened with
+  no-follow, and its opened identity compared with the checked one. The first
+  absent component ends the walk; `create_root` creates the rest as plain `0755`
+  directories and the root as `0700`, exclusively. An existing component is only
+  adopted when it is this account's directory on this volume, and every adoption
+  path — the named one and the one after a lost `mkdir` race — opens the
+  component and compares its opened identity with the checked one, so a
+  directory swapped in behind a competing creator is refused rather than
+  adopted. A root name that is already taken is retried with a fresh id rather
+  than adopted.
+- **Collisions.** A declaration is checked on every registered volume: equality
+  and nesting between two declarations and against the resolved `scratch/` and
+  `caches/` folders (overrides included) are refused as `refused_containment`;
+  with no registered volume the folder strings are compared. That is the
+  "outside every managed folder" predicate kept placements will use in S6;
+  nothing in S3 depends on the O-004 reading further than this.
+- **Holds.** `barge.hold/1` records the root id, holder id, pid, the platform's
+  process start identity, the boot identity, scope, purpose and time. Reading
+  decides `live` when the boot and start identity match, `stale` only when the
+  recorded process positively disagrees (a changed boot, a gone pid, or a reused
+  pid with a different start identity), and `unknown` when a fact cannot be read
+  (unreadable record, foreign-owned, non-regular or non-private file, unknown
+  version, unreadable start identity). A live or unknown hold makes a root not idle; only stale and
+  absent holds leave it idle. Holds are capped at 64 per root and written under
+  the root lock, after the registry read, atomically and privately. The CLI's
+  `area hold` records a hold by root id (the id the root's creator has); the
+  ownership and marker re-verification before a destructive step is S5's custody,
+  not this record.
+- **`describe`.** `barge.describe/1` gains a `roots` list (optional on read via
+  `#[serde(default)]`, so a document written before S3 still reads) whose rows
+  carry the marker's recorded path and the path the current configuration
+  resolves, the marker state and the root's holds. Its `areas` rows are now
+  filled from the stored declarations. Listing a root walks the configured
+  resolution only: after a `root_dir` change the old root is not visible under
+  the new configuration, is never moved or recreated, and only the later explicit
+  relocation command can move it. A volume that cannot be verified is skipped by
+  the root listing and stays visible in the volume rows, so `describe` remains
+  usable with a drive unplugged.
+- **Semantic kinds.** `RootKind` is `scratch_run`, `cache_root` or `area_root`;
+  `RootOrigin` is `created` (S3) or `adopted_existing` (S6). A conclusion is
+  recorded only on a `scratch_run` marker, so an area or cache root carrying one
+  is unknown.
+- **Command documents.** The area verbs name their own envelopes:
+  `barge.area.declare/1`, `barge.area.show/1`, `barge.area.list/1`,
+  `barge.area.root.create/1`, `barge.area.root.list/1`, `barge.area.hold/1` and
+  `barge.area.release/1`. The declaration, marker and hold formats stay
+  `barge.area/1`, `barge.root/1` and `barge.hold/1`, and are reported in
+  `formats`. Every mutating verb reads the registry first and refuses an invalid
+  one before any effect, including creating the state layout; a volume-scoped
+  verb also proves the volume is present and is the recorded one, and that its
+  durability is declared, before that layout or any lock file is created.
+- **Bounds as applied.** A declaration is at most 64 KiB with 128 rows; a marker
+  and a hold record are 4 KiB each; a root carries at most 64 holds; a root
+  listing keeps 4096 rows and examines at most 200 000 names, reporting
+  `truncated` and counts when it stops early.
+
 ## Proposed validation
 
 Design-only validation for this contract is `effigy docs:check` once, run from
