@@ -610,11 +610,13 @@ pub enum PlatformStatus {
     },
 }
 
-/// The most platform-verified blind-spot processes one scan records in detail.
+/// The most blind-spot processes one scan records.
 ///
-/// The scan counts every one of them and records the first
-/// [`BLIND_SPOT_RECORDS`] in scan order, so the record stays bounded without
-/// hiding how many there were.
+/// Every one of them is recorded, and a scan that meets more than this bound
+/// refuses instead of dropping the surplus: a bounded record that silently
+/// narrows is worse than a refusal, because the `Safe` evidence would count
+/// processes it no longer names. The measured hosts need far fewer (Q-008: eight
+/// processes of this account on macOS 26.6.2).
 pub const BLIND_SPOT_RECORDS: usize = 32;
 
 /// One process the platform verified as a platform binary, whose vnode
@@ -644,31 +646,42 @@ pub struct PlatformBlindSpot {
 /// descriptor paths the platform hides.
 ///
 /// The platform flag was verified for every process recorded here, which is what
-/// makes the count evidence rather than a claim.
+/// makes the count evidence rather than a claim. `records` holds **every**
+/// process `processes` counts — the record is never truncated — but it is
+/// bounded: a scan that meets more than [`BLIND_SPOT_RECORDS`] of them cannot
+/// report them all, so it answers unknown instead of dropping one and claiming
+/// the rest.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlindSpotEvidence {
     /// How many same-uid processes the scan verified as platform binaries with at
-    /// least one opaque vnode descriptor.
+    /// least one opaque vnode descriptor. Always `records.len()`.
     pub processes: usize,
     /// How many vnode descriptors the platform hid on them, in total.
     pub opaque_descriptors: usize,
-    /// The bounded record of those processes, in scan order: at most
-    /// [`BLIND_SPOT_RECORDS`] entries.
+    /// The record of those processes, in scan order: one entry per counted
+    /// process, and never more than [`BLIND_SPOT_RECORDS`].
     pub records: Vec<PlatformBlindSpot>,
 }
 
 impl BlindSpotEvidence {
-    /// Record one verified platform binary: the counts always grow, the record
-    /// list stays bounded.
-    pub fn record(&mut self, record: PlatformBlindSpot) {
-        self.processes = self.processes.saturating_add(1);
+    /// Record one verified platform binary.
+    ///
+    /// `false` means the record is full: this process could not be kept, so the
+    /// evidence would be incomplete and the scan must answer unknown rather than
+    /// report a partial record as complete. A dropped blind-spot process is
+    /// exactly the silently narrowing evidence custody must never produce.
+    #[must_use = "an unrecorded blind spot makes the evidence incomplete, so the scan must refuse"]
+    pub fn record(&mut self, record: PlatformBlindSpot) -> bool {
+        if self.records.len() >= BLIND_SPOT_RECORDS {
+            return false;
+        }
         self.opaque_descriptors = self
             .opaque_descriptors
             .saturating_add(record.opaque_descriptors);
-        if self.records.len() < BLIND_SPOT_RECORDS {
-            self.records.push(record);
-        }
+        self.records.push(record);
+        self.processes = self.processes.saturating_add(1);
+        true
     }
 }
 

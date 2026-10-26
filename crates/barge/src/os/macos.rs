@@ -23,7 +23,7 @@ use crate::os::facts::{
     DescriptorScanRequest, DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, FileSystem,
     MountPoint, MountRoot, OpenDescriptor, PlatformBlindSpot, PlatformStatus, ProcessIdentity,
     ProcessObserver, RemoveKind, RetriedUnreadable, RetryEvidence, RetryResolution, VolumeFacts,
-    VolumeIdentity, VolumeUuid,
+    VolumeIdentity, VolumeUuid, BLIND_SPOT_RECORDS,
 };
 
 /// The parent every managed volume mounts directly under.
@@ -560,12 +560,23 @@ impl MacOs {
             // skip.
             match self.platform_status(identity, faults) {
                 Ok(PlatformStatus::PlatformBinary { command }) => {
-                    os_blind_spot.record(PlatformBlindSpot {
+                    let recorded = os_blind_spot.record(PlatformBlindSpot {
                         pid,
                         start: identity.start,
                         command,
                         opaque_descriptors: opaque,
                     });
+                    // The evidence names every blind-spot process or none: a
+                    // process that did not fit would make a `Safe` verdict count
+                    // evidence it cannot show, so the scan refuses instead.
+                    if !recorded {
+                        return Ok(DescriptorScan::Unreadable {
+                            reason: format!(
+                                "the scan met more than {BLIND_SPOT_RECORDS} platform-verified processes whose vnode descriptors the platform hides, and its record holds every one of them or none: pid {pid} did not fit, so the evidence would be incomplete"
+                            ),
+                            retry: retry.clone(),
+                        });
+                    }
                 }
                 Ok(PlatformStatus::NotVerified { reason }) => {
                     return Ok(DescriptorScan::Unreadable {

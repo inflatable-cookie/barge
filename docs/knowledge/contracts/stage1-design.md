@@ -1349,7 +1349,8 @@ Choices S5 made where this design left the mechanic to the slice:
   that read. The scan then records the process (pid, start identity, command,
   count of hidden descriptors) and does not block; every readable descriptor of
   that same process is still matched against the root, so one inside it still
-  makes the verdict `Unsafe`. Everything else is unchanged and refuses with
+  makes the verdict `Unsafe`. The record names every such process, bounded at 32
+  of them: meeting more is `Unknown`, not a shorter list. Everything else is unchanged and refuses with
   `Unknown`: a process that is not a platform binary, a `csops` failure or an
   unreadable status, a start identity that changes around the read, and any other
   unreadable fact. There are no path or name lists, a foreign effective uid keeps
@@ -1367,9 +1368,11 @@ Choices S5 made where this design left the mechanic to the slice:
   listing including the terminal one, identity changes and resolution, so the
   next native diagnostic can tell an intermittent answer from a persistent one.
   It also records `os_blind_spot`: how many platform-verified processes had
-  hidden vnode descriptors, how many descriptors were hidden in total, and at
-  most 32 bounded records with the pid, kernel start identity, command and
-  hidden-descriptor count of each, which is the OS blind spot above. **Every**
+  hidden vnode descriptors, how many descriptors were hidden in total, and the
+  record of **every** one of them with its pid, kernel start identity, command
+  and hidden-descriptor count, which is the OS blind spot above. That record is
+  bounded at 32 processes but never truncated: a scan that meets more refuses,
+  because a `Safe` verdict must not count a blind-spot process it cannot name. **Every**
   verdict carries that retry record, not only `Safe`: an
   `Unsafe` or `Unknown` verdict keeps it, and the `custody_not_proven` failure
   puts it in its `detail` (`retried_unreadable` and `retried`), because a refusal
@@ -1406,7 +1409,8 @@ Choices S5 made where this design left the mechanic to the slice:
   descriptors are `safe` with the blind spot recorded, the same fixture without
   the platform flag refuses, a `csops` failure refuses, a start identity that
   changes around the read refuses, a platform binary whose readable descriptor
-  lies inside the root is `unsafe`, and a real-observer test reads the kernel's
+  lies inside the root is `unsafe`, a scan that meets more than the 32-process
+  record bound refuses rather than drop one, and a real-observer test reads the kernel's
   own table to verify one live same-uid platform binary and to show that this
   locally built test binary is not one. The deadline checks are also unit-tested on their own: a projection
   that would end past either bound is not taken, a delayed wake past either bound
