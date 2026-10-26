@@ -102,7 +102,7 @@ that contradicts a row is a defect against this table.
 | --- | --- |
 | The registered reserve is a **prune trigger**, not a stop. | [The reserve is a trigger and the floor is the stop](#the-reserve-is-a-trigger-and-the-floor-is-the-stop): at or below the reserve Barge prunes, then admits if nothing idle is left. |
 | **Only the hard floor stops work**, default 10 GiB, a registration field; a floor above the reserve wins. | The same section's decision table; the stop line is the floor alone, and the prune `target` is above `max(reserve, floor)`. |
-| Below the floor with nothing idle left, a **new command refuses** and a **running one stops**, with a message naming free space, floor, reserve and whether non-Barge data is the cause. | `barge.space.guard/1`'s completed stop and its no-effect refusal (both carry the same message and detail), and [the exit-code rules](#the-stop-the-refusal-and-the-exit-code); [rechecking while work runs](#rechecking-while-work-runs). |
+| Below the floor with nothing idle left, a **new command refuses** and a **running one stops**, with a message naming free space, floor, reserve and whether non-Barge data is the cause. | `barge.space.guard/1`'s completed stop and `barge.error/1`'s `space_below_floor` no-effect refusal (both carry the same message and detail), and [the exit-code rules](#the-stop-the-refusal-and-the-exit-code); [rechecking while work runs](#rechecking-while-work-runs). |
 | Low free space on a **present** volume never silently redirects work to the internal SSD. The drive-absent fallback is a separate, declared per-area policy. | [No low-space internal fallback](#no-low-space-internal-fallback), including the type-level absence of a fallback decision. |
 | An area's **soft cap counts that area's own bytes only**; caches, scratch and other data never count against it. | [The area soft-cap boundary](#the-area-soft-cap-boundary): Barge reports area bytes by root identity and never enforces a cap. |
 | Prune the **least-recently-used idle owned roots across areas**, by each area's declared policy. | [Idleness, activity and least-recently-used order](#idleness-activity-and-least-recently-used-order) and [pruning under the reserve](#pruning-under-the-reserve). |
@@ -203,12 +203,16 @@ Rules:
   `unknown_state` naming the missing policy. This mirrors `durability:
   undeclared`, which is likewise never inferred: a stop line is a safety
   threshold, and an absent threshold is not "no threshold".
-- **The policy is optional in the format and required in effect.** Adding the
-  field keeps `barge.registry/1` readable by the build that already reads it, and
-  a build that predates the field refuses the registry as `unknown_state` rather
-  than silently dropping a declared stop line. The alternative (bumping to
-  `barge.registry/2`) buys nothing: no consumer reads a registry, and refusing is
-  the conservative direction for a downgrade.
+- **The policy is optional in the format and required in effect, and it is a
+  forward-only addition.** `barge.registry/1` permits an optional field inside a
+  major, but the reader is strict (`deny_unknown_fields`), so a build that does
+  not know `space` **refuses** the record as `unknown_state` rather than reading
+  it and ignoring the policy. No build therefore ever reads a registry that
+  carries a declared stop line while acting as if it had none, which is the
+  direction a threshold must fail in. Writing `space` needs the build that owns
+  this contract; the alternative (a new `barge.registry/2` major) buys nothing,
+  because no consumer reads a registry and the old major would have to stay
+  readable for at least one slice carrying no policy at all.
 - **Oxide's `reserve_bytes` is never imported.** Oxide's field means the
   opposite thing — its selection refuses a volume at or below it and falls back
   to the internal pool. Importing it as Barge's reserve would turn a stop into a
@@ -324,18 +328,23 @@ check against the ruling:
 
 ### The stop, the refusal and the exit code
 
-A low-space outcome has two shapes, and which one applies is decided by whether
-the pass changed anything. Stage 1's exit codes already say it; this stage must
-not bend them:
+A low-space outcome has two shapes — a stop and a refusal — plus the unsettled
+case, and which stop shape applies is decided by whether the pass changed
+anything. Stage 1's exit codes already say it; this stage must not bend them:
 
 | Outcome | Envelope | Exit | When |
 | --- | --- | --- | --- |
-| **Completed stop** | `ok: true`, `data.decision: "stop_below_floor"` | `0` | the pass deleted at least one root and the floor is still breached. Stage 1's `0` is exactly "the command completed and its report says what it did". |
-| **No-effect refusal** | `ok: false`, `kind: "space_below_floor"` | `2` | the pass deleted nothing at all — nothing was eligible, or every candidate failed its re-verification — and the floor is breached. Nothing changed, so "refused before any effect" is literally true. |
-| **Unsettled state** | `ok: false`, `kind: "unknown_state"` | `3` | the pass left a pending intent, or the measurement, flush, policy or registry became unknown. `detail` names the pending intent id or the unknown fact, and `detail.pruned_root_ids` reports anything already deleted. |
+| **Completed stop** | `barge.space.guard/1`, `data.decision: "stop_below_floor"` | `0` | the pass deleted at least one root and the floor is still breached. Stage 1's `0` is exactly "the command completed and its report says what it did". |
+| **No-effect refusal** | `barge.error/1`, `kind: "space_below_floor"` | `2` | the pass deleted nothing at all — nothing was eligible, or every candidate failed its re-verification — and the floor is breached. Nothing changed, so "refused before any effect" is literally true. |
+| **Unsettled state** | `barge.error/1`, `kind: "unknown_state"` | `3` | the pass left a pending intent, or the measurement, flush, policy or registry became unknown. `detail` names the pending intent id or the unknown fact, and `detail.pruned_root_ids` reports anything already deleted. |
 
 Rules:
 
+- The two shapes are **different documents**, not one document with two
+  meanings: effects are always a `barge.space.guard/1` success, and refusals are
+  always stage 1's `barge.error/1`. There is no `ok: false`
+  `barge.space.guard/1` document, and no `barge.error/1` document carries a
+  `decision` or a `pruned` row set.
 - `space_below_floor` is the one new value in `barge.error/1`'s closed `kind`
   set, and it is used **only** for the no-effect refusal. A guard that pruned and
   then stopped must not claim "refused before any effect" while its own report
@@ -344,9 +353,10 @@ Rules:
   unsettled delete is `unknown_state` at exit `3`, which is what stage 1 already
   means by "a pending intent or unknown state that needs a human".
 - The stop signal a consumer reads is `decision: "stop_below_floor"` in a
-  success document, or `kind: "space_below_floor"` or `kind: "unknown_state"` in
-  an error document. A consumer must never infer a stop from the exit code alone,
-  because `0` also carries a completed stop.
+  `barge.space.guard/1` success document, or `kind: "space_below_floor"` or
+  `kind: "unknown_state"` in a `barge.error/1` document. A consumer must never
+  infer a stop from the exit code alone, because `0` also carries a completed
+  stop.
 - The message and the attribution detail are identical in both shapes, so a
   consumer's message never depends on which one it received.
 
@@ -703,8 +713,9 @@ barge space recheck --guard <token> --json     # or space::recheck(&guard)
   pruning with nothing eligible left. A stop takes the shape
   [the exit-code rules](#the-stop-the-refusal-and-the-exit-code) require: a
   completed stop (`ok: true`, `data.decision: "stop_below_floor"`, exit `0`) when
-  the recheck's prune deleted something, a no-effect refusal
-  (`space_below_floor`, exit `2`) when it deleted nothing. It carries the same
+  the recheck's prune deleted something, a no-effect refusal in stage 1's
+  `barge.error/1` envelope (`space_below_floor`, exit `2`) when it deleted nothing.
+  It carries the same
   message and attribution detail as the admission stop.
 - The contract on the consumer is one sentence: **a consumer that writes bulk
   data calls `recheck` at its own checkpoints and stops on `stop`.** The
@@ -737,7 +748,8 @@ This is the ruling most easily broken by accident, so it is carried four ways.
 2. **A low-space stop never names an internal path**, in either shape. The message
    names the free, floor and reserve figures and states that no work went to the
    internal drive. A completed stop is a success document with `decision`
-   `stop_below_floor`; a no-effect refusal is `space_below_floor` at exit `2`.
+   `stop_below_floor`; a no-effect refusal is a `barge.error/1` document with
+   `kind: space_below_floor` at exit `2`.
    Neither is allowed to carry a path the consumer could write to.
 3. **A no-effect refusal changes nothing first** — the name is accurate: no
    directory, no marker, no state file, no link, no mount point. A pass that did
@@ -794,13 +806,13 @@ rows, `unknown` never read as absent or default.
 
 | Format | Kind | Change in stage 3 |
 | --- | --- | --- |
-| `barge.registry/1` | authoritative, account state | **optional** `space` object on a volume record (above); absent means undeclared. |
+| `barge.registry/1` | authoritative, account state | **optional** `space` object on a volume record (above); absent means undeclared. A reader that predates the field is strict and refuses the record as `unknown_state`. |
 | `barge.activity/1` | authoritative, account state | **new**: one per root, `state/activity/<root-id>.json`. |
 | `barge.area/1` | authoritative, account state | unchanged shape; this contract defines what `reserve` means. |
 | `barge.space/1` | report, read-only | **new**: per-volume measurement, policy, state, attribution and area bytes. |
-| `barge.space.guard/1` | decision document | **new**: the admission and recheck result, with measurement, pruned roots, reclaimed bytes, cause, message and a `decision` of `admit`, `admit_below_reserve`, `continue` or `stop_below_floor`. |
+| `barge.space.guard/1` | decision document | **new**: the admission and recheck result, with measurement, pruned roots, reclaimed bytes, cause, message and a `decision` of `admit`, `admit_below_reserve`, `continue` or `stop_below_floor`. A stop that deleted something is this success document; every refusal is `barge.error/1`. |
 | `barge.space.prune/1` | plan and report | **new**: ordered candidates with identity digests, the plan's SHA-256, and the executed result. |
-| `barge.error/1` | report | one new `kind`, `space_below_floor`, used only for a no-effect refusal; an unsettled delete is `unknown_state` at exit `3`. |
+| `barge.error/1` | report | the only envelope for a refusal, including this command's: one new `kind`, `space_below_floor`, used only for a no-effect refusal; an unsettled delete is `unknown_state` at exit `3`. |
 | `barge.describe/1` | report | optional additions: a `space` row set and the new format names in `formats`; absent in an older document is valid. |
 | `barge.root/1`, `barge.hold/1`, `barge.intent/1` | authoritative | unchanged. This stage adds no field to a marker, a hold or an intent. |
 
@@ -891,11 +903,13 @@ something:
 }
 ```
 
-A no-effect refusal is the error envelope with the same `message` and `detail`
-fields, and no `pruned` rows:
+A **no-effect** refusal is not a guard document: it is stage 1's ordinary error
+envelope, `barge.error/1`, naming the command and carrying the same `message` and
+`detail` fields, with no `decision`, no `pruned` rows and no `barge.space.guard/1`
+schema:
 
 ```json
-{"schema": "barge.space.guard/1", "command": "space guard", "ok": false,
+{"schema": "barge.error/1", "command": "space guard", "ok": false,
  "error": {"kind": "space_below_floor", "message": "…", "detail": {"…": "…"}}}
 ```
 
@@ -906,11 +920,15 @@ the roots this call deleted, in delete order;
 `reclaimed_bytes` is the measured difference across the pass, not a sum of
 recorded root sizes. `decided_after_wait` is true when another prune held the
 volume lock past the lock wait, so this call decided on a fresh measurement
-without pruning. An unsettled delete is `kind: "unknown_state"` at exit `3` with
-`detail.pending_intent` naming the intent id and `detail.pruned_root_ids`
-naming anything already deleted. Whether a document is an error or a success is
-stage 1's envelope rule; the `decision` value repeats it for readers that log only
-successes.
+without pruning. An unsettled delete is a `barge.error/1` document with
+`kind: "unknown_state"` at exit `3`, `detail.pending_intent` naming the intent id
+and `detail.pruned_root_ids` naming anything already deleted.
+
+Everything this command completes is a `barge.space.guard/1` success document,
+including a stop that deleted something. Everything it refuses or cannot decide
+is a `barge.error/1` document, whose closed `kind` set this stage extends by
+`space_below_floor` and no more. A consumer reads one schema for effects and the
+other for refusals, and never the same schema with two meanings.
 
 ### `barge.space.prune/1`
 
@@ -984,6 +1002,7 @@ data, marker and record are unchanged and reported.
 | Unlinked-but-open file by a foreign writer | same as above | same; the cause is named as undecidable |
 | Free space fell again between flush and decision | the deciding measurement itself | the decision uses the deciding measurement; a recheck re-measures; no cached number is reused |
 | Two guards at once on one volume | the volume lock, held by the pass | the second waits ≤ 5 s, re-measures without the lock and decides (`decided_after_wait`); it never prunes, so the two can never delete the same root |
+| A guard needs to prune and cannot take the volume lock | the lock wait expires with a live owner | it prunes nothing, re-measures without the lock and applies the decision table to that measurement: `admit`/`admit_below_reserve` on it, or the no-effect `space_below_floor` refusal when `F <= L`; `decided_after_wait` names the wait; it never deletes and never returns `locked` |
 | Two guards on two volumes | per-volume lock | both proceed; no global lock |
 | A consumer's `hold` while the prune already holds that root's lock | root lock held by the prune | the hold waits for the lock up to its own deadline, then fails `locked`; nothing is written into the root and the prune completes its verified delete |
 | A consumer's `hold` recorded before the prune takes that root's lock | the hold file read under the root lock at the effect step | skip the root and report it as `held`; the hold stays valid and the consumer writes normally; no partial delete |
@@ -1064,7 +1083,7 @@ these are proposed for the slices below, not run by this design task.
 | Area | Unit | Counterfactual |
 | --- | --- | --- |
 | Measurement | `fstatfs` mapping to free/total with checked multiply; `source` and `observed_ms` always present; purgeable reported as unknown | an absent field, an overflow and a `None` all yield `unknown` and a refusal, never zero; `f_bfree` never decides; a different volume at the mount point is `volume_mismatch` |
-| Policy record | optional `space` read/write; default floor written explicitly; generation increases; `--plan` digest | an absent `space` refuses a space-gated decision and still reports; `floor_bytes == 0`, `reserve_bytes == 0` and a floor above `total_bytes` refuse at registration with nothing written; a floor below the default is reported, not silently raised |
+| Policy record | optional `space` read/write; default floor written explicitly; generation increases; `--plan` digest | an absent `space` refuses a space-gated decision and still reports; a strict reader that predates the field refuses a registry carrying `space` as `unknown_state` rather than reading it without the policy; `floor_bytes == 0`, `reserve_bytes == 0` and a floor above `total_bytes` refuse at registration with nothing written; a floor below the default is reported, not silently raised |
 | Decision table | every cell of the table, with `R < L`, `R == L` and `R > L`; and the envelope each outcome takes | `F` just above `R` with `L > R` stops (the floor wins); `F <= R` with nothing eligible admits with the below-reserve warning; `F <= L` with a candidate that reclaims nothing yields a **completed stop** (`ok: true`, `decision: stop_below_floor`, exit `0`, `space_not_reclaimed`) because it deleted something, while the same floor with nothing eligible yields the `space_below_floor` no-effect refusal (exit `2`); a completed stop is never encoded as a `space_below_floor` error, and a no-effect refusal never lists a pruned root |
 | Idleness | the eligible/ineligible matrix over marker, activity, hold and participation | missing activity, unreadable hold, live pid with mismatched start identity, future timestamp, foreign marker, other device, unconcluded scratch and `excluded` area roots each stay kept and reported |
 | LRU order | release, then created, then id ordering; stable across areas | two roots in different areas: the older release goes first; equal releases fall to `first_created_ms` and then `root_id`; a held older root in front is skipped, not deferred silently |
@@ -1075,7 +1094,7 @@ these are proposed for the slices below, not run by this design task.
 | Registration | register/update/describe documents and errors | an absent volume, an unverified UUID and a malformed size each refuse with nothing written; a concurrent update loses nothing (generation) |
 | Fallback exclusion | `SpaceDecision` has no fallback variant; a present volume's area resolution never returns a local path | a low-space decision on a present volume never yields a path; a fallback root present while its volume is present is reported `fallback_while_present` |
 | Soft cap | `area_bytes` sums that area's roots only | two areas on one volume: adding scratch, cache and a second area's bytes never changes the first area's `area_bytes` |
-| Contacts | every document matches its schema; unknown major refuses; optional addition accepted | a `barge.space/1` document with a removed field or changed type is refused by its own reader; an older `describe` without `space` is valid |
+| Contacts | every document matches its schema; unknown major refuses; optional addition accepted | a `barge.space/1` document with a removed field or changed type is refused by its own reader; an older `describe` without `space` is valid; a no-effect refusal is a `barge.error/1` document and a stop that pruned is a `barge.space.guard/1` success, and each reader refuses the other's schema |
 
 ## One bounded native design
 
