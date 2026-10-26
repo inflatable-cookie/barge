@@ -141,6 +141,7 @@ class Proof:
         self.whole_disk = None
         self.uuid = None
         self.results = []
+        self.case_evidence = []
         self.fault = None
         self.attached = False
         self.env = None
@@ -217,6 +218,12 @@ class Proof:
             return json.load(handle)["volumes"][0]["scratch_grants"]
 
     # -- the CLI ----------------------------------------------------------
+
+    def retain_evidence(self, case, document):
+        """Retain one failure's decision evidence on the receipt."""
+        evidence = expiry_evidence(document)
+        self.case_evidence.append({"case": case, "at_ms": now_ms(), "evidence": evidence})
+        return evidence
 
     def barge(self, *args, expect=None, timeout=120):
         command = [self.binary, *args, "--json"]
@@ -371,7 +378,12 @@ class Proof:
         digest = document["data"]["plan_digest"]
         real = self.expire(digest)
         if real["data"]["deleted"]["count"] != 1:
-            raise Fault("case", f"the expiry deleted {real['data']['deleted']['count']} roots")
+            evidence = self.retain_evidence("a_synthetic_old_conclusion_expires", real)
+            raise Fault(
+                "case",
+                f"the expiry deleted {real['data']['deleted']['count']} roots; "
+                f"evidence {json.dumps(evidence, sort_keys=True)[:1500]}",
+            )
         if os.path.exists(root["path"]):
             raise Fault("case", "the expired root is still there")
         unconcluded = self.held["second"]["path"]
@@ -753,6 +765,7 @@ class Proof:
             "scratch_budget_mib": SCRATCH_MIB,
             "image_mib": IMAGE_MIB,
             "cases": self.results,
+            "case_evidence": self.case_evidence,
             "premises": PREMISES,
             "environment": sorted(ENVIRONMENT),
             "supervisor_sha256": SUPERVISOR_SHA256,
@@ -775,6 +788,48 @@ class Proof:
         finally:
             if self.root and os.path.isdir(self.root):
                 shutil.rmtree(self.root, ignore_errors=True)
+
+
+def expiry_evidence(document):
+    """The decision evidence of one `barge scratch expire` document.
+
+    A case that fails on a real expiry must say *why* the sweep kept its
+    candidate: the plan it recomputed, what it skipped and any pending intent.
+    The projection is fixed and small, so it can be carried in a case detail and
+    retained in the diagnostic receipt without widening the receipt bound.
+    """
+    data = document.get("data") or {}
+    plan = data.get("plan") or {}
+
+    def rows(block):
+        return list((block or {}).get("rows") or [])
+
+    return {
+        "schema": document.get("schema"),
+        "ok": document.get("ok"),
+        "error": document.get("error"),
+        "plan_digest": data.get("plan_digest"),
+        "volume_present": data.get("volume_present"),
+        "preview": data.get("preview"),
+        "candidates": [
+            {
+                "name": row.get("name"),
+                "scope": row.get("scope"),
+                "family": row.get("family"),
+                "grant": row.get("grant"),
+                "reason": row.get("reason"),
+                "marker_digest": row.get("marker_digest"),
+            }
+            for row in rows(plan.get("candidates"))
+        ],
+        "kept_count": (plan.get("kept") or {}).get("count"),
+        "examined": plan.get("examined"),
+        "truncated": plan.get("truncated"),
+        "deleted": rows(data.get("deleted")),
+        "pending": rows(data.get("pending")),
+        "skipped": rows(data.get("skipped")),
+        "replay": data.get("replay"),
+    }
 
 
 def self_check():
@@ -828,6 +883,41 @@ def self_check():
         index = ATTACH_OPTIONS.index("-owners")
         if index + 1 >= len(ATTACH_OPTIONS) or ATTACH_OPTIONS[index + 1] != "on":
             problems.append("the attach's `-owners` is not followed by `on`")
+    synthetic = {
+        "schema": "barge.scratch.expire/1",
+        "ok": True,
+        "data": {
+            "plan_digest": "ab" * 32,
+            "volume_present": True,
+            "preview": False,
+            "plan": {
+                "candidates": {
+                    "count": 1,
+                    "rows": [{"name": "c1", "scope": {"kind": "project", "name": "p"},
+                              "family": "native", "grant": "native_root",
+                              "reason": "native root", "marker_digest": "cd" * 32}],
+                },
+                "kept": {"count": 0, "rows": []},
+                "examined": 3,
+                "truncated": False,
+            },
+            "deleted": {"count": 0, "rows": []},
+            "pending": {"count": 0, "rows": []},
+            "skipped": {"count": 1, "rows": [{"name": "c1", "scope": {"kind": "project", "name": "p"},
+                                               "reason": "custody is not proven: a reason"}]},
+        },
+    }
+    projected = expiry_evidence(synthetic)
+    for key in ("plan_digest", "candidates", "skipped", "pending", "deleted", "replay"):
+        if key not in projected:
+            problems.append(f"the expiry evidence projection omits {key}")
+    if not projected["skipped"] or not projected["skipped"][0].get("reason"):
+        problems.append("the expiry evidence projection drops the skip reason")
+    # A document with no data (a refusal before any report) must project too, so
+    # the failure path can never raise while reporting a failure.
+    empty = expiry_evidence({})
+    if empty.get("candidates") != [] or empty.get("skipped") != []:
+        problems.append("the expiry evidence projection does not tolerate an empty document")
     if len(PREMISES) != 9:
         problems.append("the premise record does not name nine premises")
     for hook in ("TMPDIR", "BARGE_STATE_DIR", "BARGE_PROOF_BIN", "HOME", "CARGO_HOME"):
@@ -911,6 +1001,7 @@ def main(argv):
         "diagnostic": receipt["diagnostic"],
         "receipt_path": receipt["receipt_path"],
         "cases": receipt["cases"],
+        "case_evidence": receipt["case_evidence"],
     }, indent=1))
     if receipt["qualified"]:
         return 0
