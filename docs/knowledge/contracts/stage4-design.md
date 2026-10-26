@@ -32,10 +32,14 @@ only.
   one this contract implements: owned-root identity survives remounts, as
   volume UUID plus a stable per-root identity, never the raw device number
   alone.
-- The [stage 1 design](stage1-design.md) as frozen at `8b36b06`, and the code
-  merged on `main` at `0727376` (slices S1 and S2). S3's `area` module is
-  specified by that design and is not in that commit, so this contract is
-  written against S3's frozen interface and says so where it matters.
+- The [stage 1 design](stage1-design.md) as frozen at `8b36b06`, the [stage 3
+  space policy](stage3-space-policy.md), and the code merged on `main` at
+  `ce9d6ab`: slices S1, S2, [S3](stage1-design.md#implementation-status) (the
+  containment walk, areas, `barge.root/1` markers, holds, root listing) and S5
+  (custody, the `barge.intent/1` journal, quarantine, whole-root delete, replay).
+  S3 records no durable identity for a root, and S5's intent carries the
+  within-run observation only; that gap is what this contract closes, and every
+  statement below about existing behaviour is checked against that tree.
 - Oxide's `oxide outputs prune` as the implementation whose behaviour this
   replaces, and Oxide's absence rule as the compatibility target, both read at
   the pinned commit in [sources](#sources-and-version-identity).
@@ -45,8 +49,9 @@ only.
   is adopted; Q-004 fixes reading Oxide's records
   in place; `765f84c6` part (b) moved owned-root identity out of Oxide into
   Barge so it is designed once, here.
-- The stage 1 freeze's own deferrals: reserve and floor pruning, and the
-  retirement of any foreign format, each need their own slice.
+- The stage 1 freeze's own deferrals: the retirement of any foreign format needs
+  its own slice, and reserve and floor pruning belong to the [stage 3 space
+  policy](stage3-space-policy.md).
 
 ### The carried finding
 
@@ -68,8 +73,9 @@ says which one the design may tolerate and which it may not.
 Owned-root identity as a durable, versioned record; identity verification with
 its tolerated and refused changes; the mount and volume facts that make it work
 after a remount, including one UUID mounted twice; the generic positive-absence
-proof for an absent consumer path; the single gate that authorizes pruning one
-whole owned root; the plan and intent additions that carry identity and absence
+proof for an absent consumer path; the release gate that authorizes giving up one
+whole owned root, and how it combines with the merged stage 3 space prune; the
+plan and intent additions that carry identity and absence
 evidence; the read-only diagnostic that makes the carried finding decidable; the
 Oxide compatibility reading; the implementation slices; the tests; one bounded
 native design.
@@ -77,7 +83,9 @@ native design.
 ### Out of scope
 
 Any live run, real drive or data change. Registering volumes, changing a
-volume's mode, reserve or floor, or measuring space (stage 1 `O-008`, later).
+volume's mode, reserve or floor, and measuring space are the [stage 3 space
+policy's](stage3-space-policy.md); this contract consumes its trigger and never
+sets one.
 Moving data, adopting a consumer's area, retiring a foreign format, changing the
 host job. Rewriting an existing root's identity. Deciding whether Oxide's own
 prune should stop comparing `st_dev`: that is an Oxide change, in Oxide's
@@ -91,7 +99,7 @@ qualification.
 
 | Source | Identity | Used for |
 | --- | --- | --- |
-| `inflatable-cookie/barge` `main` | `07273764ddabdc1627bd82885fc5d8b0dbb5f762` (2026-10-26T13:53:36Z) | the stage 1 contract at `8b36b06` (`8b36b06dbabab3b4d67a91c3bd0dae813adba1d0`), the merged S1 and S2 code (`crates/barge/src/os`, `state`, `registry`, `inspect`, `describe`, `contract`), AGENTS.md and `effigy.toml` |
+| `inflatable-cookie/barge` `main` | `ce9d6abea57ac924bc4b6b5f64df8509ef03d0b6` (2026-10-26T17:48:28Z) | the stage 1 contract at `8b36b06` and its implementation status, the [stage 3 space policy](stage3-space-policy.md), and the merged S1, S2, S3 and S5 code (`crates/barge/src/os`, `state`, `registry`, `inspect`, `describe`, `contract`, `area`, `custody`, `delete`, `digest`), AGENTS.md and `effigy.toml` |
 | `inflatable-cookie/oxide` `main` | `5ce34c5526dd4945ced71ca9a6eabadcdcad206e` (2026-10-26T14:17:11Z) | formats and rules Barge reads in place, as reference only |
 
 Oxide references below point at that commit:
@@ -114,10 +122,12 @@ Oxide references below point at that commit:
   candidate rule, the operator-list waiver of receipt-history completeness, and
   the host automation that runs preview-then-real.
 
-Barge's own `os` layer at `0727376` already reads `ATTR_VOL_UUID` through an
+Barge's own `os` layer already reads `ATTR_VOL_UUID` through an
 opened descriptor, refuses a non-APFS filesystem, refuses the boot volume, and
 requires a managed volume to be a real directory directly under `/Volumes`
-(`crates/barge/src/os/macos.rs`, `os/mod.rs::verify_volume`). It has no way to
+(`crates/barge/src/os/macos.rs`, `os/mod.rs::verify_volume`). S3 added the
+no-follow component walk that compares each component's checked and opened
+identity, which the absence primitive reuses. Neither has a way to
 *find* a volume by UUID, only to verify a path against one; this contract adds
 that seam where it is needed and names it.
 
@@ -285,13 +295,18 @@ and the same validation, and `generation` keeps [the meaning stage 4 gives
 it](#marker-generation). A v2 marker's path fields are checked exactly as the
 identity record's are.
 
-`barge.root/1` markers stay readable for at least one implementation slice, with
-one bounded relaxation: its absolute `resolved_path` is compared to the live
-path after replacing only its mount prefix with the verified live mount of the
-recorded UUID, and every component below that prefix must still match exactly.
-A root at a different relative path, or on a different volume, is still unknown.
-No stage-4 code writes a v1 marker. If S3 lands a v1 writer first, the relaxation
-is the bridge, and it is [open design issue O4-003](#open-design-issues).
+`barge.root/1` markers keep working, with one bounded relaxation: its absolute
+`resolved_path` is compared to the live path after replacing only its mount
+prefix with the verified live mount of the recorded UUID, and every component
+below that prefix must still match exactly. A root at a different relative path,
+or on a different volume, is still unknown.
+
+That bridge is live from the first day, not hypothetical: S3 has landed a
+`barge.root/1` writer, and its marker validation compares `resolved_path` to the
+path it walked (stage 1, "Implementation status"), so every root S3 creates on a
+drive that later reconnects at another mount point would otherwise be
+unverifiable. No stage-4 code writes a v1 marker; it is read by the rule above
+until the root is recreated or adopted, which is [O4-003](#open-design-issues).
 
 #### Marker generation
 
@@ -403,11 +418,17 @@ root lock:
 Adoption of an existing directory (`held-root`, stage 1 S6) takes the same steps
 with `origin: adopted_existing`.
 
-A root whose creation crashed between steps 3 and 4 has a valid marker and no
-identity record. It is `Unknown(identity_record_missing)`: never prunable,
-reported by every plan, and never given an identity automatically — deletion
+S3's landed `create_root` stops after step 3 and returns the identity facts to
+its caller without recording them, which is why F1 amends that one path: the
+record is added where the facts are already read, not reconstructed later from
+the marker. Roots S3 has already created — and a root whose creation crashed
+between steps 3 and 4 — therefore have a valid marker and no identity record.
+Such a root is `Unknown(identity_record_missing)`: never released, reported by
+every plan, and never given an identity automatically — deletion
 authority must never appear by observation. How, and whether, a human may give
-it one is [open design issue O4-002](#open-design-issues).
+it one is [open design issue O4-002](#open-design-issues). A root in that state
+may still be deleted by the [stage 3 space prune](#how-this-gate-combines-with-the-stage-3-space-prune),
+which carries its own observation; it is never *released* by this gate.
 
 ### No live identity rewrite
 
@@ -425,20 +446,31 @@ consequences are accepted deliberately:
 ### Lock order with the stage 1 locks
 
 Stage 1's order is registry → volume → root → intent, enforced by
-`state::LockSet`'s checked rank. Stage 4 adds no rank; it adds four rules:
+`state::LockSet`'s checked rank, and the [stage 3 space policy](stage3-space-policy.md#lock-order-with-the-stage-1-locks)
+already adds the rule that matters most here: **one prune per volume**, with
+`volume-<uuid>.lock` held exclusively for a prune pass and only the root lock
+released between candidates. This contract adds no rank; it uses that shape for
+the release pass and says which lock each step holds:
 
 | Step | Locks held | Rule |
 | --- | --- | --- |
-| Mount enumeration, absence proof | none | proves facts about the world outside Barge's state; it takes no lock and is never cached across a run |
-| Identity verification | volume shared, then root shared, per root | released before the next root; two roots are never held at once |
-| Plan build (one area) | registry shared, volume shared, one root shared at a time | the registry lock is never held across a directory walk or a delete |
+| Mount enumeration, absence proof, VolumeLocator | none | proves facts about the world outside Barge's state; it takes no lock and is never cached across a run |
+| Identity verification inside a preview | volume shared, then one root shared at a time | released before the next root; two roots are never held at once |
+| Plan build (one area, preview) | registry shared, released; then volume shared, then one root shared at a time | the registry lock is never held across a directory walk or a delete; a registration write is never blocked by a preview |
 | Identity write (creation, adoption, an operator repair) | volume shared, root exclusive | it is a root-lock-protected write and takes no other rank |
-| Effect (quarantine, delete, replay) | volume shared, root exclusive, then the intent write last | the intent stays the last rank, so a pending intent is always the last durable record |
+| A real release run | registry read and released; then `volume-<uuid>.lock` **exclusive** from the first re-verification to the final settlement; one root exclusive at a time; then the intent write last | the same serialisation stage 3 uses, so a release run and a space prune on one volume cannot interleave; the intent stays the last rank, so a pending intent is always the last durable record |
 
-Two concurrent prunes of the same area therefore take turns per root instead of
-one waiting on the other's whole plan, and neither can deadlock: the only
-exclusive lock a step takes is one root's, always after the volume's, always
-before its intent.
+Three consequences worth stating, because a reader will check them:
+
+- two runs on one volume cannot overlap at all, in either direction: the second
+  waits within its own run deadline and then refuses `locked`, naming the lock
+  file, having changed nothing;
+- a stale plan that reaches its effect after another run already acted still
+  finds that root's pending intent and skips that root, so serialisation plus the
+  journal are both needed and neither replaces the other;
+- no step ever takes a root lock and then asks for the volume lock: a consumer's
+  `hold` takes the root lock alone, and a prune takes the volume first, so the
+  only wait either side does for the other is the one stage 3's rule 5 describes.
 
 ## Absence: a consumer path that is positively gone
 
@@ -613,7 +645,7 @@ Rules that keep the handover safe:
 
 - While Oxide prunes, **Barge deletes no Oxide root.** The primitive is
   implemented and proven against Barge-owned roots first; Oxide's adoption is
-  its own slice with its own brief (stage 1 S8, `T6` below).
+  its own slice with its own brief (stage 1 S8, `F6` below).
 - Barge never writes an Oxide marker, receipt, registry row or tombstone. It
   reads `oxide.outputs.root/2` markers, `oxide.outputs.registry/2` rows and the
   receipts strictly, bounded, and reports them.
@@ -655,11 +687,11 @@ row whose volume is away reports `Unknown(volume_unverified)` rather than being
 skipped. Reading this file is an extension of stage 1's "presence and version
 only" boundary for Oxide's registry; it is [open design issue
 O4-006](#open-design-issues) because it widens a read boundary, and it is the
-one thing in this contract that the operator may want to see decided before T2.
+one thing in this contract that the operator may want to see decided before F2.
 
 ## Releasability: the one gate
 
-A whole owned root is deleted only when all six conditions hold, each re-proved
+A whole owned root is released only when all six conditions hold, each re-proved
 at the effect step, each with `Unknown` meaning keep:
 
 | # | Condition | Owned by | `Unknown` means |
@@ -670,6 +702,11 @@ at the effect step, each with `Unknown` meaning keep:
 | 4 | The area's declared `PrunePolicy` allows it and the volume's `durability` is `expendable`; age comes from [last activity](#last-activity) | stage 1, "Area declaration API" | keep |
 | 5 | Every reference naming the root is not current, from a complete reference set | this contract, [the consumer reference](#the-consumer-reference-what-makes-a-root-releasable) | keep the batch |
 | 6 | Every reference whose own rule requires absence has an `Absent` proof, re-established now | this contract | keep |
+
+These six are the **release** question: is this root still wanted? Conditions 1,
+3 and 4 are shared with the stage 3 space prune, which supplies condition 2 from
+its own same-run observation and asks neither 5 nor 6 — [how the two combine](#how-this-gate-combines-with-the-stage-3-space-prune)
+is part of this contract, not a caveat to it.
 
 There is no seventh condition and no override. An operator command that names one
 root explicitly still satisfies all six; it removes only condition 4's
@@ -747,7 +784,12 @@ that is what makes one plan a diagnostic as well as a permission.
 `barge.intent/1` gains two optional objects, `identity` and `absence`, holding
 what was proved at plan time and what was re-proved at effect time, so a replay
 after a reboot has the evidence it must re-establish rather than a permission it
-must trust.
+must trust. S5 has landed that record with exactly the field set stage 1
+records, including `device`, `inode` and `marker_digest` as the within-run
+observation and `plan_digest` as the permission; the two objects are additions
+inside major 1, and F4 updates S5's strict reader in the same slice, so a
+document written by an older binary still reads while the new fields are
+understood by both.
 
 ## Formats and versions
 
@@ -756,28 +798,90 @@ must trust.
 | `barge.root` marker | `/2` written, `/1` read | `.barge-root.json` in each owned root | path pair becomes mount-relative plus a mount hint; `generation` defined |
 | `barge.root.identity` | `/1` | `state/roots/<root-id>/identity.json` | new |
 | `barge.absence` | `/1` | in a plan row and an intent | new |
-| `barge.prune.plan` | `/1` | `barge prune --plan` | new: one area's plan with identity, custody, idle, reference and absence evidence |
-| `barge.maintain.plan` | `/1`, fields completed | `barge maintain --plan` | adds the `prune` array and per-area plan digests |
-| `barge.intent` | `/1`, optional fields added | `state/intents/<intent-id>.json` | adds `identity` and `absence` |
+| `barge.prune.plan` | `/1` | `barge prune --plan` | new: the *release* plan for one area, with identity, custody, idle, reference and absence evidence. Distinct from the stage 3 space plan, `barge.space.prune/1`, which selects by measurement, participation and least-recently-used order and needs no absence proof |
+| `barge.maintain.plan` | `/1`, fields completed | `barge maintain --plan` | adds the `release` array and per-area plan digests; the space stage's own rows are the stage 3 design's |
+| `barge.intent` | `/1`, landed in S5; optional fields added | `state/intents/<intent-id>.json` | adds `identity` and `absence`; `device`, `inode` and `marker_digest` stay the within-run observation |
 | `barge.describe` | `/1`, optional fields added | `barge describe` | adds `identity.capability` (what may be compared across a remount) and `volumes[].mounts` (how many live mounts carry each registered UUID) |
 | `barge.inspect` | `/1`, optional fields added | `barge inspect` | adds the Oxide registry observation and the per-row identity census |
 
 The versioning rules are stage 1's: adding an optional field stays inside a
-major; removing one, changing a type or a meaning is a new major. `barge.prune.plan/1`
-and the completed `barge.maintain.plan/1` are defined here before any landed
-code writes either — S5 and S7 are not in `0727376` — so their field sets are
-completed rather than extended, and the reader's "exactly this field set" rule
-holds from the first write.
+major; removing one, changing a type or a meaning is a new major.
+`barge.prune.plan/1` has no writer yet, so its field set is completed here
+rather than extended and the reader's "exactly this field set" rule holds from
+the first write. `barge.maintain.plan/1` has no writer either (S7 is unlanded).
+`barge.intent/1` has landed in S5, so its additions are optional fields with the
+reader updated in the same slice, and an intent written before F4 stays valid
+and readable.
 
-## Reserve and floor are not in this contract
+One naming rule, because two plans now exist: `barge.prune.plan/1` is the
+**release** plan — the evidence that a root may be given up because nothing
+references it and its consumer path is positively gone. `barge.space.prune/1`
+is the stage 3 **space** plan — the evidence that a root is idle, expendable,
+counted by its area and old enough to reclaim for room. Neither substitutes for
+the other, and `barge maintain` runs the space stage and the release stage as
+separate steps with separate digests.
 
-Stage 1 defers reserve and floor pruning to "after a qualified space
-measurement" (`O-008`). This contract owns the half that slice needs — identity,
-absence, the reference check and the gate — and not the trigger: the space
-measurement, the reserve/floor arithmetic, the "low space prunes the least
-recently used idle root first" ordering and the admission-time re-check. Those
-are a later brief that consumes `barge.prune.plan/1`; nothing here may be read
-as authorizing a reserve or floor value.
+One word, two facts, so the documents never get confused: `barge.absence/1` is a
+proof about a **path** being gone, while stage 3's `volume_absent` error kind is
+a proof about a **volume** being away. A present volume with an absent path and
+an absent volume with an unprovable path are different states with different
+consequences, and no rule in either contract converts one into the other.
+
+## Reserve, floor and the space prune belong to stage 3
+
+The [stage 3 space policy](stage3-space-policy.md) owns the space measurement and
+its limits, the registration of the reserve and the floor, the reserve prune
+trigger, area participation, idleness, least-recently-used order, the
+concurrency rules under consumer holds, and the `barge.space/1`,
+`barge.space.guard/1` and `barge.space.prune/1` formats. This contract owns
+identity, absence, the reference check and the release gate, and consumes stage
+3's trigger rather than setting one: nothing here may be read as authorizing a
+reserve or floor value, and no rule here changes when a space prune runs or what
+it may reclaim.
+
+Where the two meet is one question — may this whole root be deleted? — and
+[the next section](#how-this-gate-combines-with-the-stage-3-space-prune) says
+exactly which conditions each path supplies.
+
+## How this gate combines with the stage 3 space prune
+
+Two paths delete an owned root, and they answer different questions:
+
+- a **space prune** answers "is this root idle and expendable, and does the
+  volume need the room?" Its evidence is stage 3's measurement, participation
+  and order.
+- a **release prune** answers "is this root still wanted?" Its evidence is this
+  contract's reference check and absence proof.
+
+They share conditions 1, 3 and 4 of [the gate](#releasability-the-one-gate): the
+volume is verified, custody is `Safe`, and the area's policy and durability
+allow a delete. They differ in two places, and the difference is deliberate:
+
+- **Identity.** The release path requires the durable record
+  (condition 2 as written), because its decision can outlive the observation: a
+  reference set is read, an absence proved, and a plan may be kept, replayed or
+  settled after a reboot. The space path instead carries a *live* observation —
+  device, inode and marker digest — from its plan into its intent and re-verifies
+  it at every step (stage 3, "Pruning under the reserve"), so its identity check
+  is made from a fact taken in the same run and never compared to a stale one.
+- **References and absence.** Conditions 5 and 6 are the release question and
+  apply only there. A space prune reclaims a root the area already declared
+  expendable and idle; it does not claim the consumer is gone, and it must not
+  read an absence proof as permission.
+
+The invariant both paths share, and the reason neither is a weakening of the
+other: **no delete happens without an identity check made from a fact that cannot
+change behind the decision.** For the release path that is the durable record
+plus a same-run re-read of the marker and the inode; for the space path it is a
+same-run observation re-verified at the effect. A space prune never settles a
+pending release intent, and a release run never reclaims for room.
+
+Because the record is this contract's, making the space path honour it is F1's
+addition rather than a change to stage 3's evidence rules: F1 adds one check to
+the space prune's effect, "if a durable record exists it must verify and agree",
+and a disagreement keeps the root on both paths. The [stage 3 space
+policy](stage3-space-policy.md#pruning-under-the-reserve) states that check in
+its own custody list, so neither contract silently widens the other.
 
 ## Failure, race and cancellation matrix
 
@@ -809,6 +913,9 @@ reported. Stage 1's matrix still applies; these are the rows stage 4 adds.
 | A walk component changed between its `fstatat` reading and its `openat` | the reading and the descriptor disagree on device or inode | `Unknown(replaced)`; keep |
 | A consumer path's ancestor is a symlink, a foreign mount, a network or autofs mount, or a not-APFS volume | walk or volume proof | `Unknown`; keep |
 | A consumer path's ancestor volume is a removable volume that is away | no candidate mount | `Unknown(volume_unverified)`; keep |
+| A duplicate `barge.root/1` and `barge.root/2` root sit at one path | the v2 reader finds the marker it expected; a v1 marker where v2 was recorded, or the reverse, is a version mismatch | `Unknown(marker_version_unknown)`; keep both until the operator resolves it |
+| A durable identity record disagrees with the space prune's live observation | stage 3 re-verifies `device`, `inode` and `marker_digest` at its effect and this contract's record is present | keep the root, report both, and skip it for that run; the space prune deletes nothing the record contradicts |
+| A space prune is reclaiming a root while a release plan names it | one root lock at a time, intent last | the second sees the first's pending intent and skips that root; neither settles the other's intent |
 | A reference set is incomplete | an unreadable, oversized or schema-divergent receipt or registry | keep the whole batch that names those roots |
 | A hold is live, stale-but-undecidable, or foreign-uid | stage 1 custody rules | `Unknown`; keep |
 | A hold's boot identity differs from this boot | all three of pid, start identity and boot identity disagree | the hold is positively stale; custody may be `Safe` |
@@ -816,7 +923,7 @@ reported. Stage 1's matrix still applies; these are the rows stage 4 adds.
 | An identity record is missing | marker valid, no `state/roots/<root-id>/identity.json` | `Unknown(identity_record_missing)`; keep forever; report on every plan |
 | An identity record is unreadable, oversized or schema-divergent | strict bounded read | `Unknown(identity_record_invalid)`; keep |
 | The state directory is on an unavailable volume | state resolution fails | refuse every mutating command; `describe` still reports (stage 1 `O-002`) |
-| Two prunes run at once | one root lock at a time, intent last | the second sees a pending intent for that root and skips it; a stale reader's identity check fails and it changes nothing |
+| Two prunes run at once | `volume-<uuid>.lock` exclusive for a real pass, one root lock at a time, intent last | the second waits within its run deadline and refuses `locked` changing nothing; a stale plan that still reaches its effect sees the first run's pending intent on that root and skips it |
 | Cancellation (SIGINT/SIGTERM) mid-plan | signal | stop after the current durable step; a plan has no effect to leave behind; exit non-zero |
 | Cancellation mid-effect | signal after the intent write | leave the pending intent; exit non-zero; replay settles it |
 | A bound is reached (entries, depth, deadline, descriptor chain) | the bound's own check | report what was not reached with counts; every unreached root stays unverified and kept |
@@ -874,20 +981,22 @@ on its own.
 
 | Slice | Content | Depends on |
 | --- | --- | --- |
-| T1 | `barge.root/2` marker, `barge.root.identity/1`, the identity write at creation and adoption, [verification](#verifying-a-root) with its verdicts and reason codes, `identity.capability` and the mount census in `describe` | S3 (area, markers, holds) |
-| T2 | `os::VolumeLocator` (`getfsstat` + `ATTR_VOL_UUID`), [finding the volume](#finding-the-volume-after-a-remount) with its duplicate refusal, `barge.root/1` prefix-rule reading, the `barge.absence/1` primitive and its ancestor volume proof | S1 (`os`), and T1 only for the shared walk helper |
-| T3 | The [gate](#releasability-the-one-gate): the reference readers (Barge's own records, and Oxide's receipts, registry rows and markers read in place), `last_activity_ms`, the `barge prune --plan` verb, and `barge.prune.plan/1` with its digest and evidence rows | T1, T2, S5 (custody and delete) |
-| T4 | `barge.intent/1` with identity and absence evidence, replay under a changed device, and the `barge.root/1`-to-`/2` settlement for a pending intent written by an older reader | T3, S5 |
-| T5 | `barge inspect`'s Oxide registry census and the drift report; the read-only operation that answers the carried finding without adopting anything | T1, T2, S2 (`inspect`) |
-| T6 | Reserve and floor: the qualified space measurement, the trigger, ordering and admission re-check, `barge maintain --plan` real runs | T3, T4, S7, and its own brief |
-| T7 | Oxide declares its output areas and switches its prune to Barge's gate; the 91 legacy roots are released with an operator list | T1–T6, Oxide's own project, `ff13f2ef`, operator approval |
+| F1 | `barge.root/2` marker, `barge.root.identity/1`, the identity record added to S3's landed `create_root` and to adoption, [verification](#verifying-a-root) with its verdicts and reason codes, `identity.capability` and the mount census in `describe` | S3 (area, markers, holds) |
+| F2 | `os::VolumeLocator` (`getfsstat` + `ATTR_VOL_UUID`), [finding the volume](#finding-the-volume-after-a-remount) with its duplicate refusal, the `barge.root/1` prefix rule, the `barge.absence/1` primitive and its ancestor volume proof | S1 and S3's containment walk (`os`), and F1 only for the shared walk helper |
+| F3 | The [release gate](#releasability-the-one-gate): the reference readers (Barge's own records, and Oxide's receipts, registry rows and markers read in place), `last_activity_ms`, the `barge prune --plan` verb, and `barge.prune.plan/1` with its digest and evidence rows | F1, F2, S5 (custody and delete) |
+| F4 | `barge.intent/1` with identity and absence evidence, S5's intent reader accepting them, replay under a changed device, and the `barge.root/1`-to-`/2` settlement for a pending intent written by an older reader | F3, S5 |
+| F5 | `barge inspect`'s Oxide registry census and the drift report; the read-only operation that answers the carried finding without adopting anything | F1, F2, S2 (`inspect`) |
+| F6 | Oxide declares its output areas and switches its prune to Barge's gate; the 91 legacy roots are released with an operator list | F1–F5, the [stage 3 space policy](stage3-space-policy.md)'s slices, Oxide's own project, `ff13f2ef`, operator approval |
 
-`T1` and `T2` can run in parallel; `T2` needs nothing from `T1` except a shared
-descriptor-walk helper, which lives in the `os`-adjacent containment code either
-way. `T5` is read-only and could land before `T3`, which is useful because it
-produces the evidence for the finding while the gate is still being built.
-Nothing depends on a real drive; `T6` and `T7` each need their own operator gate
-because they change what happens to data on a real volume.
+`F1` and `F2` can run in parallel; `F2` needs nothing from `F1` except a shared
+descriptor-walk helper, which now sits beside S3's containment code either way.
+`F5` is read-only and could land before `F3`, which is useful because it produces
+the evidence for the finding while the gate is still being built. Reserve and
+floor pruning is not a slice here: the [stage 3 space
+policy](stage3-space-policy.md) owns it, and this contract contributes only the
+identity, custody and policy conditions a space prune already supplies. Nothing
+depends on a real drive; `F6` needs its own operator gate because it changes what
+happens to data on a real volume.
 
 ## Proposed validation
 
@@ -905,7 +1014,8 @@ are proposed for the implementation slices.
 | Marker versions | `barge.root/2` round-trip; `barge.root/1` read with the bounded prefix rule | a v1 marker whose relative path matches but whose mount prefix differs verifies; a v1 marker at a different relative path, or under a different volume UUID, is unknown; no code path writes a v1 marker |
 | Marker generation | 1 at creation; 2 for a concluded `scratch_run` only | a conclusion on an `area_root`, a generation-3 marker, and a generation-2 marker with a null conclusion are all unknown |
 | Volume resolution | one candidate verifies; none refuses by mode; two refuse | two mounts of one UUID (`FakeMounts`) refuse `duplicate_volume_uuid` and delete nothing; a mount-point change with the same UUID verifies and reports `mount_moved` |
-| Identity write | the write order; the identity record written under the root lock | a crash between marker and identity record leaves `identity_record_missing`, never prunable, never adopted automatically; a second identity write is impossible by type |
+| Identity write | the write order; the identity record written under the root lock | a crash between marker and identity record leaves `identity_record_missing`, never releasable, never adopted automatically, and still reclaimable by the space path; a second identity write is impossible by type |
+| The two delete paths | the shared conditions and the two differing ones | a root with no identity record is kept by the release plan and may still be reclaimed by a space prune; a durable record that contradicts a live observation keeps the root on both paths; a space prune never reads an absence proof |
 | Absence walk | leaf `ENOENT` gives `Absent`; every other outcome is enumerated | a missing non-leaf ancestor, a symlinked component, a component replaced between `fstatat` and `openat`, `EACCES`, a 65-component path and a depth-bound hit each give `Unknown` with its code; a relative path and a `..` component are refused before the walk |
 | Absence ancestry | a path whose ancestors are root-owned and on another device than the anchor still proves | a real `/Users/...`-shaped path under a root-owned ancestor, crossing a firmlink whose device differs from `/`, with an `ENOENT` leaf proves `Absent`; the same shape with a `Present` leaf proves `Present`; ownership of the root, not of the ancestry, is what a delete depends on |
 | Ancestor volume | `boot_data` and `registered(uuid)` proofs | an ancestor on a not-APFS volume, on a foreign mount, behind a stale mount point, on an unmounted removable volume, or on a volume whose UUID differs gives `Unknown` |
@@ -1019,23 +1129,27 @@ qualification claim, and none contradicts a frozen ruling.
   (for example a per-volume registration receipt written at registration time)
   is worth the coupling. If the operator wants clones treated as unknown, that
   is a scope decision, not a design detail.
-- **O4-002 — Repairing a root that has no identity record.** A crash between the
-  marker and the identity write, or a root created by an S3 build that predates
-  T1, leaves a valid owned root with no identity. Proposed: never automatic; one
+- **O4-002 — Repairing a root that has no identity record.** S3 has landed and
+  records no durable identity, so roots it created, a root adopted before F1, and
+  a root whose creation crashes between the marker and the identity write all
+  have a valid marker and no identity record. Proposed: never automatic; one
   explicit operator command that takes the root lock, verifies the marker and
   the volume, requires custody `Safe`, writes a record with
   `origin: identified`, and reports exactly what it decided. The alternative is
-  that such a root can only ever be kept and deleted by hand. The operator's
-  choice is needed before T1 lands, because it decides whether a repair verb
-  exists at all.
+  that such a root can only ever be kept and released by hand — a space prune can
+  still reclaim it, which is part of what makes the alternative tolerable. The
+  operator's choice is needed before F1 lands, because it decides whether a
+  repair verb exists at all.
 - **O4-003 — The `barge.root/1` prefix relaxation.** Stage 1's v1 marker records
-  an absolute `resolved_path`. Stage 4 reads it with the mount prefix replaced
-  by a verified mount of the recorded UUID and every component below it compared
-  exactly, and writes v2. If S3 lands a v1 writer before T1, the relaxation is
-  live from the first day; otherwise v1 has no writer and the rule is only a
-  reader test. The architect (design freeze) should confirm the relaxation, and
-  either way the alternative — refusing every v1 marker after a mount-point
-  change — is rejected because it would make S3's roots unprunable forever.
+  an absolute `resolved_path`, and S3 writes it and validates it against the path
+  it walked, so the relaxation is live from the first day rather than a
+  contingency: without it, every root S3 creates on a drive that later reconnects
+  at another mount point is unverifiable. Stage 4 reads v1 that way — the mount
+  prefix replaced by a verified mount of the recorded UUID, every component below
+  it compared exactly — and writes v2. The architect (design freeze) should
+  confirm the reading; the alternative, refusing every v1 marker after a
+  mount-point change, is rejected because it would make S3's roots unprunable
+  forever.
 - **O4-004 — The mount enumeration primitive.** Proposed: `getfsstat(2)` for the
   candidate list plus `ATTR_VOL_UUID` read through each candidate's descriptor,
   with a 256-entry bound and at most 64 candidates for one UUID; `diskutil` is
@@ -1055,7 +1169,7 @@ qualification claim, and none contradicts a frozen ruling.
   rows to answer the carried finding. Proposed: read-only, strict, bounded, never
   authoritative, used by `barge inspect` alone, and retired when Oxide adopts its
   area. This widens a read boundary that stage 1 set deliberately, so the
-  architect should confirm it before T5; the alternative is to answer the finding
+  architect should confirm it before F5; the alternative is to answer the finding
   only after Oxide's adoption, which delays the 91 held roots further.
 - **O4-007 — Who may prune an Oxide root, and when.** Proposed: nobody but
   Oxide until Oxide declares its areas and switches, so the gate is proven

@@ -1061,11 +1061,11 @@ No slice authorizes a native run, a host change or a data move on its own.
 | S8 | Consumer adoption: Oxide declares its areas and switches scratch, caches, registration, then owned-root mechanics; Effigy moves to Barge scratch. Separate briefs, Oxide's own Queue project, explicit operator gates | S1–S7, separately qualified |
 
 Dependencies that are not slices: a real-drive qualification (later, operator
-gated), Linux (later, additive behind `os`), reserve/floor pruning (later,
-after a qualified space measurement, on the gate the [stage 4
-design](stage4-design.md) owns), owned-root identity across remounts and the
-absence proof a prune needs (the [stage 4 design](stage4-design.md)), and the
-retirement of any foreign format (after its owner's adoption).
+gated), Linux (later, additive behind `os`), reserve/floor pruning (the
+[stage 3 space policy](stage3-space-policy.md) owns that design), owned-root
+identity across remounts and the absence proof a release prune needs (the
+[stage 4 design](stage4-design.md)), and the retirement of any foreign format
+(after its owner's adoption).
 
 ### Implementation status
 
@@ -1131,6 +1131,170 @@ Choices S2 made where this design left the mechanic to the slice:
   no conversion into a registry record. `barge.inspect/1` is named by its own
   `schema`; it is not added to the `formats` list, so S2 leaves
   `barge.describe/1`'s field set unchanged.
+
+- **S3** landed on `main` with this note: path containment and the
+  descriptor walk from a verified volume root; `barge.area/1` declaration
+  validation and persistence; owned roots with their strict `barge.root/1`
+  markers; cooperative holds (`barge.hold/1`); bounded root listing; and the
+  `barge area` verbs (`declare`, `show`, `list`, `root create`, `root list`,
+  `hold`, `release`). S3 deletes, prunes and moves nothing, and every fixture
+  lives under one temporary directory: the tests use injected volume facts over
+  real local directories, and no test reads or writes a real drive or the real
+  account state.
+
+Choices S3 made where this design left the mechanic to the slice:
+
+- **Marker shape.** The marker's top-level field set is exactly the one above.
+  The nested `area` object carries the pinned `namespace` and `area` and one
+  optional `effective`, which records the effective declaration applied at
+  creation (folder, absent policy, prune policy, reserve participation) exactly
+  as O-003 asks. A marker without `effective` (the pinned two-field form) is
+  valid and owns the root's identity only; a missing value never widens a
+  policy. The effective declaration is the caller's; a stored declaration that
+  differs is reported (`stored_differs: true`) and still never substituted.
+- **Root identity.** `create_root` returns the root directory's device and inode
+  read through the created descriptor, the verified volume UUID, the root id and
+  nonce, and the SHA-256 of the exact marker bytes. The digest is computed by one
+  small in-crate SHA-256 (`digest`), because the workspace pins its dependencies
+  exactly and stage 1 needs one digest rather than a cryptography surface; S5's
+  replay re-reads the same bytes and digest. `read_marker` validates every field
+  of the bytes it read — the private mode, the owner, the volume, the walked
+  path, the id and nonce shapes and the timestamps — and reports everything else
+  as `unknown`; it compares no digest, because the expected digest belongs to the
+  caller that recorded the root, and S5's replay is that caller.
+- **The walk and folder creation.** Resolution steps from the verified mount
+  root through `root_dir` and then the effective folder (an override for the
+  volume, else the declared folder). Each component is read with `lstat`, refused
+  if it is not a real directory of this account on this device, opened with
+  no-follow, and its opened identity compared with the checked one. The first
+  absent component ends the walk; `create_root` creates the rest as plain `0755`
+  directories and the root as `0700`, exclusively. An existing component is only
+  adopted when it is this account's directory on this volume, and every adoption
+  path — the named one and the one after a lost `mkdir` race — opens the
+  component and compares its opened identity with the checked one, so a
+  directory swapped in behind a competing creator is refused rather than
+  adopted. A root name that is already taken is retried with a fresh id rather
+  than adopted.
+- **Collisions.** A declaration is checked on every registered volume: equality
+  and nesting between two declarations and against the resolved `scratch/` and
+  `caches/` folders (overrides included) are refused as `refused_containment`;
+  with no registered volume the folder strings are compared. That is the
+  "outside every managed folder" predicate kept placements will use in S6;
+  nothing in S3 depends on the O-004 reading further than this.
+- **Holds.** `barge.hold/1` records the root id, holder id, pid, the platform's
+  process start identity, the boot identity, scope, purpose and time. Reading
+  decides `live` when the boot and start identity match, `stale` only when the
+  recorded process positively disagrees (a changed boot, a gone pid, or a reused
+  pid with a different start identity), and `unknown` when a fact cannot be read
+  (unreadable record, foreign-owned, non-regular or non-private file, unknown
+  version, unreadable start identity). A live or unknown hold makes a root not idle; only stale and
+  absent holds leave it idle. Holds are capped at 64 per root and written under
+  the root lock, after the registry read, atomically and privately. The CLI's
+  `area hold` records a hold by root id (the id the root's creator has); the
+  ownership and marker re-verification before a destructive step is S5's custody,
+  not this record.
+- **`describe`.** `barge.describe/1` gains a `roots` list (optional on read via
+  `#[serde(default)]`, so a document written before S3 still reads) whose rows
+  carry the marker's recorded path and the path the current configuration
+  resolves, the marker state and the root's holds. Its `areas` rows are now
+  filled from the stored declarations. Listing a root walks the configured
+  resolution only: after a `root_dir` change the old root is not visible under
+  the new configuration, is never moved or recreated, and only the later explicit
+  relocation command can move it. A volume that cannot be verified is skipped by
+  the root listing and stays visible in the volume rows, so `describe` remains
+  usable with a drive unplugged.
+- **Semantic kinds.** `RootKind` is `scratch_run`, `cache_root` or `area_root`;
+  `RootOrigin` is `created` (S3) or `adopted_existing` (S6). A conclusion is
+  recorded only on a `scratch_run` marker, so an area or cache root carrying one
+  is unknown.
+- **Command documents.** The area verbs name their own envelopes:
+  `barge.area.declare/1`, `barge.area.show/1`, `barge.area.list/1`,
+  `barge.area.root.create/1`, `barge.area.root.list/1`, `barge.area.hold/1` and
+  `barge.area.release/1`. The declaration, marker and hold formats stay
+  `barge.area/1`, `barge.root/1` and `barge.hold/1`, and are reported in
+  `formats`. Every mutating verb reads the registry first and refuses an invalid
+  one before any effect, including creating the state layout; a volume-scoped
+  verb also proves the volume is present and is the recorded one, and that its
+  durability is declared, before that layout or any lock file is created.
+- **Bounds as applied.** A declaration is at most 64 KiB with 128 rows; a marker
+  and a hold record are 4 KiB each; a root carries at most 64 holds; a root
+  listing keeps 4096 rows and examines at most 200 000 names, reporting
+  `truncated` and counts when it stops early.
+
+- **S5** is this slice: the custody state machine with `Safe` required by type,
+  the bounded same-uid descriptor observation behind `os`, the `barge.intent/1`
+  journal, the quarantine rename, whole-root deletion with the Finder and
+  `ENOTEMPTY` rules, and replay and settlement. It is a library capability only:
+  no CLI verb deletes, nothing is scheduled, no drive or real account state is
+  touched by its tests, and its native proof belongs to S4. Its unit and
+  counterfactual tests run on fixture directories with injected OS facts.
+
+Choices S5 made where this design left the mechanic to the slice:
+
+- **The observation primitive.** `ProcessObserver::scan_open_descriptors` walks
+  the pid list with `proc_listpids`, keeps the processes whose `PROC_PIDTBSDINFO`
+  uid is this account's, lists each one's descriptors with `PROC_PIDLISTFDS`, and
+  matches each vnode descriptor's `PROC_PIDFDVNODEPATHINFO` path against the root
+  by path components, under both the spelling the walk reached and the one the
+  filesystem resolves. `proc_listpids` and `proc_pidfdinfo` are declared in the
+  macOS module because `libc` does not declare them; every `unsafe` stays in that
+  one seam. A process of another uid is skipped (O-001's named limit), but a
+  process list, a process entry or a descriptor entry that cannot be read is an
+  error, and an entry or time bound that is reached is `Bounded`. Both make the
+  verdict `Unknown`. The concrete bounds are 4096 processes, 65 536 descriptors
+  and 10 s per scan; a root carries at most its 64 holds. `lsof` is never read.
+- **Hold decisions.** A hold is stale only when its process is positively gone or
+  another boot wrote it. A live pid whose start identity differs is `Unknown`,
+  not stale: the failure matrix's reused-pid row treats staleness as proved only
+  when every recorded identity positively disagrees. S3 decided that case stale;
+  S5 corrects it, because `Unknown` blocks deletion and a wrong stale would let a
+  reused pid's hold be ignored.
+- **The intent record.** `barge.intent/1` sits at
+  `state/intents/<intent-id>.json`, at most 4 KiB, with exactly `schema`,
+  `intent_id`, `root_id`, `volume_uuid`, `mount_hint`, `root_dir`, `folder`,
+  `root_name`, `quarantine_name`, `device`, `inode`, `marker_digest`,
+  `plan_digest`, `phase`, `generation`, `recorded_ms` and `phase_ms`. The
+  quarantine leaf's name is `.barge-prune-<intent-id>` and is re-derived and
+  checked, never trusted as free text. A phase advances only forward and each
+  publish is the atomic state write, so a stale writer cannot rewind an intent it
+  raced. The journal read is bounded at 4096 records; a stray name, an
+  unreadable record or a truncated journal is `unknown_state`, never a skipped
+  intent.
+- **Deletion order.** The intent is durable, custody is re-decided, the root is
+  renamed, `renamed` is durable, the volume and the leaf's identity are
+  re-verified, the tree is classified once without mutation, then deleted,
+  then the marker is unlinked last, `marker_last` is durable, the leaf is
+  removed, and `deleted` settles the intent. The two-pass walk is what makes "an
+  unknown entry stops the delete and keeps the root" literal: nothing is
+  unlinked until every entry is classified, and the delete pass removes only what
+  was classified plus Finder metadata that appeared again. Finder metadata is the
+  two named forms *as a regular file* of this user on this device: a directory, a
+  link or anything else that happens to be named `.DS_Store` or `._name` is not
+  Finder metadata and stops the delete. Anything else that appears mid-delete
+  stops it too, so the delete never widens.
+- **A settled intent is kept.** `deleted` is the settlement; the record stays in
+  `state/intents/` as the journal's own account of what happened, and replay
+  treats it as non-pending work. A rolled-back `intent` phase is the one record
+  removed, because nothing happened.
+- **Replay proofs.** Only two proofs settle or resume an intent: the quarantine
+  leaf exists with the recorded device and inode and the marker bytes digest to
+  the recorded digest (resume, or roll back when the root is still in place at
+  phase `intent`), or the leaf and marker are positively absent after a recorded
+  `marker_last` (settle). Everything else stays pending and is reported. The
+  marker digest is returned whenever the marker bytes could be read, even though
+  a quarantined leaf's marker necessarily fails the recorded-path check after the
+  rename; that is why `read_marker_with_digest` exists beside `read_marker`.
+- **Bounds as applied.** Depth 12, 200 000 names per directory, a 120 s per-root
+  deadline, and three `ENOTEMPTY` attempts one second apart. The volume is
+  re-verified every 512 examined entries and before the first unlink. Hitting a
+  bound after the intent is published leaves the intent pending; hitting one
+  before it is a refusal that changed nothing.
+- **`describe`.** `barge.describe/1` gains an optional `custody` object
+  (capability string, the facts it establishes, the cases it excludes, whether a
+  kernel proof is claimed — always false — and `lsof` as a diagnostic only). Root
+  rows gain an optional `marker_digest`, which is the observation S4 passes to
+  custody and to a delete. Both are additions inside the major version, so an
+  older document still reads.
 
 ## Proposed validation
 
@@ -1283,7 +1447,9 @@ the one reading the owner should confirm before implementation starts.
   reports available/total bytes from the filesystem that holds the area, with
   source and time, and claims nothing about exclusive occupancy. Reserve and
   floor are out of scope; the measurement primitive and its accuracy are
-  qualified with that later slice, not assumed here.
+  qualified with that later slice, not assumed here. The [stage 3 space
+  policy](stage3-space-policy.md) owns that design, including `f_bavail` versus
+  `f_bfree`, the flush before a post-delete measurement and purgeable space.
 - **O-009 — Who signs a scratch grant, and how the handover is proven.** Every
   foreign-family or unmarked deletion needs a recorded grant: a delegation from
   the family's owner, or a legacy claim from a human for one scope. Proposed:

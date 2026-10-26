@@ -15,7 +15,9 @@ mod facts;
 mod macos;
 
 pub use facts::{
-    AccountFacts, DeviceId, ExpectedVolume, FileSystem, MountPoint, MountRoot, VerifiedVolume,
+    AccountFacts, ChildEntry, ChildListing, ChildRemoval, DescriptorScan, DescriptorScanRequest,
+    DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, ExpectedVolume, FileSystem,
+    MountPoint, MountRoot, OpenDescriptor, ProcessObserver, RemoveKind, VerifiedVolume,
     VolumeFacts, VolumeIdentity, VolumeUuid,
 };
 

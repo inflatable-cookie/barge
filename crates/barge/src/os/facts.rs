@@ -6,7 +6,9 @@
 //! additive (stage 1 design, "Crate and CLI skeleton").
 
 use std::fmt;
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +18,8 @@ use crate::error::{Error, ErrorKind, Result};
 ///
 /// The volume UUID is the identity that matters across remounts; the device is
 /// part of the root identity a later slice records and re-verifies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct DeviceId(u64);
 
 impl DeviceId {
@@ -225,6 +228,316 @@ pub trait AccountFacts {
 
     /// The account-wide cache directory this platform gives another tool.
     fn tool_cache_dir(&self, tool: &str) -> Result<PathBuf>;
+}
+
+/// A directory's own identity: the device it lives on and its inode.
+///
+/// Two readings with the same [`DirId`] are the same directory, which is how
+/// the descriptor walk proves that an entry did not change between `lstat` and
+/// `open`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirId {
+    /// The device the directory is on.
+    pub device: DeviceId,
+    /// The directory's inode on that device.
+    pub inode: u64,
+}
+
+/// What one entry is, as the platform reports it without following a link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A real directory.
+    Directory,
+    /// A regular file.
+    File,
+    /// A symbolic link, which is never followed.
+    Symlink,
+    /// Anything else: a socket, a device, a fifo.
+    Other,
+}
+
+impl EntryKind {
+    /// The name a refusal or an observation reports.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Directory => "directory",
+            Self::File => "file",
+            Self::Symlink => "symlink",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One entry's own facts, read without following a symbolic link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryFacts {
+    /// What the entry is.
+    pub kind: EntryKind,
+    /// The device the entry lives on.
+    pub device: DeviceId,
+    /// The entry's inode on that device.
+    pub inode: u64,
+    /// The owning uid, so a foreign-owned entry is recognised rather than used.
+    pub uid: u32,
+    /// The permission bits, so a marker or hold file's privacy is checkable.
+    pub mode: u32,
+    /// The size in bytes; a marker is refused over its cap before it is read.
+    pub size: u64,
+    /// The modification time, when the platform reports one.
+    pub modified_ms: Option<u64>,
+}
+
+impl EntryFacts {
+    /// Whether no group or other permission bit is set: the private mode every
+    /// authoritative record is written with.
+    pub const fn is_private(&self) -> bool {
+        self.mode & 0o077 == 0
+    }
+}
+
+/// One child of a listed directory: its name and its own facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildEntry {
+    /// The entry's name inside the listed directory.
+    pub name: String,
+    /// The entry's own facts, read without following a link.
+    pub facts: EntryFacts,
+}
+
+/// One bounded directory listing.
+///
+/// `truncated` is true exactly when the directory held more names than the cap,
+/// so a short listing is never reported as a complete one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildListing {
+    /// The entries kept, in the platform's own order.
+    pub entries: Vec<ChildEntry>,
+    /// How many names the directory held, at least `entries.len()`.
+    pub total: usize,
+    /// Whether names were left out.
+    pub truncated: bool,
+}
+
+/// An opened directory descriptor and its identity.
+///
+/// Only the platform constructs one, so every operation a module above `os` can
+/// take relative to it is descriptor-relative: no path is re-resolved between
+/// two steps, which is what makes the walk's identity checks meaningful.
+#[derive(Debug)]
+pub struct DirHandle {
+    descriptor: Option<File>,
+    identity: DirId,
+}
+
+impl DirHandle {
+    /// The platform's handle over one opened descriptor.
+    pub(crate) fn from_descriptor(descriptor: File, identity: DirId) -> Self {
+        Self {
+            descriptor: Some(descriptor),
+            identity,
+        }
+    }
+
+    /// A handle with the given identity and no descriptor.
+    ///
+    /// It exists for a test that injects a fact the platform cannot be asked to
+    /// produce — a component on another device — and for nothing else.
+    #[cfg(test)]
+    pub(crate) fn injected(identity: DirId) -> Self {
+        Self {
+            descriptor: None,
+            identity,
+        }
+    }
+
+    /// The directory's identity as it was opened.
+    pub fn identity(&self) -> DirId {
+        self.identity
+    }
+
+    /// The opened descriptor, for the platform implementation only.
+    pub(crate) fn descriptor(&self) -> Option<&File> {
+        self.descriptor.as_ref()
+    }
+}
+
+/// The platform's directory operations, relative to an opened descriptor.
+///
+/// Every method that names a child takes the parent handle, so no step of a
+/// walk re-resolves a path from a string. The walk above this trait decides
+/// containment; the implementation only reports what the platform read.
+pub trait DirOps {
+    /// Open one absolute path as a directory, never following a link at the
+    /// leaf. A vanished volume is an error, never "absent and safe".
+    fn open_path(&self, path: &Path) -> Result<DirHandle>;
+
+    /// One absolute path's own facts, without following a link. `Ok(None)` is
+    /// "not there"; an unreadable entry is an error.
+    fn path_facts(&self, path: &Path) -> Result<Option<EntryFacts>>;
+
+    /// Open one child directory, never following a link at the leaf.
+    fn open_child_dir(&self, parent: &DirHandle, name: &str) -> Result<DirHandle>;
+
+    /// Duplicate one opened directory handle. The copy names the same directory
+    /// with the same identity, so a walk can start from a handle a caller still
+    /// owns.
+    fn duplicate_dir(&self, handle: &DirHandle) -> Result<DirHandle>;
+
+    /// One child's own facts, without following a link. `Ok(None)` is "not
+    /// there".
+    fn child_facts(&self, parent: &DirHandle, name: &str) -> Result<Option<EntryFacts>>;
+
+    /// Create one child directory exclusively and return its identity. An
+    /// existing name is an I/O failure: the caller re-reads the entry and
+    /// decides, so a race is visible instead of adopted.
+    fn create_child_dir(&self, parent: &DirHandle, name: &str, mode: u32) -> Result<DirId>;
+
+    /// Publish `bytes` at one child name atomically: a private temporary file in
+    /// the same directory, synced, renamed into place and the directory synced.
+    fn publish_child_file(
+        &self,
+        parent: &DirHandle,
+        name: &str,
+        bytes: &[u8],
+        mode: u32,
+    ) -> Result<()>;
+
+    /// Read one child regular file without following a link, refusing one over
+    /// `cap` bytes before its body is read. `Ok(None)` is "not there".
+    fn read_child_file(
+        &self,
+        parent: &DirHandle,
+        name: &str,
+        cap: usize,
+    ) -> Result<Option<Vec<u8>>>;
+
+    /// List one directory's children, keeping at most `max_names` names and
+    /// reporting how many it held.
+    fn list_children(&self, parent: &DirHandle, max_names: usize) -> Result<ChildListing>;
+
+    /// Remove one child entry, never following a symbolic link. The kind says
+    /// whether the entry is a directory, which is what decides between the
+    /// platform's two removal calls; a symlink is removed as a file and is never
+    /// followed.
+    fn remove_child(
+        &self,
+        parent: &DirHandle,
+        name: &str,
+        kind: RemoveKind,
+    ) -> Result<ChildRemoval>;
+
+    /// Rename one child inside its own directory, atomically. A cross-device
+    /// request is refused by the platform and surfaces as a failure, never as a
+    /// copy.
+    fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<()>;
+
+    /// Fresh random bytes from the platform's entropy source, used for a root's
+    /// id and nonce.
+    fn random_bytes(&self, length: usize) -> Result<Vec<u8>>;
+}
+
+/// How one child entry is removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveKind {
+    /// A regular file or a symbolic link; the link itself is removed.
+    File,
+    /// A directory, which must be empty.
+    Directory,
+}
+
+/// What one child removal found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildRemoval {
+    /// The entry is gone.
+    Removed,
+    /// The platform refused because the directory still holds entries: a Finder
+    /// `.DS_Store` can appear again between the listing and the removal.
+    NotEmpty,
+    /// The entry was already gone.
+    Absent,
+}
+
+/// The account and process facts a recorded hold is decided against.
+pub trait ProcessObserver {
+    /// The effective uid the account acts as, so a foreign-owned marker or hold
+    /// file is recognised as someone else's.
+    fn effective_uid(&self) -> Result<u32>;
+
+    /// The boot's identity. A pid alone is never enough: the same number after a
+    /// reboot is a different process.
+    fn boot_identity(&self) -> Result<String>;
+
+    /// The recorded process's start identity. `Ok(None)` means the process is
+    /// positively gone; an error means it cannot be decided, which is unknown
+    /// and never stale.
+    fn process_start(&self, pid: u32) -> Result<Option<u64>>;
+
+    /// Observe, within a bound, whether any process of this account holds an
+    /// open descriptor at or under `request.root`.
+    ///
+    /// The observation is the same-uid half of custody, not a kernel guarantee
+    /// (stage 1 design, "Capability limits on macOS and APFS"): a process of
+    /// another uid, and one created after the scan, is outside it. A scan that
+    /// reaches its process, descriptor or time bound answers [`DescriptorScan::Bounded`],
+    /// which is unknown and never safe. An unreadable process or descriptor
+    /// entry is an error, also never safe.
+    fn scan_open_descriptors(&self, request: &DescriptorScanRequest<'_>) -> Result<DescriptorScan>;
+}
+
+/// What one bounded same-uid open-descriptor scan is asked to observe.
+#[derive(Debug, Clone, Copy)]
+pub struct DescriptorScanRequest<'a> {
+    /// The absolute path of the root the scan is about. A descriptor whose path
+    /// is at or under it is reported.
+    pub root: &'a Path,
+    /// The root's device, so the root's own descriptor is also proved by identity.
+    pub root_device: DeviceId,
+    /// The root's inode.
+    pub root_inode: u64,
+    /// How many processes this account may be observed through.
+    pub max_processes: usize,
+    /// How many descriptors may be observed in total.
+    pub max_descriptors: usize,
+    /// How long the scan may take before it must answer "bounded".
+    pub timeout: Duration,
+}
+
+/// One open descriptor found under the scanned root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenDescriptor {
+    /// The process that holds it.
+    pub pid: u32,
+    /// The descriptor number inside that process.
+    pub descriptor: i32,
+    /// The path the platform reports for it.
+    pub path: PathBuf,
+}
+
+/// The answer of one bounded descriptor scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DescriptorScan {
+    /// The scan finished inside its bounds. `open` is every descriptor found at
+    /// or under the root; empty is the only answer custody can build on.
+    Complete {
+        /// How many same-uid processes were observed.
+        processes: usize,
+        /// How many descriptors were observed.
+        descriptors: usize,
+        /// The open descriptors at or under the root.
+        open: Vec<OpenDescriptor>,
+    },
+    /// A bound was reached before the scan finished, so it proves nothing. The
+    /// bound's name is reported and the verdict is unknown.
+    Bounded {
+        /// How many same-uid processes were observed before the bound.
+        processes: usize,
+        /// How many descriptors were observed before the bound.
+        descriptors: usize,
+        /// Which bound stopped the scan.
+        bound: &'static str,
+    },
 }
 
 /// A volume whose facts were read and matched the expectation.
