@@ -222,10 +222,13 @@ pub struct CustodyEvidence {
     /// platform's own code-signing status verified as platform binaries with
     /// vnode descriptors whose path and vnode facts it hides
     /// (`processes`), how many such descriptors there were in total, and the
-    /// bounded record of each process — pid, start identity, command and how
-    /// many of its descriptors were hidden (barge#013, Tom's decision
+    /// record of **each** of those processes — pid, start identity, command and
+    /// how many of its descriptors were hidden (barge#013, Tom's decision
     /// e528a712). Nothing can read where those descriptors point, so this is
-    /// reported rather than implied, and it never blocks `Safe`.
+    /// reported rather than implied, and it never blocks `Safe`. The record is
+    /// bounded but never truncated: a scan that meets more than
+    /// [`crate::os::BLIND_SPOT_RECORDS`] such processes refuses rather than
+    /// count one it cannot name.
     pub os_blind_spot: BlindSpotEvidence,
     /// When the verdict was decided.
     pub checked_ms: u64,
@@ -660,6 +663,7 @@ pub fn capability_report() -> CustodyReport {
             "that scan excludes the calling barge process's own descriptors, by its pid and the start identity read once and verified, and no other process: another barge process, its child or its parent is observed like any other same-uid writer".to_owned(),
             "that scan re-observes a same-uid process whose descriptor listing the kernel answers EPERM for, by re-reading the kernel's pid, start identity and effective uid and listing again at most three times inside a 250 ms settle window, with both that window and the scan's own deadline rechecked after every backoff, and settles it only on a positive fact: a later listing, a process the kernel reports gone, a changed start identity re-evaluated as the different process it now names, or a changed effective uid counted as the named blind spot; the same identity still answering EPERM is unknown and refuses, and elapsed time is never taken as proof".to_owned(),
             "that scan treats a vnode descriptor whose path and vnode facts the platform both answer EPERM for as an OS blind spot, counted and reported in the evidence and never a refusal, only when the process's own code-signing status carries the platform binary flag and its kernel start identity is unchanged before and after that read; a process that is not a verified platform binary, a status read that fails, and an identity that changes around it leave those descriptors unknown".to_owned(),
+            "that evidence names every blind-spot process it counts — pid, kernel start identity, command and hidden-descriptor count — up to 32 of them, and a scan that meets more refuses rather than report a count it cannot show".to_owned(),
             "the bounded record of that re-observation — how many processes it re-observed, and for up to eight of them the command, kernel start identity, errno sequence, identity changes and resolution — is reported on every verdict and in every refusal's failure detail, so a diagnostic of a refusal sees it too".to_owned(),
             "the root's device, inode and marker digest equal the observation the caller was given".to_owned(),
             "the volume still verifies as the registered one".to_owned(),
@@ -1285,6 +1289,14 @@ mod tests {
                 .iter()
                 .any(|fact| fact.contains("platform binary flag") && fact.contains("OS blind spot")),
             "the capability names the verified platform binary exemption and its condition: {:?}",
+            report.establishes
+        );
+        assert!(
+            report
+                .establishes
+                .iter()
+                .any(|fact| fact.contains("names every blind-spot process")),
+            "the capability says the evidence names each blind-spot process rather than a count it cannot show: {:?}",
             report.establishes
         );
         assert!(
@@ -2148,6 +2160,42 @@ mod tests {
         );
         assert_eq!(refused.name(), "unknown", "{:?}", refused.reason());
         assert!(refused.into_evidence().is_err(), "unknown refuses");
+    }
+
+    #[test]
+    fn more_blind_spot_processes_than_the_record_bound_refuses() {
+        // The evidence never drops a blind-spot process. A scan that meets more of
+        // them than its record holds refuses, rather than report a `Safe` verdict
+        // that counts processes it no longer names.
+        let holder = real_holder("custody-013-blind-spot-bound");
+        holder.payload();
+        let children: Vec<Child> = (0..crate::os::BLIND_SPOT_RECORDS.saturating_add(1))
+            .map(|_| Child::idle())
+            .collect();
+        let mut table = vec![self_identity()];
+        let mut faults = Vec::new();
+        for child in &children {
+            let identity = child.identity();
+            table.push(identity);
+            faults.push(StatedListing {
+                pid: identity.pid,
+                opaque: 1,
+                platform: Some(StatedPlatform::PlatformBinary {
+                    command: "sleep".to_owned(),
+                }),
+                ..StatedListing::default()
+            });
+        }
+        let observer = TableObserver::stated(table, faults);
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        let reason = verdict.reason().unwrap_or_default();
+        assert!(
+            reason.contains("more than 32 platform-verified processes"),
+            "the refusal names the record bound: {reason}"
+        );
+        assert!(reason.contains("did not fit"), "{reason}");
+        assert!(verdict.into_evidence().is_err(), "unknown refuses");
     }
 
     #[test]
