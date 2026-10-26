@@ -110,7 +110,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
     AccountFacts, ChildListing, ChildRemoval, DescriptorScan, DescriptorScanRequest, DeviceId,
     DirHandle, DirId, DirOps, EntryFacts, FileSystem, MacOs, MountPoint, MountRoot, OpenDescriptor,
-    ProcessObserver, RemoveKind, VolumeFacts, VolumeIdentity, VolumeUuid,
+    ProcessObserver, RemoveKind, RenameOutcome, VolumeFacts, VolumeIdentity, VolumeUuid,
 };
 use crate::registry::{
     Availability, Durability, FolderOverrides, RecordOrigin, RegistryDocument, RegistryWriter,
@@ -321,8 +321,9 @@ impl ProcessObserver for FakeObserver {
 
 /// The platform's directory operations with the faults a platform cannot be
 /// asked to produce: a foreign owner, an entry on another device, an
-/// `ENOTEMPTY` that keeps coming back, and a device change after the quarantine
-/// rename.
+/// `ENOTEMPTY` that keeps coming back, a racer that replaces an entry after the
+/// deletion observed it, a racer that takes a name back while the captured entry
+/// is held privately, and a device change after the quarantine rename.
 #[derive(Default)]
 pub struct Faults {
     inner: MacOs,
@@ -343,6 +344,76 @@ pub struct Faults {
     /// removals, so a test can prove what happens to Finder-shaped metadata that
     /// appears after the classification.
     pub plant: RefCell<Option<Plant>>,
+    /// Entries a racer replaces after the deletion observed them, which is the
+    /// window between a check and the capture that follows it.
+    pub races: RefCell<Vec<Race>>,
+    /// Entries a racer takes back as soon as they are captured, so a put-back
+    /// finds its own name occupied.
+    pub occupy_after_capture: RefCell<Vec<(PathBuf, PathBuf)>>,
+}
+
+/// What a racer puts at a name after the deletion observed the entry there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Replacement {
+    /// A regular file holding these bytes.
+    File(Vec<u8>),
+    /// A symbolic link to this target, which a deletion must never follow.
+    Symlink(PathBuf),
+    /// A directory holding one regular file with these bytes.
+    Directory {
+        /// The name of the file inside the racer's directory.
+        name: String,
+        /// The bytes of that file.
+        bytes: Vec<u8>,
+    },
+}
+
+/// One entry a racer replaces after the deletion observed it.
+///
+/// The observation counter is what makes the race land in the delete pass rather
+/// than in the classification pass: the classification observes each entry first,
+/// so `2` is the deletion's own check and the replacement lands between that
+/// check and the capture that follows it.
+#[derive(Debug)]
+pub struct Race {
+    /// The folder holding the entry: the root being deleted, or the area folder
+    /// whose quarantine leaf holds it once the root has been renamed.
+    pub holder: PathBuf,
+    /// The entry's path inside the holder (or inside its quarantine leaf).
+    pub relative: PathBuf,
+    /// Which observation of the entry's name fires, counted from one.
+    pub observation: usize,
+    /// What it puts at the name.
+    pub replacement: Replacement,
+    seen: Cell<usize>,
+}
+
+impl Race {
+    /// Replace the entry at `relative` after its `observation`-th check.
+    pub fn after(
+        holder: &Path,
+        relative: &str,
+        observation: usize,
+        replacement: Replacement,
+    ) -> Self {
+        Self {
+            holder: holder.to_path_buf(),
+            relative: PathBuf::from(relative),
+            observation,
+            replacement,
+            seen: Cell::new(0),
+        }
+    }
+}
+
+/// Which shape a planted entry has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlantKind {
+    /// A directory, so a Finder-shaped *name* that is not a regular file is
+    /// exercised.
+    Directory,
+    /// A regular file, which is Finder metadata by class.
+    File,
 }
 
 /// A directory to create inside the quarantine leaf mid-delete.
@@ -353,6 +424,8 @@ pub struct Plant {
     pub name: String,
     /// After how many successful file removals it is created.
     pub after_removals: usize,
+    /// Whether the planted entry is a directory or a regular file.
+    pub kind: PlantKind,
     removed: usize,
     done: bool,
 }
@@ -404,9 +477,83 @@ impl Faults {
             area: area.to_path_buf(),
             name: name.to_owned(),
             after_removals,
+            kind: PlantKind::Directory,
             removed: 0,
             done: false,
         });
+    }
+
+    /// Create a regular file named `name` inside the quarantine leaf after
+    /// `after_removals` successful file removals: the Finder metadata Barge
+    /// tolerates by class when it is recreated mid-delete.
+    pub fn planting_file(&self, area: &Path, name: &str, after_removals: usize) {
+        *self.plant.borrow_mut() = Some(Plant {
+            area: area.to_path_buf(),
+            name: name.to_owned(),
+            after_removals,
+            kind: PlantKind::File,
+            removed: 0,
+            done: false,
+        });
+    }
+
+    /// Replace `relative` inside `holder` - or inside the quarantine leaf
+    /// `holder` contains, once the root has been renamed - with `replacement`
+    /// after its `observation`-th check, which is the racer the
+    /// capture-and-verify rule exists for.
+    pub fn racing(
+        &self,
+        holder: &Path,
+        relative: &str,
+        observation: usize,
+        replacement: Replacement,
+    ) {
+        self.races
+            .borrow_mut()
+            .push(Race::after(holder, relative, observation, replacement));
+    }
+
+    /// Take the entry at `relative` back as soon as it is captured away from its
+    /// name, so a put-back finds its original name occupied.
+    pub fn occupying_after_capture(&self, holder: &Path, relative: &str) {
+        self.occupy_after_capture
+            .borrow_mut()
+            .push((holder.to_path_buf(), PathBuf::from(relative)));
+    }
+
+    /// Run the racers whose name was just observed.
+    ///
+    /// The entry is resolved at the moment it is raced rather than when the test
+    /// registered it, because the deletion renames the root into its quarantine
+    /// leaf before it walks it.
+    fn maybe_race(&self, name: &str) {
+        let mut races = self.races.borrow_mut();
+        for race in races.iter_mut() {
+            if race.relative.file_name().and_then(|part| part.to_str()) != Some(name) {
+                continue;
+            }
+            let seen = race.seen.get().saturating_add(1);
+            race.seen.set(seen);
+            if seen != race.observation {
+                continue;
+            }
+            let path = raced_path(&race.holder, &race.relative);
+            replace_entry(&path, &race.replacement);
+        }
+    }
+
+    /// Take back a captured entry's original name.
+    fn maybe_occupy(&self, from: &str) {
+        for (holder, relative) in self.occupy_after_capture.borrow().iter() {
+            if relative.file_name().and_then(|part| part.to_str()) != Some(from) {
+                continue;
+            }
+            let path = raced_path(holder, relative);
+            if path.exists() {
+                continue;
+            }
+            let _ = std::fs::write(path, b"a racer took this name back");
+        }
     }
 
     /// Create the planted entry once enough removals have happened.
@@ -431,10 +578,56 @@ impl Faults {
                 .to_string_lossy()
                 .starts_with(crate::state::QUARANTINE_PREFIX)
             {
-                if std::fs::create_dir(entry.path().join(&plant.name)).is_ok() {
+                let target = entry.path().join(&plant.name);
+                let planted = match plant.kind {
+                    PlantKind::Directory => std::fs::create_dir(&target),
+                    PlantKind::File => std::fs::write(&target, b"finder"),
+                };
+                if planted.is_ok() {
                     plant.done = true;
                 }
                 break;
+            }
+        }
+    }
+}
+
+/// Resolve a raced entry: the quarantine leaf `holder` contains when it holds
+/// one, otherwise `holder` itself.
+///
+/// A deletion renames the root into `.barge-prune-<intent-id>` before it walks it,
+/// so a racer that only knew the root's path has to follow it in.
+fn raced_path(holder: &Path, relative: &Path) -> PathBuf {
+    if let Ok(entries) = std::fs::read_dir(holder) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(crate::state::QUARANTINE_PREFIX)
+            {
+                return entry.path().join(relative);
+            }
+        }
+    }
+    holder.join(relative)
+}
+
+/// Replace the entry at `path` with `replacement`, the way a same-uid racer
+/// does: the observed object is moved away, so the delete's next step meets a
+/// different object under the same name.
+fn replace_entry(path: &Path, replacement: &Replacement) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(path);
+    match replacement {
+        Replacement::File(bytes) => {
+            let _ = std::fs::write(path, bytes);
+        }
+        Replacement::Symlink(target) => {
+            let _ = std::os::unix::fs::symlink(target, path);
+        }
+        Replacement::Directory { name, bytes } => {
+            if std::fs::create_dir(path).is_ok() {
+                let _ = std::fs::write(path.join(name), bytes);
             }
         }
     }
@@ -469,6 +662,10 @@ impl DirOps for Faults {
                 facts.device = device;
             }
         }
+        // The racer replaces the entry after the check that just read these
+        // facts, so the returned observation describes an object that is no
+        // longer at the name: the exact window a check-then-unlink by name loses.
+        self.maybe_race(name);
         Ok(Some(facts))
     }
 
@@ -529,12 +726,19 @@ impl DirOps for Faults {
         removal
     }
 
-    fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<()> {
-        self.inner.rename_child(parent, from, to)?;
-        if let Some(volume) = &self.volume {
-            volume.shift_device();
+    fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<RenameOutcome> {
+        let outcome = self.inner.rename_child(parent, from, to)?;
+        if outcome == RenameOutcome::Renamed {
+            self.maybe_occupy(from);
+            if let Some(volume) = &self.volume {
+                volume.shift_device();
+            }
         }
-        Ok(())
+        Ok(outcome)
+    }
+
+    fn recheck_dir(&self, handle: &DirHandle) -> Result<DirId> {
+        self.inner.recheck_dir(handle)
     }
 
     fn random_bytes(&self, length: usize) -> Result<Vec<u8>> {

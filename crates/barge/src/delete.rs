@@ -23,6 +23,17 @@
 //! an entry that is neither a plain file of this user on this device, a
 //! directory, nor Finder metadata stops it too. No rule ever widens what is
 //! deleted.
+//!
+//! Every entry is removed through one rule: **capture, verify, unlink**. The name
+//! is exclusively renamed to `.barge-del-<random 128-bit nonce>` in the same
+//! directory, the captured object's own facts are re-read under that private name
+//! and compared with the observation the walk took of it, and only a match is
+//! unlinked. A mismatch never unlinks: the object goes back under its original
+//! name, or, when that name is taken, stays under the private name with both names
+//! reported, and the deletion stops with the intent pending. That closes the
+//! check-then-unlink-by-name race, in which a same-uid racer replaces each entry
+//! after its check and the next check passes. Leftover `.barge-del-*` names a stop
+//! left behind are re-verified the same way, never unlinked on sight.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -36,7 +47,7 @@ use crate::custody::{self, CustodyBounds, CustodyEvidence, ObservedRoot, Pending
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
     ChildRemoval, DeviceId, DirHandle, DirOps, EntryFacts, EntryKind, MountRoot, ProcessObserver,
-    RemoveKind, RetryEvidence, VolumeFacts, VolumeUuid,
+    RemoveKind, RenameOutcome, RetryEvidence, VolumeFacts, VolumeUuid,
 };
 use crate::registry;
 use crate::state::{
@@ -60,6 +71,28 @@ pub const ENOTEMPTY_PAUSE: Duration = Duration::from_secs(1);
 
 /// After how many examined entries the volume is re-verified.
 const REVERIFY_ENTRIES: usize = 512;
+
+/// The prefix of the private name one entry is held under between its capture
+/// and its unlink.
+///
+/// The name is `.barge-del-` plus a fresh 128-bit nonce, chosen in the same
+/// directory the entry was captured from, so the capture is one atomic rename and
+/// a racer must discover the private name to interfere with it at all. A stopped
+/// deletion can leave one behind; replay recognises the form and re-verifies the
+/// object before anything unlinks it.
+pub const CAPTURE_PREFIX: &str = ".barge-del-";
+
+/// How many fresh private names one capture tries before it stops: a collision
+/// on a 128-bit random name is a defect or a racer, never an ordinary retry.
+const CAPTURE_ATTEMPTS: usize = 3;
+
+/// The size bound Finder metadata must stay inside to be removed by class.
+///
+/// A `.DS_Store` or `._name` file that appeared after the classification has no
+/// recorded inode to verify against, so it is verified by class instead: a
+/// regular file of this user on this device, no larger than this. Anything
+/// bigger is not tolerated as Finder metadata and stops the deletion.
+const FINDER_METADATA_BYTES: u64 = 1 << 20;
 
 /// One deletion's bounds. A test shortens them; a real run uses the design's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +170,7 @@ pub struct DeleteReport {
     pub reason: Option<String>,
     /// The quarantine leaf's path, kept while the intent is pending.
     pub quarantine: PathBuf,
-    /// How many entries were removed.
+    /// How many entries were removed, the marker included.
     pub entries_removed: usize,
     /// How many directories were removed, the leaf included.
     pub directories_removed: usize,
@@ -402,17 +435,32 @@ pub fn delete_root_on_volume(
         return Ok(report);
     }
 
-    // The quarantine rename is atomic inside one directory; a cross-device or
+    // The quarantine rename is atomic and exclusive inside one directory: an
+    // existing name refuses instead of being replaced, and a cross-device or
     // changed-inode result stops before anything is deleted.
-    if let Err(error) = dirs.rename_child(&area_handle, &observed.root_id, &intent.quarantine_name)
-    {
-        return Ok(pending_report(
-            &intent,
-            quarantine,
-            Counts::default(),
-            format!("the quarantine rename did not happen: {error}"),
-            Some(evidence),
-        ));
+    match dirs.rename_child(&area_handle, &observed.root_id, &intent.quarantine_name) {
+        Ok(RenameOutcome::Renamed) => {}
+        Ok(RenameOutcome::TargetExists) => {
+            return Ok(pending_report(
+                &intent,
+                quarantine,
+                Counts::default(),
+                format!(
+                    "the quarantine name `{}` is already taken, so the root was not renamed",
+                    intent.quarantine_name
+                ),
+                Some(evidence),
+            ))
+        }
+        Err(error) => {
+            return Ok(pending_report(
+                &intent,
+                quarantine,
+                Counts::default(),
+                format!("the quarantine rename did not happen: {error}"),
+                Some(evidence),
+            ))
+        }
     }
     match dirs.open_child_dir(&area_handle, &intent.quarantine_name) {
         Ok(leaf)
@@ -596,25 +644,12 @@ fn finish_deletion(
                 )
             }
         }
-        match dirs.remove_child(&leaf, ROOT_MARKER_FILE, RemoveKind::File) {
-            Ok(ChildRemoval::Removed) => counts.marker_removed = true,
-            Ok(ChildRemoval::Absent) => {
-                return pending_report(
-                    intent,
-                    quarantine,
-                    counts,
-                    "the marker vanished before it was unlinked last".to_owned(),
-                    None,
-                )
-            }
-            Ok(ChildRemoval::NotEmpty) => {
-                return pending_report(
-                    intent,
-                    quarantine,
-                    counts,
-                    "the marker could not be removed".to_owned(),
-                    None,
-                )
+        // The marker is the ownership proof, and it is captured and verified like
+        // every other entry before it is unlinked last.
+        match walk.remove_marker_last(&leaf, &mut counts) {
+            Ok(Walk::Clean) => {}
+            Ok(Walk::Stop(reason)) => {
+                return pending_report(intent, quarantine, counts, reason, None)
             }
             Err(error) => {
                 return pending_report(
@@ -640,9 +675,11 @@ fn finish_deletion(
         }
     }
 
-    // The marker is gone: only now may the quarantine leaf be removed.
+    // The marker is gone: only now may the quarantine leaf be removed, and only
+    // through the descriptor that was verified as the recorded root.
     match walk.remove_directory(
         area_handle,
+        &leaf,
         &current.quarantine_name,
         0,
         Path::new(""),
@@ -905,19 +942,266 @@ impl<'a> WalkState<'a> {
         Ok(Walk::Clean)
     }
 
-    /// Whether one entry may be removed: it was classified, or it is Finder
-    /// metadata that appeared again. Nothing else is ever removed.
+    /// Capture one child entry under a private random name in its own
+    /// directory.
     ///
-    /// Finder tolerance is exactly Oxide's two forms *and* a regular file: a
-    /// directory, a link or anything else that happens to be named `.DS_Store`
-    /// or `._name` is not Finder metadata, stops the delete and keeps the root.
-    /// The owner and device are already checked by the classification.
-    fn may_remove(&self, relative: &Path, name: &str, facts: &EntryFacts) -> bool {
-        self.expected.contains(relative)
-            || (facts.kind == EntryKind::File && is_finder_metadata(name))
+    /// The rename is the platform's exclusive one, so it either moves the object
+    /// the walk asked for or reports that the private name is taken; it never
+    /// replaces an entry. A taken private name is retried with fresh random
+    /// bytes, so a collision can never be mistaken for a capture.
+    fn capture(&mut self, handle: &DirHandle, name: &str) -> Result<Capture> {
+        for _ in 0..CAPTURE_ATTEMPTS {
+            let private = format!("{CAPTURE_PREFIX}{}", hex(&self.dirs.random_bytes(16)?));
+            match self.dirs.rename_child(handle, name, &private)? {
+                RenameOutcome::Renamed => return Ok(Capture::Held(private)),
+                RenameOutcome::TargetExists => continue,
+            }
+        }
+        Ok(Capture::Stopped(format!(
+            "`{name}` could not be captured under a fresh private name: {CAPTURE_ATTEMPTS} were taken"
+        )))
+    }
+
+    /// Verify one captured object against the observation it was captured from.
+    ///
+    /// An entry the classification recorded, and a private name a stopped
+    /// deletion left behind, must report the same device, inode and kind as the
+    /// observation the walk took, and still belong to this account. Finder
+    /// metadata that appeared after the classification is verified by class:
+    /// a regular file of this user on this device, inside the size bound. The
+    /// parent binding is re-read through the descriptor the capture went through,
+    /// so a volume that changed under it stops the deletion before any unlink.
+    fn verify_capture(
+        &mut self,
+        handle: &DirHandle,
+        private: &str,
+        observed: &EntryFacts,
+        allowance: Allowance,
+    ) -> Result<Verify> {
+        let parent = self.dirs.recheck_dir(handle)?;
+        let opened = handle.identity();
+        if parent.device != self.device || parent.inode != opened.inode {
+            return Ok(Verify::Mismatch(format!(
+                "the directory holding `{private}` is device {} inode {}, not the opened {} / {} on the recorded device {}",
+                parent.device, parent.inode, opened.device, opened.inode, self.device
+            )));
+        }
+        let Some(facts) = self.dirs.child_facts(handle, private)? else {
+            return Ok(Verify::Mismatch(format!(
+                "the captured object is not there under `{private}`"
+            )));
+        };
+        if facts.uid != self.uid {
+            return Ok(Verify::Mismatch(format!(
+                "the captured `{private}` belongs to uid {}, not this account's {}",
+                facts.uid, self.uid
+            )));
+        }
+        let matched = match allowance {
+            Allowance::Finder => {
+                facts.kind == EntryKind::File
+                    && facts.device == self.device
+                    && facts.size <= FINDER_METADATA_BYTES
+            }
+            Allowance::Observed | Allowance::Leftover => {
+                facts.kind == observed.kind
+                    && facts.device == observed.device
+                    && facts.inode == observed.inode
+            }
+        };
+        if matched {
+            return Ok(Verify::Verified);
+        }
+        Ok(Verify::Mismatch(format!(
+            "the captured `{private}` is a {} on device {} inode {} of {} bytes, not the observed {} on device {} inode {}",
+            facts.kind.as_str(),
+            facts.device,
+            facts.inode,
+            facts.size,
+            observed.kind.as_str(),
+            observed.device,
+            observed.inode
+        )))
+    }
+
+    /// Capture one entry under a private name, verify the captured object, then
+    /// unlink only on a match.
+    ///
+    /// This is the whole deletion rule: the object that is unlinked is the object
+    /// that was verified after it was captured, so a same-uid racer that replaces
+    /// the name between the check and the capture cannot have its own object
+    /// removed. A mismatch never unlinks; the object is put back under its
+    /// original name, or, when that name is taken, left under the private name
+    /// with both names reported, and the deletion stops.
+    #[allow(clippy::too_many_arguments)]
+    fn capture_and_remove(
+        &mut self,
+        handle: &DirHandle,
+        name: &str,
+        observed: &EntryFacts,
+        allowance: Allowance,
+        depth: usize,
+        relative: &Path,
+        counts: &mut Counts,
+    ) -> Result<Walk> {
+        let private = match self.capture(handle, name)? {
+            Capture::Held(private) => private,
+            Capture::Stopped(reason) => return Ok(Walk::Stop(reason)),
+        };
+        if let Verify::Mismatch(reason) =
+            self.verify_capture(handle, &private, observed, allowance)?
+        {
+            // Never unlink. A put-back that itself fails still reports both the
+            // original and the private name, because the operator has to decide
+            // what happens to the object left under the private one.
+            let stopped = match self.put_back(handle, name, &private, &reason) {
+                Ok(stopped) => stopped,
+                Err(error) => format!(
+                    "`{name}` changed after its check and could not be put back from `{private}`: {error}"
+                ),
+            };
+            return Ok(Walk::Stop(stopped));
+        }
+        match observed.kind {
+            EntryKind::File => {
+                match self.dirs.remove_child(handle, &private, RemoveKind::File)? {
+                    ChildRemoval::Removed => counts.entries = counts.entries.saturating_add(1),
+                    ChildRemoval::Absent => {
+                        return Ok(Walk::Stop(format!(
+                            "the verified `{name}` vanished from `{private}` before it was unlinked"
+                        )))
+                    }
+                    ChildRemoval::NotEmpty => {
+                        return Ok(Walk::Stop(format!(
+                            "`{private}` reported not-empty as a file"
+                        )))
+                    }
+                }
+                Ok(Walk::Clean)
+            }
+            EntryKind::Directory => {
+                let child = match self.dirs.open_child_dir(handle, &private) {
+                    Ok(child) => child,
+                    Err(error) => {
+                        return Ok(Walk::Stop(format!(
+                            "the verified `{name}` could not be opened under `{private}`: {error}"
+                        )))
+                    }
+                };
+                let opened = child.identity();
+                if opened.device != observed.device || opened.inode != observed.inode {
+                    return Ok(Walk::Stop(format!(
+                        "`{name}` under `{private}` opened as device {} inode {}, not the verified {} / {}, so nothing is removed",
+                        opened.device, opened.inode, observed.device, observed.inode
+                    )));
+                }
+                if let Walk::Stop(reason) =
+                    self.delete_contents(&child, depth + 1, relative, false, counts)?
+                {
+                    return Ok(Walk::Stop(reason));
+                }
+                // The private name can only be replaced once the directory is
+                // empty; the verified inode is what is removed, and nothing else.
+                let still_verified =
+                    self.dirs
+                        .child_facts(handle, &private)?
+                        .is_some_and(|facts| {
+                            facts.kind == EntryKind::Directory
+                                && facts.device == observed.device
+                                && facts.inode == observed.inode
+                        });
+                if !still_verified {
+                    return Ok(Walk::Stop(format!(
+                        "`{private}` is no longer the verified directory, so it is not removed"
+                    )));
+                }
+                match self.remove_directory(
+                    handle,
+                    &child,
+                    &private,
+                    depth + 1,
+                    relative,
+                    counts,
+                )? {
+                    Removal::Gone => {
+                        counts.directories = counts.directories.saturating_add(1);
+                        Ok(Walk::Clean)
+                    }
+                    Removal::Stopped(reason) => Ok(Walk::Stop(reason)),
+                }
+            }
+            EntryKind::Symlink | EntryKind::Other => Ok(Walk::Stop(format!(
+                "`{name}` is a {}, which the deletion never captures",
+                observed.kind.as_str()
+            ))),
+        }
+    }
+
+    /// Put a captured object back under its original name after a failed
+    /// verification, and report how the deletion stops.
+    ///
+    /// Nothing is unlinked on this path. When the original name is taken the
+    /// object stays under its private name and both names are reported, because
+    /// an operator has to decide which of the two should exist.
+    fn put_back(
+        &mut self,
+        handle: &DirHandle,
+        name: &str,
+        private: &str,
+        reason: &str,
+    ) -> Result<String> {
+        match self.dirs.rename_child(handle, private, name)? {
+            RenameOutcome::Renamed => Ok(format!(
+                "`{name}` changed after its check, so it was put back under its own name and nothing was unlinked: {reason}"
+            )),
+            RenameOutcome::TargetExists => Ok(format!(
+                "`{name}` changed after its check and its original name is taken, so it is kept under `{private}`; both names are kept: {reason}"
+            )),
+        }
+    }
+
+    /// Remove the marker last, through the same capture, verify and unlink rule
+    /// every other entry goes through.
+    fn remove_marker_last(&mut self, leaf: &DirHandle, counts: &mut Counts) -> Result<Walk> {
+        let Some(observed) = self.dirs.child_facts(leaf, ROOT_MARKER_FILE)? else {
+            return Ok(Walk::Stop(
+                "the marker vanished before it was unlinked last".to_owned(),
+            ));
+        };
+        if let Walk::Stop(reason) = self.classify_entry(ROOT_MARKER_FILE, &observed) {
+            return Ok(Walk::Stop(reason));
+        }
+        if observed.kind != EntryKind::File {
+            return Ok(Walk::Stop(format!(
+                "the marker is a {}, not a regular file",
+                observed.kind.as_str()
+            )));
+        }
+        match self.capture_and_remove(
+            leaf,
+            ROOT_MARKER_FILE,
+            &observed,
+            Allowance::Observed,
+            0,
+            Path::new(""),
+            counts,
+        )? {
+            Walk::Clean => {
+                counts.marker_removed = true;
+                Ok(Walk::Clean)
+            }
+            stop => Ok(stop),
+        }
     }
 
     /// Delete every entry of one directory except, at the top level, the marker.
+    ///
+    /// Every entry is captured under a private name and verified before it is
+    /// unlinked, so what is removed is what was verified. The pass removes what
+    /// the classification recorded, Finder metadata that appeared again (by
+    /// class), and a private name a stopped deletion left behind (re-verified
+    /// against its own observation); a new entry that is none of those stops the
+    /// deletion rather than widening it.
     fn delete_contents(
         &mut self,
         handle: &DirHandle,
@@ -946,6 +1230,7 @@ impl<'a> WalkState<'a> {
             if skip_marker && entry.name == ROOT_MARKER_FILE {
                 continue;
             }
+            // This read is the observation the capture is verified against.
             let Some(facts) = self.dirs.child_facts(handle, &entry.name)? else {
                 continue;
             };
@@ -953,49 +1238,44 @@ impl<'a> WalkState<'a> {
                 return Ok(Walk::Stop(reason));
             }
             let path = relative.join(&entry.name);
-            if !self.may_remove(&path, &entry.name, &facts) {
+            let allowance = if self.expected.contains(&path) {
+                Allowance::Observed
+            } else if is_capture_name(&entry.name) {
+                // A private name a stopped deletion left behind: recognised so it
+                // can be re-verified, never unlinked on the strength of its name.
+                Allowance::Leftover
+            } else if is_finder_metadata(&entry.name) && facts.kind == EntryKind::File {
+                Allowance::Finder
+            } else {
                 return Ok(Walk::Stop(format!(
                     "`{}` appeared after the classification, so the delete stops",
                     path.display()
                 )));
-            }
-            if facts.kind == EntryKind::Directory {
-                let child = self.dirs.open_child_dir(handle, &entry.name)?;
-                if let Walk::Stop(reason) =
-                    self.delete_contents(&child, depth + 1, &path, false, counts)?
-                {
-                    return Ok(Walk::Stop(reason));
-                }
-                match self.remove_directory(handle, &entry.name, depth + 1, &path, counts)? {
-                    Removal::Gone => {
-                        counts.directories = counts.directories.saturating_add(1);
-                    }
-                    Removal::Stopped(reason) => return Ok(Walk::Stop(reason)),
-                }
-            } else {
-                match self
-                    .dirs
-                    .remove_child(handle, &entry.name, RemoveKind::File)?
-                {
-                    ChildRemoval::Removed => {
-                        counts.entries = counts.entries.saturating_add(1);
-                    }
-                    ChildRemoval::Absent => {}
-                    ChildRemoval::NotEmpty => {
-                        return Ok(Walk::Stop(format!("`{}` could not be removed", entry.name)))
-                    }
-                }
+            };
+            if let Walk::Stop(reason) = self.capture_and_remove(
+                handle,
+                &entry.name,
+                &facts,
+                allowance,
+                depth,
+                &path,
+                counts,
+            )? {
+                return Ok(Walk::Stop(reason));
             }
         }
         Ok(Walk::Clean)
     }
 
-    /// Remove one directory, retrying `ENOTEMPTY` at most the declared number of
-    /// times because Finder can recreate `.DS_Store` mid-delete. The retry
-    /// re-deletes only what the walk already recognises; it never widens it.
+    /// Remove one verified directory by its captured name, retrying `ENOTEMPTY`
+    /// at most the declared number of times because Finder can recreate
+    /// `.DS_Store` mid-delete. Each retry re-deletes only what the walk already
+    /// recognises, through the descriptor of the directory that was verified as
+    /// the captured one; it never re-opens the name to widen the walk.
     fn remove_directory(
         &mut self,
         parent: &DirHandle,
+        child: &DirHandle,
         name: &str,
         depth: usize,
         relative: &Path,
@@ -1015,9 +1295,8 @@ impl<'a> WalkState<'a> {
                         )));
                     }
                     std::thread::sleep(self.bounds.retry_pause);
-                    let child = self.dirs.open_child_dir(parent, name)?;
                     if let Walk::Stop(reason) =
-                        self.delete_contents(&child, depth, relative, false, counts)?
+                        self.delete_contents(child, depth, relative, false, counts)?
                     {
                         return Ok(Removal::Stopped(reason));
                     }
@@ -1028,6 +1307,48 @@ impl<'a> WalkState<'a> {
             "`{name}` was still not empty after {attempts} attempts"
         )))
     }
+}
+
+/// Why one entry may be removed at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Allowance {
+    /// The entry the classification pass recorded, verified against the
+    /// observation the delete pass took of it.
+    Observed,
+    /// Finder metadata that appeared after the classification, verified by class
+    /// instead of by inode, because it has no recorded inode to match.
+    Finder,
+    /// A private capture name a stopped deletion left behind, re-verified against
+    /// its own observation before anything is unlinked.
+    Leftover,
+}
+
+/// One capture's answer.
+enum Capture {
+    /// The entry is held under this private name.
+    Held(String),
+    /// The entry could not be captured; the deletion stops.
+    Stopped(String),
+}
+
+/// One capture verification's answer.
+enum Verify {
+    /// The captured object is the observed one, or Finder metadata of the allowed
+    /// class.
+    Verified,
+    /// The object is not the observed one, so it is never unlinked.
+    Mismatch(String),
+}
+
+/// Whether a name is one of Barge's own private capture names.
+///
+/// Only the form is recognised here; the object under it is still verified before
+/// anything unlinks it.
+fn is_capture_name(name: &str) -> bool {
+    let Some(nonce) = name.strip_prefix(CAPTURE_PREFIX) else {
+        return false;
+    };
+    nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Finder metadata is exactly Oxide's two forms: `.DS_Store`, or `._` followed
@@ -1166,9 +1487,11 @@ fn replay_one(
             && facts.device.get() == intent.device
             && facts.inode == intent.inode
     });
-    let marker_digest = if leaf_matches {
+    // One handle to the leaf serves the marker proof and the leaf removal, so the
+    // retry that empties it deletes through the descriptor that was verified.
+    let leaf_handle = if leaf_matches {
         match dirs.open_child_dir(&area_handle, &intent.quarantine_name) {
-            Ok(leaf) => Some(leaf_marker_digest(dirs, observer, intent, &leaf)?),
+            Ok(leaf) => Some(leaf),
             Err(error) => {
                 return Ok(ReplayOutcome::Pending(format!(
                     "the quarantine leaf cannot be opened: {error}"
@@ -1177,6 +1500,10 @@ fn replay_one(
         }
     } else {
         None
+    };
+    let marker_digest = match &leaf_handle {
+        Some(leaf) => Some(leaf_marker_digest(dirs, observer, intent, leaf)?),
+        None => None,
     };
 
     match intent.phase {
@@ -1250,35 +1577,41 @@ fn replay_one(
                 state::advance_intent(&write, state_paths, intent, IntentPhase::Deleted)?;
                 return Ok(ReplayOutcome::Settled);
             }
-            if leaf_matches && matches!(marker_digest, Some(MarkerBytes::Absent)) {
-                let mut walk = WalkState::new(
-                    dirs,
-                    facts,
-                    observer,
-                    intent.volume_uuid.clone(),
-                    DeviceId::new(intent.device),
-                    intent.mount_hint.clone(),
-                    bounds,
-                )?;
-                walk.verify_volume()?;
-                let mut counts = Counts::default();
-                match walk.remove_directory(
-                    &area_handle,
-                    &intent.quarantine_name,
-                    0,
-                    Path::new(""),
-                    &mut counts,
-                )? {
-                    Removal::Gone => {
-                        state::advance_intent(&write, state_paths, intent, IntentPhase::Deleted)?;
-                        return Ok(ReplayOutcome::Settled);
-                    }
-                    Removal::Stopped(reason) => return Ok(ReplayOutcome::Pending(reason)),
-                }
+            let Some(leaf) = leaf_handle.as_ref() else {
+                return Ok(ReplayOutcome::Pending(
+                    "the leaf and marker do not prove completion".to_owned(),
+                ));
+            };
+            if !matches!(marker_digest, Some(MarkerBytes::Absent)) {
+                return Ok(ReplayOutcome::Pending(
+                    "the leaf and marker do not prove completion".to_owned(),
+                ));
             }
-            Ok(ReplayOutcome::Pending(
-                "the leaf and marker do not prove completion".to_owned(),
-            ))
+            let mut walk = WalkState::new(
+                dirs,
+                facts,
+                observer,
+                intent.volume_uuid.clone(),
+                DeviceId::new(intent.device),
+                intent.mount_hint.clone(),
+                bounds,
+            )?;
+            walk.verify_volume()?;
+            let mut counts = Counts::default();
+            match walk.remove_directory(
+                &area_handle,
+                leaf,
+                &intent.quarantine_name,
+                0,
+                Path::new(""),
+                &mut counts,
+            )? {
+                Removal::Gone => {
+                    state::advance_intent(&write, state_paths, intent, IntentPhase::Deleted)?;
+                    Ok(ReplayOutcome::Settled)
+                }
+                Removal::Stopped(reason) => Ok(ReplayOutcome::Pending(reason)),
+            }
         }
         IntentPhase::Deleted => Ok(ReplayOutcome::Settled),
     }
@@ -1344,16 +1677,20 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use super::{delete_root_on_volume, replay_pending, DeleteBounds, DeleteOutcome, ReplayReport};
+    use super::{
+        delete_root_on_volume, replay_pending, DeleteBounds, DeleteOutcome, ReplayReport,
+        CAPTURE_PREFIX,
+    };
     use crate::area::{AreaDeclaration, RootKind, ROOT_MARKER_FILE};
     use crate::custody::ObservedRoot;
     use crate::error::ErrorKind;
     use crate::os::{
-        DescriptorScan, DescriptorScanRequest, DeviceId, ProcessObserver, RetriedUnreadable,
-        RetryEvidence, RetryResolution,
+        ChildRemoval, DescriptorScan, DescriptorScanRequest, DeviceId, DirOps, EntryKind,
+        ProcessObserver, RemoveKind, RenameOutcome, RetriedUnreadable, RetryEvidence,
+        RetryResolution,
     };
     use crate::state::{self, IntentPhase, IntentRecord, LockSet, QUARANTINE_PREFIX};
-    use crate::testkit::{FakeObserver, Faults, VolumeFixture};
+    use crate::testkit::{FakeObserver, Faults, Replacement, VolumeFixture};
 
     const PLAN: &str = "abababababababababababababababababababababababababababababababab";
 
@@ -2023,5 +2360,351 @@ mod tests {
             .join(format!("{QUARANTINE_PREFIX}{}", report.intent_id));
         assert_eq!(report.quarantine, expected);
         assert!(Path::new(&report.quarantine).is_dir());
+    }
+
+    /// The private capture names one directory holds: what a stopped deletion
+    /// left behind, and what a put-back collision keeps beside the original name.
+    fn capture_names(directory: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return Vec::new();
+        };
+        let mut names: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(CAPTURE_PREFIX)
+            })
+            .map(|entry| entry.path())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_racer_that_replaces_each_entry_after_its_check_gets_nothing_removed() {
+        // The racer replaces an entry between the deletion's check of it and the
+        // capture that follows: the window a check-then-unlink by name loses. The
+        // captured object no longer matches the observation, so nothing is
+        // unlinked and the racer's object survives under its own name.
+        let prepared = prepared("delete-racer-file");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"mine");
+        let faults = Faults::new();
+        let foreign = b"the racer's object";
+        faults.racing(&area, "payload.txt", 2, Replacement::File(foreign.to_vec()));
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(report.phase, IntentPhase::Renamed, "{report:?}");
+        assert_eq!(report.entries_removed, 0, "nothing was unlinked");
+        assert!(!report.marker_removed, "the marker is kept");
+        assert!(
+            report
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("put back"),
+            "the stop reports the put-back: {:?}",
+            report.reason
+        );
+        let leaf = report.quarantine.clone();
+        assert_eq!(
+            std::fs::read(leaf.join("payload.txt")).expect("the racer's object is kept"),
+            foreign,
+            "the object that was not the observed one is never unlinked"
+        );
+        assert!(leaf.join(ROOT_MARKER_FILE).is_file(), "the root is kept");
+        assert!(capture_names(&leaf).is_empty(), "nothing is left private");
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1, "the intent stays pending");
+        assert_eq!(pending[0].phase, IntentPhase::Renamed);
+    }
+
+    #[test]
+    fn a_racer_that_replaces_a_directory_is_captured_and_never_recursed_into() {
+        let prepared = prepared("delete-racer-directory");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        std::fs::create_dir(root.join("sub")).expect("the directory exists");
+        let faults = Faults::new();
+        faults.racing(
+            &area,
+            "sub",
+            2,
+            Replacement::Directory {
+                name: "foreign.txt".to_owned(),
+                bytes: b"the racer's object".to_vec(),
+            },
+        );
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(report.entries_removed, 0, "nothing was unlinked");
+        let leaf = report.quarantine.clone();
+        assert_eq!(
+            std::fs::read(leaf.join("sub/foreign.txt"))
+                .expect("the racer's directory is kept whole"),
+            b"the racer's object",
+            "an unverified directory is never recursed into"
+        );
+        assert!(leaf.join(ROOT_MARKER_FILE).is_file());
+    }
+
+    #[test]
+    fn a_racer_that_replaces_a_file_with_a_symlink_is_never_followed() {
+        let prepared = prepared("delete-racer-symlink");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "link-swapped.txt", b"mine");
+        let victim = area.join("victim.txt");
+        std::fs::write(&victim, b"never removed").expect("the victim exists");
+        let faults = Faults::new();
+        faults.racing(
+            &area,
+            "link-swapped.txt",
+            2,
+            Replacement::Symlink(victim.clone()),
+        );
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(report.entries_removed, 0, "nothing was unlinked");
+        assert_eq!(
+            std::fs::read(&victim).expect("the link target is untouched"),
+            b"never removed"
+        );
+        let leaf = report.quarantine.clone();
+        assert!(
+            std::fs::symlink_metadata(leaf.join("link-swapped.txt"))
+                .expect("the swapped link is put back")
+                .file_type()
+                .is_symlink(),
+            "a captured symlink is put back as itself, never followed"
+        );
+    }
+
+    #[test]
+    fn a_put_back_collision_leaves_the_object_under_its_private_name() {
+        let prepared = prepared("delete-put-back-collision");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"mine");
+        let faults = Faults::new();
+        let foreign = b"the racer's object";
+        faults.racing(&area, "payload.txt", 2, Replacement::File(foreign.to_vec()));
+        faults.occupying_after_capture(&area, "payload.txt");
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(report.entries_removed, 0, "nothing was unlinked");
+        let leaf = report.quarantine.clone();
+        let reason = report.reason.unwrap_or_default();
+        assert!(reason.contains("payload.txt"), "{reason}");
+        assert!(
+            reason.contains(CAPTURE_PREFIX),
+            "both names are reported: {reason}"
+        );
+        assert_eq!(
+            std::fs::read(leaf.join("payload.txt")).expect("the name that was taken back"),
+            b"a racer took this name back"
+        );
+        let private = capture_names(&leaf);
+        assert_eq!(
+            private.len(),
+            1,
+            "the captured object keeps its private name"
+        );
+        assert_eq!(
+            std::fs::read(&private[0]).expect("the captured object is kept"),
+            foreign
+        );
+        assert!(leaf.join(ROOT_MARKER_FILE).is_file());
+    }
+
+    #[test]
+    fn finder_metadata_that_reappears_mid_delete_is_removed_by_class() {
+        let prepared = prepared("delete-finder-recreated");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        // Finder recreates its store after the classification and while the leaf
+        // is being emptied: it has no recorded inode, so it is verified by class.
+        let faults = Faults::new();
+        faults.planting_file(&area, ".DS_Store", 1);
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_deleted(), "{:?}", report.reason);
+        assert!(!root.exists());
+        assert!(!report.quarantine.exists());
+    }
+
+    #[test]
+    fn an_exclusive_rename_onto_an_existing_name_refuses() {
+        let fixture = VolumeFixture::new("exclusive-rename");
+        let dirs = Faults::new();
+        let handle = dirs.open_path(&fixture.root).expect("the directory opens");
+        std::fs::write(fixture.root.join("a.txt"), b"source").expect("the source exists");
+        std::fs::write(fixture.root.join("b.txt"), b"target").expect("the target exists");
+
+        let outcome = dirs
+            .rename_child(&handle, "a.txt", "b.txt")
+            .expect("the refusal is an answer, not a failure");
+        assert_eq!(outcome, RenameOutcome::TargetExists);
+        assert_eq!(
+            std::fs::read(fixture.root.join("a.txt")).expect("the source is untouched"),
+            b"source"
+        );
+        assert_eq!(
+            std::fs::read(fixture.root.join("b.txt")).expect("the target is untouched"),
+            b"target",
+            "an existing name is never replaced"
+        );
+
+        std::fs::create_dir(fixture.root.join("c.txt")).expect("the directory exists");
+        assert_eq!(
+            dirs.rename_child(&handle, "a.txt", "c.txt")
+                .expect("the refusal is an answer"),
+            RenameOutcome::TargetExists,
+            "a directory target is refused the same way"
+        );
+        assert_eq!(
+            dirs.rename_child(&handle, "a.txt", "free.txt")
+                .expect("a free name is renamed onto"),
+            RenameOutcome::Renamed
+        );
+        assert!(fixture.root.join("free.txt").is_file());
+    }
+
+    #[test]
+    fn replay_reverifies_and_removes_a_leftover_private_name() {
+        let prepared = prepared("replay-leftover-private");
+        let root = prepared.observed.path.clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        publish(&prepared, &[]);
+        rename_to_quarantine(&prepared);
+        let leaf = prepared.quarantine();
+        std::fs::remove_file(leaf.join(ROOT_MARKER_FILE)).expect("the marker is removed");
+        let private = leaf.join(format!("{CAPTURE_PREFIX}{}", "ab".repeat(16)));
+        std::fs::rename(leaf.join("payload.txt"), &private).expect("a capture is left behind");
+        publish(&prepared, &[IntentPhase::Renamed, IntentPhase::MarkerLast]);
+
+        let report = prepared.replay();
+        assert_eq!(report.settled, 1, "{report:?}");
+        assert!(report.is_settled());
+        assert!(!leaf.exists(), "the leaf is gone");
+        assert!(
+            !private.exists(),
+            "the leftover was re-verified and removed"
+        );
+    }
+
+    #[test]
+    fn replay_keeps_a_leftover_private_name_that_does_not_verify() {
+        let prepared = prepared("replay-leftover-symlink");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        publish(&prepared, &[]);
+        rename_to_quarantine(&prepared);
+        let leaf = prepared.quarantine();
+        std::fs::remove_file(leaf.join(ROOT_MARKER_FILE)).expect("the marker is removed");
+        let victim = area.join("victim.txt");
+        std::fs::write(&victim, b"never removed").expect("the victim exists");
+        // A private-shaped name that holds a symlink is not a captured object of
+        // this deletion's, and a link is never followed or removed on sight.
+        let private = leaf.join(format!("{CAPTURE_PREFIX}{}", "cd".repeat(16)));
+        std::os::unix::fs::symlink(&victim, &private).expect("the link exists");
+        publish(&prepared, &[IntentPhase::Renamed, IntentPhase::MarkerLast]);
+
+        let report = prepared.replay();
+        assert_eq!(report.settled, 0, "{report:?}");
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(
+            report.pending[0].reason.contains("symbolic link"),
+            "{:?}",
+            report.pending[0].reason
+        );
+        assert!(std::fs::symlink_metadata(&private)
+            .expect("the leftover is kept")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read(&victim).expect("the link target is untouched"),
+            b"never removed"
+        );
+        assert!(leaf.is_dir(), "the intent stays pending with its leaf");
+    }
+
+    #[test]
+    fn the_old_check_then_unlink_removes_what_capture_verify_keeps() {
+        // The counterfactual: the same fixture and the same racer, once through a
+        // check-then-unlink-by-name helper and once through the deletion. The
+        // helper's check passes, the racer replaces the entry, and the unlink by
+        // name removes the racer's object; the deletion puts it back instead.
+        let foreign = b"the racer's object";
+
+        let old = prepared("delete-counterfactual-old");
+        let old_root = old.observed.path.clone();
+        VolumeFixture::payload(&old_root, "payload.txt", b"mine");
+        let old_dirs = Faults::new();
+        old_dirs.racing(
+            &old_root,
+            "payload.txt",
+            1,
+            Replacement::File(foreign.to_vec()),
+        );
+        let handle = old_dirs.open_path(&old_root).expect("the root opens");
+        let mut removed = 0;
+        for entry in old_dirs
+            .list_children(&handle, 16)
+            .expect("the root lists")
+            .entries
+        {
+            if entry.name == ROOT_MARKER_FILE {
+                continue;
+            }
+            let Some(facts) = old_dirs
+                .child_facts(&handle, &entry.name)
+                .expect("the entry is observed")
+            else {
+                continue;
+            };
+            if facts.kind == EntryKind::File
+                && old_dirs
+                    .remove_child(&handle, &entry.name, RemoveKind::File)
+                    .expect("the entry is removed")
+                    == ChildRemoval::Removed
+            {
+                removed += 1;
+            }
+        }
+        assert_eq!(removed, 1, "the old path unlinked by name");
+        assert!(
+            !old_root.join("payload.txt").exists(),
+            "the racer's object is gone, which is the defect"
+        );
+
+        let new = prepared("delete-counterfactual-new");
+        let new_root = new.observed.path.clone();
+        VolumeFixture::payload(&new_root, "payload.txt", b"mine");
+        let new_area = new_root.parent().expect("the area folder").to_path_buf();
+        let new_dirs = Faults::new();
+        new_dirs.racing(
+            &new_area,
+            "payload.txt",
+            2,
+            Replacement::File(foreign.to_vec()),
+        );
+        let facts = new.fixture.facts();
+        let report = new.delete(&new_dirs, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(
+            std::fs::read(report.quarantine.join("payload.txt"))
+                .expect("the racer's object survives"),
+            foreign
+        );
     }
 }

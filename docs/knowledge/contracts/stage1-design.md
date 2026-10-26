@@ -879,33 +879,84 @@ bounded:
    `barge.intent/1` (`intent` phase) recording root id, marker digest, device,
    inode, volume UUID, plan digest and time. The intent is durable before any
    rename.
-2. Rename the root inside its area to `.barge-prune-<intent-id>` with
-   `renameat`, then record the `renamed` phase. A same-device rename is atomic;
-   a cross-device or changed-inode result stops before deletion.
+2. Rename the root inside its area to `.barge-prune-<intent-id>` with the
+   platform's exclusive rename (`renameatx_np` with `RENAME_EXCL` on macOS),
+   then record the `renamed` phase. The rename is atomic and never replaces an
+   existing name: a taken target refuses and the intent stays pending. A
+   cross-device or changed-inode result stops before deletion.
 3. Walk and delete through descriptors opened from the area's descriptor:
-   `openat` with `O_NOFOLLOW` per directory, `unlinkat` (with `AT_REMOVEDIR`
-   for directories) for contents, never following a symlink, with a depth bound
-   (12) and per-directory name bound (200 000) and a per-root deadline (120 s).
+   `openat` with `O_NOFOLLOW` per directory, and every entry removed through
+   **capture, verify, unlink** (below), never following a symlink, with a depth
+   bound (12) and per-directory name bound (200 000) and a per-root deadline
+   (120 s).
 4. Finder tolerance is exactly Oxide's two forms and nothing broader:
-   `.DS_Store`, or `._` followed by a nonempty name; a regular file, no-follow,
-   owned by this user, on the directory's device. Every other unexpected entry
-   stops the deletion and keeps the root. Finder metadata is deleted as part of
-   the whole root; it never establishes ownership, never makes a root reusable
-   and never permits a narrower delete.
+   `.DS_Store`, or `._` followed by a nonempty name. A Finder-named entry that
+   the classification recorded is verified like any other entry; one that
+   appears after the classification is verified by class instead, because it has
+   no recorded inode to match: a regular file, no-follow, owned by this user, on
+   the directory's device, inside the size bound. A directory, a link or
+   anything else that happens to carry a Finder name is not Finder metadata.
+   Every other unexpected entry stops the deletion and keeps the root. Finder
+   metadata is deleted as part of the whole root; it never establishes
+   ownership, never makes a root reusable and never permits a narrower delete.
 5. `ENOTEMPTY`/`EEXIST` from `rmdir`/`unlink` retries the enclosing directory at
    most three times with a one-second pause, because Finder can recreate
-   `.DS_Store` mid-delete. After the third failure the intent stays pending, the
+   `.DS_Store` mid-delete. Each retry re-deletes only what the walk already
+   recognises, through the descriptor of the directory that was verified as the
+   captured one. After the third failure the intent stays pending, the
    quarantine leaf is kept, and the command exits `3`. It does not widen what it
    deletes.
-6. The marker is unlinked last. Only after that may the quarantine leaf be
-   removed. Then the `deleted` phase is recorded and the intent is settled.
+6. The marker is unlinked last, through the same capture and verify as every
+   other entry. Only after that may the quarantine leaf be removed. Then the
+   `deleted` phase is recorded and the intent is settled.
 7. On replay, a pending intent is resolved only from its recorded identity: the
    quarantine leaf exists with the recorded device and inode and the marker
    digest matches, or both the leaf and the marker are positively absent (in
    which case the marker's absence plus a completed `marker_last` phase is the
    proof). Anything else stays pending, is reported, and blocks reuse of that
-   leaf forever. A symlink inside a quarantine stops the deletion and leaves the
-   intent pending; it is never followed and never removed.
+   leaf forever. A private `.barge-del-*` name a stopped deletion left behind is
+   re-verified before anything unlinks it, and a leftover that does not verify
+   keeps the intent pending. A symlink inside a quarantine stops the deletion and
+   leaves the intent pending; it is never followed and never removed.
+
+#### Capture, verify, unlink
+
+A check followed by an unlink by name is not safe: a same-uid racer can replace
+one entry after its check, and every later check passes, so a deletion by name can
+remove objects it never verified. Every entry is therefore removed through one
+rule, and the marker with them:
+
+1. **Capture.** Exclusively rename the name to `.barge-del-<random 128-bit
+   nonce>` in the same directory. The rename is atomic and never replaces an
+   existing name; a taken private name is retried with fresh random bytes.
+2. **Verify the captured object.** `fstatat(private, AT_SYMLINK_NOFOLLOW)` —
+   the deleted entry's own facts, read under its private name — must report the
+   device, inode and kind the walk observed before the capture, and this
+   account's owner. Finder metadata that appeared after the classification is
+   verified by class instead (a regular file, not a link or a directory, same
+   device, within the size bound). The parent binding is re-read through the
+   descriptor the capture went through, so a volume that changed under it stops
+   the deletion before any unlink.
+3. **Unlink only on a match.** A file is unlinked under its private name. A
+   directory is opened through the private name (no-follow), its opened identity
+   is compared with the verified one, its contents are deleted through that
+   descriptor, the private name is re-verified as the same inode, and only then
+   is it removed with `AT_REMOVEDIR`, where `ENOTEMPTY` stops.
+4. **On a mismatch, never unlink.** The object is exclusively renamed back to its
+   original name. If that name is taken, the object stays under its private name,
+   both names are reported, and the deletion stops with the intent pending
+   (exit `3`). A crash replay recognises leftover `.barge-del-*` names under the
+   intent and re-verifies them before any unlink; a leftover that does not verify
+   keeps the intent pending.
+
+The guarantee this states:
+
+> Deletion removes only objects it verified after atomically capturing them under
+> a private random name; it never follows a link, never recurses into an unverified
+> directory, never unlinks a captured object that fails verification, and never
+> replaces an existing name. The residual is a same-user process that discovers the
+> private 128-bit name inside Barge's own quarantine within the capture-to-unlink
+> window.
 
 Deletion never touches a foreign marker family, a marker-less directory, an
 `adopted_existing` root without an explicit plan entry, a root on another
@@ -975,6 +1026,11 @@ data, marker and record are left unchanged and reported.
 | Drive pulled mid-delete | descriptor-relative call fails after the quarantine rename | stop; keep the pending intent and the quarantine leaf; exit `3`; replay only after the volume is reverified and the recorded identity matches |
 | Drive pulled mid-adopt | the form's publish step fails | a `setting` adopt leaves either the old or the new bytes and a pending intent that `undo` and replay settle; a `link` adopt publishes through a temporary name, so the original path is never a dangling name in the absent case, and the empty-directory case re-creates the empty directory on replay instead of leaving it missing; a `held-root` adopt either wrote the marker or did not |
 | Finder recreates `.DS_Store` | `ENOTEMPTY`/`EEXIST` from `rmdir` | three attempts, 1 s apart; then keep the pending quarantine and exit `3` |
+| Finder recreates `.DS_Store` while an entry is captured | the captured name is not the observed inode, or the file is not the allowed class | capture, verify by class, unlink; anything that is not a regular file of this user on this device inside the size bound stops the deletion |
+| An entry is replaced between its check and its capture | the captured object's device, inode or kind differs from the observation | never unlink; put the object back under its original name and stop with the intent pending, exit `3` |
+| An entry's original name is taken while it is captured | the put-back rename answers `EEXIST` | keep the object under its private name, report both names, stop with the intent pending, exit `3` |
+| A rename would replace an existing name | the exclusive rename answers `EEXIST` | nothing is renamed; a capture retries with a fresh private name, the quarantine rename stops with the intent pending |
+| A `.barge-del-*` leftover is left by a stopped deletion | the private name is recognised under the intent | re-verify it before any unlink; an unverifiable leftover keeps the intent pending |
 | Finder writes a non-metadata entry | refusal in the walk | stop, keep the root, report the escaped name; never widen the delete |
 | Two allocators race | exclusive `mkdir` with the fresh id | the loser gets `EEXIST` and retries with a new id; no shared root, no adoption of the other's marker |
 | Two expiries race | root lock plus intent publish | the second sees the pending intent and skips that root; a stale reader's identity check fails and it changes nothing |
@@ -1394,6 +1450,33 @@ Choices S5 made where this design left the mechanic to the slice:
   link or anything else that happens to be named `.DS_Store` or `._name` is not
   Finder metadata and stops the delete. Anything else that appears mid-delete
   stops it too, so the delete never widens.
+- **Capture, verify, unlink** (corrected here under barge#014, the same race class
+  oxide#155's exact-head review found). A check followed by an unlink by name is
+  not safe: a same-uid racer can replace each successive entry after its check,
+  and every later check passes, so a deletion by name can remove objects it never
+  verified. Every entry — and the marker last — is now exclusively renamed to
+  `.barge-del-<random 128-bit nonce>` in its own directory, verified under that
+  private name against the device, inode and kind the walk observed, and unlinked
+  only on a match; a Finder file that appeared after the classification is
+  verified by class instead. A mismatch never unlinks: the object goes back under
+  its original name, or, when that name is taken, stays under the private name
+  with both names reported, and the deletion stops with the intent pending.
+  Directories are recursed through the descriptor of the verified inode,
+  re-verified before `AT_REMOVEDIR`, and `ENOTEMPTY` stops. A replay recognises a
+  leftover `.barge-del-*` name under the intent and re-verifies it before any
+  unlink. The guarantee is stated in "Whole-root deletion, Finder metadata and
+  quarantine".
+- **Exclusive renames.** `DirOps::rename_child` is the platform's exclusive
+  rename (`renameatx_np` with `RENAME_EXCL`): an existing target name answers
+  `TargetExists` and nothing is renamed, so the quarantine rename, a capture and a
+  put-back can never replace an entry. The one replacing rename left in the layer
+  is the state publish, which replaces the temporary name it created itself.
+- **Listing one handle twice.** `list_children` rewinds the directory stream it
+  opens over a duplicated descriptor. `dup` shares the directory offset, so before
+  this correction a second listing through one handle began where the first ended
+  and answered empty; the old delete pass masked it because its `ENOTEMPTY` retry
+  re-opened the name. The capture rule re-lists the leaf through the handle it
+  verified, so the stream is now read from the directory's first name.
 - **A settled intent is kept.** `deleted` is the settlement; the record stays in
   `state/intents/` as the journal's own account of what happened, and replay
   treats it as non-pending work. A rolled-back `intent` phase is the one record
@@ -1439,7 +1522,7 @@ are real by constructing the state each rule must refuse.
 | Scratch | conclusion transitions; eligibility table; sweep bounds; grant lookup per unit | unconcluded root, `closure: none`, `kept_reason: exception`, an Effigy marker with a live pid and no delegation, an Oxide `hosting` root, a plain `oxide-validation` directory and an unmarked unit with no legacy claim all survive a sweep; a delegated Effigy marker past 24 h and a claimed unmarked unit past its idle age are the only foreign/unmarked units that do not |
 | Caches | the three placement forms; adopt/undo records; link and root identity; setting parse | a setting already pointing at the owned root changes no byte; a non-empty real directory refuses with a plan and nothing renamed or deleted; an empty real directory becomes a link and undo restores it empty; an absent path gets a link through a temporary name; a diverged file after adopt refuses undo; a symlinked original is recorded, not swapped |
 | Custody | state machine transitions; `Safe` required by type | unreadable hold, bounded-out scan, live pid with a mismatched start identity, foreign-uid evidence all yield `Unknown` and refuse |
-| Deletion | phase machine; Finder metadata classification; ENOTEMPTY retry; marker last | unknown entry stops the delete; symlink inside quarantine stops it; injected ENOTEMPTY three times leaves a pending intent; injected device change stops before the first unlink |
+| Deletion | phase machine; Finder metadata classification; ENOTEMPTY retry; marker last; capture and verify for every entry | unknown entry stops the delete; symlink inside quarantine stops it; injected ENOTEMPTY three times leaves a pending intent; injected device change stops before the first unlink; a racer that replaces each entry after its check removes nothing foreign and leaves the intent pending; a symlink and a directory swap are captured and never followed or recursed into; a recreated Finder file is removed by class; a put-back collision keeps both names; an exclusive rename onto an existing name refuses; a replay re-verifies leftover private names; the old check-then-unlink removes the racer's object where capture-and-verify keeps it |
 | Contacts | JSON documents match their schemas; unknown major refuses; optional-field addition accepted | a `barge.describe/1` document with a removed field or a changed type is refused by its own reader |
 | Foreign state | Oxide `removable.json` v1/v2 and `pools.json` parsers; the pinned Oxide and Effigy scratch marker field sets; delegations and legacy claims | unknown field, unknown version, unparsable and unreadable inputs become `unknown_state` observations; an Effigy marker that omits `task`/`checkout`/`pid`/`pid_start` is valid, and one that adds a field is refused; a unit whose family has no delegation or whose scope has no claim is reported, never deleted |
 | Prune/maintain | plan canonicalisation, digest mismatch, ordering | a changed plan digest, a changed root identity, a changed registry revision, a live hold, a revoked claim and a unit that became marked each stop the affected unit only |

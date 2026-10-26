@@ -3226,8 +3226,17 @@ mod tests {
             self.inner.remove_child(parent, name, kind)
         }
 
-        fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<()> {
+        fn rename_child(
+            &self,
+            parent: &DirHandle,
+            from: &str,
+            to: &str,
+        ) -> Result<crate::os::RenameOutcome> {
             self.inner.rename_child(parent, from, to)
+        }
+
+        fn recheck_dir(&self, handle: &DirHandle) -> Result<DirId> {
+            self.inner.recheck_dir(handle)
         }
 
         fn random_bytes(&self, length: usize) -> Result<Vec<u8>> {
@@ -4428,8 +4437,16 @@ mod tests {
             ) -> Result<crate::os::ChildRemoval> {
                 self.inner.remove_child(parent, name, kind)
             }
-            fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<()> {
+            fn rename_child(
+                &self,
+                parent: &DirHandle,
+                from: &str,
+                to: &str,
+            ) -> Result<crate::os::RenameOutcome> {
                 self.inner.rename_child(parent, from, to)
+            }
+            fn recheck_dir(&self, handle: &DirHandle) -> Result<DirId> {
+                self.inner.recheck_dir(handle)
             }
             fn random_bytes(&self, length: usize) -> Result<Vec<u8>> {
                 let mut calls = self.calls.borrow_mut();
