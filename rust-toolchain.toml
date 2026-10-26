@@ -1,0 +1,7 @@
+# The channel is the first consumer's pin (design, "Declared toolchain and
+# RustQuality resolution", O-007). `rust-version` in Cargo.toml declares the
+# same version, so a newer default toolchain cannot silently raise the MSRV.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

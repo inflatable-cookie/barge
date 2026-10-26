@@ -1,0 +1,37 @@
+# Barge's workspace: one library that holds every mechanic and one thin CLI
+# over it (docs/knowledge/contracts/stage1-design.md, "Crate and CLI skeleton").
+[workspace]
+members = ["crates/barge", "crates/barge-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# The declared toolchain is the first consumer's: Oxide declares
+# `rust-version = "1.97.1"` and pins the same channel, so Barge's MSRV is
+# re-derived from Oxide's manifests rather than invented here (design,
+# "Declared toolchain and RustQuality resolution", O-007).
+rust-version = "1.97.1"
+# No registry is chosen in stage 1; the library is consumed by path or git.
+publish = false
+
+# RustQuality strict (docs/knowledge/contracts/rust-quality-deviations.json).
+# The pack's mechanical set for this profile is clippy::all plus the two rustc
+# lints the API and unsafe rules name; its threshold lints (cognitive
+# complexity, too_many_lines, type_complexity) are evaluation-only and are not
+# turned into gates here.
+[workspace.lints.rust]
+missing_debug_implementations = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+# RUST-UNSAFE-001's named mechanical check: every unsafe block states the
+# invariant it relies on in a SAFETY comment. Only the `os` macOS seam has any.
+undocumented_unsafe_blocks = { level = "deny", priority = -1 }
+
+# Shared workspace profile: our own units keep the toolchain's dev debug
+# recipe (Oxide selects it), while dependency units carry no debug info, so a
+# test build stays small.
+[profile.dev.package."*"]
+debug = false

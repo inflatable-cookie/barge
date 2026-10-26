@@ -1,0 +1,20 @@
+[package]
+name = "barge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Barge's library: volume identity, account state and placement mechanics"
+
+[dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+
+# The only platform dependency: every use of it sits behind the `os` layer's
+# macOS implementation, and no other module names a syscall, errno or platform
+# path convention.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "=0.2.190"
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "barge-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Barge's thin CLI: parsing, the JSON envelope, exit codes and the human summary"
+
+[[bin]]
+name = "barge"
+path = "src/main.rs"
+
+[dependencies]
+barge = { path = "../barge" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json = "=1.0.151"
