@@ -295,18 +295,21 @@ impl ProcessObserver for FakeObserver {
                 processes: 3,
                 descriptors: 12,
                 foreign: 0,
+                retry: crate::os::RetryEvidence::default(),
                 open: Vec::new(),
             }),
             ScanMode::Open(open) => Ok(DescriptorScan::Complete {
                 processes: 3,
                 descriptors: 12,
                 foreign: 0,
+                retry: crate::os::RetryEvidence::default(),
                 open: open.clone(),
             }),
             ScanMode::Bounded => Ok(DescriptorScan::Bounded {
                 processes: 4096,
                 descriptors: 65_536,
                 bound: "descriptors",
+                retry: crate::os::RetryEvidence::default(),
             }),
             ScanMode::Unreadable => Err(Error::new(
                 ErrorKind::UnknownState,

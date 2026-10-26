@@ -36,7 +36,7 @@ use crate::custody::{self, CustodyBounds, CustodyEvidence, ObservedRoot, Pending
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
     ChildRemoval, DeviceId, DirHandle, DirOps, EntryFacts, EntryKind, MountRoot, ProcessObserver,
-    RemoveKind, VolumeFacts, VolumeUuid,
+    RemoveKind, RetryEvidence, VolumeFacts, VolumeUuid,
 };
 use crate::registry;
 use crate::state::{
@@ -146,6 +146,12 @@ pub struct DeleteReport {
     /// The custody evidence that authorised the first effect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custody: Option<CustodyEvidence>,
+    /// The bounded `EPERM` re-observation record of the custody verdict that
+    /// refused after the intent was written, when one did: a pending deletion
+    /// keeps that evidence too, so a diagnostic of the refusal reads it from the
+    /// report rather than losing it to a reason string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody_retry: Option<RetryEvidence>,
 }
 
 impl DeleteReport {
@@ -382,7 +388,7 @@ pub fn delete_root_on_volume(
         bounds.custody,
     );
     if !after_publish.is_safe() {
-        return Ok(pending_report(
+        let mut report = pending_report(
             &intent,
             quarantine,
             Counts::default(),
@@ -391,7 +397,9 @@ pub fn delete_root_on_volume(
                 after_publish.reason().unwrap_or("the verdict is not safe")
             ),
             Some(evidence),
-        ));
+        );
+        report.custody_retry = Some(after_publish.retry().clone());
+        return Ok(report);
     }
 
     // The quarantine rename is atomic inside one directory; a cross-device or
@@ -669,6 +677,7 @@ fn finish_deletion(
             directories_removed: counts.directories,
             marker_removed: counts.marker_removed,
             custody: None,
+            custody_retry: None,
         },
         Err(error) => pending_report(
             &current,
@@ -736,6 +745,7 @@ fn pending_report(
         directories_removed: counts.directories,
         marker_removed: counts.marker_removed,
         custody,
+        custody_retry: None,
     }
 }
 
@@ -1338,9 +1348,12 @@ mod tests {
     use crate::area::{AreaDeclaration, RootKind, ROOT_MARKER_FILE};
     use crate::custody::ObservedRoot;
     use crate::error::ErrorKind;
-    use crate::os::DeviceId;
+    use crate::os::{
+        DescriptorScan, DescriptorScanRequest, DeviceId, ProcessObserver, RetriedUnreadable,
+        RetryEvidence, RetryResolution,
+    };
     use crate::state::{self, IntentPhase, IntentRecord, LockSet, QUARANTINE_PREFIX};
-    use crate::testkit::{Faults, VolumeFixture};
+    use crate::testkit::{FakeObserver, Faults, VolumeFixture};
 
     const PLAN: &str = "abababababababababababababababababababababababababababababababab";
 
@@ -1373,14 +1386,22 @@ mod tests {
         }
 
         fn delete(&self, dirs: &Faults, facts: &crate::testkit::FakeVolume) -> super::DeleteReport {
+            self.delete_with(dirs, facts, &self.fixture.observer())
+        }
+
+        fn delete_with(
+            &self,
+            dirs: &Faults,
+            facts: &crate::testkit::FakeVolume,
+            observer: &dyn ProcessObserver,
+        ) -> super::DeleteReport {
             let mounts = self.fixture.mounts();
-            let observer = self.fixture.observer();
             delete_root_on_volume(
                 &self.fixture.state,
                 dirs,
                 facts,
                 &mounts,
-                &observer,
+                observer,
                 &self.fixture.uuid,
                 &self.declaration,
                 None,
@@ -1422,6 +1443,85 @@ mod tests {
                 .cloned()
                 .collect()
         }
+    }
+
+    /// The fixture observer whose first custody scan completes and whose second
+    /// answers unreadable with a bounded retry record. It is the deletion's
+    /// re-decision after the intent is published: that refusal must keep the
+    /// evidence, not reduce it to a reason string.
+    struct RefusesTheSecondScan {
+        inner: FakeObserver,
+        scans: std::cell::Cell<usize>,
+    }
+
+    impl ProcessObserver for RefusesTheSecondScan {
+        fn effective_uid(&self) -> crate::error::Result<u32> {
+            self.inner.effective_uid()
+        }
+
+        fn boot_identity(&self) -> crate::error::Result<String> {
+            self.inner.boot_identity()
+        }
+
+        fn process_start(&self, pid: u32) -> crate::error::Result<Option<u64>> {
+            self.inner.process_start(pid)
+        }
+
+        fn scan_open_descriptors(
+            &self,
+            request: &DescriptorScanRequest<'_>,
+        ) -> crate::error::Result<DescriptorScan> {
+            let seen = self.scans.get().saturating_add(1);
+            self.scans.set(seen);
+            if seen == 1 {
+                return self.inner.scan_open_descriptors(request);
+            }
+            Ok(DescriptorScan::Unreadable {
+                reason: "the open descriptors of pid 4242 (`dmd`, start 7) are still unreadable: Operation not permitted (os error 1) on 2 attempts (retries: 1)".to_owned(),
+                retry: RetryEvidence {
+                    retried_unreadable: 1,
+                    retried: vec![RetriedUnreadable {
+                        pid: 4_242,
+                        command: Some("dmd".to_owned()),
+                        start: 7,
+                        errnos: vec![1, 1],
+                        identity_changes: 0,
+                        resolution: RetryResolution::Unreadable,
+                    }],
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn a_custody_refusal_after_the_intent_keeps_its_bounded_retry_record() {
+        let prepared = prepared("delete-custody-after-intent");
+        let dirs = Faults::new();
+        let facts = prepared.fixture.facts();
+        let observer = RefusesTheSecondScan {
+            inner: prepared.fixture.observer(),
+            scans: std::cell::Cell::new(0),
+        };
+        let report = prepared.delete_with(&dirs, &facts, &observer);
+        assert_eq!(report.outcome, DeleteOutcome::Pending);
+        assert!(
+            report
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("after the intent"),
+            "the refusal names when it happened: {:?}",
+            report.reason
+        );
+        let retry = report
+            .custody_retry
+            .expect("the refusal keeps its bounded retry record");
+        assert_eq!(retry.retried_unreadable, 1);
+        let record = retry.retried.first().expect("the retried pid");
+        assert_eq!(record.pid, 4_242);
+        assert_eq!(record.command.as_deref(), Some("dmd"));
+        assert_eq!(record.errnos, vec![1, 1]);
+        assert_eq!(record.resolution, RetryResolution::Unreadable);
     }
 
     /// Publish one intent for the prepared root, advancing it through `phases`.

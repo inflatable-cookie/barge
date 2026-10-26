@@ -18,11 +18,18 @@ pub use facts::{
     AccountFacts, ChildEntry, ChildListing, ChildRemoval, DescriptorScan, DescriptorScanRequest,
     DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, ExpectedVolume, FileSystem,
     MountPoint, MountRoot, OpenDescriptor, ProcessIdentity, ProcessObserver, RemoveKind,
-    SelfExclusion, VerifiedVolume, VolumeFacts, VolumeIdentity, VolumeUuid,
+    RetriedUnreadable, RetryEvidence, RetryResolution, SelfExclusion, VerifiedVolume, VolumeFacts,
+    VolumeIdentity, VolumeUuid, RETRY_RECORDS,
 };
 
 #[cfg(target_os = "macos")]
 pub use macos::MacOs;
+
+/// The parts of the macOS scan the crate's own tests state for themselves: an
+/// `EPERM` answer sequence and the backoff schedule it is settled on. Nothing
+/// outside a test build can reach them.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use macos::{retry_schedule, StatedListing};
 
 #[cfg(not(target_os = "macos"))]
 compile_error!(

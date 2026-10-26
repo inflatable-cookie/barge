@@ -3064,6 +3064,7 @@ mod tests {
                 processes: 0,
                 descriptors: 0,
                 foreign: 0,
+                retry: crate::os::RetryEvidence::default(),
                 open: Vec::new(),
             })
         }
