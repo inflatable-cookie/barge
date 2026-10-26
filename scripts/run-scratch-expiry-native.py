@@ -9,6 +9,10 @@ image, a session or an accounting harness of its own.
 Usage:
   python3 scripts/run-scratch-expiry-native.py [--diagnostic] [--receipt <path>]
 
+Without `--receipt` the case script writes its receipt into the supervisor's
+evidence directory (`OXIDE_PROOF_EVIDENCE`) and prints that path; the receipt
+never lands outside the guard's own root.
+
 The owner activates each run separately: one uncounted `--diagnostic` pass, then
 the counted pass at the exact head. A counted pass with a missing receipt is a
 missing proof.
@@ -62,10 +66,6 @@ def main(argv):
             "BARGE_PROOF_BIN must name an executable barge binary; build it through oxide "
             "and pass its path when activating the run"
         )
-    receipt = options.receipt or os.path.join(
-        os.environ.get("OXIDE_PROOF_EVIDENCE", os.environ.get("TMPDIR", ".")),
-        "scratch-expiry-receipt.json",
-    )
     command = [
         sys.executable, supervisor,
         "--limit", str(WALL_LIMIT_S),
@@ -73,7 +73,12 @@ def main(argv):
     ]
     if os.path.isdir(DESIGNATED_SCRATCH):
         command += ["--root-parent", DESIGNATED_SCRATCH]
-    command += ["--", sys.executable, case_script, "--receipt", receipt]
+    command += ["--", sys.executable, case_script]
+    if options.receipt:
+        # An explicit receipt path is only honoured when it is inside the guard's
+        # own evidence directory; otherwise the case script writes its receipt
+        # beside the supervisor's evidence, never outside the guard's scratch.
+        command += ["--receipt", options.receipt]
     if options.diagnostic:
         command.append("--diagnostic")
     env = dict(os.environ)

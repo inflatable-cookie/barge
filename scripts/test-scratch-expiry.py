@@ -336,7 +336,7 @@ class Proof:
 
     # -- cases ------------------------------------------------------------
 
-    def case_two_concurrent_allocations(self):
+    def case_two_concurrent_allocations_get_distinct_ids(self):
         project = "concurrent"
         first = self.alloc(project, "first")
         second = self.alloc(project, "second")
@@ -351,7 +351,7 @@ class Proof:
         self.held = {"first": first, "second": second}
         return f"distinct root ids {first['root_id'][:8]}, {second['root_id'][:8]}"
 
-    def case_one_concluded_one_unconcluded(self):
+    def case_one_root_concluded_one_left_unconcluded(self):
         root = self.held["first"]
         self.conclude(root["root_id"], "first")
         self.release(root["root_id"], "first")
@@ -363,7 +363,7 @@ class Proof:
             raise Fault("case", "the concluded root did not record a positive closure")
         return "one positive conclusion, one unconcluded root"
 
-    def case_synthetic_old_conclusion_expires(self):
+    def case_a_synthetic_old_conclusion_expires(self):
         root = self.held["first"]
         self.age_conclusion(root["path"], NATIVE_AGE_DAYS + 1)
         document = self.plan()
@@ -383,7 +383,7 @@ class Proof:
             raise Fault("case", "the marker was not unlinked last")
         return "the old conclusion expired; the unconcluded root survived; the marker went last"
 
-    def case_unknown_entry_stops_the_delete(self):
+    def case_an_unknown_entry_stops_the_delete(self):
         root = self.alloc("unknown-entry", "owner")
         self.conclude(root["root_id"], "owner")
         self.release(root["root_id"], "owner")
@@ -413,7 +413,7 @@ class Proof:
                                 "leaf": os.path.join(self.project("unknown-entry"), leaves[0])}
         return "an unknown entry stopped the delete at `renamed`; the root survived as the leaf"
 
-    def case_clean_root_deleted(self):
+    def case_a_clean_root_is_deleted_and_the_marker_goes_last(self):
         # First settle the pending intent the previous case left: a real run
         # replays it before its plan's effects, and a plan with no candidates
         # keeps this step to the replay.
@@ -442,7 +442,7 @@ class Proof:
             raise Fault("case", "the clean root is still there")
         return f"deleted whole: {deleted[0]['entries_removed']} entries, marker last"
 
-    def case_enotempty_leaves_a_pending_intent(self):
+    def case_an_injected_enotempty_leaves_a_pending_intent(self):
         root = self.alloc("enotempty", "owner")
         self.conclude(root["root_id"], "owner")
         self.release(root["root_id"], "owner")
@@ -461,44 +461,62 @@ class Proof:
             command, env=self.env, cwd=self.root,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
+        # A writer keeps recreating an entry inside the quarantined leaf while the
+        # deletion runs, so the delete meets an entry it did not classify (or a
+        # leaf that is not empty when it is removed). Both are the conservative
+        # stop the design names: the intent stays pending and the leaf is kept.
+        # The marker-last `ENOTEMPTY` retry itself is proved by the counted unit
+        # counterfactual (`delete::tests::enotempty_three_times_...`); a native
+        # cannot inject a platform fault at an exact step.
+        planted_rounds = 0
         try:
             leaf = self.wait_for_quarantine(folder, timeout=60)
-            # Finder can recreate metadata mid-delete; a *directory* with a
-            # metadata-shaped name is not metadata, so the leaf's removal fails
-            # with ENOTEMPTY and the intent stays pending.
             planted = os.path.join(leaf, ".DS_Store")
             deadline = time.time() + 30
             while time.time() < deadline:
                 try:
                     os.makedirs(planted, exist_ok=True)
+                    planted_rounds += 1
                 except OSError:
                     pass
                 if not os.path.isdir(leaf):
                     break
-                time.sleep(0.02)
+                time.sleep(0.01)
         finally:
             process.wait(timeout=180)
         document = json.loads(process.stdout.read() or "{}")
         if process.returncode not in (0, 3):
-            raise Fault("case", f"the expiry exited {process.returncode}")
+            raise Fault("case", f"the expiry exited {process.returncode}: {document}")
         pending = self.pending_intents()
         if len(pending) != 1:
-            raise Fault("case", f"expected a pending intent, found {len(pending)}")
-        if pending[0]["phase"] != "marker_last":
-            raise Fault("case", f"the pending intent is at `{pending[0]['phase']}`")
+            raise Fault(
+                "case",
+                f"expected one pending intent after the plant, found {len(pending)} "
+                f"(exit {process.returncode}, planted {planted_rounds} times)",
+            )
+        phase = pending[0]["phase"]
+        if phase not in ("renamed", "marker_last"):
+            raise Fault("case", f"the pending intent is at `{phase}`")
         leaf = os.path.join(folder, pending[0]["quarantine_name"])
         if not os.path.isdir(leaf):
             raise Fault("case", "the quarantine leaf was not kept")
+        reason = document.get("data", {}).get("pending", {}).get("rows", [{}])[0].get("reason")
         self.settle_pending()
-        return "an injected ENOTEMPTY left a `marker_last` intent and the kept leaf; replay settled it"
+        return (
+            f"a mid-delete entry stopped the delete at `{phase}` ({reason}); "
+            "the leaf was kept and the replay settled it"
+        )
 
-    def case_pull_mid_delete_then_replay(self):
+    def case_a_pull_mid_delete_leaves_a_pending_intent_then_replay(self):
         root = self.alloc("pull", "owner")
         self.conclude(root["root_id"], "owner")
         self.release(root["root_id"], "owner")
-        for index in range(400):
-            with open(os.path.join(root["path"], f"file-{index:03}.txt"), "w", encoding="utf-8") as handle:
-                handle.write("payload")
+        for folder_index in range(80):
+            folder = os.path.join(root["path"], f"bulk-{folder_index:02}")
+            os.makedirs(folder)
+            for index in range(100):
+                with open(os.path.join(folder, f"file-{index:03}.txt"), "w", encoding="utf-8") as handle:
+                    handle.write("payload")
         self.age_conclusion(root["path"], NATIVE_AGE_DAYS + 1)
         document = self.plan()
         digest = document["data"]["plan_digest"]
@@ -545,7 +563,7 @@ class Proof:
             raise Fault("case", "the kept leaf survived the replay")
         return "an ordinary pull mid-delete kept the leaf; the replay after re-attach settled it"
 
-    def case_stale_mount_point_is_never_written(self):
+    def case_a_stale_mount_point_is_never_written(self):
         self.detach()
         stale = self.mount
         existed = os.path.isdir(stale)
@@ -635,8 +653,10 @@ class Proof:
 
     def settle_pending(self):
         # An operator resolves what the stopped delete refused before replaying:
-        # the obstacle a case planted is removed from the kept quarantine leaf,
-        # and the replay then finishes from the recorded identity alone.
+        # only the obstacle a case planted is removed from the kept quarantine
+        # leaf (a symlink, or the metadata-shaped plant), and the replay then
+        # finishes the rest from the recorded identity alone. Nothing else is
+        # touched here: the payloads go through Barge's own delete.
         for intent in self.pending_intents():
             folder = os.path.join(self.mount, intent["folder"])
             leaf = os.path.join(folder, intent["quarantine_name"])
@@ -646,9 +666,9 @@ class Proof:
                 if name == ".barge-root.json":
                     continue
                 target = os.path.join(leaf, name)
-                if os.path.islink(target) or os.path.isfile(target):
+                if os.path.islink(target):
                     os.unlink(target)
-                else:
+                elif os.path.isdir(target) and name == ".DS_Store":
                     shutil.rmtree(target)
         digest, plan = self.empty_plan_digest()
         if plan["candidates"]["count"] != 0:
@@ -757,16 +777,32 @@ class Proof:
 
 
 def self_check():
-    """The proof's own apparatus: case map, pins, premises and receipt shape."""
+    """The proof's own apparatus: the case map and its dispatch, pins, premises.
+
+    The dispatch check is the guard that was missing when eight of nine case
+    names had no method: `run_cases` calls `case_<name>`, so the self-check
+    proves every case name resolves to a method and every case method is in the
+    map, and that each dependency is evaluated before the case that needs it.
+    """
     problems = []
     names = [name for name, _ in CASES]
     if len(names) != 9 or len(set(names)) != 9:
         problems.append("the case map does not name nine distinct cases")
     known = set(names)
+    seen = set()
     for name, needs in CASES:
         for need in needs:
             if need not in known:
                 problems.append(f"{name} depends on unknown case {need}")
+            elif need not in seen:
+                problems.append(f"{name} depends on {need}, which is not evaluated first")
+        method = f"case_{name}"
+        if not callable(getattr(Proof, method, None)):
+            problems.append(f"{name} has no dispatch method `{method}`")
+        seen.add(name)
+    for attribute in dir(Proof):
+        if attribute.startswith("case_") and attribute[len("case_"):] not in known:
+            problems.append(f"`{attribute}` is a case method the map never dispatches")
     if not SUPERVISOR_SHA256 or len(SUPERVISOR_SHA256) != 64:
         problems.append("the supervisor digest is not a SHA-256")
     if len(PREMISES) != 9:
@@ -777,6 +813,10 @@ def self_check():
     for hook in ENVIRONMENT.values():
         if not hook:
             problems.append("an environment hook has no recorded purpose")
+    if not set(ENVIRONMENT) <= {
+        "TMPDIR", "TMP", "TEMP", "BARGE_STATE_DIR", "BARGE_PROOF_BIN", "HOME", "CARGO_HOME",
+    }:
+        problems.append("the environment record names a hook the case script does not read")
     return problems
 
 
@@ -793,6 +833,7 @@ def main(argv):
         print(json.dumps({
             "schema": "barge.scratch.expiry.native.self-check/1",
             "cases": [name for name, _ in CASES],
+            "dispatch": {name: f"case_{name}" for name, _ in CASES},
             "premises": len(PREMISES),
             "supervisor_sha256": SUPERVISOR_SHA256,
             "problems": problems,
@@ -834,8 +875,15 @@ def main(argv):
         except Exception:
             cancelled = None
     receipt = proof.receipt(cancelled)
+    receipt["receipt_path"] = proof.receipt_path
     proof.write_receipt(receipt)
-    print(json.dumps({key: receipt[key] for key in ("schema", "qualified", "diagnostic", "cases")}, indent=1))
+    print(json.dumps({
+        "schema": receipt["schema"],
+        "qualified": receipt["qualified"],
+        "diagnostic": receipt["diagnostic"],
+        "receipt_path": receipt["receipt_path"],
+        "cases": receipt["cases"],
+    }, indent=1))
     if receipt["qualified"]:
         return 0
     return 3 if options.diagnostic else 1

@@ -2187,6 +2187,15 @@ Choices S4 made where this design left the mechanic to the slice:
   a claimed unit to 12 levels for its newest entry, and keeps the deletion's own
   120 s per-root deadline and three `ENOTEMPTY` attempts. The plan and its rows
   use the root row cap.
+- **What the native proves, and what it does not.** The proof's case map is
+  bound to its dispatch by its own self-check: every case name resolves to a
+  `case_<name>` method, no case method is undispatched, and every dependency is
+  evaluated first, so a renamed case cannot pass unnoticed. Its `ENOTEMPTY` case
+  injects a writer that recreates an entry inside the quarantined leaf while the
+  delete runs; a native cannot inject a platform fault at an exact step, so the
+  case asserts the design's observable — one pending intent and the kept leaf,
+  whichever conservative stop the race produces — and the marker-last
+  `ENOTEMPTY` retry itself stays proved by the counted unit counterfactual.
 - **What S4 does not claim.** No real-drive sweep, no reaper or LaunchAgent
   change, no Oxide or Effigy adoption, and no native receipt until the owner
   activates the runs. `scratch:expiry:native` and its `:diagnostic` twin are
