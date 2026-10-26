@@ -110,7 +110,7 @@ Library modules, each with one job:
 | `inspect` | Read-only parsers for foreign state (Oxide `pools.json`, `removable.json`, root and scratch markers; Effigy scratch markers), returning `Observed<T>` values that never become authoritative. |
 | `area` | Area declaration, path resolution, root creation, holds, root listing, prune planning. |
 | `scratch` | Project scratch allocation, conclusion, expiry sweep. |
-| `cache` | Cache kinds, link-first adoption, tool-setting adoption and undo. |
+| `cache` | Cache kinds, the three placement forms (`setting`, `held-root`, `link`) and undo. |
 | `custody` | Writer-custody evidence, verdicts, deletion authorization. |
 | `delete` | Whole-root deletion, Finder tolerance, quarantine and replay. |
 | `prune` | Area prune policy evaluation, plan/preview, intent journal. |
@@ -256,19 +256,41 @@ locks and re-reads the registry state it needs before publishing its intent.
 | `volume_uuid` | APFS volume UUID from the kernel, the identity that matters |
 | `mount_hint` | last observed mount point; used to find it, never as identity |
 | `availability` | `permanent` or `ephemeral` |
-| `durability` | `expendable` or `kept` |
+| `durability` | `expendable`, `kept` or `undeclared` |
 | `root_dir` | folder relative to the mount; `""` means the drive root |
 | `folders.scratch`, `folders.caches` | per-volume override of Barge's own folders, relative to `root_dir` |
 | `origin` | `declared` (an operator wrote it) or `observed_oxide` (imported, read-only) |
+| `scratch_grants` | recorded deletion authority for non-native scratch: `delegations` and `claims`; empty means keep and report |
 | `generation` | increases on every change; used to detect a stale reader |
 | `registered_ms` | when this record was written |
 
 Availability and durability are independent and both explicit; a record missing
-either is invalid. `durability` is never defaulted: an imported Oxide
-registration declares `mode` (availability) but says nothing about durability,
-so an import records durability as `undeclared` and every placement on that
-volume refuses with `unknown_state` until a human declares it. Expending data is
-a destructive permission; it is never inferred.
+either is invalid. `durability` has three values and is never defaulted:
+`expendable` permits pruning, `kept` forbids it, and `undeclared` is the honest
+state of an imported record that does not say. An imported Oxide registration
+declares `mode` (availability) but nothing about durability, so the import
+writes `undeclared`, and every placement or area use on that volume refuses with
+`unknown_state` until a human declares it. `undeclared` is not a synonym for
+`expendable` and is never treated as one; expending data is a destructive
+permission that is never inferred.
+
+`scratch_grants` is the one place a non-native scratch deletion is authorized:
+
+```json
+{"delegations": [{"family": "effigy_scratch", "by": "operator", "declared_ms": 0}],
+ "claims": [{"scope": {"kind": "project", "name": "example"},
+             "unit": "child", "unmarked_idle_seconds": 1209600,
+             "families_excluded": ["oxide_scratch", "effigy_scratch"],
+             "declared_by": "operator", "declared_ms": 0}]}
+```
+
+A delegation names one marker family (`oxide_scratch`, `effigy_scratch`) and is
+written only by that family's owner. A claim names one scope (`project` with a
+name, or `top_level_adhoc`) and one unit shape (`child` or `entry`). Both are
+read under the volume lock immediately before an effect, never cached across a
+run, and both can be withdrawn without touching data. Their exact predicates
+are in [scratch compatibility](#compatibility-with-effigy-and-oxide-roots).
+Empty or absent means no non-native unit is ever deleted.
 
 Volume identity is verified on every use, not cached: the mount point must open
 as a real directory directly under a `/Volumes` that passes the mount-parent
@@ -558,13 +580,16 @@ report.
 volume's scratch folder, whole roots only, with fixed bounds:
 
 - Eligible: a `scratch_run` root whose marker records `closure: positive`,
-  `nested_scope: exclusive`, `kept_reason` in `evidence`/`qualify-base`, and a
-  `concluded_ms` strictly older than the policy age (default seven days,
-  per-area or per-volume override).
+  `nested_scope: exclusive`, `kept_reason: evidence`, and a `concluded_ms`
+  strictly older than the policy age (default seven days, per-area or
+  per-volume override). `qualify-base` is an Oxide marker reason, not a Barge
+  one: Barge's own `kept_reason` enum cannot produce it, so it is never listed
+  as eligible here.
 - Never eligible: unconcluded, unknown, `retained`, `unclosed`, `failed` with
   `kept_reason` `unclosed`/`exception`/`nested-unclosed`, `hosting`, another
-  user's root, another device, a symlink at any level, a foreign marker family,
-  or anything Barge cannot positively identify.
+  user's root, another device, a symlink at any level, a foreign marker family
+  without a recorded delegation, an unmarked unit without a recorded legacy
+  claim, or anything Barge cannot positively identify.
 - Bounds: 1 s and 4096 examined entries per sweep, checked between filesystem
   steps, plus a per-root delete deadline (see [bounded
   resources](#bounded-resources)). Exhaustion leaves the unreached work for a
@@ -578,21 +603,73 @@ volume's scratch folder, whole roots only, with fixed bounds:
 
 ### Compatibility with Effigy and Oxide roots
 
-Barge must subsume the host reaper without breaking two live marker families.
+Barge must subsume the host reaper without breaking two live marker families and
+without either leaking the trees the reaper used to delete or over-deleting
+something it never owned. One positive rule does that: **nothing in a scratch
+folder is deleted unless a recorded grant covers the unit, that grant's own
+eligibility predicate holds, and custody is `Safe`.** There is no delete path
+that skips a grant, and no grant authorizes a different owner's data.
 
-| Family | Marker | Who concludes | Expiry Barge applies |
+A *grant* is one of three recorded forms:
+
+| Grant | Written by | Covers | Eligibility predicate |
 | --- | --- | --- | --- |
-| Barge | `.barge-root.json`, `kind: scratch_run` | Barge | the policy above |
-| Oxide scratch | `.oxide-scratch.json` (`version: 1`) | Oxide's supervisor only | the marker's own rule: positive conclusion, `exclusive`, expirable reason, strictly older than seven days |
-| Oxide validation temp | none (plain `oxide-validation/run.*`) | Oxide | never; not a marked root |
-| Effigy | `.effigy-scratch.json` (`Marker`: `run`, `pid`, `pid_start`, `created_ms`, optional `keep`, `concluded_ms`) | Effigy only | the marker's own rule: concluded and over 24 h, or no conclusion and the creating process positively gone, or over seven days |
+| Native root | Barge, at allocation | one `scratch_run` root it created | [the expiry rule](#expiry) |
+| Foreign delegation | the family's owner, once per family and volume, in the volume's `scratch_grants` | roots carrying that family's marker | that family's own rule, exactly as pinned below |
+| Legacy claim | a human, once per scope, at declaration time | unmarked units in one declared scope | the claim's declared idle age and unit shape |
 
-Reading these is read-only: Barge parses them strictly, reports them with their
-owner and version, and evaluates the owner's own rule. It never writes a foreign
-marker, never concludes a foreign root, never converts one to a Barge marker and
-never deletes a foreign root whose rule it cannot decide. A legacy root without
-a marker is left alone and reported (`unknown`), exactly as the current host
-reaper leaves unmarked entries.
+The three marker families, with the field sets pinned to the sources above:
+
+| Family | Marker | Fields Barge reads | Who concludes | Eligibility Barge applies |
+| --- | --- | --- | --- | --- |
+| Barge | `.barge-root.json`, `kind: scratch_run` | `barge.root/1`, exactly its field set | Barge | the [expiry](#expiry) rule |
+| Oxide scratch | `.oxide-scratch.json` (`version: 1`) | `version`, `run_id`, `root`, `owner_uid`, `device`, `inode`, `created_unix`, `concluded_unix`, `outcome`, `closure`, `kept_reason`, `nested_scope` | Oxide's supervisor only | with a delegation: `closure: positive`, `nested_scope: exclusive`, `kept_reason` in `evidence`/`qualify-base`, concluded strictly more than seven days ago |
+| Oxide validation temp | none, plain `oxide-validation/run.*` | none | Oxide | never; not a marked root and never claimed |
+| Effigy | `.effigy-scratch.json` (`Marker`) | `run` (required), `task`, `checkout`, `pid`, `pid_start` (all four defaulted by the pinned source, so absent is valid), `created_ms`, optional `keep`, optional `concluded_ms` | Effigy only | with a delegation: `keep: true` with `concluded_ms` older than 24 h, or no conclusion and the recorded `pid`/`pid_start` positively gone, or `created_ms` older than seven days |
+
+Reading a foreign marker is read-only: Barge parses it strictly *against that
+family's pinned field set* — an omitted field the family defaults is valid, not
+`unknown_state`; an extra field, an unknown version, a wrong type or an
+unreadable file is `unknown_state` and the unit is kept. Barge never writes a
+foreign marker, never concludes a foreign root, never converts one to a Barge
+marker, and never applies its own seven-day rule to one.
+
+**Legacy claims.** The current host job does not skip unmarked scratch: its
+`reap.py` deletes each child of every project folder under `scratch/` after
+their newest entry is fourteen days old and no process has them open, deletes
+top-level entries that are files or whose names contain a dot as single units
+the same way, and skips only symlinks, the `oxide` project, Effigy-marked
+directories and bare eight-character run names. That behaviour is the thing to
+replace, so the design reproduces it as an explicit grant instead of an
+implicit name rule. A legacy claim is declared once, per scope, by the owner of
+the data:
+
+- The record shape is the volume's `scratch_grants`
+  ([registry](#registry-of-volumes)); one claim per scope, with its declared
+  idle age, unit shape and excluded families.
+- `scope.kind` is `project` (children of `<scratch>/<project>/`) or
+  `top_level_adhoc` (entries directly under `<scratch>/` whose name contains a
+  dot, or that are not directories, matching the reaper's units). A claim never
+  covers the scratch root as a whole and never covers a named project folder.
+- A claimed unit is eligible only when it carries no marker of any recognised
+  family, is not a symlink at any level, the owning project folder (when the
+  scope is a project) has a valid claim, the newest entry in the unit is older
+  than the claimed idle age, no hold covers it, custody is `Safe`, and the
+  delete is whole-unit with the Finder and `ENOTEMPTY` rules below. A unit that
+  becomes marked between plan and effect is kept.
+- A claim is reversible and per scope. Removing it returns the scope to
+  keep-and-report without touching data.
+- A claim is an operator declaration, recorded in the volume's `scratch_grants`
+  beside any foreign delegation. It is never inferred from a directory name, a
+  marker's absence or an mtime.
+
+Until a family's delegation or a scope's claim exists, `maintain --plan` reports
+the units such a grant *would* cover, with counts and reasons, and deletes
+nothing there. That is what makes replacing the host job staged per scope: the
+plan names every leftover, so a missing grant cannot leak silently, and no
+grant means no deletion rather than an over-delete. The same rule is why the
+reaper's replacement is a sequence of recorded declarations, each reviewed
+against the job's own dry run, not a single switch.
 
 Two layout facts must be preserved rather than tidied:
 
@@ -600,82 +677,121 @@ Two layout facts must be preserved rather than tidied:
   (`<mount>/scratch/<8-char>`), beside the project folders, because it was
   configured with `[scratch] root = /Volumes/Builds/scratch`. Barge's own roots
   are one level deeper (`<scratch>/<project>/<root-id>`). The expiry sweep
-  therefore recognises *both* levels and never treats an eight-character
-  project folder as a run root, or the reverse; a name never establishes
-  ownership. Moving Effigy under `<scratch>/effigy/` is a consumer change for a
+  therefore recognises both levels and never treats an eight-character project
+  folder as a run root, or the reverse; a name never establishes ownership and
+  a bare eight-character directory is only ever covered by a `top_level_adhoc`
+  claim. Moving Effigy under `<scratch>/effigy/` is a consumer change for a
   later task.
 - Oxide's validation temp is `<mount>/scratch/oxide-validation/`, a sibling of
   its `scratch/oxide` subtree, outside the seven-day self-expiry. It is not a
-  Barge scratch root and the sweep skips it.
+  Barge scratch root, no claim may cover it, and the sweep skips it.
 
 The current host job (`com.tom.scratch-reaper`, daily 04:30) also runs Oxide's
 outputs prune. Barge's job replaces only the scratch part, and only after the
-scratch slice is qualified; the prune entry stays Oxide's until stage 4.
+scratch slice is qualified and that scope's grants are declared; the prune entry
+stays Oxide's until stage 4.
 
 ## Package-cache placements
 
-### Kinds and link-first adoption
+### Kinds and placement forms
 
 Stage 1 designs four kinds:
 
-| Kind | Original path | Mechanism |
+| Kind | Original path | Form |
 | --- | --- | --- |
-| `npm-cache` | `~/.npmrc` `cache=` | tool setting |
-| `bun-cache` | `~/.bunfig.toml` `[install.cache] dir` | tool setting |
-| `cargo-registry` | `~/.cargo/registry` | directory link |
-| `cargo-git` | `~/.cargo/git` | directory link |
+| `npm-cache` | `<account home>/.npmrc` `cache=` | `setting` |
+| `bun-cache` | `<account home>/.bunfig.toml` `[install.cache] dir` | `setting` |
+| `cargo-registry` | `<account home>/.cargo/registry` | `held-root` or `link` |
+| `cargo-git` | `<account home>/.cargo/git` | `held-root` or `link` |
 
-Links first (Q-003). Where the tool's own path is a directory, Barge creates an
-owned root under the volume's `caches/` folder and replaces the original path
-with a symlink whose text is the recorded absolute target; the placement record
-holds the original path, the target, the volume UUID, the root id and the link
-text. The swap is: verify the original is a real directory of this user and not
-a symlink; acquire custody of it; create the root and marker; move nothing;
-publish the link through a temporary name and `rename`, so the original path is
-either the directory or the link, never absent; sync the parent. If the original
-is already a symlink to an owned root with a valid marker, adoption records it
-and changes nothing.
+Original paths resolve from the **account home** (the password-database home
+used for state), never from `$HOME`. A `~` in a declaration is expanded once at
+declaration and the record holds the absolute path; a later `$HOME` or `~`
+change never re-points a placement. Links first (Q-003), and the three placement
+forms are distinct records because they need different mechanics:
 
-Where the tool can only be redirected by its own setting, Barge writes that
-setting only during an explicit adopt, and the record holds the exact previous
-bytes of the file and the exact new bytes, plus the file's identity (device,
-inode, size, mtime, digest before and after). The edit is line-scoped on the
-named key with a backup copy written first; a file with an unexpected shape
-(multiple candidate keys, a parse error, an unknown format version) refuses
-rather than editing. `barge cache undo --json` restores the recorded bytes only
-if the file still has the exact after-bytes Barge wrote; otherwise it refuses
-and reports the divergence, changing nothing.
+1. **`setting`** — the tool can only be redirected by its own setting. Barge
+   writes that setting once during an explicit adopt and records the file's
+   identity (device, inode, size, mtime, digest) and the exact bytes before and
+   after. The edit is line-scoped on the named key, with a backup copy written
+   first; a file with an unexpected shape (multiple candidate keys, a parse
+   error, an unknown format version) refuses rather than editing. No filesystem
+   link is involved.
+2. **`held-root`** (adopted in place) — the directory already exists where the
+   placement wants it, on the registered volume. Adopt writes
+   `.barge-root.json` with `origin: adopted_existing` into that directory and
+   records its pre-adoption observation (device, inode, entry count, newest
+   mtime, allocated bytes). Nothing is renamed, linked, copied or moved. This
+   form exists precisely because today's hand-made cache directories are already
+   in the right place.
+3. **`link`** — the tool's original path should follow the volume. Barge creates
+   an owned root under the volume's `caches/` folder and publishes a symlink at
+   the original path whose text is the recorded absolute target. A symlink can
+   only be published where no directory is in the way, so this form is
+   mechanically available in exactly three starting states:
+   - the original path is **absent**: create the link under a temporary name in
+     the parent and `rename` it into place, so the path is never a missing path
+     for a concurrent reader;
+   - the original path is **already a symlink**: record it; a link to a foreign
+     target is `foreign_owner` unless the explicit adopt names the change;
+   - the original path is an **empty real directory**: custody on that directory,
+     `rmdir`, then the temporary-name publish. That is the only moment the path
+     is briefly absent, which is why the directory must be empty and why custody
+     is taken first.
+
+   A **non-empty real directory is never replaced by a link during adopt.** A
+   symlink cannot be renamed over a directory, and deleting or moving the
+   directory's contents would be exactly the data move the design forbids here.
+   Adopt refuses with exit `2` and prints a plan naming the directory, its
+   observed entries and the two real options: adopt it in place as a
+   `held-root`, or relocate its contents with the separate explicit
+   operator-authorized relocation command (below).
+
+**Relocation is its own operation, not part of adopt.** Moving existing cache
+contents onto the volume needs explicit operator approval for that action, a
+custody proof on both the source and the destination, a durable per-entry
+journal, verification after each batch, and its own undo. It is a later slice
+with its own gate; nothing in this design moves consumer data.
+
+`barge cache undo --json` reverses exactly the recorded form: a `setting`
+restores the recorded bytes only if the file still has the exact after-bytes
+Barge wrote (otherwise it refuses and reports the divergence, changing nothing);
+a `link` removes the link and restores an empty directory where one was
+replaced, or removes the link where the original was absent; a `held-root` undo
+removes only the marker it wrote, and refuses if the directory's identity
+changed. Undo never reverses a relocation; that operation's own undo does.
 
 Absent volume (Q-001): a cache placement fails clearly, naming the drive to
 attach. There is never a silent internal fallback, no re-download to the
 internal SSD, and no "create an empty directory so the tool proceeds" — an
-absent link target is an error, and Barge never recreates the mount point.
+absent link target or root is an error, and Barge never recreates the mount
+point.
 
 ### Adopting the existing hand-made placements
 
-Today `~/.npmrc` and `~/.bunfig.toml` point at `/Volumes/Builds/caches/{npm,bun}`
-and `~/.cargo/{registry,git}` are links into `/Volumes/Builds/caches/cargo/`.
-Adoption is in place, with no data move:
+Today `<account home>/.npmrc` and `/.bunfig.toml` point at
+`/Volumes/Builds/caches/{npm,bun}` and `/.cargo/{registry,git}` are links into
+`/Volumes/Builds/caches/cargo/`. Adoption is in place, with no data move:
 
-- If the tool setting already resolves to a path under a Barge `caches/` folder
-  on a registered volume, adopt records it and writes nothing to the file: no
-  byte, mode or timestamp change. This is the expected case today.
-- If the original path is already a symlink into a registered volume's
-  `caches/` folder, adopt records the link text and root and writes nothing.
-- The pre-existing directories carry no Barge marker. Adopt refuses to write a
-  marker into a non-empty directory unless the operator passes
-  `--adopt-existing-root`, which records `origin: adopted_existing` plus the
-  pre-adoption observation (device, inode, entry count, newest mtime, allocated
-  bytes) in the placement record. The marker is additive; no consumer file is
-  touched. Without the flag, adopt reports exactly what it would do and exits
-  `2`, changing nothing.
-- A setting that points at a *different* external path, at the internal drive,
-  or at a path whose volume is not registered is not adopted silently: adopt
+- A tool setting that already names a path under a registered volume's
+  `caches/` folder is recorded as a `setting` placement and the file is not
+  written: no byte, mode or timestamp change. This is the expected case today.
+- A symmetric link into a registered volume's `caches/` folder is recorded as a
+  `link` placement with no write. Its target directory carries no Barge marker,
+  so the same adopt also offers `--adopt-existing-root`: that writes the marker
+  as a `held-root` record, additively, and still moves nothing. Without the flag
+  adopt reports what it would do and exits `2`, changing nothing.
+- A real directory is not linked over. If it already sits on the registered
+  volume at the intended path it is adopted as a `held-root` (marker only, with
+  `--adopt-existing-root`); if it sits on the internal drive it refuses with the
+  plan described above, and the data move stays an explicit operator operation.
+- A setting or link that points at a *different* external path, at the internal
+  drive, or at a path on an unregistered volume is not adopted silently: adopt
   names the current value and the intended one and requires the explicit adopt.
 - The Cargo `cargo-swap.py` host script's behaviour (swapping the registry
-  directory) is replaced, not wrapped: Barge's link is stable and its root is
-  prunable only by policy with custody, so no swap script is needed once the
-  kind is qualified.
+  directory) is replaced, not wrapped: a stable link or a `held-root` whose root
+  is prunable only by policy with custody needs no swap script once the kind is
+  qualified.
 
 ## Writer custody and safe deletion
 
@@ -833,7 +949,7 @@ data, marker and record are left unchanged and reported.
 | --- | --- | --- |
 | Drive pulled before a command | mount root will not open, UUID or device mismatch, `EIO`/`ENOENT` on the volume descriptor | refuse `volume_absent` naming the drive; nothing created, nothing deleted; kept data is unavailable, never "gone" |
 | Drive pulled mid-delete | descriptor-relative call fails after the quarantine rename | stop; keep the pending intent and the quarantine leaf; exit `3`; replay only after the volume is reverified and the recorded identity matches |
-| Drive pulled mid-adopt | link publish or setting write fails | publish order keeps the original path present (temporary + rename); a half-written intent stays pending and `undo` refuses until the intent is settled |
+| Drive pulled mid-adopt | the form's publish step fails | a `setting` adopt leaves either the old or the new bytes and a pending intent that `undo` and replay settle; a `link` adopt publishes through a temporary name, so the original path is never a dangling name in the absent case, and the empty-directory case re-creates the empty directory on replay instead of leaving it missing; a `held-root` adopt either wrote the marker or did not |
 | Finder recreates `.DS_Store` | `ENOTEMPTY`/`EEXIST` from `rmdir` | three attempts, 1 s apart; then keep the pending quarantine and exit `3` |
 | Finder writes a non-metadata entry | refusal in the walk | stop, keep the root, report the escaped name; never widen the delete |
 | Two allocators race | exclusive `mkdir` with the fresh id | the loser gets `EEXIST` and retries with a new id; no shared root, no adoption of the other's marker |
@@ -849,6 +965,12 @@ data, marker and record are left unchanged and reported.
 | Same mount, different volume | UUID/device mismatch | refuse `volume_mismatch`; never use, never delete |
 | Stale mount-point directory | path exists, but not a mount root of the registered UUID | never write through it; never recreate it |
 | Marker-less non-empty directory in an area | walk sees no valid marker | unknown: skip, report, never delete or adopt |
+| Unmarked scratch unit with no legacy claim | no recognised marker and no claim covering its scope | keep and report; `maintain --plan` lists what a claim would cover; never infer a claim from a name or an mtime |
+| Foreign scratch family with no delegation | an Oxide or Effigy marker whose family has no recorded delegation for that volume | keep and report; never apply Barge's age or conclusion rule to it |
+| Unit becomes marked between plan and effect | identity or marker re-verification at the effect step | keep the unit; the effect is abandoned with no partial delete |
+| Legacy claim revoked between plan and effect | claim re-read under the volume lock | keep the unit; the claim is never cached across the run |
+| Cache original path is a non-empty real directory | adopt sees a real directory with entries | refuse `refused_boundary` with a plan (adopt in place as `held-root`, or the separate relocation operation); nothing is renamed, linked, deleted or copied |
+| Cache undo after the file diverged | after-bytes digest mismatch | refuse, report the divergence, change nothing |
 | Foreign marker family in a Barge area | marker name/owner differs | skip and report; the owner's rule decides |
 | `EACCES` inside a tree | walk error | bounded skip with the reason; never abort the whole sweep into a fallback; the root keeps its marker |
 | Clock skew or future-dated marker | conclusion/creation time ahead of now | not eligible; report `unknown_state` |
@@ -867,14 +989,19 @@ data, marker and record are left unchanged and reported.
 | Oxide `oxide-outputs` root markers `root/1`, `root/2` | yes, identify and report only | never | with Oxide's stage 4 area adoption |
 | Oxide receipts, registry, prune journals, tombstones | presence and version only | never | with Oxide's stage 4 |
 | Oxide `oxide-pool` payload and slots | not interpreted | never | stage 3/4 |
-| Oxide `.oxide-scratch.json` and validation temp | yes, owner's expiry rule | never | with Oxide's scratch adoption |
-| Effigy `.effigy-scratch.json` | yes, owner's expiry rule | never | with Effigy's own adoption |
+| Oxide `.oxide-scratch.json` and validation temp | yes, strict; with a recorded delegation, its own expiry rule, otherwise keep and report | never | with Oxide's scratch adoption |
+| Effigy `.effigy-scratch.json` | yes, strict against the pinned field set; with a recorded delegation, its own expiry rule, otherwise keep and report | never | with Effigy's own adoption |
 | Barge registry, areas, placements, roots, holds, intents | — | yes, authoritative | — |
 
 Rules that keep this safe:
 
 - Barge never rewrites, moves, renames, marker-marks or deletes a foreign owner's
-  data. Compatibility is read-only until the owner's own adoption slice.
+  data. Compatibility is read-only until the owner's own adoption slice grants
+  it; a foreign marker is read, reported and kept until a delegation or a legacy
+  claim covers it.
+- Every scratch deletion needs a recorded grant (native root, foreign family
+  delegation, or legacy claim). A missing grant means keep and report, never a
+  name-based or age-based delete.
 - A foreign format's unknown field, unknown version or unreadable bytes make the
   fact unknown. Unknown is never treated as absent, idle, empty or safe.
 - Paths are recorded at adopt and never silently moved. `root_dir` and folder
@@ -896,7 +1023,9 @@ Rules that keep this safe:
 | `kept/` group folder | Retired by Tom's ruling (`c80e2034`): kept data lives where the user organises it, outside managed folders, and is never owned. |
 | Oxide-specific `outputs/` and `pools/` folders in Barge | Refined by `e5e7bffa`: Barge has no consumer knowledge. Broad names would either grow per-consumer code or mis-file data. |
 | One `delete` primitive without a quarantine rename | A crash mid-walk leaves a partially deleted root with a valid marker, which the next run could read as a complete root. Rename-then-delete with a journal keeps the identity recoverable. |
-| Deleting by name pattern or age alone | A name is not ownership and mtime is not a conclusion. Only a valid marker plus the owner's conclusion authorizes deletion. |
+| Deleting unmarked scratch by name or age alone | A name is not ownership and mtime is not a conclusion, and the live reaper's name rules are exactly what must not survive the handover. A legacy claim records the scope, unit shape, idle age and excluded families once, so the replacement deletes what the operator meant and reports everything else. |
+| Deleting a foreign marker family's roots under Barge's own age rule | It would silently outlive or contradict the owner's conclusion contract. A family's own rule applies only after that owner's explicit delegation. |
+| Replacing a real cache directory with a link during adopt | A symlink cannot be renamed over a directory; moving or deleting its contents would be the data move this design forbids. Adopt does the in-place `held-root` form or refuses with a plan, and relocation stays a separate authorized operation. |
 | `lsof` as the custody proof | External, unbounded, and its silence is not a kernel guarantee. It is a diagnostic at most. |
 | Treating a same-device link as "no data move" without a record | Without the recorded link text and root identity, an undo cannot prove what it is restoring. Every link is recorded. |
 | Hard links or copies for cache placement | A copy doubles writes (the opposite of the product's purpose) and a hard link cannot cross volumes; the link is a symlink with a recorded target. |
@@ -914,9 +1043,9 @@ No slice authorizes a native run, a host change or a data move on its own.
 | S1 | Workspace, both crates, toolchain pin, RustQuality activation, `os` traits with the macOS implementation, volume identity and mount verification, `barge describe --json` skeleton, JSON/error contract, docs check wiring | this design frozen |
 | S2 | Account state directory, atomic publish, locks, bounded reads, `barge.registry/1` with read-only import of Oxide's `removable.json`/`pools.json` and `barge inspect` | S1 |
 | S3 | Path containment and the descriptor walk, area declarations (`barge.area/1`), owned roots and markers, holds, root listing, `barge area` verbs | S1, S2 |
-| S4 | Scratch allocation, conclusion, expiry sweep with plan/digest, legacy marker families (Oxide, Effigy), `barge scratch` verbs | S3 |
+| S4 | Scratch allocation, conclusion, expiry sweep with plan/digest, grants (foreign-family delegations and legacy claims) with their recorded declarations, `barge scratch` verbs | S3 |
 | S5 | Custody state machine, same-uid descriptor observation, intent journal, quarantine, whole-root delete with Finder and ENOTEMPTY rules, replay and settlement | S3 |
-| S6 | Cache kinds, link-first adopt/undo, tool-setting adopt/undo with byte-level undo proof, in-place adoption of today's hand-made placements | S3, S5 |
+| S6 | Cache kinds, the three placement forms (`setting`, `held-root`, `link`), adopt/undo with byte-level and link/root identity proofs, refusal of a non-empty real directory, in-place adoption of today's hand-made placements | S3, S5 |
 | S7 | `barge maintain` preview/real, exit codes, `describe` completion, host-job handoff contract (the plist change itself stays an operator gate) | S4, S5, S6 |
 | S8 | Consumer adoption: Oxide declares its areas and switches scratch, caches, registration, then owned-root mechanics; Effigy moves to Barge scratch. Separate briefs, Oxide's own Queue project, explicit operator gates | S1–S7, separately qualified |
 
@@ -943,19 +1072,24 @@ are real by constructing the state each rule must refuse.
 | State | atomic publish, bounded read, strict schema, lock order | truncated/oversized/unknown-version registry refuses every mutation and is never rebuilt from markers |
 | Areas | declaration validation, collision detection, effective-policy recording | two declarations over one folder, a declaration over `scratch/`, a namespace escaping the volume all refuse |
 | Markers | strict validation of each field, identity checks | absent, foreign-uid, symlinked, oversized, future-dated, unknown-version and `hosting` markers are never eligible |
-| Scratch | conclusion transitions; eligibility table; sweep bounds | unconcluded root, `closure: none`, `kept_reason: exception`, an Effigy marker with a live pid, an Oxide `hosting` root, a plain `oxide-validation` directory all survive a sweep |
-| Caches | adopt/undo byte records; link identity; setting parse | a setting already pointing at the owned root changes no byte; a diverged file after adopt refuses undo; a symlinked original is recorded, not swapped |
+| Scratch | conclusion transitions; eligibility table; sweep bounds; grant lookup per unit | unconcluded root, `closure: none`, `kept_reason: exception`, an Effigy marker with a live pid and no delegation, an Oxide `hosting` root, a plain `oxide-validation` directory and an unmarked unit with no legacy claim all survive a sweep; a delegated Effigy marker past 24 h and a claimed unmarked unit past its idle age are the only foreign/unmarked units that do not |
+| Caches | the three placement forms; adopt/undo records; link and root identity; setting parse | a setting already pointing at the owned root changes no byte; a non-empty real directory refuses with a plan and nothing renamed or deleted; an empty real directory becomes a link and undo restores it empty; an absent path gets a link through a temporary name; a diverged file after adopt refuses undo; a symlinked original is recorded, not swapped |
 | Custody | state machine transitions; `Safe` required by type | unreadable hold, bounded-out scan, live pid with a mismatched start identity, foreign-uid evidence all yield `Unknown` and refuse |
 | Deletion | phase machine; Finder metadata classification; ENOTEMPTY retry; marker last | unknown entry stops the delete; symlink inside quarantine stops it; injected ENOTEMPTY three times leaves a pending intent; injected device change stops before the first unlink |
 | Contacts | JSON documents match their schemas; unknown major refuses; optional-field addition accepted | a `barge.describe/1` document with a removed field or a changed type is refused by its own reader |
-| Foreign state | Oxide `removable.json` v1/v2 and `pools.json` parsers; marker families | unknown field, unknown version, unparsable and unreadable inputs become `unknown_state` observations, never defaults |
-| Prune/maintain | plan canonicalisation, digest mismatch, ordering | a changed plan digest, a changed root identity, a changed registry revision and a live hold each stop the affected root only |
+| Foreign state | Oxide `removable.json` v1/v2 and `pools.json` parsers; the pinned Oxide and Effigy scratch marker field sets; delegations and legacy claims | unknown field, unknown version, unparsable and unreadable inputs become `unknown_state` observations; an Effigy marker that omits `task`/`checkout`/`pid`/`pid_start` is valid, and one that adds a field is refused; a unit whose family has no delegation or whose scope has no claim is reported, never deleted |
+| Prune/maintain | plan canonicalisation, digest mismatch, ordering | a changed plan digest, a changed root identity, a changed registry revision, a live hold, a revoked claim and a unit that became marked each stop the affected unit only |
 
 The host reaper's current behaviours are the counterfactual baseline for scratch
-expiry: fourteen idle days, skip `scratch/oxide` and Effigy runs, never follow a
-symlink, never delete outside `scratch/`, keep a busy root, and stop at a run
-budget. Barge's expiry must be at least as conservative on each of those, and a
-test asserts the comparison.
+expiry: units are the children of each project folder and the top-level entries
+that are files or have a dot in the name; a unit goes once its newest entry is
+fourteen days old and no process has it open; it never follows a symlink, never
+deletes outside `scratch/`, skips the `oxide` project and Effigy-marked and
+bare eight-character directories, keeps a busy unit, retries `ENOTEMPTY` and
+stops at a run budget. Barge must reach the same set of deletable units only
+through recorded grants, and must be at least as conservative on every one of
+those conditions; the test asserts both the equivalence under grants and the
+difference without them (nothing deleted, everything reported).
 
 ### One bounded native
 
@@ -976,7 +1110,10 @@ together, on owned scratch only:
   whole and prove the marker is removed last; inject `ENOTEMPTY` and prove the
   pending intent; pull the volume (ordinary `hdiutil detach`) mid-delete and
   prove a pending intent with the quarantine leaf kept, then replay after
-  re-attach; prove a stale mount point is never written to.
+  re-attach; prove a stale mount point is never written to; plant one Oxide
+  marker, one Effigy marker and one unmarked unit, prove all three survive with
+  no delegation or claim, then declare the delegation and claim and prove only
+  the eligible units go.
 - Explicitly not claimed: a real USB/Thunderbolt surprise removal, a real
   drive's flush cost, the internal SSD write saving, and any qualification of
   Oxide's or Effigy's adoption.
@@ -1050,10 +1187,11 @@ the one reading the owner should confirm before implementation starts.
 - **O-005 — Legacy scratch layout at the root level.** Effigy's existing runs
   sit at `<scratch>/<8-char>` beside project folders. Proposed: recognise both
   levels, use the marker (not the name) as ownership, and leave Effigy's move
-  under `<scratch>/effigy/` to its own adoption. The implementation brief must
-  decide the collision rule for a project literally named with eight lowercase
-  characters and no marker: proposed, it is a project folder and is never
-  treated as a run root.
+  under `<scratch>/effigy/` to its own adoption. An eight-character directory
+  with no marker is covered only by a `top_level_adhoc` claim, never by its
+  name; the implementation brief must decide the collision rule for a project
+  literally named with eight lowercase characters and no marker: proposed, it is
+  a project folder and is never treated as a run root.
 - **O-006 — Host job identity and schedule.** Proposed: one host job calling
   `barge maintain` with preview-then-real, replacing only the reaper's scratch
   part; Oxide's prune entry stays until stage 4. The plist content, label,
@@ -1068,3 +1206,14 @@ the one reading the owner should confirm before implementation starts.
   source and time, and claims nothing about exclusive occupancy. Reserve and
   floor are out of scope; the measurement primitive and its accuracy are
   qualified with that later slice, not assumed here.
+- **O-009 — Who signs a scratch grant, and how the handover is proven.** Every
+  foreign-family or unmarked deletion needs a recorded grant: a delegation from
+  the family's owner, or a legacy claim from a human for one scope. Proposed:
+  grants are operator declarations (the owner of the data or Tom), written into
+  the volume's `scratch_grants`, per volume and per scope, with no default and no
+  inference; a delegation is offered by the consumer only after its own
+  contract names Barge as the expiring authority. The implementation brief must
+  fix the declaration verb and its review, and the handover proof must compare
+  one `maintain --plan` run against the reaper's own dry run before the host job
+  is changed, so a missing grant is visible as a reported leftover rather than
+  a silent leak.
