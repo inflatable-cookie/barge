@@ -30,27 +30,38 @@ each registered volume.
   everything Barge owns there. Empty means the drive root. Examples:
   `root_dir = "barge"` keeps all of Barge's data under `/Volumes/<drive>/barge/`;
   `root_dir = ""` puts the groups directly at the root.
-- **Feature groups** each get one folder under `root_dir`, using these defaults:
-  `scratch/` (per-project scratch), `caches/` (package caches), `outputs/`
-  (owned build-output roots) and `pools/` (build pools such as Oxide's slots).
-  Any group's folder can be overridden per volume, still relative to
-  `root_dir`. Group folders hold only expendable data that Barge owns.
-- **Kept placements have no group folder.** Kept data goes wherever the user
+- **Barge's own folders.** Two features Barge implements itself get folders
+  under `root_dir`: `scratch/` (per-project scratch areas) and `caches/`
+  (package-cache placements). Each can be overridden per volume, still
+  relative to `root_dir`.
+- **Consumer areas.** Every other managed folder is an *area* that a consumer
+  declares, named `<namespace>/<area>` (for example `oxide/pool`,
+  `oxide/outputs`). Its default path is `<root_dir>/<namespace>/<area>/`, and it
+  can be overridden per volume. Barge gives the namespace and area names no
+  meaning. The consumer declares the area's policies: its absent-volume
+  behaviour, its pruning (for example oldest idle owned root first), and
+  whether it counts toward the volume's reserve. Barge then provides the
+  generic mechanics: the location, owned roots inside the area with markers
+  and identities, holds and releases on a root, pruning of whole idle roots,
+  writer custody and safe deletion. What lives inside a root, such as slots,
+  ledgers or build outputs, is opaque to Barge and owned by the consumer.
+- Barge's own folders and consumer areas hold only expendable data, which
+  Barge may prune under each area's declared policy.
+- **Kept placements have no managed folder.** Kept data goes wherever the user
   organises it on the volume (for example `/Volumes/Vault/Parallels/`). Its path
-  is chosen explicitly at adopt time and must sit outside Barge's group
-  folders. Barge records the placement and its link but never owns, prunes,
-  moves or recreates that data. Being outside the group folders is what marks
-  data as kept.
+  is chosen explicitly at adopt time and must sit outside Barge's own folders
+  and every consumer area. Barge records the placement and its link but never owns, prunes,
+  moves or recreates that data. Being outside Barge's managed folders is what marks data as kept.
 - A path is resolved once, when a placement is adopted, and recorded in that
-  placement. Changing `root_dir` or a group folder later never silently moves
+  placement. Changing `root_dir` or a folder override later never silently moves
   existing data; relocating it is an explicit command.
-- Barge writes only inside its resolved group folders, apart from the
+- Barge writes only inside its own folders and declared areas, apart from the
   explicit link and record of a kept placement. A folder name that would escape
   the volume (absolute, `..`, or a link leaving the mount) is refused.
 - Today's Builds layout (`scratch/`, `caches/`, `oxide-pool/` and
-  `oxide-outputs/` at the drive root) is expressed as `root_dir = ""` with the
-  pool and output groups mapped to Oxide's existing folder names, so adopting
-  Barge moves nothing (Q-004).
+  `oxide-outputs/` at the drive root) is expressed as `root_dir = ""`, with
+  Oxide's two areas overridden to its existing folder names, so adopting Barge
+  moves nothing (Q-004).
 
 ## Volume modes
 
@@ -81,8 +92,8 @@ kept.
 ### Placement mechanics by mode
 
 - **Permanent + expendable.** The original path is an owned link into the
-  volume. When the volume is absent, the declared policy applies: build output
-  may use an explicit, visible checkout-local fallback; caches and scratch wait
+  volume. When the volume is absent, the declared policy applies: a consumer
+  area may declare an explicit, visible local fallback; caches and scratch wait
   or fail. On return, Barge relinks to the volume root, keeps any fallback root
   until it is pruned, and never merges fallback data back in. Low space prunes
   the oldest idle owned roots down to the reserve.
@@ -111,8 +122,9 @@ kept.
 
 ## Placement rules (Tom, 2026-10-26)
 
-- **Absent volume, by kind (Q-001).** Build output uses a visible local
-  fallback, which is Oxide's current rule. Package caches fail with a clear
+- **Absent volume, by kind (Q-001).** Each consumer area declares its own
+  policy, which may be a visible local fallback (Oxide declares that for its
+  build output). Package caches fail with a clear
   message naming the drive to attach, so they never quietly re-download onto
   the internal SSD. Scratch fails clearly. Kept data is unavailable and Barge
   names the drive.
@@ -160,15 +172,18 @@ macOS on APFS only for now (Tom, 2026-10-26, Q-005). Every platform-specific fac
 3. Volume registration, mode, selection, reserve and floor, flush and
    surprise-removal detection, which today are Oxide's removable-volume support
    (`apfs-volume-v1`, `pools.json`).
-4. Owned output roots, their markers, the owned-link primitive and pruning,
-   which today are Oxide's `oxide-outputs` and `oxide outputs prune`.
+4. The generic mechanics of owned roots, holds, the owned-link primitive and
+   pruning, which today are built into Oxide's `oxide-outputs` and `oxide outputs
+   prune`. Oxide then declares its pool and outputs as consumer areas and keeps
+   the meaning of what lives inside them.
 
 **Stays in Oxide:** the Cargo front door, slots, leases and the ledger,
 recipes and profiles, the freshness gate, `oxide exec`, Cargo-specific output
 member links, and its own proofs of those.
 
-Oxide calls Barge to learn where its pool, outputs and scratch live and how
-much room there is. Barge never interprets Cargo layouts.
+Oxide calls Barge to resolve its areas' locations and available room, and to
+hold, release and prune its owned roots. Barge never interprets Cargo layouts
+or any consumer's contents.
 
 ## Consumers today
 
