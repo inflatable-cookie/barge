@@ -9,6 +9,12 @@ Contracts own durable interfaces and formats:
   markers, scratch and cache placement, writer custody and safe deletion, the
   scheduled-job contract, the stage 1 failure and race matrix, the implementation
   slices and the proposed validation.
+- [Stage 3 space policy](contracts/stage3-space-policy.md) owns volume
+  registration of the reserve and floor, the space measurement and its limits,
+  the reserve prune trigger and the hard floor, area `reserve` participation,
+  idleness and least-recently-used order, concurrent pruning under consumer
+  holds, the stage 3 formats, bounds, failure matrix, slices and its bounded
+  native design.
 
 Rust quality policy owns the strict profile for the Rust workspace:
 [activation](contracts/language-quality-activation.json) records the

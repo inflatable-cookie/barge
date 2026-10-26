@@ -1052,9 +1052,10 @@ No slice authorizes a native run, a host change or a data move on its own.
 | S8 | Consumer adoption: Oxide declares its areas and switches scratch, caches, registration, then owned-root mechanics; Effigy moves to Barge scratch. Separate briefs, Oxide's own Queue project, explicit operator gates | S1–S7, separately qualified |
 
 Dependencies that are not slices: a real-drive qualification (later, operator
-gated), Linux (later, additive behind `os`), reserve/floor pruning (later,
-after a qualified space measurement), and the retirement of any foreign format
-(after its owner's adoption).
+gated), Linux (later, additive behind `os`), reserve/floor pruning (later, after a
+qualified space measurement; the [stage 3 space
+policy](stage3-space-policy.md) owns that design), and the retirement of any
+foreign format (after its owner's adoption).
 
 ### Implementation status
 
@@ -1272,7 +1273,9 @@ the one reading the owner should confirm before implementation starts.
   reports available/total bytes from the filesystem that holds the area, with
   source and time, and claims nothing about exclusive occupancy. Reserve and
   floor are out of scope; the measurement primitive and its accuracy are
-  qualified with that later slice, not assumed here.
+  qualified with that later slice, not assumed here. The [stage 3 space
+  policy](stage3-space-policy.md) owns that design, including `f_bavail` versus
+  `f_bfree`, the flush before a post-delete measurement and purgeable space.
 - **O-009 — Who signs a scratch grant, and how the handover is proven.** Every
   foreign-family or unmarked deletion needs a recorded grant: a delegation from
   the family's owner, or a legacy claim from a human for one scope. Proposed:
