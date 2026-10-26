@@ -487,10 +487,13 @@ pub trait ProcessObserver {
     /// it, and the implementation verifies that identity before it skips the
     /// process; no other process is excluded. A listing the kernel answers
     /// `EPERM` for is re-observed by identity before it is decided, at most
-    /// `EPERM_RETRIES` times inside a bounded settle window and always inside
-    /// the scan's time bound: the retry settles on a later listing, a gone
-    /// process, a changed start identity or a changed effective uid, and never
-    /// on elapsed time. The same identity still answering `EPERM` is
+    /// three times inside a bounded settle window and always inside the scan's
+    /// time bound. Both deadlines are checked before each backoff and again
+    /// after it, and a terminal answer is accepted only while both still hold,
+    /// so neither a delayed wake nor a slow read escapes them. The retry settles
+    /// on a later listing, a gone process, a changed start identity or a changed
+    /// effective uid, and never on elapsed time. The same identity still
+    /// answering `EPERM` is
     /// unreadable, which is unknown and never safe. A scan that reaches its
     /// process, descriptor or time bound answers [`DescriptorScan::Bounded`],
     /// which is unknown and never safe. An unreadable effective uid, and an
@@ -612,7 +615,10 @@ pub struct RetriedUnreadable {
     pub start: u64,
     /// The errno of each failed descriptor listing, in order: one entry per
     /// attempt inside the settle window, so a persistent answer appears as a
-    /// repeated errno rather than a single one.
+    /// repeated errno rather than a single one. The terminal errno is included
+    /// when a retry ended the re-observation, so the sequence shows the fact
+    /// that resolved it (`ESRCH`, or another unreadable reason) as well as the
+    /// `EPERM`s that were retried.
     pub errnos: Vec<i32>,
     /// How many times the pid reported a different start identity while it was
     /// re-observed: a reused pid, which was re-evaluated as the different
@@ -636,7 +642,9 @@ pub enum RetryResolution {
     Foreign,
     /// The same identity still answered `EPERM` after every retry it was given.
     Unreadable,
-    /// The scan's own time bound would have been crossed by another retry.
+    /// A deadline stopped the re-observation before it produced an acceptable
+    /// answer: the process's settle window closed, or the scan's own time bound
+    /// would be crossed.
     Bounded,
 }
 

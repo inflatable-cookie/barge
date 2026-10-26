@@ -1299,26 +1299,31 @@ Choices S5 made where this design left the mechanic to the slice:
   short backoff: three retries of 25, 75 and 100 ms, a settle window of at most
   250 ms per process, always inside the scan's own 10 s bound. Both deadlines are
   projected before each backoff and **checked again after it**, so a late wake
-  never buys one more listing past either, and a terminal answer whose reading
-  crossed the scan's deadline is answered bounded rather than complete. It
-  settles only on a positive fact: a later listing succeeds; the kernel reports
-  no such pid, or a retried listing answers `ESRCH`, and a gone process holds no
-  descriptors; the start identity changed, so a different process now has the pid
-  and is re-evaluated from scratch under the same rule and inside the same
-  budget; or the effective uid changed, so the pid now names another account's
-  process and is classified as the named blind spot above instead of refused. The
-  same identity still answering `EPERM` after its retries is `Unknown` and
-  refuses. An unreadable listing for any other reason refuses at once. Nothing
-  here infers safety from elapsed time: a process the scan cannot read still
-  refuses.
+  never buys one more listing past either. They are checked a third time when a
+  terminal answer arrives, because the read that produced it may itself have been
+  slow: an answer read after the scan's deadline makes the scan bounded, and one
+  read after the process's settle window closes is a refusal, since the bounded
+  re-observation did not finish inside its bound. It settles only on a positive
+  fact: a later listing succeeds; the kernel reports no such pid, or a retried
+  listing answers `ESRCH`, and a gone process holds no descriptors; the start
+  identity changed, so a different process now has the pid and is re-evaluated
+  from scratch under the same rule and inside the same budget; or the effective
+  uid changed, so the pid now names another account's process and is classified
+  as the named blind spot above instead of refused. The same identity still
+  answering `EPERM` after its retries is `Unknown` and refuses. An unreadable
+  listing for any other reason refuses at once, and when it answers a retry its
+  errno joins the sequence beside the `EPERM`s: the recorded sequence is every
+  failed listing, `EPERM` or the terminal fact that ended the re-observation.
+  Nothing here infers safety from elapsed time: a process the scan cannot read
+  still refuses.
 - **What the evidence says.** The evidence records `self_excluded: <pid>` (the one
   process the scan excluded), `foreign_uid_processes` (how many processes of
   another effective uid it classified and did not inspect) and `retry`: how many
   same-uid processes' listings answered `EPERM` and were re-observed
   (`retried_unreadable`), and at most eight bounded records of them, each with
-  the pid, command, kernel start identity, errno sequence, identity changes and
-  resolution, so the next native diagnostic can tell an intermittent answer from
-  a persistent one. **Every** verdict carries that record, not only `Safe`: an
+  the pid, command, kernel start identity, the errno sequence of every failed
+  listing including the terminal one, identity changes and resolution, so the
+  next native diagnostic can tell an intermittent answer from a persistent one. **Every** verdict carries that record, not only `Safe`: an
   `Unsafe` or `Unknown` verdict keeps it, and the `custody_not_proven` failure
   puts it in its `detail` (`retried_unreadable` and `retried`), because a refusal
   is exactly where a diagnostic needs it. A pending deletion's report keeps it
@@ -1345,9 +1350,12 @@ Choices S5 made where this design left the mechanic to the slice:
   `EPERM` with a changed effective uid is foreign, `EPERM` through all three
   retries stays `unknown` with the bounded errno sequence kept on the refusal, and
   a scan time bound shorter than the first backoff answers `bounded` with the
-  record kept. The backoff deadline checks are also unit-tested on their own: a
-  projection that would end past either bound is not taken, and a delayed wake
-  past either bound stops the retry instead of listing again.
+  record kept, and `EPERM` then another unreadable errno records both in the
+  sequence. The deadline checks are also unit-tested on their own: a projection
+  that would end past either bound is not taken, a delayed wake past either bound
+  stops the retry instead of listing again, a terminal answer inside both bounds
+  is accepted, and one read after the settle window or after the scan deadline is
+  not.
 - **The residual this correction does not touch.** On a real session, a handful
   of this account's own system daemons refuse `PROC_PIDFDVNODEPATHINFO` for some
   of their descriptors (measured on macOS 26.6.2: 8 of 1004), which the rule

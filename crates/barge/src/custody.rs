@@ -1774,6 +1774,33 @@ mod tests {
     }
 
     #[test]
+    fn an_eperm_then_another_errno_records_both_in_the_sequence() {
+        // A retry that is answered with some other unreadable reason refuses at
+        // once, and the terminal errno is part of the sequence beside the
+        // `EPERM` that was retried: that is what tells a diagnostic where the
+        // re-observation ended.
+        let holder = real_holder("custody-012-terminal-errno");
+        holder.payload();
+        let child = Child::idle();
+        let identity = child.identity();
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                errnos: vec![EPERM, EACCES],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        let retry = verdict.retry();
+        assert_eq!(retry.retried_unreadable, 1);
+        let record = retry.retried.first().expect("the retried pid is recorded");
+        assert_eq!(record.errnos, vec![EPERM, EACCES]);
+        assert!(verdict.into_evidence().is_err(), "unknown refuses");
+    }
+
+    #[test]
     fn an_eperm_with_a_changed_effective_uid_is_the_named_foreign_blind_spot() {
         let holder = real_holder("custody-012-foreign");
         holder.payload();

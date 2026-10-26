@@ -561,7 +561,13 @@ impl MacOs {
             match listing {
                 DescriptorListing::Listed(fds) => {
                     record.resolution = RetryResolution::Listed;
-                    return settle(record, SettledListing::Listed(fds), started, timeout);
+                    return settle(
+                        record,
+                        SettledListing::Listed(fds),
+                        settle_started,
+                        started,
+                        timeout,
+                    );
                 }
                 DescriptorListing::Gone { errno } => {
                     // A retried listing that answers `ESRCH` is the positive fact
@@ -573,13 +579,26 @@ impl MacOs {
                         }
                     }
                     record.resolution = RetryResolution::Gone;
-                    return settle(record, SettledListing::Gone, started, timeout);
+                    return settle(
+                        record,
+                        SettledListing::Gone,
+                        settle_started,
+                        started,
+                        timeout,
+                    );
                 }
                 DescriptorListing::Unreadable(error) => {
                     // Only `EPERM` is the intermittent answer this rule is about.
                     // Every other unreadable listing is unknown immediately, as
-                    // it was before.
+                    // it was before. When it answers a retry, its errno is the
+                    // fact that ended the re-observation, so the sequence keeps
+                    // it beside the `EPERM`s that were retried.
                     if error.raw_os_error() != Some(libc::EPERM) {
+                        if !record.errnos.is_empty() {
+                            if let Some(errno) = error.raw_os_error() {
+                                record.errnos.push(errno);
+                            }
+                        }
                         return Settled {
                             listing: SettledListing::Unreadable(
                                 unreadable_descriptors(pid, &error).message().to_owned(),
@@ -596,7 +615,13 @@ impl MacOs {
                         // and a gone process holds no descriptors.
                         Ok(None) => {
                             record.resolution = RetryResolution::Gone;
-                            return settle(record, SettledListing::Gone, started, timeout);
+                            return settle(
+                                record,
+                                SettledListing::Gone,
+                                settle_started,
+                                started,
+                                timeout,
+                            );
                         }
                         Err(error) => {
                             return Settled {
@@ -614,7 +639,13 @@ impl MacOs {
                             // named blind spot, counted and reported, never
                             // inspected (Tom, 2026-10-26, ruling bcaa83d8).
                             record.resolution = RetryResolution::Foreign;
-                            return settle(record, SettledListing::Foreign, started, timeout);
+                            return settle(
+                                record,
+                                SettledListing::Foreign,
+                                settle_started,
+                                started,
+                                timeout,
+                            );
                         }
                         Some(_) => {}
                         None => {
@@ -890,27 +921,79 @@ fn stop_after_backoff(
     None
 }
 
-/// One terminal answer from [`MacOs::settle_descriptors`], turned into bounded
-/// when the scan's own deadline has passed while it was read: the scan never
-/// completes an observation beyond its time bound, and never returns a terminal
-/// answer for a candidate whose reading crossed it.
+/// Whether one process's terminal answer may be accepted.
+///
+/// The read that produced it may itself have been slow, so both deadlines are
+/// checked again here: a re-observation that finishes after its 250 ms settle
+/// window, or after the scan's own time bound, is not an answer. The settle
+/// window is the per-process bound, so it refuses; the scan's bound makes the
+/// whole scan bounded.
+fn stop_when_settled(
+    settle_elapsed: Duration,
+    scan_elapsed: Duration,
+    timeout: Duration,
+) -> Option<RetryStop> {
+    if settle_elapsed >= EPERM_SETTLE_WINDOW {
+        return Some(RetryStop::Unreadable);
+    }
+    if scan_elapsed >= timeout {
+        return Some(RetryStop::Bounded);
+    }
+    None
+}
+
+/// One terminal answer from [`MacOs::settle_descriptors`], accepted only while
+/// both deadlines still hold.
+///
+/// An answer read after the scan's own deadline makes the scan bounded; one read
+/// after the process's settle window closes is a refusal, because the bounded
+/// re-observation did not finish inside its bound. Either way the scan never
+/// accepts an observation from outside the bounds it states, and the record of
+/// what was tried travels with the refusal.
 fn settle(
     mut record: RetriedUnreadable,
     listing: SettledListing,
+    settle_started: Instant,
     started: Instant,
     timeout: Duration,
 ) -> Settled {
-    if started.elapsed() >= timeout {
-        record.resolution = RetryResolution::Bounded;
-        return Settled {
-            listing: SettledListing::Bounded,
-            record: retried(record),
-        };
+    match stop_when_settled(settle_started.elapsed(), started.elapsed(), timeout) {
+        Some(RetryStop::Unreadable) => {
+            record.resolution = RetryResolution::Bounded;
+            return Settled {
+                listing: SettledListing::Unreadable(window_closed(&record)),
+                record: retried(record),
+            };
+        }
+        Some(RetryStop::Bounded) => {
+            record.resolution = RetryResolution::Bounded;
+            return Settled {
+                listing: SettledListing::Bounded,
+                record: retried(record),
+            };
+        }
+        None => {}
     }
     Settled {
         listing,
         record: retried(record),
     }
+}
+
+/// The refusal for a re-observation that produced an answer after its settle
+/// window had closed: the answer is not evidence, because the bounded
+/// re-observation did not finish inside its bound.
+fn window_closed(record: &RetriedUnreadable) -> String {
+    let described = match record.command.as_deref() {
+        Some(command) => format!("`{command}`"),
+        None => "a process".to_owned(),
+    };
+    format!(
+        "the re-observation of {described} (pid {}, start {}) produced its answer after its {} ms settle window closed, so it is not evidence",
+        record.pid,
+        record.start,
+        EPERM_SETTLE_WINDOW.as_millis()
+    )
 }
 
 /// The bounded record of one process's re-observation, or `None` when its
@@ -2277,7 +2360,9 @@ mod tests {
 
     use std::time::Duration;
 
-    use super::{stop_after_backoff, stop_before_backoff, RetryStop, EPERM_SETTLE_WINDOW};
+    use super::{
+        stop_after_backoff, stop_before_backoff, stop_when_settled, RetryStop, EPERM_SETTLE_WINDOW,
+    };
 
     /// A scan deadline well clear of the settle window, so the two bounds are
     /// told apart.
@@ -2347,6 +2432,37 @@ mod tests {
     fn a_delayed_wake_past_the_scan_deadline_is_bounded() {
         assert_eq!(
             stop_after_backoff(Duration::from_millis(100), SCAN_TIMEOUT, SCAN_TIMEOUT),
+            Some(RetryStop::Bounded)
+        );
+    }
+
+    #[test]
+    fn a_terminal_answer_inside_both_deadlines_is_accepted() {
+        assert_eq!(
+            stop_when_settled(
+                Duration::from_millis(200),
+                Duration::from_millis(3),
+                SCAN_TIMEOUT
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_terminal_answer_read_after_the_settle_window_is_not_accepted() {
+        // The read that produced the answer may itself have been slow: the
+        // per-process window is checked again when the answer arrives, so a
+        // retry or a read begun inside the window cannot resolve after it.
+        assert_eq!(
+            stop_when_settled(EPERM_SETTLE_WINDOW, Duration::from_millis(30), SCAN_TIMEOUT),
+            Some(RetryStop::Unreadable)
+        );
+    }
+
+    #[test]
+    fn a_terminal_answer_read_after_the_scan_deadline_is_bounded() {
+        assert_eq!(
+            stop_when_settled(Duration::from_millis(20), SCAN_TIMEOUT, SCAN_TIMEOUT),
             Some(RetryStop::Bounded)
         );
     }
