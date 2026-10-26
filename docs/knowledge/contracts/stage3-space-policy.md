@@ -102,7 +102,7 @@ that contradicts a row is a defect against this table.
 | --- | --- |
 | The registered reserve is a **prune trigger**, not a stop. | [The reserve is a trigger and the floor is the stop](#the-reserve-is-a-trigger-and-the-floor-is-the-stop): at or below the reserve Barge prunes, then admits if nothing idle is left. |
 | **Only the hard floor stops work**, default 10 GiB, a registration field; a floor above the reserve wins. | The same section's decision table; the stop line is the floor alone, and the prune `target` is above `max(reserve, floor)`. |
-| Below the floor with nothing idle left, a **new command refuses** and a **running one stops**, with a message naming free space, floor, reserve and whether non-Barge data is the cause. | `barge.space.guard/1`'s `refuse_below_floor` and [the refusal message](#the-refusal-message); [rechecking while work runs](#rechecking-while-work-runs). |
+| Below the floor with nothing idle left, a **new command refuses** and a **running one stops**, with a message naming free space, floor, reserve and whether non-Barge data is the cause. | `barge.space.guard/1`'s completed stop and its no-effect refusal (both carry the same message and detail), and [the exit-code rules](#the-stop-the-refusal-and-the-exit-code); [rechecking while work runs](#rechecking-while-work-runs). |
 | Low free space on a **present** volume never silently redirects work to the internal SSD. The drive-absent fallback is a separate, declared per-area policy. | [No low-space internal fallback](#no-low-space-internal-fallback), including the type-level absence of a fallback decision. |
 | An area's **soft cap counts that area's own bytes only**; caches, scratch and other data never count against it. | [The area soft-cap boundary](#the-area-soft-cap-boundary): Barge reports area bytes by root identity and never enforces a cap. |
 | Prune the **least-recently-used idle owned roots across areas**, by each area's declared policy. | [Idleness, activity and least-recently-used order](#idleness-activity-and-least-recently-used-order) and [pruning under the reserve](#pruning-under-the-reserve). |
@@ -158,7 +158,8 @@ measurement used for a decision must not be a stale one.
   post-batch measurement. A decision never admits on an unflushed measurement it
   caused itself; a measurement nothing changed needs no flush.
 - A flush failure, timeout (30 s) or volume change during the flush makes the
-  post-prune measurement unknown: the guard refuses `unknown_state`, reports the
+  post-prune measurement unknown: the guard reports `unknown_state` at exit `3`,
+  reports the
   roots it did delete, and leaves no pending intent unless the delete itself left
   one. It never treats "the flush failed" as "the space is there".
 - There is no environment-variable fault-injection hook in product code (Oxide
@@ -257,7 +258,7 @@ what needs it:
 | `reserve` | Meaning |
 | --- | --- |
 | `counts` | The area's owned roots are **eligible to yield under the reserve trigger**: idle roots in this area are prune candidates while the volume is at or below its reserve, whatever their age. |
-| `excluded` | The area's roots are **never pruned for space**. They are still subject to their own `prune` policy in `maintain`, and they are reported in the refusal's attribution as data the reserve does not cover. |
+| `excluded` | The area's roots are **never pruned for space**. They are still subject to their own `prune` policy in `maintain`, and they are reported in the stop's attribution as data the reserve does not cover. |
 
 - `reserve` and `prune` are independent. `prune: none` with `reserve: counts`
   means "yield under pressure, but never on a schedule"; `prune:
@@ -301,7 +302,7 @@ The decision table, applied at admission and again on every recheck:
 | Volume `durability` is `kept` or `undeclared` | Refuse `refused_boundary` (kept) or `unknown_state` (undeclared). Expendable work is not admitted onto a volume whose data Barge may not expend. |
 | `F > max(R, L)` | **Admit**, nothing pruned. |
 | `L < F <= R` (so `R > L`) | **Prune** in least-recently-used order until `F' > max(R, L)` or nothing eligible is left. If a batch reaches `F' > max(R, L)`, **admit**. If nothing eligible remains and `F' > L`, **admit below the reserve** with a warning naming `F'`, `R` and `L`. |
-| `F <= L` | **Prune** in the same order until `F' > max(R, L)` or nothing eligible is left; then **admit** if `F' > L`, or **refuse `space_below_floor`** once nothing eligible remains and `F' <= L`. A running command **stops** on the same test. |
+| `F <= L` | **Prune** in the same order until `F' > max(R, L)` or nothing eligible is left; then **admit** if `F' > L`, or **stop** once nothing eligible remains and `F' <= L` — a completed stop when the pass deleted something, a no-effect refusal when it deleted nothing. A running command **stops** on the same test. |
 
 Stated without the table, because this is the sentence a reviewer must be able to
 check against the ruling:
@@ -310,7 +311,10 @@ check against the ruling:
   nothing, work proceeds — with a warning naming the free, reserve and floor
   figures — as long as the floor is satisfied.
 - The floor **always** stops work, and only after pruning has been tried. There
-  is no "prune and then admit below the floor" case and no "force" path.
+  is no "prune and then admit below the floor" case and no "force" path. A stop
+  that follows deletions is a **completed command** whose report says what it
+  did, not a refusal: see
+  [the exit-code rules](#the-stop-the-refusal-and-the-exit-code).
 - `max(R, L)` is why "a floor above the reserve wins": with `L > R`, being just
   above `R` is not enough to admit, because the volume is still at or below the
   floor. The floor is evaluated independently of the trigger, so a low reserve
@@ -318,11 +322,34 @@ check against the ruling:
 - Both are evaluated on the **same measurement**, taken after the last flush, and
   every decision document reports which measurement decided it.
 
-### The refusal message
+### The stop, the refusal and the exit code
 
-`space_below_floor` is one new value in `barge.error/1`'s closed `kind` set, at
-exit code `2` (refused before any effect). A consumer that does not recognise a
-`kind` must treat it as a refusal; `kind` selects the message, never an effect.
+A low-space outcome has two shapes, and which one applies is decided by whether
+the pass changed anything. Stage 1's exit codes already say it; this stage must
+not bend them:
+
+| Outcome | Envelope | Exit | When |
+| --- | --- | --- | --- |
+| **Completed stop** | `ok: true`, `data.decision: "stop_below_floor"` | `0` | the pass deleted at least one root and the floor is still breached. Stage 1's `0` is exactly "the command completed and its report says what it did". |
+| **No-effect refusal** | `ok: false`, `kind: "space_below_floor"` | `2` | the pass deleted nothing at all — nothing was eligible, or every candidate failed its re-verification — and the floor is breached. Nothing changed, so "refused before any effect" is literally true. |
+| **Unsettled state** | `ok: false`, `kind: "unknown_state"` | `3` | the pass left a pending intent, or the measurement, flush, policy or registry became unknown. `detail` names the pending intent id or the unknown fact, and `detail.pruned_root_ids` reports anything already deleted. |
+
+Rules:
+
+- `space_below_floor` is the one new value in `barge.error/1`'s closed `kind`
+  set, and it is used **only** for the no-effect refusal. A guard that pruned and
+  then stopped must not claim "refused before any effect" while its own report
+  lists the roots it deleted.
+- `pending_intent` is not a kind: stage 1's closed set has no such value. An
+  unsettled delete is `unknown_state` at exit `3`, which is what stage 1 already
+  means by "a pending intent or unknown state that needs a human".
+- The stop signal a consumer reads is `decision: "stop_below_floor"` in a
+  success document, or `kind: "space_below_floor"` or `kind: "unknown_state"` in
+  an error document. A consumer must never infer a stop from the exit code alone,
+  because `0` also carries a completed stop.
+- The message and the attribution detail are identical in both shapes, so a
+  consumer's message never depends on which one it received.
+
 The message and the `detail` object both carry the four facts the ruling
 requires:
 
@@ -336,15 +363,17 @@ is not Barge-owned (estimated). No work was sent to the internal drive.
 | Detail field | Meaning |
 | --- | --- |
 | `free_bytes`, `floor_bytes`, `reserve_bytes` | The measured facts and the declared policy that decided. |
-| `pruned_root_ids`, `reclaimed_bytes` | What the guard deleted before refusing, if anything. |
-| `owned_prunable_bytes` | Idle, eligible, Barge-owned bytes that were candidates and are now gone (or, for a refusal, zero because nothing eligible was left). |
+| `pruned_root_ids`, `reclaimed_bytes` | What the pass deleted before the stop or the refusal; empty and zero for a no-effect refusal. |
+| `owned_prunable_bytes` | Idle, eligible, Barge-owned bytes still present: zero once the pass has taken everything eligible, which is what a stop means. |
 | `held_or_unknown_bytes` | Barge-owned bytes in eligible areas that were **not** idle: held roots, unknown markers, unknown holds, unconcluded scratch. |
 | `excluded_bytes` | Barge-owned bytes in areas whose `reserve` is `excluded`, and in unparticipating folders. |
 | `other_estimate_bytes` | `total - free - owned - excluded`, labelled `estimate`: everything else on the volume, including APFS metadata, kept data and other tools. It is a lower bound on "not Barge's", never authority, and it exists so an operator can see that a full drive is somebody else's data. |
 | `cause` | `held_owned_roots`, `excluded_or_non_barge`, `unknown`, or `none`. `unknown` when the estimate cannot be formed; it is never presented as `none`. |
 
-The message names the internal drive only to say no work went there. It is a
-statement of fact from the refusal path, not a promised fallback.
+The message names the internal drive only to say no work went there. Its wording
+names what could not be freed, so the sentence differs by cause while the fields
+above are identical in both shapes. It is a statement of fact from the stop or
+refusal path, not a promised fallback.
 
 ## Idleness, activity and least-recently-used order
 
@@ -448,16 +477,23 @@ A **guard call** is the admission step a consumer makes before it writes. It:
    bounded read) and the volume's identity, and refuses without a measurement if
    the policy is missing, the durability forbids expendable work or the volume is
    absent;
-2. measures (flush-free: nothing has changed yet);
-3. if the state is `trigger` or `stop`, takes the volume lock exclusively and
-   re-measures (another process may have pruned in between), then plans;
-4. deletes candidates in order, one root at a time, each under the root lock with
-   the stage 1 custody, intent and quarantine protocol, up to its bounds;
+2. measures (flush-free: nothing has changed yet). A measurement needs no lock:
+   it is a read, and a concurrent prune can only free space;
+3. if that measurement is at or below `max(R, L)` — the trigger, or already the
+   stop — takes the volume lock **exclusively** and **holds it from this first
+   authoritative measurement to the final decision**, re-measures (another
+   process may have pruned in between) and plans. If the lock cannot be taken
+   within the lock wait, the guard does not prune: it re-measures and applies the
+   decision table to that measurement as if nothing could be pruned, reporting
+   `decided_after_wait`;
+4. deletes candidates in order, one root at a time, each under its root lock
+   (volume → root, strictly ascending) with the stage 1 custody, intent and
+   quarantine protocol, up to its bounds;
 5. flushes the volume, re-measures, and repeats a batch if still at or below
-   `max(R, L)` and eligible candidates remain;
-6. decides and reports `barge.space.guard/1` — admit, admit below the reserve, or
-   refuse — with the measurement that decided, the roots it deleted, the bytes it
-   reclaimed and the attribution.
+   `max(R, L)` and eligible candidates remain, still holding the volume lock;
+6. decides, releases the volume lock, and reports `barge.space.guard/1` — admit,
+   admit below the reserve, or stop — with the measurement that decided, the
+   roots it deleted, the bytes it reclaimed and the attribution.
 
 `barge space prune --plan` is the operator's preview: the same computation with
 no effect, printing the ordered candidates with their identity digests and the
@@ -490,7 +526,7 @@ which requires, in this stage's terms:
 
 A held root — one with a live hold, one whose holder is alive, one the scan
 cannot complete, one with an unreadable hold file — is skipped and reported, never
-"attempted and failed". Skipping is the safe outcome; it also means the refusal
+"attempted and failed". Skipping is the safe outcome; it also means the stop's
 attribution can say exactly why bytes were not freed.
 
 The residual limit is stage 1's and is not papered over: a process of another
@@ -504,18 +540,23 @@ path exists.
 After each batch: flush, then measure. Then:
 
 - if `F' > max(R, L)`, stop pruning and decide on that measurement;
-- if nothing eligible is left, stop and decide: admit if `F' > L`, refuse once
-  `F' <= L`;
+- if nothing eligible is left, stop and decide: admit if `F' > L`, and once
+  `F' <= L` report the stop in the shape
+  [the exit-code rules](#the-stop-the-refusal-and-the-exit-code) require — a
+  completed stop if this pass deleted anything, a no-effect refusal if it did
+  not;
 - if `reclaimed_bytes` for a batch is zero *and* the flush succeeded, stop
   pruning and report `space_not_reclaimed` (detail: the roots deleted, their
-  recorded sizes, the two measurements). Unlinked-but-open files of a foreign
-  writer, purgeable space that will not materialise, or a filesystem that has not
+  recorded sizes, the two measurements). That report is a completed document,
+  because something was deleted. Unlinked-but-open files of a foreign writer,
+  purgeable space that will not materialise, or a filesystem that has not
   committed are all causes Barge cannot distinguish; it stops rather than
-  deleting more data for no effect, and the refusal is the floor's, not a gamble;
+  deleting more data for no effect, and the outcome is the floor's, not a gamble;
 - the batch, round and per-root budgets in
   [bounds](#bounded-resources) end the pass regardless. A pass that ends on a
-  budget still decides from its last flushed measurement, and reports
-  `budget_exhausted` with what it did not reach.
+  budget still decides from its last flushed measurement, reports
+  `budget_exhausted` with what it did not reach, and takes the same stop or
+  refusal shape as any other outcome.
 
 ### What a space prune never does
 
@@ -540,46 +581,66 @@ test.
 
 `hold(root)` takes the root lock, writes the hold record, releases the lock.
 `release(hold)` takes the root lock, removes the hold record, writes the activity
-record, releases the lock. A prune holds the root lock across its decision and
-effect. So either the consumer's hold is recorded before the prune reads the
-holds — and the root is skipped — or the prune is already inside its root lock,
-and the consumer's `hold` fails `locked` instead of writing into a root that is
-about to be renamed. The window in which a consumer can start writing into a
-root a prune has chosen is closed by a lock, not by timing.
+record, releases the lock. A prune takes the root lock of each candidate and
+holds it across that candidate's plan → intent → rename → delete sequence. There
+are exactly two orderings, and both are safe:
+
+1. **The hold is recorded before the prune takes that root's lock.** The prune
+   reads the hold file under the lock, finds a live hold, skips the root and
+   reports it as `held`. The consumer's hold succeeded and it writes normally; it
+   waited on nothing.
+2. **The prune already holds the root lock.** The consumer's `hold` waits for the
+   lock up to its own deadline and then fails `locked`, so it never starts
+   writing into a root that is about to be renamed or deleted. The prune completes
+   its verified delete. This is a wait on a **lock**, not on a hold.
+
+There is no third ordering, because both sides take the same root lock and the
+prune re-reads the holds under it. The window in which a consumer could start
+writing into a root a prune has chosen is closed by that lock, not by timing.
 
 `hold` and `release` are tiny (one lock, one small atomic file, one unlink). They
-do not take the volume lock, so they cannot be starved by a prune that holds it.
+never take the volume lock, so a long prune pass cannot starve them beyond the
+single candidate whose root lock it currently holds.
 
 ### 2. Custody is evidence, not a lock, so it creates no order
 
-Hold files are read as evidence under the root lock. The prune never waits on a
-hold, and a consumer never waits on the prune except for the root lock. There is
-therefore no lock-order edge between consumer holds and Barge's locks: holds are
-files, and the only ordered locks are the stage 1 ranks below. A consumer that
-holds a root and then tries a space decision would acquire rank 2 under a held
-rank 3 — `LockSet`'s rank check refuses that as `usage`, which is the documented
-rule: **take the decision first, hold second, and release before the next
-decision.**
+Hold files are read as evidence under the root lock. A prune never blocks on a
+hold — a hold is a file it reads, not a lock it takes — and a consumer never
+waits on a prune except for the root lock described above. There is therefore no
+lock-order edge between consumer holds and Barge's locks: holds are files, and
+the only ordered locks are the stage 1 ranks below. A consumer that holds a root
+and then tries a space decision would acquire rank 2 under a held rank 3 —
+`LockSet`'s rank check refuses that as `usage`, which is the documented rule:
+**take the decision first, hold second, and release before the next decision.**
 
-### 3. One volume, one prune, and a re-measurement after waiting
+### 3. One prune per volume, and other decisions keep measuring
 
-A prune holds the volume lock exclusively; a read-only report holds it shared; a
-hold/release takes no volume lock. A second guard that needs to prune waits up to
-the lock wait (5 s), then:
+A prune holds the volume lock exclusively from its first authoritative
+measurement to its final decision; a read-only report holds it shared, and only
+when the lock file already exists; a measurement by a guard that is only deciding
+needs no lock; a hold/release takes no volume lock. The volume lock therefore
+serializes **pruning**, not reporting or admission, and two prunes on one volume
+cannot overlap at all.
 
-- re-measures. If the measurement already satisfies the condition it wanted
-  (`F > max(R, L)`, or `F > L` when it was below the floor), it decides on that
-  measurement and reports `decided_after_wait` naming the other holder's volume
-  lock. This is the common case: one guard pruned, the next one needs nothing.
-- otherwise it refuses `locked`, names the lock file, and changes nothing. It
-  never spins, never breaks a lock whose owner is unknown, and never prunes
-  concurrently with another prune on the same volume.
+A second guard that finds itself needing to prune waits up to the lock wait (5 s).
+Because it cannot prune, it then re-measures and applies the decision table to
+that fresh measurement as if nothing could be pruned: `admit` when
+`F > max(R, L)`, `admit_below_reserve` when `L < F <= R`, and the no-effect
+refusal when `F <= L`. It reports `decided_after_wait` naming the volume lock it
+waited on. This is the common case — one guard pruned, the next one needs
+nothing — and it never spins and never breaks a lock whose owner is unknown.
+Because that guard deleted nothing, a below-floor outcome in that position is
+always the no-effect refusal, never a completed stop.
 
-Two guards therefore cannot both delete the same root: the second sees the first's
-pending intent or the root's absence under the root lock, and stage 1's replay
-rules handle the intent. Two guards on *different* volumes prune concurrently and
-independently — the volume lock is per volume, so a full Builds drive cannot block
-a Vault report.
+Two guards therefore cannot both delete the same root, and neither can hold the
+volume lock for longer than its own pass bounds allow. Two guards on *different*
+volumes prune concurrently and independently — the volume lock is per volume, so
+a full Builds drive cannot block a Vault report.
+
+`locked` is not a guard outcome: an admission decision needs no lock, so refusing
+`locked` would be a worse answer than the measurement the guard can already take.
+`locked` remains the answer for the operations that must hold the lock in order to
+act — an operator's `space prune --plan` real run and a registration write.
 
 ### 4. The policy is a versioned snapshot, and a change stops an effect
 
@@ -593,8 +654,9 @@ document) and compares:
   candidate that no longer qualifies (its area withdrew `counts`, or the reserve
   moved) is skipped and reported `policy_changed`; the pass continues from the
   fresh measurement, because the new policy's thresholds may be different;
-- registry unreadable or invalid: stop, delete nothing further, refuse
-  `unknown_state`.
+- registry unreadable or invalid: stop, delete nothing further, and report
+  `unknown_state` (exit `3`), naming the file, with anything already deleted in
+  `detail`.
 
 A running consumer's `recheck` reads the policy afresh every call, so a changed
 reserve or floor applies to work already running at its next checkpoint. That is
@@ -635,9 +697,15 @@ barge space recheck --guard <token> --json     # or space::recheck(&guard)
   resolves on is `volume_mismatch`.
 - A `recheck` on a volume that has become absent returns `volume_absent`; a
   running consumer treats that as a stop, because its writes are failing anyway.
-- Each call measures, prunes if needed, flushes, and returns `continue` or
-  `stop`: `stop` is exactly `F' <= L` after pruning with nothing eligible left.
-  The same `restart-not-possible` message and detail as the admission refusal.
+- Each call measures, prunes if needed, flushes, and reports the same
+  `barge.space.guard/1` document as admission: `decision: continue` when work may
+  proceed (`admit` or `admit_below_reserve`), and a stop when `F' <= L` after
+  pruning with nothing eligible left. A stop takes the shape
+  [the exit-code rules](#the-stop-the-refusal-and-the-exit-code) require: a
+  completed stop (`ok: true`, `data.decision: "stop_below_floor"`, exit `0`) when
+  the recheck's prune deleted something, a no-effect refusal
+  (`space_below_floor`, exit `2`) when it deleted nothing. It carries the same
+  message and attribution detail as the admission stop.
 - The contract on the consumer is one sentence: **a consumer that writes bulk
   data calls `recheck` at its own checkpoints and stops on `stop`.** The
   recommended cadence is at least once per minute of continuous writing and after
@@ -658,19 +726,25 @@ barge space recheck --guard <token> --json     # or space::recheck(&guard)
 This is the ruling most easily broken by accident, so it is carried four ways.
 
 1. **The decision type has no fallback.** `SpaceDecision` is `admit`,
-   `admit_below_reserve`, or `refuse(kind, detail)`. There is no
+   `admit_below_reserve`, or a stop (`stop_below_floor`) — a completed stop or
+   the no-effect refusal of
+   [the exit-code rules](#the-stop-the-refusal-and-the-exit-code). There is no
    `fallback_local` variant and no `Option<PathBuf>` for one, so a caller cannot
    receive a low-space redirect even by mistake. Stage 1's `AbsentPolicy::
    FallbackLocal` exists on the *area declaration* and is reachable only from an
    **absent** volume path, which requires a verified absence (`volume_absent`), not
    a low measurement.
-2. **The refusal is the only low-space outcome**, at exit `2`, with the message
-   naming the free, floor and reserve figures and stating that no work went to
-   the internal drive.
-3. **Barge writes nothing internal on refusal.** A refusal changes nothing first:
-   no directory, no marker, no state file, no link, no mount point. The only
-   writes in the whole pass are the intents and journal records of deletions it
-   actually completed.
+2. **A low-space stop never names an internal path**, in either shape. The message
+   names the free, floor and reserve figures and states that no work went to the
+   internal drive. A completed stop is a success document with `decision`
+   `stop_below_floor`; a no-effect refusal is `space_below_floor` at exit `2`.
+   Neither is allowed to carry a path the consumer could write to.
+3. **A no-effect refusal changes nothing first** — the name is accurate: no
+   directory, no marker, no state file, no link, no mount point. A pass that did
+   delete something reports it as the completed stop instead, so the "changed
+   nothing" claim is never made by a command that changed something. In both
+   shapes the only writes are the stage 1 intents and journal records of
+   deletions that actually completed.
 4. **A fallback is visible and attributed.** `barge space` and
    `barge describe --json` list every fallback root in use with the reason it
    exists, and the only reason they can name is `volume_absent`. A fallback root
@@ -724,9 +798,9 @@ rows, `unknown` never read as absent or default.
 | `barge.activity/1` | authoritative, account state | **new**: one per root, `state/activity/<root-id>.json`. |
 | `barge.area/1` | authoritative, account state | unchanged shape; this contract defines what `reserve` means. |
 | `barge.space/1` | report, read-only | **new**: per-volume measurement, policy, state, attribution and area bytes. |
-| `barge.space.guard/1` | decision document | **new**: the admission and recheck result, with measurement, pruned roots, reclaimed bytes, cause and message. |
+| `barge.space.guard/1` | decision document | **new**: the admission and recheck result, with measurement, pruned roots, reclaimed bytes, cause, message and a `decision` of `admit`, `admit_below_reserve`, `continue` or `stop_below_floor`. |
 | `barge.space.prune/1` | plan and report | **new**: ordered candidates with identity digests, the plan's SHA-256, and the executed result. |
-| `barge.error/1` | report | one new `kind`, `space_below_floor`; a `detail` object as above. |
+| `barge.error/1` | report | one new `kind`, `space_below_floor`, used only for a no-effect refusal; an unsettled delete is `unknown_state` at exit `3`. |
 | `barge.describe/1` | report | optional additions: a `space` row set and the new format names in `formats`; absent in an older document is valid. |
 | `barge.root/1`, `barge.hold/1`, `barge.intent/1` | authoritative | unchanged. This stage adds no field to a marker, a hold or an intent. |
 
@@ -781,21 +855,33 @@ only when the lock file already exists.
 
 ### `barge.space.guard/1`
 
+A completed decision is a success document, including a stop that deleted
+something:
+
 ```json
 {
   "schema": "barge.space.guard/1",
   "command": "space guard",
-  "ok": false,
-  "error": {
-    "kind": "space_below_floor",
+  "ok": true,
+  "data": {
+    "decision": "stop_below_floor",
+    "volume_uuid": "…", "mount_hint": "/Volumes/Builds",
+    "area": {"namespace": "oxide", "area": "pool"},
+    "before": {"free_bytes": 3435973836, "observed_ms": 0},
+    "after": {"free_bytes": 4724464024, "observed_ms": 0},
+    "policy": {"reserve_bytes": 21474836480, "floor_bytes": 10737418240},
+    "pruned": {"rows": [{"root_id": "…", "area": "oxide/pool",
+                        "bytes": 1288490188, "last_release_ms": 0}],
+               "count": 1, "total": 1, "truncated": false},
+    "reclaimed_bytes": 1288490188,
+    "rounds": 1,
+    "decided_after_wait": false,
     "message": "…",
     "detail": {
-      "volume_uuid": "…", "mount_hint": "/Volumes/Builds",
-      "area": {"namespace": "oxide", "area": "pool"},
-      "free_bytes": 3435973836, "floor_bytes": 10737418240,
+      "free_bytes": 4724464024, "floor_bytes": 10737418240,
       "reserve_bytes": 21474836480,
-      "pruned_root_ids": ["…"], "reclaimed_bytes": 0,
-      "owned_prunable_bytes": 0, "held_or_unknown_bytes": 44814942208,
+      "pruned_root_ids": ["…"], "reclaimed_bytes": 1288490188,
+      "owned_prunable_bytes": 0, "held_or_unknown_bytes": 43528138752,
       "excluded_bytes": 0, "other_estimate_bytes": 13851269529,
       "cause": "held_owned_roots",
       "measurement_source": "fstatfs.f_bavail*bsize",
@@ -805,12 +891,26 @@ only when the lock file already exists.
 }
 ```
 
-A successful guard uses `ok: true` and a `data` object with `decision`
-(`admit` or `admit_below_reserve`), the `before` and `after` measurements, the
-`policy`, the `pruned` row set, `reclaimed_bytes`, `rounds`, `decided_after_wait`
-and the same attribution. Whether the document is an error or a success is
-stage 1's envelope rule; the `decision` value repeats it for readers that log
-only successes.
+A no-effect refusal is the error envelope with the same `message` and `detail`
+fields, and no `pruned` rows:
+
+```json
+{"schema": "barge.space.guard/1", "command": "space guard", "ok": false,
+ "error": {"kind": "space_below_floor", "message": "…", "detail": {"…": "…"}}}
+```
+
+`decision` is `admit`, `admit_below_reserve`, `continue` (a recheck that may
+proceed) or `stop_below_floor`. A recheck reports `continue` in place of
+`admit`/`admit_below_reserve` and is otherwise the same document. `pruned` lists
+the roots this call deleted, in delete order;
+`reclaimed_bytes` is the measured difference across the pass, not a sum of
+recorded root sizes. `decided_after_wait` is true when another prune held the
+volume lock past the lock wait, so this call decided on a fresh measurement
+without pruning. An unsettled delete is `kind: "unknown_state"` at exit `3` with
+`detail.pending_intent` naming the intent id and `detail.pruned_root_ids`
+naming anything already deleted. Whether a document is an error or a success is
+stage 1's envelope rule; the `decision` value repeats it for readers that log only
+successes.
 
 ### `barge.space.prune/1`
 
@@ -832,7 +932,7 @@ locks are held for which step.
 | Rank | Lock | Held by stage 3 for | Never held across |
 | --- | --- | --- | --- |
 | 1 | `registry.lock` | the policy snapshot read (shared), and a registration write (exclusive) | a measurement, a volume walk, a deletion |
-| 2 | `volume-<uuid>.lock` | a decision that may prune (exclusive); a report (shared, only if the file exists); each prune's effect | a registry write |
+| 2 | `volume-<uuid>.lock` | a prune pass (exclusive, held from its first authoritative measurement to its final decision); a report (shared, only if the file exists); an operator prune's real run; a registration write | a registry lock write |
 | 3 | `root-<id>.lock` | `hold`, `release` and the activity write; one candidate's plan → intent → rename → delete | another root's effect |
 | 4 | intent write (no lock file) | the intent publish before an effect | — |
 
@@ -845,20 +945,29 @@ Rules a reviewer can check:
 2. **The registry lock is never held across a walk or a delete.** A long prune
    holds the volume and one root lock, and re-reads the registry bytes it needs
    (bounded, 4 MiB, 10 s) before publishing its intent.
-3. **One root at a time.** Volume and root locks are released between candidates,
-   so two concurrent prunes cannot deadlock on a pair of roots and a consumer's
-   `hold` waits for at most one deletion, not for a whole batch.
+3. **The volume lock is held for the whole prune pass; only the root lock is
+   released between candidates.** A pass takes the volume lock before its first
+   authoritative measurement and releases it after its final decision, so two
+   prunes on one volume cannot overlap and no deadlock is possible. Each
+   candidate's effect takes its root lock after the volume lock, one root at a
+   time, and releases it before the next candidate, so a consumer's `hold` waits
+   for at most one deletion, never for a whole batch.
 4. **No consumer ever holds a root and asks for a volume lock.** That would be a
    descending acquisition (`usage` refusal); the API documents the two phases —
    decide, then hold — and the guard's own code holds no root lock.
 5. **Holds are not locks.** Hold files are read as evidence under the root lock;
-   a prune never waits on a hold, and a hold never waits on a prune.
+   a prune never blocks on a hold, because a hold is a file, not a lock. A
+   consumer's `hold` may wait for the root lock a prune holds and then fail
+   `locked`, which is waiting on a **lock**, not on a hold; that is the only
+   wait either side can do for the other.
 6. **The intent is last.** It takes no lock file, and it is durable before the
    first destructive step, exactly as stage 1 defines.
 
-A lock that cannot be taken within the deadline is `locked`, names the lock file,
-changes nothing, and is never broken. A guard that waits and then measures
-(`decided_after_wait`) is the only "wait" behaviour; there is no back-off loop.
+A lock that cannot be taken within the deadline that the operation *needs* — an
+operator prune's real run, a registration write — is `locked`, names the lock
+file, changes nothing, and is never broken. A guard never treats the volume lock
+that way: it measures without it and decides (`decided_after_wait`), because an
+admission decision needs no lock to act.
 
 ## Failure, race and cancellation matrix
 
@@ -869,15 +978,15 @@ data, marker and record are unchanged and reported.
 | --- | --- | --- |
 | Drive pulled before a decision | mount root will not open; UUID or device mismatch; `EIO`/`ENOENT` on the volume descriptor | refuse `volume_absent`, naming the drive; nothing measured, pruned or created |
 | Drive pulled mid-prune | a descriptor-relative call fails after the quarantine rename | stop; keep the pending intent and the quarantine leaf; exit `3`; replay only after the volume reverifies and the recorded identity matches |
-| Drive pulled during the flush | flush or the reverify around it fails | post-prune measurement unknown; refuse `unknown_state`; report the roots already deleted; no admission |
-| Measurement unknown or overflowing | absent field, `None`, checked-multiply failure | refuse `unknown_state`; never treat as zero or as plenty |
-| Purgeable space not materialised | a batch reclaimed nothing and the flush succeeded | stop pruning; report `space_not_reclaimed` with both measurements; decide on the floor |
+| Drive pulled during the flush | flush or the reverify around it fails | post-prune measurement unknown; `unknown_state` at exit `3`, reporting the roots already deleted; no admission |
+| Measurement unknown or overflowing | absent field, `None`, checked-multiply failure | `unknown_state`; never treat as zero or as plenty |
+| Purgeable space not materialised | a batch reclaimed nothing and the flush succeeded | stop pruning; report `space_not_reclaimed` with both measurements; the outcome is the floor's (completed stop when something was deleted) |
 | Unlinked-but-open file by a foreign writer | same as above | same; the cause is named as undecidable |
 | Free space fell again between flush and decision | the deciding measurement itself | the decision uses the deciding measurement; a recheck re-measures; no cached number is reused |
-| Two guards at once on one volume | volume lock with a live owner | wait ≤ 5 s, re-measure, then decide (`decided_after_wait`) or refuse `locked`; never two prunes |
+| Two guards at once on one volume | the volume lock, held by the pass | the second waits ≤ 5 s, re-measures without the lock and decides (`decided_after_wait`); it never prunes, so the two can never delete the same root |
 | Two guards on two volumes | per-volume lock | both proceed; no global lock |
-| Consumer takes a hold while its root is chosen | root lock held by the prune | the hold waits, then fails `locked`; the root is skipped and reported `held` |
-| Hold recorded between plan and effect | holds re-read under the root lock at the effect step | skip the root and report it; no partial delete |
+| A consumer's `hold` while the prune already holds that root's lock | root lock held by the prune | the hold waits for the lock up to its own deadline, then fails `locked`; nothing is written into the root and the prune completes its verified delete |
+| A consumer's `hold` recorded before the prune takes that root's lock | the hold file read under the root lock at the effect step | skip the root and report it as `held`; the hold stays valid and the consumer writes normally; no partial delete |
 | Consumer releases a hold mid-pass | the activity record and hold scan at the effect step | the root becomes eligible; it is considered in the next batch, never retroactively in the current plan |
 | Hold file unreadable, foreign uid, or pid alive with no start identity | custody evidence | `Unknown`; skip and report `held_or_unknown_bytes`; never idle |
 | Holder pid reused | pid + start identity + boot identity all disagree | stale only when all three positively disagree; otherwise unknown |
@@ -886,14 +995,14 @@ data, marker and record are unchanged and reported.
 | Marker unverifiable, foreign family, or another device | stage 1 marker rules | skip and report; never a candidate |
 | Root becomes absent or renamed between plan and effect | identity re-verification | skip with `identity_changed`; no delete |
 | Registry changed between snapshot and effect | generation compare on a bounded re-read | re-evaluate that candidate against the new policy; skip if it no longer qualifies (`policy_changed`); continue on a fresh measurement |
-| Registry unreadable or invalid | bounded re-read | stop; delete nothing further; refuse `unknown_state` naming the file |
+| Registry unreadable or invalid | bounded re-read | stop; delete nothing further; `unknown_state` at exit `3` naming the file, with anything already deleted in `detail` |
 | Area declaration withdrawn mid-pass | declaration re-read with the registry snapshot | the root stops being a candidate; skip and report |
 | Floor or reserve edited while work runs | the recheck's fresh policy read | the new thresholds apply at that checkpoint; documented, not a race |
-| Volume's durability changed to `kept` mid-pass | registry generation compare | stop; delete nothing further; refuse `refused_boundary` |
-| Pending intent from an earlier prune | intent directory | that root is skipped and reported; the guard refuses `pending_intent` (exit `3`) rather than admitting over an unsettled delete |
+| Volume's durability changed to `kept` mid-pass | registry generation compare | stop; delete nothing further; report `unknown_state`/`refused_boundary` at exit `3`, naming what was already deleted |
+| Pending intent from an earlier prune | intent directory | that root is skipped and reported; the guard `unknown_state` (exit `3`) with `detail.pending_intent`, rather than admitting over an unsettled delete |
 | `ENOSPC` on the state volume | intent or activity write | refuse before the effect; nothing deleted; report the state volume |
 | Signal during a batch (SIGINT/SIGTERM) | signal | finish the current durable step, leave the intent (never an unrecorded effect), release locks, exit non-zero |
-| Prune budget exhausted mid-batch | per-root and per-pass deadlines | stop; decide from the last flushed measurement; report `budget_exhausted` and what was not reached |
+| Prune budget exhausted mid-batch | per-root and per-pass deadlines | stop; decide from the last flushed measurement; report `budget_exhausted` and what was not reached, in the completed-stop or no-effect-refusal shape that matches whether anything was deleted |
 | Finder recreates `.DS_Store` during the delete | `ENOTEMPTY`/`EEXIST` | stage 1's three attempts, 1 s apart, then pending intent and exit `3`; never a wider delete |
 | Unknown entry inside a chosen root | the walk | stop, keep the root, report the name; the candidate is skipped for the rest of the pass |
 | Two registration writes race | exclusive registry lock and `generation` | one wins; the loser re-reads and reports the newer generation; no lost update |
@@ -941,7 +1050,8 @@ reports the unfinished part as done, and it never turns into a longer deadline.
 | A background watchdog that prunes on a timer | The vision excludes a daemon; `maintain` already gives a scheduled pass, and consumers recheck at their own checkpoints. |
 | Preview-then-real for the guard's prune | Admission is one call on a live path; requiring a plan round-trip would mean measuring, returning, and being admitted later on stale facts. The guard re-verifies each candidate at its effect step, and reports the plan it executed; the operator's `space prune` keeps the strict preview discipline. |
 | `lsof` or a process scan as the "no writer" proof | Stage 1's limit stands: external, unbounded, and its silence is not a kernel guarantee. Custody stays cooperative plus same-uid descriptor observation. |
-| Delete more when a flush shows no reclaim (widen the batch) | It would delete data for no measured effect, and the cause (purgeable space, a foreign open file) is undecidable. Stop, report `space_not_reclaimed`, and let the floor refuse. |
+| Delete more when a flush shows no reclaim (widen the batch) | It would delete data for no measured effect, and the cause (purgeable space, a foreign open file) is undecidable. Stop, report `space_not_reclaimed`, and let the floor stop work. |
+| Report a stop that pruned as a refusal at exit `2` | Stage 1's exit `2` means "refused before any effect", so a document listing deleted roots in the same envelope would be false about its own behaviour, and a consumer could not tell a stop it can act on from a refusal that changed nothing. A stop that changed something is a completed command at exit `0`; only a pass that deleted nothing is a refusal. |
 | Rewrite the root marker to record activity | The marker is written once and is never rewritten to add a fact another process could have raced; activity lives in account state beside it. |
 | A `--force` pruning or admission escape hatch | Any force path lets an unknown become safe, which stage 1 rejected for deletion; the floor is the honest stop. |
 
@@ -955,12 +1065,12 @@ these are proposed for the slices below, not run by this design task.
 | --- | --- | --- |
 | Measurement | `fstatfs` mapping to free/total with checked multiply; `source` and `observed_ms` always present; purgeable reported as unknown | an absent field, an overflow and a `None` all yield `unknown` and a refusal, never zero; `f_bfree` never decides; a different volume at the mount point is `volume_mismatch` |
 | Policy record | optional `space` read/write; default floor written explicitly; generation increases; `--plan` digest | an absent `space` refuses a space-gated decision and still reports; `floor_bytes == 0`, `reserve_bytes == 0` and a floor above `total_bytes` refuse at registration with nothing written; a floor below the default is reported, not silently raised |
-| Decision table | every cell of the table, with `R < L`, `R == L` and `R > L` | `F` just above `R` with `L > R` refuses (the floor wins); `F <= R` with nothing eligible admits with the below-reserve warning; `F <= L` with a candidate that reclaims nothing refuses and reports `space_not_reclaimed` |
+| Decision table | every cell of the table, with `R < L`, `R == L` and `R > L`; and the envelope each outcome takes | `F` just above `R` with `L > R` stops (the floor wins); `F <= R` with nothing eligible admits with the below-reserve warning; `F <= L` with a candidate that reclaims nothing yields a **completed stop** (`ok: true`, `decision: stop_below_floor`, exit `0`, `space_not_reclaimed`) because it deleted something, while the same floor with nothing eligible yields the `space_below_floor` no-effect refusal (exit `2`); a completed stop is never encoded as a `space_below_floor` error, and a no-effect refusal never lists a pruned root |
 | Idleness | the eligible/ineligible matrix over marker, activity, hold and participation | missing activity, unreadable hold, live pid with mismatched start identity, future timestamp, foreign marker, other device, unconcluded scratch and `excluded` area roots each stay kept and reported |
 | LRU order | release, then created, then id ordering; stable across areas | two roots in different areas: the older release goes first; equal releases fall to `first_created_ms` and then `root_id`; a held older root in front is skipped, not deferred silently |
-| Prune custody | plan → intent → rename → delete phases; marker last; Finder tolerance; `ENOTEMPTY` | a hold recorded between plan and effect skips the root; an unknown entry stops the delete; an injected device change stops before the first unlink; a symlink inside the quarantine stops it |
-| Reclaim | flush after the batch, then measure; zero-reclaim detection | a flush failure yields `unknown_state` with the deleted roots reported; an injected zero reclaim stops the pass instead of deleting more |
-| Concurrency | two guards, one volume: second waits, measures, decides or refuses `locked`; two volumes proceed | an injected held volume lock yields `decided_after_wait` when the measurement satisfies, `locked` otherwise; a consumer `hold` during a root lock fails `locked` and the root is untouched |
+| Prune custody | plan → intent → rename → delete phases; marker last; Finder tolerance; `ENOTEMPTY` | an unknown entry stops the delete; an injected device change stops before the first unlink; a symlink inside the quarantine stops it |
+| Reclaim | flush after the batch, then measure; zero-reclaim detection | a flush failure yields `unknown_state` at exit `3` with the deleted roots reported; an injected zero reclaim stops the pass instead of deleting more |
+| Concurrency | two guards on one volume: the second waits, never prunes, re-measures without the lock and decides `decided_after_wait`; two volumes proceed; an operator prune's real run needs the lock | an injected held volume lock yields `decided_after_wait` for a guard and `locked` (nothing changed) for an operator prune's real run; a guard never returns `locked`; a consumer `hold` while the prune holds that root lock fails `locked` and the root is untouched; a hold recorded before the prune takes the root lock makes it skip that root and report `held` |
 | Policy snapshot | generation compare before each effect | a registry changed to withdraw the area skips the candidate; a changed reserve re-evaluates; an invalid registry stops the pass with nothing further deleted |
 | Registration | register/update/describe documents and errors | an absent volume, an unverified UUID and a malformed size each refuse with nothing written; a concurrent update loses nothing (generation) |
 | Fallback exclusion | `SpaceDecision` has no fallback variant; a present volume's area resolution never returns a local path | a low-space decision on a present volume never yields a path; a fallback root present while its volume is present is reported `fallback_while_present` |
@@ -1000,9 +1110,10 @@ native, and a missing receipt from the slice that runs it is a missing proof.
 | 1 | Register the image with `reserve 48 MiB`, `floor 24 MiB`; fill two areas with roots so free is above the reserve; guard | admission with no prune, no flush, nothing deleted |
 | 2 | Fill below the reserve with idle roots in two areas of different ages; guard | LRU across areas: the older-release root from the second area goes first; admission once free is back above the reserve |
 | 3 | Hold one root and keep writing to it in a second process while a guard prunes the rest | the held root's inode and bytes are unchanged, the writer's data is intact, the pass reports it as held |
-| 4 | Fill below the floor with every eligible root held | refusal `space_below_floor`; the message and detail carry free, floor, reserve, held bytes and cause; the fake internal pool is empty afterwards |
+| 4 | Fill below the floor with every eligible root held | no-effect refusal `space_below_floor` at exit `2` (the pass deleted nothing); the message and detail carry free, floor, reserve, held bytes and cause; the fake internal pool is empty afterwards |
+| 4b | Fill below the floor again, this time with one large eligible idle root | the pass deletes it and the floor is still breached: a **completed stop** (`ok: true`, `decision: stop_below_floor`, exit `0`) listing the deleted root, and the fake internal pool is still empty |
 | 5 | One root with an unreadable hold file and one with no activity record, both large | both survive, both are reported, and the pass never treats them as idle |
-| 6 | Register a second fixture volume with `reserve 16 MiB`, `floor 32 MiB`; fill so free sits between the two (above the reserve, below the floor), with nothing eligible left | the floor wins: the guard prunes, then refuses at 32 MiB although free is above the 16 MiB reserve |
+| 6 | Register a second fixture volume with `reserve 16 MiB`, `floor 32 MiB`; fill so free sits between the two (above the reserve, below the floor), with nothing eligible left | the floor wins: the guard prunes, then stops at 32 MiB although free is above the 16 MiB reserve, in the completed-stop shape if its prune deleted anything |
 | 7 | Delete a chosen root whose file is still open by a same-uid process, so free does not rise | `space_not_reclaimed` after the flush, no further deletion, and after the writer exits a recheck sees the space |
 | 8 | Detach the image (ordinary, after the writers finish) mid-pass, then re-attach | pending intent with the quarantine leaf kept, exit `3`, replay completes after re-attach; no stale mount point written |
 | 9 | A stale `/Volumes/<name>` directory left after detach | never written to, never recreated; the decision refuses |
@@ -1123,7 +1234,7 @@ starts before stage 1's S3 (areas, roots, holds) and S5 (custody, delete) are on
 | T3 | `barge.activity/1`; `hold`/`release` taking the root lock; `area idle-baseline`; the idleness matrix and the LRU order | T2, stage 1 S3 |
 | T4 | Candidate planning for space (`barge.space.prune/1`), the area `reserve` participation rules, scratch's relaxed expiry predicate | T3, stage 1 S3 |
 | T5 | The space prune: per-root delete under the stage 1 custody, intent and quarantine protocol; flush and reclaim; the batch, round and deadline bounds; operator `space prune --plan` and replay | T4, stage 1 S5 |
-| T6 | The guard and recheck: admission decision table, `barge.space.guard/1`, attribution, the refusal message, concurrency (`decided_after_wait`, `locked`), policy-generation re-evaluation | T5 |
+| T6 | The guard and recheck: admission decision table, `barge.space.guard/1`, attribution, the completed-stop and no-effect-refusal shapes with their exit codes, concurrency (`decided_after_wait`), policy-generation re-evaluation | T5 |
 | T7 | `maintain`'s space stage, `describe` completion, and the single-command contract for the host job (the plist change itself stays operator-gated) | T6, stage 1 S7 |
 | T8 | The bounded native proof above, as its own brief with the Elevated gates | T1–T7 |
 | T9 | A real-drive qualification and the host-job change | T8, operator gate |
@@ -1204,9 +1315,13 @@ a reviewer may prefer. None blocks the design from being reviewed as a whole.
    delete a cache root whole and repair its link, which reclaims the largest
    bytes but leaves a consumer path momentarily dangling and needs a link-repair
    mechanism this stage does not have.
-5. **Is one new error kind (`space_below_floor`) enough?** Alternative: reuse
-   `refused_boundary` or `resource_bound`, which would lose the distinction
-   between a policy stop, a bound and a boundary refusal in every log.
+5. **Is the completed-stop split the right envelope?** A stop that deleted
+   something is `ok: true` at exit `0` with `decision: stop_below_floor`, and only
+   a pass that deleted nothing is `space_below_floor` at exit `2`. Alternative:
+   always report the floor as an error, reusing `resource_bound` or
+   `refused_boundary`, which would put a report of deleted roots inside an
+   envelope that promises no effect and lose the distinction between a policy
+   stop and a bound.
 6. **Should a floor below the 10 GiB default be allowed?** Alternative: refuse
    anything under the default, which makes the default a minimum rather than a
    default and takes an operator's own margin away.
