@@ -15,14 +15,14 @@ static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The scratch directory AGENTS.md names for scratch writes when the Builds
 /// drive is present. Nothing is ever written to a fixed name inside it: every
-/// fixture is a fresh directory this process creates and removes.
+/// fixture owns a fresh `run.*` root there and removes it when it ends.
 pub const SCRATCH_BASE: &str = "/Volumes/Builds/scratch/barge";
 
-/// The base a fixture that needs the real OS layer is created under.
+/// The base a fixture is created under.
 ///
 /// AGENTS.md asks for scratch inside the Builds drive when it is present. When
 /// it is not, the platform's temporary directory is used, which is still a fresh
-/// directory per test rather than a fixed name.
+/// `run.*` root per fixture rather than a fixed name.
 pub fn scratch_base() -> PathBuf {
     let scratch = PathBuf::from(SCRATCH_BASE);
     if scratch.is_dir() {
@@ -32,21 +32,26 @@ pub fn scratch_base() -> PathBuf {
     }
 }
 
-/// A temporary directory that removes itself when the test ends.
+/// A temporary fixture that removes itself, and the fresh `run.*` root it owns,
+/// when the test ends.
 #[derive(Debug)]
 pub struct TempDir {
     path: PathBuf,
+    /// The fresh task-owned `run.*` root this fixture lives inside. It is removed
+    /// with the fixture, so nothing is left behind under the scratch base.
+    run_root: PathBuf,
 }
 
 impl TempDir {
-    /// Create a fresh directory named after `label` and this process.
+    /// Create a fresh fixture named after `label` and this process, inside its own
+    /// fresh `run.*` root under the scratch base.
     pub fn new(label: &str) -> Self {
-        Self::under(&std::env::temp_dir(), label)
+        Self::under(&scratch_base(), label)
     }
 
-    /// Create a fresh directory named after `label` and this process under
-    /// `base`, creating `base` when it is not there.
-    pub fn under(base: &Path, label: &str) -> Self {
+    /// Create a fresh fixture named after `label` and this process under `base`,
+    /// inside a fresh `run.*` root that the fixture owns and removes with itself.
+    fn under(base: &Path, label: &str) -> Self {
         if !base.is_dir() {
             std::fs::create_dir_all(base).expect("the fixture base is created");
         }
@@ -55,18 +60,24 @@ impl TempDir {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.subsec_nanos());
-            let path = base.join(format!(
-                "barge-test-{label}-{}-{sequence}-{nanos}",
-                std::process::id()
-            ));
-            match std::fs::create_dir(&path) {
-                Ok(()) => return Self { path },
+            let run_root = base.join(format!("run.{}-{sequence}-{nanos}", std::process::id()));
+            match std::fs::create_dir(&run_root) {
+                Ok(()) => {
+                    let path = run_root.join(format!("barge-test-{label}-{}", std::process::id()));
+                    match std::fs::create_dir(&path) {
+                        Ok(()) => return Self { path, run_root },
+                        Err(error) => {
+                            let _ = std::fs::remove_dir(&run_root);
+                            panic!("cannot create the fixture directory: {error}");
+                        }
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => panic!("cannot create the fixture directory: {error}"),
+                Err(error) => panic!("cannot create the fixture run root: {error}"),
             }
         }
         panic!(
-            "could not find a fresh fixture directory name under {}",
+            "could not find a fresh fixture run root under {}",
             base.display()
         );
     }
@@ -94,7 +105,9 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        // The fixture lives inside the run root, so one removal clears both and
+        // nothing is left under the scratch base.
+        let _ = std::fs::remove_dir_all(&self.run_root);
     }
 }
 
@@ -523,10 +536,13 @@ impl Faults {
 
     /// Run the racers whose name was just observed.
     ///
-    /// The entry is resolved at the moment it is raced rather than when the test
-    /// registered it, because the deletion renames the root into its quarantine
-    /// leaf before it walks it.
-    fn maybe_race(&self, name: &str) {
+    /// A file and a directory are replaced through the handle the check read, so a
+    /// race lands in the directory the deletion is looking at at any depth: the
+    /// deletion renames the root into its quarantine leaf, and then renames each
+    /// captured directory, so no fixed path stays valid. A symlink can only be
+    /// made by path, so that replacement follows the root into its quarantine leaf
+    /// and the tests that use it race a top-level entry.
+    fn maybe_race(&self, parent: &DirHandle, name: &str) {
         let mut races = self.races.borrow_mut();
         for race in races.iter_mut() {
             if race.relative.file_name().and_then(|part| part.to_str()) != Some(name) {
@@ -537,8 +553,32 @@ impl Faults {
             if seen != race.observation {
                 continue;
             }
-            let path = raced_path(&race.holder, &race.relative);
-            replace_entry(&path, &race.replacement);
+            self.replace_entry(parent, name, race);
+        }
+    }
+
+    /// Put `race.replacement` where the checked entry was.
+    fn replace_entry(&self, parent: &DirHandle, name: &str, race: &Race) {
+        match &race.replacement {
+            Replacement::File(bytes) => {
+                // A racer publishes over the name it observed, which is one atomic
+                // rename onto a fresh inode: the check it raced no longer describes
+                // what is there.
+                let _ = self.inner.publish_child_file(parent, name, bytes, 0o644);
+            }
+            Replacement::Directory { name: held, bytes } => {
+                let _ = self.inner.remove_child(parent, name, RemoveKind::Directory);
+                if self.inner.create_child_dir(parent, name, 0o755).is_ok() {
+                    if let Ok(child) = self.inner.open_child_dir(parent, name) {
+                        let _ = self.inner.publish_child_file(&child, held, bytes, 0o644);
+                    }
+                }
+            }
+            Replacement::Symlink(target) => {
+                let path = raced_path(&race.holder, &race.relative);
+                let _ = std::fs::remove_file(&path);
+                let _ = std::os::unix::fs::symlink(target, &path);
+            }
         }
     }
 
@@ -612,27 +652,6 @@ fn raced_path(holder: &Path, relative: &Path) -> PathBuf {
     holder.join(relative)
 }
 
-/// Replace the entry at `path` with `replacement`, the way a same-uid racer
-/// does: the observed object is moved away, so the delete's next step meets a
-/// different object under the same name.
-fn replace_entry(path: &Path, replacement: &Replacement) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_dir_all(path);
-    match replacement {
-        Replacement::File(bytes) => {
-            let _ = std::fs::write(path, bytes);
-        }
-        Replacement::Symlink(target) => {
-            let _ = std::os::unix::fs::symlink(target, path);
-        }
-        Replacement::Directory { name, bytes } => {
-            if std::fs::create_dir(path).is_ok() {
-                let _ = std::fs::write(path.join(name), bytes);
-            }
-        }
-    }
-}
-
 impl DirOps for Faults {
     fn open_path(&self, path: &Path) -> Result<DirHandle> {
         self.inner.open_path(path)
@@ -665,7 +684,7 @@ impl DirOps for Faults {
         // The racer replaces the entry after the check that just read these
         // facts, so the returned observation describes an object that is no
         // longer at the name: the exact window a check-then-unlink by name loses.
-        self.maybe_race(name);
+        self.maybe_race(parent, name);
         Ok(Some(facts))
     }
 

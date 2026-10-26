@@ -32,8 +32,10 @@
 //! name, or, when that name is taken, stays under the private name with both names
 //! reported, and the deletion stops with the intent pending. That closes the
 //! check-then-unlink-by-name race, in which a same-uid racer replaces each entry
-//! after its check and the next check passes. Leftover `.barge-del-*` names a stop
-//! left behind are re-verified the same way, never unlinked on sight.
+//! after its check and the next check passes. A `.barge-del-*` name a stop left
+//! behind is recorded with the observation its capture failed to match, and no run
+//! and no replay ever unlinks one: it is unverifiable, so it keeps the intent
+//! pending for an operator instead.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -51,7 +53,8 @@ use crate::os::{
 };
 use crate::registry;
 use crate::state::{
-    self, IntentPhase, IntentRecord, IntentWrite, LockSet, StatePaths, QUARANTINE_PREFIX,
+    self, is_capture_name, IntentPhase, IntentRecord, IntentWrite, LeftoverRecord, LockSet,
+    PutBackOutcome, StatePaths, CAPTURE_PREFIX, LEFTOVER_REASON_BYTES, QUARANTINE_PREFIX,
 };
 
 /// How deep a whole-root delete walks (design, "Bounded resources").
@@ -71,16 +74,6 @@ pub const ENOTEMPTY_PAUSE: Duration = Duration::from_secs(1);
 
 /// After how many examined entries the volume is re-verified.
 const REVERIFY_ENTRIES: usize = 512;
-
-/// The prefix of the private name one entry is held under between its capture
-/// and its unlink.
-///
-/// The name is `.barge-del-` plus a fresh 128-bit nonce, chosen in the same
-/// directory the entry was captured from, so the capture is one atomic rename and
-/// a racer must discover the private name to interfere with it at all. A stopped
-/// deletion can leave one behind; replay recognises the form and re-verifies the
-/// object before anything unlinks it.
-pub const CAPTURE_PREFIX: &str = ".barge-del-";
 
 /// How many fresh private names one capture tries before it stops: a collision
 /// on a 128-bit random name is a defect or a racer, never an ordinary retry.
@@ -404,6 +397,7 @@ pub fn delete_root_on_volume(
         generation: 1,
         recorded_ms: now,
         phase_ms: now,
+        leftovers: Vec::new(),
     };
     let write = locks.begin_intent_write()?;
     state::publish_intent(&write, state_paths, &intent)?;
@@ -589,6 +583,7 @@ fn finish_deletion(
         DeviceId::new(intent.device),
         intent.mount_hint.clone(),
         bounds,
+        &intent.leftovers,
     ) {
         Ok(walk) => walk,
         Err(error) => {
@@ -627,11 +622,27 @@ fn finish_deletion(
             }
         };
         if let Walk::Stop(reason) = classified {
-            return pending_report(intent, quarantine, counts, reason, None);
+            return pending_with_leftovers(
+                write,
+                state_paths,
+                intent,
+                &walk.leftovers,
+                quarantine,
+                counts,
+                reason,
+            );
         }
         match walk.delete_contents(&leaf, 0, Path::new(""), true, &mut counts) {
             Ok(Walk::Stop(reason)) => {
-                return pending_report(intent, quarantine, counts, reason, None)
+                return pending_with_leftovers(
+                    write,
+                    state_paths,
+                    intent,
+                    &walk.leftovers,
+                    quarantine,
+                    counts,
+                    reason,
+                )
             }
             Ok(Walk::Clean) => {}
             Err(error) => {
@@ -649,7 +660,15 @@ fn finish_deletion(
         match walk.remove_marker_last(&leaf, &mut counts) {
             Ok(Walk::Clean) => {}
             Ok(Walk::Stop(reason)) => {
-                return pending_report(intent, quarantine, counts, reason, None)
+                return pending_with_leftovers(
+                    write,
+                    state_paths,
+                    intent,
+                    &walk.leftovers,
+                    quarantine,
+                    counts,
+                    reason,
+                )
             }
             Err(error) => {
                 return pending_report(
@@ -687,7 +706,15 @@ fn finish_deletion(
     ) {
         Ok(Removal::Gone) => {}
         Ok(Removal::Stopped(reason)) => {
-            return pending_report(&current, quarantine, counts, reason, None)
+            return pending_with_leftovers(
+                write,
+                state_paths,
+                &current,
+                &walk.leftovers,
+                quarantine,
+                counts,
+                reason,
+            )
         }
         Err(error) => {
             return pending_report(
@@ -762,6 +789,39 @@ fn leaf_marker_digest(
     }
 }
 
+/// Report a stop, publishing the unverified captures the walk could not put back.
+///
+/// The record is durable before the report, so a later run and a replay know which
+/// private names hold objects whose capture never verified. A record that cannot be
+/// written does not weaken the stop: the intent stays pending either way, and an
+/// unrecorded private name is still unverifiable and still never unlinked.
+fn pending_with_leftovers(
+    write: &IntentWrite,
+    state_paths: &StatePaths,
+    intent: &IntentRecord,
+    leftovers: &[LeftoverRecord],
+    quarantine: PathBuf,
+    counts: Counts,
+    reason: String,
+) -> DeleteReport {
+    let mut recorded = intent.clone();
+    if !leftovers.is_empty() {
+        match state::record_leftovers(write, state_paths, intent, leftovers) {
+            Ok(next) => recorded = next,
+            Err(error) => {
+                return pending_report(
+                    &recorded,
+                    quarantine,
+                    counts,
+                    format!("{reason}; the unverified capture could not be recorded: {error}"),
+                    None,
+                )
+            }
+        }
+    }
+    pending_report(&recorded, quarantine, counts, reason, None)
+}
+
 fn pending_report(
     intent: &IntentRecord,
     quarantine: PathBuf,
@@ -802,9 +862,16 @@ struct WalkState<'a> {
     /// what was classified and Finder metadata that appeared again; anything
     /// else is a new entry, which stops the deletion rather than widening it.
     expected: HashSet<PathBuf>,
+    /// The unverified captures the intent already records, so a stop can name the
+    /// object's original name and why its capture did not verify.
+    recorded: Vec<LeftoverRecord>,
+    /// The unverified captures this run could not put back, which the caller
+    /// publishes into the intent before it reports the stop.
+    leftovers: Vec<LeftoverRecord>,
 }
 
 impl<'a> WalkState<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         dirs: &'a dyn DirOps,
         facts: &'a dyn VolumeFacts,
@@ -813,6 +880,7 @@ impl<'a> WalkState<'a> {
         device: DeviceId,
         mount: PathBuf,
         bounds: DeleteBounds,
+        recorded: &[LeftoverRecord],
     ) -> Result<Self> {
         Ok(Self {
             dirs,
@@ -825,7 +893,36 @@ impl<'a> WalkState<'a> {
             deadline: Instant::now() + bounds.timeout,
             examined: 0,
             expected: HashSet::new(),
+            recorded: recorded.to_vec(),
+            leftovers: Vec::new(),
         })
+    }
+
+    /// The stop for a private name this run did not capture.
+    ///
+    /// A leftover is unverifiable: nothing recorded the identity of the object
+    /// under the private name for the walk to check it against, so no run and no
+    /// replay may unlink it. A recorded capture additionally names what it was
+    /// and why its verification failed.
+    fn leftover_stop(&self, private: &str) -> String {
+        match self
+            .recorded
+            .iter()
+            .find(|leftover| leftover.private == private)
+        {
+            Some(record) => format!(
+                "`{private}` holds the unverified capture of `{}`, whose put back {}: {}; it is never unlinked, so the intent stays pending",
+                record.original,
+                match record.put_back {
+                    PutBackOutcome::Taken => "was refused because the name was taken",
+                    PutBackOutcome::Failed => "failed",
+                },
+                record.reason
+            ),
+            None => format!(
+                "`{private}` is a private capture name this deletion did not create, so its object is unverifiable and nothing is unlinked"
+            ),
+        }
     }
 
     /// Re-read the volume's facts and refuse when it is no longer the same
@@ -930,6 +1027,12 @@ impl<'a> WalkState<'a> {
             if let Walk::Stop(reason) = self.classify_entry(&entry.name, &facts) {
                 return Ok(Walk::Stop(reason));
             }
+            if is_capture_name(&entry.name) {
+                // A private name is never an ordinary entry: it holds an object
+                // whose capture this walk cannot verify, so it stops the deletion
+                // and is never recorded as something the delete pass may remove.
+                return Ok(Walk::Stop(self.leftover_stop(&entry.name)));
+            }
             let path = relative.join(&entry.name);
             self.expected.insert(path.clone());
             if facts.kind == EntryKind::Directory {
@@ -1003,7 +1106,7 @@ impl<'a> WalkState<'a> {
                     && facts.device == self.device
                     && facts.size <= FINDER_METADATA_BYTES
             }
-            Allowance::Observed | Allowance::Leftover => {
+            Allowance::Observed => {
                 facts.kind == observed.kind
                     && facts.device == observed.device
                     && facts.inode == observed.inode
@@ -1054,12 +1157,32 @@ impl<'a> WalkState<'a> {
             // Never unlink. A put-back that itself fails still reports both the
             // original and the private name, because the operator has to decide
             // what happens to the object left under the private one.
-            let stopped = match self.put_back(handle, name, &private, &reason) {
-                Ok(stopped) => stopped,
-                Err(error) => format!(
-                    "`{name}` changed after its check and could not be put back from `{private}`: {error}"
+            let (put_back, stopped) = match self.put_back(handle, name, &private, &reason) {
+                Ok((put_back, stopped)) => (put_back, stopped),
+                Err(error) => (
+                    PutBack::Failed,
+                    format!(
+                        "`{name}` changed after its check and could not be put back from `{private}`: {error}"
+                    ),
                 ),
             };
+            if put_back != PutBack::Renamed {
+                // The object stays under its private name. Record it durably, so
+                // no later run and no replay can mistake it for an ordinary entry
+                // of the root and unlink an object whose capture never verified.
+                self.leftovers.push(LeftoverRecord {
+                    private,
+                    original: name.to_owned(),
+                    device: observed.device.get(),
+                    inode: observed.inode,
+                    kind: observed.kind.as_str().to_owned(),
+                    put_back: match put_back {
+                        PutBack::Taken => PutBackOutcome::Taken,
+                        PutBack::Renamed | PutBack::Failed => PutBackOutcome::Failed,
+                    },
+                    reason: bounded_reason(&reason),
+                });
+            }
             return Ok(Walk::Stop(stopped));
         }
         match observed.kind {
@@ -1142,20 +1265,27 @@ impl<'a> WalkState<'a> {
     ///
     /// Nothing is unlinked on this path. When the original name is taken the
     /// object stays under its private name and both names are reported, because
-    /// an operator has to decide which of the two should exist.
+    /// an operator has to decide which of the two should exist; that is the case
+    /// the caller records as an unverified leftover.
     fn put_back(
         &mut self,
         handle: &DirHandle,
         name: &str,
         private: &str,
         reason: &str,
-    ) -> Result<String> {
+    ) -> Result<(PutBack, String)> {
         match self.dirs.rename_child(handle, private, name)? {
-            RenameOutcome::Renamed => Ok(format!(
-                "`{name}` changed after its check, so it was put back under its own name and nothing was unlinked: {reason}"
+            RenameOutcome::Renamed => Ok((
+                PutBack::Renamed,
+                format!(
+                    "`{name}` changed after its check, so it was put back under its own name and nothing was unlinked: {reason}"
+                ),
             )),
-            RenameOutcome::TargetExists => Ok(format!(
-                "`{name}` changed after its check and its original name is taken, so it is kept under `{private}`; both names are kept: {reason}"
+            RenameOutcome::TargetExists => Ok((
+                PutBack::Taken,
+                format!(
+                    "`{name}` changed after its check and its original name is taken, so it is kept under `{private}`; both names are kept: {reason}"
+                ),
             )),
         }
     }
@@ -1237,13 +1367,15 @@ impl<'a> WalkState<'a> {
             if let Walk::Stop(reason) = self.classify_entry(&entry.name, &facts) {
                 return Ok(Walk::Stop(reason));
             }
+            if is_capture_name(&entry.name) {
+                // Nothing recorded the identity of the object under this private
+                // name for the walk to verify, so it is never captured again and
+                // never unlinked: it keeps the intent pending.
+                return Ok(Walk::Stop(self.leftover_stop(&entry.name)));
+            }
             let path = relative.join(&entry.name);
             let allowance = if self.expected.contains(&path) {
                 Allowance::Observed
-            } else if is_capture_name(&entry.name) {
-                // A private name a stopped deletion left behind: recognised so it
-                // can be re-verified, never unlinked on the strength of its name.
-                Allowance::Leftover
             } else if is_finder_metadata(&entry.name) && facts.kind == EntryKind::File {
                 Allowance::Finder
             } else {
@@ -1310,6 +1442,10 @@ impl<'a> WalkState<'a> {
 }
 
 /// Why one entry may be removed at all.
+///
+/// A private capture name is never on this list: nothing recorded the identity of
+/// the object under it for the walk to verify, so it is unverifiable and stops the
+/// deletion instead of being captured again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Allowance {
     /// The entry the classification pass recorded, verified against the
@@ -1318,9 +1454,6 @@ enum Allowance {
     /// Finder metadata that appeared after the classification, verified by class
     /// instead of by inode, because it has no recorded inode to match.
     Finder,
-    /// A private capture name a stopped deletion left behind, re-verified against
-    /// its own observation before anything is unlinked.
-    Leftover,
 }
 
 /// One capture's answer.
@@ -1340,15 +1473,32 @@ enum Verify {
     Mismatch(String),
 }
 
-/// Whether a name is one of Barge's own private capture names.
+/// What a put-back of one unverified capture answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PutBack {
+    /// The object is back under its original name.
+    Renamed,
+    /// The original name is taken, so the object stays under its private name.
+    Taken,
+    /// The put-back failed, so the object stays under its private name.
+    Failed,
+}
+
+/// One reason string bounded to what an intent record may hold.
 ///
-/// Only the form is recognised here; the object under it is still verified before
-/// anything unlinks it.
-fn is_capture_name(name: &str) -> bool {
-    let Some(nonce) = name.strip_prefix(CAPTURE_PREFIX) else {
-        return false;
-    };
-    nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+/// A reason that would not fit is truncated at a character boundary: the record
+/// says what happened in as much detail as it can, and the truncated form is never
+/// mistaken for the complete one because the stop's own reason is reported beside
+/// it.
+fn bounded_reason(reason: &str) -> String {
+    if reason.len() <= LEFTOVER_REASON_BYTES {
+        return reason.to_owned();
+    }
+    let mut end = LEFTOVER_REASON_BYTES;
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_owned()
 }
 
 /// Finder metadata is exactly Oxide's two forms: `.DS_Store`, or `._` followed
@@ -1595,6 +1745,7 @@ fn replay_one(
                 DeviceId::new(intent.device),
                 intent.mount_hint.clone(),
                 bounds,
+                &intent.leftovers,
             )?;
             walk.verify_volume()?;
             let mut counts = Counts::default();
@@ -1610,7 +1761,19 @@ fn replay_one(
                     state::advance_intent(&write, state_paths, intent, IntentPhase::Deleted)?;
                     Ok(ReplayOutcome::Settled)
                 }
-                Removal::Stopped(reason) => Ok(ReplayOutcome::Pending(reason)),
+                Removal::Stopped(reason) => {
+                    // The retry may have captured an object it could not put back;
+                    // record it before the pending answer is reported.
+                    if walk.leftovers.is_empty() {
+                        return Ok(ReplayOutcome::Pending(reason));
+                    }
+                    match state::record_leftovers(&write, state_paths, intent, &walk.leftovers) {
+                        Ok(_) => Ok(ReplayOutcome::Pending(reason)),
+                        Err(error) => Ok(ReplayOutcome::Pending(format!(
+                            "{reason}; the unverified capture could not be recorded: {error}"
+                        ))),
+                    }
+                }
             }
         }
         IntentPhase::Deleted => Ok(ReplayOutcome::Settled),
@@ -1883,6 +2046,7 @@ mod tests {
             generation: 1,
             recorded_ms: now,
             phase_ms: now,
+            leftovers: Vec::new(),
         };
         let mut locks = LockSet::new(prepared.fixture.state.clone());
         let _volume = locks
@@ -2362,6 +2526,73 @@ mod tests {
         assert!(Path::new(&report.quarantine).is_dir());
     }
 
+    /// The entries a racer test replaces, at three depths.
+    const RACED_ENTRIES: [&str; 4] = [
+        "payload.txt",
+        "second.txt",
+        "sub/nested.txt",
+        "sub/deep/item.bin",
+    ];
+
+    /// Find one name anywhere under `directory`.
+    ///
+    /// A raced entry whose parent the deletion captured is put back inside that
+    /// parent, which is itself held under a private name, so a test cannot assume
+    /// the entry stayed at the path it was planted at.
+    fn find_entry(directory: &Path, name: &str) -> Option<PathBuf> {
+        let mut nested = Vec::new();
+        for entry in std::fs::read_dir(directory).ok()?.flatten() {
+            if entry.file_name().to_string_lossy() == name {
+                return Some(entry.path());
+            }
+            if entry.path().is_dir() {
+                nested.push(entry.path());
+            }
+        }
+        nested
+            .iter()
+            .find_map(|directory| find_entry(directory, name))
+    }
+
+    /// The file name of one raced entry.
+    fn raced_name(raced: &str) -> &str {
+        raced.rsplit('/').next().unwrap_or(raced)
+    }
+
+    /// Plant the racer fixture's tree under `root`.
+    fn plant_tree(root: &Path, bytes: &[u8]) {
+        for name in RACED_ENTRIES {
+            VolumeFixture::payload(root, name, bytes);
+        }
+    }
+
+    /// The check-then-unlink-by-name walk this change replaces: it reads each
+    /// entry's facts and then removes it by name, which is exactly the race. It
+    /// exists only as the counterfactual a test runs.
+    fn check_then_unlink(
+        dirs: &Faults,
+        handle: &crate::os::DirHandle,
+        removed: &mut usize,
+    ) -> crate::error::Result<()> {
+        for entry in dirs.list_children(handle, 64)?.entries {
+            if entry.name == ROOT_MARKER_FILE {
+                continue;
+            }
+            let Some(facts) = dirs.child_facts(handle, &entry.name)? else {
+                continue;
+            };
+            if facts.kind == EntryKind::Directory {
+                let child = dirs.open_child_dir(handle, &entry.name)?;
+                check_then_unlink(dirs, &child, removed)?;
+            } else if dirs.remove_child(handle, &entry.name, RemoveKind::File)?
+                == ChildRemoval::Removed
+            {
+                *removed = removed.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
     /// The private capture names one directory holds: what a stopped deletion
     /// left behind, and what a put-back collision keeps beside the original name.
     fn capture_names(directory: &Path) -> Vec<PathBuf> {
@@ -2399,7 +2630,6 @@ mod tests {
         let report = prepared.delete(&faults, &facts);
         assert!(report.is_pending(), "{report:?}");
         assert_eq!(report.phase, IntentPhase::Renamed, "{report:?}");
-        assert_eq!(report.entries_removed, 0, "nothing was unlinked");
         assert!(!report.marker_removed, "the marker is kept");
         assert!(
             report
@@ -2522,6 +2752,28 @@ mod tests {
             foreign
         );
         assert!(leaf.join(ROOT_MARKER_FILE).is_file());
+
+        // The unverified capture is durable evidence: the private name, the name
+        // it came from, the observation it failed to match and why.
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1);
+        let recorded = &pending[0].leftovers;
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].original, "payload.txt");
+        assert_eq!(
+            recorded[0].private,
+            private[0]
+                .file_name()
+                .expect("a private name")
+                .to_str()
+                .expect("an ASCII name")
+        );
+        assert_eq!(recorded[0].kind, "file");
+        assert_eq!(recorded[0].put_back, state::PutBackOutcome::Taken);
+        assert!(
+            !recorded[0].reason.is_empty(),
+            "the record says why the capture did not verify"
+        );
     }
 
     #[test]
@@ -2579,7 +2831,10 @@ mod tests {
     }
 
     #[test]
-    fn replay_reverifies_and_removes_a_leftover_private_name() {
+    fn replay_never_unlinks_a_leftover_private_name_it_cannot_verify() {
+        // A private name is not an ordinary entry: nothing recorded the identity
+        // of the object under it for a replay to check, so the replay keeps it,
+        // reports it and leaves the intent pending.
         let prepared = prepared("replay-leftover-private");
         let root = prepared.observed.path.clone();
         VolumeFixture::payload(&root, "payload.txt", b"bytes");
@@ -2592,13 +2847,65 @@ mod tests {
         publish(&prepared, &[IntentPhase::Renamed, IntentPhase::MarkerLast]);
 
         let report = prepared.replay();
-        assert_eq!(report.settled, 1, "{report:?}");
-        assert!(report.is_settled());
-        assert!(!leaf.exists(), "the leaf is gone");
+        assert_eq!(report.settled, 0, "{report:?}");
+        assert_eq!(report.pending.len(), 1, "{report:?}");
         assert!(
-            !private.exists(),
-            "the leftover was re-verified and removed"
+            report.pending[0].reason.contains("unverifiable"),
+            "{:?}",
+            report.pending[0].reason
         );
+        assert!(private.is_file(), "the leftover is never unlinked");
+        assert!(leaf.is_dir(), "the intent stays pending with its leaf");
+        assert_eq!(prepared.pending_intents().len(), 1);
+    }
+
+    #[test]
+    fn replay_after_a_put_back_collision_keeps_the_foreign_object_and_the_intent() {
+        // The review's replay defect: a collision left a foreign object under a
+        // private name. A replay must not reclassify it as an ordinary owned entry
+        // and unlink it; it must keep it and stay pending.
+        let prepared = prepared("replay-after-collision");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"mine");
+        let foreign = b"the racer's object";
+        let faults = Faults::new();
+        faults.racing(&area, "payload.txt", 2, Replacement::File(foreign.to_vec()));
+        faults.occupying_after_capture(&area, "payload.txt");
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        let leaf = report.quarantine.clone();
+        let private = capture_names(&leaf);
+        assert_eq!(private.len(), 1);
+        assert_eq!(
+            std::fs::read(&private[0]).expect("the captured object is kept"),
+            foreign
+        );
+        let occupant = std::fs::read(leaf.join("payload.txt")).expect("the name that was taken");
+        assert_eq!(occupant, b"a racer took this name back");
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0].reason.contains("payload.txt"),
+            "the replay names the object it keeps: {:?}",
+            replay.pending[0].reason
+        );
+        assert_eq!(
+            std::fs::read(&private[0]).expect("the replay never unlinks the foreign object"),
+            foreign
+        );
+        assert_eq!(
+            std::fs::read(leaf.join("payload.txt")).expect("the occupant is kept too"),
+            occupant
+        );
+        assert!(leaf.join(ROOT_MARKER_FILE).is_file(), "the root is kept");
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1, "the intent stays pending");
+        assert_eq!(pending[0].leftovers.len(), 1);
     }
 
     #[test]
@@ -2639,72 +2946,145 @@ mod tests {
     }
 
     #[test]
-    fn the_old_check_then_unlink_removes_what_capture_verify_keeps() {
-        // The counterfactual: the same fixture and the same racer, once through a
-        // check-then-unlink-by-name helper and once through the deletion. The
-        // helper's check passes, the racer replaces the entry, and the unlink by
-        // name removes the racer's object; the deletion puts it back instead.
+    fn the_old_check_then_unlink_removes_every_raced_object_where_capture_verify_keeps_it() {
+        // The counterfactual: for every successive entry, the same fixture and the
+        // same racer, once through a check-then-unlink-by-name helper and once
+        // through the deletion. The helper's check passes, the racer replaces the
+        // entry, and the unlink by name removes the racer's object; the deletion
+        // puts it back instead.
         let foreign = b"the racer's object";
+        for (position, raced) in RACED_ENTRIES.iter().enumerate() {
+            let old = prepared(&format!("delete-counterfactual-old-{position}"));
+            let old_root = old.observed.path.clone();
+            plant_tree(&old_root, b"mine");
+            let old_dirs = Faults::new();
+            old_dirs.racing(&old_root, raced, 1, Replacement::File(foreign.to_vec()));
+            let handle = old_dirs.open_path(&old_root).expect("the root opens");
+            let mut removed = 0;
+            check_then_unlink(&old_dirs, &handle, &mut removed).expect("the old path runs");
+            assert!(
+                removed >= 1,
+                "the old path unlinked by name at position {position}"
+            );
+            assert!(
+                !old_root.join(raced).exists(),
+                "`{raced}` (the racer's object) is gone, which is the defect"
+            );
 
-        let old = prepared("delete-counterfactual-old");
-        let old_root = old.observed.path.clone();
-        VolumeFixture::payload(&old_root, "payload.txt", b"mine");
-        let old_dirs = Faults::new();
-        old_dirs.racing(
-            &old_root,
-            "payload.txt",
+            let new = prepared(&format!("delete-counterfactual-new-{position}"));
+            let new_root = new.observed.path.clone();
+            plant_tree(&new_root, b"mine");
+            let new_area = new_root.parent().expect("the area folder").to_path_buf();
+            let new_dirs = Faults::new();
+            new_dirs.racing(&new_area, raced, 2, Replacement::File(foreign.to_vec()));
+            let facts = new.fixture.facts();
+            let report = new.delete(&new_dirs, &facts);
+            assert!(report.is_pending(), "{report:?}");
+            let found = find_entry(&report.quarantine, raced_name(raced))
+                .expect("the racer's object survives");
+            assert_ne!(
+                std::fs::read(&found).expect("the racer's object reads"),
+                b"mine".to_vec(),
+                "position {position} keeps the object the old path removed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_racer_that_replaces_every_successive_entry_gets_nothing_foreign_removed() {
+        // The racer is registered for every entry, at three depths, and replaces
+        // each one after its own check. The first replacement is a mismatch, so
+        // the deletion stops: exactly one foreign object was created and it is
+        // still there, and nothing was unlinked.
+        let prepared = prepared("delete-racer-every-entry");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        plant_tree(&root, b"mine");
+        let faults = Faults::new();
+        let mut foreign: Vec<Vec<u8>> = Vec::new();
+        for (position, raced) in RACED_ENTRIES.iter().enumerate() {
+            let bytes = format!("the racer's object {position}").into_bytes();
+            faults.racing(&area, raced, 2, Replacement::File(bytes.clone()));
+            foreign.push(bytes);
+        }
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(report.phase, IntentPhase::Renamed, "{report:?}");
+        assert_eq!(report.entries_removed, 0, "nothing was unlinked");
+        assert!(!report.marker_removed, "the marker is kept");
+        let leaf = report.quarantine.clone();
+        let survivors: Vec<(&str, Vec<u8>)> = RACED_ENTRIES
+            .iter()
+            .map(|raced| {
+                let found = find_entry(&leaf, raced_name(raced))
+                    .expect("every entry is still there, under its own or a private parent");
+                let bytes = std::fs::read(&found).expect("every entry reads");
+                (*raced, bytes)
+            })
+            .collect();
+        let replaced: Vec<&str> = survivors
+            .iter()
+            .filter(|(_, bytes)| foreign.contains(bytes))
+            .map(|(raced, _)| *raced)
+            .collect();
+        assert_eq!(
+            replaced.len(),
             1,
-            Replacement::File(foreign.to_vec()),
+            "exactly one racer object was created, and it survived: {survivors:?}"
         );
-        let handle = old_dirs.open_path(&old_root).expect("the root opens");
-        let mut removed = 0;
-        for entry in old_dirs
-            .list_children(&handle, 16)
-            .expect("the root lists")
-            .entries
-        {
-            if entry.name == ROOT_MARKER_FILE {
-                continue;
-            }
-            let Some(facts) = old_dirs
-                .child_facts(&handle, &entry.name)
-                .expect("the entry is observed")
-            else {
-                continue;
-            };
-            if facts.kind == EntryKind::File
-                && old_dirs
-                    .remove_child(&handle, &entry.name, RemoveKind::File)
-                    .expect("the entry is removed")
-                    == ChildRemoval::Removed
-            {
-                removed += 1;
+        for (raced, bytes) in &survivors {
+            if *raced != replaced[0] {
+                assert_eq!(bytes, b"mine", "`{raced}` was never replaced");
             }
         }
-        assert_eq!(removed, 1, "the old path unlinked by name");
-        assert!(
-            !old_root.join("payload.txt").exists(),
-            "the racer's object is gone, which is the defect"
-        );
+        assert!(leaf.join(ROOT_MARKER_FILE).is_file(), "the root is kept");
+        assert_eq!(prepared.pending_intents().len(), 1);
+    }
 
-        let new = prepared("delete-counterfactual-new");
-        let new_root = new.observed.path.clone();
-        VolumeFixture::payload(&new_root, "payload.txt", b"mine");
-        let new_area = new_root.parent().expect("the area folder").to_path_buf();
-        let new_dirs = Faults::new();
-        new_dirs.racing(
-            &new_area,
-            "payload.txt",
-            2,
-            Replacement::File(foreign.to_vec()),
-        );
-        let facts = new.fixture.facts();
-        let report = new.delete(&new_dirs, &facts);
-        assert!(report.is_pending(), "{report:?}");
-        assert_eq!(
-            std::fs::read(report.quarantine.join("payload.txt"))
-                .expect("the racer's object survives"),
-            foreign
-        );
+    #[test]
+    fn every_successive_entry_a_racer_replaces_is_kept_and_stops_the_delete() {
+        // Each position in turn is the entry the racer replaces after its check:
+        // the deletion stops there with the intent pending and the object stays
+        // under its original name. No position lets a foreign object be unlinked.
+        for (position, raced) in RACED_ENTRIES.iter().enumerate() {
+            let prepared = prepared(&format!("delete-racer-successive-{position}"));
+            let root = prepared.observed.path.clone();
+            let area = root.parent().expect("the area folder").to_path_buf();
+            plant_tree(&root, b"mine");
+            let foreign = format!("the racer's object at {position}").into_bytes();
+            let faults = Faults::new();
+            faults.racing(&area, raced, 2, Replacement::File(foreign.clone()));
+            let facts = prepared.fixture.facts();
+            let report = prepared.delete(&faults, &facts);
+            assert!(report.is_pending(), "position {position}: {report:?}");
+            let leaf = report.quarantine.clone();
+            let found = find_entry(&leaf, raced_name(raced))
+                .expect("the racer's object survives under its own or its parent's private name");
+            assert_eq!(
+                std::fs::read(&found).expect("the racer's object reads"),
+                foreign,
+                "position {position} keeps the object it replaced"
+            );
+            for other in RACED_ENTRIES.iter().filter(|other| *other != raced) {
+                if let Some(path) = find_entry(&leaf, raced_name(other)) {
+                    let bytes = std::fs::read(&path).expect("the entry reads");
+                    assert_eq!(
+                        bytes,
+                        b"mine".to_vec(),
+                        "position {position}: `{other}` is either verified or untouched, never foreign"
+                    );
+                }
+            }
+            assert!(
+                leaf.join(ROOT_MARKER_FILE).is_file(),
+                "position {position} keeps the marker"
+            );
+            assert_eq!(
+                prepared.pending_intents().len(),
+                1,
+                "position {position} leaves one pending intent"
+            );
+        }
     }
 }

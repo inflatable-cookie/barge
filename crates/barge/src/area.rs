@@ -4507,8 +4507,8 @@ mod tests {
 
     #[test]
     fn a_fixture_volume_never_writes_to_a_real_drive() {
-        // The whole module's fixtures live under this process's temporary
-        // directory; this asserts the path the walk used is inside it.
+        // The whole module's fixtures live inside a fresh task-owned `run.*` root
+        // under the scratch base; this asserts the path the walk used is inside it.
         let fixture = Fixture::new("root-scratch");
         let declaration = fixture.declaration("example/pool");
         let (root, _) = fixture.create_root(&fixture.record, &declaration);
@@ -4518,8 +4518,8 @@ mod tests {
             root.path.display()
         );
         assert!(
-            root.path.starts_with(std::env::temp_dir()),
-            "{} is under the process temporary directory",
+            root.path.starts_with(crate::testkit::scratch_base()),
+            "{} is inside the task-owned scratch root",
             root.path.display()
         );
     }

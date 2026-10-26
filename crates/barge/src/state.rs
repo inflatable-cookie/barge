@@ -985,7 +985,9 @@ impl IntentPhase {
 ///
 /// The record never states a conclusion about data it has not observed. A replay
 /// resolves it only from the recorded device, inode and marker digest, which is
-/// why they are recorded before the first effect.
+/// why they are recorded before the first effect. It also carries the captured
+/// objects the deletion could not put back, so a replay never mistakes one of
+/// them for an ordinary entry it may delete.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IntentRecord {
@@ -1023,6 +1025,10 @@ pub struct IntentRecord {
     pub recorded_ms: u64,
     /// When this phase was written.
     pub phase_ms: u64,
+    /// The captured objects a deletion could not put back, so a replay keeps them
+    /// and the intent pending instead of unlinking them as ordinary entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leftovers: Vec<LeftoverRecord>,
 }
 
 impl IntentRecord {
@@ -1094,12 +1100,127 @@ impl IntentRecord {
             )
             .with_detail("intent_id", self.intent_id.clone().into()));
         }
+        if self.leftovers.len() > INTENT_LEFTOVERS {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("the intent records more than {INTENT_LEFTOVERS} unverified captures"),
+            )
+            .with_detail("intent_id", self.intent_id.clone().into()));
+        }
+        for leftover in &self.leftovers {
+            leftover.validate()?;
+        }
         Ok(())
     }
 }
 
 /// The quarantine leaf's name prefix: `.barge-prune-<intent-id>`.
 pub const QUARANTINE_PREFIX: &str = ".barge-prune-";
+
+/// The private name one entry is held under between its capture and its unlink:
+/// `.barge-del-<128-bit nonce>`.
+pub const CAPTURE_PREFIX: &str = ".barge-del-";
+
+/// How many unverified captures one intent records.
+///
+/// A deletion stops at the first one, so a run adds at most one; the bound keeps
+/// repeated runs' evidence from growing the record without limit.
+pub const INTENT_LEFTOVERS: usize = 4;
+
+/// The longest reason one unverified-capture record keeps, in bytes.
+pub const LEFTOVER_REASON_BYTES: usize = 160;
+
+/// Whether a name is one of Barge's private capture names.
+///
+/// Only the form is recognised: the object under it is still verified before
+/// anything unlinks it, and a private name a replay did not create itself is
+/// never unlinked at all.
+pub fn is_capture_name(name: &str) -> bool {
+    let Some(nonce) = name.strip_prefix(CAPTURE_PREFIX) else {
+        return false;
+    };
+    nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// What a deletion's put-back of one unverified capture answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PutBackOutcome {
+    /// The original name was taken, so the object stays under its private name.
+    Taken,
+    /// The put-back could not be attempted or failed, so the object stays too.
+    Failed,
+}
+
+/// One captured object a deletion could not put back.
+///
+/// It records the private name that holds the object, the name it was captured
+/// from and the observation its capture failed to match, so a replay can say
+/// what is there and why, and so it never unlinks that object as if it were an
+/// ordinary entry of the root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeftoverRecord {
+    /// The private `.barge-del-<nonce>` name the object is held under.
+    pub private: String,
+    /// The name the object was captured from.
+    pub original: String,
+    /// The device the failed observation reported.
+    pub device: u64,
+    /// The inode the failed observation reported.
+    pub inode: u64,
+    /// The kind the failed observation reported: `file` or `directory`.
+    pub kind: String,
+    /// What the put-back attempt answered.
+    pub put_back: PutBackOutcome,
+    /// Why the captured object was not verified, bounded.
+    pub reason: String,
+}
+
+impl LeftoverRecord {
+    /// Validate every recorded fact strictly.
+    pub fn validate(&self) -> Result<()> {
+        if !is_capture_name(&self.private) {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "`{}` is not a private `{CAPTURE_PREFIX}<nonce>` name",
+                    self.private
+                ),
+            )
+            .with_detail("private", self.private.clone().into()));
+        }
+        if self.original.is_empty()
+            || self.original.len() > 255
+            || self.original == "."
+            || self.original == ".."
+            || self.original.contains('/')
+        {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "an unverified capture does not record one entry name".to_owned(),
+            )
+            .with_detail("private", self.private.clone().into()));
+        }
+        if self.kind != "file" && self.kind != "directory" {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("an unverified capture records the kind `{}`", self.kind),
+            )
+            .with_detail("private", self.private.clone().into()));
+        }
+        if self.reason.is_empty() || self.reason.len() > LEFTOVER_REASON_BYTES {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "an unverified capture's reason must be 1 to {LEFTOVER_REASON_BYTES} bytes"
+                ),
+            )
+            .with_detail("private", self.private.clone().into()));
+        }
+        Ok(())
+    }
+}
 
 fn is_hex(value: &str, length: usize) -> bool {
     value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -1193,6 +1314,43 @@ pub fn advance_intent(
     }
     let mut next = record.clone();
     next.phase = phase;
+    next.generation = record.generation.saturating_add(1);
+    next.phase_ms = now_ms().max(record.phase_ms);
+    publish_intent(write, state, &next)?;
+    Ok(next)
+}
+
+/// Record the captured objects a deletion could not put back.
+///
+/// The record names the private names a replay must never unlink, with the
+/// observation each capture failed to match. The phase does not change, but the
+/// generation still increases, so a stale writer cannot drop a record it raced.
+/// A caller that records a leftover stops the deletion, so no phase advances on a
+/// record it has not read back.
+pub fn record_leftovers(
+    write: &IntentWrite,
+    state: &StatePaths,
+    record: &IntentRecord,
+    leftovers: &[LeftoverRecord],
+) -> Result<IntentRecord> {
+    let mut next = record.clone();
+    for leftover in leftovers {
+        if next
+            .leftovers
+            .iter()
+            .any(|held| held.private == leftover.private)
+        {
+            continue;
+        }
+        next.leftovers.push(leftover.clone());
+    }
+    if next.leftovers.len() > INTENT_LEFTOVERS {
+        return Err(Error::new(
+            ErrorKind::ResourceBound,
+            format!("the intent would record more than {INTENT_LEFTOVERS} unverified captures"),
+        )
+        .with_detail("intent_id", record.intent_id.clone().into()));
+    }
     next.generation = record.generation.saturating_add(1);
     next.phase_ms = now_ms().max(record.phase_ms);
     publish_intent(write, state, &next)?;
@@ -1742,8 +1900,9 @@ mod intent_tests {
     use std::path::PathBuf;
 
     use super::{
-        advance_intent, publish_intent, read_intent, read_intents, IntentPhase, IntentRecord,
-        LockSet, StatePaths, QUARANTINE_PREFIX,
+        advance_intent, publish_intent, read_intent, read_intents, record_leftovers, IntentPhase,
+        IntentRecord, LeftoverRecord, LockSet, PutBackOutcome, StatePaths, CAPTURE_PREFIX,
+        INTENT_LEFTOVERS, QUARANTINE_PREFIX,
     };
     use crate::error::ErrorKind;
     use crate::os::VolumeUuid;
@@ -1785,6 +1944,7 @@ mod intent_tests {
             generation: 1,
             recorded_ms: now,
             phase_ms: now,
+            leftovers: Vec::new(),
         }
     }
 
@@ -1846,6 +2006,100 @@ mod intent_tests {
 
         let error = read_intents(&state, 64).expect_err("an unknown field is refused");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
+    }
+
+    fn leftover(original: &str, nonce: u8) -> LeftoverRecord {
+        LeftoverRecord {
+            private: format!("{CAPTURE_PREFIX}{}", format!("{nonce:02x}").repeat(16)),
+            original: original.to_owned(),
+            device: 16_777_219,
+            inode: 4_242,
+            kind: "file".to_owned(),
+            put_back: PutBackOutcome::Taken,
+            reason: "the captured object is not the observed one".to_owned(),
+        }
+    }
+
+    #[test]
+    fn an_unverified_capture_is_recorded_once_and_bounded() {
+        let (_dir, state, uuid) = fixture("intent-leftovers");
+        let intent = record(&uuid);
+        let mut locks = LockSet::new(state.clone());
+        let _volume = locks.lock_volume(&uuid).expect("the volume lock");
+        let _root = locks.lock_root(&intent.root_id).expect("the root lock");
+        let write = locks.begin_intent_write().expect("the intent step");
+        publish_intent(&write, &state, &intent).expect("the intent publishes");
+
+        let first = record_leftovers(&write, &state, &intent, &[leftover("payload.txt", 1)])
+            .expect("the leftover is recorded");
+        assert_eq!(first.generation, intent.generation + 1);
+        assert_eq!(
+            first.phase,
+            IntentPhase::Intent,
+            "the phase does not change"
+        );
+        let read = read_intent(&state, &intent.intent_id).expect("the intent reads back");
+        assert_eq!(read.leftovers.len(), 1);
+        assert_eq!(read.leftovers[0].original, "payload.txt");
+
+        // The same capture recorded again is not duplicated, and a different one
+        // is added.
+        let again = record_leftovers(&write, &state, &read, &[leftover("payload.txt", 1)])
+            .expect("the same leftover is recorded again");
+        assert_eq!(again.leftovers.len(), 1);
+        let two = record_leftovers(&write, &state, &again, &[leftover("second.txt", 2)])
+            .expect("a second leftover is recorded");
+        assert_eq!(two.leftovers.len(), 2);
+
+        // The record is bounded, and a record over the bound is refused rather
+        // than quietly dropped.
+        let mut held = two;
+        for index in 0..INTENT_LEFTOVERS {
+            let next = leftover(&format!("entry-{index}.txt"), 3 + index as u8);
+            if held.leftovers.len() == INTENT_LEFTOVERS {
+                let refused = record_leftovers(&write, &state, &held, &[next])
+                    .expect_err("a record over the bound is refused");
+                assert_eq!(refused.kind(), ErrorKind::ResourceBound);
+                break;
+            }
+            held =
+                record_leftovers(&write, &state, &held, &[next]).expect("the leftover is recorded");
+        }
+    }
+
+    #[test]
+    fn a_leftover_record_that_does_not_validate_is_unknown_state() {
+        let (_dir, state, uuid) = fixture("intent-leftover-invalid");
+        let intent = record(&uuid);
+        let base = super::intent_path(&state, &intent.intent_id).expect("the path");
+
+        let mut cases: Vec<(&str, LeftoverRecord)> = Vec::new();
+        let mut not_private = leftover("payload.txt", 1);
+        not_private.private = ".barge-prune-x".to_owned();
+        cases.push(("a private name", not_private));
+        let mut not_one_name = leftover("payload.txt", 2);
+        not_one_name.original = "sub/name".to_owned();
+        cases.push(("one entry name", not_one_name));
+        let mut wrong_kind = leftover("payload.txt", 3);
+        wrong_kind.kind = "symlink".to_owned();
+        cases.push(("a kind", wrong_kind));
+        let mut long_reason = leftover("payload.txt", 4);
+        long_reason.reason = "x".repeat(super::LEFTOVER_REASON_BYTES + 1);
+        cases.push(("a reason", long_reason));
+
+        for (label, bad) in cases {
+            let mut record = intent.clone();
+            record.leftovers = vec![bad];
+            let mut value = serde_json::to_value(&record).expect("the record encodes");
+            value["schema"] = serde_json::Value::String(crate::contract::INTENT_SCHEMA.to_owned());
+            std::fs::write(
+                &base,
+                serde_json::to_vec_pretty(&value).expect("the record encodes"),
+            )
+            .expect("the record is written");
+            let error = read_intent(&state, &intent.intent_id).expect_err(label);
+            assert_eq!(error.kind(), ErrorKind::UnknownState, "{label}");
+        }
     }
 
     #[test]
