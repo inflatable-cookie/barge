@@ -36,6 +36,14 @@ SUPERVISOR = "scripts/bounded-test.py"
 # The qualified supervisor's bytes at this proof's authoring head.
 SUPERVISOR_SHA256 = "bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924"
 IMAGE_MIB = 128
+# The owned image's two invocations, so the code and the self-check cannot drift
+# apart. `hdiutil create` does not accept `-owners`; ownership is enabled when
+# the image is attached, which is the only place the option exists.
+CREATE_IMAGE_OPTIONS = [
+    "-size", f"{IMAGE_MIB}m", "-fs", "APFS", "-type", "SPARSE",
+    "-volname", "barge-proof-scratch",
+]
+ATTACH_OPTIONS = ["-nobrowse", "-owners", "on"]
 WALL_MS = 300_000
 SCRATCH_MIB = 512
 NATIVE_AGE_DAYS = 7
@@ -163,21 +171,11 @@ class Proof:
         self.create_image()
 
     def create_image(self):
-        run(
-            [
-                "hdiutil", "create", "-size", f"{IMAGE_MIB}m", "-fs", "APFS",
-                "-type", "SPARSE", "-volname", "barge-proof-scratch",
-                "-owners", "on", self.image,
-            ],
-            self.env,
-        )
+        run(["hdiutil", "create", *CREATE_IMAGE_OPTIONS, self.image], self.env)
         name = f"barge-proof-{os.getpid()}-{int(time.time()) % 100000}"
         self.mount = f"/Volumes/{name}"
         run(
-            [
-                "hdiutil", "attach", self.image, "-mountpoint", self.mount,
-                "-nobrowse", "-owners", "on",
-            ],
+            ["hdiutil", "attach", self.image, "-mountpoint", self.mount, *ATTACH_OPTIONS],
             self.env,
         )
         self.attached = True
@@ -685,8 +683,11 @@ class Proof:
     def reattach(self):
         if self.attached:
             return
-        run(["hdiutil", "attach", self.image, "-mountpoint", self.mount,
-             "-nobrowse", "-owners", "on"], self.env, timeout=180)
+        run(
+            ["hdiutil", "attach", self.image, "-mountpoint", self.mount, *ATTACH_OPTIONS],
+            self.env,
+            timeout=180,
+        )
         self.attached = True
 
     def detach(self):
@@ -805,6 +806,28 @@ def self_check():
             problems.append(f"`{attribute}` is a case method the map never dispatches")
     if not SUPERVISOR_SHA256 or len(SUPERVISOR_SHA256) != 64:
         problems.append("the supervisor digest is not a SHA-256")
+    # The owned image's invocations: `hdiutil create` rejects `-owners`, and the
+    # attach must enable ownership. Both are asserted on the option lists the
+    # proof actually runs, not on a copy of them.
+    if "-owners" in CREATE_IMAGE_OPTIONS:
+        problems.append("`hdiutil create` is given `-owners`, which it does not accept")
+    for flag, value in (("-fs", "APFS"), ("-type", "SPARSE")):
+        if CREATE_IMAGE_OPTIONS.count(flag) != 1 or CREATE_IMAGE_OPTIONS.count(value) != 1:
+            problems.append(f"the create invocation no longer declares {flag} {value}")
+        else:
+            index = CREATE_IMAGE_OPTIONS.index(flag)
+            if CREATE_IMAGE_OPTIONS[index + 1] != value:
+                problems.append(f"the create invocation's {flag} is not {value}")
+    if f"{IMAGE_MIB}m" not in CREATE_IMAGE_OPTIONS or IMAGE_MIB > 128:
+        problems.append("the create invocation's size is not the bounded 128 MiB")
+    if CREATE_IMAGE_OPTIONS[-2:] != ["-volname", "barge-proof-scratch"]:
+        problems.append("the create invocation's volume name changed")
+    if ATTACH_OPTIONS.count("-owners") != 1:
+        problems.append("the attach does not enable ownership exactly once")
+    else:
+        index = ATTACH_OPTIONS.index("-owners")
+        if index + 1 >= len(ATTACH_OPTIONS) or ATTACH_OPTIONS[index + 1] != "on":
+            problems.append("the attach's `-owners` is not followed by `on`")
     if len(PREMISES) != 9:
         problems.append("the premise record does not name nine premises")
     for hook in ("TMPDIR", "BARGE_STATE_DIR", "BARGE_PROOF_BIN", "HOME", "CARGO_HOME"):
@@ -834,6 +857,11 @@ def main(argv):
             "schema": "barge.scratch.expiry.native.self-check/1",
             "cases": [name for name, _ in CASES],
             "dispatch": {name: f"case_{name}" for name, _ in CASES},
+            "image": {
+                "create": ["hdiutil", "create", *CREATE_IMAGE_OPTIONS, "<image>"],
+                "attach": ["hdiutil", "attach", "<image>", "-mountpoint", "<mount>",
+                           *ATTACH_OPTIONS],
+            },
             "premises": len(PREMISES),
             "supervisor_sha256": SUPERVISOR_SHA256,
             "problems": problems,
