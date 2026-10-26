@@ -34,6 +34,10 @@ pub const DESCRIBE_SCHEMA: &str = "barge.describe/1";
 pub const DESCRIBE_SCHEMA_PREFIX: &str = "barge.describe/";
 /// The error document's schema string.
 pub const ERROR_SCHEMA: &str = "barge.error/1";
+/// The inspect document's schema string.
+pub const INSPECT_SCHEMA: &str = "barge.inspect/1";
+/// The prefix every major of the inspect document shares.
+pub const INSPECT_SCHEMA_PREFIX: &str = "barge.inspect/";
 /// The account volume registry's format (written from slice S2).
 pub const REGISTRY_SCHEMA: &str = "barge.registry/1";
 /// One area declaration's format.

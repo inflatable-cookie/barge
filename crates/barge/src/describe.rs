@@ -1,15 +1,20 @@
-//! The versioned documents the library and CLI return, starting with
-//! `barge.describe/1` (stage 1 design, "Versioned JSON and error contract").
+//! The versioned documents the library and CLI return: `barge.describe/1` and
+//! `barge.inspect/1` (stage 1 design, "Versioned JSON and error contract").
 //!
-//! `describe` reports what Barge knows and nothing else: it resolves the account
-//! state directory, says whether it is initialized, and reports every registered
-//! volume, declared area, placement and foreign observation. It performs no
-//! mutation and takes no lock. Slice S1 has no registry yet, so the four lists
-//! are empty and carry the row-cap shape a later slice fills; the document's
-//! reader is already strict, so a consumer written against it keeps working
-//! when rows arrive.
+//! `describe` reports what Barge knows: the account state directory and whether
+//! it is initialized, every registered volume from the registry, and every
+//! foreign observation with its source and version. It performs no mutation and
+//! takes only a shared registry lock, and it refuses an invalid registry rather
+//! than reporting an empty one — a silently short list would read as "no
+//! volumes".
 //!
-//! The reader refuses an unknown major, a document over the size cap, an
+//! `inspect` is the read-only diagnostic over the same facts: it reports the
+//! state directory, the registry as absent, valid or invalid with the reason, and
+//! Oxide's observations in full, including the volume an import would describe.
+//! It creates no file, directory or lock, so it is safe against a host whose
+//! authority is not initialized.
+//!
+//! Both readers refuse an unknown major, a document over the size cap, an
 //! unknown command and any missing or mistyped required field. An extra field is
 //! accepted, because within a major version a new optional field is a compatible
 //! addition — reading is strict about what it requires, not about what it may
@@ -21,20 +26,33 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::inspect::{ObservationRow, ObservationState};
+pub use crate::registry::{Availability, Durability, FolderOverrides, RecordOrigin};
+pub use crate::state::StateDirSource;
+
 use crate::contract::{
     parse_document, FormatVersions, RowSet, DESCRIBE_SCHEMA, DESCRIBE_SCHEMA_PREFIX,
+    INSPECT_SCHEMA, INSPECT_SCHEMA_PREFIX, OBSERVATION_ROWS, VOLUME_ROWS,
 };
 use crate::error::{Error, ErrorKind, Result};
+use crate::inspect::{
+    self, Observation, ObservedVolume, OxideObservations, OxideRegistration, OXIDE_POOL_ROWS,
+};
 use crate::os::AccountFacts;
+use crate::registry::{self, Registry, VolumeRecord};
+use crate::state::{LockSet, StatePaths};
 
-/// The command name this document belongs to.
+/// The command name the describe document belongs to.
 pub const DESCRIBE_COMMAND: &str = "describe";
+
+/// The command name the inspect document belongs to.
+pub const INSPECT_COMMAND: &str = "inspect";
 
 /// The tool name a document reports.
 pub const TOOL_NAME: &str = "barge";
 
 /// What `describe` reads. The caller supplies the platform's account facts and
-/// the environment it was given; nothing is created, locked or written.
+/// the environment it was given; nothing is created or written.
 pub struct DescribeRequest<'a> {
     /// The platform's account facts. The account home comes from here, never
     /// from the environment.
@@ -61,6 +79,30 @@ impl fmt::Debug for DescribeRequest<'_> {
     }
 }
 
+/// What `inspect` reads: the same account facts and environment, and nothing
+/// else.
+pub struct InspectRequest<'a> {
+    /// The platform's account facts.
+    pub account: &'a dyn AccountFacts,
+    /// The environment's `HOME`, reported beside the account home.
+    pub environment_home: Option<&'a Path>,
+    /// `BARGE_STATE_DIR`, the fixture-only override.
+    pub state_dir_override: Option<&'a Path>,
+    /// The tool version the document reports.
+    pub tool_version: &'a str,
+}
+
+impl fmt::Debug for InspectRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InspectRequest")
+            .field("environment_home", &self.environment_home)
+            .field("state_dir_override", &self.state_dir_override)
+            .field("tool_version", &self.tool_version)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The `data` of `barge.describe/1`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DescribeData {
@@ -80,6 +122,23 @@ pub struct DescribeData {
     pub observations: RowSet<ObservationRow>,
 }
 
+/// The `data` of `barge.inspect/1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectData {
+    /// The tool that produced the document.
+    pub tool: ToolVersions,
+    /// Every format version this build speaks.
+    pub formats: FormatVersions,
+    /// The account state directory and whether it is initialized.
+    pub state: StateReport,
+    /// The registry as it was found, with the volumes it holds.
+    pub registry: RegistryReport,
+    /// Foreign observations, bounded to the observation row cap.
+    pub observations: RowSet<ObservationRow>,
+    /// Oxide's observations in full.
+    pub oxide: OxideReport,
+}
+
 /// The tool that produced a document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolVersions {
@@ -89,28 +148,18 @@ pub struct ToolVersions {
     pub version: String,
 }
 
-/// The account state directory, as `describe` reports it.
+/// The account state directory, as the documents report it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateReport {
     /// The state directory path, as resolved. It is not canonicalised: the path
-    /// may not exist yet, and `describe` creates nothing.
+    /// may not exist yet, and a read-only command creates nothing.
     pub dir: PathBuf,
-    /// Whether the state directory exists as a directory. S1 never creates it.
+    /// Whether the state directory exists as a directory.
     pub initialized: bool,
     /// Where the path came from.
     pub source: StateDirSource,
     /// The account home and the environment's own, so a mismatch is visible.
     pub home: HomeReport,
-}
-
-/// Where the state directory path came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StateDirSource {
-    /// The platform's account state root.
-    Account,
-    /// `BARGE_STATE_DIR`, which exists for fixtures and proofs only.
-    EnvironmentOverride,
 }
 
 /// The account home, and the environment's `HOME` when it differs.
@@ -124,8 +173,10 @@ pub struct HomeReport {
     pub mismatch: bool,
 }
 
-/// One registered volume, as `describe` reports it (stage 1 design, "Registry of
-/// volumes"). Slice S2 fills these rows; S1 reports an empty list.
+/// One registered volume, as the documents report it.
+///
+/// It projects the fields the design names for `describe`; the record's own
+/// `scratch_grants`, `generation` and `registered_ms` stay in the registry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeRow {
     /// The APFS volume UUID from the kernel: the identity that matters.
@@ -146,45 +197,19 @@ pub struct VolumeRow {
     pub origin: RecordOrigin,
 }
 
-/// A volume's availability (stage 1 design, "Volume modes").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Availability {
-    /// Always attached; absence is abnormal.
-    Permanent,
-    /// Attached on and off; absence is normal.
-    Ephemeral,
-}
-
-/// A volume's durability (stage 1 design, "Volume modes").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Durability {
-    /// Rebuildable data Barge may prune.
-    Expendable,
-    /// Data that lives only on that volume and is never pruned.
-    Kept,
-    /// An imported record that does not say; never treated as expendable.
-    Undeclared,
-}
-
-/// Barge's own folder overrides for one volume.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FolderOverrides {
-    /// The per-volume `scratch/` override, relative to `root_dir`.
-    pub scratch: Option<String>,
-    /// The per-volume `caches/` override, relative to `root_dir`.
-    pub caches: Option<String>,
-}
-
-/// Where a volume record came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecordOrigin {
-    /// An operator declared it.
-    Declared,
-    /// Imported from Oxide's registration, read-only.
-    ObservedOxide,
+impl VolumeRow {
+    /// Project one registry record into the document's row shape.
+    pub fn from_record(record: &VolumeRecord) -> Self {
+        Self {
+            volume_uuid: record.volume_uuid.as_str().to_owned(),
+            mount_hint: record.mount_hint.clone(),
+            availability: record.availability,
+            durability: record.durability,
+            root_dir: record.root_dir.clone(),
+            folders: record.folders.clone(),
+            origin: record.origin,
+        }
+    }
 }
 
 /// One declared consumer area, as `describe` reports it (stage 1 design,
@@ -262,51 +287,96 @@ pub enum AbsentPolicy {
     FallbackLocal,
 }
 
-/// One foreign observation: someone else's state, read and reported, never
-/// authoritative (stage 1 design, "Read-only inspection versus authoritative
-/// writes"). Slice S2 fills these rows.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObservationRow {
-    /// The source family, for example `oxide.removable`.
-    pub source: String,
-    /// The version the source states.
-    pub version: String,
-    /// The file that was read.
-    pub path: PathBuf,
-    /// Whether the observation was reported or is unknown state.
-    pub state: ObservationState,
-    /// Why the observation is unknown, when it is.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
-
-/// How a foreign observation came out.
+/// How the registry was found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ObservationState {
-    /// Read and valid for its stated version.
-    Reported,
-    /// Unreadable, oversized, unknown-version or schema-divergent; never a
-    /// default.
-    UnknownState,
+pub enum RegistryReportState {
+    /// There is no registry file, so no volume is registered.
+    Absent,
+    /// The registry validated.
+    Valid,
+    /// The registry is there but did not validate; nothing was changed.
+    Invalid,
+}
+
+/// The registry as `inspect` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryReport {
+    /// The registry file that was looked at.
+    pub path: PathBuf,
+    /// Absent, valid or invalid.
+    pub state: RegistryReportState,
+    /// Why the registry is invalid, when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The registered volumes, bounded to the volume row cap. Empty unless the
+    /// registry validated.
+    pub volumes: RowSet<VolumeRow>,
+}
+
+/// Oxide's observations as `inspect` reports them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OxideReport {
+    /// The removable-volume registration.
+    pub registration: RegistrationReport,
+    /// The informational pools record.
+    pub pools: PoolsReport,
+}
+
+/// One foreign registration as `inspect` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistrationReport {
+    /// The file that was read or looked at.
+    pub path: PathBuf,
+    /// Whether it was reported, absent or unknown.
+    pub state: ObservationState,
+    /// Why it is absent or unknown, when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The facts it states, when it was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facts: Option<OxideRegistration>,
+    /// The volume it describes, as an observation and never as authority.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_volume: Option<ObservedVolume>,
+    /// Every registration path that was looked at, in order.
+    pub searched: Vec<PathBuf>,
+}
+
+/// Oxide's pools record as `inspect` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolsReport {
+    /// The file that was read or looked at.
+    pub path: PathBuf,
+    /// Whether it was reported, absent or unknown.
+    pub state: ObservationState,
+    /// Why it is absent or unknown, when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The pool paths it names, bounded to Oxide's own row cap.
+    pub paths: RowSet<PathBuf>,
 }
 
 /// Build the `barge.describe/1` data.
 ///
-/// No file, directory or lock is created: the state directory is inspected with
-/// one metadata read, and every list is empty until a later slice has records to
-/// report.
+/// No file, directory or lock is created: the state directory is inspected, the
+/// registry is read under a shared lock when its lock file already exists, and
+/// Oxide's records are read. An invalid registry is refused, naming the file,
+/// because reporting no volumes would read as "none registered".
 pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
-    let account_home = request.account.account_home()?;
-    let (state_dir, source) = match request.state_dir_override {
-        Some(path) => (path.to_path_buf(), StateDirSource::EnvironmentOverride),
-        None => (request.account.state_root()?, StateDirSource::Account),
-    };
-    let initialized = state_directory_is_initialized(&state_dir)?;
-    let environment_home = request.environment_home.map(Path::to_path_buf);
-    let mismatch = environment_home
-        .as_ref()
-        .is_some_and(|home| home != &account_home);
+    let paths = StatePaths::resolve(request.account, request.state_dir_override)?;
+    let state = state_report(request.account, request.environment_home, &paths)?;
+    let registry = read_registry_observed(&paths)?;
+    let observations = inspect::observe_oxide(request.account)?;
+
+    let volume_rows: Vec<VolumeRow> = registry
+        .volumes()
+        .iter()
+        .map(VolumeRow::from_record)
+        .collect();
+    let volume_total = volume_rows.len();
+    let observation_rows = observations.rows().to_vec();
+    let observation_total = observation_rows.len();
 
     Ok(DescribeData {
         tool: ToolVersions {
@@ -314,37 +384,156 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
             version: request.tool_version.to_owned(),
         },
         formats: FormatVersions::current(),
-        state: StateReport {
-            dir: state_dir,
-            initialized,
-            source,
-            home: HomeReport {
-                account: account_home,
-                environment: environment_home,
-                mismatch,
-            },
-        },
-        volumes: RowSet::empty(),
+        state,
+        volumes: RowSet::bounded(volume_rows, volume_total, VOLUME_ROWS),
         areas: RowSet::empty(),
         placements: RowSet::empty(),
-        observations: RowSet::empty(),
+        observations: RowSet::bounded(observation_rows, observation_total, OBSERVATION_ROWS),
     })
 }
 
-/// Whether the state directory exists as a directory. An unreadable path or a
-/// non-directory at that path is unknown state, never "not initialized".
-fn state_directory_is_initialized(path: &Path) -> Result<bool> {
-    match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_dir() => Ok(true),
-        Ok(_) => Err(unknown(format!(
-            "the state directory path {} is not a directory",
-            path.display()
-        ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(unknown(format!(
-            "the state directory {} could not be read: {error}",
-            path.display()
-        ))),
+/// Build the `barge.inspect/1` data.
+///
+/// Like `describe` it creates nothing and takes only a shared lock. Unlike
+/// `describe` an invalid registry is not a failure here: diagnosing it is the
+/// point, so the report says `invalid` and names the file.
+pub fn inspect(request: &InspectRequest<'_>) -> Result<InspectData> {
+    let paths = StatePaths::resolve(request.account, request.state_dir_override)?;
+    let state = state_report(request.account, request.environment_home, &paths)?;
+    let registry = registry_report(&paths)?;
+    let observations = inspect::observe_oxide(request.account)?;
+    let rows = observations.rows().to_vec();
+    let total = rows.len();
+    Ok(InspectData {
+        tool: ToolVersions {
+            name: TOOL_NAME.to_owned(),
+            version: request.tool_version.to_owned(),
+        },
+        formats: FormatVersions::current(),
+        state,
+        registry,
+        observations: RowSet::bounded(rows, total, OBSERVATION_ROWS),
+        oxide: oxide_report(&observations),
+    })
+}
+
+/// The state directory and home report both documents share.
+pub(crate) fn state_report(
+    account: &dyn AccountFacts,
+    environment_home: Option<&Path>,
+    paths: &StatePaths,
+) -> Result<StateReport> {
+    let account_home = account.account_home()?;
+    let environment_home = environment_home.map(Path::to_path_buf);
+    let mismatch = environment_home
+        .as_ref()
+        .is_some_and(|home| home != &account_home);
+    Ok(StateReport {
+        dir: paths.root().to_path_buf(),
+        initialized: paths.is_initialized()?,
+        source: paths.source(),
+        home: HomeReport {
+            account: account_home,
+            environment: environment_home,
+            mismatch,
+        },
+    })
+}
+
+/// Read the registry under a shared lock, when a lock file already exists.
+fn read_registry_observed(paths: &StatePaths) -> Result<Registry> {
+    let mut locks = LockSet::new(paths.clone());
+    let _lock = locks.observe_registry()?;
+    registry::read(paths)
+}
+
+fn registry_report(paths: &StatePaths) -> Result<RegistryReport> {
+    let path = paths.registry_path();
+    match read_registry_observed(paths) {
+        Ok(Registry::Absent) => Ok(RegistryReport {
+            path,
+            state: RegistryReportState::Absent,
+            detail: Some("there is no registry, so no volume is registered".to_owned()),
+            volumes: RowSet::empty(),
+        }),
+        Ok(Registry::Present(document)) => {
+            let rows: Vec<VolumeRow> = document
+                .volumes
+                .iter()
+                .map(VolumeRow::from_record)
+                .collect();
+            let total = rows.len();
+            Ok(RegistryReport {
+                path,
+                state: RegistryReportState::Valid,
+                detail: None,
+                volumes: RowSet::bounded(rows, total, VOLUME_ROWS),
+            })
+        }
+        Err(error) => Ok(RegistryReport {
+            path: path.clone(),
+            state: RegistryReportState::Invalid,
+            detail: Some(format!("{}: {}", path.display(), error.message())),
+            volumes: RowSet::empty(),
+        }),
+    }
+}
+
+fn oxide_report(observations: &OxideObservations) -> OxideReport {
+    let searched = observations.searched.clone();
+    let registration = match &observations.registration {
+        Observation::Reported(observed) => RegistrationReport {
+            path: observed.path().to_path_buf(),
+            state: ObservationState::Reported,
+            detail: None,
+            facts: Some(observed.value().clone()),
+            observed_volume: Some(observed.value().observed_volume()),
+            searched,
+        },
+        Observation::Absent { path, detail, .. } => RegistrationReport {
+            path: path.clone(),
+            state: ObservationState::Absent,
+            detail: Some(detail.clone()),
+            facts: None,
+            observed_volume: None,
+            searched,
+        },
+        Observation::Unknown { path, detail, .. } => RegistrationReport {
+            path: path.clone(),
+            state: ObservationState::UnknownState,
+            detail: Some(detail.clone()),
+            facts: None,
+            observed_volume: None,
+            searched,
+        },
+    };
+    let pools = match &observations.pools {
+        Observation::Reported(observed) => {
+            let paths = observed.value().paths().to_vec();
+            let total = paths.len();
+            PoolsReport {
+                path: observed.path().to_path_buf(),
+                state: ObservationState::Reported,
+                detail: None,
+                paths: RowSet::bounded(paths, total, OXIDE_POOL_ROWS),
+            }
+        }
+        Observation::Absent { path, detail, .. } => PoolsReport {
+            path: path.clone(),
+            state: ObservationState::Absent,
+            detail: Some(detail.clone()),
+            paths: RowSet::empty(),
+        },
+        Observation::Unknown { path, detail, .. } => PoolsReport {
+            path: path.clone(),
+            state: ObservationState::UnknownState,
+            detail: Some(detail.clone()),
+            paths: RowSet::empty(),
+        },
+    };
+    OxideReport {
+        registration,
+        pools,
     }
 }
 
@@ -355,36 +544,12 @@ fn state_directory_is_initialized(path: &Path) -> Result<bool> {
 /// counts disagree with its rows. It accepts an extra field, which is how a new
 /// optional field lands inside a major version.
 pub fn read_describe_document(bytes: &[u8]) -> Result<DescribeData> {
-    let document = parse_document(bytes)?;
-
-    let schema = document
-        .get("schema")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| unknown("the document has no schema string"))?;
-    if schema != DESCRIBE_SCHEMA {
-        let message = if schema.starts_with(DESCRIBE_SCHEMA_PREFIX) {
-            format!("`{schema}` is an unknown major; this reader knows {DESCRIBE_SCHEMA}")
-        } else {
-            format!("`{schema}` is not a {DESCRIBE_SCHEMA_PREFIX} document")
-        };
-        return Err(unknown(message)
-            .with_detail("schema", schema.into())
-            .with_detail("supported", DESCRIBE_SCHEMA.into()));
-    }
-
-    if document.get("command").and_then(serde_json::Value::as_str) != Some(DESCRIBE_COMMAND) {
-        return Err(unknown(format!(
-            "the document is not a `{DESCRIBE_COMMAND}` document"
-        )));
-    }
-    if document.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        return Err(unknown("the document is not a successful command document"));
-    }
-
-    let data = document
-        .get("data")
-        .cloned()
-        .ok_or_else(|| unknown("the document has no data"))?;
+    let data = document_data(
+        bytes,
+        DESCRIBE_SCHEMA,
+        DESCRIBE_SCHEMA_PREFIX,
+        DESCRIBE_COMMAND,
+    )?;
     let data: DescribeData = serde_json::from_value(data).map_err(|error| {
         unknown(format!(
             "the document does not provide the field set {DESCRIBE_SCHEMA} requires: {error}"
@@ -397,6 +562,61 @@ pub fn read_describe_document(bytes: &[u8]) -> Result<DescribeData> {
     Ok(data)
 }
 
+/// Read one `barge.inspect/1` document.
+pub fn read_inspect_document(bytes: &[u8]) -> Result<InspectData> {
+    let data = document_data(
+        bytes,
+        INSPECT_SCHEMA,
+        INSPECT_SCHEMA_PREFIX,
+        INSPECT_COMMAND,
+    )?;
+    let data: InspectData = serde_json::from_value(data).map_err(|error| {
+        unknown(format!(
+            "the document does not provide the field set {INSPECT_SCHEMA} requires: {error}"
+        ))
+    })?;
+    data.registry.volumes.validate()?;
+    data.observations.validate()?;
+    data.oxide.pools.paths.validate()?;
+    Ok(data)
+}
+
+/// Check one document's envelope and return its `data`.
+fn document_data(
+    bytes: &[u8],
+    schema: &str,
+    schema_prefix: &str,
+    command: &str,
+) -> Result<serde_json::Value> {
+    let document = parse_document(bytes)?;
+    let found = document
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| unknown("the document has no schema string"))?;
+    if found != schema {
+        let message = if found.starts_with(schema_prefix) {
+            format!("`{found}` is an unknown major; this reader knows {schema}")
+        } else {
+            format!("`{found}` is not a {schema_prefix} document")
+        };
+        return Err(unknown(message)
+            .with_detail("schema", found.into())
+            .with_detail("supported", schema.into()));
+    }
+    if document.get("command").and_then(serde_json::Value::as_str) != Some(command) {
+        return Err(unknown(format!(
+            "the document is not a `{command}` document"
+        )));
+    }
+    if document.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(unknown("the document is not a successful command document"));
+    }
+    document
+        .get("data")
+        .cloned()
+        .ok_or_else(|| unknown("the document has no data"))
+}
+
 fn unknown(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::UnknownState, message)
 }
@@ -406,17 +626,31 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     use super::{
-        describe, read_describe_document, AbsentPolicy, DescribeData, DescribeRequest, LinkState,
-        ObservationRow, ObservationState, PlacementKind, StateDirSource,
+        describe, inspect, read_describe_document, read_inspect_document, AbsentPolicy,
+        DescribeData, DescribeRequest, InspectData, InspectRequest, LinkState, ObservationRow,
+        ObservationState, PlacementKind, RegistryReportState, StateDirSource,
     };
-    use crate::contract::{success_bytes, RowSet, DESCRIBE_SCHEMA};
+    use crate::contract::{success_bytes, RowSet, DESCRIBE_SCHEMA, INSPECT_SCHEMA};
     use crate::error::{Error, ErrorKind, Result};
     use crate::os::AccountFacts;
+    use crate::registry::{
+        Availability, Durability, FolderOverrides, RecordOrigin, RegistryDocument, RegistryWriter,
+        ScratchGrants, VolumeRecord,
+    };
+    use crate::state::{Deadline, LockSet, StatePaths};
+    use crate::testkit::TempDir;
+
+    const UUID: &str = "A6AC3ED7-33EA-46B4-8082-7254CF291ED2";
+
+    fn registration_v2() -> &'static str {
+        r#"{"version":2,"mount_point":"/Volumes/Builds","volume_uuid":"A6AC3ED7-33EA-46B4-8082-7254CF291ED2","container_uuid":"AD1C4598-BCE0-4B23-9AAE-01349C7FA596","reserve_bytes":100000595968,"cap_bytes":749999226880,"quota_bytes":null,"capacity_bytes":999995129856,"registered_ms":1792525019847,"mode":"permanent"}"#
+    }
 
     /// Injected account facts: the account home is a fixture, so no test reads
-    /// or writes a real account's state.
+    /// or writes a real account's state or another tool's state.
     struct FakeAccount {
         home: PathBuf,
     }
@@ -429,79 +663,176 @@ mod tests {
         fn state_root(&self) -> Result<PathBuf> {
             Ok(self.home.join("Library/Application Support/barge/state"))
         }
-    }
 
-    /// A path that does not exist, in the test process's temp directory. Nothing
-    /// creates it: `describe` must not.
-    fn absent_state_dir() -> PathBuf {
-        std::env::temp_dir()
-            .join(format!("barge-describe-{}", std::process::id()))
-            .join("state")
-    }
+        fn tool_state_dir(&self, tool: &str) -> Result<PathBuf> {
+            Ok(self
+                .home
+                .join("Library/Application Support")
+                .join(tool)
+                .join("state"))
+        }
 
-    fn account() -> FakeAccount {
-        FakeAccount {
-            home: PathBuf::from("/Users/fixture"),
+        fn tool_cache_dir(&self, tool: &str) -> Result<PathBuf> {
+            Ok(self.home.join("Library/Caches").join(tool))
         }
     }
 
-    fn request<'a>(
-        account: &'a FakeAccount,
-        state_dir_override: Option<&'a Path>,
-    ) -> DescribeRequest<'a> {
-        DescribeRequest {
-            account,
-            environment_home: None,
-            state_dir_override,
-            tool_version: "0.1.0",
+    struct Fixture {
+        dir: TempDir,
+        account: FakeAccount,
+        state_dir: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let dir = TempDir::new(label);
+            let account = FakeAccount {
+                home: dir.path().to_path_buf(),
+            };
+            let state_dir = dir.join("state");
+            Self {
+                dir,
+                account,
+                state_dir,
+            }
         }
+
+        fn state_override(&self) -> &Path {
+            &self.state_dir
+        }
+
+        fn request(&self) -> DescribeRequest<'_> {
+            DescribeRequest {
+                account: &self.account,
+                environment_home: None,
+                state_dir_override: Some(self.state_override()),
+                tool_version: "0.1.0",
+            }
+        }
+
+        fn inspect_request(&self) -> InspectRequest<'_> {
+            InspectRequest {
+                account: &self.account,
+                environment_home: None,
+                state_dir_override: Some(self.state_override()),
+                tool_version: "0.1.0",
+            }
+        }
+
+        fn state(&self) -> StatePaths {
+            StatePaths::resolve(&self.account, Some(self.state_override()))
+                .expect("the fixture state directory resolves")
+        }
+
+        /// Write a valid registry holding one declared volume.
+        fn register_a_volume(&self) {
+            self.state().initialize().expect("the layout exists");
+            let mut locks =
+                LockSet::with_deadline(self.state(), Deadline::after(Duration::from_secs(5)));
+            let lock = locks.lock_registry().expect("the registry lock");
+            let document = RegistryDocument::new(vec![VolumeRecord {
+                volume_uuid: crate::os::VolumeUuid::parse(UUID).expect("a UUID"),
+                mount_hint: Some(PathBuf::from("/Volumes/Builds")),
+                availability: Availability::Permanent,
+                durability: Durability::Expendable,
+                root_dir: String::new(),
+                folders: FolderOverrides::none(),
+                origin: RecordOrigin::Declared,
+                scratch_grants: ScratchGrants::none(),
+                generation: 1,
+                registered_ms: 1_792_525_019_847,
+            }]);
+            RegistryWriter::new(&self.state())
+                .publish(&lock, &document)
+                .expect("the registry is written");
+        }
+
+        /// Write Oxide's pools record and registration into the fixture.
+        fn observe_oxide(&self) {
+            let pools =
+                serde_json::to_vec(&vec![self.dir.join("pool")]).expect("the record encodes");
+            self.dir
+                .write("Library/Application Support/oxide/state/pools.json", &pools);
+            self.dir.write(
+                "pool/oxide-managed/removable.json",
+                registration_v2().as_bytes(),
+            );
+        }
+    }
+
+    fn document(data: &DescribeData) -> Vec<u8> {
+        success_bytes(DESCRIBE_SCHEMA, super::DESCRIBE_COMMAND, data).expect("the document encodes")
+    }
+
+    fn inspect_document(data: &InspectData) -> Vec<u8> {
+        success_bytes(INSPECT_SCHEMA, super::INSPECT_COMMAND, data).expect("the document encodes")
     }
 
     #[test]
     fn an_uninitialized_state_directory_is_reported_and_not_created() {
-        let account = account();
-        let state_dir = absent_state_dir();
-        assert!(!state_dir.exists(), "the fixture path starts absent");
-        let data = describe(&request(&account, Some(&state_dir))).expect("describe reads");
+        let fixture = Fixture::new("describe-uninitialized");
+        assert!(
+            !fixture.state_override().exists(),
+            "the fixture starts absent"
+        );
+        let data = describe(&fixture.request()).expect("describe reads");
         assert!(!data.state.initialized);
-        assert_eq!(data.state.dir, state_dir);
+        assert_eq!(data.state.dir, fixture.state_override());
         assert_eq!(data.state.source, StateDirSource::EnvironmentOverride);
         assert!(
-            !state_dir.exists(),
+            !fixture.state_override().exists(),
             "describe must not create the state directory"
         );
     }
 
     #[test]
     fn the_account_state_root_is_reported_when_no_override_is_given() {
-        let account = account();
-        let data = describe(&request(&account, None)).expect("describe reads");
+        let fixture = Fixture::new("describe-account-root");
+        let data = describe(&DescribeRequest {
+            account: &fixture.account,
+            environment_home: None,
+            state_dir_override: None,
+            tool_version: "0.1.0",
+        })
+        .expect("describe reads");
         assert_eq!(
             data.state.dir,
-            PathBuf::from("/Users/fixture/Library/Application Support/barge/state")
+            fixture
+                .account
+                .home
+                .join("Library/Application Support/barge/state")
         );
         assert_eq!(data.state.source, StateDirSource::Account);
         assert!(!data.state.initialized);
+        assert!(!data.state.dir.exists(), "describe creates nothing");
     }
 
     #[test]
-    fn a_environment_home_that_differs_is_reported() {
-        let account = account();
-        let environment = PathBuf::from("/tmp/other-home");
+    fn a_home_that_differs_from_the_account_home_is_reported_and_moves_nothing() {
+        let fixture = Fixture::new("describe-home-mismatch");
+        let other = PathBuf::from("/Users/an-environment-home");
         let data = describe(&DescribeRequest {
-            account: &account,
-            environment_home: Some(&environment),
-            state_dir_override: Some(&absent_state_dir()),
+            account: &fixture.account,
+            environment_home: Some(&other),
+            state_dir_override: None,
             tool_version: "0.1.0",
         })
         .expect("describe reads");
         assert!(data.state.home.mismatch);
-        assert_eq!(data.state.home.environment, Some(environment));
+        assert_eq!(data.state.home.environment, Some(other.clone()));
+        assert_eq!(
+            data.state.dir,
+            fixture
+                .account
+                .home
+                .join("Library/Application Support/barge/state"),
+            "a differing HOME does not move state"
+        );
 
         let same = describe(&DescribeRequest {
-            account: &account,
-            environment_home: Some(Path::new("/Users/fixture")),
-            state_dir_override: Some(&absent_state_dir()),
+            account: &fixture.account,
+            environment_home: Some(&fixture.account.home),
+            state_dir_override: None,
             tool_version: "0.1.0",
         })
         .expect("describe reads");
@@ -509,40 +840,202 @@ mod tests {
     }
 
     #[test]
-    fn slice_one_reports_empty_lists_with_the_row_cap_shape() {
-        let account = account();
-        let data = describe(&request(&account, Some(&absent_state_dir()))).expect("describe reads");
-        for rows in [
-            (&data.volumes.count, &data.volumes.total),
-            (&data.areas.count, &data.areas.total),
-            (&data.placements.count, &data.placements.total),
-            (&data.observations.count, &data.observations.total),
-        ] {
-            assert_eq!(*rows.0, 0);
-            assert_eq!(*rows.1, 0);
-        }
+    fn an_absent_registry_reports_no_volumes_and_two_absent_observations() {
+        let fixture = Fixture::new("describe-empty");
+        let data = describe(&fixture.request()).expect("describe reads");
+        assert_eq!(data.volumes.count, 0);
+        assert_eq!(data.volumes.total, 0);
         assert!(!data.volumes.truncated);
-        assert!(!data.areas.truncated);
-        assert!(!data.placements.truncated);
+        assert_eq!(
+            data.observations.count, 2,
+            "the registration and the pools record"
+        );
+        assert_eq!(data.observations.total, 2);
         assert!(!data.observations.truncated);
-    }
-
-    fn document(data: &DescribeData) -> Vec<u8> {
-        success_bytes(DESCRIBE_SCHEMA, super::DESCRIBE_COMMAND, data).expect("the document encodes")
+        for row in &data.observations.rows {
+            assert_eq!(row.state, ObservationState::Absent, "{}", row.source);
+        }
+        assert_eq!(data.areas.count, 0);
+        assert_eq!(data.placements.count, 0);
     }
 
     #[test]
-    fn a_document_round_trips_through_its_reader() {
-        let account = account();
-        let data = describe(&request(&account, Some(&absent_state_dir()))).expect("describe reads");
+    fn a_registered_volume_and_a_present_registration_are_reported() {
+        let fixture = Fixture::new("describe-filled");
+        fixture.register_a_volume();
+        fixture.observe_oxide();
+        let data = describe(&fixture.request()).expect("describe reads");
+        assert_eq!(data.volumes.count, 1);
+        let row = &data.volumes.rows[0];
+        assert_eq!(row.volume_uuid, UUID);
+        assert_eq!(row.availability, Availability::Permanent);
+        assert_eq!(row.durability, Durability::Expendable);
+        assert_eq!(row.origin, RecordOrigin::Declared);
+        assert_eq!(row.root_dir, "");
+
+        let reported: Vec<&ObservationRow> = data
+            .observations
+            .rows
+            .iter()
+            .filter(|row| row.state == ObservationState::Reported)
+            .collect();
+        assert_eq!(reported.len(), 2, "both foreign records were read");
+        let registration = reported
+            .iter()
+            .find(|row| row.source == "oxide.removable")
+            .expect("the registration row");
+        assert_eq!(registration.version, "2");
+        assert!(registration.detail.is_none());
+        assert!(
+            fixture.state_override().join("registry.json").exists(),
+            "describe read the registry it reports"
+        );
+    }
+
+    #[test]
+    fn describe_refuses_an_invalid_registry_instead_of_reporting_no_volumes() {
+        let fixture = Fixture::new("describe-invalid-registry");
+        fixture.state().initialize().expect("the layout exists");
+        fixture
+            .dir
+            .write("state/registry.json", b"{ not a registry");
+        let error = describe(&fixture.request()).expect_err("an invalid registry is refused");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert_eq!(
+            error.detail()["path"],
+            fixture
+                .state_override()
+                .join("registry.json")
+                .display()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn inspect_reports_an_invalid_registry_with_its_reason() {
+        let fixture = Fixture::new("inspect-invalid-registry");
+        fixture.state().initialize().expect("the layout exists");
+        let path = fixture
+            .dir
+            .write("state/registry.json", b"{ not a registry");
+        let data =
+            inspect(&fixture.inspect_request()).expect("inspect reports rather than refuses");
+        assert_eq!(data.registry.state, RegistryReportState::Invalid);
+        let detail = data.registry.detail.expect("the reason is named");
+        assert!(detail.contains("registry.json"), "{detail}");
+        assert_eq!(data.registry.volumes.count, 0);
+        assert_eq!(
+            data.registry.path, path,
+            "the report names the file it read"
+        );
+    }
+
+    #[test]
+    fn inspect_reports_an_absent_registry_and_absent_observations_without_creating_them() {
+        let fixture = Fixture::new("inspect-empty");
+        let data = inspect(&fixture.inspect_request()).expect("inspect reads");
+        assert!(!data.state.initialized);
+        assert_eq!(data.registry.state, RegistryReportState::Absent);
+        assert_eq!(data.registry.volumes.count, 0);
+        assert_eq!(data.oxide.registration.state, ObservationState::Absent);
+        assert!(data.oxide.registration.facts.is_none());
+        assert!(data.oxide.registration.observed_volume.is_none());
+        assert_eq!(data.oxide.pools.state, ObservationState::Absent);
+        assert_eq!(data.oxide.pools.paths.count, 0);
+        assert_eq!(data.observations.count, 2);
+        assert!(
+            !fixture.state_override().exists(),
+            "inspect creates no directory"
+        );
+        assert!(
+            !fixture.dir.join("Library").exists(),
+            "inspect creates no foreign state either"
+        );
+    }
+
+    #[test]
+    fn inspect_reports_a_valid_registry_its_volumes_and_the_observed_volume() {
+        let fixture = Fixture::new("inspect-filled");
+        fixture.register_a_volume();
+        fixture.observe_oxide();
+        let data = inspect(&fixture.inspect_request()).expect("inspect reads");
+        assert_eq!(data.registry.state, RegistryReportState::Valid);
+        assert_eq!(data.registry.volumes.count, 1);
+        assert_eq!(data.registry.volumes.rows[0].volume_uuid, UUID);
+
+        assert_eq!(data.oxide.registration.state, ObservationState::Reported);
+        let facts = data
+            .oxide
+            .registration
+            .facts
+            .as_ref()
+            .expect("the registration facts");
+        assert_eq!(facts.mode, Availability::Permanent);
+        let observed = data
+            .oxide
+            .registration
+            .observed_volume
+            .as_ref()
+            .expect("the observed volume");
+        assert_eq!(observed.origin, RecordOrigin::ObservedOxide);
+        assert_eq!(observed.durability, Durability::Undeclared);
+        assert_eq!(observed.availability, Availability::Permanent);
+
+        assert_eq!(data.oxide.pools.state, ObservationState::Reported);
+        assert_eq!(data.oxide.pools.paths.count, 1);
+        assert_eq!(data.oxide.pools.paths.rows[0], fixture.dir.join("pool"));
+        assert_eq!(
+            data.oxide.registration.searched.len(),
+            3,
+            "the recorded pool plus the current and retired defaults"
+        );
+    }
+
+    #[test]
+    fn inspect_reports_an_unreadable_registration_as_unknown_state_naming_the_file() {
+        let fixture = Fixture::new("inspect-unknown-registration");
+        fixture
+            .dir
+            .write("pool/oxide-managed/removable.json", b"{ broken");
+        let pools =
+            serde_json::to_vec(&vec![fixture.dir.join("pool")]).expect("the record encodes");
+        fixture
+            .dir
+            .write("Library/Application Support/oxide/state/pools.json", &pools);
+        let data = inspect(&fixture.inspect_request()).expect("inspect reads");
+        assert_eq!(
+            data.oxide.registration.state,
+            ObservationState::UnknownState
+        );
+        let detail = data.oxide.registration.detail.expect("the reason is named");
+        assert!(detail.contains("removable.json"), "{detail}");
+        assert!(data.oxide.registration.facts.is_none());
+    }
+
+    #[test]
+    fn a_describe_document_round_trips_through_its_reader() {
+        let fixture = Fixture::new("describe-round-trip");
+        fixture.register_a_volume();
+        fixture.observe_oxide();
+        let data = describe(&fixture.request()).expect("describe reads");
         let read = read_describe_document(&document(&data)).expect("its own document reads");
         assert_eq!(read, data);
     }
 
     #[test]
-    fn the_reader_refuses_an_unknown_major() {
-        let account = account();
-        let data = describe(&request(&account, Some(&absent_state_dir()))).expect("describe reads");
+    fn an_inspect_document_round_trips_through_its_reader() {
+        let fixture = Fixture::new("inspect-round-trip");
+        fixture.register_a_volume();
+        fixture.observe_oxide();
+        let data = inspect(&fixture.inspect_request()).expect("inspect reads");
+        let read = read_inspect_document(&inspect_document(&data)).expect("its own document reads");
+        assert_eq!(read, data);
+    }
+
+    #[test]
+    fn both_readers_refuse_an_unknown_major() {
+        let fixture = Fixture::new("describe-unknown-major");
+        let data = describe(&fixture.request()).expect("describe reads");
         let bytes = String::from_utf8(document(&data)).expect("the document is text");
         let future = bytes.replace("barge.describe/1", "barge.describe/2");
         let error = read_describe_document(future.as_bytes())
@@ -550,71 +1043,116 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::UnknownState);
         assert_eq!(error.detail()["schema"], "barge.describe/2");
         assert_eq!(error.detail()["supported"], "barge.describe/1");
-    }
 
-    #[test]
-    fn the_reader_refuses_another_document() {
-        let bytes = br#"{"schema":"barge.error/1","command":"describe","ok":false,"error":{"kind":"io","message":"x","detail":{}}}"#;
-        let error = read_describe_document(bytes).expect_err("another schema is refused");
+        let data = inspect(&fixture.inspect_request()).expect("inspect reads");
+        let bytes = String::from_utf8(inspect_document(&data)).expect("the document is text");
+        let future = bytes.replace("barge.inspect/1", "barge.inspect/3");
+        let error = read_inspect_document(future.as_bytes()).expect_err("a newer major is refused");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert_eq!(error.detail()["schema"], "barge.inspect/3");
     }
 
     #[test]
-    fn the_reader_refuses_a_removed_required_field() {
-        let account = account();
-        let data = describe(&request(&account, Some(&absent_state_dir()))).expect("describe reads");
+    fn the_readers_refuse_another_document() {
+        let bytes = br#"{"schema":"barge.error/1","command":"describe","ok":false,"error":{"kind":"io","message":"x","detail":{}}}"#;
+        assert_eq!(
+            read_describe_document(bytes)
+                .expect_err("another schema")
+                .kind(),
+            ErrorKind::UnknownState
+        );
+        assert_eq!(
+            read_inspect_document(bytes)
+                .expect_err("another schema")
+                .kind(),
+            ErrorKind::UnknownState
+        );
+    }
+
+    #[test]
+    fn the_readers_refuse_a_removed_field_and_a_changed_type() {
+        let fixture = Fixture::new("describe-strictness");
+        let data = describe(&fixture.request()).expect("describe reads");
         let mut value: serde_json::Value =
             serde_json::from_slice(&document(&data)).expect("the document parses");
         value["data"]
             .as_object_mut()
             .expect("data is an object")
             .remove("state");
-        let bytes = serde_json::to_vec(&value).expect("the value encodes");
-        let error = read_describe_document(&bytes).expect_err("a missing field is refused");
+        let error = read_describe_document(&serde_json::to_vec(&value).expect("encodes"))
+            .expect_err("a missing field is refused");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
-    }
 
-    #[test]
-    fn the_reader_refuses_a_changed_type() {
-        let account = account();
-        let data = describe(&request(&account, Some(&absent_state_dir()))).expect("describe reads");
         let mut value: serde_json::Value =
             serde_json::from_slice(&document(&data)).expect("the document parses");
         value["data"]["state"]["initialized"] = serde_json::Value::String("no".to_owned());
-        let bytes = serde_json::to_vec(&value).expect("the value encodes");
-        let error = read_describe_document(&bytes).expect_err("a changed type is refused");
+        let error = read_describe_document(&serde_json::to_vec(&value).expect("encodes"))
+            .expect_err("a changed type is refused");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+
+        let inspect = inspect(&fixture.inspect_request()).expect("inspect reads");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&inspect_document(&inspect)).expect("the document parses");
+        value["data"]["registry"]
+            .as_object_mut()
+            .expect("the registry is an object")
+            .remove("volumes");
+        let error = read_inspect_document(&serde_json::to_vec(&value).expect("encodes"))
+            .expect_err("a missing required field is refused");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
 
     #[test]
-    fn the_reader_accepts_an_optional_field_added_inside_the_major() {
-        let account = account();
-        let data = describe(&request(&account, Some(&absent_state_dir()))).expect("describe reads");
+    fn the_readers_accept_an_optional_field_added_inside_the_major() {
+        let fixture = Fixture::new("describe-optional");
+        let data = describe(&fixture.request()).expect("describe reads");
         let mut value: serde_json::Value =
             serde_json::from_slice(&document(&data)).expect("the document parses");
         value["data"]["a_later_optional_field"] = serde_json::Value::Bool(true);
-        let bytes = serde_json::to_vec(&value).expect("the value encodes");
-        read_describe_document(&bytes).expect("an optional addition stays readable");
+        read_describe_document(&serde_json::to_vec(&value).expect("encodes"))
+            .expect("an optional addition stays readable");
+
+        let inspect = inspect(&fixture.inspect_request()).expect("inspect reads");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&inspect_document(&inspect)).expect("the document parses");
+        value["data"]["registry"]["a_later_optional_field"] = serde_json::Value::Bool(true);
+        read_inspect_document(&serde_json::to_vec(&value).expect("encodes"))
+            .expect("an optional addition stays readable");
     }
 
     #[test]
-    fn the_reader_refuses_an_oversized_document() {
+    fn the_readers_refuse_an_oversized_document_and_a_non_document() {
         let bytes = vec![b' '; crate::contract::DOCUMENT_SIZE_CAP_BYTES + 1];
-        let error = read_describe_document(&bytes).expect_err("an oversized document is refused");
-        assert_eq!(error.kind(), ErrorKind::ResourceBound);
-    }
-
-    #[test]
-    fn the_reader_refuses_a_document_that_is_not_json() {
-        let error = read_describe_document(b"not json").expect_err("a non-document is refused");
-        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert_eq!(
+            read_describe_document(&bytes)
+                .expect_err("an oversized document is refused")
+                .kind(),
+            ErrorKind::ResourceBound
+        );
+        assert_eq!(
+            read_inspect_document(&bytes)
+                .expect_err("an oversized document is refused")
+                .kind(),
+            ErrorKind::ResourceBound
+        );
+        assert_eq!(
+            read_describe_document(b"not json")
+                .expect_err("a non-document is refused")
+                .kind(),
+            ErrorKind::UnknownState
+        );
+        assert_eq!(
+            read_inspect_document(b"not json")
+                .expect_err("a non-document is refused")
+                .kind(),
+            ErrorKind::UnknownState
+        );
     }
 
     #[test]
     fn a_truncated_list_round_trips_and_names_its_counts() {
-        let account = account();
-        let mut data =
-            describe(&request(&account, Some(&absent_state_dir()))).expect("describe reads");
+        let fixture = Fixture::new("describe-truncated");
+        let mut data = describe(&fixture.request()).expect("describe reads");
         data.observations = RowSet::bounded(
             vec![ObservationRow {
                 source: "oxide.removable".to_owned(),
@@ -634,10 +1172,9 @@ mod tests {
     }
 
     #[test]
-    fn the_reader_refuses_a_list_whose_counts_disagree_with_its_rows() {
-        let account = account();
-        let mut data =
-            describe(&request(&account, Some(&absent_state_dir()))).expect("describe reads");
+    fn a_document_whose_counts_disagree_with_its_rows_is_refused() {
+        let fixture = Fixture::new("describe-counts");
+        let mut data = describe(&fixture.request()).expect("describe reads");
         data.volumes.total = 4;
         let value = serde_json::to_value(&data).expect("the data encodes");
         let bytes = serde_json::to_vec(&serde_json::json!({
@@ -648,6 +1185,19 @@ mod tests {
         }))
         .expect("the document encodes");
         let error = read_describe_document(&bytes).expect_err("inconsistent counts are refused");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+
+        let inspect = inspect(&fixture.inspect_request()).expect("inspect reads");
+        let mut value = serde_json::to_value(&inspect).expect("the data encodes");
+        value["oxide"]["pools"]["paths"]["count"] = serde_json::json!(9);
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema": "barge.inspect/1",
+            "command": "inspect",
+            "ok": true,
+            "data": value,
+        }))
+        .expect("the document encodes");
+        let error = read_inspect_document(&bytes).expect_err("inconsistent counts are refused");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
 
@@ -666,9 +1216,26 @@ mod tests {
             fn state_root(&self) -> Result<PathBuf> {
                 self.account_home()
             }
+
+            fn tool_state_dir(&self, _tool: &str) -> Result<PathBuf> {
+                self.account_home()
+            }
+
+            fn tool_cache_dir(&self, _tool: &str) -> Result<PathBuf> {
+                self.account_home()
+            }
         }
 
         let error = describe(&DescribeRequest {
+            account: &FailingAccount,
+            environment_home: None,
+            state_dir_override: None,
+            tool_version: "0.1.0",
+        })
+        .expect_err("an unreadable account home refuses");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+
+        let error = inspect(&InspectRequest {
             account: &FailingAccount,
             environment_home: None,
             state_dir_override: None,
@@ -693,5 +1260,62 @@ mod tests {
         assert_eq!(value["kind"], "cargo_registry");
         assert_eq!(value["link"], "linked");
         assert_eq!(value["absent"], "fail");
+
+        let volume = crate::registry::VolumeRecord {
+            volume_uuid: crate::os::VolumeUuid::parse(UUID).expect("a UUID"),
+            mount_hint: Some(PathBuf::from("/Volumes/Builds")),
+            availability: Availability::Ephemeral,
+            durability: Durability::Kept,
+            root_dir: "barge".to_owned(),
+            folders: FolderOverrides {
+                scratch: Some("temp".to_owned()),
+                caches: None,
+            },
+            origin: RecordOrigin::ObservedOxide,
+            scratch_grants: ScratchGrants::none(),
+            generation: 1,
+            registered_ms: 0,
+        };
+        let value =
+            serde_json::to_value(super::VolumeRow::from_record(&volume)).expect("the row encodes");
+        assert_eq!(value["availability"], "ephemeral");
+        assert_eq!(value["durability"], "kept");
+        assert_eq!(value["origin"], "observed_oxide");
+        assert_eq!(value["folders"]["scratch"], "temp");
+    }
+
+    #[test]
+    fn a_state_directory_that_is_not_a_directory_is_unknown_state() {
+        let fixture = Fixture::new("describe-not-a-directory");
+        std::fs::write(fixture.state_override(), b"a file").expect("the fixture file is written");
+        let error = describe(&fixture.request()).expect_err("a file is not a state directory");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        let error = inspect(&fixture.inspect_request()).expect_err("nor for inspect");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+    }
+
+    #[test]
+    fn a_relative_state_override_is_refused_by_both_commands() {
+        let fixture = Fixture::new("describe-relative-override");
+        let error = describe(&DescribeRequest {
+            account: &fixture.account,
+            environment_home: None,
+            state_dir_override: Some(Path::new("relative/state")),
+            tool_version: "0.1.0",
+        })
+        .expect_err("a relative override is refused");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert_eq!(
+            error.detail()["state_dir"],
+            "relative/state",
+            "the refusal names the path"
+        );
+        assert!(inspect(&InspectRequest {
+            account: &fixture.account,
+            environment_home: None,
+            state_dir_override: Some(Path::new("relative/state")),
+            tool_version: "0.1.0",
+        })
+        .is_err());
     }
 }
