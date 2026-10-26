@@ -812,7 +812,7 @@ design states the limit and builds only on facts it can establish:
 | Fact Barge needs | Available evidence | Limit |
 | --- | --- | --- |
 | A cooperative holder is done | its hold file was released, or its recorded process is positively gone | a process that never took a hold, or escaped its group, is outside this |
-| No same-uid process has an open descriptor under the root | each process's effective uid and start identity from the kernel's own process table (`sysctl`/`KERN_PROC_ALL`), then `proc_pidinfo`/`PROC_PIDLISTFDS` and `PROC_PIDFDVNODEPATHINFO` for this account's processes only, matching vnode paths | a process of another effective uid is classified and reported, never inspected; a process created after the scan, and a same-uid descriptor whose path the kernel will not show, are not observed |
+| No same-uid process has an open descriptor under the root | each process's effective uid and start identity from the kernel's own process table (`sysctl`/`KERN_PROC_ALL`), then `proc_pidinfo`/`PROC_PIDLISTFDS` and `PROC_PIDFDVNODEPATHINFO` for this account's processes only, matching vnode paths; a descriptor whose path the kernel hides is checked against the process's own code-signing status (`csops`/`CS_OPS_STATUS`) | a process of another effective uid is classified and reported, never inspected; a process created after the scan is not observed; a hidden vnode descriptor is an OS blind spot, counted and reported rather than refused, only for a process that status verifies as a platform binary with an unchanged start identity, and nothing can read where such a descriptor points |
 | The root is the inode that was verified | `fstat` device + inode through the opened descriptor before and after each step | a rename by another user between steps stops the operation |
 | The volume is still the registered one | descriptor `fstatfs` + `ATTR_VOL_UUID`, re-verified | a vanished volume fails the call, it does not answer "absent and safe" |
 
@@ -822,10 +822,13 @@ guarantee. It may appear only as a diagnostic in a report, never as a custody
 verdict.
 
 The verdict is therefore explicitly *cooperative plus same-uid observation*.
-Two residuals are named rather than implied: a process of another effective uid,
+Three residuals are named rather than implied: a process of another effective uid,
 which the kernel's process table reports and custody counts but never inspects
-(Tom, 2026-10-26, ruling bcaa83d8), and a process that dropped its hold and kept
-writing. Both are named here and in `describe` (`custody.capability`), and are
+(Tom, 2026-10-26, ruling bcaa83d8); a vnode descriptor whose path and vnode facts
+the platform hides on a process it verifies as a platform binary, which is
+counted and reported as the OS blind spot (Tom, 2026-10-26, decision e528a712,
+Q-008); and a process that dropped its hold and kept writing. All are named here
+and in `describe` (`custody.capability`), and are
 the reason deletion additionally requires the intent journal and quarantine
 rename below, which make a wrong deletion recoverable up to the marker-unlink
 step. Barge never claims more than this, and no unknown becomes safe.
@@ -856,10 +859,20 @@ process, its child or its parent holds a descriptor like anyone else. A
 descriptor listing the kernel answers `EPERM` for is re-observed by kernel
 identity inside a bounded settle window before it is decided, and settles only on
 a positive fact — a later listing, a gone process, a changed start identity or a
-changed effective uid — never on elapsed time (barge#012, below). Any unreadable
+changed effective uid — never on elapsed time (barge#012, below). A vnode
+descriptor whose path and vnode facts both answer `EPERM` is an **OS blind spot**
+when the process's own code-signing status reports the platform binary flag and
+its start identity is unchanged before and after that read: it is counted and
+reported in the evidence, and it does not block `Safe` (Tom, 2026-10-26, decision
+e528a712, barge#013). Every readable descriptor of that same process is still
+evaluated, so one that lies inside the root still makes the verdict `Unsafe`, and
+every other hidden descriptor — a process that is not a verified platform binary,
+a status read that fails, an identity that moves around it — stays unreadable.
+Any unreadable
 hold, an unreadable effective uid, a same-uid descriptor that stays unreadable
-after its retries, a scan that hits its entry or time bound, a foreign-uid
-holder, or a `lsof`-style diagnostic that errors makes the verdict `Unknown`,
+after its retries or that no verified platform binary explains, a scan that hits
+its entry or time bound, a foreign-uid holder, or a `lsof`-style diagnostic that
+errors makes the verdict `Unknown`,
 which is a refusal. Deletion and swap take a `Safe` value by type, so a caller
 cannot pass a boolean.
 
@@ -1257,7 +1270,10 @@ Choices S5 made where this design left the mechanic to the slice:
   this account's processes are then enumerated with `PROC_PIDLISTFDS`, and each
   vnode descriptor's `PROC_PIDFDVNODEPATHINFO` path is matched against the root
   by path components, under both the spelling the walk reached and the one the
-  filesystem resolves. This is what removed the `EPERM` wall: identifying a
+  filesystem resolves. A path the kernel hides as `EPERM` is checked against the
+  same descriptor's `PROC_PIDFDVNODEINFO` facts, and only when both are hidden
+  is it opaque; how far that goes is the `CS_OPS_STATUS` rule below. This is what
+  removed the `EPERM` wall: identifying a
   process through its own `PROC_PIDTBSDINFO` facts is refused for another
   account's processes, and reading the pid list first could not tell those apart
   from a process whose facts were genuinely unreadable. `proc_pidfdinfo` is
@@ -1316,6 +1332,32 @@ Choices S5 made where this design left the mechanic to the slice:
   failed listing, `EPERM` or the terminal fact that ended the re-observation.
   Nothing here infers safety from elapsed time: a process the scan cannot read
   still refuses.
+- **A verified platform binary's hidden descriptors are an OS blind spot**
+  (corrected here under barge#013, Tom's decision e528a712, answering Q-008).
+  Some of this account's own Apple daemons — `/usr/libexec/dmd` is the measured
+  example (pid 69326 on 2026-10-26, 6 of 9 descriptors) — answer `EPERM` to both
+  `PROC_PIDFDVNODEPATHINFO` and `PROC_PIDFDVNODEINFO` for protected vnode
+  descriptors, persistently and from every context, while
+  `proc_pidinfo(PROC_PIDLISTFDS)` succeeds for the process. That is not an
+  intermittent answer, so the re-observation above cannot settle it, and refusing
+  it made a full-scan `Safe` verdict unreachable on a real session. The rule is
+  narrow and proved: when a vnode descriptor of a same-uid process answers
+  `EPERM` to **both** flavors, the scan reads the process's code-signing status
+  through `csops(pid, CS_OPS_STATUS)` behind `ProcessObserver`, and the
+  descriptors are an OS blind spot only when `CS_PLATFORM_BINARY` is set **and**
+  the kernel's start identity for the pid is the classified one before and after
+  that read. The scan then records the process (pid, start identity, command,
+  count of hidden descriptors) and does not block; every readable descriptor of
+  that same process is still matched against the root, so one inside it still
+  makes the verdict `Unsafe`. Everything else is unchanged and refuses with
+  `Unknown`: a process that is not a platform binary, a `csops` failure or an
+  unreadable status, a start identity that changes around the read, and any other
+  unreadable fact. There are no path or name lists, a foreign effective uid keeps
+  ruling bcaa83d8's treatment, and the bounded re-observation of barge#012 still
+  applies first. `csops` is declared in the macOS module beside
+  `proc_pidfdinfo`, because `libc` declares neither, and it is readable for any
+  pid, which is what lets it speak about a process whose own descriptors it
+  hides.
 - **What the evidence says.** The evidence records `self_excluded: <pid>` (the one
   process the scan excluded), `foreign_uid_processes` (how many processes of
   another effective uid it classified and did not inspect) and `retry`: how many
@@ -1323,13 +1365,19 @@ Choices S5 made where this design left the mechanic to the slice:
   (`retried_unreadable`), and at most eight bounded records of them, each with
   the pid, command, kernel start identity, the errno sequence of every failed
   listing including the terminal one, identity changes and resolution, so the
-  next native diagnostic can tell an intermittent answer from a persistent one. **Every** verdict carries that record, not only `Safe`: an
+  next native diagnostic can tell an intermittent answer from a persistent one.
+  It also records `os_blind_spot`: how many platform-verified processes had
+  hidden vnode descriptors, how many descriptors were hidden in total, and at
+  most 32 bounded records with the pid, kernel start identity, command and
+  hidden-descriptor count of each, which is the OS blind spot above. **Every**
+  verdict carries that retry record, not only `Safe`: an
   `Unsafe` or `Unknown` verdict keeps it, and the `custody_not_proven` failure
   puts it in its `detail` (`retried_unreadable` and `retried`), because a refusal
   is exactly where a diagnostic needs it. A pending deletion's report keeps it
   too (`custody_retry`) when custody refuses after the intent was written. The
   scan's own answers carry it as well: `Complete`, `Bounded` and `Unreadable`. `describe.custody` names all of it: the
-  exclusion, the foreign-uid blind spot that is reported rather than observed, and
+  exclusion, the foreign-uid blind spot that is reported rather than observed, the
+  OS blind spot of a verified platform binary's hidden descriptors, and
   the retry rule with its positive facts and its two rechecked deadlines. A
   same-uid process the scan cannot read is an `Unreadable` answer rather than a
   returned error, so the record reaches the refusal; a returned error is only a
@@ -1338,7 +1386,8 @@ Choices S5 made where this design left the mechanic to the slice:
   the caller's own open handles stay open and the verdict is `safe`; a same-uid
   child holding the payload open is `unsafe`; real `/usr/bin/login` identities,
   read-only from the kernel's table, are counted as foreign and do not block; an
-  unreadable uid, a same-uid descriptor the kernel will not show, a mismatched
+  unreadable uid, a hidden descriptor of a same-uid process that is not a
+  verified platform binary, a mismatched
   start identity and a forced bound are `unknown`; and the counterfactuals refuse
   — the exclusion removed refuses the caller's own descriptor, identification
   through the process's own facts refuses the real login process, and a stated
@@ -1351,20 +1400,25 @@ Choices S5 made where this design left the mechanic to the slice:
   retries stays `unknown` with the bounded errno sequence kept on the refusal, and
   a scan time bound shorter than the first backoff answers `bounded` with the
   record kept, and `EPERM` then another unreadable errno records both in the
-  sequence. The deadline checks are also unit-tested on their own: a projection
+  sequence. The platform exemption's cases are stated the same way, with a
+  hidden-descriptor count and a code-signing answer injected because this account
+  owns no Apple-signed binary to hide them: a verified platform binary's hidden
+  descriptors are `safe` with the blind spot recorded, the same fixture without
+  the platform flag refuses, a `csops` failure refuses, a start identity that
+  changes around the read refuses, a platform binary whose readable descriptor
+  lies inside the root is `unsafe`, and a real-observer test reads the kernel's
+  own table to verify one live same-uid platform binary and to show that this
+  locally built test binary is not one. The deadline checks are also unit-tested on their own: a projection
   that would end past either bound is not taken, a delayed wake past either bound
   stops the retry instead of listing again, a terminal answer inside both bounds
   is accepted, and one read after the settle window or after the scan deadline is
   not.
-- **The residual this correction does not touch.** On a real session, a handful
-  of this account's own system daemons refuse `PROC_PIDFDVNODEPATHINFO` for some
-  of their descriptors (measured on macOS 26.6.2: 8 of 1004), which the rule
-  above makes `Unknown` for a whole-system scan. That is a descriptor *path* read
-  failing after the listing succeeded, not an `EPERM` from the listing itself, so
-  the re-observation above does not settle it. It is the design's conservative
-  answer, not a defect, but it means a full-scan `Safe` verdict is not reachable
-  on such a host; [Q-008](../questions.md) records it with the measurements and
-  the decision it needs.
+- **The prediction this correction replaces.** Before barge#013 the design
+  expected a handful of this account's own system daemons to refuse
+  `PROC_PIDFDVNODEPATHINFO` for some of their descriptors (measured on macOS
+  26.6.2: 8 of 1004), which made a whole-system scan `Unknown` and a full-scan
+  `Safe` verdict unreachable. That is now the OS blind spot above, decided by
+  Tom's ruling e528a712 rather than refused; Q-008 keeps the measurements.
 - **Hold decisions.** A hold is stale only when its process is positively gone or
   another boot wrote it. A live pid whose start identity differs is `Unknown`,
   not stale: the failure matrix's reused-pid row treats staleness as proved only
@@ -1438,7 +1492,7 @@ are real by constructing the state each rule must refuse.
 | Markers | strict validation of each field, identity checks | absent, foreign-uid, symlinked, oversized, future-dated, unknown-version and `hosting` markers are never eligible |
 | Scratch | conclusion transitions; eligibility table; sweep bounds; grant lookup per unit | unconcluded root, `closure: none`, `kept_reason: exception`, an Effigy marker with a live pid and no delegation, an Oxide `hosting` root, a plain `oxide-validation` directory and an unmarked unit with no legacy claim all survive a sweep; a delegated Effigy marker past 24 h and a claimed unmarked unit past its idle age are the only foreign/unmarked units that do not |
 | Caches | the three placement forms; adopt/undo records; link and root identity; setting parse | a setting already pointing at the owned root changes no byte; a non-empty real directory refuses with a plan and nothing renamed or deleted; an empty real directory becomes a link and undo restores it empty; an absent path gets a link through a temporary name; a diverged file after adopt refuses undo; a symlinked original is recorded, not swapped |
-| Custody | state machine transitions; `Safe` required by type | unreadable hold, bounded-out scan, live pid with a mismatched start identity, foreign-uid evidence all yield `Unknown` and refuse |
+| Custody | state machine transitions; `Safe` required by type | unreadable hold, bounded-out scan, live pid with a mismatched start identity, foreign-uid evidence all yield `Unknown` and refuse; a hidden vnode descriptor of a verified platform binary is recorded as the OS blind spot and does not block, and the same descriptor refuses without the platform flag, with a failed status read, and with a start identity that moved around it |
 | Deletion | phase machine; Finder metadata classification; ENOTEMPTY retry; marker last | unknown entry stops the delete; symlink inside quarantine stops it; injected ENOTEMPTY three times leaves a pending intent; injected device change stops before the first unlink |
 | Contacts | JSON documents match their schemas; unknown major refuses; optional-field addition accepted | a `barge.describe/1` document with a removed field or a changed type is refused by its own reader |
 | Foreign state | Oxide `removable.json` v1/v2 and `pools.json` parsers; the pinned Oxide and Effigy scratch marker field sets; delegations and legacy claims | unknown field, unknown version, unparsable and unreadable inputs become `unknown_state` observations; an Effigy marker that omits `task`/`checkout`/`pid`/`pid_start` is valid, and one that adds a field is refused; a unit whose family has no delegation or whose scope has no claim is reported, never deleted |
