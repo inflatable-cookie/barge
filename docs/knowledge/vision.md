@@ -4,8 +4,8 @@ Barge moves heavy, rebuildable developer data off the internal drive and onto
 a dedicated external volume, then keeps it there safely. Data comes back when
 needed. Tools that would otherwise each reinvent drive handling use Barge
 instead. It manages build output, caches, scratch, virtual machines and
-similar bulk data: anything a developer can regenerate or afford to lose,
-but should not write to the internal SSD.
+similar bulk data that should not live on, or churn, the internal SSD:
+rebuildable data it may prune, and kept data it only places and never deletes.
 
 ## What it does
 
@@ -57,8 +57,8 @@ but should not write to the internal SSD.
 
 ## Not this
 
-- Not a backup, sync or archive tool. Placed data is rebuildable or
-  expendable; anything precious stays the owner's responsibility.
+- Not a backup, sync or archive tool. Barge places kept data but does not copy
+  or protect it; backing it up stays the owner's responsibility.
 - Not a build system. Rust build logic stays in Oxide.
 - No background daemon in the first version: commands and scheduled host jobs
   only.
