@@ -37,8 +37,9 @@ lists the commands. Each covers what it names:
 - `effigy rust:test` — the unit and integration suites, through `oxide test`
   with a bounded admission and execution window.
 - `effigy os:volumes:probe` — the read-only OS-layer diagnostic:
-  `BARGE_OS_PROBE_PATH` names one directory to read and nothing is written.
-  Evidence, not a test.
+  `BARGE_OS_PROBE_PATH` names one directory on a volume, whose facts are read
+  and then verified against that identity; nothing is written. Evidence, not a
+  test.
 - `effigy docs:check` — the Northstar link and retired-concept checks plus
   `git diff --check HEAD`. Check its exit code.
 

@@ -37,13 +37,15 @@ pub const fn platform() -> MacOs {
     MacOs::new()
 }
 
-/// Verify that `path` is the volume `expected` names.
+/// Verify that `path` is on the volume `expected` names.
 ///
 /// The facts are read through an opened descriptor, the volume must be APFS, its
 /// UUID must match the record, its mount point must be proved to be a mount
-/// root, and the boot volume is refused. Any unreadable fact is unknown state;
-/// any different fact is `volume_mismatch`; a vanished volume is an error. A
-/// refusal here changes nothing, because nothing has been written yet.
+/// root, and the boot volume is refused. `path` may be any directory on the
+/// volume: the mount-root proof runs against the kernel's mount point, never
+/// against the path in use. Any unreadable fact is unknown state; any different
+/// fact is `volume_mismatch`; a vanished volume is an error. A refusal here
+/// changes nothing, because nothing has been written yet.
 pub fn verify_volume(
     facts: &dyn VolumeFacts,
     mounts: &dyn MountRoot,
@@ -105,18 +107,21 @@ pub fn verify_volume(
     }
 
     if let Some(mount_hint) = expected.mount_hint {
-        let mount_root = mounts.mount_root(path)?;
+        // The mount root to prove is the kernel's own mount point, never the
+        // path in use: a directory inside the volume is an ordinary use of it,
+        // and only the mount point itself can be a mount root.
+        let mount_root = mounts.mount_root(&identity.mount_point)?;
         if mount_root.as_path() != mount_hint {
             return Err(mount_mismatch(
-                path,
+                &identity.mount_point,
                 mount_hint,
                 mount_root.as_path(),
-                "the path is not the recorded mount root",
+                "the volume's mount point is not a mount root",
             ));
         }
         if identity.mount_point != mount_hint {
             return Err(mount_mismatch(
-                path,
+                &identity.mount_point,
                 mount_hint,
                 &identity.mount_point,
                 "the kernel reports a different mount point",
@@ -146,6 +151,7 @@ fn mount_mismatch(path: &Path, expected: &Path, actual: &Path, reason: &str) -> 
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+    use std::cell::RefCell;
     use std::path::{Path, PathBuf};
 
     use super::{
@@ -166,12 +172,41 @@ mod tests {
         }
     }
 
-    /// Injected mount facts: a test decides the mount root the platform proves.
-    struct FakeMounts(PathBuf);
+    /// Injected mount facts that obey the real `MountRoot` contract: only the
+    /// one path the platform reports as a mount point is proved to be a mount
+    /// root, exactly as the macOS layer proves only the kernel's own mount
+    /// point. A request for any other path refuses, so a policy that hands the
+    /// layer a path in use instead of the mount point cannot pass.
+    struct FakeMounts {
+        root: PathBuf,
+        requested: RefCell<Vec<PathBuf>>,
+    }
+
+    impl FakeMounts {
+        fn new(root: &str) -> Self {
+            Self {
+                root: PathBuf::from(root),
+                requested: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// The paths the policy asked to prove, in order.
+        fn requested(&self) -> Vec<PathBuf> {
+            self.requested.borrow().clone()
+        }
+    }
 
     impl MountRoot for FakeMounts {
-        fn mount_root(&self, _path: &Path) -> Result<MountPoint> {
-            Ok(MountPoint::new(self.0.clone()))
+        fn mount_root(&self, path: &Path) -> Result<MountPoint> {
+            self.requested.borrow_mut().push(path.to_path_buf());
+            if path != self.root {
+                return Err(Error::new(
+                    ErrorKind::VolumeMismatch,
+                    format!("{} is not a mount root", path.display()),
+                )
+                .with_detail("path", path.display().to_string().into()));
+            }
+            Ok(MountPoint::new(self.root.clone()))
         }
     }
 
@@ -196,30 +231,56 @@ mod tests {
     }
 
     #[test]
-    fn a_matching_volume_verifies() {
+    fn a_directory_inside_the_volume_verifies_against_its_mount_root() {
         let uuid = VolumeUuid::parse(UUID).expect("a test UUID");
         let facts = FakeFacts(Ok(identity(Some(UUID), "/Volumes/Builds")));
-        let mounts = FakeMounts(PathBuf::from("/Volumes/Builds"));
-        let path = Path::new("/Volumes/Builds/scratch");
+        let mounts = FakeMounts::new("/Volumes/Builds");
+        // A subdirectory is an ordinary use of the volume: the mount-root proof
+        // must run against the kernel's mount point, not against this path.
+        let path = Path::new("/Volumes/Builds/scratch/project/run-1");
         let verified = verify_volume(
             &facts,
             &mounts,
             path,
             &expected(&uuid, Some(Path::new("/Volumes/Builds"))),
         )
-        .expect("the facts match the record");
+        .expect("a directory inside the matching volume verifies");
         assert_eq!(
             verified.identity().mount_point,
             PathBuf::from("/Volumes/Builds")
         );
         assert_eq!(verified.path(), path);
+        assert_eq!(
+            mounts.requested(),
+            vec![PathBuf::from("/Volumes/Builds")],
+            "the policy proves the kernel mount point, not the path in use"
+        );
+    }
+
+    #[test]
+    fn a_hint_that_is_not_the_proved_mount_root_is_a_mismatch() {
+        let uuid = VolumeUuid::parse(UUID).expect("a test UUID");
+        let facts = FakeFacts(Ok(identity(Some(UUID), "/Volumes/Builds")));
+        // The kernel's mount point proves, but it is not the recorded one.
+        let mounts = FakeMounts::new("/Volumes/Builds");
+        let error = verify_volume(
+            &facts,
+            &mounts,
+            Path::new("/Volumes/Builds/scratch"),
+            &expected(&uuid, Some(Path::new("/Volumes/Other"))),
+        )
+        .expect_err("the proved mount root is not the recorded one");
+        assert_eq!(error.kind(), ErrorKind::VolumeMismatch);
+        assert_eq!(error.detail()["actual_mount"], "/Volumes/Builds");
+        assert_eq!(error.detail()["expected_mount"], "/Volumes/Other");
+        assert_eq!(mounts.requested(), vec![PathBuf::from("/Volumes/Builds")]);
     }
 
     #[test]
     fn an_unreadable_volume_uuid_refuses_rather_than_defaulting() {
         let uuid = VolumeUuid::parse(UUID).expect("a test UUID");
         let facts = FakeFacts(Ok(identity(None, "/Volumes/Builds")));
-        let mounts = FakeMounts(PathBuf::from("/Volumes/Builds"));
+        let mounts = FakeMounts::new("/Volumes/Builds");
         let error = verify_volume(
             &facts,
             &mounts,
@@ -234,7 +295,7 @@ mod tests {
     fn a_different_volume_at_the_mount_point_is_a_mismatch() {
         let uuid = VolumeUuid::parse(UUID).expect("a test UUID");
         let facts = FakeFacts(Ok(identity(Some(OTHER_UUID), "/Volumes/Builds")));
-        let mounts = FakeMounts(PathBuf::from("/Volumes/Builds"));
+        let mounts = FakeMounts::new("/Volumes/Builds");
         let error = verify_volume(
             &facts,
             &mounts,
@@ -253,7 +314,7 @@ mod tests {
         // The UUID matches but the kernel says the volume is mounted elsewhere:
         // the identity is right and the place is wrong.
         let facts = FakeFacts(Ok(identity(Some(UUID), "/Volumes/Elsewhere")));
-        let mounts = FakeMounts(PathBuf::from("/Volumes/Elsewhere"));
+        let mounts = FakeMounts::new("/Volumes/Elsewhere");
         let error = verify_volume(
             &facts,
             &mounts,
@@ -273,7 +334,7 @@ mod tests {
             ErrorKind::VolumeAbsent,
             "the volume holding /Volumes/Builds is not available",
         )));
-        let mounts = FakeMounts(PathBuf::from("/Volumes/Builds"));
+        let mounts = FakeMounts::new("/Volumes/Builds");
         let error = verify_volume(
             &facts,
             &mounts,
@@ -290,7 +351,7 @@ mod tests {
         let mut boot = identity(Some(UUID), "/");
         boot.boot_volume = true;
         let facts = FakeFacts(Ok(boot));
-        let mounts = FakeMounts(PathBuf::from("/"));
+        let mounts = FakeMounts::new("/");
         let error = verify_volume(&facts, &mounts, Path::new("/Users"), &expected(&uuid, None))
             .expect_err("the boot volume is never managed");
         assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
@@ -302,7 +363,7 @@ mod tests {
         let mut other = identity(Some(UUID), "/Volumes/USB");
         other.filesystem = FileSystem::Other("exfat".to_owned());
         let facts = FakeFacts(Ok(other));
-        let mounts = FakeMounts(PathBuf::from("/Volumes/USB"));
+        let mounts = FakeMounts::new("/Volumes/USB");
         let error = verify_volume(
             &facts,
             &mounts,
@@ -318,7 +379,7 @@ mod tests {
     fn re_verification_refuses_a_changed_volume() {
         let uuid = VolumeUuid::parse(UUID).expect("a test UUID");
         let matching = FakeFacts(Ok(identity(Some(UUID), "/Volumes/Builds")));
-        let mounts = FakeMounts(PathBuf::from("/Volumes/Builds"));
+        let mounts = FakeMounts::new("/Volumes/Builds");
         let verified = verify_volume(
             &matching,
             &mounts,
