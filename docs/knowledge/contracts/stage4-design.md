@@ -227,8 +227,9 @@ known version, `root_id`/`nonce` of the right shape, a canonical `volume_uuid`,
 a `mount_relative_path` that passes [containment](stage1-design.md#path-containment-and-resolution)
 in its relative form (non-empty components, no `.` or `..`, no leading or
 trailing separator, at least one component below the mount), `kind` in
-`scratch_run`/`cache_root`/`area_root`, `origin` in `created`/`adopted`/
-`identified`, `inode` and `device_at_record` non-zero, at most 4 KiB, a regular
+`scratch_run`/`cache_root`/`area_root`, `origin` in `created`/
+`adopted_existing`/`identified` — the first two are stage 1's values, spelled
+its way, and `identified` is [O4-002](#open-design-issues)'s repair — `inode` and `device_at_record` non-zero, at most 4 KiB, a regular
 file of this user with private mode, no symlink. An invalid record is
 `unknown_state`: the root is kept and every prune plan names it.
 
@@ -400,7 +401,7 @@ root lock:
 5. only then may a consumer write payload.
 
 Adoption of an existing directory (`held-root`, stage 1 S6) takes the same steps
-with `origin: adopted`.
+with `origin: adopted_existing`.
 
 A root whose creation crashed between steps 3 and 4 has a valid marker and no
 identity record. It is `Unknown(identity_record_missing)`: never prunable,
@@ -465,17 +466,39 @@ Unknown(reason)    cannot be decided; never treated as absent
    text, never a stale mount-point directory. For any other path the anchor is
    `/`.
 2. **A no-follow walk from the anchor.** Each component is opened with
-   `O_DIRECTORY | O_NOFOLLOW`; every component above the leaf exists, is a real
-   directory of this user, and is on the anchor device. A symlinked component, a
-   component on another device, an unreadable directory (`EACCES`), a depth-bound
-   or deadline hit is `Unknown`.
+   `O_DIRECTORY | O_NOFOLLOW` and must be a real directory (a no-follow
+   `fstatat` says `S_IFDIR`). The `fstatat` reading and the descriptor `openat`
+   returns are compared on device and inode, so a component replaced between the
+   two calls is `Unknown(replaced)`. A symlinked component, an unreadable
+   directory (`EACCES`), a depth-bound or deadline hit is `Unknown`.
+
+   The walk makes **no ownership claim and no device claim on its components**,
+   and both omissions are deliberate:
+
+   - `/Users`, `/private` and the other ancestors of a consumer path are
+     root-owned by design on macOS, so requiring this user's ownership on a
+     component would make every `/Users/...` checkout permanently undecidable —
+     a false refusal, and exactly the class of defect the carried finding is
+     about. Ownership is a property of the *root* ([verifying a
+     root](#verifying-a-root), which does check it).
+   - `/` is the read-only system volume, and `/Users`, `/private` and
+     `/Applications` reach the Data volume through firmlinks, so their device
+     differs from the anchor's for every real checkout. A per-component device
+     comparison against the anchor would refuse all of them.
+
+   What proves the ancestry is local and current is therefore condition 4 alone —
+   the volume proof — which is also how Oxide's `checkout_absence` is written:
+   walk no-follow, decide `ENOENT` at the leaf, prove the volume separately.
 3. **Only the leaf may be ENOENT.** A missing leaf gives `Absent`. A missing
    non-leaf component gives `Unknown(ancestor_missing)`: a renamed or deleted
    parent means the path may have moved, and a moved consumer path is not a
    deleted one.
 4. **A verified nearest existing ancestor.** The leaf's parent — which condition
-   2 has already proved to exist — must be on a local, verified volume:
-   [the ancestor volume proof](#the-ancestor-volume-proof).
+   2 has already proved to exist as a real directory, reached without following a
+   symlink and not replaced since it was read — must be on a local, verified
+   volume: [the ancestor volume proof](#the-ancestor-volume-proof). This is where
+   "is this really the internal drive" is decided, and it is the only
+   local-volume check the walk needs.
 
 Anything else is `Unknown`, and `Unknown` is never absence, never idle, never
 empty.
@@ -488,8 +511,8 @@ empty.
 | A non-leaf component is `ENOENT` | `Unknown(ancestor_missing)` |
 | A component is a symlink | `Unknown(symlink_component)` |
 | A component is a regular file or other non-directory | `Unknown(not_a_directory)` |
-| A component is on another device than the anchor | `Unknown(cross_device)` |
-| A component is owned by another user, or `EACCES` | `Unknown(not_readable)` |
+| A component was replaced between its `fstatat` reading and its `openat` (device or inode differ) | `Unknown(replaced)` |
+| A component cannot be read (`EACCES`) | `Unknown(not_readable)` |
 | The path is relative, empty, has no component below the anchor, or contains `.`/`..` | refused before the walk (`usage`) |
 | The walk reaches its 64-component bound | `Unknown(depth_bound)` |
 | The walk reaches its 1 s deadline | `Unknown(deadline)` |
@@ -582,6 +605,7 @@ is deliberately compatible in both directions.
 | a recorded checkout outside `/Volumes` | ancestor on `boot_data` (the internal drive) or on a `registered` volume | Oxide's registered-row rule, generalised: Barge accepts any registered volume it can verify, not only APFS or HFS by name |
 | `--operator-list` legacy exception: nearest existing ancestor on the boot Data volume, any missing ancestor tolerated | ancestor on `boot_data`; **a missing non-leaf ancestor is still `Unknown`** | Barge is stricter here on purpose: the operator list is a one-off waiver with a human in the loop, and a general primitive must not inherit it |
 | only the leaf may be `ENOENT` | the same | identical |
+| no ownership or device check on a walk component; the volume proof is the local-volume check | the same | identical, and required: `/Users` and `/private` are root-owned and reach the Data volume through firmlinks, so either check on a component would refuse every real `/Users/...` checkout |
 | `Absent` requires the root's own identity, custody and no current selection | the same, as the [gate](#releasability-the-one-gate) | identical |
 | `diskutil`/`statfs` text | never identity; kernel facts through descriptors | stage 1's rule |
 
@@ -776,6 +800,7 @@ reported. Stage 1's matrix still applies; these are the rows stage 4 adds.
 | A consumer path reappears between plan and effect | the re-established proof returns `Present` | keep that root, abandon its effect, continue the plan |
 | A consumer path's ancestor changed between plan and effect | the re-established proof returns a different ancestor inode or volume | re-prove from scratch; if it does not prove `Absent`, keep |
 | A non-leaf ancestor of a consumer path is missing | `ENOENT` above the leaf | `Unknown(ancestor_missing)`; keep |
+| A walk component changed between its `fstatat` reading and its `openat` | the reading and the descriptor disagree on device or inode | `Unknown(replaced)`; keep |
 | A consumer path's ancestor is a symlink, a foreign mount, a network or autofs mount, or a not-APFS volume | walk or volume proof | `Unknown`; keep |
 | A consumer path's ancestor volume is a removable volume that is away | no candidate mount | `Unknown(volume_unverified)`; keep |
 | A reference set is incomplete | an unreadable, oversized or schema-divergent receipt or registry | keep the whole batch that names those roots |
@@ -826,6 +851,8 @@ reports the unverified part as eligible.
 | Refuse any volume whose UUID was ever seen twice | A reconnect legitimately re-uses a UUID after the old mount is gone; only *simultaneous* candidates are ambiguous. |
 | A per-volume receipt file on the drive as identity | A block-level clone copies the receipt, so it adds nothing a UUID and marker do not already give. |
 | Treat a missing ancestor as absence (the reaper's implicit behaviour, and Oxide's `--operator-list` waiver) | A renamed or deleted parent means the consumer path may have *moved*, and its outputs are still live there. A general primitive must not inherit a one-off human waiver. |
+| Require this user's ownership on every walked component | The ancestors of a real consumer path are root-owned by design (`/Users`, `/private`), so the rule would make every `/Users/...` checkout permanently undecidable. Ownership is checked on the root, where it means something; the walk proves containment and the volume proves locality. |
+| Require every walked component to be on the anchor's device | `/` is the read-only system volume and `/Users`, `/private` and `/Applications` reach the Data volume through firmlinks, so a real checkout always crosses a device boundary at the anchor. The volume proof is the local-volume check instead. |
 | Trust the plan's absence proof at effect time | The path can reappear between preview and effect, which is the ordinary case for a checkout being recreated. The proof is re-established. |
 | Cache idleness or an identity verdict across runs | Both are facts about a moment. A cached verdict is a permission granted by the past, and the whole finding is what happens when a stale fact is compared to a live one. |
 | Let an unverified root be adopted into identity automatically when its marker looks right | Deletion authority would then appear by observation, which is the one thing the design forbids. It stays an explicit operator action (O4-002). |
@@ -873,13 +900,14 @@ are proposed for the implementation slices.
 | Marker generation | 1 at creation; 2 for a concluded `scratch_run` only | a conclusion on an `area_root`, a generation-3 marker, and a generation-2 marker with a null conclusion are all unknown |
 | Volume resolution | one candidate verifies; none refuses by mode; two refuse | two mounts of one UUID (`FakeMounts`) refuse `duplicate_volume_uuid` and delete nothing; a mount-point change with the same UUID verifies and reports `mount_moved` |
 | Identity write | the write order; the identity record written under the root lock | a crash between marker and identity record leaves `identity_record_missing`, never prunable, never adopted automatically; a second identity write is impossible by type |
-| Absence walk | leaf `ENOENT` gives `Absent`; every other outcome is enumerated | a missing non-leaf ancestor, a symlinked component, a cross-device component, `EACCES`, a 65-component path and a depth-bound hit each give `Unknown` with its code; a relative path and a `..` component are refused before the walk |
+| Absence walk | leaf `ENOENT` gives `Absent`; every other outcome is enumerated | a missing non-leaf ancestor, a symlinked component, a component replaced between `fstatat` and `openat`, `EACCES`, a 65-component path and a depth-bound hit each give `Unknown` with its code; a relative path and a `..` component are refused before the walk |
+| Absence ancestry | a path whose ancestors are root-owned and on another device than the anchor still proves | a real `/Users/...`-shaped path under a root-owned ancestor, crossing a firmlink whose device differs from `/`, with an `ENOENT` leaf proves `Absent`; the same shape with a `Present` leaf proves `Present`; ownership of the root, not of the ancestry, is what a delete depends on |
 | Ancestor volume | `boot_data` and `registered(uuid)` proofs | an ancestor on a not-APFS volume, on a foreign mount, behind a stale mount point, on an unmounted removable volume, or on a volume whose UUID differs gives `Unknown` |
 | The gate | each of the six conditions alone blocks a delete | six counterfactuals, one per condition, each proving the root survives with its reason; plus one proving all six together authorize it |
 | References | receipts, registry flags and Barge's own records decide "current" | an incomplete reference set keeps the whole batch; a selected, reserved, pruning or cancelling row keeps its root |
 | Plan and intent | canonical plan, digest, evidence on every row | a changed digest, a changed marker digest, a changed identity and a reappeared consumer path each stop the affected row only; a replay after a device change settles from the recorded identity |
 | Oxide census | strict bounded reading of `oxide.outputs.registry/2` and `/1` | a version-1 row, an incomplete registry, a duplicated UUID and a row whose volume is away each report the honest verdict; nothing is written and no row becomes authoritative |
-| Caches and scratch | the identity rule reaches every root kind | a `scratch_run` root concluded under generation 2 verifies; an adopted `held-root` with `origin: adopted` verifies; a `cache_root` with a changed inode is kept |
+| Caches and scratch | the identity rule reaches every root kind | a `scratch_run` root concluded under generation 2 verifies; an adopted `held-root` with `origin: adopted_existing` verifies; a `cache_root` with a changed inode is kept |
 
 The regression test the carried finding needs is a named pair: a fixture root
 whose recorded and live device differ verifies under stage 4 and would have been
@@ -917,7 +945,9 @@ a remount and the absence primitive together:
   6. prove the absence primitive on the internal volume inside the guard's own
      scratch: a directory that exists is `Present`, after removal it is `Absent`
      with an ancestor on the boot Data volume by device and UUID, and a missing
-     non-leaf ancestor and a symlinked ancestor are `Unknown`;
+     non-leaf ancestor and a symlinked ancestor are `Unknown`. The path crosses
+     root-owned components (`/private`, `/private/tmp`) whose device differs from
+     `/`, so this case also proves the walk does not refuse on either fact;
   7. prove the absence primitive under the image's mount, with the image as a
      `registered(uuid)` ancestor; detach the image and prove the same path is
      `Unknown`, never `Absent`;
