@@ -9,3 +9,11 @@ Contracts own durable interfaces and formats:
   markers, scratch and cache placement, writer custody and safe deletion, the
   scheduled-job contract, the stage 1 failure and race matrix, the implementation
   slices and the proposed validation.
+
+Rust quality policy owns the strict profile for the Rust workspace:
+[activation](contracts/language-quality-activation.json) records the
+repository's everyday-authoring opt-in,
+[profile](contracts/rust-quality-profile.json) declares the profile and its MSRV
+sources, and [deviations](contracts/rust-quality-deviations.json) records every
+accepted deviation. The `effigy rust:*` selectors in [AGENTS.md](../../AGENTS.md)
+are the validation route through `oxide`.
