@@ -247,6 +247,21 @@ def file_read_complete(
     )
 
 
+def file_read_status(clock, deadline, **facts):
+    """`complete`, `incomplete` or `deadline` for one file's read.
+
+    A complete read still has to happen inside the observation's bound: a read
+    that finishes after the deadline is past it, whatever its bytes say, so the
+    observation is incomplete. `clock` and `deadline` are injected so the
+    late-read counterfactual can be simulated exactly.
+    """
+    if not file_read_complete(**facts):
+        return "incomplete"
+    if clock() >= deadline:
+        return "deadline"
+    return "complete"
+
+
 def _incomplete(reason, entries=0, total=0):
     """An observation that cannot prove the state's content: never a pass."""
     return {
@@ -258,7 +273,7 @@ def _incomplete(reason, entries=0, total=0):
     }
 
 
-def real_state_observation(deadline_seconds=REAL_STATE_SECONDS):
+def real_state_observation(deadline_seconds=REAL_STATE_SECONDS, clock=time.monotonic):
     """A bounded, read-only, descriptor-relative observation of the real state.
 
     Premise 2 needs *complete content equality*, so this walks the account state
@@ -284,7 +299,7 @@ def real_state_observation(deadline_seconds=REAL_STATE_SECONDS):
     except OSError as error:
         return _incomplete(f"the real state directory cannot be opened without following: {error}")
     digest = hashlib.sha256()
-    deadline = time.monotonic() + deadline_seconds
+    deadline = clock() + deadline_seconds
     entries = 0
     total = 0
     stack = [(root_fd, "")]
@@ -304,7 +319,7 @@ def real_state_observation(deadline_seconds=REAL_STATE_SECONDS):
                         return _incomplete(
                             f"the entry cap {REAL_STATE_ENTRIES} was reached", entries, total
                         )
-                    if time.monotonic() >= deadline:
+                    if clock() >= deadline:
                         return _incomplete(
                             f"the deadline {deadline_seconds:g}s was reached", entries, total
                         )
@@ -367,7 +382,9 @@ def real_state_observation(deadline_seconds=REAL_STATE_SECONDS):
                                         )
                                     digest.update(block)
                                 after = os.fstat(file_fd)
-                                if not file_read_complete(
+                                status = file_read_status(
+                                    clock,
+                                    deadline,
                                     expected_size=info.st_size,
                                     expected_mtime_ns=info.st_mtime_ns,
                                     opened_size=opened.st_size,
@@ -375,10 +392,18 @@ def real_state_observation(deadline_seconds=REAL_STATE_SECONDS):
                                     read_total=read_total,
                                     after_size=after.st_size,
                                     after_mtime_ns=after.st_mtime_ns,
-                                ):
+                                )
+                                if status == "incomplete":
                                     return _incomplete(
                                         f"`{name}` was truncated or changed during its read "
                                         f"({read_total} bytes read, {info.st_size} expected)",
+                                        entries,
+                                        total,
+                                    )
+                                if status == "deadline":
+                                    return _incomplete(
+                                        f"the read of `{name}` finished after the deadline "
+                                        f"{deadline_seconds:g}s",
                                         entries,
                                         total,
                                     )
@@ -393,6 +418,14 @@ def real_state_observation(deadline_seconds=REAL_STATE_SECONDS):
     finally:
         for fd, _relative in stack:
             os.close(fd)
+    # A complete walk that finished past its bound is not a complete observation:
+    # the last listing or filesystem step may itself have blocked.
+    if clock() >= deadline:
+        return _incomplete(
+            f"the observation finished after the deadline {deadline_seconds:g}s",
+            entries,
+            total,
+        )
     return {
         "status": "complete",
         "digest": digest.hexdigest(),
@@ -2121,11 +2154,29 @@ def preflight_problems():
         broken[field] = value
         if file_read_complete(**broken):
             problems.append(f"{why} was accepted as complete")
+
+    # A seven-byte read that finishes after the observation's deadline is past it,
+    # whatever its bytes say: the reviewer's late-final-read counterexample.
+    deadline_seconds = 20.0
+    if file_read_status(lambda: 21.0, deadline_seconds, **complete_read) != "deadline":
+        problems.append("a complete seven-byte read finishing at t=21s was not a deadline")
+    if file_read_status(lambda: 21.0, deadline_seconds, **dict(complete_read, read_total=7)) != "deadline":
+        problems.append("the late-read counterexample is not classified as a deadline")
+    if file_read_status(lambda: 19.5, deadline_seconds, **complete_read) != "complete":
+        problems.append("a twenty-second read inside the deadline was not complete")
+    if file_read_status(  # a truncated late read is incomplete, not a deadline pass
+        lambda: 21.0, deadline_seconds, **dict(complete_read, read_total=0)
+    ) != "incomplete":
+        problems.append("a truncated late read was classified as a deadline pass")
     observation_source = inspect.getsource(real_state_observation)
-    if "file_read_complete(" not in observation_source:
-        problems.append("the real-state observation does not check a complete file read")
+    if "file_read_status(" not in observation_source:
+        problems.append("the real-state observation does not check a file read's status")
     if "read_total" not in observation_source:
         problems.append("the real-state observation does not count the bytes it read")
+    if 'status == "deadline"' not in observation_source:
+        problems.append("the real-state observation does not refuse a read past the deadline")
+    if "the observation finished after the deadline" not in observation_source:
+        problems.append("the real-state observation does not re-check the deadline before completing")
     if REAL_STATE_RELATIVE != "Library/Application Support/barge/state":
         problems.append("the real state root is not the product's own layout")
 

@@ -2273,8 +2273,11 @@ Choices S4 made where this design left the mechanic to the slice:
   mtime and bytes are hashed. The entry cap, the byte cap, the deadline, a short
   read (fewer bytes than the file's own facts report), a file that grew, or any
   size or mtime change between the entry's facts, its open and the end of its
-  read make the observation `incomplete`; two incomplete observations never prove
-  equality, and an incomplete or changed reading makes the receipt unqualified.
+  read make the observation `incomplete`; the deadline is re-checked after every
+  file read and again before a complete observation is reported, so a read or
+  filesystem step that finished past the bound cannot be labelled complete. Two
+  incomplete observations never prove equality, and an incomplete or changed
+  reading makes the receipt unqualified.
   The resolver is proved from fixture-only evidence, never from `describe` (which
   observes live Oxide state), and from the environment the **child commands** run
   with rather than the proof process's own: the child's `BARGE_STATE_DIR` must be
