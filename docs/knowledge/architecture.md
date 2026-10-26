@@ -21,6 +21,63 @@ registered volume, protected by file locks.
 - **Writer custody.** Before any move, swap or delete, Barge proves that no
   process has the data open. Where it cannot prove that, it keeps the data.
 
+## Volume modes
+
+A volume has two independent properties, and a placement's behaviour follows
+from both.
+
+**Availability** describes when the volume is attached:
+
+- **Permanent:** always attached, for example a drive on the desk dock. Absence
+  is abnormal: Barge reports it loudly, and each placement applies its declared
+  absent-volume policy.
+- **Ephemeral:** attached on and off, for example a drive that travels or a
+  dock in another room. Absence is normal: placements on it are expected to be
+  unavailable at times, and coming back is routine.
+
+**Durability** describes what the data on the volume is:
+
+- **Expendable:** rebuildable data such as build output, package caches and
+  scratch. Barge may prune it under space pressure and may recreate it
+  elsewhere.
+- **Kept:** data that lives only on that volume, such as VMs or large archives.
+  Barge never prunes it, never recreates it elsewhere and never treats an absent
+  volume's copy as gone.
+
+Examples today: Builds is permanent and expendable; Vault is ephemeral and
+kept.
+
+### Placement mechanics by mode
+
+- **Permanent + expendable.** The original path is an owned link into the
+  volume. When the volume is absent, the declared policy applies: build output
+  may use an explicit, visible checkout-local fallback; caches and scratch wait
+  or fail. On return, Barge relinks to the volume root, keeps any fallback root
+  until it is pruned, and never merges fallback data back in. Low space prunes
+  the oldest idle owned roots down to the reserve.
+- **Ephemeral + expendable.** The same link model, but absence is routine:
+  commands fall back without alarm, show the fallback in status, and relink
+  quietly on return. The original location is the authoritative home and the
+  volume is a warm extra, so no data is lost when it is away.
+- **Ephemeral + kept.** No fallback copy ever exists. When the volume is away,
+  the placement is unavailable and Barge says which volume to attach. On return
+  it is usable again with no reconciliation. Barge prunes nothing and recreates
+  nothing.
+- **Permanent + kept.** Treated like ephemeral + kept, except that absence is
+  reported loudly.
+
+### Attach, detach and surprise removal
+
+- Before a volume is used, its identity is verified by UUID and mount, every
+  time. A different volume at the same mount point is never used.
+- A placement that is being written when its volume disappears fails that
+  write cleanly. Its owned root is checked on return before anything reuses it.
+- An ordinary detach first waits for every writer on that volume to finish, and
+  flushes.
+- Every mode change is explicit and recorded. Changing durability from kept to
+  expendable requires operator confirmation, because it makes the data
+  prunable.
+
 ## Invariants
 
 - Nothing is written to a drive root or a home folder as scratch.

@@ -10,8 +10,10 @@ but should not write to the internal SSD.
 ## What it does
 
 - **Registers volumes.** A registered external volume is identified by its
-  UUID and mount and has a mode: permanent (always attached, treated as the
-  home for its data) or ephemeral (attached on and off).
+  UUID and mount. It declares its availability (permanent: always attached;
+  ephemeral: attached on and off) and its durability (expendable data Barge
+  may prune and recreate, or kept data it never touches). Placement behaviour
+  follows from both ([architecture](architecture.md#volume-modes)).
 - **Places data.** A path such as a package cache, a scratch tree or a VM
   folder is relocated onto a registered volume behind an owned link. The
   original path keeps working, and the placement can be undone.

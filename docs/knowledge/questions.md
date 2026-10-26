@@ -15,7 +15,7 @@ absent; low space never does.
 ## Q-002 — Which volume owns which data when several are registered?
 
 Status: open
-Builds (permanent, 1 TB) and Vault (ephemeral, 4 TB) are both attached today.
+Builds (permanent, expendable, 1 TB) and Vault (ephemeral, kept, 4 TB) are both attached today.
 Placement-to-volume binding, preference order and moving a placement between
 volumes are undecided.
 
