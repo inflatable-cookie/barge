@@ -20,6 +20,10 @@
 //!   then volume, then root, then the intent write. Acquiring out of order is
 //!   refused, and [`LockSet::observe_registry`] takes only a shared lock and only
 //!   when the lock file already exists, so a read-only command creates nothing.
+//! - [`IntentRecord`]: one durable `barge.intent/1` phase record. Slice S5 writes
+//!   every phase before the effect it authorises, so a crash leaves a pending
+//!   intent that replay resolves from the recorded identity and never from an
+//!   inference.
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind as IoErrorKind, Read, Write};
@@ -938,6 +942,388 @@ impl LockSet {
     }
 }
 
+/// One whole-root deletion's phase, in the order the phases happen.
+///
+/// Every phase is durable before the effect it authorises: `Intent` before the
+/// quarantine rename, `Renamed` before the first unlink, `MarkerLast` before the
+/// quarantine leaf is removed, and `Deleted` once the leaf is gone. Only
+/// `Deleted` is settled; every other phase is a pending intent and a replay
+/// question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentPhase {
+    /// The intent is written; the root is still in place.
+    Intent,
+    /// The root was renamed to its quarantine name; its contents are being
+    /// deleted.
+    Renamed,
+    /// The marker was unlinked last and the leaf may be removed.
+    MarkerLast,
+    /// The leaf is gone and the intent is settled.
+    Deleted,
+}
+
+impl IntentPhase {
+    /// The phase's name, as a document reports it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Intent => "intent",
+            Self::Renamed => "renamed",
+            Self::MarkerLast => "marker_last",
+            Self::Deleted => "deleted",
+        }
+    }
+
+    /// Whether the intent still needs a replay decision.
+    pub const fn is_pending(self) -> bool {
+        !matches!(self, Self::Deleted)
+    }
+}
+
+/// One durable `barge.intent/1` record: the identity a deletion acts on, and the
+/// phase it has reached.
+///
+/// The record never states a conclusion about data it has not observed. A replay
+/// resolves it only from the recorded device, inode and marker digest, which is
+/// why they are recorded before the first effect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentRecord {
+    /// Always `barge.intent/1`.
+    pub schema: String,
+    /// The intent's fresh 128-bit id, which also names the quarantine leaf.
+    pub intent_id: String,
+    /// The owned root the deletion acts on.
+    pub root_id: String,
+    /// The verified volume's UUID.
+    pub volume_uuid: VolumeUuid,
+    /// The mount point observed when the intent was written.
+    pub mount_hint: PathBuf,
+    /// The volume's `root_dir` the root was resolved under.
+    pub root_dir: String,
+    /// The area folder the root was resolved in.
+    pub folder: String,
+    /// The root directory's name inside that folder.
+    pub root_name: String,
+    /// The quarantine leaf's name inside that folder.
+    pub quarantine_name: String,
+    /// The root's device, as read through its descriptor.
+    pub device: u64,
+    /// The root's inode, as read through its descriptor.
+    pub inode: u64,
+    /// The SHA-256 of the root's marker bytes.
+    pub marker_digest: String,
+    /// The SHA-256 of the plan that authorised the deletion.
+    pub plan_digest: String,
+    /// The phase the deletion reached.
+    pub phase: IntentPhase,
+    /// Increases with every phase published; an intent starts at 1.
+    pub generation: u64,
+    /// When the intent was first written.
+    pub recorded_ms: u64,
+    /// When this phase was written.
+    pub phase_ms: u64,
+}
+
+impl IntentRecord {
+    /// Whether the intent is written before its first effect.
+    pub const fn is_pending(&self) -> bool {
+        self.phase.is_pending()
+    }
+
+    /// Validate every recorded fact strictly. A record that does not validate is
+    /// unknown, never an intent to act on.
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != crate::contract::INTENT_SCHEMA {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "`{}` is not the `{}` major this build reads",
+                    self.schema,
+                    crate::contract::INTENT_SCHEMA
+                ),
+            )
+            .with_detail("intent_id", self.intent_id.clone().into()));
+        }
+        validate_identifier("intent_id", &self.intent_id)?;
+        validate_identifier("root_id", &self.root_id)?;
+        let quarantine = format!("{QUARANTINE_PREFIX}{}", self.intent_id);
+        if self.quarantine_name != quarantine {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "the intent's quarantine name is `{}`, not `{quarantine}`",
+                    self.quarantine_name
+                ),
+            )
+            .with_detail("intent_id", self.intent_id.clone().into()));
+        }
+        if self.root_name != self.root_id {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "the intent's root name is not the root id".to_owned(),
+            )
+            .with_detail("intent_id", self.intent_id.clone().into()));
+        }
+        crate::registry::validate_folder("root_dir", &self.root_dir, true)?;
+        crate::registry::validate_folder("folder", &self.folder, false)?;
+        if !is_hex(self.marker_digest.as_str(), 64) || !is_hex(self.plan_digest.as_str(), 64) {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "the intent's marker or plan digest is not a SHA-256 hex string".to_owned(),
+            )
+            .with_detail("intent_id", self.intent_id.clone().into()));
+        }
+        if self.volume_uuid.to_string().is_empty() {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "the intent records no volume".to_owned(),
+            ));
+        }
+        if self.generation == 0 {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "an intent's generation starts at 1".to_owned(),
+            )
+            .with_detail("intent_id", self.intent_id.clone().into()));
+        }
+        if self.phase_ms < self.recorded_ms {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "the intent's phase is older than the intent".to_owned(),
+            )
+            .with_detail("intent_id", self.intent_id.clone().into()));
+        }
+        Ok(())
+    }
+}
+
+/// The quarantine leaf's name prefix: `.barge-prune-<intent-id>`.
+pub const QUARANTINE_PREFIX: &str = ".barge-prune-";
+
+fn is_hex(value: &str, length: usize) -> bool {
+    value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Where one intent record lives.
+pub fn intent_path(state: &StatePaths, intent_id: &str) -> Result<PathBuf> {
+    validate_identifier("intent_id", intent_id)?;
+    Ok(state.intents_dir().join(format!("{intent_id}.json")))
+}
+
+/// Every intent record the state directory holds, bounded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentSet {
+    /// The records read, sorted by intent id.
+    pub records: Vec<IntentRecord>,
+    /// How many files the directory held, at least `records.len()`.
+    pub total: usize,
+    /// Whether records were left out because of the row cap.
+    pub truncated: bool,
+}
+
+impl IntentSet {
+    /// No intents.
+    pub fn empty() -> Self {
+        Self {
+            records: Vec::new(),
+            total: 0,
+            truncated: false,
+        }
+    }
+
+    /// The intents that still need a replay decision.
+    pub fn pending(&self) -> impl Iterator<Item = &IntentRecord> {
+        self.records.iter().filter(|record| record.is_pending())
+    }
+}
+
+/// Publish one intent phase durably.
+///
+/// The publish is atomic — a private temporary file, sync, rename, directory
+/// sync — so the phase is on disk before the caller performs the effect it
+/// authorises. The [`IntentWrite`] token is the type-level proof that the write
+/// came last in the fixed lock order.
+pub fn publish_intent(
+    _write: &IntentWrite,
+    state: &StatePaths,
+    record: &IntentRecord,
+) -> Result<()> {
+    record.validate()?;
+    let mut bytes = serde_json::to_vec_pretty(record).map_err(|error| {
+        Error::new(
+            ErrorKind::Io,
+            format!("could not encode the intent record: {error}"),
+        )
+    })?;
+    bytes.push(b'\n');
+    if bytes.len() > crate::contract::INTENT_CAP_BYTES {
+        return Err(Error::new(
+            ErrorKind::ResourceBound,
+            format!(
+                "the intent record would be {} bytes, over the {}-byte cap",
+                bytes.len(),
+                crate::contract::INTENT_CAP_BYTES
+            ),
+        )
+        .with_detail("intent_id", record.intent_id.clone().into()));
+    }
+    publish_atomic(&intent_path(state, &record.intent_id)?, &bytes)
+}
+
+/// Advance one intent to `phase`, publishing the new generation durably before
+/// its effect. A phase may only move forward, so a stale writer cannot rewind an
+/// intent it raced.
+pub fn advance_intent(
+    write: &IntentWrite,
+    state: &StatePaths,
+    record: &IntentRecord,
+    phase: IntentPhase,
+) -> Result<IntentRecord> {
+    if phase <= record.phase {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            format!(
+                "an intent at `{}` cannot advance to `{}`",
+                record.phase.as_str(),
+                phase.as_str()
+            ),
+        )
+        .with_detail("intent_id", record.intent_id.clone().into()));
+    }
+    let mut next = record.clone();
+    next.phase = phase;
+    next.generation = record.generation.saturating_add(1);
+    next.phase_ms = now_ms().max(record.phase_ms);
+    publish_intent(write, state, &next)?;
+    Ok(next)
+}
+
+/// Read one intent record strictly, bounded by its own cap.
+pub fn read_intent(state: &StatePaths, intent_id: &str) -> Result<IntentRecord> {
+    let path = intent_path(state, intent_id)?;
+    let bytes = match read_bounded(
+        &path,
+        &Bounds::new(
+            crate::contract::INTENT_CAP_BYTES,
+            1,
+            Deadline::after(READ_DEADLINE),
+        ),
+    ) {
+        ReadOutcome::Present(bytes) => bytes,
+        ReadOutcome::Absent => {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("the intent {} is not there", path.display()),
+            )
+            .with_detail("path", path.display().to_string().into()))
+        }
+        ReadOutcome::Refused(error) => return Err(error),
+    };
+    let record: IntentRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "{} is not a `{}` document: {error}",
+                path.display(),
+                crate::contract::INTENT_SCHEMA
+            ),
+        )
+        .with_detail("path", path.display().to_string().into())
+    })?;
+    record.validate()?;
+    Ok(record)
+}
+
+/// Read every intent record, bounded. A stray name, an unreadable record and a
+/// truncated directory are unknown state: a pending intent is never skipped
+/// because it was inconvenient to read.
+pub fn read_intents(state: &StatePaths, max: usize) -> Result<IntentSet> {
+    let directory = state.intents_dir();
+    let names = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == IoErrorKind::NotFound => return Ok(IntentSet::empty()),
+        Err(error) => {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("cannot read the intent journal: {error}"),
+            )
+            .with_detail("path", directory.display().to_string().into()))
+        }
+    };
+    let deadline = Deadline::after(READ_DEADLINE);
+    let mut records = Vec::new();
+    let mut total = 0usize;
+    for entry in names {
+        let entry = entry.map_err(|error| {
+            Error::new(
+                ErrorKind::UnknownState,
+                format!("cannot read the intent journal: {error}"),
+            )
+            .with_detail("path", directory.display().to_string().into())
+        })?;
+        total = total.saturating_add(1);
+        if total > max || deadline.expired() {
+            return Err(Error::new(
+                ErrorKind::ResourceBound,
+                format!("the intent journal holds more than {max} records or ran out of time"),
+            )
+            .with_detail("path", directory.display().to_string().into())
+            .with_detail("rows", total.into())
+            .with_detail("cap", max.into()));
+        }
+        let name = entry.file_name();
+        let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "the intent journal holds `{}`, which is not an intent record",
+                    name.to_string_lossy()
+                ),
+            )
+            .with_detail("path", directory.display().to_string().into()));
+        };
+        match read_intent(state, stem) {
+            Ok(record) => records.push(record),
+            Err(error) if error.kind() == ErrorKind::UnknownState => {
+                // A record that vanished between the listing and the read was
+                // settled by another process; nothing is inferred from it.
+                if entry.path().exists() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    records.sort_by(|left, right| left.intent_id.cmp(&right.intent_id));
+    Ok(IntentSet {
+        records,
+        total,
+        truncated: false,
+    })
+}
+
+/// Remove one intent record. Only a rolled-back `intent` phase is removed: a
+/// settled intent keeps its `deleted` phase as the journal's own record.
+pub fn remove_intent(state: &StatePaths, intent_id: &str) -> Result<bool> {
+    let path = intent_path(state, intent_id)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            let _ = sync_directory(
+                path.parent()
+                    .ok_or_else(|| Error::new(ErrorKind::Usage, "the intent has no parent"))?,
+            );
+            Ok(true)
+        }
+        Err(error) if error.kind() == IoErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error::new(
+            ErrorKind::Io,
+            format!("cannot remove {}: {error}", path.display()),
+        )
+        .with_detail("path", path.display().to_string().into())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -1346,5 +1732,143 @@ mod tests {
             .lock_registry()
             .expect_err("a missing locks directory is reported, not created");
         assert_eq!(error.kind(), ErrorKind::Io);
+    }
+}
+
+#[cfg(test)]
+mod intent_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::path::PathBuf;
+
+    use super::{
+        advance_intent, publish_intent, read_intent, read_intents, IntentPhase, IntentRecord,
+        LockSet, StatePaths, QUARANTINE_PREFIX,
+    };
+    use crate::error::ErrorKind;
+    use crate::os::VolumeUuid;
+    use crate::testkit::{FakeAccount, TempDir};
+
+    const UUID: &str = "A6AC3ED7-33EA-46B4-8082-7254CF291ED2";
+
+    fn fixture(label: &str) -> (TempDir, StatePaths, VolumeUuid) {
+        let dir = TempDir::new(label);
+        let state = StatePaths::resolve(
+            &FakeAccount {
+                home: dir.path().to_path_buf(),
+            },
+            Some(&dir.join("state")),
+        )
+        .expect("the fixture state directory resolves");
+        state.initialize().expect("the layout exists");
+        (dir, state, VolumeUuid::parse(UUID).expect("a UUID"))
+    }
+
+    fn record(uuid: &VolumeUuid) -> IntentRecord {
+        let intent_id = format!("{:032x}", 7);
+        let now = super::now_ms();
+        IntentRecord {
+            schema: crate::contract::INTENT_SCHEMA.to_owned(),
+            intent_id: intent_id.clone(),
+            root_id: format!("{:032x}", 8),
+            volume_uuid: uuid.clone(),
+            mount_hint: PathBuf::from("/Volumes/Builds"),
+            root_dir: String::new(),
+            folder: "example/pool".to_owned(),
+            root_name: format!("{:032x}", 8),
+            quarantine_name: format!("{QUARANTINE_PREFIX}{intent_id}"),
+            device: 16_777_219,
+            inode: 4_242,
+            marker_digest: "a".repeat(64),
+            plan_digest: "b".repeat(64),
+            phase: IntentPhase::Intent,
+            generation: 1,
+            recorded_ms: now,
+            phase_ms: now,
+        }
+    }
+
+    #[test]
+    fn an_intent_advances_forward_only_and_each_phase_reads_back() {
+        let (_dir, state, uuid) = fixture("intent-advance");
+        let intent = record(&uuid);
+        let mut locks = LockSet::new(state.clone());
+        let _volume = locks.lock_volume(&uuid).expect("the volume lock");
+        let _root = locks.lock_root(&intent.root_id).expect("the root lock");
+        let write = locks.begin_intent_write().expect("the intent step");
+
+        publish_intent(&write, &state, &intent).expect("the intent publishes");
+        let read = read_intent(&state, &intent.intent_id).expect("the intent reads back");
+        assert_eq!(read.phase, IntentPhase::Intent);
+        assert!(read.is_pending());
+
+        let renamed = advance_intent(&write, &state, &read, IntentPhase::Renamed)
+            .expect("the phase advances");
+        assert_eq!(renamed.generation, 2);
+        let read = read_intent(&state, &intent.intent_id).expect("the intent reads back");
+        assert_eq!(read.phase, IntentPhase::Renamed);
+
+        let rewind = advance_intent(&write, &state, &read, IntentPhase::Intent)
+            .expect_err("an intent never rewinds");
+        assert_eq!(rewind.kind(), ErrorKind::Usage);
+        assert_eq!(
+            read_intent(&state, &intent.intent_id)
+                .expect("the intent reads back")
+                .phase,
+            IntentPhase::Renamed,
+            "the refused rewind changed nothing"
+        );
+
+        let settled = advance_intent(&write, &state, &read, IntentPhase::MarkerLast)
+            .and_then(|next| advance_intent(&write, &state, &next, IntentPhase::Deleted))
+            .expect("the intent settles");
+        assert!(!settled.is_pending());
+        let set = read_intents(&state, 64).expect("the journal reads");
+        assert_eq!(set.total, 1);
+        assert!(
+            set.pending().next().is_none(),
+            "a settled intent is not pending work"
+        );
+    }
+
+    #[test]
+    fn an_intent_record_with_an_unknown_field_is_refused() {
+        let (_dir, state, uuid) = fixture("intent-unknown-field");
+        let intent = record(&uuid);
+        let path = super::intent_path(&state, &intent.intent_id).expect("the path");
+        let mut value = serde_json::to_value(&intent).expect("the record encodes");
+        value["a_later_field"] = serde_json::Value::Bool(true);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&value).expect("the record encodes"),
+        )
+        .expect("the record is written");
+
+        let error = read_intents(&state, 64).expect_err("an unknown field is refused");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+    }
+
+    #[test]
+    fn a_stray_journal_entry_is_unknown_state() {
+        let (_dir, state, _uuid) = fixture("intent-stray");
+        std::fs::write(state.intents_dir().join("not-an-intent.txt"), b"x")
+            .expect("the stray file is written");
+        let error = read_intents(&state, 64).expect_err("a stray name is unknown");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+    }
+
+    #[test]
+    fn an_absent_journal_is_empty_and_creates_nothing() {
+        let dir = TempDir::new("intent-absent");
+        let state = StatePaths::resolve(
+            &FakeAccount {
+                home: dir.path().to_path_buf(),
+            },
+            Some(&dir.join("state")),
+        )
+        .expect("the fixture state directory resolves");
+        let set = read_intents(&state, 64).expect("an absent journal reads");
+        assert_eq!(set.total, 0);
+        assert!(!dir.join("state").exists(), "reading creates nothing");
     }
 }

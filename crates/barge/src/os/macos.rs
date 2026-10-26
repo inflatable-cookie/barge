@@ -18,9 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::facts::{
-    AccountFacts, ChildEntry, ChildListing, DeviceId, DirHandle, DirId, DirOps, EntryFacts,
-    EntryKind, FileSystem, MountPoint, MountRoot, ProcessObserver, VolumeFacts, VolumeIdentity,
-    VolumeUuid,
+    AccountFacts, ChildEntry, ChildListing, ChildRemoval, DescriptorScan, DescriptorScanRequest,
+    DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, FileSystem, MountPoint, MountRoot,
+    OpenDescriptor, ProcessObserver, RemoveKind, VolumeFacts, VolumeIdentity, VolumeUuid,
 };
 
 /// The parent every managed volume mounts directly under.
@@ -50,6 +50,52 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// A generous fixed buffer for one `fgetattrlist` volume attribute: the kernel
 /// writes a 4-byte length followed by the attribute's value.
 const VOLUME_ATTRIBUTE_BYTES: usize = 32;
+
+/// `PROC_ALL_PIDS` from `sys/proc_info.h`: every process the kernel reports.
+const PROC_ALL_PIDS: u32 = 1;
+
+/// `PROC_PIDFDVNODEPATHINFO` from `sys/proc_info.h`: one descriptor's vnode path.
+const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+/// How many descriptors one process may hold before the scan is bounded: the
+/// platform's own open-file limit is far below this, so reaching it means the
+/// observation cannot be complete.
+const SCAN_DESCRIPTORS_PER_PROCESS: usize = 4096;
+
+// `proc_listpids` and `proc_pidfdinfo` are the two libproc calls the descriptor
+// scan needs; `libc` declares neither, so the seam declares them itself.
+extern "C" {
+    fn proc_listpids(
+        kind: u32,
+        typeinfo: u32,
+        buffer: *mut libc::c_void,
+        buffer_size: libc::c_int,
+    ) -> libc::c_int;
+    fn proc_pidfdinfo(
+        pid: libc::c_int,
+        descriptor: libc::c_int,
+        flavor: libc::c_int,
+        buffer: *mut libc::c_void,
+        buffer_size: libc::c_int,
+    ) -> libc::c_int;
+}
+
+/// `struct proc_fileinfo` from `sys/proc_info.h`, which `libc` does not declare.
+#[repr(C)]
+struct ProcFileInfo {
+    fi_openflags: u32,
+    fi_status: u32,
+    fi_offset: i64,
+    fi_type: i32,
+    fi_guardflags: u32,
+}
+
+/// `struct vnode_fdinfowithpath` from `sys/proc_info.h`.
+#[repr(C)]
+struct VnodeFdInfoWithPath {
+    pfi: ProcFileInfo,
+    pvip: libc::vnode_info_path,
+}
 
 /// The macOS OS layer.
 #[derive(Debug, Clone, Copy, Default)]
@@ -182,40 +228,268 @@ impl ProcessObserver for MacOs {
             )
             .with_detail("pid", u64::from(pid).into()));
         }
-        // SAFETY: `proc_bsdinfo` is a plain-old-data C struct, so an all-zero
-        // value is a valid initial buffer that `proc_pidinfo` overwrites.
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of::<libc::proc_bsdinfo>();
-        // SAFETY: `info` is a writable buffer of exactly the size passed, so the
-        // kernel writes only inside it and returns how much it wrote.
+        let Some(info) = bsd_info(pid)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            info.pbi_start_tvsec
+                .saturating_mul(1_000_000)
+                .saturating_add(info.pbi_start_tvusec),
+        ))
+    }
+
+    fn scan_open_descriptors(&self, request: &DescriptorScanRequest<'_>) -> Result<DescriptorScan> {
+        let uid = self.effective_uid()?;
+        let started = std::time::Instant::now();
+        // The kernel reports canonical paths, so the root is matched under both
+        // the spelling the walk reached and the one the filesystem resolves.
+        let mut roots = vec![request.root.to_path_buf()];
+        if let Ok(canonical) = std::fs::canonicalize(request.root) {
+            if canonical != request.root {
+                roots.push(canonical);
+            }
+        }
+
+        // The whole system's pid list is read first; a list that fills the
+        // buffer is bounded, because a missing pid could hold the root open.
+        let mut pids = vec![0i32; SCAN_PID_CAP];
+        let pids_bytes = pids.len().saturating_mul(std::mem::size_of::<i32>());
+        // SAFETY: `pids` is a writable slice whose exact byte length is passed,
+        // so the kernel writes only inside it and returns how many bytes it wrote.
         let written = unsafe {
-            libc::proc_pidinfo(
-                pid as libc::c_int,
-                libc::PROC_PIDTBSDINFO,
+            proc_listpids(
+                PROC_ALL_PIDS,
                 0,
-                std::ptr::addr_of_mut!(info).cast(),
-                size as libc::c_int,
+                pids.as_mut_ptr().cast(),
+                libc::c_int::try_from(pids_bytes).unwrap_or(libc::c_int::MAX),
             )
         };
-        if written as usize == size {
-            return Ok(Some(
-                info.pbi_start_tvsec
-                    .saturating_mul(1_000_000)
-                    .saturating_add(info.pbi_start_tvusec),
-            ));
-        }
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
-            // The kernel reports no such process: it is positively gone.
-            Some(libc::ESRCH) => Ok(None),
-            _ => Err(Error::new(
+        if written <= 0 {
+            return Err(Error::new(
                 ErrorKind::UnknownState,
-                format!("the start identity of pid {pid} is unreadable: {error}"),
+                format!(
+                    "the process list could not be read: {}",
+                    io::Error::last_os_error()
+                ),
             )
-            .with_detail("pid", u64::from(pid).into())
-            .with_detail("os_error", error.to_string().into())),
+            .with_detail("fact", "process list".into()));
         }
+        let written = written as usize;
+        if written >= pids_bytes {
+            return Ok(DescriptorScan::Bounded {
+                processes: 0,
+                descriptors: 0,
+                bound: "process list",
+            });
+        }
+        let count = written / std::mem::size_of::<i32>();
+
+        let mut processes = 0usize;
+        let mut descriptors = 0usize;
+        let mut open = Vec::new();
+        for pid in pids.into_iter().take(count) {
+            if started.elapsed() >= request.timeout {
+                return Ok(DescriptorScan::Bounded {
+                    processes,
+                    descriptors,
+                    bound: "time",
+                });
+            }
+            if pid <= 0 {
+                continue;
+            }
+            let pid = u32::try_from(pid).unwrap_or(0);
+            let Some(info) = bsd_info(pid)? else {
+                // The process exited while it was observed: nothing can be held
+                // open by a process that is positively gone.
+                continue;
+            };
+            if info.pbi_uid != uid {
+                // A process of another uid is the named limit of this evidence,
+                // never a fact Barge claims.
+                continue;
+            }
+            processes = processes.saturating_add(1);
+            if processes > request.max_processes {
+                return Ok(DescriptorScan::Bounded {
+                    processes,
+                    descriptors,
+                    bound: "processes",
+                });
+            }
+
+            let mut fds = vec![
+                libc::proc_fdinfo {
+                    proc_fd: 0,
+                    proc_fdtype: 0,
+                };
+                SCAN_DESCRIPTORS_PER_PROCESS
+            ];
+            let fds_bytes = fds
+                .len()
+                .saturating_mul(std::mem::size_of::<libc::proc_fdinfo>());
+            // SAFETY: `fds` is a writable slice whose exact byte length is
+            // passed, so the kernel writes only inside it.
+            let written = unsafe {
+                libc::proc_pidinfo(
+                    libc::c_int::try_from(pid).unwrap_or(libc::c_int::MAX),
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    fds.as_mut_ptr().cast(),
+                    libc::c_int::try_from(fds_bytes).unwrap_or(libc::c_int::MAX),
+                )
+            };
+            if written < 0 {
+                let error = io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::ESRCH) => continue,
+                    _ => return Err(unreadable_descriptors(pid, &error)),
+                }
+            }
+            let written = written as usize;
+            if written >= fds_bytes {
+                return Ok(DescriptorScan::Bounded {
+                    processes,
+                    descriptors,
+                    bound: "descriptors per process",
+                });
+            }
+            let fd_count = written / std::mem::size_of::<libc::proc_fdinfo>();
+            for fd in fds.into_iter().take(fd_count) {
+                if started.elapsed() >= request.timeout {
+                    return Ok(DescriptorScan::Bounded {
+                        processes,
+                        descriptors,
+                        bound: "time",
+                    });
+                }
+                descriptors = descriptors.saturating_add(1);
+                if descriptors > request.max_descriptors {
+                    return Ok(DescriptorScan::Bounded {
+                        processes,
+                        descriptors,
+                        bound: "descriptors",
+                    });
+                }
+                if libc::c_int::try_from(fd.proc_fdtype).ok() != Some(libc::PROX_FDTYPE_VNODE) {
+                    continue;
+                }
+                let Some(path) = descriptor_path(pid, fd.proc_fd)? else {
+                    continue;
+                };
+                if roots.iter().any(|root| path_is_at_or_under(&path, root)) {
+                    open.push(OpenDescriptor {
+                        pid,
+                        descriptor: fd.proc_fd,
+                        path,
+                    });
+                }
+            }
+        }
+        Ok(DescriptorScan::Complete {
+            processes,
+            descriptors,
+            open,
+        })
     }
+}
+
+/// How many pids the scan reads from the kernel in one call. A system with more
+/// processes than this makes the scan bounded rather than incomplete.
+const SCAN_PID_CAP: usize = 8192;
+
+/// One process's BSD info, or `Ok(None)` when the kernel reports no such
+/// process. Any other failure is an unreadable fact.
+fn bsd_info(pid: u32) -> Result<Option<libc::proc_bsdinfo>> {
+    // SAFETY: `proc_bsdinfo` is a plain-old-data C struct, so an all-zero value
+    // is a valid initial buffer that `proc_pidinfo` overwrites.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // SAFETY: `info` is a writable buffer of exactly the size passed, so the
+    // kernel writes only inside it and returns how much it wrote.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            libc::c_int::try_from(pid).unwrap_or(libc::c_int::MAX),
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            libc::c_int::try_from(size).unwrap_or(libc::c_int::MAX),
+        )
+    };
+    if written as usize == size {
+        return Ok(Some(info));
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        // The kernel reports no such process: it is positively gone.
+        Some(libc::ESRCH) => Ok(None),
+        _ => Err(Error::new(
+            ErrorKind::UnknownState,
+            format!("the facts of pid {pid} are unreadable: {error}"),
+        )
+        .with_detail("pid", u64::from(pid).into())
+        .with_detail("os_error", error.to_string().into())),
+    }
+}
+
+/// One descriptor's path, or `Ok(None)` when the descriptor closed while it was
+/// observed. Any other failure is an unreadable fact.
+fn descriptor_path(pid: u32, descriptor: i32) -> Result<Option<PathBuf>> {
+    // SAFETY: `VnodeFdInfoWithPath` is a plain-old-data C struct, so an
+    // all-zero value is a valid initial buffer.
+    let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<VnodeFdInfoWithPath>();
+    // SAFETY: `info` is a writable buffer of exactly the size passed, so the
+    // kernel writes only inside it and returns how much it wrote.
+    let written = unsafe {
+        proc_pidfdinfo(
+            libc::c_int::try_from(pid).unwrap_or(libc::c_int::MAX),
+            descriptor,
+            PROC_PIDFDVNODEPATHINFO,
+            std::ptr::addr_of_mut!(info).cast(),
+            libc::c_int::try_from(size).unwrap_or(libc::c_int::MAX),
+        )
+    };
+    if written as usize != size {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH | libc::EBADF) => Ok(None),
+            _ => Err(unreadable_descriptors(pid, &error)),
+        };
+    }
+    // SAFETY: `vip_path` is a fixed array of `c_char` inside `info`, which is
+    // alive for this borrow, and only bytes are read from it.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            info.pvip.vip_path.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(&info.pvip.vip_path),
+        )
+    };
+    let Ok(path) = CStr::from_bytes_until_nul(bytes) else {
+        return Err(unreadable_descriptors(
+            pid,
+            &io::Error::from_raw_os_error(libc::ENAMETOOLONG),
+        ));
+    };
+    if path.to_bytes().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PathBuf::from(OsStr::from_bytes(path.to_bytes()))))
+}
+
+fn unreadable_descriptors(pid: u32, error: &io::Error) -> Error {
+    Error::new(
+        ErrorKind::UnknownState,
+        format!("the open descriptors of pid {pid} are unreadable: {error}"),
+    )
+    .with_detail("pid", u64::from(pid).into())
+    .with_detail("os_error", error.to_string().into())
+}
+
+/// Whether one reported path is the root itself or lies under it, compared by
+/// path components so `/a/bc` never matches the root `/a/b`.
+fn path_is_at_or_under(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
 }
 
 impl DirOps for MacOs {
@@ -542,6 +816,55 @@ impl DirOps for MacOs {
             .with_detail("os_error", error.to_string().into())
         })?;
         Ok(buffer)
+    }
+
+    fn remove_child(
+        &self,
+        parent: &DirHandle,
+        name: &str,
+        kind: RemoveKind,
+    ) -> Result<ChildRemoval> {
+        let directory = parent_descriptor(parent, name)?;
+        let raw = name_cstring(name)?;
+        let flags = match kind {
+            RemoveKind::File => 0,
+            RemoveKind::Directory => libc::AT_REMOVEDIR,
+        };
+        // SAFETY: `directory` is open for this call, `raw` is one NUL-terminated
+        // component and `flags` is either zero or libc's own directory flag, so
+        // no symbolic link at the leaf is ever followed.
+        if unsafe { libc::unlinkat(directory, raw.as_ptr(), flags) } == 0 {
+            return Ok(ChildRemoval::Removed);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ENOENT) => Ok(ChildRemoval::Absent),
+            Some(libc::ENOTEMPTY | libc::EEXIST) => Ok(ChildRemoval::NotEmpty),
+            _ => Err(removal_error(name, kind, error)),
+        }
+    }
+
+    fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<()> {
+        let directory = parent_descriptor(parent, from)?;
+        let source = name_cstring(from)?;
+        let target = name_cstring(to)?;
+        // SAFETY: both names are NUL-terminated components inside the same open
+        // directory, which is exactly what makes the rename atomic.
+        if unsafe { libc::renameat(directory, source.as_ptr(), directory, target.as_ptr()) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        let kind = match error.raw_os_error() {
+            Some(libc::EXDEV) => ErrorKind::VolumeMismatch,
+            Some(libc::ENOENT | libc::ENXIO | libc::EIO | libc::ENODEV) => ErrorKind::VolumeAbsent,
+            _ => ErrorKind::Io,
+        };
+        Err(
+            Error::new(kind, format!("cannot rename `{from}` to `{to}`: {error}"))
+                .with_detail("from", from.into())
+                .with_detail("to", to.into())
+                .with_detail("os_error", error.to_string().into()),
+        )
     }
 }
 
@@ -1022,5 +1345,30 @@ fn child_bound_error(name: &str, bytes: u64, cap: usize) -> Error {
 
 fn listing_error(error: io::Error) -> Error {
     Error::new(ErrorKind::Io, format!("cannot list the directory: {error}"))
+        .with_detail("os_error", error.to_string().into())
+}
+
+/// A removal the platform refused for a reason other than an entry that came
+/// back: a vanished volume stays `volume_absent`, and a leaf that turned into a
+/// directory when a file was expected is a containment refusal, because the
+/// whole-root delete never widens what it removes.
+fn removal_error(name: &str, kind: RemoveKind, error: io::Error) -> Error {
+    let (error_kind, message) = match error.raw_os_error() {
+        Some(libc::ENOENT | libc::ENXIO | libc::EIO | libc::ENODEV) => (
+            ErrorKind::VolumeAbsent,
+            format!("the volume holding `{name}` is not available: {error}"),
+        ),
+        Some(libc::ELOOP | libc::ENOTDIR) => (
+            ErrorKind::RefusedContainment,
+            format!("`{name}` changed into something this delete never removes: {error}"),
+        ),
+        Some(libc::EISDIR) if kind == RemoveKind::File => (
+            ErrorKind::RefusedContainment,
+            format!("`{name}` is a directory where a file was observed: {error}"),
+        ),
+        _ => (ErrorKind::Io, format!("cannot remove `{name}`: {error}")),
+    };
+    Error::new(error_kind, message)
+        .with_detail("name", name.into())
         .with_detail("os_error", error.to_string().into())
 }

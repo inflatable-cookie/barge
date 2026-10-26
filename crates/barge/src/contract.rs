@@ -41,6 +41,11 @@ pub const AREA_DECLARATION_CAP_BYTES: usize = 64 * 1024;
 pub const MARKER_CAP_BYTES: usize = 4 * 1024;
 /// The largest hold record. Every authoritative record is private and small.
 pub const HOLD_CAP_BYTES: usize = 4 * 1024;
+/// The largest intent journal record. It is one bounded record, like a marker.
+pub const INTENT_CAP_BYTES: usize = 4 * 1024;
+/// The row cap for intents read in one pass. A journal over this is unbounded
+/// work, so a caller reports the bound instead of the unfinished part.
+pub const INTENT_ROWS: usize = 4096;
 
 /// The describe document's schema string.
 pub const DESCRIBE_SCHEMA: &str = "barge.describe/1";

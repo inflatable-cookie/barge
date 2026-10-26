@@ -1075,6 +1075,47 @@ pub fn effective_folder(record: &VolumeRecord, declaration: &AreaDeclaration) ->
     Ok(declaration.folder.clone())
 }
 
+/// Open one area folder descriptor-relative from the verified mount root,
+/// creating nothing.
+///
+/// This is the walk a replay needs: the intent records `root_dir` and the folder
+/// it acted in and nothing more, so the folder is resolved again from the
+/// record's verified volume. `Ok(None)` means the folder is positively not
+/// there, which is a different fact from an unreadable one.
+pub fn open_folder(
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    record: &VolumeRecord,
+    root_dir: &str,
+    folder: &str,
+) -> Result<Option<(PathBuf, DirHandle)>> {
+    record.declared_durability()?;
+    let volume = VolumeRoot::open(dirs, facts, mounts, record)?;
+    let effective_uid = observer.effective_uid()?;
+    let device = volume.identity().device;
+    let base = volume.mount_point().to_path_buf();
+    let mut components = if root_dir.is_empty() {
+        Vec::new()
+    } else {
+        folder_components("root_dir", root_dir)?
+    };
+    components.extend(folder_components("folder", folder)?);
+    let walked = walk_folder(
+        dirs,
+        volume.into_handle(),
+        &components,
+        device,
+        &base,
+        effective_uid,
+    )?;
+    if !walked.exists() {
+        return Ok(None);
+    }
+    Ok(Some((walked.path, walked.handle)))
+}
+
 /// Create one owned root inside the resolved area.
 ///
 /// The area folder (and any missing component of it) is created as a plain
@@ -1480,73 +1521,81 @@ pub fn read_marker(
     root: &DirHandle,
     expectation: &MarkerExpectation<'_>,
 ) -> MarkerState {
+    read_marker_with_digest(dirs, root, expectation).0
+}
+
+/// Read one root's marker and the SHA-256 of the exact bytes read.
+///
+/// The reader compares no digest itself: the expected digest belongs to the
+/// caller that recorded the root. Custody and replay are that caller, and this
+/// is how they prove the marker is the one they were told about rather than a
+/// different file of the same shape.
+pub fn read_marker_with_digest(
+    dirs: &dyn DirOps,
+    root: &DirHandle,
+    expectation: &MarkerExpectation<'_>,
+) -> (MarkerState, Option<String>) {
     let facts = match dirs.child_facts(root, ROOT_MARKER_FILE) {
         Ok(Some(facts)) => facts,
-        Ok(None) => return MarkerState::Absent,
+        Ok(None) => return (MarkerState::Absent, None),
         Err(error) => {
-            return MarkerState::Unknown {
-                reason: error.to_string(),
-            }
+            return (
+                MarkerState::Unknown {
+                    reason: error.to_string(),
+                },
+                None,
+            )
         }
     };
+    let unknown = |reason: String| (MarkerState::Unknown { reason }, None);
     if facts.kind != EntryKind::File {
-        return MarkerState::Unknown {
-            reason: format!(
-                "the marker is a {}, and Barge only owns a regular file",
-                facts.kind.as_str()
-            ),
-        };
+        return unknown(format!(
+            "the marker is a {}, and Barge only owns a regular file",
+            facts.kind.as_str()
+        ));
     }
     if facts.uid != expectation.effective_uid {
-        return MarkerState::Unknown {
-            reason: format!(
-                "the marker is owned by uid {}, not this account's {}",
-                facts.uid, expectation.effective_uid
-            ),
-        };
+        return unknown(format!(
+            "the marker is owned by uid {}, not this account's {}",
+            facts.uid, expectation.effective_uid
+        ));
     }
     if !facts.is_private() {
-        return MarkerState::Unknown {
-            reason: format!("the marker's mode {:o} is not private", facts.mode),
-        };
+        return unknown(format!("the marker's mode {:o} is not private", facts.mode));
     }
     if facts.size > MARKER_CAP_BYTES as u64 {
-        return MarkerState::Unknown {
-            reason: format!(
-                "the marker is {} bytes, over the {MARKER_CAP_BYTES}-byte cap",
-                facts.size
-            ),
-        };
+        return unknown(format!(
+            "the marker is {} bytes, over the {MARKER_CAP_BYTES}-byte cap",
+            facts.size
+        ));
     }
     let bytes = match dirs.read_child_file(root, ROOT_MARKER_FILE, MARKER_CAP_BYTES) {
         Ok(Some(bytes)) => bytes,
-        Ok(None) => {
-            return MarkerState::Unknown {
-                reason: "the marker disappeared while it was read".to_owned(),
-            }
-        }
-        Err(error) => {
-            return MarkerState::Unknown {
-                reason: error.to_string(),
-            }
-        }
+        Ok(None) => return unknown("the marker disappeared while it was read".to_owned()),
+        Err(error) => return unknown(error.to_string()),
     };
+    let digest = sha256_hex(&bytes);
     let marker: RootMarker = match serde_json::from_slice(&bytes) {
         Ok(marker) => marker,
         Err(error) => {
-            return MarkerState::Unknown {
-                reason: format!(
-                    "the marker is not a `{}` document: {error}",
-                    crate::contract::ROOT_SCHEMA
-                ),
-            }
+            return unknown(format!(
+                "the marker is not a `{}` document: {error}",
+                crate::contract::ROOT_SCHEMA
+            ))
         }
     };
+    // The bytes were read, so the digest is a fact even when the marker does not
+    // validate where it was found: custody and replay carry the expected digest
+    // themselves, and a quarantined leaf's marker necessarily fails the path
+    // check after the rename.
     match marker.validate(expectation) {
-        Ok(()) => MarkerState::Owned(Box::new(marker)),
-        Err(error) => MarkerState::Unknown {
-            reason: error.to_string(),
-        },
+        Ok(()) => (MarkerState::Owned(Box::new(marker)), Some(digest)),
+        Err(error) => (
+            MarkerState::Unknown {
+                reason: error.to_string(),
+            },
+            Some(digest),
+        ),
     }
 }
 
@@ -2059,11 +2108,12 @@ pub struct HoldRecord {
 pub enum HoldState {
     /// The recorded process is positively the holder.
     Live,
-    /// The recorded process is positively gone (or the boot changed), so the
-    /// hold is stale.
+    /// The recorded process is positively gone, or another boot wrote the hold,
+    /// so the hold is stale.
     Stale,
-    /// The hold cannot be decided: unreadable, foreign-owned, unknown version or
-    /// a pid whose start identity is unreadable. Unknown is never stale.
+    /// The hold cannot be decided: unreadable, foreign-owned, unknown version, a
+    /// pid whose start identity is unreadable, or a live pid whose start identity
+    /// disagrees with the record. Unknown is never stale.
     Unknown,
 }
 
@@ -2471,8 +2521,13 @@ fn unknown_hold(
     )
 }
 
-/// Decide one hold: stale only when the recorded process positively disagrees
-/// with every recorded identity, unknown whenever a fact cannot be read.
+/// Decide one hold.
+///
+/// It is stale only when the recorded process is positively gone or another boot
+/// wrote it. A live pid whose start identity differs is *not* proved stale: the
+/// design treats the reused-pid case as unknown unless every recorded identity
+/// positively disagrees, and an unknown hold blocks deletion (stage 1 design,
+/// failure matrix). A fact that cannot be read is unknown, never stale.
 fn decide_hold(
     observer: &dyn ProcessObserver,
     record: &HoldRecord,
@@ -2503,9 +2558,9 @@ fn decide_hold(
         ),
         Ok(Some(start)) if start == record.process_start => (HoldState::Live, None),
         Ok(Some(start)) => (
-            HoldState::Stale,
+            HoldState::Unknown,
             Some(format!(
-                "pid {} is now start {start}, not the recorded {}",
+                "pid {} is now start {start}, not the recorded {}; a live pid whose start identity disagrees is not proved stale",
                 record.pid, record.process_start
             )),
         ),
@@ -2554,6 +2609,10 @@ pub struct RootObservation {
     /// The root directory's inode, when it was opened.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inode: Option<u64>,
+    /// The SHA-256 of the marker's exact bytes, when the marker is owned. A
+    /// caller that acts on the root compares this with what it re-reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_digest: Option<String>,
     /// When the marker says the root was created.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_ms: Option<u64>,
@@ -2660,7 +2719,7 @@ pub fn list_roots(
             effective_uid,
             now_ms,
         };
-        let marker = read_marker(dirs, &root, &expectation);
+        let (marker, marker_digest) = read_marker_with_digest(dirs, &root, &expectation);
         let holds = if state::validate_identifier("root_id", &entry.name).is_err() {
             HoldReading::empty()
         } else {
@@ -2682,6 +2741,7 @@ pub fn list_roots(
             &configured_path,
             entry.facts.modified_ms,
             marker,
+            marker_digest,
             &holds,
         ));
     }
@@ -2699,6 +2759,7 @@ fn observe_root(
     configured_path: &Path,
     directory_modified_ms: Option<u64>,
     marker: MarkerState,
+    marker_digest: Option<String>,
     holds: &HoldReading,
 ) -> RootObservation {
     let mut row = RootObservation {
@@ -2713,6 +2774,7 @@ fn observe_root(
         configured_path: configured_path.to_path_buf(),
         device: Some(root.identity().device.get()),
         inode: Some(root.identity().inode),
+        marker_digest,
         created_ms: None,
         last_activity_ms: None,
         idle: holds.is_idle(),
@@ -2754,6 +2816,7 @@ fn unreadable_root(name: &str, configured_path: &Path, reason: String) -> RootOb
         configured_path: configured_path.to_path_buf(),
         device: None,
         inode: None,
+        marker_digest: None,
         created_ms: None,
         last_activity_ms: None,
         // An unreadable root's holds are unknown, so it is never reported idle.
@@ -2881,8 +2944,9 @@ mod tests {
     use crate::digest::sha256_hex;
     use crate::error::{Error, ErrorKind, Result};
     use crate::os::{
-        AccountFacts, ChildListing, DeviceId, DirHandle, DirId, DirOps, EntryFacts, FileSystem,
-        MacOs, MountPoint, MountRoot, ProcessObserver, VolumeFacts, VolumeIdentity, VolumeUuid,
+        AccountFacts, ChildListing, DescriptorScan, DescriptorScanRequest, DeviceId, DirHandle,
+        DirId, DirOps, EntryFacts, FileSystem, MacOs, MountPoint, MountRoot, ProcessObserver,
+        VolumeFacts, VolumeIdentity, VolumeUuid,
     };
     use crate::registry::{
         Availability, Durability, FolderOverrides, RecordOrigin, RegistryDocument, RegistryWriter,
@@ -2989,6 +3053,18 @@ mod tests {
                 ));
             }
             Ok(self.processes.get(&pid).copied().flatten())
+        }
+
+        fn scan_open_descriptors(
+            &self,
+            _request: &DescriptorScanRequest<'_>,
+        ) -> Result<DescriptorScan> {
+            // S3's tests never ask for custody; S5's own tests inject the scan.
+            Ok(DescriptorScan::Complete {
+                processes: 0,
+                descriptors: 0,
+                open: Vec::new(),
+            })
         }
     }
 
@@ -3137,6 +3213,19 @@ mod tests {
 
         fn list_children(&self, parent: &DirHandle, max_names: usize) -> Result<ChildListing> {
             self.inner.list_children(parent, max_names)
+        }
+
+        fn remove_child(
+            &self,
+            parent: &DirHandle,
+            name: &str,
+            kind: crate::os::RemoveKind,
+        ) -> Result<crate::os::ChildRemoval> {
+            self.inner.remove_child(parent, name, kind)
+        }
+
+        fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<()> {
+            self.inner.rename_child(parent, from, to)
         }
 
         fn random_bytes(&self, length: usize) -> Result<Vec<u8>> {
@@ -4328,6 +4417,17 @@ mod tests {
             }
             fn list_children(&self, parent: &DirHandle, max_names: usize) -> Result<ChildListing> {
                 self.inner.list_children(parent, max_names)
+            }
+            fn remove_child(
+                &self,
+                parent: &DirHandle,
+                name: &str,
+                kind: crate::os::RemoveKind,
+            ) -> Result<crate::os::ChildRemoval> {
+                self.inner.remove_child(parent, name, kind)
+            }
+            fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<()> {
+                self.inner.rename_child(parent, from, to)
             }
             fn random_bytes(&self, length: usize) -> Result<Vec<u8>> {
                 let mut calls = self.calls.borrow_mut();
