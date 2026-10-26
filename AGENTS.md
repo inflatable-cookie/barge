@@ -4,7 +4,7 @@ Barge moves heavy, rebuildable developer data off the internal drive onto a dedi
 
 ## Ownership and work
 
-Repository: `inflatable-cookie/barge`. Planning, briefs, tasks and reviews belong in Queue once the `barge` project is registered there; do not create repository planning or status mirrors. Until then, changes are knowledge only.
+Repository: `inflatable-cookie/barge`, planned inside Queue project `oxide` and owned by the Oxide workspace (Tom, 2026-10-26); there is no separate Barge project, workspace or agent. Planning, briefs, tasks and reviews live in that Queue project; do not create repository planning or status mirrors. Product implementation needs an approved Queue brief and independent exact-head review, as in Oxide.
 
 Tom's scope and authority ruling lives in [vision](docs/knowledge/vision.md). Concepts, invariants and the Oxide boundary live in [architecture](docs/knowledge/architecture.md). Read [questions](docs/knowledge/questions.md) and [retirements](docs/knowledge/retired.toml) before planning.
 
