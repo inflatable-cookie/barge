@@ -111,8 +111,8 @@ Oxide references below point at that commit:
   and never a mount root).
 - `src/volume.rs` — `Binding`, `dir_at`, `verify`, `refuse_mount_root`.
 - `docs/knowledge/contracts/workflow.md` — "Pruning owned output roots": the
-  candidate rule, the operator list and the host automation that runs
-  preview-then-real.
+  candidate rule, the operator-list waiver of receipt-history completeness, and
+  the host automation that runs preview-then-real.
 
 Barge's own `os` layer at `0727376` already reads `ATTR_VOL_UUID` through an
 opened descriptor, refuses a non-APFS filesystem, refuses the boot volume, and
@@ -603,8 +603,8 @@ is deliberately compatible in both directions.
 | --- | --- | --- |
 | `/Volumes/<mount>/…` checkout with a recorded `checkout_volume_uuid` | anchor = the verified mount of that UUID; walk the components below it | Barge finds the mount by UUID, so a reconnect at another mount name still resolves |
 | a recorded checkout outside `/Volumes` | ancestor on `boot_data` (the internal drive) or on a `registered` volume | Oxide's registered-row rule, generalised: Barge accepts any registered volume it can verify, not only APFS or HFS by name |
-| `--operator-list` legacy exception: nearest existing ancestor on the boot Data volume, any missing ancestor tolerated | ancestor on `boot_data`; **a missing non-leaf ancestor is still `Unknown`** | Barge is stricter here on purpose: the operator list is a one-off waiver with a human in the loop, and a general primitive must not inherit it |
-| only the leaf may be `ENOENT` | the same | identical |
+| `--operator-list` | the same ancestry rule: ancestor on `boot_data`, only the leaf may be `ENOENT`; Barge carries no operator list | identical on absence: at the pin the list waives **receipt-history completeness** for the named legacy roots only, and their checkout's no-follow walk must still end in a leaf `ENOENT`. Barge needs no waiver because it keeps any root whose reference set is incomplete |
+| only the leaf may be `ENOENT`; a missing non-leaf ancestor is uncertainty, never absence | the same, for the same reason | identical |
 | no ownership or device check on a walk component; the volume proof is the local-volume check | the same | identical, and required: `/Users` and `/private` are root-owned and reach the Data volume through firmlinks, so either check on a component would refuse every real `/Users/...` checkout |
 | `Absent` requires the root's own identity, custody and no current selection | the same, as the [gate](#releasability-the-one-gate) | identical |
 | `diskutil`/`statfs` text | never identity; kernel facts through descriptors | stage 1's rule |
@@ -617,10 +617,16 @@ Rules that keep the handover safe:
 - Barge never writes an Oxide marker, receipt, registry row or tombstone. It
   reads `oxide.outputs.root/2` markers, `oxide.outputs.registry/2` rows and the
   receipts strictly, bounded, and reports them.
-- Where Oxide's own rule is stricter than Barge's (the operator list, receipt
-  completeness), Oxide's rule wins while Oxide owns the prune.
-- Where Barge's rule is stricter (missing ancestor), Barge keeps more, which is
-  the safe direction for a handover in progress.
+- Where Oxide's own rule is stricter than Barge's — the complete-receipt
+  requirement, and the operator list that can waive it for named legacy roots —
+  Oxide's rule wins while Oxide owns the prune.
+- Where the two rules agree, they agree exactly: leaf-only `ENOENT` with a missing
+  non-leaf ancestor kept on both sides, the boot Data volume proof for a legacy
+  checkout outside `/Volumes`, and the root's own identity, custody and current
+  selection checks. The one difference is the receipt-completeness waiver, which
+  Barge does not carry, so Barge keeps a root whose reference set it cannot read
+  completely where Oxide may prune it under an operator list — the safe direction
+  for a handover in progress.
 - The 91 legacy roots held by `ff13f2ef` stay held: they need an operator list in
   Oxide and an adoption decision in Barge, neither of which this contract
   authorizes. Oxide's own implementation of the absence rule (`40010b40`) stays
@@ -850,7 +856,7 @@ reports the unverified part as eligible.
 | Accept any mount that reports the UUID, ignoring duplicates | Two mounts of one UUID make "the volume" ambiguous; picking one silently is how a delete lands on the wrong copy. |
 | Refuse any volume whose UUID was ever seen twice | A reconnect legitimately re-uses a UUID after the old mount is gone; only *simultaneous* candidates are ambiguous. |
 | A per-volume receipt file on the drive as identity | A block-level clone copies the receipt, so it adds nothing a UUID and marker do not already give. |
-| Treat a missing ancestor as absence (the reaper's implicit behaviour, and Oxide's `--operator-list` waiver) | A renamed or deleted parent means the consumer path may have *moved*, and its outputs are still live there. A general primitive must not inherit a one-off human waiver. |
+| Treat a missing ancestor as absence (the reaper's implicit behaviour) | A renamed or deleted parent means the consumer path may have *moved*, and its outputs are still live there. `/Users`-shaped examples are ordinary: a renamed project directory is not a deleted checkout. Oxide's `checkout_absence` refuses it too, and the reaper's silence is not a rule to inherit. |
 | Require this user's ownership on every walked component | The ancestors of a real consumer path are root-owned by design (`/Users`, `/private`), so the rule would make every `/Users/...` checkout permanently undecidable. Ownership is checked on the root, where it means something; the walk proves containment and the volume proves locality. |
 | Require every walked component to be on the anchor's device | `/` is the read-only system volume and `/Users`, `/private` and `/Applications` reach the Data volume through firmlinks, so a real checkout always crosses a device boundary at the anchor. The volume proof is the local-volume check instead. |
 | Trust the plan's absence proof at effect time | The path can reappear between preview and effect, which is the ordinary case for a checkout being recreated. The proof is re-established. |
