@@ -478,11 +478,29 @@ pub trait ProcessObserver {
     ///
     /// The observation is the same-uid half of custody, not a kernel guarantee
     /// (stage 1 design, "Capability limits on macOS and APFS"): a process of
-    /// another uid, and one created after the scan, is outside it. A scan that
-    /// reaches its process, descriptor or time bound answers [`DescriptorScan::Bounded`],
-    /// which is unknown and never safe. An unreadable process or descriptor
-    /// entry is an error, also never safe.
+    /// another uid, and one created after the scan, is outside it. The one
+    /// process the request may exclude is the calling one, by its pid and the
+    /// start identity the caller read for it, and the implementation verifies
+    /// that identity before it skips the process; no other process is excluded.
+    /// A scan that reaches its process, descriptor or time bound answers
+    /// [`DescriptorScan::Bounded`], which is unknown and never safe. An
+    /// unreadable process or descriptor entry is an error, also never safe.
     fn scan_open_descriptors(&self, request: &DescriptorScanRequest<'_>) -> Result<DescriptorScan>;
+}
+
+/// The calling process a scan excludes from its own evidence.
+///
+/// Custody reads it once, by pid and by the start identity the kernel reports
+/// for it, and the platform re-reads that identity while it scans: the process
+/// is skipped only while the identity still matches, so a recycled pid belongs
+/// to another process and is observed like any other. The scan excludes nothing
+/// else, so another Barge process, its child or its parent is observed normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelfExclusion {
+    /// The calling process's own pid.
+    pub pid: u32,
+    /// The start identity the caller read for that pid.
+    pub start: u64,
 }
 
 /// What one bounded same-uid open-descriptor scan is asked to observe.
@@ -501,6 +519,12 @@ pub struct DescriptorScanRequest<'a> {
     pub max_descriptors: usize,
     /// How long the scan may take before it must answer "bounded".
     pub timeout: Duration,
+    /// The calling process to exclude, or `None` to exclude nothing. Custody
+    /// always names itself: the descriptors it holds for its own walk and its
+    /// own checks are not evidence about another writer. `None` is the
+    /// counterfactual the tests use to show what the exclusion prevents, and a
+    /// request without it can only make a verdict stricter.
+    pub self_exclusion: Option<SelfExclusion>,
 }
 
 /// One open descriptor found under the scanned root.

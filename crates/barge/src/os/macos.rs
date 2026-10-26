@@ -231,14 +231,49 @@ impl ProcessObserver for MacOs {
         let Some(info) = bsd_info(pid)? else {
             return Ok(None);
         };
-        Ok(Some(
-            info.pbi_start_tvsec
-                .saturating_mul(1_000_000)
-                .saturating_add(info.pbi_start_tvusec),
-        ))
+        Ok(Some(bsd_start(&info)))
     }
 
     fn scan_open_descriptors(&self, request: &DescriptorScanRequest<'_>) -> Result<DescriptorScan> {
+        // The whole system's pid list is read first; a list that fills the
+        // buffer is bounded, because a missing pid could hold the root open.
+        let Some(pids) = system_pids()? else {
+            return Ok(DescriptorScan::Bounded {
+                processes: 0,
+                descriptors: 0,
+                bound: "process list",
+            });
+        };
+        self.scan_pids(request, &pids)
+    }
+}
+
+impl MacOs {
+    /// Scan one known set of pids with the real descriptor enumeration, matching
+    /// and self-exclusion.
+    ///
+    /// The production path always passes the kernel's whole pid list. The unit
+    /// tests pass the two or three pids they own, because this platform answers
+    /// `EPERM` to `PROC_PIDTBSDINFO` for another account's processes: such an
+    /// entry is an unreadable fact (and so an `Unknown` custody verdict), which
+    /// is the scan's real behaviour but is not something a fixture can control.
+    /// Everything below the pid list — `PROC_PIDLISTFDS`,
+    /// `PROC_PIDFDVNODEPATHINFO`, the path match and the exclusion — is the
+    /// production code.
+    #[cfg(test)]
+    pub(crate) fn scan_open_descriptors_over(
+        &self,
+        request: &DescriptorScanRequest<'_>,
+        pids: &[u32],
+    ) -> Result<DescriptorScan> {
+        self.scan_pids(request, pids)
+    }
+
+    fn scan_pids(
+        &self,
+        request: &DescriptorScanRequest<'_>,
+        pids: &[u32],
+    ) -> Result<DescriptorScan> {
         let uid = self.effective_uid()?;
         let started = std::time::Instant::now();
         // The kernel reports canonical paths, so the root is matched under both
@@ -250,44 +285,14 @@ impl ProcessObserver for MacOs {
             }
         }
 
-        // The whole system's pid list is read first; a list that fills the
-        // buffer is bounded, because a missing pid could hold the root open.
-        let mut pids = vec![0i32; SCAN_PID_CAP];
-        let pids_bytes = pids.len().saturating_mul(std::mem::size_of::<i32>());
-        // SAFETY: `pids` is a writable slice whose exact byte length is passed,
-        // so the kernel writes only inside it and returns how many bytes it wrote.
-        let written = unsafe {
-            proc_listpids(
-                PROC_ALL_PIDS,
-                0,
-                pids.as_mut_ptr().cast(),
-                libc::c_int::try_from(pids_bytes).unwrap_or(libc::c_int::MAX),
-            )
-        };
-        if written <= 0 {
-            return Err(Error::new(
-                ErrorKind::UnknownState,
-                format!(
-                    "the process list could not be read: {}",
-                    io::Error::last_os_error()
-                ),
-            )
-            .with_detail("fact", "process list".into()));
-        }
-        let written = written as usize;
-        if written >= pids_bytes {
-            return Ok(DescriptorScan::Bounded {
-                processes: 0,
-                descriptors: 0,
-                bound: "process list",
-            });
-        }
-        let count = written / std::mem::size_of::<i32>();
-
         let mut processes = 0usize;
         let mut descriptors = 0usize;
         let mut open = Vec::new();
-        for pid in pids.into_iter().take(count) {
+        // Whether the process the request names as the calling one was found and
+        // skipped. An exclusion that never matched proves nothing about what it
+        // left out, so the scan answers unreadable rather than complete.
+        let mut self_excluded = false;
+        for pid in pids.iter().copied() {
             if started.elapsed() >= request.timeout {
                 return Ok(DescriptorScan::Bounded {
                     processes,
@@ -295,10 +300,6 @@ impl ProcessObserver for MacOs {
                     bound: "time",
                 });
             }
-            if pid <= 0 {
-                continue;
-            }
-            let pid = u32::try_from(pid).unwrap_or(0);
             let Some(info) = bsd_info(pid)? else {
                 // The process exited while it was observed: nothing can be held
                 // open by a process that is positively gone.
@@ -308,6 +309,29 @@ impl ProcessObserver for MacOs {
                 // A process of another uid is the named limit of this evidence,
                 // never a fact Barge claims.
                 continue;
+            }
+            if let Some(exclusion) = request.self_exclusion {
+                if pid == exclusion.pid {
+                    // The calling process's own descriptors are the walk's and
+                    // the checks', never evidence about another writer. The
+                    // skip is conditional on the identity read when the scan was
+                    // asked for: a reused pid is a different process.
+                    let start = bsd_start(&info);
+                    if start != exclusion.start {
+                        return Err(Error::new(
+                            ErrorKind::UnknownState,
+                            format!(
+                                "pid {pid} is the calling process, but its start identity is {start}, not the recorded {}; the scan cannot exclude itself",
+                                exclusion.start
+                            ),
+                        )
+                        .with_detail("pid", u64::from(pid).into())
+                        .with_detail("recorded_start", exclusion.start.into())
+                        .with_detail("actual_start", start.into()));
+                    }
+                    self_excluded = true;
+                    continue;
+                }
             }
             processes = processes.saturating_add(1);
             if processes > request.max_processes {
@@ -386,6 +410,18 @@ impl ProcessObserver for MacOs {
                 }
             }
         }
+        if let Some(exclusion) = request.self_exclusion {
+            if !self_excluded {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    format!(
+                        "the calling process pid {} was not observed in the process list, so the scan cannot prove what it excluded",
+                        exclusion.pid
+                    ),
+                )
+                .with_detail("pid", u64::from(exclusion.pid).into()));
+            }
+        }
         Ok(DescriptorScan::Complete {
             processes,
             descriptors,
@@ -397,6 +433,52 @@ impl ProcessObserver for MacOs {
 /// How many pids the scan reads from the kernel in one call. A system with more
 /// processes than this makes the scan bounded rather than incomplete.
 const SCAN_PID_CAP: usize = 8192;
+
+/// The kernel's whole pid list, or `Ok(None)` when the list filled the buffer,
+/// which is a bound rather than a complete list. An unreadable list is an error.
+fn system_pids() -> Result<Option<Vec<u32>>> {
+    let mut pids = vec![0i32; SCAN_PID_CAP];
+    let pids_bytes = pids.len().saturating_mul(std::mem::size_of::<i32>());
+    // SAFETY: `pids` is a writable slice whose exact byte length is passed, so
+    // the kernel writes only inside it and returns how many bytes it wrote.
+    let written = unsafe {
+        proc_listpids(
+            PROC_ALL_PIDS,
+            0,
+            pids.as_mut_ptr().cast(),
+            libc::c_int::try_from(pids_bytes).unwrap_or(libc::c_int::MAX),
+        )
+    };
+    if written <= 0 {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the process list could not be read: {}",
+                io::Error::last_os_error()
+            ),
+        )
+        .with_detail("fact", "process list".into()));
+    }
+    let written = written as usize;
+    if written >= pids_bytes {
+        return Ok(None);
+    }
+    let count = written / std::mem::size_of::<i32>();
+    Ok(Some(
+        pids.into_iter()
+            .take(count)
+            .filter(|pid| *pid > 0)
+            .map(|pid| u32::try_from(pid).unwrap_or(0))
+            .collect(),
+    ))
+}
+
+/// One process's start identity, from the facts already read for it.
+fn bsd_start(info: &libc::proc_bsdinfo) -> u64 {
+    info.pbi_start_tvsec
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbi_start_tvusec)
+}
 
 /// One process's BSD info, or `Ok(None)` when the kernel reports no such
 /// process. Any other failure is an unreadable fact.

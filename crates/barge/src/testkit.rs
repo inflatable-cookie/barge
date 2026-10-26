@@ -13,6 +13,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// The scratch directory AGENTS.md names for scratch writes when the Builds
+/// drive is present. Nothing is ever written to a fixed name inside it: every
+/// fixture is a fresh directory this process creates and removes.
+pub const SCRATCH_BASE: &str = "/Volumes/Builds/scratch/barge";
+
+/// The base a fixture that needs the real OS layer is created under.
+///
+/// AGENTS.md asks for scratch inside the Builds drive when it is present. When
+/// it is not, the platform's temporary directory is used, which is still a fresh
+/// directory per test rather than a fixed name.
+pub fn scratch_base() -> PathBuf {
+    let scratch = PathBuf::from(SCRATCH_BASE);
+    if scratch.is_dir() {
+        scratch
+    } else {
+        std::env::temp_dir()
+    }
+}
+
 /// A temporary directory that removes itself when the test ends.
 #[derive(Debug)]
 pub struct TempDir {
@@ -22,7 +41,15 @@ pub struct TempDir {
 impl TempDir {
     /// Create a fresh directory named after `label` and this process.
     pub fn new(label: &str) -> Self {
-        let base = std::env::temp_dir();
+        Self::under(&std::env::temp_dir(), label)
+    }
+
+    /// Create a fresh directory named after `label` and this process under
+    /// `base`, creating `base` when it is not there.
+    pub fn under(base: &Path, label: &str) -> Self {
+        if !base.is_dir() {
+            std::fs::create_dir_all(base).expect("the fixture base is created");
+        }
         for _ in 0..32 {
             let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let nanos = SystemTime::now()
@@ -530,7 +557,16 @@ pub struct VolumeFixture {
 impl VolumeFixture {
     /// A fresh fixture volume with an expendable record and no state yet.
     pub fn new(label: &str) -> Self {
-        let dir = TempDir::new(label);
+        Self::within(TempDir::new(label))
+    }
+
+    /// A fresh fixture volume under the scratch base (AGENTS.md), for a test
+    /// that exercises the real OS layer instead of injected facts.
+    pub fn under_scratch(label: &str) -> Self {
+        Self::within(TempDir::under(&scratch_base(), label))
+    }
+
+    fn within(dir: TempDir) -> Self {
         let root = dir.join("volume");
         std::fs::create_dir(&root).expect("the fixture volume root is created");
         let platform = crate::os::platform();

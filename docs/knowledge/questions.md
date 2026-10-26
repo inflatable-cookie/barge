@@ -32,3 +32,22 @@ Answer: macOS on APFS only for now, with an OS layer throughout so Linux can fol
 
 Status: answered 2026-10-26
 Answer: outside Barge's own folders and every declared area, not outside `root_dir` (design freeze d3e170db, O-004, matching Tom's ruling c80e2034). The Vault needs no layout change; see the [stage 1 design](contracts/stage1-design.md#open-design-issues).
+
+## Q-007 — Can a same-uid descriptor scan read every process it must decide?
+
+Status: open (found 2026-10-26 in barge#011, the S5 self-exclusion correction)
+Measured: on macOS 26.6.2 (25G83), `proc_pidinfo(PROC_PIDTBSDINFO)` answers `EPERM`
+for the 357 processes of another uid among 1328, because this account may not
+read another account's BSD facts. The scan reads that entry before it can apply
+its uid filter, so a whole-system scan on a multi-user machine is an unreadable
+process entry, and custody is `Unknown` for every root: the same "no delete ever
+proceeds" symptom barge#006 and barge#007 saw, from a second cause. The
+correction in this task (exclude the calling process's own descriptors) is
+necessary and is implemented; it is not sufficient on this machine.
+Proposed, for the architect: read each process's uid and start identity from
+`sysctl KERN_PROC_ALL`, which reports them for every process, and keep
+`proc_pidinfo`/`PROC_PIDLISTFDS` for the descriptors of same-uid processes only.
+That reads the same facts through a public interface, so no unknown becomes
+safe, but it changes the observation primitive the [stage 1 design](contracts/stage1-design.md#writer-custody-and-safe-deletion)
+names, which is why it is a decision, not a correction. Until it is decided, an
+unreadable process entry keeps meaning `Unknown`.

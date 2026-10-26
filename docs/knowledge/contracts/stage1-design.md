@@ -842,10 +842,15 @@ Safe(evidence)      -- authorizes swap or delete
 stale; the same-uid open-descriptor scan complete within its bound and empty for
 this root; the root's device, inode and marker digest equal to the observation
 the caller was given; the volume verified; and no pending intent naming another
-root. Any unreadable hold, an unreadable process entry, a scan that hits its
-entry or time bound, a foreign-uid holder, or a `lsof`-style diagnostic that
-errors makes the verdict `Unknown`, which is a refusal. Deletion and swap take a
-`Safe` value by type, so a caller cannot pass a boolean.
+root. The scan excludes the calling `barge` process's own descriptors — Barge
+holds descriptors inside the root for its own walk and its own checks, and those
+are not another writer — by its pid and the start identity read once and
+verified; no other process is excluded, so another `barge` process, its child or
+its parent holds a descriptor like anyone else. Any unreadable hold, an
+unreadable process entry, a scan that hits its entry or time bound, a foreign-uid
+holder, or a `lsof`-style diagnostic that errors makes the verdict `Unknown`,
+which is a refusal. Deletion and swap take a `Safe` value by type, so a caller
+cannot pass a boolean.
 
 Custody is taken before a link swap, before a root's quarantine rename, and
 before a link removal, and it is re-checked after the intent publish and before
@@ -1243,6 +1248,26 @@ Choices S5 made where this design left the mechanic to the slice:
   error, and an entry or time bound that is reached is `Bounded`. Both make the
   verdict `Unknown`. The concrete bounds are 4096 processes, 65 536 descriptors
   and 10 s per scan; a root carries at most its 64 holds. `lsof` is never read.
+- **The calling process excludes itself, and nothing else** (corrected here after
+  S6's spent diagnostic). Custody opens the area folder and the root for its own
+  walk and its own checks, so the first implementation's scan always found its
+  own handles inside the root and refused every CLI-driven delete. The request
+  now names the calling process by pid and by the start identity custody reads
+  once with `ProcessObserver::process_start`, and the platform re-reads that
+  identity while it scans: it skips the process only while the identity matches,
+  because a reused pid is a different process. A missing or mismatched identity,
+  or a calling process the pid list never showed, is `Unknown`, never a skip; a
+  skip that never happened proves nothing about what it left out. The `Safe`
+  evidence records `self_excluded: <pid>`, and `describe.custody` states the
+  exclusion beside the limits it does not cover. Everything else is unchanged: a
+  descriptor held by another same-uid process, another `barge` process, its child
+  or its parent is still `Unsafe`. The unit tests run the real macOS observer on
+  a fixture root under scratch, and the counterfactual removes the exclusion —
+  the same fixture, walked by the same real observer — and gets a refusal for the
+  calling process's own descriptor. An unreadable process entry still makes the
+  verdict `Unknown`, and on a multi-user machine another account's processes are
+  exactly that; [Q-007](../questions.md) records that measured limit and the
+  decision it needs.
 - **Hold decisions.** A hold is stale only when its process is positively gone or
   another boot wrote it. A live pid whose start identity differs is `Unknown`,
   not stale: the failure matrix's reused-pid row treats staleness as proved only

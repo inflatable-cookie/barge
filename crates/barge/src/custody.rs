@@ -8,7 +8,8 @@
 //!
 //! - every recorded hold for the root released or positively stale;
 //! - the same-uid descriptor scan complete within its bound and empty for the
-//!   root;
+//!   root, with the calling process's own descriptors excluded by pid and start
+//!   identity (the walk's and the checks' handles are not another writer);
 //! - the root's device, inode and marker digest equal to the observation the
 //!   caller was given;
 //! - the volume still verified; and
@@ -17,6 +18,8 @@
 //! A process of another uid, and a process created after the scan, is outside
 //! this evidence; that residual is named in [`capability_report`] and a wrong
 //! delete stays recoverable through the intent journal and quarantine rename.
+//! The scan excludes the calling `barge` process and nothing else: another Barge
+//! process, its child or its parent holds a descriptor like any other writer.
 //! `lsof` is never custody: it is external, unbounded and its silence is not a
 //! kernel guarantee, so nothing here reads it.
 //!
@@ -33,7 +36,7 @@ use crate::contract::HOLD_ROWS;
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
     DescriptorScan, DescriptorScanRequest, DeviceId, DirOps, MountRoot, ProcessObserver,
-    VolumeFacts, VolumeUuid,
+    SelfExclusion, VolumeFacts, VolumeUuid,
 };
 use crate::registry;
 use crate::state::{self, IntentRecord, StatePaths};
@@ -185,6 +188,10 @@ pub struct CustodyEvidence {
     pub processes: usize,
     /// How many descriptors the scan observed.
     pub descriptors: usize,
+    /// The calling process's own pid. The scan excluded that process's
+    /// descriptors, so this is the one process the evidence does not cover and
+    /// the only exclusion it made.
+    pub self_excluded: u32,
     /// When the verdict was decided.
     pub checked_ms: u64,
 }
@@ -425,6 +432,26 @@ fn decide(
     }
 
     // 4. The same-uid descriptor observation, complete within its bound.
+    //
+    //    The calling process holds descriptors inside the root for the walk and
+    //    for the checks that follow, so its own pid is excluded from the
+    //    evidence: read once here, with the start identity the kernel reports
+    //    for it, and verified by the platform as it scans. Nothing else is
+    //    excluded, and an identity that cannot be read or does not match is a
+    //    refusal, never a skip.
+    let self_pid = std::process::id();
+    let self_start = observer
+        .process_start(self_pid)
+        .map_err(|error| {
+            Refusal::Unknown(format!(
+                "the calling process's start identity is unreadable: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            Refusal::Unknown(format!(
+                "the calling process pid {self_pid} has no start identity, so its own descriptors cannot be excluded"
+            ))
+        })?;
     let scan = observer.scan_open_descriptors(&DescriptorScanRequest {
         root: &root_path,
         root_device: observed.device,
@@ -432,6 +459,10 @@ fn decide(
         max_processes: bounds.processes,
         max_descriptors: bounds.descriptors,
         timeout: bounds.timeout,
+        self_exclusion: Some(SelfExclusion {
+            pid: self_pid,
+            start: self_start,
+        }),
     });
     let (processes, descriptors) = match scan {
         Err(error) => {
@@ -475,6 +506,7 @@ fn decide(
         holds_stale: stale,
         processes,
         descriptors,
+        self_excluded: self_pid,
         checked_ms: state::now_ms(),
     })
 }
@@ -509,6 +541,7 @@ pub fn capability_report() -> CustodyReport {
         establishes: vec![
             "every recorded hold for the root is released or positively stale".to_owned(),
             "a bounded scan of this account's open descriptors is complete and finds none at or under the root".to_owned(),
+            "that scan excludes the calling barge process's own descriptors, by its pid and the start identity read once and verified, and no other process: another barge process, its child or its parent is observed like any other writer".to_owned(),
             "the root's device, inode and marker digest equal the observation the caller was given".to_owned(),
             "the volume still verifies as the registered one".to_owned(),
             "no pending intent names another root".to_owned(),
@@ -534,7 +567,10 @@ mod tests {
         PendingIntent, CAPABILITY,
     };
     use crate::area::RootKind;
-    use crate::os::{OpenDescriptor, VolumeUuid};
+    use crate::error::{Error, ErrorKind, Result};
+    use crate::os::{
+        DescriptorScan, DescriptorScanRequest, OpenDescriptor, ProcessObserver, VolumeUuid,
+    };
     use crate::testkit::{Faults, ScanMode, VolumeFixture, FIXTURE_BOOT, OTHER_UUID};
 
     struct Holder {
@@ -543,12 +579,172 @@ mod tests {
     }
 
     fn holder(label: &str) -> Holder {
-        let fixture = VolumeFixture::new(label);
+        build(VolumeFixture::new(label))
+    }
+
+    /// A holder whose fixture lives under the scratch base (AGENTS.md): the
+    /// real-observer tests run there.
+    fn real_holder(label: &str) -> Holder {
+        build(VolumeFixture::under_scratch(label))
+    }
+
+    fn build(fixture: VolumeFixture) -> Holder {
         fixture.register();
         let declaration = fixture.declaration("example/pool");
         let (root, _) = fixture.create_root(&fixture.record, &declaration, RootKind::AreaRoot);
         let observed = ObservedRoot::from_owned(&root, "", "example/pool");
         Holder { fixture, observed }
+    }
+
+    /// The real macOS observer over the pids a test owns.
+    fn real_observer(pids: Vec<u32>) -> PinnedProcesses {
+        PinnedProcesses::new(pids)
+    }
+
+    /// The real macOS observer, restricted to the pids a test owns.
+    ///
+    /// The descriptor enumeration, the path matching and the self-exclusion are
+    /// the production ones; only the pid list is pinned, because this platform
+    /// answers `EPERM` to the BSD facts of another account's processes, and one
+    /// such entry makes the whole-system scan `Unknown` by design.
+    struct PinnedProcesses {
+        inner: crate::os::MacOs,
+        pids: Vec<u32>,
+    }
+
+    impl PinnedProcesses {
+        fn new(pids: Vec<u32>) -> Self {
+            Self {
+                inner: crate::os::platform(),
+                pids,
+            }
+        }
+    }
+
+    impl ProcessObserver for PinnedProcesses {
+        fn effective_uid(&self) -> Result<u32> {
+            self.inner.effective_uid()
+        }
+
+        fn boot_identity(&self) -> Result<String> {
+            self.inner.boot_identity()
+        }
+
+        fn process_start(&self, pid: u32) -> Result<Option<u64>> {
+            self.inner.process_start(pid)
+        }
+
+        fn scan_open_descriptors(
+            &self,
+            request: &DescriptorScanRequest<'_>,
+        ) -> Result<DescriptorScan> {
+            self.inner.scan_open_descriptors_over(request, &self.pids)
+        }
+    }
+
+    /// A same-uid child process that holds a file under the root open, so the
+    /// scan has another writer to find. It is killed and reaped by [`Child`].
+    struct Child {
+        process: std::process::Child,
+    }
+
+    impl Child {
+        /// Spawn `/bin/sleep` with the file at `path` as its stdin, so the child
+        /// holds one descriptor at that vnode for as long as it runs.
+        fn holding(path: &std::path::Path) -> Self {
+            let held = std::fs::File::open(path).expect("the held payload opens");
+            let process = std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .stdin(std::process::Stdio::from(held))
+                .spawn()
+                .expect("a same-uid child holds the payload open");
+            Self { process }
+        }
+
+        fn pid(&self) -> u32 {
+            self.process.id()
+        }
+    }
+
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.process.kill();
+            let _ = self.process.wait();
+        }
+    }
+
+    /// The real observer with the self-exclusion removed: the counterfactual
+    /// that shows the exclusion is what makes the calling process's own handles
+    /// invisible.
+    struct NoSelfExclusion {
+        inner: crate::os::MacOs,
+        pids: Vec<u32>,
+    }
+
+    impl ProcessObserver for NoSelfExclusion {
+        fn effective_uid(&self) -> Result<u32> {
+            self.inner.effective_uid()
+        }
+
+        fn boot_identity(&self) -> Result<String> {
+            self.inner.boot_identity()
+        }
+
+        fn process_start(&self, pid: u32) -> Result<Option<u64>> {
+            self.inner.process_start(pid)
+        }
+
+        fn scan_open_descriptors(
+            &self,
+            request: &DescriptorScanRequest<'_>,
+        ) -> Result<DescriptorScan> {
+            self.inner.scan_open_descriptors_over(
+                &DescriptorScanRequest {
+                    self_exclusion: None,
+                    ..*request
+                },
+                &self.pids,
+            )
+        }
+    }
+
+    /// The real observer whose recorded start identity for the calling process
+    /// is wrong, which the platform must refuse rather than skip.
+    struct MismatchedSelf {
+        inner: crate::os::MacOs,
+        pids: Vec<u32>,
+    }
+
+    impl ProcessObserver for MismatchedSelf {
+        fn effective_uid(&self) -> Result<u32> {
+            self.inner.effective_uid()
+        }
+
+        fn boot_identity(&self) -> Result<String> {
+            self.inner.boot_identity()
+        }
+
+        fn process_start(&self, pid: u32) -> Result<Option<u64>> {
+            let start = self.inner.process_start(pid)?;
+            if pid == std::process::id() {
+                return start
+                    .map(|start| Some(start.saturating_add(1)))
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::UnknownState,
+                            "the calling process has no start identity",
+                        )
+                    });
+            }
+            Ok(start)
+        }
+
+        fn scan_open_descriptors(
+            &self,
+            request: &DescriptorScanRequest<'_>,
+        ) -> Result<DescriptorScan> {
+            self.inner.scan_open_descriptors_over(request, &self.pids)
+        }
     }
 
     impl Holder {
@@ -582,6 +778,15 @@ mod tests {
             pending: &[PendingIntent],
             observer: &crate::testkit::FakeObserver,
         ) -> CustodyVerdict {
+            self.take_with(pending, observer, CustodyBounds::default())
+        }
+
+        fn take_with(
+            &self,
+            pending: &[PendingIntent],
+            observer: &dyn ProcessObserver,
+            bounds: CustodyBounds,
+        ) -> CustodyVerdict {
             let faults = Faults::new();
             let facts = self.fixture.facts();
             let mounts = self.fixture.mounts();
@@ -593,8 +798,21 @@ mod tests {
                 &self.fixture.state,
                 &self.observed,
                 pending,
-                CustodyBounds::default(),
+                bounds,
             )
+        }
+
+        /// The root's absolute path, as the walk reached it.
+        fn root_path(&self) -> PathBuf {
+            self.observed.path.clone()
+        }
+
+        /// A payload file inside the root, whose open descriptor is a writer's
+        /// claim on the root.
+        fn payload(&self) -> PathBuf {
+            let path = self.root_path().join("payload.bin");
+            std::fs::write(&path, b"payload").expect("the payload is written");
+            path
         }
 
         fn safe(&self) -> CustodyVerdict {
@@ -808,6 +1026,14 @@ mod tests {
             .excludes
             .iter()
             .any(|fact| fact.contains("another uid")));
+        assert!(
+            report
+                .establishes
+                .iter()
+                .any(|fact| fact.contains("calling barge process")),
+            "the capability names the one exclusion the scan makes: {:?}",
+            report.establishes
+        );
     }
 
     #[test]
@@ -828,5 +1054,115 @@ mod tests {
             CustodyBounds::default(),
         );
         assert_eq!(verdict.name(), "unknown");
+    }
+
+    // ---- the real observer, on a fixture root under scratch ------------------
+
+    #[test]
+    fn the_real_observer_excludes_the_calling_process_own_handles() {
+        let holder = real_holder("custody-real-self");
+        let payload = holder.payload();
+        // The handles custody itself holds while it scans: a directory
+        // descriptor on the root and an open file inside it. Before the
+        // correction these were the evidence that refused every delete.
+        let root_handle = std::fs::File::open(holder.root_path()).expect("the root opens");
+        let file_handle = std::fs::File::open(&payload).expect("the payload opens");
+        let observer = real_observer(vec![std::process::id()]);
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+        let evidence = verdict.evidence().expect("the evidence");
+        assert_eq!(evidence.self_excluded, std::process::id());
+        assert_eq!(evidence.holds, 0);
+        // The handles were open across the scan, not closed before it.
+        assert!(root_handle.metadata().is_ok());
+        assert!(file_handle.metadata().is_ok());
+    }
+
+    #[test]
+    fn the_real_observer_still_finds_another_process_holding_the_root_open() {
+        let holder = real_holder("custody-real-other");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let observer = real_observer(vec![std::process::id(), child.pid()]);
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unsafe", "{:?}", verdict.reason());
+        assert!(
+            verdict
+                .reason()
+                .unwrap_or_default()
+                .contains(&child.pid().to_string()),
+            "the refusal names the other holder: {:?}",
+            verdict.reason()
+        );
+    }
+
+    #[test]
+    fn the_real_observer_without_the_exclusion_refuses_on_the_calling_process() {
+        let holder = real_holder("custody-real-counterfactual");
+        let payload = holder.payload();
+        let handle = std::fs::File::open(&payload).expect("the payload opens");
+        let observer = NoSelfExclusion {
+            inner: crate::os::platform(),
+            pids: vec![std::process::id()],
+        };
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unsafe", "{:?}", verdict.reason());
+        assert!(
+            verdict
+                .reason()
+                .unwrap_or_default()
+                .contains(&std::process::id().to_string()),
+            "without the exclusion the caller's own descriptor refuses it: {:?}",
+            verdict.reason()
+        );
+        assert!(handle.metadata().is_ok());
+    }
+
+    #[test]
+    fn a_real_self_exclusion_that_mismatches_is_unknown() {
+        let holder = real_holder("custody-real-mismatch");
+        holder.payload();
+        let observer = MismatchedSelf {
+            inner: crate::os::platform(),
+            pids: vec![std::process::id()],
+        };
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        assert!(verdict
+            .reason()
+            .unwrap_or_default()
+            .contains("start identity"));
+        assert!(verdict.clone().into_evidence().is_err(), "unknown refuses");
+    }
+
+    #[test]
+    fn a_real_forced_process_bound_is_unknown() {
+        let holder = real_holder("custody-real-bound");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let observer = real_observer(vec![std::process::id(), child.pid()]);
+        let bounds = CustodyBounds {
+            processes: 0,
+            ..CustodyBounds::default()
+        };
+        let verdict = holder.take_with(&[], &observer, bounds);
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        assert!(verdict.reason().unwrap_or_default().contains("bound"));
+    }
+
+    #[test]
+    fn a_real_self_exclusion_the_scan_never_saw_is_unknown() {
+        let holder = real_holder("custody-real-unseen");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        // The calling process is not in the pid list at all, so the scan cannot
+        // prove what it left out and must refuse.
+        let observer = real_observer(vec![child.pid()]);
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        assert!(verdict
+            .reason()
+            .unwrap_or_default()
+            .contains("not observed"));
     }
 }
