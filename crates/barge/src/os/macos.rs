@@ -15,13 +15,14 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::facts::{
     AccountFacts, ChildEntry, ChildListing, ChildRemoval, DescriptorScan, DescriptorScanRequest,
     DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, FileSystem, MountPoint, MountRoot,
-    OpenDescriptor, ProcessIdentity, ProcessObserver, RemoveKind, VolumeFacts, VolumeIdentity,
-    VolumeUuid,
+    OpenDescriptor, ProcessIdentity, ProcessObserver, RemoveKind, RetriedUnreadable,
+    RetryResolution, VolumeFacts, VolumeIdentity, VolumeUuid, RETRY_RECORDS,
 };
 
 /// The parent every managed volume mounts directly under.
@@ -59,6 +60,28 @@ const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
 /// platform's own open-file limit is far below this, so reaching it means the
 /// observation cannot be complete.
 const SCAN_DESCRIPTORS_PER_PROCESS: usize = 4096;
+
+/// The backoff before each re-observation of one process whose descriptor
+/// listing answered `EPERM`. The settle is short on purpose: the answers it
+/// settles are intermittent, and a real refusal must still refuse quickly.
+const EPERM_BACKOFFS: [Duration; 3] = [
+    Duration::from_millis(25),
+    Duration::from_millis(75),
+    Duration::from_millis(100),
+];
+
+/// The most time one process's `EPERM` may be re-observed for, always inside the
+/// scan's own overall time bound. It is larger than the backoffs above, so the
+/// retry count is what normally stops a persistent answer.
+const EPERM_SETTLE_WINDOW: Duration = Duration::from_millis(250);
+
+/// The backoff schedule this build retries a same-uid `EPERM` on. A test that
+/// states an empty schedule is the counterfactual: the same answer that the
+/// retry settles then refuses at once.
+#[cfg(test)]
+pub(crate) fn retry_schedule() -> &'static [Duration] {
+    &EPERM_BACKOFFS
+}
 
 // `proc_pidfdinfo` is the one libproc call the descriptor scan needs; `libc`
 // declares it not at all, so the seam declares it itself. The process table is
@@ -240,7 +263,7 @@ impl ProcessObserver for MacOs {
             });
         };
         let table: Vec<ProcessIdentity> = table.into_iter().map(|row| row.identity).collect();
-        self.scan_processes(request, &table)
+        self.scan_processes(request, &table, &EPERM_BACKOFFS, &mut [])
     }
 }
 
@@ -260,16 +283,38 @@ impl MacOs {
         request: &DescriptorScanRequest<'_>,
         table: &[ProcessIdentity],
     ) -> Result<DescriptorScan> {
-        self.scan_processes(request, table)
+        self.scan_processes(request, table, &EPERM_BACKOFFS, &mut [])
+    }
+
+    /// Scan one known process table with the real descriptor enumeration, the
+    /// real identity re-observation, a stated backoff schedule and a test's
+    /// stated `EPERM` answers.
+    ///
+    /// The production path states nothing. A test states an `EPERM` sequence so
+    /// the bounded re-observation of a transient answer is exercised without the
+    /// kernel having to produce one: the classification, the identity re-read,
+    /// the backoff, the retry bound and the descriptor reads are all the
+    /// production ones.
+    #[cfg(test)]
+    pub(crate) fn scan_open_descriptors_with(
+        &self,
+        request: &DescriptorScanRequest<'_>,
+        table: &[ProcessIdentity],
+        backoffs: &[Duration],
+        faults: &mut [StatedListing],
+    ) -> Result<DescriptorScan> {
+        self.scan_processes(request, table, backoffs, faults)
     }
 
     fn scan_processes(
         &self,
         request: &DescriptorScanRequest<'_>,
         table: &[ProcessIdentity],
+        backoffs: &[Duration],
+        faults: &mut [StatedListing],
     ) -> Result<DescriptorScan> {
         let uid = self.effective_uid()?;
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         // The kernel reports canonical paths, so the root is matched under both
         // the spelling the walk reached and the one the filesystem resolves.
         let mut roots = vec![request.root.to_path_buf()];
@@ -282,6 +327,8 @@ impl MacOs {
         let mut processes = 0usize;
         let mut descriptors = 0usize;
         let mut foreign = 0usize;
+        let mut retried_unreadable = 0usize;
+        let mut retried: Vec<RetriedUnreadable> = Vec::new();
         let mut open = Vec::new();
         // Whether the process the request names as the calling one was found and
         // skipped. An exclusion that never matched proves nothing about what it
@@ -337,6 +384,39 @@ impl MacOs {
                     continue;
                 }
             }
+            // A listing the kernel answers `EPERM` for is re-observed by
+            // identity before it is decided, never assumed: the count says how
+            // many processes needed it and the bounded record says which ones
+            // and how each resolved.
+            let settled =
+                self.settle_descriptors(identity, uid, started, request.timeout, backoffs, faults)?;
+            if let Some(record) = settled.record {
+                retried_unreadable = retried_unreadable.saturating_add(1);
+                if retried.len() < RETRY_RECORDS {
+                    retried.push(record);
+                }
+            }
+            let fds = match settled.listing {
+                SettledListing::Listed(fds) => fds,
+                // The kernel reports no such process: it is positively gone, so
+                // nothing it held is open.
+                SettledListing::Gone => continue,
+                // The pid now names another account's process: the named blind
+                // spot, counted and reported, never inspected.
+                SettledListing::Foreign => {
+                    foreign = foreign.saturating_add(1);
+                    continue;
+                }
+                // The scan's own time bound would have been crossed by another
+                // retry, so the observation cannot be completed.
+                SettledListing::Bounded => {
+                    return Ok(DescriptorScan::Bounded {
+                        processes,
+                        descriptors,
+                        bound: "time",
+                    })
+                }
+            };
             processes = processes.saturating_add(1);
             if processes > request.max_processes {
                 return Ok(DescriptorScan::Bounded {
@@ -345,58 +425,14 @@ impl MacOs {
                     bound: "processes",
                 });
             }
-
-            let mut fds = vec![
-                libc::proc_fdinfo {
-                    proc_fd: 0,
-                    proc_fdtype: 0,
-                };
-                SCAN_DESCRIPTORS_PER_PROCESS
-            ];
-            let fds_bytes = fds
-                .len()
-                .saturating_mul(std::mem::size_of::<libc::proc_fdinfo>());
-            // `proc_pidinfo` answers zero bytes on failure and leaves the reason
-            // in errno, so the error is cleared first and read after: a process
-            // that holds no descriptors at all also answers zero bytes. Reading
-            // zero bytes as "nothing open" without that distinction would turn
-            // an unreadable process into evidence of absence.
-            // SAFETY: `__error` returns this thread's errno cell, which is
-            // writable for this thread and outlives the call.
-            unsafe { *libc::__error() = 0 };
-            // SAFETY: `fds` is a writable slice whose exact byte length is
-            // passed, so the kernel writes only inside it.
-            let written = unsafe {
-                libc::proc_pidinfo(
-                    libc::c_int::try_from(pid).unwrap_or(libc::c_int::MAX),
-                    libc::PROC_PIDLISTFDS,
-                    0,
-                    fds.as_mut_ptr().cast(),
-                    libc::c_int::try_from(fds_bytes).unwrap_or(libc::c_int::MAX),
-                )
-            };
-            if written <= 0 {
-                let error = io::Error::last_os_error();
-                match error.raw_os_error() {
-                    // The kernel reports no such process: it is positively gone,
-                    // so nothing it held is open.
-                    Some(libc::ESRCH) => continue,
-                    // No error at all: the process genuinely holds no
-                    // descriptors.
-                    Some(0) | None => continue,
-                    _ => return Err(unreadable_descriptors(pid, &error)),
-                }
-            }
-            let written = written as usize;
-            if written >= fds_bytes {
+            if fds.len() >= SCAN_DESCRIPTORS_PER_PROCESS {
                 return Ok(DescriptorScan::Bounded {
                     processes,
                     descriptors,
                     bound: "descriptors per process",
                 });
             }
-            let fd_count = written / std::mem::size_of::<libc::proc_fdinfo>();
-            for fd in fds.into_iter().take(fd_count) {
+            for fd in fds {
                 if started.elapsed() >= request.timeout {
                     return Ok(DescriptorScan::Bounded {
                         processes,
@@ -443,9 +479,332 @@ impl MacOs {
             processes,
             descriptors,
             foreign,
+            retried_unreadable,
+            retried,
             open,
         })
     }
+
+    /// One same-uid process's descriptor listing, settling a transient `EPERM`
+    /// by bounded identity re-observation.
+    ///
+    /// A listing the kernel answers `EPERM` for is never turned into evidence of
+    /// absence, and elapsed time is never taken as proof that it cleared (barge#012,
+    /// found by barge#007's owner-context diagnostic: the cause of a same-uid
+    /// `EPERM` is not established). The scan re-reads the process's kernel
+    /// identity — pid, start time and effective uid — and lists again after a
+    /// short backoff, once per entry in `backoffs`, inside [`EPERM_SETTLE_WINDOW`]
+    /// and inside the scan's own time bound. It settles
+    /// only on a positive fact: a later listing, the kernel reporting no such
+    /// pid, a changed start identity (a different process, re-evaluated under
+    /// this same rule inside the same budget), or a changed effective uid (the
+    /// named blind spot, ruling bcaa83d8). The same identity still answering
+    /// `EPERM` after its retries is unreadable, which is a refusal.
+    fn settle_descriptors(
+        &self,
+        classified: ProcessIdentity,
+        uid: u32,
+        started: Instant,
+        timeout: Duration,
+        backoffs: &[Duration],
+        faults: &mut [StatedListing],
+    ) -> Result<Settled> {
+        let pid = classified.pid;
+        let settle_started = Instant::now();
+        let mut start = classified.start;
+        let mut retries = 0usize;
+        let mut record = RetriedUnreadable {
+            pid,
+            command: None,
+            start,
+            errnos: Vec::new(),
+            identity_changes: 0,
+            resolution: RetryResolution::Unreadable,
+        };
+        loop {
+            let listing = match stated_errno(faults, pid) {
+                Some(errno) => DescriptorListing::Unreadable(io::Error::from_raw_os_error(errno)),
+                None => self.list_descriptors(pid),
+            };
+            match listing {
+                DescriptorListing::Listed(fds) => {
+                    if record.errnos.is_empty() {
+                        return Ok(Settled {
+                            listing: SettledListing::Listed(fds),
+                            record: None,
+                        });
+                    }
+                    record.resolution = RetryResolution::Listed;
+                    return Ok(Settled {
+                        listing: SettledListing::Listed(fds),
+                        record: Some(record),
+                    });
+                }
+                DescriptorListing::Gone => {
+                    if record.errnos.is_empty() {
+                        return Ok(Settled {
+                            listing: SettledListing::Gone,
+                            record: None,
+                        });
+                    }
+                    record.resolution = RetryResolution::Gone;
+                    return Ok(Settled {
+                        listing: SettledListing::Gone,
+                        record: Some(record),
+                    });
+                }
+                DescriptorListing::Unreadable(error) => {
+                    // Only `EPERM` is the intermittent answer this rule is about.
+                    // Every other unreadable listing is unknown immediately, as
+                    // it was before.
+                    if error.raw_os_error() != Some(libc::EPERM) {
+                        return Err(unreadable_descriptors(pid, &error));
+                    }
+                    record.errnos.push(libc::EPERM);
+                    // The positive fact: what the kernel's own table reports for
+                    // this pid now. Elapsed time decides nothing here.
+                    let Some(now) = self.reobserve_identity(pid, faults)? else {
+                        // The kernel reports no such pid: it is positively gone,
+                        // and a gone process holds no descriptors.
+                        record.resolution = RetryResolution::Gone;
+                        return Ok(Settled {
+                            listing: SettledListing::Gone,
+                            record: Some(record),
+                        });
+                    };
+                    if record.command.is_none() {
+                        record.command = Some(now.command);
+                    }
+                    match now.identity.effective_uid {
+                        Some(other) if other != uid => {
+                            // The pid now names another account's process: the
+                            // named blind spot, counted and reported, never
+                            // inspected (Tom, 2026-10-26, ruling bcaa83d8).
+                            record.resolution = RetryResolution::Foreign;
+                            return Ok(Settled {
+                                listing: SettledListing::Foreign,
+                                record: Some(record),
+                            });
+                        }
+                        Some(_) => {}
+                        None => {
+                            return Err(Error::new(
+                                ErrorKind::UnknownState,
+                                format!(
+                                    "pid {pid} has no readable effective uid, so its unreadable descriptors cannot be settled"
+                                ),
+                            )
+                            .with_detail("pid", u64::from(pid).into()));
+                        }
+                    }
+                    // A changed start identity means a different process now has
+                    // the pid: it is re-evaluated under this same rule, inside
+                    // this same bounded budget, so a churning pid can never keep
+                    // the scan busy.
+                    if now.identity.start != start {
+                        record.identity_changes = record.identity_changes.saturating_add(1);
+                        start = now.identity.start;
+                    }
+                    let Some(backoff) = backoffs.get(retries).copied() else {
+                        record.resolution = RetryResolution::Unreadable;
+                        return Err(still_unreadable(&record, &error));
+                    };
+                    if settle_started.elapsed().saturating_add(backoff) >= EPERM_SETTLE_WINDOW {
+                        record.resolution = RetryResolution::Unreadable;
+                        return Err(still_unreadable(&record, &error));
+                    }
+                    if started.elapsed().saturating_add(backoff) >= timeout {
+                        record.resolution = RetryResolution::Bounded;
+                        return Ok(Settled {
+                            listing: SettledListing::Bounded,
+                            record: Some(record),
+                        });
+                    }
+                    std::thread::sleep(backoff);
+                    retries = retries.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// The kernel's own identity for one pid, with any identity a test states.
+    ///
+    /// `Ok(None)` is the kernel reporting no such process, which is the positive
+    /// fact a gone process is settled on.
+    fn reobserve_identity(
+        &self,
+        pid: u32,
+        faults: &[StatedListing],
+    ) -> Result<Option<KinfoProcess>> {
+        let Some(mut now) = kinfo_process(pid)? else {
+            return Ok(None);
+        };
+        if let Some(stated) = faults.iter().find(|stated| stated.pid == pid) {
+            if let Some(start) = stated.start {
+                now.identity.start = start;
+            }
+            if let Some(uid) = stated.uid {
+                now.identity.effective_uid = Some(uid);
+            }
+        }
+        Ok(Some(now))
+    }
+
+    /// One process's descriptors, as `PROC_PIDLISTFDS` answers them.
+    fn list_descriptors(&self, pid: u32) -> DescriptorListing {
+        let mut fds = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0,
+            };
+            SCAN_DESCRIPTORS_PER_PROCESS
+        ];
+        let fds_bytes = fds
+            .len()
+            .saturating_mul(std::mem::size_of::<libc::proc_fdinfo>());
+        // `proc_pidinfo` answers zero bytes on failure and leaves the reason in
+        // errno, so the error is cleared first and read after: a process that
+        // holds no descriptors at all also answers zero bytes. Reading zero
+        // bytes as "nothing open" without that distinction would turn an
+        // unreadable process into evidence of absence.
+        // SAFETY: `__error` returns this thread's errno cell, which is writable
+        // for this thread and outlives the call.
+        unsafe { *libc::__error() = 0 };
+        // SAFETY: `fds` is a writable slice whose exact byte length is passed,
+        // so the kernel writes only inside it.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                libc::c_int::try_from(pid).unwrap_or(libc::c_int::MAX),
+                libc::PROC_PIDLISTFDS,
+                0,
+                fds.as_mut_ptr().cast(),
+                libc::c_int::try_from(fds_bytes).unwrap_or(libc::c_int::MAX),
+            )
+        };
+        if written <= 0 {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                // The kernel reports no such process: it is positively gone, so
+                // nothing it held is open.
+                Some(libc::ESRCH) => DescriptorListing::Gone,
+                // No error at all: the process genuinely holds no descriptors.
+                Some(0) | None => DescriptorListing::Listed(Vec::new()),
+                _ => DescriptorListing::Unreadable(error),
+            };
+        }
+        let written = written as usize;
+        if written >= fds_bytes {
+            // The buffer filled, so the listing cannot be complete. The caller
+            // answers the per-process bound.
+            return DescriptorListing::Listed(fds);
+        }
+        fds.truncate(written / std::mem::size_of::<libc::proc_fdinfo>());
+        DescriptorListing::Listed(fds)
+    }
+}
+
+/// One descriptor listing's answer for one process.
+#[derive(Debug)]
+enum DescriptorListing {
+    /// The process's descriptors, listed inside the per-process buffer.
+    Listed(Vec<libc::proc_fdinfo>),
+    /// The kernel reports no such process.
+    Gone,
+    /// The listing could not be read, with the kernel's own reason. `EPERM` is
+    /// the intermittent answer the scan re-observes; every other reason is
+    /// unknown at once.
+    Unreadable(io::Error),
+}
+
+/// What one same-uid process's descriptor listing settled to, and the bounded
+/// record of the re-observation it took to get there.
+#[derive(Debug)]
+struct Settled {
+    listing: SettledListing,
+    record: Option<RetriedUnreadable>,
+}
+
+/// A settled descriptor listing. Only [`Listed`](Self::Listed) carries
+/// descriptors; every other answer is a resolved fact, never an assumption.
+#[derive(Debug)]
+enum SettledListing {
+    Listed(Vec<libc::proc_fdinfo>),
+    Gone,
+    Foreign,
+    Bounded,
+}
+
+/// What a test states about one process's descriptor listing.
+///
+/// The production scan states nothing: [`MacOs::scan_open_descriptors`] passes an
+/// empty list, so every answer a real scan acts on comes from the kernel. A test
+/// states the errno sequence the listing gives and, when it needs one, a
+/// different start identity or effective uid for the re-observation, which is how
+/// the intermittent, persistent and reused-pid rules are exercised without the
+/// kernel having to produce them.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StatedListing {
+    /// The pid the statement is about.
+    pub(crate) pid: u32,
+    /// The errno of each descriptor listing, in order, before the kernel's own
+    /// answer. `EPERM` is the answer the scan re-observes; any other entry is
+    /// refused at once, exactly as a real one would be.
+    pub(crate) errnos: Vec<i32>,
+    /// A start identity the re-observation reports instead of the kernel's.
+    pub(crate) start: Option<u64>,
+    /// An effective uid the re-observation reports instead of the kernel's.
+    pub(crate) uid: Option<u32>,
+}
+
+/// The errno a test states for this process's next listing, consuming it. A
+/// production scan states nothing, so it always answers `None` and every listing
+/// comes from the kernel.
+fn stated_errno(faults: &mut [StatedListing], pid: u32) -> Option<i32> {
+    let stated = faults.iter_mut().find(|stated| stated.pid == pid)?;
+    if stated.errnos.is_empty() {
+        return None;
+    }
+    Some(stated.errnos.remove(0))
+}
+
+/// The refusal for a same-uid process whose descriptor listing still answers
+/// `EPERM` after its bounded re-observation.
+///
+/// The errno sequence it was given, the identity it belongs to and the command
+/// are recorded, because unknown is a refusal and its evidence is what lets the
+/// next native diagnostic tell an intermittent answer from a persistent one.
+fn still_unreadable(record: &RetriedUnreadable, error: &io::Error) -> Error {
+    let described = match record.command.as_deref() {
+        Some(command) => format!("`{command}`"),
+        None => "an unnamed process".to_owned(),
+    };
+    let retries = record.errnos.len().saturating_sub(1);
+    Error::new(
+        ErrorKind::UnknownState,
+        format!(
+            "the open descriptors of {described} (pid {}, start {}) are still unreadable: {error} on {} attempts (retries: {retries})",
+            record.pid,
+            record.start,
+            record.errnos.len()
+        ),
+    )
+    .with_detail("pid", u64::from(record.pid).into())
+    .with_detail("command", record.command.clone().unwrap_or_default().into())
+    .with_detail("start", record.start.into())
+    .with_detail(
+        "errnos",
+        record
+            .errnos
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+            .into(),
+    )
+    .with_detail(
+        "identity_changes",
+        u64::try_from(record.identity_changes).unwrap_or(u64::MAX).into(),
+    )
 }
 
 /// How many processes the scan reads from the kernel's table before it answers
@@ -453,9 +812,9 @@ impl MacOs {
 const SCAN_PID_CAP: usize = 8192;
 
 /// `sizeof(struct kinfo_proc)` from `<sys/sysctl.h>` on this platform, and the
-/// offsets of the four fields this layer reads. The struct between them is left
+/// offsets of the five fields this layer reads. The struct between them is left
 /// opaque: this build reads the start time (a `timeval` at the head of the
-/// exported union), the pid, the command name and the effective uid, and nothing
+/// exported union), the pid, the command name, the effective uid and nothing
 /// else.
 ///
 /// A hard-coded table of offsets is only safe because the read checks itself:
@@ -467,11 +826,103 @@ const KINFO_PROC_SIZE: usize = 648;
 const KINFO_START_SEC_OFFSET: usize = 0;
 const KINFO_START_USEC_OFFSET: usize = 8;
 const KINFO_PID_OFFSET: usize = 40;
-#[cfg(test)]
 const KINFO_COMMAND_OFFSET: usize = 243;
-#[cfg(test)]
 const KINFO_COMMAND_BYTES: usize = 17;
 const KINFO_UID_OFFSET: usize = 420;
+
+/// One process's identity and command name from the kernel's own table.
+///
+/// The identity is what a re-observation decides on; the command name is recorded
+/// only for a process whose descriptor listing answered `EPERM`, which is why it
+/// is read for that one pid rather than for every process in a scan.
+#[derive(Debug)]
+struct KinfoProcess {
+    identity: ProcessIdentity,
+    command: String,
+}
+
+/// One process's kernel identity through `KERN_PROC_PID`, or `Ok(None)` when the
+/// kernel reports no such process.
+///
+/// This is the positive fact an intermittent `EPERM` is settled against. The
+/// table reports every process's pid, start time and effective uid without
+/// inspecting the process, so a pid that now names another account's process is
+/// classified rather than refused (ruling bcaa83d8).
+fn kinfo_process(pid: u32) -> Result<Option<KinfoProcess>> {
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        libc::c_int::try_from(pid).unwrap_or(libc::c_int::MAX),
+    ];
+    let mut size = 0usize;
+    // SAFETY: the size query passes a null buffer with a writable size, which is
+    // the documented first half of a `sysctl` read.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            u32::try_from(mib.len()).unwrap_or(u32::MAX),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(process_table_error("for one pid could not be read"));
+    }
+    // The size query's answer is an estimate: this platform returns room for a
+    // few entries even for one pid, and no bytes for a pid it does not have. The
+    // read below is what says how many entries the kernel actually wrote, so the
+    // buffer is that estimate with room for the one entry that is asked for.
+    let mut buffer = vec![0u8; size.max(KINFO_PROC_SIZE)];
+    let mut written = buffer.len();
+    // SAFETY: `buffer` is a writable allocation of exactly `written` bytes and
+    // `mib` describes the one-pid request, so the kernel writes only inside it.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            u32::try_from(mib.len()).unwrap_or(u32::MAX),
+            buffer.as_mut_ptr().cast(),
+            &mut written,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(process_table_error("for one pid could not be read"));
+    }
+    // The process can exit between the size query and the read, and a pid the
+    // kernel does not have answers no bytes at all.
+    if written == 0 {
+        return Ok(None);
+    }
+    if written != KINFO_PROC_SIZE {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the kernel returned {written} bytes for pid {pid}, not one {KINFO_PROC_SIZE}-byte entry"
+            ),
+        )
+        .with_detail("pid", u64::from(pid).into()));
+    }
+    let identity = parse_identity(&buffer)?;
+    if identity.pid != pid {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the kernel answered pid {pid} with the entry of pid {}",
+                identity.pid
+            ),
+        )
+        .with_detail("pid", u64::from(pid).into())
+        .with_detail("answered_pid", u64::from(identity.pid).into()));
+    }
+    Ok(Some(KinfoProcess {
+        identity,
+        command: entry_command(&buffer),
+    }))
+}
 
 impl MacOs {
     /// The kernel's own process table, read through `sysctl KERN_PROC_ALL`.
@@ -590,27 +1041,32 @@ struct TableRow {
 impl TableRow {
     /// One entry, at the offsets this platform's `<sys/sysctl.h>` gives them.
     fn parse(entry: &[u8]) -> Result<Self> {
-        let start_sec = entry_i64(entry, KINFO_START_SEC_OFFSET)?;
-        let start_usec = entry_i32(entry, KINFO_START_USEC_OFFSET)?;
-        let pid = entry_i32(entry, KINFO_PID_OFFSET)?;
-        let uid = entry_u32(entry, KINFO_UID_OFFSET)?;
         Ok(Self {
-            identity: ProcessIdentity {
-                pid: u32::try_from(pid).unwrap_or(0),
-                effective_uid: Some(uid),
-                start: u64::try_from(start_sec)
-                    .unwrap_or(0)
-                    .saturating_mul(1_000_000)
-                    .saturating_add(u64::try_from(start_usec).unwrap_or(0)),
-            },
+            identity: parse_identity(entry)?,
             #[cfg(test)]
             command: entry_command(entry),
         })
     }
 }
 
-/// One entry's command name, for the tests that name a process.
-#[cfg(test)]
+/// The identity fields of one table entry, at the offsets above.
+fn parse_identity(entry: &[u8]) -> Result<ProcessIdentity> {
+    let start_sec = entry_i64(entry, KINFO_START_SEC_OFFSET)?;
+    let start_usec = entry_i32(entry, KINFO_START_USEC_OFFSET)?;
+    let pid = entry_i32(entry, KINFO_PID_OFFSET)?;
+    let uid = entry_u32(entry, KINFO_UID_OFFSET)?;
+    Ok(ProcessIdentity {
+        pid: u32::try_from(pid).unwrap_or(0),
+        effective_uid: Some(uid),
+        start: u64::try_from(start_sec)
+            .unwrap_or(0)
+            .saturating_mul(1_000_000)
+            .saturating_add(u64::try_from(start_usec).unwrap_or(0)),
+    })
+}
+
+/// One entry's command name, read for a test that names a process and for the
+/// bounded record of a retried `EPERM`.
 fn entry_command(entry: &[u8]) -> String {
     entry
         .get(KINFO_COMMAND_OFFSET..KINFO_COMMAND_OFFSET.saturating_add(KINFO_COMMAND_BYTES))

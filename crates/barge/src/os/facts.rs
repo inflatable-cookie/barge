@@ -485,11 +485,17 @@ pub trait ProcessObserver {
     /// being reported as unreadable. The one process the request may exclude is
     /// the calling one, by its pid and the start identity the caller read for
     /// it, and the implementation verifies that identity before it skips the
-    /// process; no other process is excluded. A scan that reaches its process,
-    /// descriptor or time bound answers [`DescriptorScan::Bounded`], which is
-    /// unknown and never safe. An unreadable effective uid, and an unreadable
-    /// descriptor entry of this account's process, is an error, also never
-    /// safe.
+    /// process; no other process is excluded. A listing the kernel answers
+    /// `EPERM` for is re-observed by identity before it is decided, at most
+    /// `EPERM_RETRIES` times inside a bounded settle window and always inside
+    /// the scan's time bound: the retry settles on a later listing, a gone
+    /// process, a changed start identity or a changed effective uid, and never
+    /// on elapsed time. The same identity still answering `EPERM` is
+    /// unreadable, which is unknown and never safe. A scan that reaches its
+    /// process, descriptor or time bound answers [`DescriptorScan::Bounded`],
+    /// which is unknown and never safe. An unreadable effective uid, and an
+    /// unreadable descriptor entry of this account's process that is not a
+    /// retried `EPERM`, is an error, also never safe.
     fn scan_open_descriptors(&self, request: &DescriptorScanRequest<'_>) -> Result<DescriptorScan>;
 }
 
@@ -550,6 +556,59 @@ pub struct DescriptorScanRequest<'a> {
     pub self_exclusion: Option<SelfExclusion>,
 }
 
+/// The most retried pids one scan records in its evidence.
+///
+/// The scan counts every retried pid and records the first [`RETRY_RECORDS`] of
+/// them, so the record stays bounded without hiding that more were retried.
+pub const RETRY_RECORDS: usize = 8;
+
+/// One same-uid process whose descriptor listing the kernel answered `EPERM`
+/// for, and how the scan resolved it.
+///
+/// It is evidence, not a verdict: a transient answer is settled only by a
+/// positive fact — a later listing, a gone process, a changed start identity or
+/// a changed effective uid — and the record exists so a native diagnostic can
+/// tell an intermittent answer from a persistent one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetriedUnreadable {
+    /// The process's pid.
+    pub pid: u32,
+    /// The command name the kernel's own table reports for it, when the kernel
+    /// still reported the process while it was re-observed.
+    pub command: Option<String>,
+    /// The start identity the scan first classified the process with.
+    pub start: u64,
+    /// The errno of each failed descriptor listing, in order: one entry per
+    /// attempt inside the settle window, so a persistent answer appears as a
+    /// repeated errno rather than a single one.
+    pub errnos: Vec<i32>,
+    /// How many times the pid reported a different start identity while it was
+    /// re-observed: a reused pid, which was re-evaluated as the different
+    /// process it now names.
+    pub identity_changes: usize,
+    /// How the scan resolved the process.
+    pub resolution: RetryResolution,
+}
+
+/// How one retried `EPERM` was resolved. Only
+/// [`Unreadable`](Self::Unreadable) refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryResolution {
+    /// A later listing succeeded.
+    Listed,
+    /// The kernel reports no such process.
+    Gone,
+    /// The pid now names another account's process, so it is the named blind
+    /// spot: classified and counted, never inspected.
+    Foreign,
+    /// The same identity still answered `EPERM` after every retry it was given.
+    Unreadable,
+    /// The scan's own time bound would have been crossed by another retry.
+    Bounded,
+}
+
 /// One open descriptor found under the scanned root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenDescriptor {
@@ -576,6 +635,12 @@ pub enum DescriptorScan {
         /// They were classified, not inspected: this is the named blind spot,
         /// reported so no reader mistakes it for an observation.
         foreign: usize,
+        /// How many same-uid processes' listings the kernel answered `EPERM`
+        /// for and the scan re-observed instead of refusing.
+        retried_unreadable: usize,
+        /// The bounded record of those processes, in scan order: at most
+        /// [`RETRY_RECORDS`] entries, each with at most one errno per retry.
+        retried: Vec<RetriedUnreadable>,
         /// The open descriptors at or under the root.
         open: Vec<OpenDescriptor>,
     },

@@ -12,6 +12,10 @@
 //!   identity (the walk's and the checks' handles are not another writer) and
 //!   every process of another effective uid classified and reported rather than
 //!   inspected;
+//! - every same-uid process whose descriptor listing the kernel answered `EPERM`
+//!   for re-observed by kernel identity until it settled on a positive fact — a
+//!   later listing, a gone process, a changed start identity or a changed
+//!   effective uid — never on elapsed time (barge#012);
 //! - the root's device, inode and marker digest equal to the observation the
 //!   caller was given;
 //! - the volume still verified; and
@@ -40,7 +44,7 @@ use crate::contract::HOLD_ROWS;
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
     DescriptorScan, DescriptorScanRequest, DeviceId, DirOps, MountRoot, ProcessObserver,
-    SelfExclusion, VolumeFacts, VolumeUuid,
+    RetriedUnreadable, SelfExclusion, VolumeFacts, VolumeUuid,
 };
 use crate::registry;
 use crate::state::{self, IntentRecord, StatePaths};
@@ -201,6 +205,15 @@ pub struct CustodyEvidence {
     /// named blind spot, reported so the evidence never implies they were
     /// observed.
     pub foreign_uid_processes: usize,
+    /// How many same-uid processes' descriptor listings the kernel answered
+    /// `EPERM` for and the scan re-observed by identity instead of refusing.
+    /// Each one settled on a positive fact, never on elapsed time.
+    pub retried_unreadable: usize,
+    /// The bounded record of those processes: at most
+    /// [`crate::os::RETRY_RECORDS`] entries, each with the command, start
+    /// identity, errno sequence and resolution, so a native diagnostic can tell
+    /// an intermittent answer from a persistent one.
+    pub retried: Vec<RetriedUnreadable>,
     /// When the verdict was decided.
     pub checked_ms: u64,
 }
@@ -473,7 +486,7 @@ fn decide(
             start: self_start,
         }),
     });
-    let (processes, descriptors, foreign) = match scan {
+    let (processes, descriptors, foreign, retried_unreadable, retried) = match scan {
         Err(error) => {
             return Err(Refusal::Unknown(format!(
                 "the open-descriptor scan is unreadable: {error}"
@@ -492,6 +505,8 @@ fn decide(
             processes,
             descriptors,
             foreign,
+            retried_unreadable,
+            retried,
             open,
         }) => {
             if let Some(first) = open.first() {
@@ -502,7 +517,7 @@ fn decide(
                     first.path.display()
                 )));
             }
-            (processes, descriptors, foreign)
+            (processes, descriptors, foreign, retried_unreadable, retried)
         }
     };
 
@@ -518,6 +533,8 @@ fn decide(
         descriptors,
         self_excluded: self_pid,
         foreign_uid_processes: foreign,
+        retried_unreadable,
+        retried,
         checked_ms: state::now_ms(),
     })
 }
@@ -554,6 +571,8 @@ pub fn capability_report() -> CustodyReport {
             "a bounded scan of this account's open descriptors is complete and finds none at or under the root".to_owned(),
             "that scan classifies each process by the effective uid the kernel's own process table reports, before it inspects any descriptor, and reports how many processes of another effective uid it classified".to_owned(),
             "that scan excludes the calling barge process's own descriptors, by its pid and the start identity read once and verified, and no other process: another barge process, its child or its parent is observed like any other same-uid writer".to_owned(),
+            "that scan re-observes a same-uid process whose descriptor listing the kernel answers EPERM for, by re-reading the kernel's pid, start identity and effective uid and listing again at most three times inside a 250 ms settle window, and settles it only on a positive fact: a later listing, a process the kernel reports gone, a changed start identity re-evaluated as the different process it now names, or a changed effective uid counted as the named blind spot; the same identity still answering EPERM is unknown and refuses, and elapsed time is never taken as proof".to_owned(),
+            "the evidence counts how many processes that re-observation settled, and records for up to eight of them the command, kernel start identity, errno sequence and resolution".to_owned(),
             "the root's device, inode and marker digest equal the observation the caller was given".to_owned(),
             "the volume still verifies as the registered one".to_owned(),
             "no pending intent names another root".to_owned(),
@@ -573,6 +592,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use super::{
         capability_report, take_custody, CustodyBounds, CustodyVerdict, ObservedRoot,
@@ -581,10 +601,16 @@ mod tests {
     use crate::area::RootKind;
     use crate::error::{Error, ErrorKind, Result};
     use crate::os::{
-        platform, DescriptorScan, DescriptorScanRequest, OpenDescriptor, ProcessIdentity,
-        ProcessObserver, VolumeUuid,
+        platform, retry_schedule, DescriptorScan, DescriptorScanRequest, OpenDescriptor,
+        ProcessIdentity, ProcessObserver, RetryResolution, StatedListing, VolumeUuid,
     };
     use crate::testkit::{Faults, ScanMode, VolumeFixture, FIXTURE_BOOT, OTHER_UUID};
+
+    /// `EPERM`, the intermittent errno the kernel answers for a descriptor
+    /// listing it will not show, and `EACCES`, an answer the retry rule does not
+    /// settle. The scan reports both exactly as the kernel does.
+    const EPERM: i32 = 1;
+    const EACCES: i32 = 13;
 
     struct Holder {
         fixture: VolumeFixture,
@@ -628,6 +654,18 @@ mod tests {
             Self { process }
         }
 
+        /// Spawn `/bin/sleep` holding nothing under the root: a live same-uid
+        /// process whose listing can be stated unreadable, and whose own handles
+        /// are not a writer's claim on the root.
+        fn idle() -> Self {
+            let process = std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .expect("a same-uid child runs");
+            Self { process }
+        }
+
         /// The child's own identity, as the kernel's table reports it.
         fn identity(&self) -> ProcessIdentity {
             let pid = self.process.id();
@@ -665,14 +703,22 @@ mod tests {
 
     /// The real macOS observer, given one process table a test states itself.
     ///
-    /// The classification, the descriptor enumeration, the path matching and the
-    /// self-exclusion are the production ones; only the table is injected, which
-    /// is how an unprivileged fact about another account, an unreadable uid or a
-    /// table that claims a pid this account cannot read is exercised against the
-    /// real kernel reads.
+    /// The classification, the descriptor enumeration, the path matching, the
+    /// self-exclusion and the bounded re-observation of an `EPERM` are the
+    /// production ones; only the table and the stated `EPERM` answers are
+    /// injected, which is how an unprivileged fact about another account, an
+    /// unreadable uid, a table that claims a pid this account cannot read, and an
+    /// intermittent descriptor listing are exercised against the real kernel
+    /// reads.
     struct TableObserver {
         inner: crate::os::MacOs,
         table: Vec<ProcessIdentity>,
+        /// The `EPERM` answers and identity overrides the test states, consumed
+        /// by the scan.
+        faults: Vec<StatedListing>,
+        /// The backoff schedule the scan retries on: the production one, or the
+        /// empty schedule of the counterfactual.
+        backoffs: Vec<Duration>,
     }
 
     impl TableObserver {
@@ -680,6 +726,26 @@ mod tests {
             Self {
                 inner: platform(),
                 table,
+                faults: Vec::new(),
+                backoffs: retry_schedule().to_vec(),
+            }
+        }
+
+        /// The same observer with a stated `EPERM` sequence.
+        fn stated(table: Vec<ProcessIdentity>, faults: Vec<StatedListing>) -> Self {
+            Self {
+                faults,
+                ..Self::new(table)
+            }
+        }
+
+        /// The same observer with a stated `EPERM` sequence and an empty backoff
+        /// schedule: the counterfactual, where nothing is retried.
+        fn without_retries(table: Vec<ProcessIdentity>, faults: Vec<StatedListing>) -> Self {
+            Self {
+                faults,
+                backoffs: Vec::new(),
+                ..Self::new(table)
             }
         }
     }
@@ -701,7 +767,10 @@ mod tests {
             &self,
             request: &DescriptorScanRequest<'_>,
         ) -> Result<DescriptorScan> {
-            self.inner.scan_open_descriptors_over(request, &self.table)
+            // The stated answers are consumed, so each scan reads its own copy.
+            let mut faults = self.faults.clone();
+            self.inner
+                .scan_open_descriptors_with(request, &self.table, &self.backoffs, &mut faults)
         }
     }
 
@@ -1074,6 +1143,22 @@ mod tests {
             "the capability names the classification the scan makes: {:?}",
             report.establishes
         );
+        assert!(
+            report
+                .establishes
+                .iter()
+                .any(|fact| fact.contains("EPERM") && fact.contains("positive fact")),
+            "the capability names the bounded re-observation and that it settles only on a positive fact: {:?}",
+            report.establishes
+        );
+        assert!(
+            report
+                .establishes
+                .iter()
+                .any(|fact| fact.contains("errno sequence")),
+            "the capability names the bounded record each retried pid leaves: {:?}",
+            report.establishes
+        );
     }
 
     #[test]
@@ -1260,12 +1345,15 @@ mod tests {
     }
 
     #[test]
-    fn a_process_this_account_may_not_read_is_unknown_even_when_the_table_claims_it() {
+    fn a_process_this_account_may_not_read_is_reclassified_foreign_by_its_identity() {
         let holder = real_holder("custody-real-descriptors-unreadable");
         holder.payload();
         // A pid whose descriptors the kernel will not show this account, claimed
-        // by the table as this account's own. The descriptor read refuses, and a
-        // refusal to read is unknown, never "nothing open".
+        // by the table as this account's own. The listing answers `EPERM`, and
+        // the re-observation reads the pid's kernel identity, which reports
+        // another account: it is the named blind spot, counted and reported,
+        // rather than an unreadable same-uid process (barge#012, ruling
+        // bcaa83d8). Nothing about it is inspected.
         let foreign = a_foreign_identity();
         let observer = TableObserver::new(vec![
             self_identity(),
@@ -1276,12 +1364,18 @@ mod tests {
             },
         ]);
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
-        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
-        assert!(verdict
-            .reason()
-            .unwrap_or_default()
-            .contains("descriptors of pid"));
-        assert!(verdict.clone().into_evidence().is_err(), "unknown refuses");
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+        let evidence = verdict.evidence().expect("the evidence");
+        assert_eq!(evidence.foreign_uid_processes, 1);
+        assert_eq!(evidence.retried_unreadable, 1);
+        assert_eq!(
+            evidence
+                .retried
+                .first()
+                .expect("the retried pid")
+                .resolution,
+            RetryResolution::Foreign
+        );
     }
 
     /// One real process of another effective uid, read from the kernel's own
@@ -1359,7 +1453,279 @@ mod tests {
             assert_eq!(error.kind(), ErrorKind::UnknownState, "{}", identity.pid);
             // The kernel's own table classified it without asking the process,
             // which is what makes it the named blind spot instead.
+
             assert_ne!(identity.effective_uid, Some(uid));
         }
+    }
+
+    // ---- barge#012: a transient EPERM is settled only by positive facts ------
+
+    #[test]
+    fn a_transient_eperm_settles_to_safe_evidence() {
+        let holder = real_holder("custody-012-transient");
+        holder.payload();
+        let child = Child::idle();
+        let identity = child.identity();
+        // One `EPERM`, then the kernel's own answer: the retry is what turns the
+        // unreadable listing into an observation instead of a refusal.
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                errnos: vec![EPERM],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+        let evidence = verdict.evidence().expect("the evidence");
+        assert_eq!(evidence.retried_unreadable, 1);
+        let record = evidence
+            .retried
+            .first()
+            .expect("the retried pid is recorded");
+        assert_eq!(record.pid, identity.pid);
+        assert_eq!(record.start, identity.start);
+        assert_eq!(record.errnos, vec![EPERM]);
+        assert_eq!(record.identity_changes, 0);
+        assert_eq!(record.resolution, RetryResolution::Listed);
+        assert_eq!(record.command.as_deref(), Some("sleep"));
+    }
+
+    #[test]
+    fn an_eperm_for_a_process_the_kernel_reports_gone_is_resolved_as_gone() {
+        let holder = real_holder("custody-012-gone");
+        holder.payload();
+        // A pid no process has: the kernel's own table reports no such process,
+        // which is a positive fact, and a gone process holds no descriptors.
+        let absent = ProcessIdentity {
+            pid: 4_242_420,
+            effective_uid: Some(platform().effective_uid().expect("the account uid")),
+            start: 7,
+        };
+        let observer = TableObserver::stated(
+            vec![self_identity(), absent],
+            vec![StatedListing {
+                pid: absent.pid,
+                errnos: vec![EPERM],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+        let evidence = verdict.evidence().expect("the evidence");
+        assert_eq!(evidence.retried_unreadable, 1);
+        let record = evidence
+            .retried
+            .first()
+            .expect("the retried pid is recorded");
+        assert_eq!(record.pid, absent.pid);
+        assert_eq!(record.errnos, vec![EPERM]);
+        assert_eq!(record.resolution, RetryResolution::Gone);
+        assert!(
+            record.command.is_none(),
+            "the kernel never reported the process, so no command was read: {:?}",
+            record.command
+        );
+    }
+
+    #[test]
+    fn an_eperm_with_a_changed_start_identity_re_evaluates_the_new_process() {
+        let holder = real_holder("custody-012-restarted");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let identity = child.identity();
+        // The pid now reports a different start identity, so it is a different
+        // process: the scan re-evaluates it under the same rule and reads its
+        // descriptors, which find the payload holder instead of assuming.
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                errnos: vec![EPERM],
+                start: Some(identity.start.saturating_add(1)),
+                uid: None,
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unsafe", "{:?}", verdict.reason());
+        assert!(
+            verdict
+                .reason()
+                .unwrap_or_default()
+                .contains(&identity.pid.to_string()),
+            "the re-evaluated process's descriptor is the refusal: {:?}",
+            verdict.reason()
+        );
+    }
+
+    #[test]
+    fn an_eperm_through_every_retry_stays_unknown() {
+        let holder = real_holder("custody-012-persistent");
+        holder.payload();
+        let child = Child::idle();
+        let identity = child.identity();
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                errnos: vec![EPERM; 9],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        let reason = verdict.reason().unwrap_or_default();
+        assert!(reason.contains(&identity.pid.to_string()), "{reason}");
+        assert!(reason.contains("retries: 3"), "{reason}");
+        assert!(reason.contains("on 4 attempts"), "{reason}");
+        assert!(verdict.clone().into_evidence().is_err(), "unknown refuses");
+    }
+
+    #[test]
+    fn a_persistent_eperm_records_its_errno_sequence_in_the_scan_error() {
+        // The bounded sequence the scan records for a pid that stays unreadable,
+        // read where it is structured: the error's detail, not only its message.
+        let request = DescriptorScanRequest {
+            root: std::path::Path::new("/nonexistent"),
+            root_device: crate::os::DeviceId::new(1),
+            root_inode: 1,
+            max_processes: 8,
+            max_descriptors: 64,
+            timeout: Duration::from_secs(5),
+            self_exclusion: None,
+        };
+        let identity = self_identity();
+        let mut faults = vec![StatedListing {
+            pid: identity.pid,
+            errnos: vec![EPERM; 9],
+            ..StatedListing::default()
+        }];
+        let error = platform()
+            .scan_open_descriptors_with(&request, &[identity], retry_schedule(), &mut faults)
+            .expect_err("a persistent EPERM refuses");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(error.message().contains("retries: 3"), "{error}");
+        assert!(error.message().contains("on 4 attempts"), "{error}");
+        assert_eq!(
+            error.detail().get("errnos"),
+            Some(&serde_json::Value::from("1,1,1,1")),
+            "the errno sequence is recorded: {:?}",
+            error.detail()
+        );
+        assert_eq!(
+            error.detail().get("pid"),
+            Some(&serde_json::Value::from(u64::from(identity.pid)))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_listing_that_is_not_eperm_refuses_at_once() {
+        // The retry rule is about `EPERM` alone. Any other reason a listing could
+        // not be read is unknown immediately, with no retry and no listing after
+        // it, exactly as it was before barge#012.
+        let holder = real_holder("custody-012-not-eperm");
+        holder.payload();
+        let child = Child::idle();
+        let identity = child.identity();
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                errnos: vec![EACCES],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        assert!(verdict
+            .reason()
+            .unwrap_or_default()
+            .contains("descriptors of pid"));
+        assert!(verdict.into_evidence().is_err(), "unknown refuses");
+    }
+
+    #[test]
+    fn an_eperm_with_a_changed_effective_uid_is_the_named_foreign_blind_spot() {
+        let holder = real_holder("custody-012-foreign");
+        holder.payload();
+        let child = Child::idle();
+        let identity = child.identity();
+        let foreign = platform()
+            .effective_uid()
+            .expect("the account uid")
+            .saturating_add(1);
+        // The pid now reports another account's effective uid, so it is the
+        // named blind spot (Tom, 2026-10-26, ruling bcaa83d8): counted and
+        // reported as classified, never inspected, and therefore not a process
+        // this scan observed.
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                errnos: vec![EPERM],
+                start: None,
+                uid: Some(foreign),
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+        let evidence = verdict.evidence().expect("the evidence");
+        assert_eq!(evidence.foreign_uid_processes, 1);
+        assert_eq!(evidence.retried_unreadable, 1);
+        assert_eq!(evidence.processes, 0, "it was classified, never inspected");
+        let record = evidence
+            .retried
+            .first()
+            .expect("the retried pid is recorded");
+        assert_eq!(record.resolution, RetryResolution::Foreign);
+    }
+
+    #[test]
+    fn the_settle_window_stays_inside_the_scans_time_bound() {
+        let holder = real_holder("custody-012-window");
+        holder.payload();
+        let child = Child::idle();
+        let identity = child.identity();
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                errnos: vec![EPERM; 9],
+                ..StatedListing::default()
+            }],
+        );
+        // A scan time bound shorter than the first backoff: no retry can be made
+        // inside it, so the scan answers bounded rather than retrying past it.
+        let bounds = CustodyBounds {
+            timeout: Duration::from_millis(20),
+            ..CustodyBounds::default()
+        };
+        let verdict = holder.take_with(&[], &observer, bounds);
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        assert!(verdict.reason().unwrap_or_default().contains("bound"));
+    }
+
+    #[test]
+    fn without_the_retry_the_transient_eperm_refuses() {
+        // The counterfactual: the same one-`EPERM`-then-success fixture the retry
+        // above settles to `Safe` refuses at once with the schedule removed.
+        let holder = real_holder("custody-012-counterfactual");
+        holder.payload();
+        let child = Child::idle();
+        let identity = child.identity();
+        let observer = TableObserver::without_retries(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                errnos: vec![EPERM],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        let reason = verdict.reason().unwrap_or_default();
+        assert!(reason.contains("retries: 0"), "{reason}");
+        assert!(verdict.into_evidence().is_err(), "unknown refuses");
     }
 }
