@@ -30,6 +30,7 @@ pub mod contract;
 pub mod custody;
 pub mod delete;
 pub mod describe;
+pub mod diagnostic;
 pub mod digest;
 pub mod error;
 pub mod inspect;

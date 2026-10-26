@@ -647,103 +647,80 @@ fn source_between(begin: &str, end: &str) -> String {
 }
 
 #[test]
-fn the_full_census_classifies_every_same_uid_process_and_preserves_its_bounds() {
-    let fixture = Fixture::new("full-census");
-    let census = source_between("# >>> s6-descriptor-census", "# <<< s6-descriptor-census");
-    let body = r#"
-import errno, os
-uid = os.geteuid()
-def row(pid, owner=uid):
-    return {"pid": pid, "uid": owner, "command": "fixture-" + str(pid)}
-
-# Inject at the kernel boundary, never invoke sysctl or proc_pidinfo.
-calls = []
-def listing(pid):
-    calls.append(pid)
-    return 2
-descriptor_count = listing
-process_table = lambda: [row(100001), row(100002), row(100003, uid + 1), row(os.getpid())]
-result = census()
-assert result["status"] == "passed", result
-assert calls == [100001, 100002], calls
-assert result["processes"] == 2 and result["descriptors"] == 4, result
-assert result["foreign"] == 1 and result["self_excluded"] == 1, result
-
-def denied(pid):
-    raise OSError(errno.EPERM, "listing denied")
-descriptor_count = denied
-process_table = lambda: [row(1299)]
-result = census()
-assert result["status"] == "infrastructure" and result["pid"] == 1299, result
-assert result["command"] == "fixture-1299" and "listing denied" in result["problem"], result
-
-def exited(pid):
-    if pid == 100001:
-        raise OSError(errno.ESRCH, "exited")
-    return 0
-descriptor_count = exited
-process_table = lambda: [row(100001), row(100002)]
-result = census()
-assert result["status"] == "passed" and result["exited"] == 1, result
-assert result["processes"] == 2 and result["descriptors"] == 0, result
-
-# Every fixed bound must refuse instead of publishing a partial pass.
-for count, descriptors, problem in [
-    (8193, 0, "process list"), (4097, 0, "processes"),
-    (1, 4096, "descriptors per process"), (17, 4095, "descriptors"),
-]:
-    process_table = lambda: [row(100000 + i) for i in range(count)]
-    descriptor_count = lambda pid: descriptors
-    result = census()
-    assert result["status"] == "infrastructure" and problem in result["problem"], result
-    assert "pid" in result and "command" in result, result
-
-process_table = lambda: [row(100001)]
-clock = iter([0, 10])
-time.monotonic = lambda: next(clock)
-result = census()
-assert result["status"] == "infrastructure" and result["problem"] == "time bound", result
-assert result["pid"] == 100001 and result["command"] == "fixture-100001", result
+fn the_full_census_uses_the_same_barge_command_and_rejects_incomplete_documents() {
+    let block = source_between("preflight_existing_descriptors() {", "\npreflight() {");
+    assert!(block.contains("barge_cli \"$probe_dir/census.json\" diagnostic descriptor-census --root \"$probe_dir\" --json"));
+    assert!(
+        !proof_source().contains("ctypes.POINTER(ctypes.c_int)"),
+        "no parallel Python census remains"
+    );
+    for (mode, expected) in [
+        ("passed", 0),
+        ("infrastructure", 1),
+        ("bounds", 1),
+        ("error", 1),
+        ("malformed", 1),
+    ] {
+        let fixture = Fixture::new("same-barge-census");
+        let body = r#"
+ROOT="$PWD"
+mkdir "$ROOT/probe"
+barge_cli() {
+  [[ "$2" == diagnostic && "$3" == descriptor-census && "$4" == --root && "$6" == --json ]] || return 99
+  /usr/bin/python3 - "$1" "$5" "$S6_CENSUS_FIXTURE" <<'PY'
+import json, sys
+out, root, mode = sys.argv[1:]
+data = {"status": mode, "root": root, "process_limit": 4096,
+        "descriptor_limit": 65536, "timeout_ms": 10000, "processes": 2, "descriptors": 5}
+if mode == 'bounds':
+    data.update(status='passed', process_limit=9999)
+if mode == 'infrastructure':
+    data.update(problem='pid 42 unreadable', retry={'retried_unreadable': 1})
+doc = {"schema": "barge.diagnostic.descriptor-census/1", "command": "diagnostic.descriptor-census",
+       "ok": True, "data": data}
+if mode == 'error':
+    doc = {"ok": False, "error": {"message": "cannot start census"}}
+with open(out, 'w') as f:
+    f.write('not-json' if mode == 'malformed' else json.dumps(doc))
+PY
+}
+preflight_existing_descriptors "$ROOT/probe"
+result=$?
+printf '%s\n' "$PREFLIGHT_LAST_CENSUS"
+exit "$result"
 "#;
-    // Execute the definitions as a fixture module: the native main never runs.
-    let script = fixture.write("census.py", format!("{census}\n{body}").as_bytes(), 0o644);
-    let output = Command::new("/usr/bin/python3")
-        .args([
-            "-c",
-            "import runpy,sys; runpy.run_path(sys.argv[1], run_name='fixture')",
-        ])
-        .arg(script)
-        .output()
-        .expect("the pure census fixture runs");
-    assert!(output.status.success(), "{}", stderr(&output));
-
-    // Drift from the product's process set or limits is a harness defect.
-    let source = proof_source();
-    let package = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let custody = std::fs::read_to_string(package.join("src/custody.rs")).expect("custody source");
-    let platform = std::fs::read_to_string(package.join("src/os/macos.rs")).expect("OS source");
-    for (python, rust) in [
-        ("SCAN_PROCESSES = 4096", "SCAN_PROCESSES: usize = 4096"),
-        (
-            "SCAN_DESCRIPTORS = 65_536",
-            "SCAN_DESCRIPTORS: usize = 65_536",
-        ),
-        ("SCAN_TIMEOUT = 10", "Duration::from_secs(10)"),
-    ] {
-        assert!(source.contains(python) && custody.contains(rust));
+        let script = fixture.write(
+            "census.sh",
+            format!("set -uo pipefail\npreflight_existing_descriptors() {{{block}\n{body}")
+                .as_bytes(),
+            0o644,
+        );
+        let output = Command::new("/bin/bash")
+            .arg(script)
+            .current_dir(&fixture.path)
+            .env("S6_CENSUS_FIXTURE", mode)
+            .output()
+            .expect("the pure census wrapper fixture runs");
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{mode}: {}",
+            stderr(&output)
+        );
+        let doc: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("normalized census JSON");
+        assert_eq!(
+            doc["status"],
+            if mode == "passed" {
+                "passed"
+            } else {
+                "infrastructure"
+            }
+        );
+        if mode == "infrastructure" {
+            assert_eq!(doc["retry"]["retried_unreadable"], 1);
+        }
     }
-    for (python, rust) in [
-        ("SCAN_PID_CAP = 8192", "SCAN_PID_CAP: usize = 8192"),
-        ("KINFO_PROC_SIZE = 648", "KINFO_PROC_SIZE: usize = 648"),
-        (
-            "SCAN_DESCRIPTORS_PER_PROCESS = 4096",
-            "SCAN_DESCRIPTORS_PER_PROCESS: usize = 4096",
-        ),
-    ] {
-        assert!(source.contains(python) && platform.contains(rust));
-    }
-    assert!(source.contains("(1, 14, 0)  # CTL_KERN/KERN_PROC/KERN_PROC_ALL"));
-    assert!(source.contains("libc.proc_pidinfo(pid, 1, 0, buf, len(buf))"));
 }
 
 #[test]
@@ -1242,6 +1219,7 @@ fn fabricated_receipt(
         .env("S6_HEAD", "fixture-head")
         .env("S6_REPO", root)
         .env("S6_BINARY", "/bin/true")
+        .env("S6_BINARY_SHA256", "fixture-binary-sha256")
         .env("S6_SUPERVISOR", "/bin/true")
         .env("S6_SUPERVISOR_SHA", "fixture-supervisor")
         .env("S6_VOLUME", "BargeProofFixture")

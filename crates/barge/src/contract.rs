@@ -84,6 +84,8 @@ pub const CACHE_ADOPT_SCHEMA: &str = "barge.cache.adopt/1";
 pub const CACHE_UNDO_SCHEMA: &str = "barge.cache.undo/1";
 /// The cache list command document.
 pub const CACHE_LIST_SCHEMA: &str = "barge.cache.list/1";
+/// The read-only full descriptor census diagnostic document.
+pub const DESCRIPTOR_CENSUS_SCHEMA: &str = "barge.diagnostic.descriptor-census/1";
 /// The account volume registry's format (written from slice S2).
 pub const REGISTRY_SCHEMA: &str = "barge.registry/1";
 /// One area declaration's format.

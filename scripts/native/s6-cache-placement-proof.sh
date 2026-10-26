@@ -135,6 +135,9 @@ esac
 [[ -d "$EVIDENCE" ]] || refuse "the evidence directory $EVIDENCE is not there"
 BARGE_BIN="$(cd "$(dirname "$BARGE_BIN_INPUT")" && pwd)/$(basename "$BARGE_BIN_INPUT")"
 [[ -x "$BARGE_BIN" ]] || refuse "$BARGE_BIN is not an executable CLI"
+BARGE_BIN_SHA256="$(shasum -a 256 "$BARGE_BIN" | awk '{print $1}')"
+[[ "$BARGE_BIN_SHA256" =~ ^[0-9a-f]{64}$ ]] || refuse "cannot hash the Barge executable"
+readonly BARGE_BIN_SHA256
 
 # The shared supervisor starts this run as one guarded leader in its own
 # session. That session is captured once and every case's preflight requires it
@@ -302,6 +305,7 @@ write_receipt() {
   S6_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')" \
   S6_REPO="$REPO_ROOT" \
   S6_BINARY="$BARGE_BIN" \
+  S6_BINARY_SHA256="$BARGE_BIN_SHA256" \
   S6_SUPERVISOR="$SUPERVISOR" \
   S6_SUPERVISOR_SHA="$SUPERVISOR_SHA256" \
   S6_VOLUME="$VOLNAME" \
@@ -443,7 +447,7 @@ premises = [
             "scratch_budget_mib": int(os.environ["S6_SCRATCH_MIB"]),
             "second_supervisor": False,
             "preflight_probes": ["supervisor", "sentinel-descriptors", "full-census"],
-            "descriptor_primitive": "proc_pidinfo(PROC_PIDLISTFDS) with a proc_pidinfo(PROC_PIDTBSDINFO) same-uid fact",
+            "descriptor_primitive": "same Barge product observer: kinfo effective uid/start, listings, vnode paths and bounded re-observation",
         },
     },
 ]
@@ -513,7 +517,7 @@ if preflight_path and os.path.exists(preflight_path):
                 })
 preflight = {
     "probes": ["supervisor", "sentinel-descriptors", "full-census"],
-    "primitive": "sysctl(KERN_PROC_ALL) effective uid/start; proc_pidinfo(PROC_PIDLISTFDS)",
+    "primitive": "same Barge binary: product ProcessObserver::scan_open_descriptors (listing and vnode paths)",
     "censuses": censuses,
     "census_bounds": {"table": 8192, "processes": 4096, "descriptors": 65536,
                       "descriptors_per_process": 4096, "seconds": 10},
@@ -564,6 +568,7 @@ receipt = {
     "head": os.environ["S6_HEAD"],
     "repo": os.environ["S6_REPO"],
     "binary": os.environ["S6_BINARY"],
+    "binary_sha256": os.environ["S6_BINARY_SHA256"],
     "supervisor": os.environ["S6_SUPERVISOR"],
     "supervisor_sha256": os.environ["S6_SUPERVISOR_SHA"],
     "evidence": os.environ["S6_EVIDENCE"],
@@ -636,6 +641,10 @@ barge_cli() {
   local out="$1"
   shift
   local status=0
+  if [[ "$(shasum -a 256 "$BARGE_BIN" | awk '{print $1}')" != "$BARGE_BIN_SHA256" ]]; then
+    printf 'the Barge binary changed after guarded startup; refusing invocation\n' >&2
+    return 125
+  fi
   "$BARGE_BIN" "$@" >"$out" 2>"$out.stderr" || status=$?
   if [[ "$status" -ne 0 ]]; then
     printf 'barge %s exited %s\n' "$*" "$status"
@@ -921,138 +930,37 @@ preflight_sentinel() {
 }
 
 preflight_existing_descriptors() {
-  # Required probe two: the full kinfo same-effective-uid process set, with the
-  # product's process/descriptor/time bounds. This checks listing capability,
-  # not custody or the readability of every vnode path in a later product scan.
-  local observation status=0
-  observation="$(/usr/bin/python3 - <<'PY'
-# >>> s6-descriptor-census
-import ctypes, errno, json, os, struct, time
+  # Required probe two: the exact Barge executable's product observer, including
+  # vnode paths and #012 re-observation, with custody's unchanged scan bounds.
+  local probe_dir="$1" status=0
+  barge_cli "$probe_dir/census.json" diagnostic descriptor-census --root "$probe_dir" --json || status=$?
+  PREFLIGHT_LAST_CENSUS="$(/usr/bin/python3 - "$probe_dir/census.json" "$probe_dir" "$status" <<'PY_CENSUS'
+import json, sys
 
-KINFO_PROC_SIZE = 648
-SCAN_PID_CAP = 8192
-SCAN_PROCESSES = 4096
-SCAN_DESCRIPTORS = 65_536
-SCAN_DESCRIPTORS_PER_PROCESS = 4096
-SCAN_TIMEOUT = 10
-libc = ctypes.CDLL(None, use_errno=True)
-libc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
-                            ctypes.c_void_p, ctypes.c_int]
-libc.proc_pidinfo.restype = ctypes.c_int
-libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint,
-                       ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
-                       ctypes.c_void_p, ctypes.c_size_t]
-libc.sysctl.restype = ctypes.c_int
-
-def process_table():
-    mib = (ctypes.c_int * 3)(1, 14, 0)  # CTL_KERN/KERN_PROC/KERN_PROC_ALL
-    size = ctypes.c_size_t()
-    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0):
-        raise OSError(ctypes.get_errno(), "kinfo size")
-    if not size.value or size.value % KINFO_PROC_SIZE:
-        raise ValueError("invalid kinfo table size")
-    if size.value // KINFO_PROC_SIZE > SCAN_PID_CAP:
-        raise ValueError("process list bound")
-    buf = ctypes.create_string_buffer(size.value + 64 * KINFO_PROC_SIZE)
-    size.value = len(buf)
-    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0):
-        raise OSError(ctypes.get_errno(), "kinfo read")
-    if size.value > len(buf) or size.value % KINFO_PROC_SIZE:
-        raise ValueError("invalid returned kinfo table size")
-    if size.value // KINFO_PROC_SIZE > SCAN_PID_CAP:
-        raise ValueError("process list bound")
-    rows = []
-    for offset in range(0, size.value, KINFO_PROC_SIZE):
-        pid = struct.unpack_from("<i", buf.raw, offset + 40)[0]
-        if pid == 0:
-            continue
-        sec, usec = struct.unpack_from("<qi", buf.raw, offset)
-        if pid < 0 or sec < 0 or not 0 <= usec < 1_000_000:
-            raise ValueError("invalid kinfo identity")
-        rows.append({"pid": pid, "uid": struct.unpack_from("<I", buf.raw, offset + 420)[0],
-                     "start": sec * 1_000_000 + usec,
-                     "command": buf.raw[offset + 243:offset + 260].split(b"\0", 1)[0].decode(errors="replace")})
-    # Check the ABI against independent facts, as the product does.
-    own = next((row for row in rows if row["pid"] == os.getpid()), None)
-    bsd = ctypes.create_string_buffer(136)
-    if libc.proc_pidinfo(os.getpid(), 3, 0, bsd, len(bsd)) != len(bsd):
-        raise ValueError("own process identity unavailable")
-    sec, usec = struct.unpack_from("<QQ", bsd.raw, 120)
-    if (own is None or own["uid"] != os.geteuid()
-            or struct.unpack_from("<I", bsd.raw, 12)[0] != os.getpid()
-            or struct.unpack_from("<I", bsd.raw, 20)[0] != own["uid"]
-            or own["start"] != sec * 1_000_000 + usec):
-        raise ValueError("kinfo layout does not match this process")
-    return rows
-
-def descriptor_count(pid):
-    buf = ctypes.create_string_buffer(SCAN_DESCRIPTORS_PER_PROCESS * 8)
-    ctypes.set_errno(0)
-    written = libc.proc_pidinfo(pid, 1, 0, buf, len(buf))  # PROC_PIDLISTFDS
-    error = ctypes.get_errno()
-    if written <= 0:
-        if error:
-            raise OSError(error, "PROC_PIDLISTFDS")
-        return 0
-    if written >= len(buf):
-        raise ValueError("descriptors per process bound")
-    if written % 8:
-        raise ValueError("partial descriptor listing")
-    return written // 8
-
-def census():
-    result = {"status": "infrastructure", "enumerated": 0, "processes": 0,
-              "descriptors": 0, "foreign": 0, "exited": 0, "self_excluded": 0}
-    started = time.monotonic()
-    row = {"pid": None, "command": "kinfo table"}
-    try:
-        rows = process_table()
-        result["enumerated"] = len(rows)
-        if len(rows) > SCAN_PID_CAP:
-            raise ValueError("process list bound")
-        for row in rows:
-            if time.monotonic() - started >= SCAN_TIMEOUT:
-                raise ValueError("time bound")
-            if row["uid"] != os.geteuid():
-                result["foreign"] += 1
-                continue
-            if row["pid"] == os.getpid():
-                result["self_excluded"] += 1
-                continue
-            result["processes"] += 1
-            if result["processes"] > SCAN_PROCESSES:
-                raise ValueError("processes bound")
-            try:
-                count = descriptor_count(row["pid"])
-            except OSError as error:
-                if error.errno == errno.ESRCH:
-                    result["exited"] += 1
-                    continue
-                raise
-            if count >= SCAN_DESCRIPTORS_PER_PROCESS:
-                raise ValueError("descriptors per process bound")
-            result["descriptors"] += count
-            if result["descriptors"] > SCAN_DESCRIPTORS:
-                raise ValueError("descriptors bound")
-        if time.monotonic() - started >= SCAN_TIMEOUT:
-            raise ValueError("time bound")
-        result["status"] = "passed"
-    except (OSError, ValueError) as error:
-        result.update(pid=row["pid"], command=row["command"], problem=str(error))
-        if isinstance(error, OSError):
-            result["errno"] = error.errno
-    return result
-
-if __name__ == "__main__":
-    result = census()
-    print(json.dumps(result, separators=(",", ":")))
-    raise SystemExit(0 if result["status"] == "passed" else 3)
-# <<< s6-descriptor-census
-PY
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        doc = json.load(handle)
+    if int(sys.argv[3]) != 0 or not doc.get("ok"):
+        result = {"status": "infrastructure", "problem": doc.get("error", doc)}
+    elif (doc.get("schema") != "barge.diagnostic.descriptor-census/1"
+          or doc.get("command") != "diagnostic.descriptor-census"):
+        result = {"status": "infrastructure", "problem": "unexpected census document"}
+    else:
+        result = doc["data"]
+        if (result.get("root") != sys.argv[2]
+                or result.get("process_limit") != 4096
+                or result.get("descriptor_limit") != 65536
+                or result.get("timeout_ms") != 10000
+                or result.get("status") not in ("passed", "infrastructure")):
+            result = {"status": "infrastructure", "problem": "census root, bounds or outcome mismatch"}
+except (OSError, ValueError, KeyError, TypeError) as error:
+    result = {"status": "infrastructure", "problem": str(error)}
+print(json.dumps(result, separators=(",", ":")))
+raise SystemExit(0 if result["status"] == "passed" else 3)
+PY_CENSUS
 )" || status=$?
-  PREFLIGHT_LAST_CENSUS="$observation"
   if [[ "$status" != 0 ]]; then
-    printf 'preflight: full same-uid census unavailable: %s\n' "$observation" >&2
+    printf 'preflight: same-Barge full same-uid census unavailable: %s\n' "$PREFLIGHT_LAST_CENSUS" >&2
     return 1
   fi
   return 0
@@ -1072,7 +980,7 @@ preflight() {
     PREFLIGHT_FAILURE="sentinel descriptor probe failed before $case_id"
     return 1
   fi
-  if ! preflight_existing_descriptors; then
+  if ! preflight_existing_descriptors "$probe_dir"; then
     printf '%s\tfull-census\t%s\n' "$case_id" "$PREFLIGHT_LAST_CENSUS" >>"$PREFLIGHT_TSV"
     PREFLIGHT_FAILURE="full same-uid descriptor census failed before $case_id: $PREFLIGHT_LAST_CENSUS"
     return 1

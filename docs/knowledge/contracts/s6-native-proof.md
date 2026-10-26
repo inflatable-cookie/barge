@@ -78,8 +78,9 @@ the digest is compared before the supervisor is executed.
   share a settings file, a registry or a placement record.
 - One fixture `barge.registry/1` per case, in that case's private state
   directory, registering the image at the exact volume UUID the kernel reports.
-- One preflight directory per case under the run root, holding only the sentinel
-  identity file; the preflight probes write nothing else.
+- One preflight directory per case under the run root, holding the sentinel
+  identity file and the census JSON/stderr. Fixture cleanup removes these;
+  the receipt retains the census result and bounded failure evidence.
 
 Nothing is created, written or deleted outside the run root, the image's own
 mount, and the evidence directory.
@@ -174,14 +175,16 @@ The script always writes `$OXIDE_PROOF_EVIDENCE/s6-cache-placement-receipt.json`
   bounded observation row per probe per case: the sentinel prints
   `<kind> <uid> <descriptors> <vnodes> <identity-fd> <identity-vnode>`, and the
   supervisor row names the session and pin it re-checked. `censuses` retains
-  each full census's case, result, enumerated/process/descriptor counts,
-  foreign/exited/self-excluded counts and, on failure, pid, command and reason.
+  each full census's case, result, process/descriptor/foreign/open counts,
+  observer pid/start/effective uid and product retry evidence. Failures retain
+  the product reason and any retried pid/command/errno sequence; unavailable
+  counts remain `null`.
   `census_bounds` names the fixed bounds. A counted receipt additionally needs
   exactly one passed census for every case; failed census evidence is retained
   even when its case never runs;
 - `mode`, `head`, `repo`, `binary`, `supervisor`, `supervisor_sha256`,
   `evidence`, the volume block (name, mount, backing, `size_mib`, `owners: true`),
-  the `real_state` block (path, before, after, unchanged), the nine `premises`
+  the binary SHA-256 verified before every CLI invocation, the `real_state` block (path, before, after, unchanged), the nine `premises`
   with their traces and evidence, the `cases` with status and evidence, and the
   `summary` (cases, recorded, passed, failed, skipped, not_run, first_fault,
   real_state_unchanged).
@@ -192,14 +195,26 @@ its cases. It never counts as a pass.
 
 ## The harness preflight
 
-Every case that runs is preceded by one preflight of **two required descriptor
-probes**. The sentinel uses `proc_pidinfo(PROC_PIDLISTFDS)` and
-`proc_pidinfo(PROC_PIDTBSDINFO)`. The full census enumerates the kernel's
-`sysctl(KERN_PROC_ALL)` table, classifying effective uid and start identity
-at the same checked kinfo offsets as the product, before listing descriptors.
-A valid supervisor pin and session say nothing about
-whether this account can read descriptor evidence at all, so they are not
-substitutes: they are only a supplemental check.
+Every case that runs is preceded by a sentinel probe and a full same-effective-uid
+census, plus the pinned-supervisor/session check. The sentinel retains its
+`proc_pidinfo(PROC_PIDLISTFDS)`/`PROC_PIDTBSDINFO` observations. The full census
+runs the **same Barge executable** as the cases, through its product observer:
+
+```text
+barge diagnostic descriptor-census --root <case-preflight-directory> --json
+```
+
+This read-only command opens an existing absolute directory without creating
+state, registering a volume, taking locks or writing data. Its versioned
+`barge.diagnostic.descriptor-census/1` document reports `status: passed` only
+for a completed product scan; `status: infrastructure` reports a bounded or
+unreadable scan. A valid observation document exits 0 in either case; the
+apparatus checks its status and refuses an infrastructure result. Failure to
+start the observation is a normal `barge.error/1` document and is also
+infrastructure. The command never produces a custody `Safe` value: open
+writers under the fixture root are counted as observations, not authorized.
+The receipt names the binary and its startup SHA-256; every `barge_cli`
+invocation refuses if those bytes have changed.
 
 - **The sentinel probe** starts one sentinel child in this run's session — the
   shared supervisor's guarded session — as a plain child with no `setsid`, no
@@ -212,25 +227,32 @@ substitutes: they are only a supplemental check.
   sentinel exited before its bound, if the listing is unavailable or does not
   show the live identity descriptor, if it ran in a different session, or if it
   survived the reap.
-- **The full census** attempts `PROC_PIDLISTFDS` for every enumerated process
-  of this effective uid, excluding only the observer itself after checking its
-  pid, effective uid and start identity against independent kernel facts.
-  Foreign effective uids are counted and skipped under ruling bcaa83d8.
-  `ESRCH` means the process exited and is counted as skipped; zero bytes with
-  errno zero means no descriptors. Any other unreadable same-uid listing
-  (including `EPERM`) aborts as infrastructure, naming pid and kinfo command.
-  Bounds match the product: 8192 table rows, 4096 same-uid processes, 4096
+- **The full census** calls `ProcessObserver::scan_open_descriptors` through
+  the production platform, with custody's `SCAN_PROCESSES`, `SCAN_DESCRIPTORS`
+  and `SCAN_TIMEOUT`, the opened fixture directory's identity and the caller's
+  verified pid/start self-exclusion. The observer classifies the kernel's
+  kinfo process set by effective uid, skips foreign effective uids under
+  bcaa83d8, accepts positively exited processes, and reads both descriptor
+  listings and vnode paths. It incorporates merged barge#012's bounded
+  identity re-observation of listing `EPERM`: a later positive observation may
+  settle the answer, but persistent unreadable same-uid evidence still refuses.
+  No second implementation of that policy remains in Python.
+  Bounds are unchanged: 8192 table rows, 4096 same-uid processes, 4096
   descriptors per process (a full buffer refuses), 65,536 total descriptors
-  and 10 s. A bound hit refuses with the current pid/command and counts.
-  Fixture tests inject the table, listing results and clock into the shipped
-  census definitions; no real census runs in those tests.
+  and 10 s. The census report preserves the product's counts and bounded retry
+  evidence, including pid, command, identity and errno sequence where supplied.
+  Counts absent from an unreadable answer remain `null`, never inferred zero.
+  Library tests inject complete, bounded and unreadable observer answers;
+  wrapper fixtures reject infrastructure, wrong bounds, error and malformed
+  documents. Product #012 tests own foreign-uid, exited-process, identity,
+  retry and deadline policy; the preflight does not reimplement those rules.
 
-The census proves listing capability for that snapshot, not that every vnode
-path is readable or that a later process set is identical. Product custody
-still reads vnode paths and treats unreadable same-effective-uid evidence as
-`Unknown`/refusal. No preflight result bypasses that decision.
+A completed census establishes that observation only for its snapshot and
+execution. It does not promise a later process set is identical or bypass the
+custody check each operation makes. The script checks the document's root,
+bounds and outcome and preserves the entire census result in its receipt.
 
-When either descriptor-listing capability is unavailable, or either probe
+When either descriptor capability is unavailable, or either probe
 otherwise fails, the run **records INFRASTRUCTURE, stays unqualified, and aborts
 before any case body**: the case is recorded `skipped` with the probe named,
 every remaining case is stopped in both modes, the receipt carries
@@ -328,6 +350,32 @@ changed nested marker, retargeted or replaced links, and changed undo payload.
 The stray verdict prose that executed as shell commands is now commented;
 pure fixtures execute the shipped verdict's pass, case-failure and
 infrastructure-failure paths without a native run.
+
+### Failed diagnostic at 9ad4ce04
+
+The Oxide Supervisor reported one owner-activated diagnostic at
+`9ad4ce0428304f4b0eb770efa74ce7166bddd41e`: six cases passed,
+`absent-path` undo and `empty-directory` adopt failed on unreadable same-uid
+pid 69326 (`dmd`), and `ordinary-detach` was dependency-skipped. No counted
+native ran. Historical evidence is
+`/Volumes/Builds/scratch/barge/run.SCGWXk/scratch/supervisor-evidence.76bmngb_/s6-cache-placement-receipt.json`
+(SHA-256 `3460b5df9ed3579555b7ef09828758799d4c8850ed6af650ec892cf42cde1dc7`).
+The guard reported closure with a certain empty census. The marker/mtime
+oracle and stray-prose fixes passed their cases and remain intact.
+
+Every executed case's Python listing census passed. The owner also reported a
+successful later direct Python listing of that pid. Neither observation covered
+Barge's vnode-path reads, and the former error document did not distinguish a
+listing failure from a vnode-path failure. Execution identities and timing were
+also different; no retrospective claim identifies the failing syscall from
+that shared message alone. This is spent, unqualified diagnostic history,
+not proof of the rebased head or authority to retry it.
+
+The preflight now uses the same Barge executable and complete product observer,
+including the merged #012 policy, to remove that implementation/context gap.
+Unreadability still aborts as infrastructure before cases. A fresh diagnostic
+requires independent exact-head review and a separate owner activation; this
+source revision runs none.
 
 ## Activation order
 

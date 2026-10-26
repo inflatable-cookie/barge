@@ -37,7 +37,8 @@ use barge::error::{Error, ErrorKind};
 use barge::os::{self, VolumeUuid};
 use barge::state::{self, StatePaths};
 
-const USAGE: &str = "usage: barge <describe|inspect|area|cache> [--json]
+const USAGE: &str = "usage: barge <describe|inspect|area|cache|diagnostic> [--json]
+       barge diagnostic descriptor-census --root <existing-directory>
        barge area declare --namespace <ns> --area <name> --folder <folder> [--override <uuid>=<folder>]... --absent <fail:drive|wait|fallback:path> --prune <none|oldest-idle:seconds> --reserve <counts|excluded>
        barge area show --namespace <ns> --area <name>
        barge area list
@@ -88,6 +89,7 @@ fn command_name(args: &[String]) -> String {
             Some(verb) => format!("cache.{verb}"),
             None => "cache".to_owned(),
         },
+        Some("diagnostic") => "diagnostic.descriptor-census".to_owned(),
         Some(other) => other.to_owned(),
         None => "barge".to_owned(),
     }
@@ -170,8 +172,31 @@ fn dispatch(args: &[String]) -> Result<Report, Error> {
         }
         "area" => area(rest),
         "cache" => cache(rest),
+        "diagnostic" => descriptor_census(rest),
         other => Err(usage(format!("unknown command: {other}"))),
     }
+}
+
+/// Read-only native apparatus through the same binary and product observer.
+fn descriptor_census(args: &[String]) -> Result<Report, Error> {
+    let Parsed { words, mut options } = parse(args)?;
+    if words != ["descriptor-census"] {
+        return Err(usage("expected diagnostic descriptor-census"));
+    }
+    let root = PathBuf::from(required(&mut options, "root")?);
+    refuse_unknown(options)?;
+    let platform = os::platform();
+    let report = barge::diagnostic::descriptor_census(&platform, &platform, &root)?;
+    let human = format!(
+        "descriptor census: {:?}; {:?}\n",
+        report.status, report.problem
+    );
+    Report::verb(
+        contract::DESCRIPTOR_CENSUS_SCHEMA,
+        "diagnostic.descriptor-census",
+        &report,
+        human,
+    )
 }
 
 /// Refuse any argument after a command that takes none.

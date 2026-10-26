@@ -75,7 +75,41 @@ fn stdout_document(output: &Output) -> Value {
 }
 
 /// The usage's first line; the full text names every area verb too.
-const USAGE: &str = "usage: barge <describe|inspect|area|cache> [--json]";
+const USAGE: &str = "usage: barge <describe|inspect|area|cache|diagnostic> [--json]";
+
+#[test]
+fn descriptor_census_refuses_bad_arguments_and_missing_roots_without_scanning() {
+    let (fixture, state_dir) = absent_state_dir("descriptor-census");
+    for args in [
+        vec![
+            "diagnostic",
+            "descriptor-census",
+            "--root",
+            "relative",
+            "--json",
+        ],
+        vec!["diagnostic", "descriptor-census", "--json"],
+        vec!["diagnostic", "wrong-verb", "--json"],
+    ] {
+        let output = run_in(&args, &state_dir);
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+    }
+    let absent = fixture.join("absent");
+    let output = run_in(
+        &[
+            "diagnostic",
+            "descriptor-census",
+            "--root",
+            absent.to_str().unwrap(),
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert!(!output.status.success());
+    assert_eq!(stdout_document(&output)["ok"], false);
+    assert!(!absent.exists() && !state_dir.exists());
+}
 
 #[test]
 fn describe_json_prints_one_document_and_creates_nothing() {

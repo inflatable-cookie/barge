@@ -1900,6 +1900,16 @@ Choices S6 made where this design left the mechanic to the slice:
   `cache:native:diagnostic` twin; both are owner-activated and neither is part of
   an ordinary validation pass.
 
+The read-only S6 apparatus command `barge diagnostic descriptor-census --root
+<existing-directory> --json` uses the same binary and production observer as
+cache operations, with custody's scan bounds, self-exclusion and barge#012's
+bounded identity re-observation. It returns
+`barge.diagnostic.descriptor-census/1`, preserving counts and retry evidence;
+complete observation is `passed`, unreadable or bounded is `infrastructure`.
+It grants no custody authority, writes nothing and never substitutes for the
+operation's own scan. The [proof contract](s6-native-proof.md#the-harness-preflight)
+owns its apparatus use, receipt interpretation and activation limits.
+
 ## Proposed validation
 
 Design-only validation for this contract is `effigy docs:check` once, run from

@@ -2145,14 +2145,26 @@ fn confirm_empty_directory(
             ),
         )
         .with_detail("path", original.display().to_string().into())),
-        DescriptorScan::Bounded { bound, .. } => Err(Error::new(
+        DescriptorScan::Bounded { bound, retry, .. } => Err(Error::new(
             ErrorKind::CustodyNotProven,
             format!(
                 "the descriptor observation of {} reached its {bound} bound",
                 original.display()
             ),
         )
-        .with_detail("path", original.display().to_string().into())),
+        .with_detail("path", original.display().to_string().into())
+        .with_detail(
+            "retry",
+            serde_json::to_value(retry)
+                .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))?,
+        )),
+        DescriptorScan::Unreadable { reason, retry } => {
+            Err(Error::new(ErrorKind::UnknownState, reason).with_detail(
+                "retry",
+                serde_json::to_value(retry)
+                    .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))?,
+            ))
+        }
     }
 }
 
