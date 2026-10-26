@@ -78,6 +78,29 @@ kept.
   expendable requires operator confirmation, because it makes the data
   prunable.
 
+## Placement rules (Tom, 2026-10-26)
+
+- **Absent volume, by kind (Q-001).** Build output uses a visible local
+  fallback, which is Oxide's current rule. Package caches fail with a clear
+  message naming the drive to attach, so they never quietly re-download onto
+  the internal SSD. Scratch fails clearly. Kept data is unavailable and Barge
+  names the drive.
+- **One home per placement, chosen by durability (Q-002).** Expendable data
+  (build output, caches, scratch) lives on the permanent expendable volume
+  (Builds). Kept data (VMs, archives) lives on the kept volume (Vault). A
+  placement's volume is chosen when it is adopted, and moving it to another
+  volume is an explicit command. There is no automatic preference list.
+- **Links first, tool configuration only if needed (Q-003).** Barge prefers an
+  owned link at the tool's existing path, which needs no configuration change.
+  Where a tool can only be redirected by its own setting (npm `cache`, bun
+  `install.cache.dir`, Effigy `[scratch] root`), Barge writes that setting only
+  during an explicit adopt, reports the exact change and can undo it.
+- **Oxide state is read in place (Q-004).** Barge reads Oxide's existing
+  formats as they are (`pools.json`, `oxide-outputs` roots, markers and
+  receipts, scratch markers), so nothing moves on disk. Oxide switches to Barge
+  one part at a time, in the order above. Old formats retire only once both
+  sides agree.
+
 ## Invariants
 
 - Nothing is written to a drive root or a home folder as scratch.

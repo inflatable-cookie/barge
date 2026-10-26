@@ -5,33 +5,23 @@ briefs. An answered question keeps only its pointer to where the answer lives.
 
 ## Q-001 — What does each placement kind do when its volume is absent?
 
-Status: open
-Candidates: wait (with a visible message), fail with a clear message, or use an
-explicit temporary internal location that is reported and cleaned. Caches,
-scratch, build output and VMs probably differ. Oxide's current build-pool rule
-falls back to the internal pool, with a loud warning, only when the drive is
-absent; low space never does.
+Status: answered 2026-10-26
+Answer: per kind: build output uses a visible local fallback; caches and scratch fail clearly; kept data is unavailable (Tom); see [architecture](architecture.md#placement-rules-tom-2026-10-26).
 
 ## Q-002 — Which volume owns which data when several are registered?
 
-Status: open
-Builds (permanent, expendable, 1 TB) and Vault (ephemeral, kept, 4 TB) are both attached today.
-Placement-to-volume binding, preference order and moving a placement between
-volumes are undecided.
+Status: answered 2026-10-26
+Answer: one home per placement chosen by durability: expendable data on Builds, kept data on Vault; moves are explicit (Tom); see [architecture](architecture.md#placement-rules-tom-2026-10-26).
 
 ## Q-003 — How does Barge change another tool's configuration?
 
-Status: open
-Pointing npm, bun or Effigy at a placement means editing that tool's own
-settings. Does Barge write those files itself (explicitly, with a report and an
-undo), print the change for the operator, or use links only?
+Status: answered 2026-10-26
+Answer: links first; a tool's own setting is written only during an explicit adopt, reported and undoable (Tom); see [architecture](architecture.md#placement-rules-tom-2026-10-26).
 
 ## Q-004 — How does Oxide's existing state migrate?
 
-Status: open
-Oxide's `pools.json` registration, its owned output roots and receipts, and its
-scratch markers already exist on disk. The migration order, compatibility
-period and who owns the files in between are undecided.
+Status: answered 2026-10-26
+Answer: Barge reads Oxide's existing formats in place; Oxide switches one part at a time (Tom); see [architecture](architecture.md#placement-rules-tom-2026-10-26).
 
 ## Q-005 — Which platforms are in scope?
 
