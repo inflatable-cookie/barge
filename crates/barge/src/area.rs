@@ -3063,6 +3063,7 @@ mod tests {
             Ok(DescriptorScan::Complete {
                 processes: 0,
                 descriptors: 0,
+                foreign: 0,
                 open: Vec::new(),
             })
         }

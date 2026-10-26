@@ -9,19 +9,23 @@
 //! - every recorded hold for the root released or positively stale;
 //! - the same-uid descriptor scan complete within its bound and empty for the
 //!   root, with the calling process's own descriptors excluded by pid and start
-//!   identity (the walk's and the checks' handles are not another writer);
+//!   identity (the walk's and the checks' handles are not another writer) and
+//!   every process of another effective uid classified and reported rather than
+//!   inspected;
 //! - the root's device, inode and marker digest equal to the observation the
 //!   caller was given;
 //! - the volume still verified; and
 //! - no pending intent naming another root.
 //!
-//! A process of another uid, and a process created after the scan, is outside
-//! this evidence; that residual is named in [`capability_report`] and a wrong
-//! delete stays recoverable through the intent journal and quarantine rename.
-//! The scan excludes the calling `barge` process and nothing else: another Barge
-//! process, its child or its parent holds a descriptor like any other writer.
-//! `lsof` is never custody: it is external, unbounded and its silence is not a
-//! kernel guarantee, so nothing here reads it.
+//! Two residuals are named in [`capability_report`] rather than implied: a
+//! process of another effective uid, which the kernel's own process table
+//! classifies and the evidence counts but nothing inspects, and a process that
+//! dropped its hold and kept writing. A wrong delete stays recoverable through
+//! the intent journal and quarantine rename. The scan excludes the calling
+//! `barge` process and nothing else: another Barge process, its child or its
+//! parent holds a descriptor like any other writer. `lsof` is never custody: it
+//! is external, unbounded and its silence is not a kernel guarantee, so nothing
+//! here reads it.
 //!
 //! Deletion and swap take a [`Safe`](CustodyVerdict::Safe) value, so a caller
 //! cannot pass a boolean and cannot reach the effect on a refusal.
@@ -192,6 +196,11 @@ pub struct CustodyEvidence {
     /// descriptors, so this is the one process the evidence does not cover and
     /// the only exclusion it made.
     pub self_excluded: u32,
+    /// How many processes of another effective uid the scan classified from the
+    /// kernel's own process table. They were not inspected at all: this is the
+    /// named blind spot, reported so the evidence never implies they were
+    /// observed.
+    pub foreign_uid_processes: usize,
     /// When the verdict was decided.
     pub checked_ms: u64,
 }
@@ -464,7 +473,7 @@ fn decide(
             start: self_start,
         }),
     });
-    let (processes, descriptors) = match scan {
+    let (processes, descriptors, foreign) = match scan {
         Err(error) => {
             return Err(Refusal::Unknown(format!(
                 "the open-descriptor scan is unreadable: {error}"
@@ -482,6 +491,7 @@ fn decide(
         Ok(DescriptorScan::Complete {
             processes,
             descriptors,
+            foreign,
             open,
         }) => {
             if let Some(first) = open.first() {
@@ -492,7 +502,7 @@ fn decide(
                     first.path.display()
                 )));
             }
-            (processes, descriptors)
+            (processes, descriptors, foreign)
         }
     };
 
@@ -507,6 +517,7 @@ fn decide(
         processes,
         descriptors,
         self_excluded: self_pid,
+        foreign_uid_processes: foreign,
         checked_ms: state::now_ms(),
     })
 }
@@ -541,13 +552,14 @@ pub fn capability_report() -> CustodyReport {
         establishes: vec![
             "every recorded hold for the root is released or positively stale".to_owned(),
             "a bounded scan of this account's open descriptors is complete and finds none at or under the root".to_owned(),
-            "that scan excludes the calling barge process's own descriptors, by its pid and the start identity read once and verified, and no other process: another barge process, its child or its parent is observed like any other writer".to_owned(),
+            "that scan classifies each process by the effective uid the kernel's own process table reports, before it inspects any descriptor, and reports how many processes of another effective uid it classified".to_owned(),
+            "that scan excludes the calling barge process's own descriptors, by its pid and the start identity read once and verified, and no other process: another barge process, its child or its parent is observed like any other same-uid writer".to_owned(),
             "the root's device, inode and marker digest equal the observation the caller was given".to_owned(),
             "the volume still verifies as the registered one".to_owned(),
             "no pending intent names another root".to_owned(),
         ],
         excludes: vec![
-            "a process of another uid".to_owned(),
+            "a process of another effective uid: classified from the kernel's process table and reported in the evidence as not observed, never inspected".to_owned(),
             "a process created after the scan".to_owned(),
             "a writer that never took a hold and stopped being observable".to_owned(),
         ],
@@ -569,7 +581,8 @@ mod tests {
     use crate::area::RootKind;
     use crate::error::{Error, ErrorKind, Result};
     use crate::os::{
-        DescriptorScan, DescriptorScanRequest, OpenDescriptor, ProcessObserver, VolumeUuid,
+        platform, DescriptorScan, DescriptorScanRequest, OpenDescriptor, ProcessIdentity,
+        ProcessObserver, VolumeUuid,
     };
     use crate::testkit::{Faults, ScanMode, VolumeFixture, FIXTURE_BOOT, OTHER_UUID};
 
@@ -596,52 +609,6 @@ mod tests {
         Holder { fixture, observed }
     }
 
-    /// The real macOS observer over the pids a test owns.
-    fn real_observer(pids: Vec<u32>) -> PinnedProcesses {
-        PinnedProcesses::new(pids)
-    }
-
-    /// The real macOS observer, restricted to the pids a test owns.
-    ///
-    /// The descriptor enumeration, the path matching and the self-exclusion are
-    /// the production ones; only the pid list is pinned, because this platform
-    /// answers `EPERM` to the BSD facts of another account's processes, and one
-    /// such entry makes the whole-system scan `Unknown` by design.
-    struct PinnedProcesses {
-        inner: crate::os::MacOs,
-        pids: Vec<u32>,
-    }
-
-    impl PinnedProcesses {
-        fn new(pids: Vec<u32>) -> Self {
-            Self {
-                inner: crate::os::platform(),
-                pids,
-            }
-        }
-    }
-
-    impl ProcessObserver for PinnedProcesses {
-        fn effective_uid(&self) -> Result<u32> {
-            self.inner.effective_uid()
-        }
-
-        fn boot_identity(&self) -> Result<String> {
-            self.inner.boot_identity()
-        }
-
-        fn process_start(&self, pid: u32) -> Result<Option<u64>> {
-            self.inner.process_start(pid)
-        }
-
-        fn scan_open_descriptors(
-            &self,
-            request: &DescriptorScanRequest<'_>,
-        ) -> Result<DescriptorScan> {
-            self.inner.scan_open_descriptors_over(request, &self.pids)
-        }
-    }
-
     /// A same-uid child process that holds a file under the root open, so the
     /// scan has another writer to find. It is killed and reaped by [`Child`].
     struct Child {
@@ -661,8 +628,18 @@ mod tests {
             Self { process }
         }
 
-        fn pid(&self) -> u32 {
-            self.process.id()
+        /// The child's own identity, as the kernel's table reports it.
+        fn identity(&self) -> ProcessIdentity {
+            let pid = self.process.id();
+            let start = platform()
+                .process_start(pid)
+                .expect("the child's start identity is readable")
+                .expect("the child exists");
+            ProcessIdentity {
+                pid,
+                effective_uid: Some(platform().effective_uid().expect("the account uid")),
+                start,
+            }
         }
     }
 
@@ -673,12 +650,67 @@ mod tests {
         }
     }
 
+    /// The calling process's own identity, as the kernel's table reports it.
+    fn self_identity() -> ProcessIdentity {
+        let pid = std::process::id();
+        ProcessIdentity {
+            pid,
+            effective_uid: Some(platform().effective_uid().expect("the account uid")),
+            start: platform()
+                .process_start(pid)
+                .expect("the calling process's start identity")
+                .expect("the calling process exists"),
+        }
+    }
+
+    /// The real macOS observer, given one process table a test states itself.
+    ///
+    /// The classification, the descriptor enumeration, the path matching and the
+    /// self-exclusion are the production ones; only the table is injected, which
+    /// is how an unprivileged fact about another account, an unreadable uid or a
+    /// table that claims a pid this account cannot read is exercised against the
+    /// real kernel reads.
+    struct TableObserver {
+        inner: crate::os::MacOs,
+        table: Vec<ProcessIdentity>,
+    }
+
+    impl TableObserver {
+        fn new(table: Vec<ProcessIdentity>) -> Self {
+            Self {
+                inner: platform(),
+                table,
+            }
+        }
+    }
+
+    impl ProcessObserver for TableObserver {
+        fn effective_uid(&self) -> Result<u32> {
+            self.inner.effective_uid()
+        }
+
+        fn boot_identity(&self) -> Result<String> {
+            self.inner.boot_identity()
+        }
+
+        fn process_start(&self, pid: u32) -> Result<Option<u64>> {
+            self.inner.process_start(pid)
+        }
+
+        fn scan_open_descriptors(
+            &self,
+            request: &DescriptorScanRequest<'_>,
+        ) -> Result<DescriptorScan> {
+            self.inner.scan_open_descriptors_over(request, &self.table)
+        }
+    }
+
     /// The real observer with the self-exclusion removed: the counterfactual
     /// that shows the exclusion is what makes the calling process's own handles
     /// invisible.
     struct NoSelfExclusion {
         inner: crate::os::MacOs,
-        pids: Vec<u32>,
+        table: Vec<ProcessIdentity>,
     }
 
     impl ProcessObserver for NoSelfExclusion {
@@ -703,16 +735,16 @@ mod tests {
                     self_exclusion: None,
                     ..*request
                 },
-                &self.pids,
+                &self.table,
             )
         }
     }
 
     /// The real observer whose recorded start identity for the calling process
-    /// is wrong, which the platform must refuse rather than skip.
+    /// is wrong, which the scan must refuse rather than skip.
     struct MismatchedSelf {
         inner: crate::os::MacOs,
-        pids: Vec<u32>,
+        table: Vec<ProcessIdentity>,
     }
 
     impl ProcessObserver for MismatchedSelf {
@@ -743,7 +775,7 @@ mod tests {
             &self,
             request: &DescriptorScanRequest<'_>,
         ) -> Result<DescriptorScan> {
-            self.inner.scan_open_descriptors_over(request, &self.pids)
+            self.inner.scan_open_descriptors_over(request, &self.table)
         }
     }
 
@@ -1025,13 +1057,21 @@ mod tests {
         assert!(report
             .excludes
             .iter()
-            .any(|fact| fact.contains("another uid")));
+            .any(|fact| fact.contains("another effective uid")));
         assert!(
             report
                 .establishes
                 .iter()
                 .any(|fact| fact.contains("calling barge process")),
             "the capability names the one exclusion the scan makes: {:?}",
+            report.establishes
+        );
+        assert!(
+            report
+                .establishes
+                .iter()
+                .any(|fact| fact.contains("effective uid")),
+            "the capability names the classification the scan makes: {:?}",
             report.establishes
         );
     }
@@ -1059,7 +1099,7 @@ mod tests {
     // ---- the real observer, on a fixture root under scratch ------------------
 
     #[test]
-    fn the_real_observer_excludes_the_calling_process_own_handles() {
+    fn the_calling_process_own_handles_do_not_block_safe() {
         let holder = real_holder("custody-real-self");
         let payload = holder.payload();
         // The handles custody itself holds while it scans: a directory
@@ -1067,43 +1107,44 @@ mod tests {
         // correction these were the evidence that refused every delete.
         let root_handle = std::fs::File::open(holder.root_path()).expect("the root opens");
         let file_handle = std::fs::File::open(&payload).expect("the payload opens");
-        let observer = real_observer(vec![std::process::id()]);
+        let observer = TableObserver::new(vec![self_identity()]);
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
         assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
         let evidence = verdict.evidence().expect("the evidence");
         assert_eq!(evidence.self_excluded, std::process::id());
         assert_eq!(evidence.holds, 0);
+        assert_eq!(evidence.foreign_uid_processes, 0);
         // The handles were open across the scan, not closed before it.
         assert!(root_handle.metadata().is_ok());
         assert!(file_handle.metadata().is_ok());
     }
 
     #[test]
-    fn the_real_observer_still_finds_another_process_holding_the_root_open() {
+    fn another_same_uid_process_holding_the_root_open_is_unsafe() {
         let holder = real_holder("custody-real-other");
         let payload = holder.payload();
         let child = Child::holding(&payload);
-        let observer = real_observer(vec![std::process::id(), child.pid()]);
+        let observer = TableObserver::new(vec![self_identity(), child.identity()]);
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
         assert_eq!(verdict.name(), "unsafe", "{:?}", verdict.reason());
         assert!(
             verdict
                 .reason()
                 .unwrap_or_default()
-                .contains(&child.pid().to_string()),
+                .contains(&child.process.id().to_string()),
             "the refusal names the other holder: {:?}",
             verdict.reason()
         );
     }
 
     #[test]
-    fn the_real_observer_without_the_exclusion_refuses_on_the_calling_process() {
+    fn removing_the_self_exclusion_refuses_on_the_calling_process() {
         let holder = real_holder("custody-real-counterfactual");
         let payload = holder.payload();
         let handle = std::fs::File::open(&payload).expect("the payload opens");
         let observer = NoSelfExclusion {
-            inner: crate::os::platform(),
-            pids: vec![std::process::id()],
+            inner: platform(),
+            table: vec![self_identity()],
         };
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
         assert_eq!(verdict.name(), "unsafe", "{:?}", verdict.reason());
@@ -1119,12 +1160,12 @@ mod tests {
     }
 
     #[test]
-    fn a_real_self_exclusion_that_mismatches_is_unknown() {
+    fn a_self_start_identity_that_mismatches_is_unknown() {
         let holder = real_holder("custody-real-mismatch");
         holder.payload();
         let observer = MismatchedSelf {
-            inner: crate::os::platform(),
-            pids: vec![std::process::id()],
+            inner: platform(),
+            table: vec![self_identity()],
         };
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
         assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
@@ -1136,11 +1177,11 @@ mod tests {
     }
 
     #[test]
-    fn a_real_forced_process_bound_is_unknown() {
+    fn a_forced_process_bound_is_unknown() {
         let holder = real_holder("custody-real-bound");
         let payload = holder.payload();
         let child = Child::holding(&payload);
-        let observer = real_observer(vec![std::process::id(), child.pid()]);
+        let observer = TableObserver::new(vec![self_identity(), child.identity()]);
         let bounds = CustodyBounds {
             processes: 0,
             ..CustodyBounds::default()
@@ -1151,18 +1192,174 @@ mod tests {
     }
 
     #[test]
-    fn a_real_self_exclusion_the_scan_never_saw_is_unknown() {
+    fn a_self_exclusion_the_table_never_showed_is_unknown() {
         let holder = real_holder("custody-real-unseen");
         let payload = holder.payload();
         let child = Child::holding(&payload);
-        // The calling process is not in the pid list at all, so the scan cannot
+        // The calling process is not in the table at all, so the scan cannot
         // prove what it left out and must refuse.
-        let observer = real_observer(vec![child.pid()]);
+        let observer = TableObserver::new(vec![child.identity()]);
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
         assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
         assert!(verdict
             .reason()
             .unwrap_or_default()
             .contains("not observed"));
+    }
+
+    #[test]
+    fn an_injected_foreign_effective_uid_is_reported_and_does_not_block() {
+        let holder = real_holder("custody-real-foreign-injected");
+        holder.payload();
+        // Two processes of another effective uid, injected as the kernel's
+        // table would report them. They are classified and counted; nothing
+        // about them is inspected, so no descriptor read can refuse them.
+        let observer = TableObserver::new(vec![
+            self_identity(),
+            ProcessIdentity {
+                pid: 4_242,
+                effective_uid: Some(0),
+                start: 7,
+            },
+            ProcessIdentity {
+                pid: 4_243,
+                effective_uid: Some(248),
+                start: 8,
+            },
+        ]);
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+        assert_eq!(
+            verdict
+                .evidence()
+                .expect("the evidence")
+                .foreign_uid_processes,
+            2
+        );
+    }
+
+    #[test]
+    fn a_table_entry_with_an_unreadable_effective_uid_is_unknown() {
+        let holder = real_holder("custody-real-uid-unreadable");
+        holder.payload();
+        let observer = TableObserver::new(vec![
+            self_identity(),
+            ProcessIdentity {
+                pid: 4_244,
+                effective_uid: None,
+                start: 9,
+            },
+        ]);
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        assert!(verdict
+            .reason()
+            .unwrap_or_default()
+            .contains("effective uid"));
+        assert!(verdict.clone().into_evidence().is_err(), "unknown refuses");
+    }
+
+    #[test]
+    fn a_process_this_account_may_not_read_is_unknown_even_when_the_table_claims_it() {
+        let holder = real_holder("custody-real-descriptors-unreadable");
+        holder.payload();
+        // A pid whose descriptors the kernel will not show this account, claimed
+        // by the table as this account's own. The descriptor read refuses, and a
+        // refusal to read is unknown, never "nothing open".
+        let foreign = a_foreign_identity();
+        let observer = TableObserver::new(vec![
+            self_identity(),
+            ProcessIdentity {
+                pid: foreign.pid,
+                effective_uid: Some(platform().effective_uid().expect("the account uid")),
+                start: foreign.start,
+            },
+        ]);
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        assert!(verdict
+            .reason()
+            .unwrap_or_default()
+            .contains("descriptors of pid"));
+        assert!(verdict.clone().into_evidence().is_err(), "unknown refuses");
+    }
+
+    /// One real process of another effective uid, read from the kernel's own
+    /// table: a read-only observation, naming nothing and changing nothing.
+    fn a_foreign_identity() -> ProcessIdentity {
+        let uid = platform().effective_uid().expect("the account uid");
+        let rows = platform()
+            .observed_processes()
+            .expect("the process table reads")
+            .expect("the process table is within its bound");
+        rows.into_iter()
+            .map(|(identity, _)| identity)
+            .find(|identity| identity.effective_uid != Some(uid))
+            .expect("this host reports processes of other effective uids")
+    }
+
+    /// The real login processes of this host, read-only from the kernel's own
+    /// table. They are root-owned on every macOS host that has one; if this host
+    /// has none, any process of another effective uid stands in for them, and
+    /// the fact under test is the same.
+    fn real_foreign_identities() -> Vec<ProcessIdentity> {
+        let uid = platform().effective_uid().expect("the account uid");
+        let rows = platform()
+            .observed_processes()
+            .expect("the process table reads")
+            .expect("the process table is within its bound");
+        let login: Vec<ProcessIdentity> = rows
+            .iter()
+            .filter(|(identity, command)| command == "login" && identity.effective_uid != Some(uid))
+            .map(|(identity, _)| *identity)
+            .collect();
+        if !login.is_empty() {
+            return login;
+        }
+        rows.iter()
+            .filter(|(identity, _)| identity.effective_uid != Some(uid))
+            .map(|(identity, _)| *identity)
+            .take(1)
+            .collect()
+    }
+
+    #[test]
+    fn real_login_processes_are_reported_as_foreign_and_do_not_block() {
+        let holder = real_holder("custody-real-login");
+        holder.payload();
+        let foreign = real_foreign_identities();
+        assert!(
+            !foreign.is_empty(),
+            "this host reports at least one process of another effective uid"
+        );
+        // A read-only observation of the real login processes: their identities
+        // come from the kernel's table and nothing about them is inspected.
+        let mut table = vec![self_identity()];
+        table.extend(foreign.iter().copied());
+        let observer = TableObserver::new(table);
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+        let evidence = verdict.evidence().expect("the evidence");
+        assert_eq!(evidence.foreign_uid_processes, foreign.len());
+        assert_eq!(evidence.self_excluded, std::process::id());
+    }
+
+    #[test]
+    fn without_effective_uid_classification_the_real_login_process_refuses() {
+        let uid = platform().effective_uid().expect("the account uid");
+        let candidates = real_foreign_identities();
+        assert!(!candidates.is_empty(), "there is a process to classify");
+        // Identification through the process's own BSD facts is what the scan
+        // did before this correction, and it is refused for exactly these
+        // processes: that refusal is the counterfactual.
+        for identity in &candidates {
+            let error = platform()
+                .process_start(identity.pid)
+                .expect_err("this account may not read that process's BSD facts");
+            assert_eq!(error.kind(), ErrorKind::UnknownState, "{}", identity.pid);
+            // The kernel's own table classified it without asking the process,
+            // which is what makes it the named blind spot instead.
+            assert_ne!(identity.effective_uid, Some(uid));
+        }
     }
 }

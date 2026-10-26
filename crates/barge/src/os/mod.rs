@@ -17,8 +17,8 @@ mod macos;
 pub use facts::{
     AccountFacts, ChildEntry, ChildListing, ChildRemoval, DescriptorScan, DescriptorScanRequest,
     DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, ExpectedVolume, FileSystem,
-    MountPoint, MountRoot, OpenDescriptor, ProcessObserver, RemoveKind, SelfExclusion,
-    VerifiedVolume, VolumeFacts, VolumeIdentity, VolumeUuid,
+    MountPoint, MountRoot, OpenDescriptor, ProcessIdentity, ProcessObserver, RemoveKind,
+    SelfExclusion, VerifiedVolume, VolumeFacts, VolumeIdentity, VolumeUuid,
 };
 
 #[cfg(target_os = "macos")]

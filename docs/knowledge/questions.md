@@ -35,19 +35,33 @@ Answer: outside Barge's own folders and every declared area, not outside `root_d
 
 ## Q-007 — Can a same-uid descriptor scan read every process it must decide?
 
-Status: open (found 2026-10-26 in barge#011, the S5 self-exclusion correction)
-Measured: on macOS 26.6.2 (25G83), `proc_pidinfo(PROC_PIDTBSDINFO)` answers `EPERM`
-for the 357 processes of another uid among 1328, because this account may not
-read another account's BSD facts. The scan reads that entry before it can apply
-its uid filter, so a whole-system scan on a multi-user machine is an unreadable
-process entry, and custody is `Unknown` for every root: the same "no delete ever
-proceeds" symptom barge#006 and barge#007 saw, from a second cause. The
-correction in this task (exclude the calling process's own descriptors) is
-necessary and is implemented; it is not sufficient on this machine.
-Proposed, for the architect: read each process's uid and start identity from
-`sysctl KERN_PROC_ALL`, which reports them for every process, and keep
-`proc_pidinfo`/`PROC_PIDLISTFDS` for the descriptors of same-uid processes only.
-That reads the same facts through a public interface, so no unknown becomes
-safe, but it changes the observation primitive the [stage 1 design](contracts/stage1-design.md#writer-custody-and-safe-deletion)
-names, which is why it is a decision, not a correction. Until it is decided, an
-unreadable process entry keeps meaning `Unknown`.
+Status: answered 2026-10-26
+Answer: it does not have to. Tom's ruling bcaa83d8 (carried by barge#011 v2)
+decides that each candidate is classified from the kernel's own process table
+(`sysctl`/`KERN_PROC_ALL`: effective uid and start identity, no privilege) before
+any descriptor is inspected; a process of another effective uid is the named
+blind spot, reported in the `Safe` evidence and in `describe.custody`, and does
+not block. An unreadable effective uid and a same-uid descriptor that cannot be
+read stay `Unknown`. The measured reason it mattered: `PROC_PIDTBSDINFO` answers
+`EPERM` for another uid's processes (357 of 1328 on macOS 26.6.2, 25G83), so
+identifying processes that way made every whole-system scan `Unknown`. See the
+[stage 1 design](contracts/stage1-design.md#writer-custody-and-safe-deletion).
+
+## Q-008 — What about this account's own processes whose descriptors cannot be read?
+
+Status: open (measured 2026-10-26 in barge#011 v2)
+Measured: `PROC_PIDFDVNODEPATHINFO` answers `EPERM` for some descriptors of this
+account's own processes — the sandboxed and TCC-protected system daemons:
+`progressd`, `routined`, `ScreenTimeAgent`, `dmd`, `lsd`, `nsurlsessiond`,
+`UserEventAgent`, `com.apple.quicklook.ThumbnailsAgent` on macOS 26.6.2, 8 of
+1004 processes of this account. Listing their descriptors is allowed; reading
+the path of the protected ones is not.
+Consequence: under the rule that an unreadable descriptor is `Unknown`, a
+whole-system scan is `Unknown` on a real session, so a full-scan `Safe` verdict is
+not reachable there — the same "no delete proceeds" symptom from a third cause.
+The correction in barge#011 does not touch it: an unreadable same-uid descriptor
+stays `Unknown` by the brief, and relaxing that would let a same-uid writer hide.
+Question for the architect: is a same-uid process whose descriptor paths cannot
+be read a second named blind spot (counted and reported like a foreign effective
+uid), or does custody keep refusing? Any answer changes what `Safe` promises, so
+it is a decision, not a correction.

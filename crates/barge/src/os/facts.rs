@@ -478,14 +478,37 @@ pub trait ProcessObserver {
     ///
     /// The observation is the same-uid half of custody, not a kernel guarantee
     /// (stage 1 design, "Capability limits on macOS and APFS"): a process of
-    /// another uid, and one created after the scan, is outside it. The one
-    /// process the request may exclude is the calling one, by its pid and the
-    /// start identity the caller read for it, and the implementation verifies
-    /// that identity before it skips the process; no other process is excluded.
-    /// A scan that reaches its process, descriptor or time bound answers
-    /// [`DescriptorScan::Bounded`], which is unknown and never safe. An
-    /// unreadable process or descriptor entry is an error, also never safe.
+    /// another uid, and one created after the scan, is outside it. Each
+    /// candidate is classified from the kernel's own process table by its
+    /// effective uid before any of its descriptors are inspected, so a process
+    /// of another effective uid is counted as the named blind spot instead of
+    /// being reported as unreadable. The one process the request may exclude is
+    /// the calling one, by its pid and the start identity the caller read for
+    /// it, and the implementation verifies that identity before it skips the
+    /// process; no other process is excluded. A scan that reaches its process,
+    /// descriptor or time bound answers [`DescriptorScan::Bounded`], which is
+    /// unknown and never safe. An unreadable effective uid, and an unreadable
+    /// descriptor entry of this account's process, is an error, also never
+    /// safe.
     fn scan_open_descriptors(&self, request: &DescriptorScanRequest<'_>) -> Result<DescriptorScan>;
+}
+
+/// One process as the kernel's own process table reports it: its pid, its
+/// effective uid and its start identity, read without inspecting any of the
+/// process's descriptors.
+///
+/// Classifying a candidate from this entry is what keeps another account's
+/// processes out of the same-uid observation without asking for a fact this
+/// account may not read. `effective_uid` is `None` when the table reported no
+/// readable uid for the process, which is unknown state and never "not mine".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    /// The process's pid.
+    pub pid: u32,
+    /// The process's effective uid, or `None` when it is unreadable.
+    pub effective_uid: Option<u32>,
+    /// The process's start identity, which a pid alone cannot stand for.
+    pub start: u64,
 }
 
 /// The calling process a scan excludes from its own evidence.
@@ -549,6 +572,10 @@ pub enum DescriptorScan {
         processes: usize,
         /// How many descriptors were observed.
         descriptors: usize,
+        /// How many processes the table classified as another effective uid.
+        /// They were classified, not inspected: this is the named blind spot,
+        /// reported so no reader mistakes it for an observation.
+        foreign: usize,
         /// The open descriptors at or under the root.
         open: Vec<OpenDescriptor>,
     },

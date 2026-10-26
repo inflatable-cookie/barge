@@ -294,11 +294,13 @@ impl ProcessObserver for FakeObserver {
             ScanMode::Complete => Ok(DescriptorScan::Complete {
                 processes: 3,
                 descriptors: 12,
+                foreign: 0,
                 open: Vec::new(),
             }),
             ScanMode::Open(open) => Ok(DescriptorScan::Complete {
                 processes: 3,
                 descriptors: 12,
+                foreign: 0,
                 open: open.clone(),
             }),
             ScanMode::Bounded => Ok(DescriptorScan::Bounded {
