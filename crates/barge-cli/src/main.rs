@@ -684,7 +684,7 @@ fn describe_summary(data: &DescribeData) -> String {
         "not initialized"
     };
     format!(
-        "barge {} ({})\nstate directory: {} ({state}, from {})\nhome: {}\nvolumes: {} of {}; areas: {} of {}; placements: {} of {}; roots: {} of {}; observations: {} of {}\n",
+        "barge {} ({})\nstate directory: {} ({state}, from {})\nhome: {}\nvolumes: {} of {}; areas: {} of {}; placements: {} of {}; roots: {} of {}; observations: {} of {}\ncustody: {} (kernel proof: {})\n",
         data.tool.version,
         data.formats.describe,
         data.state.dir.display(),
@@ -700,6 +700,8 @@ fn describe_summary(data: &DescribeData) -> String {
         data.roots.total,
         data.observations.count,
         data.observations.total,
+        data.custody.capability,
+        data.custody.kernel_proof,
     )
 }
 

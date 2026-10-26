@@ -8,6 +8,7 @@
 use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -415,9 +416,46 @@ pub trait DirOps {
     /// reporting how many it held.
     fn list_children(&self, parent: &DirHandle, max_names: usize) -> Result<ChildListing>;
 
+    /// Remove one child entry, never following a symbolic link. The kind says
+    /// whether the entry is a directory, which is what decides between the
+    /// platform's two removal calls; a symlink is removed as a file and is never
+    /// followed.
+    fn remove_child(
+        &self,
+        parent: &DirHandle,
+        name: &str,
+        kind: RemoveKind,
+    ) -> Result<ChildRemoval>;
+
+    /// Rename one child inside its own directory, atomically. A cross-device
+    /// request is refused by the platform and surfaces as a failure, never as a
+    /// copy.
+    fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<()>;
+
     /// Fresh random bytes from the platform's entropy source, used for a root's
     /// id and nonce.
     fn random_bytes(&self, length: usize) -> Result<Vec<u8>>;
+}
+
+/// How one child entry is removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveKind {
+    /// A regular file or a symbolic link; the link itself is removed.
+    File,
+    /// A directory, which must be empty.
+    Directory,
+}
+
+/// What one child removal found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildRemoval {
+    /// The entry is gone.
+    Removed,
+    /// The platform refused because the directory still holds entries: a Finder
+    /// `.DS_Store` can appear again between the listing and the removal.
+    NotEmpty,
+    /// The entry was already gone.
+    Absent,
 }
 
 /// The account and process facts a recorded hold is decided against.
@@ -434,6 +472,72 @@ pub trait ProcessObserver {
     /// positively gone; an error means it cannot be decided, which is unknown
     /// and never stale.
     fn process_start(&self, pid: u32) -> Result<Option<u64>>;
+
+    /// Observe, within a bound, whether any process of this account holds an
+    /// open descriptor at or under `request.root`.
+    ///
+    /// The observation is the same-uid half of custody, not a kernel guarantee
+    /// (stage 1 design, "Capability limits on macOS and APFS"): a process of
+    /// another uid, and one created after the scan, is outside it. A scan that
+    /// reaches its process, descriptor or time bound answers [`DescriptorScan::Bounded`],
+    /// which is unknown and never safe. An unreadable process or descriptor
+    /// entry is an error, also never safe.
+    fn scan_open_descriptors(&self, request: &DescriptorScanRequest<'_>) -> Result<DescriptorScan>;
+}
+
+/// What one bounded same-uid open-descriptor scan is asked to observe.
+#[derive(Debug, Clone, Copy)]
+pub struct DescriptorScanRequest<'a> {
+    /// The absolute path of the root the scan is about. A descriptor whose path
+    /// is at or under it is reported.
+    pub root: &'a Path,
+    /// The root's device, so the root's own descriptor is also proved by identity.
+    pub root_device: DeviceId,
+    /// The root's inode.
+    pub root_inode: u64,
+    /// How many processes this account may be observed through.
+    pub max_processes: usize,
+    /// How many descriptors may be observed in total.
+    pub max_descriptors: usize,
+    /// How long the scan may take before it must answer "bounded".
+    pub timeout: Duration,
+}
+
+/// One open descriptor found under the scanned root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenDescriptor {
+    /// The process that holds it.
+    pub pid: u32,
+    /// The descriptor number inside that process.
+    pub descriptor: i32,
+    /// The path the platform reports for it.
+    pub path: PathBuf,
+}
+
+/// The answer of one bounded descriptor scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DescriptorScan {
+    /// The scan finished inside its bounds. `open` is every descriptor found at
+    /// or under the root; empty is the only answer custody can build on.
+    Complete {
+        /// How many same-uid processes were observed.
+        processes: usize,
+        /// How many descriptors were observed.
+        descriptors: usize,
+        /// The open descriptors at or under the root.
+        open: Vec<OpenDescriptor>,
+    },
+    /// A bound was reached before the scan finished, so it proves nothing. The
+    /// bound's name is reported and the verdict is unknown.
+    Bounded {
+        /// How many same-uid processes were observed before the bound.
+        processes: usize,
+        /// How many descriptors were observed before the bound.
+        descriptors: usize,
+        /// Which bound stopped the scan.
+        bound: &'static str,
+    },
 }
 
 /// A volume whose facts were read and matched the expectation.

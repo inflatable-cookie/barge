@@ -137,6 +137,11 @@ pub struct DescribeData {
     pub roots: RowSet<RootObservation>,
     /// Foreign observations, bounded to the observation row cap.
     pub observations: RowSet<ObservationRow>,
+    /// The writer-custody capability this build offers, its named limits, and
+    /// the fact that no kernel proof is claimed (slice S5). An older document
+    /// without this field still reads.
+    #[serde(default)]
+    pub custody: crate::custody::CustodyReport,
 }
 
 /// The `data` of `barge.inspect/1`.
@@ -427,6 +432,7 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
         placements: RowSet::empty(),
         roots,
         observations: RowSet::bounded(observation_rows, observation_total, OBSERVATION_ROWS),
+        custody: crate::custody::capability_report(),
     })
 }
 
@@ -961,6 +967,15 @@ mod tests {
         }
         assert_eq!(data.areas.count, 0);
         assert_eq!(data.placements.count, 0);
+        assert_eq!(
+            data.custody.capability,
+            crate::custody::CAPABILITY,
+            "describe reports the custody capability honestly"
+        );
+        assert!(
+            !data.custody.kernel_proof,
+            "no kernel proof is claimed for writer custody"
+        );
     }
 
     #[test]
@@ -1475,6 +1490,17 @@ mod tests {
         fn process_start(&self, _pid: u32) -> Result<Option<u64>> {
             Ok(None)
         }
+
+        fn scan_open_descriptors(
+            &self,
+            _request: &crate::os::DescriptorScanRequest<'_>,
+        ) -> Result<crate::os::DescriptorScan> {
+            Ok(crate::os::DescriptorScan::Complete {
+                processes: 0,
+                descriptors: 0,
+                open: Vec::new(),
+            })
+        }
     }
 
     #[test]
@@ -1601,5 +1627,16 @@ mod tests {
         without.push(b'\n');
         let read = read_describe_document(&without).expect("an older document reads");
         assert_eq!(read.roots.count, 0, "a missing optional list is empty");
+
+        // The same holds for the custody object a later S5 document adds.
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("the document");
+        value["data"]
+            .as_object_mut()
+            .expect("the data is an object")
+            .remove("custody");
+        let mut without = serde_json::to_vec(&value).expect("the document encodes");
+        without.push(b'\n');
+        let read = read_describe_document(&without).expect("an older document reads");
+        assert_eq!(read.custody.capability, crate::custody::CAPABILITY);
     }
 }
