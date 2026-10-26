@@ -1870,6 +1870,35 @@ Choices S6 made where this design left the mechanic to the slice:
   resolution (`Feature::Caches`) and one public `write_marker`, so creation and
   in-place adoption share one marker writer, one field set and one read-back
   proof instead of two.
+- **Custody before a link removal.** `barge cache undo` of a `link` placement
+  reopens the volume's `caches/` folder, proves the owned root is the recorded
+  id, inode and marker bytes, and requires a `Safe` custody verdict (released or
+  stale holds, a complete and empty same-uid descriptor observation, no pending
+  intent) before it removes the link. A plan reports the removal without taking
+  custody, because a plan has no effect.
+- **An effect without its record is rolled back.** A placement record is
+  published last, after the setting write, the link or the marker. When that
+  publish fails (`ENOSPC`, `EACCES`, a changed state directory), adopt undoes the
+  effect it just made: it removes the link and restores the empty directory it
+  replaced, removes the marker it just wrote after re-proving it, or restores the
+  settings file's recorded before-bytes and removes an adopted marker. The
+  refusal's detail names every step that was rolled back, so no filesystem effect
+  is stranded without the record that proves it. The owned root a link pointed at
+  is left in place: it carries its own marker, holds no payload, and S6 removes
+  nothing on a volume.
+- **A fixture-only account home.** The native proof needs a private account home
+  (its original paths resolve from the account home, never from `$HOME`), so S6
+  adds `BARGE_ACCOUNT_HOME`, the documented fixture-only sibling of
+  `BARGE_STATE_DIR`: it is consulted only when set, it must be an absolute real
+  directory of this account, and a normal run leaves it unset. State resolution
+  is unchanged: `BARGE_STATE_DIR` still owns the state directory, and neither
+  variable is inferred from `$HOME`.
+- **The native proof's plan.** [The S6 native proof plan](s6-native-proof.md)
+  records the elevated run's fixed command, the pinned supervisor bytes, the nine
+  HIGH premises traced through the case bodies, the receipt shape, and the
+  activation order. Effigy gains `cache:native` and its uncounted
+  `cache:native:diagnostic` twin; both are owner-activated and neither is part of
+  an ordinary validation pass.
 
 ## Proposed validation
 

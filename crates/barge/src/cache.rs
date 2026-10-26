@@ -49,7 +49,9 @@ use crate::area::{
     self, Feature, FeatureFolder, MarkerExpectation, MarkerState, MarkerWrite, RootKind, RootOrigin,
 };
 use crate::contract::{PLACEMENT_CAP_BYTES, PLACEMENT_ROWS, PLACEMENT_SCHEMA, SETTING_CAP_BYTES};
-use crate::custody::{SCAN_DESCRIPTORS, SCAN_PROCESSES, SCAN_TIMEOUT};
+use crate::custody::{
+    self, CustodyBounds, PendingIntent, SCAN_DESCRIPTORS, SCAN_PROCESSES, SCAN_TIMEOUT,
+};
 use crate::describe::{AbsentPolicy as RowAbsentPolicy, LinkState, PlacementKind, PlacementRow};
 use crate::digest::sha256_hex;
 use crate::error::{Error, ErrorKind, Result};
@@ -1078,10 +1080,10 @@ fn adopt_setting(
                 target.display()
             ));
         } else {
-            notes.push(
-                "--adopt-existing-root had nothing to adopt: the cache directory does not exist yet"
-                    .to_owned(),
-            );
+            changes.push(format!(
+                "create {} and write its `.barge-root.json` with `origin: adopted_existing`",
+                target.display()
+            ));
         }
     }
     if request.plan {
@@ -1145,6 +1147,7 @@ fn adopt_setting(
     }
     let after = snapshot_of(&after_facts, &after_written)?;
     let rollback = before.clone();
+    let adopted_marker = data_held_root.clone();
     let form = PlacementForm::Setting(Box::new(SettingForm {
         settings_path: original.to_path_buf(),
         key: key.clone(),
@@ -1170,18 +1173,49 @@ fn adopt_setting(
         Ok(record) => record,
         Err(error) => {
             // The effect is applied but its record cannot be published, so a
-            // later undo could not prove it. Put the file back and say so
-            // instead of leaving a change no record authorizes.
+            // later undo could not prove it. Put every byte back and say what
+            // was rolled back instead of leaving a change no record authorizes.
+            let mut rolled_back = Vec::new();
             match &rollback {
-                Some(snapshot) => {
-                    let bytes = decode_hex(&snapshot.bytes)?;
-                    dirs.publish_child_file(&parent, &file_name, &bytes, snapshot.mode)?;
-                }
-                None => {
-                    let _ = dirs.remove_child(&parent, &file_name, RemoveKind::File);
-                }
+                Some(snapshot) => match decode_hex(&snapshot.bytes) {
+                    Ok(bytes) => match dirs.publish_child_file(
+                        &parent,
+                        &file_name,
+                        &bytes,
+                        snapshot.mode,
+                    ) {
+                        Ok(()) => rolled_back.push(format!(
+                            "restored {} to its pre-adopt bytes",
+                            original.display()
+                        )),
+                        Err(write_error) => rolled_back.push(format!(
+                            "could not restore {}: {write_error}",
+                            original.display()
+                        )),
+                    },
+                    Err(_) => rolled_back.push(format!(
+                        "the recorded pre-adopt bytes of {} did not decode; it is left as adopt wrote it",
+                        original.display()
+                    )),
+                },
+                None => match dirs.remove_child(&parent, &file_name, RemoveKind::File) {
+                    Ok(_) => rolled_back
+                        .push(format!("removed {} again", original.display())),
+                    Err(remove_error) => rolled_back.push(format!(
+                        "could not remove {}: {remove_error}",
+                        original.display()
+                    )),
+                },
             }
-            return Err(error.with_detail("rolled_back", true.into()));
+            if let Some(held) = &adopted_marker {
+                let form = HeldRootForm {
+                    path: held.path.clone(),
+                    publication: None,
+                    held_root: held.clone(),
+                };
+                rolled_back.extend(rollback_marker(dirs, record, &form, effective_uid));
+            }
+            return Err(error.with_detail("rolled_back", rolled_back.into()));
         }
     };
     Ok(AdoptReport {
@@ -1251,14 +1285,15 @@ fn adopt_directory(
                 cache_area(),
             )?;
             publish_link(dirs, original, &root.path)?;
-            let form = PlacementForm::Link(LinkForm {
+            let link_form = LinkForm {
                 link_path: original.to_path_buf(),
                 target: root.path.clone(),
                 restore: LinkRestore::Absent,
                 root_id: root.root_id,
                 marker_digest: root.marker_digest,
-            });
-            let record = finish_record(
+            };
+            let form = PlacementForm::Link(link_form.clone());
+            let record = match finish_record(
                 state,
                 dirs,
                 request.kind,
@@ -1267,7 +1302,13 @@ fn adopt_directory(
                 &folder,
                 root.path,
                 form,
-            )?;
+            ) {
+                Ok(record) => record,
+                Err(error) => {
+                    let rolled_back = rollback_link(dirs, &link_form, 0o755);
+                    return Err(error.with_detail("rolled_back", rolled_back.into()));
+                }
+            };
             Ok(AdoptReport {
                 plan: false,
                 placement: Some(record),
@@ -1370,15 +1411,16 @@ fn adopt_directory(
             let _volume_lock = locks.lock_volume(&record.volume_uuid)?;
             let folder = re_resolve(dirs, facts, mounts, observer, record)?;
             let held = adopt_in_place(dirs, record, &target, effective_uid)?;
-            let form = PlacementForm::HeldRoot(HeldRootForm {
+            let held_form = HeldRootForm {
                 path: target.clone(),
                 publication: Some(HeldRootLink {
                     link_path: original.to_path_buf(),
                     target: target.clone(),
                 }),
                 held_root: held,
-            });
-            let record = finish_record(
+            };
+            let form = PlacementForm::HeldRoot(held_form.clone());
+            let record = match finish_record(
                 state,
                 dirs,
                 request.kind,
@@ -1387,7 +1429,13 @@ fn adopt_directory(
                 &folder,
                 target,
                 form,
-            )?;
+            ) {
+                Ok(record) => record,
+                Err(error) => {
+                    let rolled_back = rollback_marker(dirs, record, &held_form, effective_uid);
+                    return Err(error.with_detail("rolled_back", rolled_back.into()));
+                }
+            };
             Ok(AdoptReport {
                 plan: false,
                 placement: Some(record),
@@ -1418,12 +1466,13 @@ fn adopt_directory(
                     let _volume_lock = locks.lock_volume(&record.volume_uuid)?;
                     let folder = re_resolve(dirs, facts, mounts, observer, record)?;
                     let held = adopt_in_place(dirs, record, original, effective_uid)?;
-                    let form = PlacementForm::HeldRoot(HeldRootForm {
+                    let held_form = HeldRootForm {
                         path: original.to_path_buf(),
                         publication: None,
                         held_root: held,
-                    });
-                    let record = finish_record(
+                    };
+                    let form = PlacementForm::HeldRoot(held_form.clone());
+                    let record = match finish_record(
                         state,
                         dirs,
                         request.kind,
@@ -1432,7 +1481,14 @@ fn adopt_directory(
                         &folder,
                         original.to_path_buf(),
                         form,
-                    )?;
+                    ) {
+                        Ok(record) => record,
+                        Err(error) => {
+                            let rolled_back =
+                                rollback_marker(dirs, record, &held_form, effective_uid);
+                            return Err(error.with_detail("rolled_back", rolled_back.into()));
+                        }
+                    };
                     return Ok(AdoptReport {
                         plan: false,
                         placement: Some(record),
@@ -1482,12 +1538,13 @@ fn adopt_directory(
                 let _volume_lock = locks.lock_volume(&record.volume_uuid)?;
                 let folder = re_resolve(dirs, facts, mounts, observer, record)?;
                 let held = adopt_in_place(dirs, record, original, effective_uid)?;
-                let form = PlacementForm::HeldRoot(HeldRootForm {
+                let held_form = HeldRootForm {
                     path: original.to_path_buf(),
                     publication: None,
                     held_root: held,
-                });
-                let record = finish_record(
+                };
+                let form = PlacementForm::HeldRoot(held_form.clone());
+                let record = match finish_record(
                     state,
                     dirs,
                     request.kind,
@@ -1496,7 +1553,13 @@ fn adopt_directory(
                     &folder,
                     original.to_path_buf(),
                     form,
-                )?;
+                ) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        let rolled_back = rollback_marker(dirs, record, &held_form, effective_uid);
+                        return Err(error.with_detail("rolled_back", rolled_back.into()));
+                    }
+                };
                 return Ok(AdoptReport {
                     plan: false,
                     placement: Some(record),
@@ -1587,14 +1650,15 @@ fn adopt_directory(
                 let _ = dirs.create_child_dir(&parent, &name, mode);
                 return Err(error);
             }
-            let form = PlacementForm::Link(LinkForm {
+            let link_form = LinkForm {
                 link_path: original.to_path_buf(),
                 target: root.path.clone(),
                 restore: LinkRestore::EmptyDirectory,
                 root_id: root.root_id,
                 marker_digest: root.marker_digest,
-            });
-            let record = finish_record(
+            };
+            let form = PlacementForm::Link(link_form.clone());
+            let record = match finish_record(
                 state,
                 dirs,
                 request.kind,
@@ -1603,7 +1667,13 @@ fn adopt_directory(
                 &folder,
                 root.path,
                 form,
-            )?;
+            ) {
+                Ok(record) => record,
+                Err(error) => {
+                    let rolled_back = rollback_link(dirs, &link_form, mode);
+                    return Err(error.with_detail("rolled_back", rolled_back.into()));
+                }
+            };
             Ok(AdoptReport {
                 plan: false,
                 placement: Some(record),
@@ -1817,6 +1887,102 @@ fn adopt_in_place(
         marker_digest: marker.marker_digest,
         observed,
     })
+}
+
+/// Undo the filesystem effect of a link adopt whose record could not be
+/// published, so no link is stranded without the record that proves it.
+///
+/// The owned root the link pointed at is deliberately left in place: it carries
+/// its own marker, holds no payload of its own and is the kind of empty owned
+/// root an area's prune policy may take. S6 removes nothing on the volume.
+fn rollback_link(dirs: &dyn DirOps, form: &LinkForm, restore_mode: u32) -> Vec<String> {
+    let mut notes = Vec::new();
+    let (parent, name) = match open_parent(dirs, &form.link_path) {
+        Ok(opened) => opened,
+        Err(error) => {
+            notes.push(format!(
+                "could not reopen {} to remove its link: {error}",
+                form.link_path.display()
+            ));
+            return notes;
+        }
+    };
+    match dirs.remove_child(&parent, &name, RemoveKind::File) {
+        Ok(crate::os::ChildRemoval::Removed | crate::os::ChildRemoval::Absent) => {
+            notes.push(format!("removed the link {}", form.link_path.display()))
+        }
+        Ok(crate::os::ChildRemoval::NotEmpty) => notes.push(format!(
+            "{} is not a removable link",
+            form.link_path.display()
+        )),
+        Err(error) => notes.push(format!(
+            "could not remove the link {}: {error}",
+            form.link_path.display()
+        )),
+    }
+    if form.restore == LinkRestore::EmptyDirectory {
+        match dirs.create_child_dir(&parent, &name, restore_mode & 0o777) {
+            Ok(_) => notes.push(format!(
+                "restored the empty directory {}",
+                form.link_path.display()
+            )),
+            Err(error) => notes.push(format!(
+                "could not restore the empty directory {}: {error}",
+                form.link_path.display()
+            )),
+        }
+    }
+    notes
+}
+
+/// Remove the marker an in-place adopt just wrote when its record could not be
+/// published, so no root is marked and no placement record proves it.
+fn rollback_marker(
+    dirs: &dyn DirOps,
+    volume: &VolumeRecord,
+    form: &HeldRootForm,
+    effective_uid: u32,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    let held = &form.held_root;
+    let handle = match dirs.open_path(&held.path) {
+        Ok(handle) => handle,
+        Err(error) => {
+            notes.push(format!(
+                "could not reopen {} to remove its marker: {error}",
+                held.path.display()
+            ));
+            return notes;
+        }
+    };
+    let expectation = MarkerExpectation {
+        volume_uuid: &volume.volume_uuid,
+        resolved_path: &held.path,
+        effective_uid,
+        now_ms: state::now_ms(),
+    };
+    match area::read_marker_with_digest(dirs, &handle, &expectation) {
+        (MarkerState::Owned(marker), Some(digest))
+            if marker.root_id == held.root_id && digest == held.marker_digest =>
+        {
+            match dirs.remove_child(&handle, area::ROOT_MARKER_FILE, RemoveKind::File) {
+                Ok(_) => notes.push(format!(
+                    "removed the marker {} from {}",
+                    area::ROOT_MARKER_FILE,
+                    held.path.display()
+                )),
+                Err(error) => notes.push(format!(
+                    "could not remove the marker in {}: {error}",
+                    held.path.display()
+                )),
+            }
+        }
+        _ => notes.push(format!(
+            "the marker just written in {} could not be proved; it is left for a human",
+            held.path.display()
+        )),
+    }
+    notes
 }
 
 /// Build and publish one placement record under a fresh id.
@@ -2349,7 +2515,9 @@ pub fn undo(
             form,
             effective_uid,
         ),
-        PlacementForm::Link(form) => undo_link(state, dirs, request, &record, form, effective_uid),
+        PlacementForm::Link(form) => {
+            undo_link(state, dirs, facts, mounts, observer, request, &record, form)
+        }
         PlacementForm::HeldRoot(form) => undo_held(
             state,
             dirs,
@@ -2502,18 +2670,21 @@ fn undo_setting(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn undo_link(
     state: &StatePaths,
     dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
     request: &UndoRequest<'_>,
     record: &PlacementRecord,
     form: &LinkForm,
-    effective_uid: u32,
 ) -> Result<UndoReport> {
-    let _ = effective_uid;
-    let text = dirs.read_link(&form.link_path)?;
     let mut changes = Vec::new();
-    match text {
+    // The link's text is the publication proof: it must still be the recorded
+    // one, or the link is not the link this record published.
+    match dirs.read_link(&form.link_path)? {
         Some(text) if text == form.target => {}
         Some(text) => {
             return Err(unknown(format!(
@@ -2533,6 +2704,11 @@ fn undo_link(
             .with_detail("path", form.link_path.display().to_string().into()))
         }
     }
+    // Custody is required before a link removal, exactly as it is before a swap
+    // or a delete: the owned root must be the recorded one, and no same-uid
+    // process may hold it open. `remove_adopted_marker` needs the same proofs for
+    // a held root; this is the link form's own.
+    let observed = observed_link_root(state, dirs, facts, mounts, observer, record, form)?;
     changes.push(format!("remove the link {}", form.link_path.display()));
     if form.restore == LinkRestore::EmptyDirectory {
         changes.push(format!(
@@ -2543,6 +2719,7 @@ fn undo_link(
     if request.plan {
         return Ok(undo_report(request, record, changes));
     }
+    take_link_custody(state, dirs, facts, mounts, observer, &observed)?;
     let (parent, name) = open_parent(dirs, &form.link_path)?;
     dirs.remove_child(&parent, &name, RemoveKind::File)?;
     if form.restore == LinkRestore::EmptyDirectory {
@@ -2563,6 +2740,117 @@ fn undo_link(
         changes,
         removed: true,
     })
+}
+
+/// Observe the owned root one `link` placement publishes.
+///
+/// The observation is the one custody needs: the root reopened from the volume's
+/// current `caches/` folder, its device and inode, and its marker re-read as the
+/// recorded bytes. A root that is absent, moved, re-marked or unreadable is
+/// unknown state, never an absent-and-safe answer.
+fn observed_link_root(
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    record: &PlacementRecord,
+    form: &LinkForm,
+) -> Result<custody::ObservedRoot> {
+    let effective_uid = observer.effective_uid()?;
+    let volume = area::registered_volume(state, &record.volume_uuid)?;
+    let opened = area::open_folder(
+        dirs,
+        facts,
+        mounts,
+        observer,
+        &volume,
+        &record.root_dir,
+        &record.folder,
+    )
+    .map_err(|error| absent_volume(error, &volume))?;
+    let Some((folder_path, folder_handle)) = opened else {
+        return Err(unknown(format!(
+            "the volume's {} folder is absent, so the root {} cannot be proved",
+            record.folder, form.root_id
+        ))
+        .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
+    };
+    let root_path = folder_path.join(&form.root_id);
+    if root_path != form.target {
+        return Err(unknown(format!(
+            "the recorded root resolves to {}, not the recorded link text {}",
+            root_path.display(),
+            form.target.display()
+        ))
+        .with_detail("recorded_target", form.target.display().to_string().into()));
+    }
+    let root = dirs.open_child_dir(&folder_handle, &form.root_id)?;
+    let expectation = MarkerExpectation {
+        volume_uuid: &record.volume_uuid,
+        resolved_path: &root_path,
+        effective_uid,
+        now_ms: state::now_ms(),
+    };
+    match area::read_marker_with_digest(dirs, &root, &expectation) {
+        (MarkerState::Owned(marker), digest) if marker.root_id == form.root_id => {
+            if digest.as_deref() != Some(form.marker_digest.as_str()) {
+                return Err(unknown(format!(
+                    "the root at {} no longer carries the marker of {}",
+                    root_path.display(),
+                    form.root_id
+                ))
+                .with_detail("path", root_path.display().to_string().into()));
+            }
+        }
+        (state_name, _) => {
+            return Err(unknown(format!(
+                "the root at {} is not the recorded one: {}",
+                root_path.display(),
+                match state_name {
+                    MarkerState::Absent => "it carries no marker".to_owned(),
+                    MarkerState::Owned(marker) => format!("it records root {}", marker.root_id),
+                    MarkerState::Unknown { reason } => reason,
+                }
+            ))
+            .with_detail("path", root_path.display().to_string().into()))
+        }
+    }
+    Ok(custody::ObservedRoot {
+        root_id: form.root_id.clone(),
+        volume_uuid: record.volume_uuid.clone(),
+        root_dir: record.root_dir.clone(),
+        folder: record.folder.clone(),
+        device: root.identity().device,
+        inode: root.identity().inode,
+        marker_digest: form.marker_digest.clone(),
+        path: root_path,
+    })
+}
+
+/// Decide custody for one observed root and require `Safe`.
+fn take_link_custody(
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    observed: &custody::ObservedRoot,
+) -> Result<()> {
+    let intents = state::read_intents(state, crate::contract::INTENT_ROWS)?;
+    let pending = PendingIntent::pending(&intents.records);
+    custody::take_custody(
+        dirs,
+        facts,
+        mounts,
+        observer,
+        state,
+        observed,
+        &pending,
+        CustodyBounds::default(),
+    )
+    .into_evidence()
+    .map(|_| ())
 }
 
 /// Prove one in-place adopted directory is still the recorded one, then remove
@@ -2983,14 +3271,39 @@ mod tests {
         }
 
         fn undo(&self, request: &UndoRequest<'_>) -> crate::error::Result<super::UndoReport> {
+            self.undo_with(&self.volume.observer(), request)
+        }
+
+        fn undo_with(
+            &self,
+            observer: &dyn crate::os::ProcessObserver,
+            request: &UndoRequest<'_>,
+        ) -> crate::error::Result<super::UndoReport> {
             undo(
                 &self.state,
                 &self.platform(),
-                &self.volume.facts(),
+                self.facts.as_ref(),
                 &self.volume.mounts(),
-                &self.volume.observer(),
+                observer,
                 request,
             )
+        }
+
+        /// Make the placements directory refuse a write, so a record cannot be
+        /// published after an effect has been applied.
+        fn deny_record_writes(&self) {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = self.state.placements_dir();
+            std::fs::create_dir_all(&dir).expect("the placements directory");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+                .expect("the directory becomes read-only");
+        }
+
+        /// Restore write permission so the fixture can be removed.
+        fn allow_record_writes(&self) {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = self.state.placements_dir();
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         }
 
         fn write(&self, name: &str, contents: &str) -> PathBuf {
@@ -3613,6 +3926,218 @@ mod tests {
             .expect("the store reads")
             .records
             .is_empty());
+    }
+
+    #[test]
+    fn undo_link_requires_safe_custody_before_removing_the_link() {
+        let fixture = Fixture::new("cache-link-custody");
+        std::fs::create_dir_all(fixture.home.path().join(".cargo")).expect("the parent exists");
+        let record = fixture
+            .adopt(&fixture.request(CacheKind::CargoRegistry))
+            .expect("the absent path is linked")
+            .placement
+            .expect("a record is written");
+        let original = fixture.home.path().join(".cargo/registry");
+
+        // An open descriptor under the owned root refuses the removal.
+        let mut observer = fixture.volume.observer();
+        observer.scan = crate::testkit::ScanMode::Open(vec![crate::os::OpenDescriptor {
+            pid: std::process::id(),
+            descriptor: 9,
+            path: match &record.form {
+                PlacementForm::Link(form) => form.target.clone(),
+                other => panic!("expected the link form, got {}", other.name()),
+            },
+        }]);
+        let error = fixture
+            .undo_with(
+                &observer,
+                &UndoRequest {
+                    placement_id: Some(&record.placement_id),
+                    kind: None,
+                    plan: false,
+                },
+            )
+            .expect_err("an open descriptor refuses the link removal");
+        assert_eq!(error.kind(), ErrorKind::CustodyNotProven);
+        assert!(original.is_symlink(), "the link is still there");
+        assert_eq!(
+            read_placements(&fixture.state)
+                .expect("the store reads")
+                .records
+                .len(),
+            1,
+            "the record stays"
+        );
+
+        // A bounded scan proves nothing either.
+        let mut bounded = fixture.volume.observer();
+        bounded.scan = crate::testkit::ScanMode::Bounded;
+        let error = fixture
+            .undo_with(
+                &bounded,
+                &UndoRequest {
+                    placement_id: Some(&record.placement_id),
+                    kind: None,
+                    plan: false,
+                },
+            )
+            .expect_err("a bounded scan refuses the link removal");
+        assert_eq!(error.kind(), ErrorKind::CustodyNotProven);
+        assert!(original.is_symlink());
+
+        // With safe custody the same undo succeeds.
+        fixture
+            .undo(&UndoRequest {
+                placement_id: Some(&record.placement_id),
+                kind: None,
+                plan: false,
+            })
+            .expect("safe custody authorizes the link removal");
+        assert!(!original.exists());
+    }
+
+    #[test]
+    fn a_live_hold_refuses_the_link_removal() {
+        let fixture = Fixture::new("cache-link-hold");
+        std::fs::create_dir_all(fixture.home.path().join(".cargo")).expect("the parent exists");
+        let record = fixture
+            .adopt(&fixture.request(CacheKind::CargoRegistry))
+            .expect("the absent path is linked")
+            .placement
+            .expect("a record is written");
+        let root_id = match &record.form {
+            PlacementForm::Link(form) => form.root_id.clone(),
+            other => panic!("expected the link form, got {}", other.name()),
+        };
+        let pid = std::process::id();
+        let bytes = crate::testkit::VolumeFixture::hold_record(
+            &root_id,
+            "reviewer",
+            pid,
+            7_000_000,
+            crate::testkit::FIXTURE_BOOT,
+        );
+        let holds = fixture.state.holds_dir().join(&root_id);
+        std::fs::create_dir_all(&holds).expect("the hold directory");
+        std::fs::write(holds.join("reviewer.json"), bytes).expect("the hold is written");
+
+        let error = fixture
+            .undo(&UndoRequest {
+                placement_id: Some(&record.placement_id),
+                kind: None,
+                plan: false,
+            })
+            .expect_err("a live holder refuses the link removal");
+        assert_eq!(error.kind(), ErrorKind::CustodyNotProven);
+        assert!(
+            fixture.home.path().join(".cargo/registry").is_symlink(),
+            "the link is still there"
+        );
+    }
+
+    #[test]
+    fn a_link_adopt_whose_record_cannot_be_published_rolls_the_link_back() {
+        let fixture = Fixture::new("cache-link-rollback");
+        std::fs::create_dir_all(fixture.home.path().join(".cargo")).expect("the parent exists");
+        let original = fixture.home.path().join(".cargo/registry");
+        fixture.deny_record_writes();
+        let error = fixture
+            .adopt(&fixture.request(CacheKind::CargoRegistry))
+            .expect_err("an unpublished record rolls the link back");
+        fixture.allow_record_writes();
+        assert_eq!(error.kind(), ErrorKind::Io);
+        assert!(
+            error.detail()["rolled_back"].is_array(),
+            "the rollback is reported: {:?}",
+            error.detail()
+        );
+        assert!(!original.exists(), "the link was removed again");
+    }
+
+    #[test]
+    fn an_empty_directory_link_whose_record_cannot_be_published_restores_the_directory() {
+        let fixture = Fixture::new("cache-link-rollback-empty");
+        let original = fixture.home.path().join(".cargo/git");
+        std::fs::create_dir_all(&original).expect("the empty directory exists");
+        fixture.deny_record_writes();
+        let error = fixture
+            .adopt(&fixture.request(CacheKind::CargoGit))
+            .expect_err("an unpublished record restores the empty directory");
+        fixture.allow_record_writes();
+        assert_eq!(error.kind(), ErrorKind::Io);
+        let restored = facts(&original);
+        assert_eq!(restored.kind, crate::os::EntryKind::Directory);
+        assert_eq!(std::fs::read_dir(&original).expect("it lists").count(), 0);
+    }
+
+    #[test]
+    fn a_held_root_whose_record_cannot_be_published_removes_its_marker() {
+        let fixture = Fixture::new("cache-held-rollback");
+        let target = fixture.caches().join("cargo/registry");
+        std::fs::create_dir_all(&target).expect("the target exists");
+        std::fs::write(target.join("payload"), b"registry data").expect("the payload");
+        let original = fixture.home.path().join(".cargo/registry");
+        std::fs::create_dir_all(fixture.home.path().join(".cargo")).expect("the parent exists");
+        std::os::unix::fs::symlink(&target, &original).expect("the hand-made link");
+        let mut request = fixture.request(CacheKind::CargoRegistry);
+        request.adopt_existing_root = true;
+        fixture.deny_record_writes();
+        let error = fixture
+            .adopt(&request)
+            .expect_err("an unpublished record removes the marker again");
+        fixture.allow_record_writes();
+        assert_eq!(error.kind(), ErrorKind::Io);
+        assert!(
+            error.detail()["rolled_back"].is_array(),
+            "{:?}",
+            error.detail()
+        );
+        assert!(
+            !target.join(area::ROOT_MARKER_FILE).exists(),
+            "the marker was removed again"
+        );
+        assert_eq!(
+            std::fs::read(target.join("payload")).expect("the payload"),
+            b"registry data"
+        );
+        assert!(
+            fixture
+                .platform()
+                .read_link(&original)
+                .expect("the link reads")
+                .is_some(),
+            "the pre-existing link is untouched"
+        );
+    }
+
+    #[test]
+    fn a_written_setting_whose_record_cannot_be_published_is_restored() {
+        let fixture = Fixture::new("cache-setting-rollback");
+        let original = "cache=/old\nregistry=https://example.invalid\n";
+        let settings = fixture.write(".npmrc", original);
+        let mut request = fixture.request(CacheKind::NpmCache);
+        request.write_setting = true;
+        request.adopt_existing_root = true;
+        fixture.deny_record_writes();
+        let error = fixture
+            .adopt(&request)
+            .expect_err("an unpublished record restores the settings file");
+        fixture.allow_record_writes();
+        assert_eq!(error.kind(), ErrorKind::Io);
+        assert_eq!(
+            read(&settings),
+            original.as_bytes(),
+            "the settings file holds its pre-adopt bytes again"
+        );
+        assert!(
+            !fixture
+                .caches()
+                .join("npm")
+                .join(area::ROOT_MARKER_FILE)
+                .exists(),
+            "the adopted marker was removed again"
+        );
     }
 
     #[test]

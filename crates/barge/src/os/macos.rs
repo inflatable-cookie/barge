@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -211,22 +212,25 @@ impl MountRoot for MacOs {
 
 impl AccountFacts for MacOs {
     fn account_home(&self) -> Result<PathBuf> {
-        account_home()
+        match std::env::var_os(crate::state::ACCOUNT_HOME_ENV) {
+            Some(raw) => fixture_account_home(Path::new(&raw)),
+            None => password_database_home(),
+        }
     }
 
     fn state_root(&self) -> Result<PathBuf> {
-        Ok(account_home()?.join(STATE_ROOT_RELATIVE))
+        Ok(password_database_home()?.join(STATE_ROOT_RELATIVE))
     }
 
     fn tool_state_dir(&self, tool: &str) -> Result<PathBuf> {
-        Ok(account_home()?
+        Ok(password_database_home()?
             .join(APPLICATION_SUPPORT_RELATIVE)
             .join(tool)
             .join("state"))
     }
 
     fn tool_cache_dir(&self, tool: &str) -> Result<PathBuf> {
-        Ok(account_home()?.join(CACHES_RELATIVE).join(tool))
+        Ok(password_database_home()?.join(CACHES_RELATIVE).join(tool))
     }
 }
 
@@ -2580,9 +2584,63 @@ fn unreadable_fact(path: &Path, fact: &str) -> Error {
     .with_detail("fact", fact.into())
 }
 
+/// A fixture or proof account home.
+///
+/// It is `BARGE_ACCOUNT_HOME`, the sibling of `BARGE_STATE_DIR`: a normal run
+/// leaves it unset, and when it is set the directory must be an absolute real
+/// directory of this account, so a relative or borrowed path cannot become the
+/// account's home. Nothing here is consulted unless the variable is set.
+fn fixture_account_home(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            format!(
+                "{} must be an absolute path; `{}` is relative",
+                crate::state::ACCOUNT_HOME_ENV,
+                path.display()
+            ),
+        )
+        .with_detail("account_home", path.display().to_string().into()));
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the fixture account home {} cannot be read: {error}",
+                path.display()
+            ),
+        )
+        .with_detail("account_home", path.display().to_string().into())
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the fixture account home {} is not a real directory",
+                path.display()
+            ),
+        )
+        .with_detail("account_home", path.display().to_string().into()));
+    }
+    // SAFETY: `geteuid` takes no arguments, cannot fail and has no
+    // preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        return Err(Error::new(
+            ErrorKind::ForeignOwner,
+            format!(
+                "the fixture account home {} is not this account's",
+                path.display()
+            ),
+        )
+        .with_detail("account_home", path.display().to_string().into()));
+    }
+    Ok(path.to_path_buf())
+}
+
 /// The account home from the password database for the effective uid, never
 /// from the environment (stage 1 design, "Account-wide state directory").
-fn account_home() -> Result<PathBuf> {
+fn password_database_home() -> Result<PathBuf> {
     // SAFETY: `geteuid` takes no arguments, cannot fail and has no preconditions.
     let uid = unsafe { libc::geteuid() };
     let mut buffer = vec![0u8; 1024];
@@ -2975,5 +3033,27 @@ mod tests {
             stop_when_settled(Duration::from_millis(20), SCAN_TIMEOUT, SCAN_TIMEOUT),
             Some(RetryStop::Bounded)
         );
+    }
+
+    use std::path::Path;
+
+    use super::fixture_account_home;
+    use crate::error::ErrorKind;
+    use crate::testkit::TempDir;
+
+    #[test]
+    fn a_fixture_account_home_must_be_an_absolute_real_directory() {
+        let fixture = TempDir::new("account-home");
+        let home = fixture_account_home(fixture.path()).expect("a fixture directory is accepted");
+        assert_eq!(home, fixture.path().to_path_buf());
+
+        let relative = fixture_account_home(Path::new("relative/home"))
+            .expect_err("a relative home is refused");
+        assert_eq!(relative.kind(), ErrorKind::Usage);
+
+        let file = fixture.write("a-file", b"bytes");
+        let refused = fixture_account_home(&file).expect_err("a file is not a home");
+        assert_eq!(refused.kind(), ErrorKind::UnknownState);
+        assert_eq!(refused.detail()["account_home"], file.display().to_string());
     }
 }

@@ -20,6 +20,22 @@ alias = "barge"
 # Effigy's own task-ref composition so one name selects it.
 "rust:test" = [{ task = "test rust" }]
 
+# S6's elevated native proof (docs/knowledge/contracts/s6-native-proof.md).
+# Owner-gated: the run attaches one owned APFS image and writes only inside the
+# guard's scratch. Each selector builds the CLI from the same head and then runs
+# the one fixed script under Oxide's pinned shared supervisor; the script refuses
+# different supervisor bytes and refuses to run outside the supervisor.
+"cache:native" = [
+  "oxide build -p barge-cli --locked",
+  "scripts/native/s6-cache-placement-proof.sh counted",
+]
+# The uncounted twin: keep-going, latched first fault, dependent-skip, and a
+# `qualified: false` receipt. It proves nothing on its own.
+"cache:native:diagnostic" = [
+  "oxide build -p barge-cli --locked",
+  "scripts/native/s6-cache-placement-proof.sh diagnostic",
+]
+
 [test.suites.rust]
 # The library and CLI suites. The budgets are the test route's timeout and
 # forced exit: an expired admission window starts no child, and an expired

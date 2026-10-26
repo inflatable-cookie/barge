@@ -22,6 +22,10 @@ Contracts own durable interfaces and formats:
   diagnostic that answers the carried "device or inode changed" finding, the
   stage 4 matrix and bounds, the Oxide compatibility reading of the absence
   rule, the stage 4 slices and the proposed validation.
+- [S6 native proof](contracts/s6-native-proof.md) records S6's elevated native
+  proof plan: the fixed command, the pinned supervisor bytes, the nine HIGH
+  premises traced through the case bodies, the receipt shape and the activation
+  order. It is a plan, not a receipt.
 
 Rust quality policy owns the strict profile for the Rust workspace:
 [activation](contracts/language-quality-activation.json) records the
