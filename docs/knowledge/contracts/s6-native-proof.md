@@ -41,8 +41,15 @@ script verifies and then executes Oxide's qualified shared supervisor:
 | Path | `~/Dev/projects/oxide/scripts/bounded-test.py` |
 | SHA-256 | `bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924` |
 | Bytes checked | 3397 lines at the head this plan was written against |
-| Invocation | `--limit 300 --scratch-budget-mib 512 -- <script> <mode> <binary>` |
-| Refusal | different bytes, a missing file or a missing CLI → exit `125`, nothing run |
+| Invocation | `/usr/bin/python3 <supervisor> --limit 300 --scratch-budget-mib 512 -- <script> <mode> <binary>` |
+| Mode | any: it is a Python file Oxide keeps mode `0644`, so a readable regular file is the gate and the digest is the identity; the execute bit is never required and its mode is never changed |
+| Refusal | an unreadable or non-regular file, different bytes, or a missing CLI → exit `125`, nothing run |
+
+A source test (`crates/barge/tests/native_proof_harness.rs`) holds the script to
+this contract: the pinned digest is an exact constant, the supervisor gate is
+`-f`/`-r` and not `-x`, the bytes are executed by `/usr/bin/python3`, the script
+never changes a mode, and a fixture supervisor kept `0644` gets past the mode
+gate only to be refused for its digest.
 
 The receipt records the supervisor's path and the pinned digest it verified, and
 the digest is compared before the supervisor is executed.
@@ -84,7 +91,7 @@ mount, and the evidence directory.
 | 6 | Every flag and environment hook used is listed with its purpose; no debug-only product bypass exists | the receipt's `premises[6].evidence` lists every hook and every product flag; the product flags are `--json`, `--kind`, `--volume`, `--placement`, `--write-setting`, `--adopt-existing-root`, `--plan`, and the product has no debug or force bypass | receipt `flags_and_hooks` |
 | 7 | Temporary storage: everything inside the guard's one owned root; no home folder, no drive root, no fixed `/tmp/<name>` | the run root is `mktemp -d "$TMPDIR/…"`; the image backing, evidence-adjacent metadata, per-case homes and state all live under it; cleanup removes it only after an ordinary detach | run root, all cases, cleanup |
 | 8 | `mktemp -d` under that root for every fixture directory, never a shared name | one `mktemp -d` run root, then `cases/<case-id>/{home,state,out}` created fresh per case under it; no fixed name is used anywhere | run root, `run_case` |
-| 9 | The qualified runner bytes and selector are named and hash-pinned; Barge adds no second supervisor, session or accounting harness | the supervisor path and SHA-256 are constants in the script and in this plan; the script refuses different bytes; the receipt records them; the two selectors are the whole entry point | startup supervisor pin, `effigy cache:native`, `effigy cache:native:diagnostic` |
+| 9 | The qualified runner bytes and selector are named and hash-pinned; Barge adds no second supervisor, session or accounting harness | the supervisor path and SHA-256 are constants in the script and in this plan; the script gates it as a readable regular Python file, runs it with `/usr/bin/python3` and refuses different bytes; the receipt records them; the two selectors are the whole entry point | startup supervisor pin, `effigy cache:native`, `effigy cache:native:diagnostic` |
 
 `BARGE_ACCOUNT_HOME` is the one new environment hook S6 needed for this plan: it
 is the fixture-only sibling of `BARGE_STATE_DIR`, documented in
@@ -131,6 +138,17 @@ The script always writes `$OXIDE_PROOF_EVIDENCE/s6-cache-placement-receipt.json`
 
 A receipt written by a failed run is still a receipt: it reports the first fault
 and the cases it reached. It never counts as a pass.
+
+## The harness preflight
+
+Before any native case runs, one preflight proves the harness itself: the pinned
+supervisor is executed once with `/usr/bin/python3` around `/usr/bin/true`, with
+the same 300 s and 512 MiB bounds, from a fresh disposable root under
+`/Volumes/Builds/scratch/barge`. Its evidence is the supervisor's closure and
+cleanup record for that root, and only the positively owned empty scratch is
+removed. The preflight runs no image, no proof case and no selector, and it is
+sequenced after the harness correction's review. A preflight that is uncertain
+about custody stops, and it is never retried.
 
 ## Activation order
 

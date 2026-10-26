@@ -16,7 +16,8 @@
 # `effigy test`, and a run below the elevated tier must not invoke it.
 #
 # What it does, in one sentence: under Oxide's qualified shared supervisor
-# (scripts/bounded-test.py, bytes pinned below), it creates one private run root
+# (scripts/bounded-test.py, bytes pinned below, run with /usr/bin/python3), it
+# creates one private run root
 # inside the guard's owned scratch, attaches one owned APFS sparse image of at
 # most 128 MiB with ownership enabled, registers that image as a fixture volume
 # in a private state directory, and runs the S6 cache cases through the real
@@ -50,6 +51,10 @@ readonly REPO_ROOT
 
 # Premise 9: the qualified shared supervisor, at the bytes this plan was written
 # against, and no second supervisor. A different file is refused, never run.
+#
+# The supervisor is a Python file, not an executable: Oxide keeps it mode 0644
+# and runs it with python3. Its readability and its digest are the gate; the
+# execute bit is not, and this script never changes the file's mode.
 readonly SUPERVISOR_PATH_DEFAULT="${HOME}/Dev/projects/oxide/scripts/bounded-test.py"
 readonly SUPERVISOR_SHA256="bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924"
 
@@ -77,8 +82,10 @@ readonly SUPERVISOR="${BARGE_S6_SUPERVISOR:-$SUPERVISOR_PATH_DEFAULT}"
 if [[ -z "${OXIDE_PROOF_EVIDENCE:-}" ]]; then
   # A caller outside the guard is either the owner activating a proof or a
   # mistake. Both get the same answer: only the pinned supervisor may run this.
-  if [[ ! -x "$SUPERVISOR" ]]; then
-    printf 's6: the qualified supervisor %s is not executable; this proof runs only under it\n' \
+  # `bounded-test.py` is a Python file kept mode 0644, so a readable regular file
+  # is the whole precondition; its identity is the digest checked next.
+  if [[ ! -f "$SUPERVISOR" || ! -r "$SUPERVISOR" ]]; then
+    printf 's6: the qualified supervisor %s is not a readable regular file; this proof runs only under it\n' \
       "$SUPERVISOR" >&2
     exit 125
   fi
@@ -93,6 +100,7 @@ if [[ -z "${OXIDE_PROOF_EVIDENCE:-}" ]]; then
       "$BARGE_BIN_INPUT" >&2
     exit 125
   fi
+  # The pinned bytes are executed by the interpreter, never through their mode.
   exec /usr/bin/python3 "$SUPERVISOR" \
     --limit "$LIMIT_SECONDS" \
     --scratch-budget-mib "$SCRATCH_BUDGET_MIB" \
