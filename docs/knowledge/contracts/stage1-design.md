@@ -812,7 +812,7 @@ design states the limit and builds only on facts it can establish:
 | Fact Barge needs | Available evidence | Limit |
 | --- | --- | --- |
 | A cooperative holder is done | its hold file was released, or its recorded process is positively gone | a process that never took a hold, or escaped its group, is outside this |
-| No same-uid process has an open descriptor under the root | enumerating its fds (`proc_pidinfo`/`PROC_PIDLISTFDS`) and matching vnode paths, or an equivalent bounded OS-layer scan | a process of another uid, or one created after the scan, is not observed |
+| No same-uid process has an open descriptor under the root | each process's effective uid and start identity from the kernel's own process table (`sysctl`/`KERN_PROC_ALL`), then `proc_pidinfo`/`PROC_PIDLISTFDS` and `PROC_PIDFDVNODEPATHINFO` for this account's processes only, matching vnode paths | a process of another effective uid is classified and reported, never inspected; a process created after the scan, and a same-uid descriptor whose path the kernel will not show, are not observed |
 | The root is the inode that was verified | `fstat` device + inode through the opened descriptor before and after each step | a rename by another user between steps stops the operation |
 | The volume is still the registered one | descriptor `fstatfs` + `ATTR_VOL_UUID`, re-verified | a vanished volume fails the call, it does not answer "absent and safe" |
 
@@ -822,8 +822,10 @@ guarantee. It may appear only as a diagnostic in a report, never as a custody
 verdict.
 
 The verdict is therefore explicitly *cooperative plus same-uid observation*.
-The residual case — a process of another user, or one that dropped its hold and
-kept writing — is named here and in `describe` (`custody.capability`), and is
+Two residuals are named rather than implied: a process of another effective uid,
+which the kernel's process table reports and custody counts but never inspects
+(Tom, 2026-10-26, ruling bcaa83d8), and a process that dropped its hold and kept
+writing. Both are named here and in `describe` (`custody.capability`), and are
 the reason deletion additionally requires the intent journal and quarantine
 rename below, which make a wrong deletion recoverable up to the marker-unlink
 step. Barge never claims more than this, and no unknown becomes safe.
@@ -842,10 +844,20 @@ Safe(evidence)      -- authorizes swap or delete
 stale; the same-uid open-descriptor scan complete within its bound and empty for
 this root; the root's device, inode and marker digest equal to the observation
 the caller was given; the volume verified; and no pending intent naming another
-root. Any unreadable hold, an unreadable process entry, a scan that hits its
-entry or time bound, a foreign-uid holder, or a `lsof`-style diagnostic that
-errors makes the verdict `Unknown`, which is a refusal. Deletion and swap take a
-`Safe` value by type, so a caller cannot pass a boolean.
+root. The scan classifies every candidate from the kernel's own process table by
+its effective uid **before** it inspects any descriptor: a process of another
+effective uid is counted and reported in the evidence as not observed, which is
+the named blind spot and does not block `Safe`; only this account's processes
+have their descriptors read. The scan also excludes the calling `barge` process's
+own descriptors — Barge holds descriptors inside the root for its own walk and
+its own checks, and those are not another writer — by its pid and the start
+identity read once and verified; no other process is excluded, so another `barge`
+process, its child or its parent holds a descriptor like anyone else. Any
+unreadable hold, an unreadable effective uid, a same-uid descriptor that cannot
+be read, a scan that hits its entry or time bound, a foreign-uid holder, or a
+`lsof`-style diagnostic that errors makes the verdict `Unknown`, which is a
+refusal. Deletion and swap take a `Safe` value by type, so a caller cannot pass a
+boolean.
 
 Custody is taken before a link swap, before a root's quarantine rename, and
 before a link removal, and it is re-checked after the intent publish and before
@@ -1231,18 +1243,62 @@ Choices S3 made where this design left the mechanic to the slice:
 
 Choices S5 made where this design left the mechanic to the slice:
 
-- **The observation primitive.** `ProcessObserver::scan_open_descriptors` walks
-  the pid list with `proc_listpids`, keeps the processes whose `PROC_PIDTBSDINFO`
-  uid is this account's, lists each one's descriptors with `PROC_PIDLISTFDS`, and
-  matches each vnode descriptor's `PROC_PIDFDVNODEPATHINFO` path against the root
+- **The observation primitive** (amended under Tom's ruling bcaa83d8).
+  `ProcessObserver::scan_open_descriptors` reads the kernel's own process table
+  with `sysctl`/`KERN_PROC_ALL` — every process's pid, effective uid, start
+  identity and command name — and **classifies each candidate before it inspects
+  any descriptor**. A process whose effective uid is not this account's is
+  counted and reported in the evidence as not observed: that is the named blind
+  spot, it does not block `Safe`, and nothing about the process is read. Only
+  this account's processes are then enumerated with `PROC_PIDLISTFDS`, and each
+  vnode descriptor's `PROC_PIDFDVNODEPATHINFO` path is matched against the root
   by path components, under both the spelling the walk reached and the one the
-  filesystem resolves. `proc_listpids` and `proc_pidfdinfo` are declared in the
-  macOS module because `libc` does not declare them; every `unsafe` stays in that
-  one seam. A process of another uid is skipped (O-001's named limit), but a
-  process list, a process entry or a descriptor entry that cannot be read is an
-  error, and an entry or time bound that is reached is `Bounded`. Both make the
-  verdict `Unknown`. The concrete bounds are 4096 processes, 65 536 descriptors
-  and 10 s per scan; a root carries at most its 64 holds. `lsof` is never read.
+  filesystem resolves. This is what removed the `EPERM` wall: identifying a
+  process through its own `PROC_PIDTBSDINFO` facts is refused for another
+  account's processes, and reading the pid list first could not tell those apart
+  from a process whose facts were genuinely unreadable. `proc_pidfdinfo` is
+  declared in the macOS module because `libc` does not declare it; every `unsafe`
+  stays in that one seam. `libc` declares neither `kinfo_proc` nor its offsets,
+  so the module reads the four fields it needs at the offsets `<sys/sysctl.h>`
+  gives them and checks itself: the entry for this very pid must report this
+  account's uid and the start identity `PROC_PIDTBSDINFO` independently reports,
+  or the table is refused as unknown. A table that fills its bound is `Bounded`;
+  an unreadable table, an unreadable effective uid, an unreadable same-uid
+  descriptor, or an entry or time bound that is reached makes the verdict
+  `Unknown`. The concrete bounds are 4096 processes, 65 536 descriptors and 10 s
+  per scan; a root carries at most its 64 holds. `lsof` is never read.
+- **The calling process excludes itself, and nothing else** (corrected here after
+  S6's spent diagnostic). Custody opens the area folder and the root for its own
+  walk and its own checks, so the first implementation's scan always found its
+  own handles inside the root and refused every CLI-driven delete. The request
+  now names the calling process by pid and by the start identity custody reads
+  once with `ProcessObserver::process_start`, and the scan compares that identity
+  with the entry the kernel's table reports: the process is skipped only while
+  they agree, because a reused pid is a different process. A mismatched or
+  missing identity, or a calling process the table never showed, is `Unknown`,
+  never a skip; a skip that never happened proves nothing about what it left out.
+  Everything else is unchanged: a descriptor held by another same-uid process,
+  another `barge` process, its child or its parent is still `Unsafe`.
+- **What the evidence says.** The `Safe` evidence records `self_excluded: <pid>`
+  (the one process it excluded) and `foreign_uid_processes` (how many processes
+  of another effective uid it classified and did not inspect), and
+  `describe.custody` names both limits: the exclusion, and the foreign-uid blind
+  spot that is reported rather than observed. The tests run the real macOS
+  observer on a fixture root under scratch: the caller's own open handles stay
+  open and the verdict is `safe`; a same-uid child holding the payload open is
+  `unsafe`; real `/usr/bin/login` identities, read-only from the kernel's table,
+  are counted as foreign and do not block; an unreadable uid, a same-uid
+  descriptor the kernel will not show, a mismatched start identity and a forced
+  bound are `unknown`; and both counterfactuals refuse — the exclusion removed
+  refuses the caller's own descriptor, and identification through the process's
+  own facts refuses the real login process.
+- **The residual this correction does not touch.** On a real session, a handful
+  of this account's own system daemons refuse `PROC_PIDFDVNODEPATHINFO` for some
+  of their descriptors (measured on macOS 26.6.2: 8 of 1004), which the rule
+  above makes `Unknown` for a whole-system scan. That is the design's
+  conservative answer, not a defect, but it means a full-scan `Safe` verdict is
+  not reachable on such a host; [Q-008](../questions.md) records it with the
+  measurements and the decision it needs.
 - **Hold decisions.** A hold is stale only when its process is positively gone or
   another boot wrote it. A live pid whose start identity differs is `Unknown`,
   not stale: the failure matrix's reused-pid row treats staleness as proved only

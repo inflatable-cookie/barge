@@ -20,7 +20,8 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::os::facts::{
     AccountFacts, ChildEntry, ChildListing, ChildRemoval, DescriptorScan, DescriptorScanRequest,
     DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, FileSystem, MountPoint, MountRoot,
-    OpenDescriptor, ProcessObserver, RemoveKind, VolumeFacts, VolumeIdentity, VolumeUuid,
+    OpenDescriptor, ProcessIdentity, ProcessObserver, RemoveKind, VolumeFacts, VolumeIdentity,
+    VolumeUuid,
 };
 
 /// The parent every managed volume mounts directly under.
@@ -51,9 +52,6 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// writes a 4-byte length followed by the attribute's value.
 const VOLUME_ATTRIBUTE_BYTES: usize = 32;
 
-/// `PROC_ALL_PIDS` from `sys/proc_info.h`: every process the kernel reports.
-const PROC_ALL_PIDS: u32 = 1;
-
 /// `PROC_PIDFDVNODEPATHINFO` from `sys/proc_info.h`: one descriptor's vnode path.
 const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
 
@@ -62,15 +60,10 @@ const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
 /// observation cannot be complete.
 const SCAN_DESCRIPTORS_PER_PROCESS: usize = 4096;
 
-// `proc_listpids` and `proc_pidfdinfo` are the two libproc calls the descriptor
-// scan needs; `libc` declares neither, so the seam declares them itself.
+// `proc_pidfdinfo` is the one libproc call the descriptor scan needs; `libc`
+// declares it not at all, so the seam declares it itself. The process table is
+// read through `sysctl`, which needs no libproc call and no privilege.
 extern "C" {
-    fn proc_listpids(
-        kind: u32,
-        typeinfo: u32,
-        buffer: *mut libc::c_void,
-        buffer_size: libc::c_int,
-    ) -> libc::c_int;
     fn proc_pidfdinfo(
         pid: libc::c_int,
         descriptor: libc::c_int,
@@ -231,14 +224,50 @@ impl ProcessObserver for MacOs {
         let Some(info) = bsd_info(pid)? else {
             return Ok(None);
         };
-        Ok(Some(
-            info.pbi_start_tvsec
-                .saturating_mul(1_000_000)
-                .saturating_add(info.pbi_start_tvusec),
-        ))
+        Ok(Some(bsd_start(&info)))
     }
 
     fn scan_open_descriptors(&self, request: &DescriptorScanRequest<'_>) -> Result<DescriptorScan> {
+        // The kernel's own process table is read first, so every candidate is
+        // classified by its effective uid before any descriptor is inspected. A
+        // table that fills its bound is bounded, because a missing pid could
+        // hold the root open.
+        let Some(table) = self.process_table()? else {
+            return Ok(DescriptorScan::Bounded {
+                processes: 0,
+                descriptors: 0,
+                bound: "process list",
+            });
+        };
+        let table: Vec<ProcessIdentity> = table.into_iter().map(|row| row.identity).collect();
+        self.scan_processes(request, &table)
+    }
+}
+
+impl MacOs {
+    /// Scan one known process table with the real descriptor enumeration,
+    /// classification and self-exclusion.
+    ///
+    /// The production path always passes the kernel's own table. The unit tests
+    /// pass a table they state themselves, which is how an injected fact — a
+    /// foreign effective uid, an unreadable uid, or a table that claims a pid
+    /// this account may not read — is exercised against the real
+    /// `PROC_PIDLISTFDS` and `PROC_PIDFDVNODEPATHINFO` reads for the pids a
+    /// fixture does own. Nothing else about the scan changes.
+    #[cfg(test)]
+    pub(crate) fn scan_open_descriptors_over(
+        &self,
+        request: &DescriptorScanRequest<'_>,
+        table: &[ProcessIdentity],
+    ) -> Result<DescriptorScan> {
+        self.scan_processes(request, table)
+    }
+
+    fn scan_processes(
+        &self,
+        request: &DescriptorScanRequest<'_>,
+        table: &[ProcessIdentity],
+    ) -> Result<DescriptorScan> {
         let uid = self.effective_uid()?;
         let started = std::time::Instant::now();
         // The kernel reports canonical paths, so the root is matched under both
@@ -250,44 +279,15 @@ impl ProcessObserver for MacOs {
             }
         }
 
-        // The whole system's pid list is read first; a list that fills the
-        // buffer is bounded, because a missing pid could hold the root open.
-        let mut pids = vec![0i32; SCAN_PID_CAP];
-        let pids_bytes = pids.len().saturating_mul(std::mem::size_of::<i32>());
-        // SAFETY: `pids` is a writable slice whose exact byte length is passed,
-        // so the kernel writes only inside it and returns how many bytes it wrote.
-        let written = unsafe {
-            proc_listpids(
-                PROC_ALL_PIDS,
-                0,
-                pids.as_mut_ptr().cast(),
-                libc::c_int::try_from(pids_bytes).unwrap_or(libc::c_int::MAX),
-            )
-        };
-        if written <= 0 {
-            return Err(Error::new(
-                ErrorKind::UnknownState,
-                format!(
-                    "the process list could not be read: {}",
-                    io::Error::last_os_error()
-                ),
-            )
-            .with_detail("fact", "process list".into()));
-        }
-        let written = written as usize;
-        if written >= pids_bytes {
-            return Ok(DescriptorScan::Bounded {
-                processes: 0,
-                descriptors: 0,
-                bound: "process list",
-            });
-        }
-        let count = written / std::mem::size_of::<i32>();
-
         let mut processes = 0usize;
         let mut descriptors = 0usize;
+        let mut foreign = 0usize;
         let mut open = Vec::new();
-        for pid in pids.into_iter().take(count) {
+        // Whether the process the request names as the calling one was found and
+        // skipped. An exclusion that never matched proves nothing about what it
+        // left out, so the scan answers unreadable rather than complete.
+        let mut self_excluded = false;
+        for identity in table.iter().copied() {
             if started.elapsed() >= request.timeout {
                 return Ok(DescriptorScan::Bounded {
                     processes,
@@ -295,19 +295,47 @@ impl ProcessObserver for MacOs {
                     bound: "time",
                 });
             }
-            if pid <= 0 {
-                continue;
+            let pid = identity.pid;
+            // Classification comes first and needs no privilege: the effective
+            // uid is in the kernel's own table. A process of another effective
+            // uid is the named blind spot — counted and reported, never
+            // inspected — and is never read as unreadable, because this account
+            // may not read its facts at all.
+            match identity.effective_uid {
+                None => {
+                    let reason = format!(
+                        "pid {pid} has no readable effective uid, so the scan cannot classify it"
+                    );
+                    return Err(Error::new(ErrorKind::UnknownState, reason)
+                        .with_detail("pid", u64::from(pid).into()));
+                }
+                Some(other) if other != uid => {
+                    foreign = foreign.saturating_add(1);
+                    continue;
+                }
+                Some(_) => {}
             }
-            let pid = u32::try_from(pid).unwrap_or(0);
-            let Some(info) = bsd_info(pid)? else {
-                // The process exited while it was observed: nothing can be held
-                // open by a process that is positively gone.
-                continue;
-            };
-            if info.pbi_uid != uid {
-                // A process of another uid is the named limit of this evidence,
-                // never a fact Barge claims.
-                continue;
+            if let Some(exclusion) = request.self_exclusion {
+                if pid == exclusion.pid {
+                    // The calling process's own descriptors are the walk's and
+                    // the checks', never evidence about another writer. The
+                    // skip is conditional on the identity custody read when it
+                    // asked for the scan: a reused pid is a different process.
+                    if identity.start != exclusion.start {
+                        return Err(Error::new(
+                            ErrorKind::UnknownState,
+                            format!(
+                                "pid {pid} is the calling process, but its start identity is {}, not the recorded {}; the scan cannot exclude itself",
+                                identity.start, exclusion.start
+                            ),
+                        )
+                        .with_detail("pid", u64::from(pid).into())
+                        .with_detail("recorded_start", exclusion.start.into())
+                        .with_detail("actual_start", identity.start.into()));
+                    }
+                    self_excluded = true;
+                    continue;
+                }
             }
             processes = processes.saturating_add(1);
             if processes > request.max_processes {
@@ -328,6 +356,14 @@ impl ProcessObserver for MacOs {
             let fds_bytes = fds
                 .len()
                 .saturating_mul(std::mem::size_of::<libc::proc_fdinfo>());
+            // `proc_pidinfo` answers zero bytes on failure and leaves the reason
+            // in errno, so the error is cleared first and read after: a process
+            // that holds no descriptors at all also answers zero bytes. Reading
+            // zero bytes as "nothing open" without that distinction would turn
+            // an unreadable process into evidence of absence.
+            // SAFETY: `__error` returns this thread's errno cell, which is
+            // writable for this thread and outlives the call.
+            unsafe { *libc::__error() = 0 };
             // SAFETY: `fds` is a writable slice whose exact byte length is
             // passed, so the kernel writes only inside it.
             let written = unsafe {
@@ -339,10 +375,15 @@ impl ProcessObserver for MacOs {
                     libc::c_int::try_from(fds_bytes).unwrap_or(libc::c_int::MAX),
                 )
             };
-            if written < 0 {
+            if written <= 0 {
                 let error = io::Error::last_os_error();
                 match error.raw_os_error() {
+                    // The kernel reports no such process: it is positively gone,
+                    // so nothing it held is open.
                     Some(libc::ESRCH) => continue,
+                    // No error at all: the process genuinely holds no
+                    // descriptors.
+                    Some(0) | None => continue,
                     _ => return Err(unreadable_descriptors(pid, &error)),
                 }
             }
@@ -386,17 +427,281 @@ impl ProcessObserver for MacOs {
                 }
             }
         }
+        if let Some(exclusion) = request.self_exclusion {
+            if !self_excluded {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    format!(
+                        "the calling process pid {} was not observed as this account's own in the process table, so the scan cannot prove what it excluded",
+                        exclusion.pid
+                    ),
+                )
+                .with_detail("pid", u64::from(exclusion.pid).into()));
+            }
+        }
         Ok(DescriptorScan::Complete {
             processes,
             descriptors,
+            foreign,
             open,
         })
     }
 }
 
-/// How many pids the scan reads from the kernel in one call. A system with more
-/// processes than this makes the scan bounded rather than incomplete.
+/// How many processes the scan reads from the kernel's table before it answers
+/// bounded rather than complete.
 const SCAN_PID_CAP: usize = 8192;
+
+/// `sizeof(struct kinfo_proc)` from `<sys/sysctl.h>` on this platform, and the
+/// offsets of the four fields this layer reads. The struct between them is left
+/// opaque: this build reads the start time (a `timeval` at the head of the
+/// exported union), the pid, the command name and the effective uid, and nothing
+/// else.
+///
+/// A hard-coded table of offsets is only safe because the read checks itself:
+/// the entry for this very process must report the pid, effective uid and start
+/// identity that `getpid`, `geteuid` and `PROC_PIDTBSDINFO` independently
+/// report. A table that disagrees is refused as unknown state, never parsed
+/// further into a wrong uid.
+const KINFO_PROC_SIZE: usize = 648;
+const KINFO_START_SEC_OFFSET: usize = 0;
+const KINFO_START_USEC_OFFSET: usize = 8;
+const KINFO_PID_OFFSET: usize = 40;
+#[cfg(test)]
+const KINFO_COMMAND_OFFSET: usize = 243;
+#[cfg(test)]
+const KINFO_COMMAND_BYTES: usize = 17;
+const KINFO_UID_OFFSET: usize = 420;
+
+impl MacOs {
+    /// The kernel's own process table, read through `sysctl KERN_PROC_ALL`.
+    ///
+    /// This is the unprivileged fact custody classifies with: the effective uid
+    /// and start identity of every process, obtained without inspecting any
+    /// process. It is what makes another account's process a *named* blind spot
+    /// instead of an unreadable fact, because `PROC_PIDTBSDINFO` and
+    /// `PROC_PIDLISTFDS` answer `EPERM` for those processes.
+    ///
+    /// `Ok(None)` is a table past its bound. An unreadable table, a table that is
+    /// not a whole number of entries, and a table that does not describe this
+    /// process as itself are errors, never an empty table.
+    fn process_table(&self) -> Result<Option<Vec<TableRow>>> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
+        let mut size = 0usize;
+        // SAFETY: the size query passes a null buffer with a writable size, which
+        // is the documented first half of a `sysctl` read.
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                u32::try_from(mib.len()).unwrap_or(u32::MAX),
+                std::ptr::null_mut(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return Err(process_table_error("its size could not be read"));
+        }
+        if size == 0 || !size.is_multiple_of(KINFO_PROC_SIZE) {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "the process table is {size} bytes, which is not a whole number of {KINFO_PROC_SIZE}-byte entries"
+                ),
+            )
+            .with_detail("fact", "process table".into()));
+        }
+        // Slack for the processes that appear between the size query and the
+        // read, so a busy machine does not make every scan fail.
+        let want = size.saturating_add(KINFO_PROC_SIZE.saturating_mul(64));
+        let mut buffer = vec![0u8; want];
+        let mut written = want;
+        // SAFETY: `buffer` is a writable allocation of exactly `written` bytes
+        // and `mib` describes the table request, so the kernel writes only
+        // inside it.
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                u32::try_from(mib.len()).unwrap_or(u32::MAX),
+                buffer.as_mut_ptr().cast(),
+                &mut written,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return Err(process_table_error("could not be read"));
+        }
+        if written > want || !written.is_multiple_of(KINFO_PROC_SIZE) {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "the process table returned {written} bytes, which is not a whole number of {KINFO_PROC_SIZE}-byte entries"
+                ),
+            )
+            .with_detail("fact", "process table".into()));
+        }
+        let count = written / KINFO_PROC_SIZE;
+        if count > SCAN_PID_CAP {
+            return Ok(None);
+        }
+        let mut rows = Vec::with_capacity(count);
+        for index in 0..count {
+            let start = index.saturating_mul(KINFO_PROC_SIZE);
+            let entry = buffer
+                .get(start..start.saturating_add(KINFO_PROC_SIZE))
+                .ok_or_else(|| {
+                    Error::new(ErrorKind::UnknownState, "the process table entry is short")
+                })?;
+            let row = TableRow::parse(entry)?;
+            if row.identity.pid == 0 {
+                continue;
+            }
+            rows.push(row);
+        }
+        verify_own_row(&rows, self.effective_uid()?)?;
+        Ok(Some(rows))
+    }
+
+    /// The kernel's table with each process's command name, for the tests that
+    /// name a real process such as `/usr/bin/login` without inspecting it.
+    #[cfg(test)]
+    pub(crate) fn observed_processes(&self) -> Result<Option<Vec<(ProcessIdentity, String)>>> {
+        Ok(self.process_table()?.map(|rows| {
+            rows.into_iter()
+                .map(|row| (row.identity, row.command))
+                .collect()
+        }))
+    }
+}
+
+/// One process in the kernel's table: the identity the scan classifies with, and
+/// the command name, which only the tests read.
+struct TableRow {
+    identity: ProcessIdentity,
+    /// The process's command name. It exists so a test can name a real process
+    /// such as `/usr/bin/login` without inspecting it, so it is parsed only for
+    /// tests: a production scan allocates no name it would never read.
+    #[cfg(test)]
+    command: String,
+}
+
+impl TableRow {
+    /// One entry, at the offsets this platform's `<sys/sysctl.h>` gives them.
+    fn parse(entry: &[u8]) -> Result<Self> {
+        let start_sec = entry_i64(entry, KINFO_START_SEC_OFFSET)?;
+        let start_usec = entry_i32(entry, KINFO_START_USEC_OFFSET)?;
+        let pid = entry_i32(entry, KINFO_PID_OFFSET)?;
+        let uid = entry_u32(entry, KINFO_UID_OFFSET)?;
+        Ok(Self {
+            identity: ProcessIdentity {
+                pid: u32::try_from(pid).unwrap_or(0),
+                effective_uid: Some(uid),
+                start: u64::try_from(start_sec)
+                    .unwrap_or(0)
+                    .saturating_mul(1_000_000)
+                    .saturating_add(u64::try_from(start_usec).unwrap_or(0)),
+            },
+            #[cfg(test)]
+            command: entry_command(entry),
+        })
+    }
+}
+
+/// One entry's command name, for the tests that name a process.
+#[cfg(test)]
+fn entry_command(entry: &[u8]) -> String {
+    entry
+        .get(KINFO_COMMAND_OFFSET..KINFO_COMMAND_OFFSET.saturating_add(KINFO_COMMAND_BYTES))
+        .map(|bytes| {
+            let end = bytes
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(bytes.len());
+            String::from_utf8_lossy(&bytes[..end]).into_owned()
+        })
+        .unwrap_or_default()
+}
+
+fn entry_i32(entry: &[u8], offset: usize) -> Result<i32> {
+    let bytes: [u8; 4] = entry
+        .get(offset..offset.saturating_add(4))
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .ok_or_else(|| short_entry(offset))?;
+    Ok(i32::from_ne_bytes(bytes))
+}
+
+fn entry_u32(entry: &[u8], offset: usize) -> Result<u32> {
+    let bytes: [u8; 4] = entry
+        .get(offset..offset.saturating_add(4))
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .ok_or_else(|| short_entry(offset))?;
+    Ok(u32::from_ne_bytes(bytes))
+}
+
+fn entry_i64(entry: &[u8], offset: usize) -> Result<i64> {
+    let bytes: [u8; 8] = entry
+        .get(offset..offset.saturating_add(8))
+        .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+        .ok_or_else(|| short_entry(offset))?;
+    Ok(i64::from_ne_bytes(bytes))
+}
+
+fn short_entry(offset: usize) -> Error {
+    Error::new(
+        ErrorKind::UnknownState,
+        format!("the process table entry ends before the field at offset {offset}"),
+    )
+    .with_detail("fact", "process table".into())
+}
+
+fn process_table_error(reason: &str) -> Error {
+    Error::new(
+        ErrorKind::UnknownState,
+        format!("the process table {reason}: {}", io::Error::last_os_error()),
+    )
+    .with_detail("fact", "process table".into())
+}
+
+/// Refuse a table whose own view of this process is not this process.
+///
+/// The offsets above are the SDK's, and this is what keeps a wrong one from
+/// becoming a wrong uid: the entry for this pid must report this account's
+/// effective uid and the start identity the kernel reports for it through
+/// `PROC_PIDTBSDINFO`, which is readable for oneself on every platform this
+/// crate builds for.
+fn verify_own_row(rows: &[TableRow], uid: u32) -> Result<()> {
+    let pid = std::process::id();
+    let expected_start = bsd_info(pid)?.map(|info| bsd_start(&info));
+    let Some(row) = rows.iter().find(|row| row.identity.pid == pid) else {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!("the process table does not report pid {pid} at all"),
+        )
+        .with_detail("pid", u64::from(pid).into()));
+    };
+    if row.identity.effective_uid != Some(uid) || Some(row.identity.start) != expected_start {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the process table reports pid {pid} as uid {:?} start {}, not this process's uid {uid} start {}",
+                row.identity.effective_uid,
+                row.identity.start,
+                expected_start.unwrap_or(0)
+            ),
+        )
+        .with_detail("pid", u64::from(pid).into()));
+    }
+    Ok(())
+}
+
+/// One process's start identity, from the facts already read for it.
+fn bsd_start(info: &libc::proc_bsdinfo) -> u64 {
+    info.pbi_start_tvsec
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbi_start_tvusec)
+}
 
 /// One process's BSD info, or `Ok(None)` when the kernel reports no such
 /// process. Any other failure is an unreadable fact.

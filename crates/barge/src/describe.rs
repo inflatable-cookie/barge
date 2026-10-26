@@ -1498,6 +1498,7 @@ mod tests {
             Ok(crate::os::DescriptorScan::Complete {
                 processes: 0,
                 descriptors: 0,
+                foreign: 0,
                 open: Vec::new(),
             })
         }
