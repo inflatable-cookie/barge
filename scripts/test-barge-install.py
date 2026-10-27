@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 spec = importlib.util.spec_from_file_location("installer", Path(__file__).with_name("barge-install.py"))
 installer = importlib.util.module_from_spec(spec)
@@ -70,6 +70,40 @@ class InstallerFixtures(unittest.TestCase):
         fake.chmod(0o700)
         with self.assertRaises(installer.Refusal):
             installer.build_identity(fake, "a" * 40, "b" * 32)
+
+    def test_pin_authentication(self):
+        pin, tip, tree = "a" * 40, "b" * 40, "c" * 40
+        answers = [f"{tip} refs/heads/main", "", tip, pin, tree]
+        with patch.object(installer, "git", side_effect=answers), \
+             patch.object(installer.subprocess, "run", return_value=Mock(returncode=0)):
+            self.assertEqual(installer.authenticate_pin(pin), (pin, tree, tip))
+        with patch.object(installer, "git", side_effect=[f"{tip} refs/heads/main", "", pin]):
+            with self.assertRaises(installer.Refusal):
+                installer.authenticate_pin(pin)
+        with patch.object(installer, "git", side_effect=[f"{tip} refs/heads/main", "", tip, pin]), \
+             patch.object(installer.subprocess, "run", return_value=Mock(returncode=1)):
+            with self.assertRaises(installer.Refusal):
+                installer.authenticate_pin(pin)
+
+    def test_environment_isolated(self):
+        staging = Path(self.temp.name) / "staging"
+        staging.mkdir()
+        with patch.dict(os.environ, {"CARGO_TARGET_DIR": "/foreign", "OXIDE_POOL": "/foreign",
+                                      "CARGO_BUILD_BUILD_DIR": "/foreign"}):
+            environment = installer.build_environment(staging, "a" * 40, "b" * 32)
+        self.assertNotIn("CARGO_TARGET_DIR", environment)
+        self.assertNotIn("CARGO_BUILD_BUILD_DIR", environment)
+        self.assertEqual(environment["OXIDE_POOL"], str(staging / "pool"))
+        self.assertEqual(environment["TMPDIR"], str(staging))
+        self.assertEqual(environment["BARGE_BUILD_PIN"], "a" * 40)
+
+    def test_unsafe_receipt_and_missing_receipt_refuse(self):
+        with self.assertRaises(installer.Refusal):
+            installer.preflight(True)
+        self.receipts.mkdir(parents=True)
+        (self.receipts / "z.json").symlink_to(self.dest)
+        with self.assertRaises(installer.Refusal):
+            installer.preflight(True)
 
     def test_changed_destination_refuses(self):
         built = Path(self.temp.name) / "built"

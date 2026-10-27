@@ -4,7 +4,7 @@ alias = "barge"
 [tasks]
 "barge:install" = "python3 scripts/barge-install.py"
 "barge:reinstall" = "python3 scripts/barge-install.py --replace"
-"barge:install:test" = "python3 scripts/test-barge-install.py"
+"barge:install:test" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-barge-install.py"
 "docs:check" = [
   "python3 scripts/check-docs.py check-links",
   "python3 scripts/check-docs.py retired-concepts",

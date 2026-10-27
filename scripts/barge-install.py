@@ -82,11 +82,41 @@ def path_entries():
     return found
 
 
+def check_directory_chain(directory, allow_missing=False):
+    """Refuse symlinks, foreign ownership and writable ancestors below HOME."""
+    parts = directory.relative_to(HOME).parts
+    for count in range(len(parts) + 1):
+        item = HOME.joinpath(*parts[:count])
+        try:
+            info = os.lstat(item)
+        except FileNotFoundError:
+            if allow_missing:
+                return
+            raise
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or (count and info.st_mode & 0o022)):
+            raise Refusal(f"{item} is not a private owned real directory")
+
+
 def newest_receipt():
-    if not RECEIPTS.is_dir():
+    check_directory_chain(RECEIPTS, allow_missing=True)
+    if not RECEIPTS.exists():
         return None
     receipts = sorted(RECEIPTS.glob("*.json"))
-    return (receipts[-1], json.loads(receipts[-1].read_text())) if receipts else None
+    if not receipts:
+        return None
+    receipt = receipts[-1]
+    info = os.lstat(receipt)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise Refusal(f"unsafe receipt {receipt}")
+    try:
+        data = json.loads(receipt.read_text())
+        digest = data["installed"]["sha256"]
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("invalid hash")
+    except (ValueError, KeyError, TypeError) as error:
+        raise Refusal(f"invalid receipt {receipt}: {error}") from error
+    return receipt, data
 
 
 def open_destination_directory():
@@ -95,13 +125,7 @@ def open_destination_directory():
     Every component from HOME down must be a real directory owned by this
     user, and none below HOME may be group or world writable.
     """
-    parts = DESTINATION.parent.relative_to(HOME).parts
-    for count in range(len(parts) + 1):
-        directory = HOME.joinpath(*parts[:count])
-        info = os.lstat(directory)
-        writable = count > 0 and info.st_mode & 0o022
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or writable:
-            raise Refusal(f"{directory} is not a real directory owned only by this user")
+    check_directory_chain(DESTINATION.parent)
     descriptor = os.open(DESTINATION.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     opened, checked = os.fstat(descriptor), os.lstat(DESTINATION.parent)
     if (opened.st_dev, opened.st_ino) != (checked.st_dev, checked.st_ino):
@@ -134,6 +158,7 @@ def identity(directory, name):
 
 def preflight(replace):
     """Return (replaced receipt, expected destination identity), or Nones in initial mode."""
+    check_directory_chain(RECEIPTS, allow_missing=True)
     entries = path_entries()
     if not replace:
         if entries:
@@ -170,7 +195,11 @@ def build_environment(staging, pin, instance):
     a caller's storage. The stamp names are read by `option_env!`, which
     Cargo tracks, so a changed stamp recompiles the binary.
     """
-    environment = {k: v for k, v in os.environ.items() if not k.startswith("CARGO_TARGET_")}
+    environment = {k: v for k, v in os.environ.items()
+                   if not k.startswith("CARGO_TARGET_") and k != "CARGO_BUILD_BUILD_DIR"
+                   and not k.startswith("OXIDE_")}
+    for name in ("TMPDIR", "TMP", "TEMP"):
+        environment[name] = str(staging)
     environment["OXIDE_POOL"] = str(staging / "pool")
     environment["OXIDE_CONFIG"] = str(staging / "oxide.toml")
     (staging / "oxide.toml").write_text("")
@@ -228,7 +257,9 @@ def build_identity(built, pin, instance):
 
 def write_receipt(receipt, started, pin):
     """Write one new receipt owner-only; earlier receipts are left untouched."""
-    RECEIPTS.mkdir(parents=True, exist_ok=True)
+    check_directory_chain(RECEIPTS, allow_missing=True)
+    RECEIPTS.mkdir(parents=True, exist_ok=True, mode=0o700)
+    check_directory_chain(RECEIPTS)
     info = os.lstat(RECEIPTS)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
         raise Refusal(f"{RECEIPTS} is not a real directory owned by this user")
@@ -300,6 +331,7 @@ def main():
     parser.add_argument("--check", action="store_true", help="preflight only; build nothing")
     arguments = parser.parse_args()
     started = datetime.datetime.now(datetime.timezone.utc)
+    staging = None
     try:
         pin, tree, tip = authenticate_pin(arguments.pin)
         previous, expected = preflight(arguments.replace)
@@ -311,7 +343,9 @@ def main():
         scratch = Path(os.environ["BARGE_INSTALL_SCRATCH"])
         info = os.lstat(scratch)
         if (not scratch.is_absolute() or scratch == Path(scratch.anchor)
-                or scratch.resolve() != scratch or not stat.S_ISDIR(info.st_mode)
+                or scratch.resolve() != scratch or os.path.ismount(scratch)
+                or scratch == HOME or HOME in scratch.parents
+                or not stat.S_ISDIR(info.st_mode)
                 or info.st_uid != os.getuid() or info.st_mode & 0o022):
             raise Refusal("BARGE_INSTALL_SCRATCH must be an absolute, private, owned real directory")
         staging = Path(tempfile.mkdtemp(prefix="barge-install.", dir=scratch))
@@ -319,9 +353,14 @@ def main():
         instance = new_instance()
         built, versions = build(pin, instance, staging)
         build_identity(built, pin, instance)
+        current, current_identity = preflight(arguments.replace)
+        if current != previous or current_identity != expected:
+            raise Refusal("destination or receipt changed during the build")
         built_hash, installed = install(built, expected)
     except (Refusal, subprocess.CalledProcessError, OSError, KeyError, ValueError) as error:
         print(f"barge:install refused: {error}", file=sys.stderr)
+        if staging is not None:
+            shutil.rmtree(staging)
         return 1
     receipt = {
         "mode": "initial" if previous is None else "replace",
@@ -344,6 +383,7 @@ def main():
     except (Refusal, OSError) as error:
         print(f"barge:install installed but cannot write a receipt: {error}", file=sys.stderr)
         print(json.dumps(receipt, indent=2))
+        shutil.rmtree(staging)
         return 1
     shutil.rmtree(staging)
     print(json.dumps(receipt, indent=2))
