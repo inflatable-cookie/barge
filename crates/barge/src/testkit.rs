@@ -1,12 +1,14 @@
 //! Test-only fixture helpers: one fresh directory per test.
 //!
-//! Every fixture lives inside a run root and never at a fixed path, so two tests
-//! — or two tasks on one machine — cannot share a name. The run root is the fresh
-//! `run.*` directory a caller names in [`SCRATCH_ROOT_ENV`] when it has one (a task
-//! confined to one directory, for instance), and otherwise a fresh `run.*` root
-//! this process creates and removes for the fixture, under [`scratch_base`]:
-//! nothing is ever created directly in the shared scratch parent. Tests that need
-//! the state directory use [`crate::state::StatePaths`] over a directory here.
+//! Every fixture lives inside a directory this process creates and removes, and
+//! never at a fixed path, so two tests — or two tasks on one machine — cannot
+//! share a name. A fixture that needs the real OS layer lives inside one run
+//! root as well ([`RunRoot`]): the caller's fresh
+//! `/Volumes/Builds/scratch/barge/run.*` directory when it names one, and
+//! otherwise a `run.*` directory this process creates and removes for the
+//! fixture, so no fixture is ever created directly in the shared scratch parent.
+//! Tests that need the state directory use
+//! [`crate::state::StatePaths`] over a directory here.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -20,16 +22,16 @@ static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// The scratch directory AGENTS.md names for scratch writes when the Builds
 /// drive is present. Nothing is ever written to a fixed name inside it: every
 /// fixture is a fresh directory this process creates and removes, inside a run
-/// root of its own unless the caller supplies one.
+/// root of its own.
 pub const SCRATCH_BASE: &str = "/Volumes/Builds/scratch/barge";
 
 /// The variable that names the run root one invocation's fixtures live in.
 ///
 /// A caller that wants every fixture of a run inside one directory it owns — a
 /// task that must not write in the shared scratch parent, for instance — creates
-/// a fresh `mktemp -d /Volumes/Builds/scratch/barge/run.XXXXXX`, names it here and
-/// removes it when the run is over. Unset, each fixture gets a `run.*` root of its
-/// own under [`scratch_base`], which it removes itself.
+/// a fresh `mktemp -d /Volumes/Builds/scratch/barge/run.XXXXXX`, names it here
+/// and removes it when the run is over. Unset, each fixture gets a `run.*` root
+/// of its own under [`scratch_base`], which it removes itself.
 pub const SCRATCH_ROOT_ENV: &str = "BARGE_TEST_SCRATCH_ROOT";
 
 /// The base a fixture is created under.
@@ -46,7 +48,7 @@ pub fn scratch_base() -> PathBuf {
     }
 }
 
-/// The run root one fixture lives in.
+/// The run root one real-OS fixture lives in.
 ///
 /// A supplied root belongs to its caller and is never removed here; one this
 /// process creates is removed with the fixture that created it.
@@ -94,7 +96,7 @@ fn fresh_run_root(parent: &Path) -> PathBuf {
     ))
 }
 
-/// A temporary fixture that removes itself when the test ends.
+/// A temporary directory that removes itself when the test ends.
 #[derive(Debug)]
 pub struct TempDir {
     path: PathBuf,
@@ -120,9 +122,10 @@ impl TempDir {
     }
 
     /// Create a fresh directory inside this invocation's run root: the fresh
-    /// `run.*` directory [`SCRATCH_ROOT_ENV`] names when the caller supplied one,
-    /// and otherwise a fresh `run.*` root this process creates and removes.
-    /// Nothing is created in the shared scratch parent itself.
+    /// `/Volumes/Builds/scratch/barge/run.*` directory [`SCRATCH_ROOT_ENV`]
+    /// names when the caller supplied one, and otherwise a fresh `run.*` root
+    /// this process creates and removes. Nothing is created in the shared scratch
+    /// parent itself.
     pub fn under_scratch(label: &str) -> Self {
         Self::within_run_root(&scratch_root(), label)
     }
@@ -384,6 +387,17 @@ impl ProcessObserver for FakeObserver {
         Ok(self.processes.get(&pid).copied().flatten())
     }
 
+    fn verify_platform_binary(
+        &self,
+        _classified: crate::os::ProcessIdentity,
+    ) -> Result<crate::os::PlatformStatus> {
+        // The fixture scan reports no opaque descriptor, so this is never asked;
+        // it answers honestly rather than pretending to a platform binary.
+        Ok(crate::os::PlatformStatus::NotVerified {
+            reason: "this observer reports no platform binary".to_owned(),
+        })
+    }
+
     fn scan_open_descriptors(
         &self,
         _request: &DescriptorScanRequest<'_>,
@@ -394,6 +408,7 @@ impl ProcessObserver for FakeObserver {
                 descriptors: 12,
                 foreign: 0,
                 retry: crate::os::RetryEvidence::default(),
+                os_blind_spot: crate::os::BlindSpotEvidence::default(),
                 open: Vec::new(),
             }),
             ScanMode::Open(open) => Ok(DescriptorScan::Complete {
@@ -401,6 +416,7 @@ impl ProcessObserver for FakeObserver {
                 descriptors: 12,
                 foreign: 0,
                 retry: crate::os::RetryEvidence::default(),
+                os_blind_spot: crate::os::BlindSpotEvidence::default(),
                 open: open.clone(),
             }),
             ScanMode::Bounded => Ok(DescriptorScan::Bounded {
@@ -1178,8 +1194,8 @@ impl VolumeFixture {
         Self::within(TempDir::new(label))
     }
 
-    /// A fresh fixture volume under the scratch base (AGENTS.md), for a test
-    /// that exercises the real OS layer instead of injected facts.
+    /// A fresh fixture volume inside this invocation's run root (AGENTS.md), for
+    /// a test that exercises the real OS layer instead of injected facts.
     pub fn under_scratch(label: &str) -> Self {
         Self::within(TempDir::under_scratch(label))
     }
@@ -1386,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fixture_stays_inside_the_run_root_it_is_given() {
+    fn a_real_os_fixture_stays_inside_the_run_root_it_is_given() {
         // The parent stands in for the run scratch area, and `run.supplied` for
         // the fresh `run.*` directory a test invocation names in
         // `SCRATCH_ROOT_ENV`. The fixture must land inside that root, nothing may
@@ -1451,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn the_invocations_run_root_is_what_a_fixture_lives_in() {
+    fn the_invocations_run_root_is_what_a_real_os_fixture_lives_in() {
         // The wiring, read-only: a supplied root is used as it is and belongs to
         // the caller; without one, the fixture base is a fresh `run.*` directory
         // under the scratch base rather than the shared parent itself.

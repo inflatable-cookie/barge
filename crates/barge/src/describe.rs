@@ -1491,6 +1491,15 @@ mod tests {
             Ok(None)
         }
 
+        fn verify_platform_binary(
+            &self,
+            _classified: crate::os::ProcessIdentity,
+        ) -> Result<crate::os::PlatformStatus> {
+            Ok(crate::os::PlatformStatus::NotVerified {
+                reason: "this observer reports no platform binary".to_owned(),
+            })
+        }
+
         fn scan_open_descriptors(
             &self,
             _request: &crate::os::DescriptorScanRequest<'_>,
@@ -1500,6 +1509,7 @@ mod tests {
                 descriptors: 0,
                 foreign: 0,
                 retry: crate::os::RetryEvidence::default(),
+                os_blind_spot: crate::os::BlindSpotEvidence::default(),
                 open: Vec::new(),
             })
         }

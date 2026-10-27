@@ -15,11 +15,12 @@ mod facts;
 mod macos;
 
 pub use facts::{
-    AccountFacts, ChildEntry, ChildListing, ChildRemoval, DescriptorScan, DescriptorScanRequest,
-    DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, ExpectedVolume, FileSystem,
-    MountPoint, MountRoot, OpenDescriptor, ProcessIdentity, ProcessObserver, RemoveKind,
-    RenameOutcome, RetriedUnreadable, RetryEvidence, RetryResolution, SelfExclusion,
-    VerifiedVolume, VolumeFacts, VolumeIdentity, VolumeUuid, RETRY_RECORDS,
+    AccountFacts, BlindSpotEvidence, ChildEntry, ChildListing, ChildRemoval, DescriptorScan,
+    DescriptorScanRequest, DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind,
+    ExpectedVolume, FileSystem, MountPoint, MountRoot, OpenDescriptor, PlatformBlindSpot,
+    PlatformStatus, ProcessIdentity, ProcessObserver, RemoveKind, RenameOutcome, RetriedUnreadable,
+    RetryEvidence, RetryResolution, SelfExclusion, VerifiedVolume, VolumeFacts, VolumeIdentity,
+    VolumeUuid, BLIND_SPOT_RECORDS, RETRY_RECORDS,
 };
 
 #[cfg(target_os = "macos")]
@@ -29,7 +30,7 @@ pub use macos::MacOs;
 /// `EPERM` answer sequence and the backoff schedule it is settled on. Nothing
 /// outside a test build can reach them.
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) use macos::{retry_schedule, StatedListing};
+pub(crate) use macos::{retry_schedule, StatedListing, StatedPlatform};
 
 #[cfg(not(target_os = "macos"))]
 compile_error!(

@@ -49,19 +49,19 @@ identifying processes that way made every whole-system scan `Unknown`. See the
 
 ## Q-008 — What about this account's own processes whose descriptors cannot be read?
 
-Status: open (measured 2026-10-26 in barge#011 v2)
-Measured: `PROC_PIDFDVNODEPATHINFO` answers `EPERM` for some descriptors of this
-account's own processes — the sandboxed and TCC-protected system daemons:
-`progressd`, `routined`, `ScreenTimeAgent`, `dmd`, `lsd`, `nsurlsessiond`,
-`UserEventAgent`, `com.apple.quicklook.ThumbnailsAgent` on macOS 26.6.2, 8 of
-1004 processes of this account. Listing their descriptors is allowed; reading
-the path of the protected ones is not.
-Consequence: under the rule that an unreadable descriptor is `Unknown`, a
-whole-system scan is `Unknown` on a real session, so a full-scan `Safe` verdict is
-not reachable there — the same "no delete proceeds" symptom from a third cause.
-The correction in barge#011 does not touch it: an unreadable same-uid descriptor
-stays `Unknown` by the brief, and relaxing that would let a same-uid writer hide.
-Question for the architect: is a same-uid process whose descriptor paths cannot
-be read a second named blind spot (counted and reported like a foreign effective
-uid), or does custody keep refusing? Any answer changes what `Safe` promises, so
-it is a decision, not a correction.
+Status: answered 2026-10-26
+Answer: a vnode descriptor whose path and vnode facts the platform both hide is
+an OS blind spot for a process its own code-signing status verifies as an Apple
+platform binary (`csops`/`CS_OPS_STATUS` carries `CS_PLATFORM_BINARY`, with the
+kernel start identity unchanged around the read). It is counted and reported in
+the `Safe` evidence and in `describe.custody`, and it does not block; every other
+hidden descriptor, a failed status read and an identity that moves around it stay
+`Unknown` (Tom, decision e528a712, implemented by barge#013); see the [stage 1
+design](contracts/stage1-design.md#writer-custody-and-safe-deletion).
+Measured before the decision (barge#011 v2, macOS 26.6.2):
+`PROC_PIDFDVNODEPATHINFO` answered `EPERM` for 8 of 1004 processes of this
+account — the sandboxed and TCC-protected system daemons `progressd`, `routined`,
+`ScreenTimeAgent`, `dmd`, `lsd`, `nsurlsessiond`, `UserEventAgent` and
+`com.apple.quicklook.ThumbnailsAgent` — while listing their descriptors was
+allowed. That made a whole-system scan `Unknown` under the rule that every
+unreadable descriptor refuses, and so a full-scan `Safe` verdict unreachable.

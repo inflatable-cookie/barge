@@ -19,10 +19,11 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::facts::{
-    AccountFacts, ChildEntry, ChildListing, ChildRemoval, DescriptorScan, DescriptorScanRequest,
-    DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, FileSystem, MountPoint, MountRoot,
-    OpenDescriptor, ProcessIdentity, ProcessObserver, RemoveKind, RenameOutcome, RetriedUnreadable,
-    RetryEvidence, RetryResolution, VolumeFacts, VolumeIdentity, VolumeUuid,
+    AccountFacts, BlindSpotEvidence, ChildEntry, ChildListing, ChildRemoval, DescriptorScan,
+    DescriptorScanRequest, DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, FileSystem,
+    MountPoint, MountRoot, OpenDescriptor, PlatformBlindSpot, PlatformStatus, ProcessIdentity,
+    ProcessObserver, RemoveKind, RenameOutcome, RetriedUnreadable, RetryEvidence, RetryResolution,
+    VolumeFacts, VolumeIdentity, VolumeUuid, BLIND_SPOT_RECORDS,
 };
 
 /// The parent every managed volume mounts directly under.
@@ -53,8 +54,20 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// writes a 4-byte length followed by the attribute's value.
 const VOLUME_ATTRIBUTE_BYTES: usize = 32;
 
+/// `PROC_PIDFDVNODEINFO`: one descriptor's vnode facts, without its path.
+const PROC_PIDFDVNODEINFO: libc::c_int = 1;
+
 /// `PROC_PIDFDVNODEPATHINFO` from `sys/proc_info.h`: one descriptor's vnode path.
 const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+/// `CS_OPS_STATUS` from `sys/codesign.h`: the operation that reads a process's
+/// code-signing status flags.
+const CS_OPS_STATUS: libc::c_uint = 0;
+
+/// `CS_PLATFORM_BINARY` from `sys/codesign.h`: the flag Apple's own platform
+/// binaries carry. It is the one fact that explains a hidden descriptor path
+/// (Tom, 2026-10-26, decision e528a712).
+const CS_PLATFORM_BINARY: u32 = 0x0400_0000;
 
 /// How many descriptors one process may hold before the scan is bounded: the
 /// platform's own open-file limit is far below this, so reaching it means the
@@ -83,9 +96,10 @@ pub(crate) fn retry_schedule() -> &'static [Duration] {
     &EPERM_BACKOFFS
 }
 
-// `proc_pidfdinfo` is the one libproc call the descriptor scan needs; `libc`
-// declares it not at all, so the seam declares it itself. The process table is
-// read through `sysctl`, which needs no libproc call and no privilege.
+// `proc_pidfdinfo` is the one libproc call the descriptor scan needs, and
+// `csops` the one code-signing call; `libc` declares neither, so the seam
+// declares them itself. The process table is read through `sysctl`, which needs
+// no libproc call and no privilege.
 extern "C" {
     fn proc_pidfdinfo(
         pid: libc::c_int,
@@ -93,6 +107,13 @@ extern "C" {
         flavor: libc::c_int,
         buffer: *mut libc::c_void,
         buffer_size: libc::c_int,
+    ) -> libc::c_int;
+
+    fn csops(
+        pid: libc::c_int,
+        ops: libc::c_uint,
+        useraddr: *mut libc::c_void,
+        usersize: libc::size_t,
     ) -> libc::c_int;
 }
 
@@ -111,6 +132,14 @@ struct ProcFileInfo {
 struct VnodeFdInfoWithPath {
     pfi: ProcFileInfo,
     pvip: libc::vnode_info_path,
+}
+
+/// `struct vnode_fdinfo` from `sys/proc_info.h`: the vnode facts without the
+/// path, which the kernel hides separately from it.
+#[repr(C)]
+struct VnodeFdInfo {
+    pfi: ProcFileInfo,
+    pvi: libc::vnode_info,
 }
 
 /// The macOS OS layer.
@@ -250,6 +279,10 @@ impl ProcessObserver for MacOs {
         Ok(Some(bsd_start(&info)))
     }
 
+    fn verify_platform_binary(&self, classified: ProcessIdentity) -> Result<PlatformStatus> {
+        self.platform_status(classified, &[])
+    }
+
     fn scan_open_descriptors(&self, request: &DescriptorScanRequest<'_>) -> Result<DescriptorScan> {
         // The kernel's own process table is read first, so every candidate is
         // classified by its effective uid before any descriptor is inspected. A
@@ -347,6 +380,7 @@ impl MacOs {
         let mut processes = 0usize;
         let mut descriptors = 0usize;
         let mut foreign = 0usize;
+        let mut os_blind_spot = BlindSpotEvidence::default();
         let mut open = Vec::new();
         // Whether the process the request names as the calling one was found and
         // skipped. An exclusion that never matched proves nothing about what it
@@ -457,6 +491,14 @@ impl MacOs {
                     retry: retry.clone(),
                 });
             }
+            // The vnode descriptors the platform hides for this process. They
+            // are counted, never assumed safe: only a process the platform's own
+            // code-signing status verifies as a platform binary may have them,
+            // and then they are recorded as the OS blind spot (Tom, 2026-10-26,
+            // decision e528a712). Every readable descriptor of the same process
+            // is still evaluated below.
+            let mut opaque = 0usize;
+            let mut vnodes = 0usize;
             for fd in fds {
                 if started.elapsed() >= request.timeout {
                     return Ok(DescriptorScan::Bounded {
@@ -478,9 +520,21 @@ impl MacOs {
                 if libc::c_int::try_from(fd.proc_fdtype).ok() != Some(libc::PROX_FDTYPE_VNODE) {
                     continue;
                 }
-                let path = match descriptor_path(pid, fd.proc_fd) {
-                    Ok(Some(path)) => path,
-                    Ok(None) => continue,
+                // A test may state that this descriptor's path read answers
+                // `EPERM`; the production scan states nothing and reads it.
+                let stated_opaque = stated_opaque(faults, pid, vnodes);
+                vnodes = vnodes.saturating_add(1);
+                if stated_opaque {
+                    opaque = opaque.saturating_add(1);
+                    continue;
+                }
+                let path = match read_descriptor(pid, fd.proc_fd) {
+                    Ok(DescriptorReading::Path(path)) => path,
+                    Ok(DescriptorReading::Closed) => continue,
+                    Ok(DescriptorReading::Opaque) => {
+                        opaque = opaque.saturating_add(1);
+                        continue;
+                    }
                     Err(error) => {
                         return Ok(DescriptorScan::Unreadable {
                             reason: error.message().to_owned(),
@@ -494,6 +548,51 @@ impl MacOs {
                         descriptor: fd.proc_fd,
                         path,
                     });
+                }
+            }
+            if opaque == 0 {
+                continue;
+            }
+            // The platform hides at least one of this process's vnode
+            // descriptors. Only its own code-signing status can explain that,
+            // and only for a platform binary whose start identity is unchanged
+            // across the status read: everything else is unreadable, never a
+            // skip.
+            match self.platform_status(identity, faults) {
+                Ok(PlatformStatus::PlatformBinary { command }) => {
+                    let recorded = os_blind_spot.record(PlatformBlindSpot {
+                        pid,
+                        start: identity.start,
+                        command,
+                        opaque_descriptors: opaque,
+                    });
+                    // The evidence names every blind-spot process or none: a
+                    // process that did not fit would make a `Safe` verdict count
+                    // evidence it cannot show, so the scan refuses instead.
+                    if !recorded {
+                        return Ok(DescriptorScan::Unreadable {
+                            reason: format!(
+                                "the scan met more than {BLIND_SPOT_RECORDS} platform-verified processes whose vnode descriptors the platform hides, and its record holds every one of them or none: pid {pid} did not fit, so the evidence would be incomplete"
+                            ),
+                            retry: retry.clone(),
+                        });
+                    }
+                }
+                Ok(PlatformStatus::NotVerified { reason }) => {
+                    return Ok(DescriptorScan::Unreadable {
+                        reason: format!(
+                            "{opaque} vnode descriptors of pid {pid} are hidden by the platform and the process is not a verified platform binary: {reason}"
+                        ),
+                        retry: retry.clone(),
+                    })
+                }
+                Err(error) => {
+                    return Ok(DescriptorScan::Unreadable {
+                        reason: format!(
+                            "{opaque} vnode descriptors of pid {pid} are hidden by the platform and its code-signing status is unreadable: {error}"
+                        ),
+                        retry: retry.clone(),
+                    })
                 }
             }
         }
@@ -513,7 +612,70 @@ impl MacOs {
             descriptors,
             foreign,
             retry: retry.clone(),
+            os_blind_spot,
             open,
+        })
+    }
+
+    /// Verify one classified process as a platform binary, with any answer a
+    /// test states.
+    ///
+    /// The fact is the process's code-signing status through `csops`, which this
+    /// account can read for any pid, and the identity the kernel's own table
+    /// reports for it before and after that read. Only the platform flag with an
+    /// unchanged start identity is an answer: the flag without the identity, an
+    /// identity that moved, and a status this account cannot read all leave the
+    /// hidden descriptors unreadable.
+    fn platform_status(
+        &self,
+        classified: ProcessIdentity,
+        faults: &[StatedListing],
+    ) -> Result<PlatformStatus> {
+        if let Some(stated) = faults
+            .iter()
+            .find(|stated| stated.pid == classified.pid)
+            .and_then(|stated| stated.platform.as_ref())
+        {
+            return stated.answer(classified);
+        }
+        let pid = classified.pid;
+        let Some(before) = kinfo_process(pid)? else {
+            return Ok(PlatformStatus::NotVerified {
+                reason: format!("the kernel reports no process at pid {pid}"),
+            });
+        };
+        if before.identity.start != classified.start {
+            return Ok(PlatformStatus::NotVerified {
+                reason: format!(
+                    "the kernel reports start identity {} for pid {pid}, not the classified {}",
+                    before.identity.start, classified.start
+                ),
+            });
+        }
+        let status = code_signing_status(pid)?;
+        let Some(after) = kinfo_process(pid)? else {
+            return Ok(PlatformStatus::NotVerified {
+                reason: format!("the kernel reports no process at pid {pid} any more"),
+            });
+        };
+        if after.identity.start != classified.start {
+            return Ok(PlatformStatus::NotVerified {
+                reason: format!(
+                    "the start identity of pid {pid} changed from {} to {} around the code-signing read, so nothing that read says is evidence about the descriptors just listed",
+                    classified.start, after.identity.start
+                ),
+            });
+        }
+        if status & CS_PLATFORM_BINARY == 0 {
+            return Ok(PlatformStatus::NotVerified {
+                reason: format!(
+                    "`{}` (pid {pid}) does not carry the platform binary flag",
+                    after.command
+                ),
+            });
+        }
+        Ok(PlatformStatus::PlatformBinary {
+            command: after.command,
         })
     }
 
@@ -860,6 +1022,89 @@ pub(crate) struct StatedListing {
     pub(crate) start: Option<u64>,
     /// An effective uid the re-observation reports instead of the kernel's.
     pub(crate) uid: Option<u32>,
+    /// How many of this process's vnode descriptors' path reads the test states
+    /// as `EPERM`, counting from the first vnode descriptor of the listing. They
+    /// stand for the descriptors the platform hides; every later vnode descriptor
+    /// is read for real.
+    pub(crate) opaque: usize,
+    /// The code-signing answer the test states instead of the kernel's.
+    pub(crate) platform: Option<StatedPlatform>,
+}
+
+/// What a test states about one process's code-signing status, instead of the
+/// platform's own `csops` read.
+///
+/// The production scan states nothing, so every verification it acts on comes
+/// from the kernel. A stated answer lets the rule that only a verified platform
+/// binary's opaque descriptors are an OS blind spot be exercised without this
+/// account owning an Apple-signed platform binary, which is why no production
+/// path constructs one.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub(crate) enum StatedPlatform {
+    /// The status read succeeds and carries the platform binary flag.
+    PlatformBinary {
+        /// The command the kernel's table reports for the process.
+        command: String,
+    },
+    /// The status read succeeds without the platform binary flag.
+    NotPlatformBinary {
+        /// The command the kernel's table reports for the process.
+        command: String,
+    },
+    /// The status read fails with this errno.
+    Failed {
+        /// The errno `csops` answers.
+        errno: i32,
+    },
+    /// The process's start identity changes to this value across the read.
+    IdentityChanged {
+        /// The command the kernel's table reports for the process.
+        command: String,
+        /// The start identity the table reports after the status read.
+        start: u64,
+    },
+}
+
+impl StatedPlatform {
+    /// The answer the scan acts on, stated exactly as the platform would report
+    /// it: a failed read is the same unknown error the platform's own `csops`
+    /// failure is.
+    fn answer(&self, classified: ProcessIdentity) -> Result<PlatformStatus> {
+        let pid = classified.pid;
+        match self {
+            Self::PlatformBinary { command } => Ok(PlatformStatus::PlatformBinary {
+                command: command.clone(),
+            }),
+            Self::NotPlatformBinary { command } => Ok(PlatformStatus::NotVerified {
+                reason: format!("`{command}` (pid {pid}) does not carry the platform binary flag"),
+            }),
+            Self::Failed { errno } => Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "the code-signing status of pid {pid} is unreadable: {}",
+                    io::Error::from_raw_os_error(*errno)
+                ),
+            )
+            .with_detail("pid", u64::from(pid).into())),
+            Self::IdentityChanged { command, start } => Ok(PlatformStatus::NotVerified {
+                reason: format!(
+                    "the start identity of `{command}` (pid {pid}) changed from {} to {start} around the code-signing read",
+                    classified.start
+                ),
+            }),
+        }
+    }
+}
+
+/// Whether a test states that one of this process's vnode descriptors is opaque,
+/// by its index among the process's vnode descriptors. A production scan states
+/// nothing, so every descriptor is read for real.
+fn stated_opaque(faults: &[StatedListing], pid: u32, index: usize) -> bool {
+    faults
+        .iter()
+        .find(|stated| stated.pid == pid)
+        .is_some_and(|stated| index < stated.opaque)
 }
 
 /// The errno a test states for this process's next listing, consuming it. A
@@ -1413,9 +1658,80 @@ fn bsd_info(pid: u32) -> Result<Option<libc::proc_bsdinfo>> {
     }
 }
 
-/// One descriptor's path, or `Ok(None)` when the descriptor closed while it was
-/// observed. Any other failure is an unreadable fact.
-fn descriptor_path(pid: u32, descriptor: i32) -> Result<Option<PathBuf>> {
+/// What one vnode descriptor could be read as.
+///
+/// The two answers that are not a path are facts of their own: a descriptor that
+/// closed is gone, and one both flavors hide is opaque, which only a verified
+/// platform binary may have (Tom, 2026-10-26, decision e528a712).
+#[derive(Debug)]
+enum DescriptorReading {
+    /// The path the platform reports for the descriptor.
+    Path(PathBuf),
+    /// The descriptor closed while it was observed.
+    Closed,
+    /// Both the path and the vnode facts answered `EPERM`, so where the
+    /// descriptor points cannot be read at all.
+    Opaque,
+}
+
+/// One vnode descriptor, read as far as the platform allows.
+///
+/// A path the platform hides as `EPERM` is confirmed against the vnode facts:
+/// only when both flavors answer `EPERM` is the descriptor opaque. A path this
+/// account may not read while its vnode facts are readable is not opaque — the
+/// exemption is about exactly the descriptors the platform hides twice — so it
+/// stays an unreadable fact and refuses. Any other failure refuses at once.
+fn read_descriptor(pid: u32, descriptor: i32) -> Result<DescriptorReading> {
+    let hidden = match descriptor_path(pid, descriptor) {
+        DescriptorPath::Path(path) => return Ok(DescriptorReading::Path(path)),
+        DescriptorPath::Closed => return Ok(DescriptorReading::Closed),
+        DescriptorPath::Hidden(error) => error,
+    };
+    if hidden.raw_os_error() != Some(libc::EPERM) {
+        return Err(unreadable_descriptors(pid, &hidden));
+    }
+    match descriptor_vnode_facts(pid, descriptor) {
+        VnodeFacts::Hidden => Ok(DescriptorReading::Opaque),
+        VnodeFacts::Closed => Ok(DescriptorReading::Closed),
+        VnodeFacts::Readable => Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the vnode facts of descriptor {descriptor} of pid {pid} are readable while its path is not, so it cannot be placed"
+            ),
+        )
+        .with_detail("pid", u64::from(pid).into())
+        .with_detail("descriptor", i64::from(descriptor).into())),
+        VnodeFacts::Unreadable(error) => Err(unreadable_descriptors(pid, &error)),
+    }
+}
+
+/// One descriptor's path, as `PROC_PIDFDVNODEPATHINFO` answers it.
+#[derive(Debug)]
+enum DescriptorPath {
+    /// The path the kernel reports.
+    Path(PathBuf),
+    /// The descriptor closed while it was observed, or reports no path.
+    Closed,
+    /// The read failed, with the kernel's own reason. `EPERM` is the hidden
+    /// answer the vnode facts are confirmed against.
+    Hidden(io::Error),
+}
+
+/// One descriptor's vnode facts, as `PROC_PIDFDVNODEINFO` answers them. The
+/// kernel hides them for the same protected descriptors whose paths it hides.
+#[derive(Debug)]
+enum VnodeFacts {
+    /// The kernel answered the facts, so the descriptor is not opaque.
+    Readable,
+    /// The kernel answered `EPERM` here too: both flavors hide the descriptor.
+    Hidden,
+    /// The descriptor closed between the two reads.
+    Closed,
+    /// Any other reason.
+    Unreadable(io::Error),
+}
+
+fn descriptor_path(pid: u32, descriptor: i32) -> DescriptorPath {
     // SAFETY: `VnodeFdInfoWithPath` is a plain-old-data C struct, so an
     // all-zero value is a valid initial buffer.
     let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
@@ -1434,8 +1750,8 @@ fn descriptor_path(pid: u32, descriptor: i32) -> Result<Option<PathBuf>> {
     if written as usize != size {
         let error = io::Error::last_os_error();
         return match error.raw_os_error() {
-            Some(libc::ESRCH | libc::EBADF) => Ok(None),
-            _ => Err(unreadable_descriptors(pid, &error)),
+            Some(libc::ESRCH | libc::EBADF) => DescriptorPath::Closed,
+            _ => DescriptorPath::Hidden(error),
         };
     }
     // SAFETY: `vip_path` is a fixed array of `c_char` inside `info`, which is
@@ -1447,15 +1763,68 @@ fn descriptor_path(pid: u32, descriptor: i32) -> Result<Option<PathBuf>> {
         )
     };
     let Ok(path) = CStr::from_bytes_until_nul(bytes) else {
-        return Err(unreadable_descriptors(
-            pid,
-            &io::Error::from_raw_os_error(libc::ENAMETOOLONG),
-        ));
+        return DescriptorPath::Hidden(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
     };
     if path.to_bytes().is_empty() {
-        return Ok(None);
+        return DescriptorPath::Closed;
     }
-    Ok(Some(PathBuf::from(OsStr::from_bytes(path.to_bytes()))))
+    DescriptorPath::Path(PathBuf::from(OsStr::from_bytes(path.to_bytes())))
+}
+
+fn descriptor_vnode_facts(pid: u32, descriptor: i32) -> VnodeFacts {
+    // SAFETY: `VnodeFdInfo` is a plain-old-data C struct, so an all-zero value is
+    // a valid initial buffer.
+    let mut info: VnodeFdInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<VnodeFdInfo>();
+    // SAFETY: `info` is a writable buffer of exactly the size passed, so the
+    // kernel writes only inside it and returns how much it wrote.
+    let written = unsafe {
+        proc_pidfdinfo(
+            libc::c_int::try_from(pid).unwrap_or(libc::c_int::MAX),
+            descriptor,
+            PROC_PIDFDVNODEINFO,
+            std::ptr::addr_of_mut!(info).cast(),
+            libc::c_int::try_from(size).unwrap_or(libc::c_int::MAX),
+        )
+    };
+    if written as usize == size {
+        return VnodeFacts::Readable;
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EPERM) => VnodeFacts::Hidden,
+        Some(libc::ESRCH | libc::EBADF) => VnodeFacts::Closed,
+        _ => VnodeFacts::Unreadable(error),
+    }
+}
+
+/// One process's code-signing status flags, through `csops(CS_OPS_STATUS)`.
+///
+/// The platform answers this for any pid, which is what makes it usable on a
+/// process whose own descriptors it hides. A failed read is unknown state: the
+/// flag is never defaulted.
+fn code_signing_status(pid: u32) -> Result<u32> {
+    let mut status: u32 = 0;
+    // SAFETY: `status` is a writable `u32` whose exact size is passed, so `csops`
+    // writes only inside it; no other buffer is passed.
+    let answer = unsafe {
+        csops(
+            libc::c_int::try_from(pid).unwrap_or(libc::c_int::MAX),
+            CS_OPS_STATUS,
+            std::ptr::addr_of_mut!(status).cast(),
+            std::mem::size_of::<u32>(),
+        )
+    };
+    if answer != 0 {
+        let error = io::Error::last_os_error();
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!("the code-signing status of pid {pid} is unreadable: {error}"),
+        )
+        .with_detail("pid", u64::from(pid).into())
+        .with_detail("os_error", error.to_string().into()));
+    }
+    Ok(status)
 }
 
 fn unreadable_descriptors(pid: u32, error: &io::Error) -> Error {
