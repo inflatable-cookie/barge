@@ -960,9 +960,16 @@ locks are held for which step.
 | Rank | Lock | Held by stage 3 for | Never held across |
 | --- | --- | --- | --- |
 | 1 | `registry.lock` | the policy snapshot read (shared), and a registration write (exclusive) | a measurement, a volume walk, a deletion |
-| 2 | `volume-<uuid>.lock` | a prune pass (exclusive, held from its first authoritative measurement to its final decision); a report (shared, only if the file exists); an operator prune's real run; a registration write | a registry lock write |
+| 2 | `volume-<uuid>.lock` | a prune pass (exclusive, held from its first authoritative measurement to its final decision); a report (shared, only if the file exists); an operator prune's real run; a registration write | a registry lock write, except the ordered registration publication described below |
 | 3 | `root-<id>.lock` | `hold`, `release` and the activity write; one candidate's plan → intent → rename → delete | another root's effect |
 | 4 | intent write (no lock file) | the intent publish before an effect | — |
+
+For a registration write, measure capacity before either lock; then take the
+exclusive registry lock followed by the exclusive volume lock. Revalidate the
+plan, registry generation and bound volume identity under both, and retain both
+through atomic publication. No measurement, volume walk or deletion occurs under
+the registry lock. This registration exception follows the stage 1 ordered
+dual-lock grant-write rule; prune and report locking are unchanged.
 
 Rules a reviewer can check:
 

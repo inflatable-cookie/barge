@@ -2,7 +2,7 @@
 
 use crate::digest::sha256_hex;
 use crate::error::{Error, ErrorKind, Result};
-use crate::os::{self, MountRoot, SpaceFacts, VolumeFacts, VolumeUuid};
+use crate::os::{self, MountRoot, SpaceFacts, VerifiedVolume, VolumeFacts, VolumeUuid};
 use crate::registry::{
     self, Availability, Durability, FolderOverrides, RecordOrigin, Registry, RegistryDocument,
     RegistryWriter, ScratchGrants, SpacePolicy, VolumeRecord, DEFAULT_FLOOR_BYTES,
@@ -11,6 +11,9 @@ use crate::registry::{
 use crate::state::{self, LockSet, StatePaths};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// Maximum bytes in a registration plan or registry publication.
+pub const REGISTRATION_SIZE_CAP_BYTES: usize = 64 * 1024;
 
 /// A registration operation and the exact record it proposes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,7 +99,7 @@ fn verify(
     facts: &dyn VolumeFacts,
     mounts: &dyn MountRoot,
     space: &dyn SpaceFacts,
-) -> Result<()> {
+) -> Result<VerifiedVolume> {
     let mount = record
         .mount_hint
         .as_ref()
@@ -117,11 +120,18 @@ fn verify(
         ));
     }
     verified.reverify(facts)?;
-    Ok(())
+    Ok(verified)
 }
 fn preview(plan: Plan) -> Result<Preview> {
     let plan = serde_json::to_string_pretty(&plan)
         .map_err(|e| Error::new(ErrorKind::Io, e.to_string()))?;
+    if plan.len() > REGISTRATION_SIZE_CAP_BYTES {
+        return Err(
+            Error::new(ErrorKind::ResourceBound, "registration plan exceeds 64 KiB")
+                .with_detail("bytes", plan.len().into())
+                .with_detail("cap", REGISTRATION_SIZE_CAP_BYTES.into()),
+        );
+    }
     Ok(Preview {
         plan_sha256: sha256_hex(plan.as_bytes()),
         plan,
@@ -276,21 +286,33 @@ pub fn apply(
     mounts: &dyn MountRoot,
     space: &dyn SpaceFacts,
 ) -> Result<VolumeRecord> {
-    if bytes.len() > registry::REGISTRY_SIZE_CAP_BYTES || sha256_hex(bytes) != digest {
+    if bytes.len() > REGISTRATION_SIZE_CAP_BYTES {
+        return Err(
+            Error::new(ErrorKind::ResourceBound, "registration plan exceeds 64 KiB")
+                .with_detail("bytes", bytes.len().into())
+                .with_detail("cap", REGISTRATION_SIZE_CAP_BYTES.into()),
+        );
+    }
+    if sha256_hex(bytes) != digest {
         return Err(Error::new(ErrorKind::Usage, "plan digest does not match"));
     }
     let plan: Plan = serde_json::from_slice(bytes)
         .map_err(|e| Error::new(ErrorKind::Usage, format!("invalid volume plan: {e}")))?;
     let current = observed(paths)?;
     validate_plan(&plan, &current)?;
-    verify(&plan.record, facts, mounts, space)?;
+    let verified = verify(&plan.record, facts, mounts, space)?;
     paths.initialize()?;
     let mut locks = LockSet::new(paths.clone());
     let lock = locks.lock_registry()?;
+    let _volume_lock = locks.lock_volume(&plan.record.volume_uuid)?;
     let current = registry::read(paths)?;
     let document = validate_plan(&plan, &current)?;
-    verify(&plan.record, facts, mounts, space)?;
-    let written = RegistryWriter::new(paths).publish(&lock, &document)?;
+    verified.reverify(facts)?;
+    let written = RegistryWriter::new(paths).publish_with_cap(
+        &lock,
+        &document,
+        REGISTRATION_SIZE_CAP_BYTES,
+    )?;
     written
         .volume(&plan.record.volume_uuid)
         .cloned()
@@ -428,6 +450,118 @@ mod tests {
             before
         );
     }
+    #[test]
+    fn oversized_plan_and_registry_write_refuse_without_changing_state() {
+        let fixture = VolumeFixture::new("volume-bounds");
+        fixture.register();
+        let before = std::fs::read(fixture.state.registry_path()).expect("registry");
+        let oversized = vec![b' '; REGISTRATION_SIZE_CAP_BYTES + 1];
+        let digest = sha256_hex(&oversized);
+        assert_eq!(
+            apply(
+                &fixture.state,
+                &oversized,
+                &digest,
+                &fixture.facts(),
+                &fixture.mounts(),
+                &Measurement
+            )
+            .expect_err("plan cap")
+            .kind(),
+            ErrorKind::ResourceBound
+        );
+        assert_eq!(
+            std::fs::read(fixture.state.registry_path()).expect("registry"),
+            before
+        );
+        let mut other = fixture.record.clone();
+        other.volume_uuid =
+            VolumeUuid::parse("A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C5D").expect("uuid");
+        other.root_dir = "x".repeat(REGISTRATION_SIZE_CAP_BYTES);
+        let document = RegistryDocument::new(vec![fixture.record.clone(), other]);
+        let mut locks = LockSet::new(fixture.state.clone());
+        let lock = locks.lock_registry().expect("lock");
+        RegistryWriter::new(&fixture.state)
+            .publish(&lock, &document)
+            .expect("fixture registry");
+        drop(lock);
+        let before = std::fs::read(fixture.state.registry_path()).expect("registry");
+        let update = UpdateRequest {
+            volume_uuid: fixture.uuid.clone(),
+            reserve_bytes: Some(20),
+            floor_bytes: Some(10),
+            availability: None,
+            durability: None,
+            root_dir: None,
+            declared_by: "operator".into(),
+        };
+        let plan = update_plan(
+            &fixture.state,
+            &update,
+            &fixture.facts(),
+            &fixture.mounts(),
+            &Measurement,
+        )
+        .expect("plan");
+        assert_eq!(
+            apply(
+                &fixture.state,
+                plan.plan.as_bytes(),
+                &plan.plan_sha256,
+                &fixture.facts(),
+                &fixture.mounts(),
+                &Measurement
+            )
+            .expect_err("write cap")
+            .kind(),
+            ErrorKind::ResourceBound
+        );
+        assert_eq!(
+            std::fs::read(fixture.state.registry_path()).expect("registry"),
+            before
+        );
+    }
+
+    #[test]
+    fn registration_refuses_when_the_volume_lock_is_held() {
+        let fixture = VolumeFixture::new("volume-held");
+        fixture.register();
+        let update = UpdateRequest {
+            volume_uuid: fixture.uuid.clone(),
+            reserve_bytes: Some(20),
+            floor_bytes: Some(10),
+            availability: None,
+            durability: None,
+            root_dir: None,
+            declared_by: "operator".into(),
+        };
+        let plan = update_plan(
+            &fixture.state,
+            &update,
+            &fixture.facts(),
+            &fixture.mounts(),
+            &Measurement,
+        )
+        .expect("plan");
+        let before = std::fs::read(fixture.state.registry_path()).expect("registry");
+        let mut locks = LockSet::new(fixture.state.clone());
+        let _held = locks.lock_volume(&fixture.uuid).expect("hold volume lock");
+        let error = apply(
+            &fixture.state,
+            plan.plan.as_bytes(),
+            &plan.plan_sha256,
+            &fixture.facts(),
+            &fixture.mounts(),
+            &Measurement,
+        )
+        .expect_err("locked volume refuses publication");
+        assert_eq!(error.kind(), ErrorKind::Locked);
+        assert_eq!(
+            std::fs::read(fixture.state.registry_path()).expect("registry"),
+            before
+        );
+    }
+
     #[test]
     fn update_cannot_infer_a_missing_floor() {
         let fixture = VolumeFixture::new("volume-undeclared");

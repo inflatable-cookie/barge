@@ -412,7 +412,7 @@ fn volume(args: &[String]) -> Result<Report, Error> {
         let digest = required(&mut options, "plan-sha256")?;
         refuse_unknown(options)?;
         let bounds = state::Bounds::new(
-            barge::registry::REGISTRY_SIZE_CAP_BYTES,
+            barge::volume::REGISTRATION_SIZE_CAP_BYTES,
             1,
             state::Deadline::after(state::READ_DEADLINE),
         );

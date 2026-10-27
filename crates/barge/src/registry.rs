@@ -605,6 +605,16 @@ impl<'a> RegistryWriter<'a> {
         lock: &StateLock,
         document: &RegistryDocument,
     ) -> Result<RegistryDocument> {
+        self.publish_with_cap(lock, document, REGISTRY_SIZE_CAP_BYTES)
+    }
+
+    /// Publish with a stricter operation-specific byte cap.
+    pub(crate) fn publish_with_cap(
+        &self,
+        lock: &StateLock,
+        document: &RegistryDocument,
+        cap: usize,
+    ) -> Result<RegistryDocument> {
         if lock.rank() != state::LockRank::Registry || lock.mode() != LockMode::Exclusive {
             return Err(Error::new(
                 ErrorKind::Usage,
@@ -623,16 +633,17 @@ impl<'a> RegistryWriter<'a> {
             )
         })?;
         bytes.push(b'\n');
-        if bytes.len() > REGISTRY_SIZE_CAP_BYTES {
+        let cap = cap.min(REGISTRY_SIZE_CAP_BYTES);
+        if bytes.len() > cap {
             return Err(Error::new(
                 ErrorKind::ResourceBound,
                 format!(
-                    "the registry would be {} bytes, over the {REGISTRY_SIZE_CAP_BYTES}-byte cap",
+                    "the registry would be {} bytes, over the {cap}-byte cap",
                     bytes.len()
                 ),
             )
             .with_detail("bytes", bytes.len().into())
-            .with_detail("cap", REGISTRY_SIZE_CAP_BYTES.into()));
+            .with_detail("cap", cap.into()));
         }
         self.state.initialize()?;
         state::publish_atomic(&self.state.registry_path(), &bytes)?;
