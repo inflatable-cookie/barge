@@ -145,6 +145,11 @@ pub struct DeleteBounds {
     pub retry_pause: Duration,
     /// The custody bounds the deletion's verdict ran within.
     pub custody: CustodyBounds,
+    /// The caller's wall clock, when it has one. No durable step of a deletion or
+    /// a replay starts after it: the preflight (locks, registry read, custody) can
+    /// be slow, so the bound is checked at the durable boundaries themselves, not
+    /// only before the call.
+    pub deadline: Option<Instant>,
 }
 
 impl Default for DeleteBounds {
@@ -156,6 +161,7 @@ impl Default for DeleteBounds {
             retry_attempts: ENOTEMPTY_ATTEMPTS,
             retry_pause: ENOTEMPTY_PAUSE,
             custody: CustodyBounds::default(),
+            deadline: None,
         }
     }
 }
@@ -506,6 +512,17 @@ pub(crate) fn delete_unit_authorized(
         captures: Vec::new(),
         foreign_captures: Vec::new(),
     };
+    // The first durable step is this intent record. The preflight above — locks,
+    // the registry re-read, the area and parent walks, the custody scan — can be
+    // slow, so the caller's clock is checked here, at that boundary: a spent clock
+    // leaves no record and no effect behind, and the unit is kept.
+    if expired(bounds.deadline) {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the run's wall clock was reached before this deletion's first durable step; the unit is kept",
+        )
+        .with_detail("unit", unit.name.clone().into()));
+    }
     let write = locks.begin_intent_write()?;
     state::publish_intent(&write, state_paths, &intent)?;
 
@@ -536,6 +553,20 @@ pub(crate) fn delete_unit_authorized(
         return Ok(report);
     }
 
+    // The rename is the first destructive step. The custody verdict above is
+    // re-decided after the intent and can itself be slow, so the clock is checked
+    // again here: a spent clock leaves the intent pending for a later replay and
+    // the unit untouched, never a rename inside the stop window.
+    if expired(bounds.deadline) {
+        return Ok(pending_report(
+            &intent,
+            quarantine,
+            Counts::default(),
+            "the run's wall clock was reached before the unit was renamed, so the intent stays pending"
+                .to_owned(),
+            Some(evidence),
+        ));
+    }
     // The quarantine rename is atomic and exclusive inside the unit's parent: an
     // existing name refuses instead of being replaced, and a cross-device or
     // changed-inode result stops before anything is deleted.
@@ -2640,6 +2671,12 @@ fn replay_one(
     let mut locks = LockSet::new(state_paths.clone());
     let _volume_lock = locks.lock_volume(&intent.volume_uuid)?;
     let _unit_lock = lock_deletion_unit(&mut locks, &unit)?;
+    // The replay's preflight (volume, folder, locks) can be slow, so the caller's
+    // clock is checked here, before its first durable step: a spent clock leaves
+    // the intent pending and changes nothing.
+    if expired(bounds.deadline) {
+        return Ok(ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned()));
+    }
     let write = locks.begin_intent_write()?;
 
     let leaf_facts = dirs.child_facts(&parent, intent.capture_name())?;
@@ -3819,6 +3856,46 @@ mod tests {
             prepared.pending_intents().len(),
             1,
             "the intent stays pending for a later run"
+        );
+    }
+
+    #[test]
+    fn a_spent_deadline_refuses_before_the_intent_is_written() {
+        let prepared = prepared("deadline-before-intent");
+        let root = prepared.unit_path().clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+
+        // The caller's clock is spent: the deletion's preflight can be as slow as
+        // it likes, but nothing durable may be written and the unit stays.
+        let faults = Faults::new();
+        let facts = prepared.fixture.facts();
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let mut bounds = prepared.bounds();
+        bounds.deadline = Some(Instant::now());
+        let error = super::delete_unit_authorized(
+            &prepared.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            &prepared.declaration,
+            None,
+            &prepared.unit,
+            bounds,
+            None,
+        )
+        .expect_err("a spent clock refuses before the first durable step");
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        assert!(
+            error.message().contains("first durable step"),
+            "{}",
+            error.message()
+        );
+        assert!(root.join("payload.txt").is_file(), "nothing was touched");
+        assert!(
+            prepared.pending_intents().is_empty(),
+            "no intent record was written"
         );
     }
 

@@ -980,7 +980,10 @@ fn run(
                 observer,
                 record,
                 &step.plan,
-                request.delete_bounds,
+                delete::DeleteBounds {
+                    deadline: Some(deadline),
+                    ..request.delete_bounds
+                },
                 request.now_ms,
                 Some(deadline),
             ) {
@@ -1125,6 +1128,10 @@ fn run(
                     });
                     continue;
                 }
+                let bounds = delete::DeleteBounds {
+                    deadline: Some(deadline),
+                    ..request.delete_bounds
+                };
                 let unit = area_unit(record, area_plan, candidate, &digest);
                 // The per-unit re-verification runs inside the deletion and can be
                 // slow, so the clock is checked here at the effect boundary: the
@@ -1161,7 +1168,7 @@ fn run(
                     &declaration,
                     Some(document),
                     &unit,
-                    request.delete_bounds,
+                    bounds,
                     Some(&authorize),
                 ) {
                     Ok(report) => {
@@ -2661,6 +2668,62 @@ mod tests {
             "no effect was refused by the clock"
         );
         assert!(root.is_dir(), "the unit is kept");
+    }
+
+    #[test]
+    fn a_slow_deletion_preflight_crossing_the_clock_leaves_no_intent_and_no_effect() {
+        let harness = Harness::new("maintain-clock-preflight");
+        let root = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        assert_eq!(harness.area_plan(&preview).candidates.count, 1);
+        let name = root.root_id.clone();
+
+        // The deletion's own preflight — the parent walk and the present check —
+        // outlives the clock. The durable boundary inside the deletion must refuse
+        // there: no intent record, no rename, and the unit kept.
+        let slept = std::cell::Cell::new(false);
+        let faults = Faults::new();
+        faults.observing(Box::new(move |observed: &str| {
+            if slept.get() || observed != name {
+                return;
+            }
+            slept.set(true);
+            std::thread::sleep(Duration::from_millis(2_300));
+        }));
+        let report = harness
+            .real_with_bounds(
+                &faults,
+                harness.aged(),
+                &preview,
+                MaintainBounds {
+                    wall: Duration::from_secs(2),
+                    stop_margin: Duration::ZERO,
+                },
+            )
+            .expect("the run reports its timeout");
+        assert!(report.timed_out, "{report:?}");
+        assert!(report.needs_human());
+        let area_stage = &report.volumes.rows[0].areas[0];
+        assert_eq!(area_stage.deleted.count, 0, "{area_stage:?}");
+        assert_eq!(area_stage.skipped.count, 1);
+        assert!(
+            area_stage.skipped.rows[0]
+                .reason
+                .contains("first durable step"),
+            "{}",
+            area_stage.skipped.rows[0].reason
+        );
+        assert_eq!(
+            report.pending.count, 0,
+            "a refusal before the intent leaves nothing pending"
+        );
+        let intents = state::read_intents(&harness.fixture.state, 64).expect("the journal reads");
+        assert!(
+            intents.records.is_empty(),
+            "no intent record was written: {:?}",
+            intents.records.len()
+        );
+        assert!(root.path.is_dir(), "the unit is kept");
     }
 
     #[test]
