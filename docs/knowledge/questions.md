@@ -65,3 +65,15 @@ account — the sandboxed and TCC-protected system daemons `progressd`, `routine
 `com.apple.quicklook.ThumbnailsAgent` — while listing their descriptors was
 allowed. That made a whole-system scan `Unknown` under the rule that every
 unreadable descriptor refuses, and so a full-scan `Safe` verdict unreachable.
+
+## Q-009 — Should Barge manage VM mounts, such as Colima profiles?
+
+Open (raised by Effigy, Tom 2026-10-27). Container fixtures run in a Colima VM
+whose profile mounts only `$HOME`, so files that `nerdctl compose` must open
+cannot live in Barge's scratch on the Builds drive. Proposed direction, not
+designed: a VM mount is another tool-configuration placement under Q-003. Barge
+would write a profile's `mounts:` entry only on explicit adopt, mount only a
+declared folder (for example `scratch/`) and never the whole volume, report the
+change exactly and undo it. It would also need a rule for an absent volume at VM
+start. This is not in stage 1. Until it is designed, mount changes stay manual
+operator changes to the Colima profile.
