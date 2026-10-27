@@ -2647,6 +2647,12 @@ fn replay_one(
         // Only the durable `removed` phase - recorded after Barge's own final
         // unlink succeeded - proves completion; an absence without it is unknown.
         if intent.phase == IntentPhase::Removed {
+            // The observation above can itself be slow, so the clock is checked
+            // again after it: a settle is a durable completion and never runs on a
+            // spent clock.
+            if expired(bounds.deadline) {
+                return Ok(ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned()));
+            }
             settle(state_paths, intent)?;
             return Ok(ReplayOutcome::Settled);
         }
@@ -2665,6 +2671,10 @@ fn replay_one(
         // The unit's parent is positively absent, so the unit and its capture are
         // too - and again only the durable `removed` phase proves completion.
         if intent.phase == IntentPhase::Removed {
+            // The parent observation can be slow too; the same rule applies.
+            if expired(bounds.deadline) {
+                return Ok(ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned()));
+            }
             settle(state_paths, intent)?;
             return Ok(ReplayOutcome::Settled);
         }
@@ -4031,6 +4041,69 @@ mod tests {
             &observer,
             prepared.bounds(),
             Some(Instant::now()),
+        )
+        .expect("the replay reports");
+        assert_eq!(report.settled, 0, "{report:?}");
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(
+            report.pending[0].reason.contains("wall clock"),
+            "{}",
+            report.pending[0].reason
+        );
+        let intents = prepared.pending_intents();
+        assert_eq!(intents.len(), 1, "the intent stays pending");
+        assert_eq!(
+            intents[0].phase,
+            IntentPhase::Removed,
+            "no settle was recorded"
+        );
+    }
+
+    #[test]
+    fn an_observation_that_consumes_the_clock_never_settles_a_removed_intent() {
+        let prepared = prepared("replay-observation-deadline");
+        let root = prepared.unit_path().clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        publish(&prepared, &[]);
+        rename_to_quarantine(&prepared);
+        std::fs::remove_dir_all(prepared.quarantine()).expect("the leaf is removed");
+        publish(
+            &prepared,
+            &[
+                IntentPhase::Renamed,
+                IntentPhase::MarkerLast,
+                IntentPhase::Removed,
+            ],
+        );
+        // The area folder is gone, so this replay's decision is the settle at the
+        // `removed` phase — but the observation that reveals the absence takes the
+        // rest of the caller's clock. The entry check passes and the post-
+        // observation check must refuse: nothing is settled on an overrun.
+        std::fs::remove_dir_all(&prepared.area).expect("the area folder is removed");
+        let faults = Faults::new();
+        // The walk observes the folder one component at a time, so the pause is on
+        // the first component: the absence is discovered after it.
+        let first_component = prepared
+            .declaration
+            .folder
+            .split('/')
+            .next()
+            .expect("a folder component")
+            .to_owned();
+        faults.sleeping_observation_prefix(&first_component, Duration::from_millis(2_300));
+        let facts = prepared.fixture.facts();
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let mut bounds = prepared.bounds();
+        bounds.deadline = Some(Instant::now() + Duration::from_secs(2));
+        let report = replay_with(
+            &prepared.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            bounds,
+            bounds.deadline,
         )
         .expect("the replay reports");
         assert_eq!(report.settled, 0, "{report:?}");
