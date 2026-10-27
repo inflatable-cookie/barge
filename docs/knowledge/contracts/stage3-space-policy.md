@@ -1351,3 +1351,13 @@ a reviewer may prefer. None blocks the design from being reviewed as a whole.
 7. **Is the `activity` record the right place for last-use?** Alternative:
    rewrite the root marker, which the frozen marker contract forbids, or rely on
    hold-file mtimes, which are not durable and disappear on release.
+
+### Implemented measurement surface
+
+The library's `os::SpaceFacts` reports checked `fstatfs` block counts with
+source, completion time and device provenance; `os::Flush` exposes the macOS
+whole-volume flush. `barge space` reads the registry and measures present
+registered volumes without creating files. Until registration gains space
+policy, its rows identify that policy as undeclared; an absent registered volume
+is reported as absent. Area attribution and policy decisions belong to their
+later slices.
