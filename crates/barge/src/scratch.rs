@@ -1687,7 +1687,7 @@ pub fn sweep(
         .with_detail("candidates", plan.candidates.count.into()));
     }
 
-    expire_plan(
+    Ok(expire_plan(
         state_paths,
         dirs,
         facts,
@@ -1697,7 +1697,9 @@ pub fn sweep(
         &plan,
         request.delete_bounds,
         request.now_ms,
-    )
+        None,
+    )?
+    .report)
 }
 
 /// Apply one `barge.scratch.plan/1` exactly as it stands, re-verifying each unit.
@@ -1715,6 +1717,14 @@ pub fn sweep(
 /// The digest recorded in the report and in each intent is the digest of the
 /// plan's own bytes, so the journal can always be re-derived from the plan the
 /// caller presented.
+///
+/// `deadline` is the caller's wall clock. When it is reached, no further effect
+/// starts: the intent replay is skipped, every planned candidate that was not
+/// attempted is reported in `skipped` with the wall-clock reason, and
+/// [`ExpireRun::timed_out`] says so even when the effect that pushed past it had
+/// already completed. An effect that was already running when the clock was
+/// reached is never lost from the accounting: it stays in `deleted` or `pending`,
+/// and only the candidates after it count as unreached.
 #[allow(clippy::too_many_arguments)]
 pub fn expire_plan(
     state_paths: &StatePaths,
@@ -1726,7 +1736,8 @@ pub fn expire_plan(
     plan: &SweepPlan,
     delete_bounds: DeleteBounds,
     now_ms: u64,
-) -> Result<ExpireReport> {
+    deadline: Option<Instant>,
+) -> Result<ExpireRun> {
     if plan.volume_uuid != record.volume_uuid {
         return Err(Error::new(
             ErrorKind::UnknownState,
@@ -1761,28 +1772,46 @@ pub fn expire_plan(
             })
             .collect();
         let total = skipped.len();
-        return Ok(ExpireReport {
-            volume_uuid: record.volume_uuid.as_str().to_owned(),
-            volume_present: false,
-            preview: false,
-            plan_digest: digest,
-            plan: plan.clone(),
-            deleted: RowSet::empty(),
-            pending: RowSet::empty(),
-            skipped: RowSet::bounded(skipped, total, ROOT_ROWS),
-            replay: None,
+        return Ok(ExpireRun {
+            report: ExpireReport {
+                volume_uuid: record.volume_uuid.as_str().to_owned(),
+                volume_present: false,
+                preview: false,
+                plan_digest: digest,
+                plan: plan.clone(),
+                deleted: RowSet::empty(),
+                pending: RowSet::empty(),
+                skipped: RowSet::bounded(skipped, total, ROOT_ROWS),
+                replay: None,
+            },
+            timed_out: false,
+            unreached: 0,
         });
     }
-
-    // A real run first settles what an earlier run left pending, from the
-    // recorded identity only, so the effects below are not blocked by work the
-    // run already knows how to finish. A preview never replays.
-    let replay = delete::replay_pending(state_paths, dirs, facts, mounts, observer, delete_bounds)?;
 
     let scratch = plan.folder.clone();
     let mut deleted: Vec<DeletedRow> = Vec::new();
     let mut pending: Vec<PendingRow> = Vec::new();
     let mut skipped: Vec<SkippedRow> = Vec::new();
+    let mut timed_out = false;
+    let mut unreached = 0usize;
+    // A real run first settles what an earlier run left pending, from the
+    // recorded identity only, so the effects below are not blocked by work the
+    // run already knows how to finish. A preview never replays, and a run whose
+    // clock is already spent starts no replay either.
+    let replay = if expired(deadline) {
+        timed_out = true;
+        None
+    } else {
+        Some(delete::replay_pending(
+            state_paths,
+            dirs,
+            facts,
+            mounts,
+            observer,
+            delete_bounds,
+        )?)
+    };
     let mut intent_seen = false;
     for row in plan.candidates.rows.iter() {
         if intent_seen {
@@ -1790,6 +1819,18 @@ pub fn expire_plan(
                 name: row.name.clone(),
                 scope: row.scope.clone(),
                 reason: "a pending intent stopped this sweep; a later run replays it".to_owned(),
+            });
+            continue;
+        }
+        // The caller's wall clock stops every further effect; what it did not
+        // reach is reported with counts rather than left out.
+        if timed_out || expired(deadline) {
+            timed_out = true;
+            unreached = unreached.saturating_add(1);
+            skipped.push(SkippedRow {
+                name: row.name.clone(),
+                scope: row.scope.clone(),
+                reason: WALL_CLOCK_REASON.to_owned(),
             });
             continue;
         }
@@ -1941,21 +1982,56 @@ pub fn expire_plan(
             }
             Err(error) => return Err(error),
         }
+        // An effect that finished past the caller's clock is still this run's
+        // work — it is in `deleted` or `pending` — but the run did not finish
+        // inside its bound, so it is a timeout and no later effect starts.
+        if expired(deadline) {
+            timed_out = true;
+        }
     }
     let deleted_total = deleted.len();
     let pending_total = pending.len();
     let skipped_total = skipped.len();
-    Ok(ExpireReport {
-        volume_uuid: record.volume_uuid.as_str().to_owned(),
-        volume_present: true,
-        preview: false,
-        plan_digest: digest,
-        plan: plan.clone(),
-        deleted: RowSet::bounded(deleted, deleted_total, ROOT_ROWS),
-        pending: RowSet::bounded(pending, pending_total, ROOT_ROWS),
-        skipped: RowSet::bounded(skipped, skipped_total, ROOT_ROWS),
-        replay: Some(replay),
+    Ok(ExpireRun {
+        report: ExpireReport {
+            volume_uuid: record.volume_uuid.as_str().to_owned(),
+            volume_present: true,
+            preview: false,
+            plan_digest: digest,
+            plan: plan.clone(),
+            deleted: RowSet::bounded(deleted, deleted_total, ROOT_ROWS),
+            pending: RowSet::bounded(pending, pending_total, ROOT_ROWS),
+            skipped: RowSet::bounded(skipped, skipped_total, ROOT_ROWS),
+            replay,
+        },
+        timed_out,
+        unreached,
     })
+}
+
+/// The reason one planned scratch unit was not attempted: the caller's wall
+/// clock was reached before its effect.
+const WALL_CLOCK_REASON: &str =
+    "the run's wall clock was reached before this effect, so the planned unit is kept";
+
+/// Whether a caller's deadline has been reached. `None` is no deadline.
+fn expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+/// What one application of a plan did, and what the caller's deadline left
+/// undone. `report` is S4's own document; the other two fields are the maintain
+/// run's accounting, so a stage that ran out of clock is never reported as a
+/// complete run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpireRun {
+    /// The `barge.scratch.expire/1` report for the stage.
+    pub report: ExpireReport,
+    /// Whether the caller's deadline was reached: before an effect (so it never
+    /// started), or while one was running (so the run overran its bound).
+    pub timed_out: bool,
+    /// How many planned candidates were never attempted because of it.
+    pub unreached: usize,
 }
 
 /// A refusal that concerns one unit and must not abort the sweep or a maintain
@@ -3602,9 +3678,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        alloc, conclude, declare_claim, declare_delegation, plan_digest, scratch_folder, sweep,
-        unmarked_provenance_digest_parts, AllocRequest, ConcludeRequest, MarkerReading,
-        SweepBounds, SweepPolicy, SweepRequest, UnitFamily, EFFIGY_AGE_SECONDS,
+        alloc, conclude, declare_claim, declare_delegation, expire_plan, plan_digest,
+        scratch_folder, sweep, unmarked_provenance_digest_parts, AllocRequest, ConcludeRequest,
+        MarkerReading, SweepBounds, SweepPolicy, SweepRequest, UnitFamily, EFFIGY_AGE_SECONDS,
         EFFIGY_KEEP_AGE_SECONDS, NATIVE_AGE_SECONDS, OXIDE_AGE_SECONDS,
     };
     use crate::area::{
@@ -4864,6 +4940,58 @@ mod tests {
             crate::state::IntentPhase::MarkerLast
         );
         assert!(report.pending.rows[0].reason.contains("not empty"));
+    }
+
+    #[test]
+    fn an_expire_plan_stage_starts_no_effect_once_its_deadline_is_reached() {
+        let harness = Harness::new("scratch-stage-deadline");
+        let root = harness.alloc("deadline", "owner");
+        harness.conclude(
+            &root,
+            "owner",
+            ConclusionOutcome::Closed,
+            ConclusionClosure::Positive,
+            KeptReason::Evidence,
+            NestedScope::Exclusive,
+        );
+        let days = NATIVE_AGE_SECONDS / (24 * 60 * 60) + 1;
+        let preview = harness.plan(days);
+        assert_eq!(preview.plan.candidates.count, 1);
+
+        let observer = harness.fixture.observer();
+        let facts = harness.fixture.facts();
+        let mounts = harness.fixture.mounts();
+        let platform = harness.fixture.platform();
+        // A caller whose clock is already spent: the replay never starts, the
+        // planned unit is never attempted, and every planned unit is reported.
+        let run = expire_plan(
+            &harness.fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &harness.fixture.record,
+            &preview.plan,
+            DeleteBounds {
+                retry_pause: std::time::Duration::ZERO,
+                ..DeleteBounds::default()
+            },
+            sweep_now(days, 0),
+            Some(std::time::Instant::now()),
+        )
+        .expect("the stage reports");
+        assert!(run.timed_out, "{run:?}");
+        assert_eq!(run.unreached, preview.plan.candidates.count);
+        assert_eq!(run.report.deleted.count, 0);
+        assert_eq!(run.report.pending.count, 0);
+        assert_eq!(run.report.skipped.count, 1);
+        assert!(
+            run.report.skipped.rows[0].reason.contains("wall clock"),
+            "{}",
+            run.report.skipped.rows[0].reason
+        );
+        assert!(run.report.replay.is_none(), "no replay starts either");
+        assert!(root.is_dir(), "the planned unit is kept");
     }
 
     #[test]

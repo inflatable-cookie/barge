@@ -950,6 +950,12 @@ fn run(
                     stage: "scratch".to_owned(),
                     candidates: step.plan.candidates.count,
                 });
+                fill_unreached_areas(
+                    &mut outcome,
+                    volume_plan,
+                    &mut unreached,
+                    "the run's wall clock was reached before this area",
+                );
                 volumes.push(outcome);
                 break 'volumes;
             }
@@ -962,7 +968,10 @@ fn run(
                 )
                 .with_detail("volume_uuid", volume_plan.volume_uuid.clone().into()));
             }
-            let report = match scratch::expire_plan(
+            // The run's deadline is passed into the stage, so every candidate's
+            // effect is gated by it: a stage with many units cannot outlive the
+            // run's bound and then be reported as a success.
+            let run = match scratch::expire_plan(
                 state_paths,
                 dirs,
                 facts,
@@ -972,8 +981,9 @@ fn run(
                 &step.plan,
                 request.delete_bounds,
                 request.now_ms,
+                Some(deadline),
             ) {
-                Ok(report) => report,
+                Ok(run) => run,
                 Err(error) => {
                     // Work may already have been done on an earlier volume, so
                     // this is never a "refused before any effect" refusal.
@@ -986,14 +996,37 @@ fn run(
                     break 'volumes;
                 }
             };
-            pending.extend(report.pending.rows.iter().cloned());
+            if run.timed_out {
+                timed_out = true;
+            }
+            if run.unreached > 0 {
+                unreached.push(UnreachedRow {
+                    volume_uuid: volume_plan.volume_uuid.clone(),
+                    stage: "scratch".to_owned(),
+                    candidates: run.unreached,
+                });
+            }
+            pending.extend(run.report.pending.rows.iter().cloned());
             outcome.scratch = Some(ScratchOutcome {
-                plan_digest: report.plan_digest,
-                deleted: report.deleted,
-                pending: report.pending,
-                skipped: report.skipped,
-                replay: report.replay,
+                plan_digest: run.report.plan_digest,
+                deleted: run.report.deleted,
+                pending: run.report.pending,
+                skipped: run.report.skipped,
+                replay: run.report.replay,
             });
+            if timed_out {
+                // No further effect may start. The areas of this volume the run
+                // did not reach are reported, with counts, and the other volumes
+                // are reported as unreached below.
+                fill_unreached_areas(
+                    &mut outcome,
+                    volume_plan,
+                    &mut unreached,
+                    "the run's wall clock was reached before this area",
+                );
+                volumes.push(outcome);
+                break 'volumes;
+            }
         }
 
         // A volume that went away between the plan and this run keeps every unit
@@ -1184,11 +1217,11 @@ fn run(
             {
                 continue;
             }
-            for stage in unreached_stages(volume_plan) {
+            for (stage, candidates) in unreached_stage_rows(volume_plan) {
                 unreached.push(UnreachedRow {
                     volume_uuid: volume_plan.volume_uuid.clone(),
                     stage,
-                    candidates: 0,
+                    candidates,
                 });
             }
         }
@@ -1211,16 +1244,48 @@ fn run(
     })
 }
 
-/// The stages of one volume plan, as an `unreached` row names them.
-fn unreached_stages(volume_plan: &VolumePlan) -> Vec<String> {
+/// The stages of one volume plan the run did not reach, with the candidate count
+/// each one would have attempted, so a stopped run reports counts and never
+/// presents the unfinished part as done.
+fn unreached_stage_rows(volume_plan: &VolumePlan) -> Vec<(String, usize)> {
     let mut stages = Vec::new();
-    if volume_plan.scratch.is_some() {
-        stages.push("scratch".to_owned());
+    if let Some(step) = &volume_plan.scratch {
+        stages.push(("scratch".to_owned(), step.plan.candidates.count));
     }
     for area_plan in &volume_plan.areas.rows {
-        stages.push(format!("area:{}/{}", area_plan.namespace, area_plan.area));
+        stages.push((
+            format!("area:{}/{}", area_plan.namespace, area_plan.area),
+            area_plan.candidates.count,
+        ));
     }
     stages
+}
+
+/// Report one volume's area stages as unreached: every planned unit is kept with
+/// the reason, and each stage's candidate count is recorded, so a run the wall
+/// clock stopped never presents the unfinished part as done.
+fn fill_unreached_areas(
+    outcome: &mut VolumeOutcome,
+    volume_plan: &VolumePlan,
+    unreached: &mut Vec<UnreachedRow>,
+    reason: &str,
+) {
+    for area_plan in &volume_plan.areas.rows {
+        if area_plan.candidates.count > 0 {
+            unreached.push(UnreachedRow {
+                volume_uuid: volume_plan.volume_uuid.clone(),
+                stage: format!("area:{}/{}", area_plan.namespace, area_plan.area),
+                candidates: area_plan.candidates.count,
+            });
+        }
+        outcome.areas.push(AreaPruneOutcome {
+            namespace: area_plan.namespace.clone(),
+            area: area_plan.area.clone(),
+            deleted: RowSet::empty(),
+            skipped: all_skipped(area_plan, reason),
+            pending: RowSet::empty(),
+        });
+    }
 }
 
 /// Report a whole volume's planned units as kept, with one reason: the plan is
@@ -1507,6 +1572,23 @@ mod tests {
             plan_bytes: Option<&'a [u8]>,
             now_ms: u64,
         ) -> MaintainRequest<'a> {
+            self.request_with_bounds(
+                preview,
+                plan_digest,
+                plan_bytes,
+                now_ms,
+                MaintainBounds::design(),
+            )
+        }
+
+        fn request_with_bounds<'a>(
+            &self,
+            preview: bool,
+            plan_digest: Option<&'a str>,
+            plan_bytes: Option<&'a [u8]>,
+            now_ms: u64,
+            maintain_bounds: MaintainBounds,
+        ) -> MaintainRequest<'a> {
             MaintainRequest {
                 preview,
                 plan_digest,
@@ -1516,7 +1598,7 @@ mod tests {
                     retry_pause: Duration::ZERO,
                     ..DeleteBounds::default()
                 },
-                maintain_bounds: MaintainBounds::design(),
+                maintain_bounds,
                 now_ms,
             }
         }
@@ -1555,6 +1637,31 @@ mod tests {
             preview: &MaintainReport,
         ) -> crate::error::Result<MaintainReport> {
             self.real_request(dirs, now_ms, &preview.plan_digest, &canonical(preview))
+        }
+
+        /// The real form with a caller's own wall clock, so a test can state a
+        /// run whose deadline is already spent or spent by one effect.
+        fn real_with_bounds(
+            &self,
+            dirs: &dyn crate::os::DirOps,
+            now_ms: u64,
+            preview: &MaintainReport,
+            maintain_bounds: MaintainBounds,
+        ) -> crate::error::Result<MaintainReport> {
+            maintain(
+                &self.fixture.state,
+                dirs,
+                &self.fixture.facts(),
+                &self.fixture.mounts(),
+                &self.fixture.observer(),
+                &self.request_with_bounds(
+                    false,
+                    Some(&preview.plan_digest),
+                    Some(&canonical(preview)),
+                    now_ms,
+                    maintain_bounds,
+                ),
+            )
         }
 
         fn real_with_facts(
@@ -2213,6 +2320,124 @@ mod tests {
             assert!(path.is_dir(), "a kept root survives the window");
         }
         assert_eq!(report.pending.count, 0);
+    }
+
+    #[test]
+    fn a_run_whose_wall_clock_is_spent_starts_no_effect() {
+        let harness = Harness::new("maintain-clock-spent");
+        let scratch_root = harness.scratch_root("alpha", "owner");
+        harness.conclude_and_release(&scratch_root, "owner");
+        let area_root = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        assert_eq!(preview.candidates, 2);
+
+        // A budget of zero means the deadline is already reached when the run
+        // starts: nothing is attempted, every planned stage and unit is reported,
+        // and the run is a timeout rather than a success.
+        let report = harness
+            .real_with_bounds(
+                &harness.fixture.platform(),
+                harness.aged(),
+                &preview,
+                MaintainBounds {
+                    wall: Duration::ZERO,
+                    stop_margin: Duration::ZERO,
+                },
+            )
+            .expect("the run reports its timeout");
+        assert!(report.timed_out, "{report:?}");
+        assert!(report.needs_human());
+        assert_eq!(report.pending.count, 0);
+        let volume = &report.volumes.rows[0];
+        assert!(volume.scratch.is_none(), "no scratch effect started");
+        assert_eq!(volume.areas[0].deleted.count, 0);
+        assert_eq!(volume.areas[0].skipped.count, 1);
+        assert!(
+            volume.areas[0].skipped.rows[0]
+                .reason
+                .contains("wall clock"),
+            "{}",
+            volume.areas[0].skipped.rows[0].reason
+        );
+        // Every stage the clock stopped is named with its candidate count.
+        assert_eq!(report.unreached.count, 2, "{:?}", report.unreached.rows);
+        let stages: Vec<&str> = report
+            .unreached
+            .rows
+            .iter()
+            .map(|row| row.stage.as_str())
+            .collect();
+        assert!(stages.contains(&"scratch"), "{stages:?}");
+        assert!(
+            stages.iter().any(|stage| stage.starts_with("area:")),
+            "{stages:?}"
+        );
+        assert!(scratch_root.is_dir() && area_root.path.is_dir());
+    }
+
+    #[test]
+    fn a_deletion_that_finishes_past_the_clock_is_reported_as_the_run_s_timeout() {
+        let harness = Harness::new("maintain-clock-in-flight");
+        let first = harness.scratch_root("alpha", "owner");
+        harness.conclude_and_release(&first, "owner");
+        let second = harness.scratch_root("beta", "owner");
+        harness.conclude_and_release(&second, "owner");
+        let preview = harness.preview();
+        let stage = preview.plan.volumes.rows[0]
+            .scratch
+            .as_ref()
+            .expect("a scratch stage");
+        assert_eq!(stage.plan.candidates.count, 2);
+
+        // The first unit's effect outlives the run's two-second clock: it is still
+        // this run's work, and the unit after it is never attempted.
+        let names = [first.clone(), second.clone()];
+        let slept = std::cell::Cell::new(false);
+        let faults = Faults::new();
+        faults.observing(Box::new(move |name: &str| {
+            if slept.get() {
+                return;
+            }
+            if names
+                .iter()
+                .any(|path| path.file_name().and_then(|part| part.to_str()) == Some(name))
+            {
+                slept.set(true);
+                std::thread::sleep(Duration::from_millis(2_300));
+            }
+        }));
+        let report = harness
+            .real_with_bounds(
+                &faults,
+                harness.aged(),
+                &preview,
+                MaintainBounds {
+                    wall: Duration::from_secs(2),
+                    stop_margin: Duration::ZERO,
+                },
+            )
+            .expect("the run reports its timeout");
+        assert!(report.timed_out, "{report:?}");
+        assert!(report.needs_human());
+        let scratch_stage = report.volumes.rows[0]
+            .scratch
+            .as_ref()
+            .expect("the scratch stage ran");
+        assert_eq!(scratch_stage.deleted.count, 1, "{scratch_stage:?}");
+        assert_eq!(scratch_stage.skipped.count, 1);
+        assert!(
+            scratch_stage.skipped.rows[0].reason.contains("wall clock"),
+            "{}",
+            scratch_stage.skipped.rows[0].reason
+        );
+        assert_eq!(report.unreached.count, 1);
+        assert_eq!(report.unreached.rows[0].stage, "scratch");
+        assert_eq!(report.unreached.rows[0].candidates, 1);
+        // The effect that ran is accounted for, and the one that never started is
+        // still there.
+        let exists = [first.exists(), second.exists()];
+        assert_eq!(exists.iter().filter(|present| !**present).count(), 1);
+        assert_eq!(exists.iter().filter(|present| **present).count(), 1);
     }
 
     #[test]
