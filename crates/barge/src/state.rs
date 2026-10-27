@@ -1842,6 +1842,15 @@ pub fn read_intent(state: &StatePaths, intent_id: &str) -> Result<IntentRecord> 
     // current record as itself, and an unknown major refuses rather than being
     // guessed at. Both shapes deny an unknown field, so a document whose fields
     // do not match its major is refused too.
+    // The document is parsed twice, and the second parse is the one that decides:
+    // the first reads only the major, because it decides which field set is the
+    // document's. The record itself is then deserialized **from the original
+    // bytes**, never from the first parse's value: `serde_json::Value` keeps the
+    // last of two identical members, and a reader that reused it would let a
+    // duplicate `foreign_captures` (or `schema`, or any nested field) erase the
+    // evidence the earlier member recorded. The version-specific structs deny
+    // unknown fields and refuse a repeated one, so a duplicated member is an
+    // unreadable record rather than an ambiguous one.
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
         Error::new(
             ErrorKind::UnknownState,
@@ -1877,9 +1886,9 @@ pub fn read_intent(state: &StatePaths, intent_id: &str) -> Result<IntentRecord> 
     };
     let record = match schema.as_str() {
         crate::contract::INTENT_SCHEMA => {
-            serde_json::from_value::<IntentRecord>(value).map_err(parse)?
+            serde_json::from_slice::<IntentRecord>(&bytes).map_err(parse)?
         }
-        crate::contract::INTENT_SCHEMA_V1 => serde_json::from_value::<IntentV1>(value)
+        crate::contract::INTENT_SCHEMA_V1 => serde_json::from_slice::<IntentV1>(&bytes)
             .map_err(parse)?
             .upgrade()?,
         other => {
@@ -2627,6 +2636,78 @@ mod intent_tests {
             error.to_string().contains("barge.intent/3"),
             "the refusal names the major: {error}"
         );
+    }
+
+    #[test]
+    fn a_v2_record_with_a_duplicate_field_is_refused() {
+        // A JSON object with two identical members is ambiguous: a reader that kept
+        // the last one would erase the foreign-capture evidence the first member
+        // recorded, or resolve a duplicated schema/unit to one shape. The strict
+        // record refuses it instead.
+        let (_dir, state, uuid) = fixture("intent-duplicate-v2");
+        let intent_id = format!("{:032x}", 12);
+        let path = super::intent_path(&state, &intent_id).expect("the path");
+        let mut intent = record(&uuid);
+        intent.foreign_captures = vec![leftover("payload.txt", 1)];
+        let text =
+            String::from_utf8(serde_json::to_vec_pretty(&intent).expect("the record encodes"))
+                .expect("the record is text");
+        assert!(
+            text.contains("foreign_captures"),
+            "the record carries the evidence"
+        );
+        let unit = serde_json::to_string(&intent.unit).expect("the unit encodes");
+        let cases = [
+            (
+                "the foreign evidence and then an empty list",
+                crate::testkit::append_json_member(&text, "\"foreign_captures\":[]"),
+            ),
+            (
+                "the schema twice",
+                crate::testkit::append_json_member(&text, "\"schema\":\"barge.intent/1\""),
+            ),
+            (
+                "the unit twice",
+                crate::testkit::append_json_member(&text, &format!("\"unit\":{unit}")),
+            ),
+        ];
+        for (label, document) in cases {
+            std::fs::write(&path, document).expect("the record is written");
+            let error = read_intent(&state, &intent_id).expect_err(label);
+            assert_eq!(error.kind(), ErrorKind::UnknownState, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_v1_record_with_a_duplicate_field_is_refused() {
+        let (_dir, state, uuid) = fixture("intent-duplicate-v1");
+        let intent_id = format!("{:032x}", 13);
+        let path = super::intent_path(&state, &intent_id).expect("the path");
+        let value = v1_value(&uuid, &intent_id);
+        let text =
+            String::from_utf8(serde_json::to_vec_pretty(&value).expect("the record encodes"))
+                .expect("the record is text");
+        let cases = [
+            (
+                "the root id twice",
+                crate::testkit::append_json_member(
+                    &text,
+                    "\"root_id\":\"0000000000000000000000000000000f\"",
+                ),
+            ),
+            (
+                "the marker digest twice",
+                crate::testkit::append_json_member(
+                    &text,
+                    &format!("\"marker_digest\":\"{}\"", "b".repeat(64)),
+                ),
+            ),
+        ];
+        for (label, document) in cases {
+            std::fs::write(&path, document).expect("the record is written");
+            let error = read_intent(&state, &intent_id).expect_err(label);
+            assert_eq!(error.kind(), ErrorKind::UnknownState, "{label}");
+        }
     }
 
     fn leftover(original: &str, nonce: u8) -> ForeignCapture {

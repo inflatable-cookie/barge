@@ -1698,7 +1698,12 @@ Choices S5 made where this design left the mechanic to the slice:
   only shape v1 could describe - and the next publish writes v2. A reader
   refuses an unknown major, and refuses a document whose fields do not match its
   major (both shapes deny unknown fields), so a v1 record cannot be read as v2
-  or the reverse. `captures` is the
+  or the reverse. The document is parsed twice - once for its major, and then
+  **from its own bytes** into that major's struct - so a repeated JSON member
+  (`schema`, `foreign_captures`, `unit`, or any nested field) is refused as
+  unknown state rather than silently resolved to its last value; a reader that
+  reused the first parse's value would let a duplicate `foreign_captures` erase
+  the recorded mismatch evidence a replay depends on. `captures` is the
   in-flight chain of recorded captures - at most twenty, one per depth level plus
   headroom, and never more than the record's 4 KiB cap allows - and
   each entry carries the private name, the original name, the device, inode and

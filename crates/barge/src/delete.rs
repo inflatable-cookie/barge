@@ -6633,6 +6633,70 @@ mod tests {
     }
 
     #[test]
+    fn a_replay_refuses_an_intent_whose_foreign_capture_evidence_is_duplicated() {
+        // The reviewer's erasure case: a journal with the recorded mismatch first
+        // and an empty `foreign_captures` second. A reader that kept the last member
+        // would drop the evidence and resume the intent, walking the put-back
+        // foreign object as an ordinary entry. The journal is refused instead, and
+        // nothing is unlinked.
+        let prepared = prepared("replay-duplicate-foreign");
+        plant_unit_contents(&prepared);
+        let foreign = b"the racer's object".to_vec();
+        let faults = Faults::new();
+        faults.racing(
+            &prepared.parent_path(),
+            "payload.txt",
+            2,
+            Replacement::File(foreign.clone()),
+        );
+        let report = prepared.delete(&faults, &prepared.fixture.facts());
+        assert!(report.is_pending(), "{report:?}");
+        let leaf = report.quarantine.clone();
+        assert_eq!(
+            std::fs::read(leaf.join("payload.txt")).expect("the put-back object is there"),
+            foreign
+        );
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].foreign_captures.len(),
+            1,
+            "the mismatch is recorded before the put-back"
+        );
+
+        let path = state::intent_path(&prepared.fixture.state, &pending[0].intent_id)
+            .expect("the intent path");
+        let text = std::fs::read_to_string(&path).expect("the intent reads");
+        std::fs::write(
+            &path,
+            crate::testkit::append_json_member(&text, "\"foreign_captures\":[]"),
+        )
+        .expect("the altered journal is written");
+
+        let error = replay_with(
+            &prepared.fixture.state,
+            &Faults::new(),
+            &prepared.fixture.facts(),
+            &prepared.fixture.mounts(),
+            &prepared.fixture.observer(),
+            prepared.bounds(),
+        )
+        .expect_err("an ambiguous journal is refused");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert_eq!(
+            std::fs::read(leaf.join("payload.txt"))
+                .expect("the replay never unlinks the put-back foreign object"),
+            foreign
+        );
+        // The journal itself is untouched, so an operator still has the evidence.
+        let after = std::fs::read_to_string(&path).expect("the intent still reads");
+        assert!(
+            after.contains("foreign_captures"),
+            "the refused read changed nothing"
+        );
+    }
+
+    #[test]
     fn a_v1_intent_from_main_replays_as_a_barge_marked_directory_unit() {
         // `barge.intent/1` recorded a Barge root and nothing else. It stays
         // readable, maps to a Barge-marked directory unit, and a replay completes
