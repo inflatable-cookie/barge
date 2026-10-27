@@ -2391,14 +2391,18 @@ Choices S7 made where this design left the mechanic to the slice:
   stage's `skipped` rows with the error, and nothing after it is attempted.
 - **The wall clock.** 600 s, with no new effect starting inside the last 30 s.
   The deadline is carried into every stage the run performs, including S4's
-  scratch stage: `scratch::expire_plan` checks it before the intent replay and
-  before each planned unit's effect, so a stage with many units cannot outlive
-  the run's bound and then be reported as a success. Reaching it sets `timed_out`,
+  scratch stage and every replay path inside it: `scratch::expire_plan` checks it
+  before the intent replay and before each planned unit's effect, and
+  `delete::replay_pending` stops starting intent replays at it and reports each
+  intent it did not reach as still pending with the wall-clock reason. So neither
+  a stage with many units nor a long journal of earlier intents can outlive the
+  run's bound and then be reported as a success. Reaching it sets `timed_out`,
   reports every stage and candidate the run did not reach with counts, and forces
-  exit `3`. A deletion that was already running when the clock was reached is not
-  counted as unreached: it stays in `deleted` or `pending`, the run is still a
-  timeout, and only the units after it are reported as unreached. A timeout is
-  never success.
+  exit `3` — including when the plan had no candidate at all and only a replay
+  consumed the clock. A deletion that was already running when the clock was
+  reached is not counted as unreached: it stays in `deleted` or `pending`, the run
+  is still a timeout, and only the units after it are reported as unreached. A
+  timeout is never success.
 - **Area prune mechanics.** A step exists only for a declaration whose policy is
   `oldest-idle:<seconds>`; a candidate is an owned root (`barge.root/1`, any kind)
   with no live or undecidable hold and last activity — its own directory mtime or

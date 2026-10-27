@@ -1810,8 +1810,15 @@ pub fn expire_plan(
             mounts,
             observer,
             delete_bounds,
+            deadline,
         )?)
     };
+    // A replay that ran to the caller's clock — or a stage reached with an empty
+    // candidate list — is still a timeout: the run overran its bound and must
+    // never be reported as a success, and no later effect starts.
+    if expired(deadline) {
+        timed_out = true;
+    }
     let mut intent_seen = false;
     for row in plan.candidates.rows.iter() {
         if intent_seen {
@@ -4995,6 +5002,45 @@ mod tests {
     }
 
     #[test]
+    fn an_expire_plan_stage_with_no_candidates_reports_a_spent_clock() {
+        let harness = Harness::new("scratch-stage-deadline-empty");
+        // A run that is not old enough to be eligible: the plan has no candidate
+        // at all, which is the shape that must still report a timeout.
+        let _root = harness.alloc("fresh", "owner");
+        let preview = harness.plan(0);
+        assert_eq!(preview.plan.candidates.count, 0);
+
+        let observer = harness.fixture.observer();
+        let facts = harness.fixture.facts();
+        let mounts = harness.fixture.mounts();
+        let platform = harness.fixture.platform();
+        let run = expire_plan(
+            &harness.fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &harness.fixture.record,
+            &preview.plan,
+            DeleteBounds {
+                retry_pause: std::time::Duration::ZERO,
+                ..DeleteBounds::default()
+            },
+            sweep_now(0, 0),
+            Some(std::time::Instant::now()),
+        )
+        .expect("the stage reports");
+        assert!(run.timed_out, "an empty plan must not hide a spent clock");
+        assert_eq!(run.unreached, 0);
+        assert_eq!(run.report.deleted.count, 0);
+        assert_eq!(run.report.pending.count, 0);
+        assert!(
+            run.report.replay.is_none(),
+            "no replay starts on a spent clock"
+        );
+    }
+
+    #[test]
     fn a_permanent_volume_that_is_absent_refuses_and_writes_nothing() {
         let harness = Harness::new("scratch-volume-absent");
         let facts = harness.fixture.facts();
@@ -6585,6 +6631,7 @@ mod tests {
                     retry_pause: std::time::Duration::ZERO,
                     ..DeleteBounds::default()
                 },
+                None,
             )
             .expect("the replay reports");
             assert!(

@@ -2484,6 +2484,7 @@ pub fn replay_pending(
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
     bounds: DeleteBounds,
+    deadline: Option<Instant>,
 ) -> Result<ReplayReport> {
     let intents = state::read_intents(state_paths, INTENT_ROWS)?;
     let mut report = ReplayReport {
@@ -2502,6 +2503,19 @@ pub fn replay_pending(
     state_paths.initialize()?;
 
     for intent in pending {
+        // A caller's wall clock governs the replay too: once it is reached no
+        // further intent is replayed, and each one the run did not reach is
+        // reported as still pending rather than left out of the accounting.
+        if expired(deadline) {
+            report.pending.push(PendingRow {
+                intent_id: intent.intent_id.clone(),
+                unit_name: intent.unit.name.clone(),
+                unit_kind: intent.unit.kind.as_str().to_owned(),
+                phase: intent.phase,
+                reason: WALL_CLOCK_REASON.to_owned(),
+            });
+            continue;
+        }
         let Some(record) = registry.volume(&intent.volume_uuid).cloned() else {
             report.pending.push(PendingRow {
                 intent_id: intent.intent_id.clone(),
@@ -2547,6 +2561,16 @@ pub fn replay_pending(
         }
     }
     Ok(report)
+}
+
+/// Why one pending intent was not replayed: the caller's wall clock was reached
+/// before it, so it stays pending for a later run.
+const WALL_CLOCK_REASON: &str =
+    "the run's wall clock was reached before this intent was replayed, so it stays pending";
+
+/// Whether a caller's deadline has been reached. `None` is no deadline.
+fn expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
 
 /// What one replay decided.
@@ -3026,7 +3050,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         delete_unit_on_volume, replay_pending, DeleteBounds, DeleteOutcome, ReplayReport,
@@ -3324,6 +3348,7 @@ mod tests {
                 &mounts,
                 &observer,
                 self.bounds(),
+                None,
             )
             .expect("the replay reports")
         }
@@ -3481,8 +3506,9 @@ mod tests {
         mounts: &crate::testkit::FakeMounts,
         observer: &dyn ProcessObserver,
         bounds: DeleteBounds,
+        deadline: Option<Instant>,
     ) -> crate::error::Result<ReplayReport> {
-        replay_pending(state_paths, dirs, facts, mounts, observer, bounds)
+        replay_pending(state_paths, dirs, facts, mounts, observer, bounds, deadline)
     }
 
     /// Record one capture on the prepared intent, after its phases are published.
@@ -3752,6 +3778,48 @@ mod tests {
         );
         assert!(report.quarantine.join("payload.txt").is_file());
         assert!(report.quarantine.join(ROOT_MARKER_FILE).is_file());
+    }
+
+    #[test]
+    fn replay_stops_at_the_caller_s_deadline_and_leaves_the_intent_pending() {
+        let prepared = prepared("replay-deadline");
+        let root = prepared.unit_path().clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        publish(&prepared, &[]);
+
+        // A caller whose clock is already spent starts no replay: the intent is
+        // reported as still pending with the wall-clock reason, and nothing is
+        // rolled back, resumed or removed.
+        let faults = Faults::new();
+        let facts = prepared.fixture.facts();
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let report = replay_with(
+            &prepared.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            prepared.bounds(),
+            Some(Instant::now()),
+        )
+        .expect("the replay reports");
+        assert_eq!(report.examined, 1, "{report:?}");
+        assert_eq!(report.settled, 0);
+        assert_eq!(report.rolled_back, 0);
+        assert_eq!(report.resumed, 0);
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(
+            report.pending[0].reason.contains("wall clock"),
+            "{}",
+            report.pending[0].reason
+        );
+        assert!(root.join("payload.txt").is_file(), "nothing was touched");
+        assert_eq!(
+            prepared.pending_intents().len(),
+            1,
+            "the intent stays pending for a later run"
+        );
     }
 
     #[test]
@@ -4730,6 +4798,7 @@ mod tests {
             &mounts,
             &observer,
             prepared.bounds(),
+            None,
         )
         .expect("the replay reports");
         assert_eq!(replay.settled, 0, "{replay:?}");
@@ -4832,6 +4901,7 @@ mod tests {
             &mounts,
             &observer,
             prepared.bounds(),
+            None,
         )
         .expect("the replay reports");
         assert_eq!(replay.settled, 0, "{replay:?}");
@@ -4927,6 +4997,7 @@ mod tests {
             &mounts,
             &observer,
             prepared.bounds(),
+            None,
         )
         .expect("the replay reports");
         assert_eq!(replay.resumed, 0, "{replay:?}");
@@ -6675,6 +6746,7 @@ mod tests {
             &prepared.fixture.mounts(),
             &prepared.fixture.observer(),
             prepared.bounds(),
+            None,
         )
         .expect("the replay reports");
         assert_eq!(replay.settled, 0, "{replay:?}");
@@ -6830,6 +6902,7 @@ mod tests {
             &prepared.fixture.mounts(),
             &prepared.fixture.observer(),
             prepared.bounds(),
+            None,
         )
         .expect_err("an ambiguous journal is refused");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
@@ -6938,6 +7011,7 @@ mod tests {
             &mounts,
             &observer,
             prepared.bounds(),
+            None,
         )
         .expect_err("an unknown intent major refuses");
         assert_eq!(error.kind(), ErrorKind::UnknownState);

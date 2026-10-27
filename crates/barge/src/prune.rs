@@ -2441,6 +2441,65 @@ mod tests {
     }
 
     #[test]
+    fn a_replay_that_consumes_the_clock_is_a_timeout_even_with_no_candidates() {
+        let harness = Harness::new("maintain-clock-replay");
+        let root = harness.scratch_root("alpha", "owner");
+        harness.conclude_and_release(&root, "owner");
+        let first = harness.preview();
+        assert_eq!(first.candidates, 1);
+
+        // A real run that stops on its leaf capture leaves a pending intent; the
+        // unit's visible name is gone, so the next plan has no candidate at all.
+        let mut capture_faults = Faults::new();
+        capture_faults.failing_remove_prefix(state::CAPTURE_PREFIX, 3);
+        let stopped = harness
+            .real_with(&capture_faults, harness.aged(), &first)
+            .expect("the run reports");
+        assert!(stopped.needs_human());
+        let second = harness.preview();
+        assert_eq!(
+            second.candidates, 0,
+            "the stopped unit is a quarantine leaf"
+        );
+
+        // The next run's replay outlives a two-second clock. There is no
+        // candidate to delete, so a run that reported success here would be
+        // reporting an overrun as success; it must be a timeout.
+        let slept = std::cell::Cell::new(false);
+        let faults = Faults::new();
+        faults.observing(Box::new(move |_name: &str| {
+            if slept.get() {
+                return;
+            }
+            slept.set(true);
+            std::thread::sleep(Duration::from_millis(2_300));
+        }));
+        let report = harness
+            .real_with_bounds(
+                &faults,
+                harness.aged(),
+                &second,
+                MaintainBounds {
+                    wall: Duration::from_secs(2),
+                    stop_margin: Duration::ZERO,
+                },
+            )
+            .expect("the run reports its timeout");
+        assert!(report.timed_out, "{report:?}");
+        assert!(report.needs_human(), "an overrun is never success");
+        assert_eq!(report.candidates, 0);
+        assert_eq!(report.unreached.count, 0, "nothing was planned");
+        let stage = report.volumes.rows[0]
+            .scratch
+            .as_ref()
+            .expect("the scratch stage ran");
+        assert!(
+            stage.replay.is_some(),
+            "the replay started before the clock was reached"
+        );
+    }
+
+    #[test]
     fn a_pending_intent_makes_the_run_need_a_human() {
         let harness = Harness::new("maintain-pending");
         let root = harness.create_root(RootKind::AreaRoot);
