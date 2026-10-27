@@ -57,7 +57,8 @@ use crate::digest::sha256_hex;
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
     AccountFacts, DescriptorScan, DescriptorScanRequest, DeviceId, DirHandle, DirOps, EntryFacts,
-    EntryKind, MountRoot, ProcessObserver, RemoveKind, SelfExclusion, VolumeFacts, VolumeUuid,
+    EntryKind, MountRoot, ProcessObserver, RemoveKind, RenameOutcome, SelfExclusion, VolumeFacts,
+    VolumeUuid,
 };
 use crate::registry::VolumeRecord;
 use crate::state::{self, Bounds, Deadline, LockSet, ReadOutcome, StatePaths, READ_DEADLINE};
@@ -2033,7 +2034,19 @@ fn publish_link(dirs: &dyn DirOps, original: &Path, target: &Path) -> Result<()>
     }
     let temporary = format!(".{name}.barge-link-{}", hex_encode(&dirs.random_bytes(8)?));
     dirs.create_child_symlink(&parent, &temporary, target)?;
-    if let Err(error) = dirs.rename_child(&parent, &temporary, &name) {
+    let publication = match dirs.rename_child(&parent, &temporary, &name) {
+        Ok(RenameOutcome::Renamed) => Ok(()),
+        Ok(RenameOutcome::TargetExists) => Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "{} appeared before link publication; nothing was replaced",
+                original.display()
+            ),
+        )
+        .with_detail("path", original.display().to_string().into())),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = publication {
         let _ = dirs.remove_child(&parent, &temporary, RemoveKind::File);
         return Err(error);
     }
@@ -3597,6 +3610,26 @@ mod tests {
         plan.plan = true;
         assert!(fixture.adopt(&plan).is_err());
         assert_eq!(tree(&original), before);
+    }
+
+    #[test]
+    fn a_matching_link_that_races_publication_is_refused_and_kept() {
+        let fixture = TempDir::new("cache-link-publication-race");
+        let original = fixture.join("original");
+        let target = fixture.write("payload", b"cache data");
+        let dirs = crate::testkit::Faults::new();
+        *dirs.occupy_link_path.borrow_mut() = Some((original.clone(), target.clone()));
+        let error = super::publish_link(&dirs, &original, &target).expect_err(
+            "an existing target is never a successful publication, even with matching text",
+        );
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        assert_eq!(std::fs::read_link(&original).unwrap(), target);
+        assert_eq!(std::fs::read(&target).unwrap(), b"cache data");
+        assert_eq!(
+            std::fs::read_dir(fixture.path()).unwrap().count(),
+            2,
+            "only the racer link and payload remain"
+        );
     }
 
     #[test]

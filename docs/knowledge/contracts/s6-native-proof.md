@@ -176,7 +176,9 @@ The script always writes `$OXIDE_PROOF_EVIDENCE/s6-cache-placement-receipt.json`
   `<kind> <uid> <descriptors> <vnodes> <identity-fd> <identity-vnode>`, and the
   supervisor row names the session and pin it re-checked. `censuses` retains
   each full census's case, result, process/descriptor/foreign/open counts,
-  observer pid/start/effective uid and product retry evidence. Failures retain
+  observer pid/start/effective uid, product retry evidence and `os_blind_spot`.
+  The latter preserves every named platform blind spot from a complete scan;
+  incomplete scans report `null` rather than inventing an empty record. Failures retain
   the product reason and any retried pid/command/errno sequence; unavailable
   counts remain `null`.
   `census_bounds` names the fixed bounds. A counted receipt additionally needs
@@ -236,6 +238,9 @@ invocation refuses if those bytes have changed.
   listings and vnode paths. It incorporates merged barge#012's bounded
   identity re-observation of listing `EPERM`: a later positive observation may
   settle the answer, but persistent unreadable same-uid evidence still refuses.
+  The current product's [platform blind-spot policy](stage1-design.md#writer-custody-and-safe-deletion)
+  applies unchanged, and the census preserves its `os_blind_spot` counts and
+  full records. It does not reclassify processes or hide that evidence.
   No second implementation of that policy remains in Python.
   Bounds are unchanged: 8192 table rows, 4096 same-uid processes, 4096
   descriptors per process (a full buffer refuses), 65,536 total descriptors
@@ -376,6 +381,16 @@ including the merged #012 policy, to remove that implementation/context gap.
 Unreadability still aborts as infrastructure before cases. A fresh diagnostic
 requires independent exact-head review and a separate owner activation; this
 source revision runs none.
+
+### Infrastructure observation at 6b9f9ac
+
+The accepted independent source review at
+`6b9f9ac141c4d6e931a654518146b129592a4e51` reported a read-only fixture-root
+census returning `status: infrastructure` on unreadable pid 69326. The probe
+directory and real npm/bun/Cargo placements were unchanged. That was a census
+observation, not an activated diagnostic or counted native, and there was no
+`barge.s6.native/1` receipt at that head. It remains historical infrastructure
+evidence, without a claim about the rebased observer or future proof.
 
 ## Activation order
 

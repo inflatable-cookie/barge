@@ -1192,9 +1192,12 @@ fn fabricated_receipt(
         } else {
             "infrastructure"
         };
-        preflight.push_str(&format!(
-            "{case}\tfull-census\t{{\"status\":\"{status}\",\"processes\":2,\"descriptors\":5}}\n"
-        ));
+        let census = serde_json::json!({
+            "status": status, "processes": 2, "descriptors": 5,
+            "os_blind_spot": {"processes": 1, "opaque_descriptors": 2,
+                "records": [{"pid": 43, "start": 321, "command": "platform-fixture", "opaque_descriptors": 2}]}
+        });
+        preflight.push_str(&format!("{case}\tfull-census\t{census}\n"));
     }
     std::fs::write(root.join("preflight.tsv"), preflight)
         .expect("the fabricated preflight observations are written");
@@ -1265,6 +1268,12 @@ fn the_receipt_folds_the_premise_trace_against_case_results() {
         .as_array()
         .expect("censuses retained");
     assert_eq!(censuses.len(), 9);
+    assert!(
+        censuses
+            .iter()
+            .all(|row| row["os_blind_spot"]["records"][0]["pid"] == 43),
+        "the receipt preserves the product's named blind spots, not just its pass status"
+    );
     assert!(censuses
         .iter()
         .all(|row| row["status"] == "passed" && row["processes"] == 2));

@@ -453,6 +453,9 @@ pub type ModeProbe = Box<dyn Fn(u32) -> bool>;
 #[derive(Default)]
 pub struct Faults {
     inner: MacOs,
+    /// A fixture link a racer publishes after the temporary link is created,
+    /// before the caller attempts its exclusive rename.
+    pub occupy_link_path: RefCell<Option<(PathBuf, PathBuf)>>,
     /// A name whose facts report another owner.
     pub foreign_uid_name: Option<String>,
     /// A name whose facts report another device.
@@ -1167,7 +1170,12 @@ impl DirOps for Faults {
     }
 
     fn create_child_symlink(&self, parent: &DirHandle, name: &str, target: &Path) -> Result<()> {
-        self.inner.create_child_symlink(parent, name, target)
+        self.inner.create_child_symlink(parent, name, target)?;
+        if let Some((path, text)) = self.occupy_link_path.borrow_mut().take() {
+            std::os::unix::fs::symlink(text, path)
+                .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn read_link(&self, path: &Path) -> Result<Option<PathBuf>> {

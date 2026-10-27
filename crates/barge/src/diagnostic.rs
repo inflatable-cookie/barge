@@ -7,7 +7,8 @@ use serde::Serialize;
 use crate::custody::{SCAN_DESCRIPTORS, SCAN_PROCESSES, SCAN_TIMEOUT};
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
-    DescriptorScan, DescriptorScanRequest, DirOps, ProcessObserver, RetryEvidence, SelfExclusion,
+    BlindSpotEvidence, DescriptorScan, DescriptorScanRequest, DirOps, ProcessObserver,
+    RetryEvidence, SelfExclusion,
 };
 
 /// The result of observing descriptor capability, not an idleness verdict.
@@ -52,13 +53,18 @@ pub struct DescriptorCensus {
     pub problem: Option<String>,
     /// The unchanged bounded re-observation evidence from the product scan.
     pub retry: RetryEvidence,
+    /// Platform-verified opaque descriptors, when supplied by a complete scan.
+    /// Incomplete scans do not supply this evidence and report `null`.
+    pub os_blind_spot: Option<BlindSpotEvidence>,
 }
 
 /// Observe the full same-uid descriptor set with the exact custody observer.
 ///
 /// This takes no locks, registers nothing and writes nothing. Foreign effective
 /// uids and positively exited processes follow the product policy. An unreadable
-/// same-uid listing or vnode path, or any bound, is infrastructure. A completed
+/// same-uid listing or unexplained vnode path, or any bound, is infrastructure.
+/// Verified platform blind spots follow the product policy and stay visible.
+/// A completed
 /// observation can report open descriptors: it is never a `Safe` custody value.
 pub fn descriptor_census(
     dirs: &dyn DirOps,
@@ -107,6 +113,7 @@ pub fn descriptor_census(
         open: None,
         problem: None,
         retry: RetryEvidence::default(),
+        os_blind_spot: None,
     };
     match scan {
         DescriptorScan::Complete {
@@ -115,6 +122,7 @@ pub fn descriptor_census(
             foreign,
             retry,
             open,
+            os_blind_spot,
         } => {
             report.status = CensusStatus::Passed;
             report.processes = Some(processes);
@@ -122,6 +130,7 @@ pub fn descriptor_census(
             report.foreign = Some(foreign);
             report.open = Some(open.len());
             report.retry = retry;
+            report.os_blind_spot = Some(os_blind_spot);
         }
         DescriptorScan::Bounded {
             processes,
@@ -164,6 +173,12 @@ mod tests {
         fn process_start(&self, pid: u32) -> Result<Option<u64>> {
             assert_eq!(pid, std::process::id());
             Ok(Some(123))
+        }
+        fn verify_platform_binary(
+            &self,
+            _: crate::os::ProcessIdentity,
+        ) -> Result<crate::os::PlatformStatus> {
+            panic!("the diagnostic must delegate platform classification to the product observer")
         }
         fn scan_open_descriptors(
             &self,
@@ -211,6 +226,16 @@ mod tests {
                 descriptors: 5,
                 foreign: 3,
                 retry: retry.clone(),
+                os_blind_spot: BlindSpotEvidence {
+                    processes: 1,
+                    opaque_descriptors: 2,
+                    records: vec![crate::os::PlatformBlindSpot {
+                        pid: 43,
+                        start: 321,
+                        command: "platform-fixture".into(),
+                        opaque_descriptors: 2,
+                    }],
+                },
                 open: vec![],
             }),
             fixture.path(),
@@ -221,6 +246,12 @@ mod tests {
         assert_eq!(report.processes, Some(2));
         assert_eq!(report.descriptors, Some(5));
         assert_eq!(report.retry, retry);
+        let blind_spot = report.os_blind_spot.as_ref().unwrap();
+        assert_eq!(blind_spot.processes, 1);
+        assert_eq!(blind_spot.opaque_descriptors, 2);
+        assert_eq!(blind_spot.records[0].command, "platform-fixture");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["os_blind_spot"]["records"][0]["pid"], 43);
         assert!(std::fs::read_dir(fixture.path()).unwrap().next().is_none());
     }
 
@@ -255,6 +286,10 @@ mod tests {
             assert_eq!(report.status, CensusStatus::Infrastructure);
             assert!(report.problem.is_some());
             assert_eq!(report.retry, retry);
+            assert!(
+                report.os_blind_spot.is_none(),
+                "missing evidence is never an empty census"
+            );
         }
         assert!(std::fs::read_dir(fixture.path()).unwrap().next().is_none());
     }
