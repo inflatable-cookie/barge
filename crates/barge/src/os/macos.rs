@@ -2706,12 +2706,12 @@ fn is_boot_volume(mount_point: &Path) -> bool {
     mount_point == Path::new("/") || mount_point.starts_with("/System/Volumes")
 }
 
-/// Whether the mount point is a mount root directly under the mount parent, and
-/// that parent is a real directory rather than a link.
+/// Whether the recorded path has the mount parent's direct-child shape.
 pub(super) fn recorded_mount_path(path: &Path) -> bool {
     path.parent() == Some(Path::new(VOLUMES_PARENT))
 }
 
+/// Whether the mount point is directly under the real, non-link mount parent.
 fn is_under_volumes_parent(mount_point: &Path) -> bool {
     if mount_point.parent() != Some(Path::new(VOLUMES_PARENT)) {
         return false;

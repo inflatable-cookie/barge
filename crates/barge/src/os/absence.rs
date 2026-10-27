@@ -311,10 +311,12 @@ mod tests {
     use super::*;
     use crate::os::{DeviceId, MacOs, MountPoint};
     use crate::testkit::TempDir;
+    use std::cell::RefCell;
 
     struct Facts {
         device: DeviceId,
         removable: bool,
+        located: RefCell<Vec<VolumeUuid>>,
     }
     impl Facts {
         fn identity(&self) -> VolumeIdentity {
@@ -335,7 +337,8 @@ mod tests {
         }
     }
     impl VolumeLocator for Facts {
-        fn mounts_for_uuid(&self, _: &VolumeUuid) -> Result<Vec<MountPoint>> {
+        fn mounts_for_uuid(&self, uuid: &VolumeUuid) -> Result<Vec<MountPoint>> {
+            self.located.borrow_mut().push(uuid.clone());
             Ok(vec![])
         }
     }
@@ -346,12 +349,8 @@ mod tests {
     }
     impl AbsenceVolume for Facts {
         fn volume_prefix(&self, path: &Path) -> Option<PathBuf> {
-            self.removable.then(|| {
-                path.ancestors()
-                    .find(|p| p.parent() == Some(Path::new("/Volumes")))
-                    .unwrap()
-                    .to_path_buf()
-            })
+            let prefix = Path::new("/Volumes/Fixture");
+            (self.removable && path.starts_with(prefix)).then(|| prefix.to_path_buf())
         }
         fn identify_directory(&self, _: &DirHandle) -> Result<VolumeIdentity> {
             Ok(self.identity())
@@ -368,6 +367,7 @@ mod tests {
         let facts = Facts {
             device: parent.identity().device,
             removable: false,
+            located: RefCell::new(Vec::new()),
         };
         let path = fixture.path().join("gone");
         let proof = prove_absence(&dirs, &facts, &path, AncestorExpected::BootData).unwrap();
@@ -415,6 +415,7 @@ mod tests {
         let foreign = Facts {
             device: DeviceId::new(parent.identity().device.get() + 1),
             removable: false,
+            located: RefCell::new(Vec::new()),
         };
         assert_eq!(
             prove_absence(&dirs, &foreign, &path, AncestorExpected::BootData)
@@ -422,24 +423,49 @@ mod tests {
                 .reason(),
             Some("volume_unverified")
         );
-        let removable = Facts {
-            device: parent.identity().device,
+    }
+
+    #[test]
+    fn an_unmounted_registered_volume_is_unknown_after_the_uuid_lookup() {
+        let dirs = MacOs::new();
+        let facts = Facts {
+            device: DeviceId::new(1),
             removable: true,
+            located: RefCell::new(Vec::new()),
         };
         let uuid = facts.identity().volume_uuid.unwrap();
+        let path = Path::new("/Volumes/Fixture/project/gone");
+        let mismatch = prove_absence(
+            &dirs,
+            &facts,
+            path,
+            AncestorExpected::Registered {
+                uuid: &uuid,
+                recorded_mount: Path::new("/Volumes/Other"),
+            },
+        )
+        .unwrap();
+        assert_eq!(mismatch.reason(), Some("volume_unverified"));
+        assert!(
+            facts.located.borrow().is_empty(),
+            "a mismatched prefix refuses before lookup"
+        );
+        let unmounted = prove_absence(
+            &dirs,
+            &facts,
+            path,
+            AncestorExpected::Registered {
+                uuid: &uuid,
+                recorded_mount: Path::new("/Volumes/Fixture"),
+            },
+        )
+        .unwrap();
+        assert_eq!(unmounted.verdict(), "unknown");
+        assert_eq!(unmounted.reason(), Some("volume_unverified"));
         assert_eq!(
-            prove_absence(
-                &dirs,
-                &removable,
-                &path,
-                AncestorExpected::Registered {
-                    uuid: &uuid,
-                    recorded_mount: Path::new("/Volumes/Builds")
-                }
-            )
-            .unwrap()
-            .reason(),
-            Some("volume_unverified")
+            *facts.located.borrow(),
+            vec![uuid],
+            "the matching UUID was looked up and found unmounted"
         );
     }
 }

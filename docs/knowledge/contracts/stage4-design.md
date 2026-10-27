@@ -1001,6 +1001,21 @@ identity, custody and policy conditions a space prune already supplies. Nothing
 depends on a real drive; `F6` needs its own operator gate because it changes what
 happens to data on a real volume.
 
+### F2 library primitives
+
+The OS layer exposes a bounded UUID mount locator and a unique-mount verifier.
+A mount census that exceeds its table bound or changes during observation is
+unknown; duplicate UUID mounts are unknown with `duplicate_volume_uuid`.
+The v1 marker reader can compare paths after replacing the recorded mount prefix
+with a verified live mount, retaining exact comparison of every lower component.
+
+`os::prove_absence` walks held directory descriptors without following links,
+checks each opened identity against the no-follow observation, and accepts only
+an absent leaf whose parent is on the verified boot Data or registered volume.
+Its `barge.absence/1` document is evidence for one observation; it must be
+established again at effect time. The primitive does not itself authorize a
+prune or change any consumer's state.
+
 ## Proposed validation
 
 Design-only validation for this contract is `effigy docs:check` once per changed
@@ -1179,18 +1194,3 @@ qualification claim, and none contradicts a frozen ruling.
   against Barge-owned roots first; the 91 legacy roots then need an operator list
   and an adoption decision that `ff13f2ef` already tracks. Nothing in this
   contract authorizes a single Oxide root to be deleted by Barge.
-
-### F2 library primitives
-
-The OS layer exposes a bounded UUID mount locator and a unique-mount verifier.
-A mount census that exceeds its table bound or changes during observation is
-unknown; duplicate UUID mounts are unknown with `duplicate_volume_uuid`.
-The v1 marker reader can compare paths after replacing the recorded mount prefix
-with a verified live mount, retaining exact comparison of every lower component.
-
-`os::prove_absence` walks held directory descriptors without following links,
-checks each opened identity against the no-follow observation, and accepts only
-an absent leaf whose parent is on the verified boot Data or registered volume.
-Its `barge.absence/1` document is evidence for one observation; it must be
-established again at effect time. The primitive does not itself authorize a
-prune or change any consumer's state.
