@@ -654,10 +654,11 @@ marker, and never applies its own seven-day rule to one.
 `reap.py` deletes each child of every project folder under `scratch/` after
 their newest entry is fourteen days old and no process has them open, deletes
 top-level entries that are files or whose names contain a dot as single units
-the same way, and skips only symlinks, the `oxide` project, Effigy-marked
-directories and bare eight-character run names. That behaviour is the thing to
-replace, so the design reproduces it as an explicit grant instead of an
-implicit name rule. A legacy claim is declared once, per scope, by the owner of
+the same way, and skips symlinks, the `oxide` project and Effigy-marked units.
+Since 2026-10-27 it treats every other plain-named directory as a project, without
+name-shape or known-project lists (the prior script was saved as
+`reap.py.bak-20261027`). Barge requires an explicit grant instead of inferring
+ownership from a name. A legacy claim is declared once, per scope, by the owner of
 the data:
 
 - The record shape is the volume's `scratch_grants`
@@ -669,12 +670,14 @@ the data:
   collision ruling). That last case is a ruled exception to the reaper's set;
   without a claim it is kept. A claim never covers the scratch root as a whole;
   an eight-character project claim and a top-level claim cannot overlap.
-- A claimed unit is eligible only when it carries no marker of any recognised
-  family, is not a symlink at any level, the owning project folder (when the
+- A claimed unit is eligible only when no marker of any recognised family is
+  present anywhere in its bounded tree, it is not a symlink at any level, the owning project folder (when the
   scope is a project) has a valid claim, the newest entry in the unit is older
   than the claimed idle age, no hold covers it, custody is `Safe`, and the
   delete is whole-unit with the Finder and `ENOTEMPTY` rules below. A unit that
-  becomes marked between plan and effect is kept.
+  becomes marked between plan and effect is kept. A walk that hits its bound is
+  unknown and never planned; S5 independently stops before capturing a nested
+  recognised marker and keeps the intent pending.
 - A claim is reversible and per scope. Removing it returns the scope to
   keep-and-report without touching data.
 - A claim is an operator declaration, recorded in the volume's `scratch_grants`
@@ -2330,13 +2333,15 @@ The host reaper's current behaviours are the counterfactual baseline for scratch
 expiry: units are the children of each project folder and the top-level entries
 that are files or have a dot in the name; a unit goes once its newest entry is
 fourteen days old and no process has it open; it never follows a symlink, never
-deletes outside `scratch/`, skips the `oxide` project and Effigy-marked and
-bare eight-character directories, keeps a busy unit, retries `ENOTEMPTY` and
-stops at a run budget. Through recorded grants, Barge reaches the same set and
-is at least as conservative on those conditions, apart from the explicit O-005
+deletes outside `scratch/`, skips the `oxide` project and Effigy-marked units,
+keeps a busy unit, retries `ENOTEMPTY` and stops at a run budget. Since
+2026-10-27 all other plain-named top-level directories are projects; the prior
+script is backed up as `reap.py.bak-20261027`. Through recorded grants, Barge
+reaches the same set and is at least as conservative on those conditions, apart
+from the explicit O-005
 ruling: an unmarked bare eight-character directory can be deleted as one unit
-under a top-level claim, although the reaper skips it. The tests pin both that
-exception and the no-grant result (nothing deleted, everything reported).
+under a top-level claim, although the reaper treats it as a project and only
+considers its children. The tests pin both that exception and the no-grant result (nothing deleted, everything reported).
 
 ### Test fixtures on the real OS
 

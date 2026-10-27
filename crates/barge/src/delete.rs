@@ -1333,6 +1333,17 @@ impl<'a> WalkState<'a> {
         )))
     }
 
+    /// A nested marked root is never authorised by the enclosing unit's grant.
+    fn nested_marker(&self, name: &str, depth: usize, relative: &Path) -> Option<Walk> {
+        if (depth > 0 || self.marker.is_none()) && MarkerFamily::from_marker_file(name).is_some() {
+            return Some(Walk::Stop(format!(
+                "recognised marker `{}` inside the unit is not covered by its grant",
+                relative.join(name).display()
+            )));
+        }
+        None
+    }
+
     /// Publish the in-flight captures, which is the durable list a private name
     /// must be in before anything unlinks it.
     fn publish_chain(&self) -> Result<()> {
@@ -1491,6 +1502,9 @@ impl<'a> WalkState<'a> {
             return Ok(Walk::Stop(stop));
         }
         for entry in &listing.entries {
+            if let Some(stop) = self.nested_marker(&entry.name, depth, relative) {
+                return Ok(stop);
+            }
             if depth == 0 {
                 if let Some(stop) = self.top_level_marker(&entry.name) {
                     return Ok(stop);
@@ -1528,6 +1542,9 @@ impl<'a> WalkState<'a> {
                 let Some(capture) = ours else {
                     return Ok(Walk::Stop(self.unrecorded_stop(&entry.name, Some(&facts))));
                 };
+                if let Some(stop) = self.nested_marker(&capture.original, depth, relative) {
+                    return Ok(stop);
+                }
                 if facts.kind == EntryKind::Directory {
                     let original = relative.join(&capture.original);
                     let child = self.dirs.open_child_dir(handle, &entry.name)?;
@@ -2182,6 +2199,9 @@ impl<'a> WalkState<'a> {
             return Ok(Walk::Stop(stop));
         }
         for entry in &listing.entries {
+            if let Some(stop) = self.nested_marker(&entry.name, depth, relative) {
+                return Ok(stop);
+            }
             if skip_marker {
                 if let Some(stop) = self.top_level_marker(&entry.name) {
                     return Ok(stop);
@@ -2218,6 +2238,9 @@ impl<'a> WalkState<'a> {
                 else {
                     return Ok(Walk::Stop(self.unrecorded_stop(&entry.name, Some(&facts))));
                 };
+                if let Some(stop) = self.nested_marker(&record.original, depth, relative) {
+                    return Ok(stop);
+                }
                 // Its contents are the tree they were, so the path the walk
                 // expects them under is the captured object's original one.
                 let original = relative.join(&record.original);
@@ -3484,6 +3507,101 @@ mod tests {
     fn rename_to_quarantine(prepared: &Prepared) {
         std::fs::rename(prepared.unit_path(), prepared.quarantine())
             .expect("the unit is quarantined");
+    }
+
+    #[test]
+    fn a_nested_marker_stops_shared_delete_and_replay_for_each_family() {
+        for (_kind, make) in directory_kind_makers() {
+            for marker in crate::unit::RECOGNISED_MARKER_FILES {
+                let prepared = make("delete-nested-marker");
+                let nested = prepared.unit_path().join("inside/deeper");
+                std::fs::create_dir_all(&nested).expect("nested directory");
+                std::fs::write(nested.join(marker), b"foreign").expect("marker");
+                let report = prepared.delete(&Faults::new(), &prepared.fixture.facts());
+                assert!(report.is_pending(), "{marker}: {report:?}");
+                assert!(report
+                    .reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(marker));
+                assert!(report
+                    .quarantine
+                    .join("inside/deeper")
+                    .join(marker)
+                    .exists());
+                let replay = prepared.replay();
+                assert_eq!(replay.pending.len(), 1, "{marker}: {replay:?}");
+                assert!(report
+                    .quarantine
+                    .join("inside/deeper")
+                    .join(marker)
+                    .exists());
+            }
+        }
+    }
+
+    #[test]
+    fn a_marker_inserted_after_classification_stops_before_capture_and_on_replay() {
+        for marker in crate::unit::RECOGNISED_MARKER_FILES {
+            let prepared = prepared_unmarked("delete-marker-after-classification");
+            std::fs::create_dir_all(prepared.unit_path().join("inside")).expect("nested directory");
+            let intent = publish(&prepared, &[IntentPhase::Renamed]);
+            rename_to_quarantine(&prepared);
+            let dirs = Faults::new();
+            let facts = prepared.fixture.facts();
+            let observer = prepared.fixture.observer();
+            {
+                let mut locks = LockSet::new(prepared.fixture.state.clone());
+                let _volume = locks
+                    .lock_volume(&prepared.fixture.uuid)
+                    .expect("volume lock");
+                let _unit =
+                    super::lock_deletion_unit(&mut locks, &prepared.unit).expect("unit lock");
+                let write = locks.begin_intent_write().expect("intent lock");
+                let journal = super::CaptureJournal::new(&write, &prepared.fixture.state, &intent);
+                let mut walk = super::WalkState::new(
+                    &dirs,
+                    &facts,
+                    &observer,
+                    intent.volume_uuid.clone(),
+                    DeviceId::new(intent.unit.device),
+                    intent.mount_hint.clone(),
+                    prepared.bounds(),
+                    &journal,
+                    Vec::new(),
+                    None,
+                )
+                .expect("walk");
+                let leaf = dirs
+                    .open_path(&prepared.quarantine())
+                    .expect("captured leaf");
+                assert!(matches!(
+                    walk.classify(&leaf, 0, Path::new(""))
+                        .expect("classification"),
+                    super::Walk::Clean
+                ));
+                std::fs::write(
+                    prepared.quarantine().join("inside").join(marker),
+                    b"foreign",
+                )
+                .expect("insert marker");
+                let mut counts = super::Counts::default();
+                let result = walk
+                    .delete_contents(&leaf, 0, Path::new(""), true, &mut counts)
+                    .expect("delete walk");
+                assert!(matches!(result, super::Walk::Stop(reason) if reason.contains(marker)));
+            }
+            assert!(
+                find_entry(&prepared.quarantine(), marker).is_some(),
+                "{marker} is kept"
+            );
+            let replay = prepared.replay();
+            assert_eq!(replay.pending.len(), 1, "{marker}: {replay:?}");
+            assert!(
+                find_entry(&prepared.quarantine(), marker).is_some(),
+                "replay keeps {marker}"
+            );
+        }
     }
 
     #[test]

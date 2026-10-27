@@ -3158,7 +3158,14 @@ fn assess_unmarked(
             reason: "the claim's declared unit shape does not match this scope".to_owned(),
         });
     }
-    let newest = match newest_entry(ctx.dirs, unit, facts.modified_ms.unwrap_or(0), 0, budget)? {
+    let newest = match newest_entry(
+        ctx.dirs,
+        unit,
+        facts.modified_ms.unwrap_or(0),
+        0,
+        Path::new(""),
+        budget,
+    )? {
         Ok(newest) => newest,
         Err(reason) => {
             return Ok(Assessed::Kept {
@@ -3202,12 +3209,13 @@ fn assess_unmarked(
 }
 
 /// The newest modification time in one claimed unit's tree, refusing a symlink
-/// at any level and bounded by the sweep budget.
+/// or a recognised marker at any level and bounded by the sweep budget.
 fn newest_entry(
     dirs: &dyn DirOps,
     handle: &DirHandle,
     own_modified_ms: u64,
     depth: usize,
+    relative: &Path,
     budget: &mut Budget,
 ) -> Result<std::result::Result<u64, String>> {
     if depth > delete::DELETE_DEPTH {
@@ -3240,6 +3248,12 @@ fn newest_entry(
                 "the sweep's examination budget was reached inside this unit".to_owned(),
             ));
         }
+        if crate::unit::MarkerFamily::from_marker_file(&entry.name).is_some() {
+            return Ok(Err(format!(
+                "recognised marker `{}` inside the claimed unit is not covered by its claim",
+                relative.join(&entry.name).display()
+            )));
+        }
         if entry.facts.kind == EntryKind::Symlink {
             return Ok(Err(format!(
                 "`{}` is a symbolic link inside the unit, which is never followed",
@@ -3252,7 +3266,14 @@ fn newest_entry(
                 Ok(child) => child,
                 Err(error) => return Ok(Err(format!("the unit cannot be walked: {error}"))),
             };
-            match newest_entry(dirs, &child, 0, depth + 1, budget)? {
+            match newest_entry(
+                dirs,
+                &child,
+                0,
+                depth + 1,
+                &relative.join(&entry.name),
+                budget,
+            )? {
                 Ok(inner) => newest = newest.max(inner),
                 Err(reason) => return Ok(Err(reason)),
             }
@@ -4750,6 +4771,105 @@ mod tests {
     }
 
     #[test]
+    fn nested_markers_keep_claimed_units_even_with_family_delegations() {
+        for top_level in [false, true] {
+            for delegated in [false, true] {
+                for marker in crate::unit::RECOGNISED_MARKER_FILES {
+                    let harness = Harness::new("nested-marker-claim");
+                    let unit = if top_level {
+                        std::fs::create_dir_all(harness.scratch()).expect("scratch");
+                        harness.adhoc_claim(60);
+                        harness.scratch().join("run.legacy")
+                    } else {
+                        harness.claim("alpha", 60);
+                        harness.project("alpha").join("old-child")
+                    };
+                    if delegated {
+                        harness.delegate(MarkerFamily::EffigyScratch);
+                        harness.delegate(MarkerFamily::OxideScratch);
+                    }
+                    let nested = unit.join("inner-run/deeper");
+                    std::fs::create_dir_all(&nested).expect("nested directory");
+                    let marker_path = nested.join(marker);
+                    std::fs::write(&marker_path, b"foreign ownership").expect("marker");
+                    age_tree(&unit, 20);
+                    let now = state::now_ms() + 3_600_000;
+                    let plan = harness.plan_at(now);
+                    assert_eq!(
+                        plan.plan.candidates.count, 0,
+                        "{top_level} {delegated} {marker}"
+                    );
+                    let name = unit.file_name().unwrap().to_string_lossy();
+                    let kept = plan
+                        .plan
+                        .kept
+                        .rows
+                        .iter()
+                        .find(|row| row.name == name)
+                        .expect("unit reported");
+                    assert!(
+                        kept.reason.contains(&format!("inner-run/deeper/{marker}")),
+                        "{}",
+                        kept.reason
+                    );
+                    let real = harness.expire_at(now, &plan.plan_digest);
+                    assert_eq!(real.deleted.count, 0);
+                    assert!(marker_path.is_file(), "nested marker is kept");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_nested_marker_inserted_after_preview_refuses_locked_reassessment() {
+        let harness = Harness::new("nested-marker-after-preview");
+        let unit = harness.project("alpha").join("old-child");
+        let nested = unit.join("inner-run");
+        std::fs::create_dir_all(&nested).expect("nested directory");
+        age_tree(&unit, 20);
+        harness.claim("alpha", 60);
+        let now = state::now_ms() + 3_600_000;
+        let plan = harness.plan_at(now);
+        let row = &plan.plan.candidates.rows[0];
+        std::fs::write(nested.join(super::EFFIGY_MARKER_FILE), b"foreign").expect("marker");
+        let record = area::registered_volume(&harness.fixture.state, &harness.fixture.uuid)
+            .expect("registry");
+        let error = super::authorize_under(
+            &harness.fixture.platform(),
+            &harness.fixture.facts(),
+            &harness.fixture.mounts(),
+            &harness.fixture.observer(),
+            &harness.fixture.state,
+            &record,
+            row,
+            now,
+        )
+        .expect_err("the new marker refuses");
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        let request = SweepRequest {
+            volume_uuid: &harness.fixture.uuid,
+            preview: false,
+            plan_digest: Some(&plan.plan_digest),
+            bounds: SweepBounds::default(),
+            delete_bounds: DeleteBounds::default(),
+            now_ms: now,
+        };
+        let result = sweep(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.fixture.facts(),
+            &harness.fixture.mounts(),
+            &harness.fixture.observer(),
+            &request,
+        );
+        assert_eq!(
+            result.expect_err("the stale preview refuses").kind(),
+            ErrorKind::UnknownState
+        );
+        assert!(nested.join(super::EFFIGY_MARKER_FILE).exists());
+    }
+
+    #[test]
     fn a_claimed_top_level_file_is_deleted_whole_through_s5() {
         let harness = Harness::new("scratch-claimed-file");
         std::fs::create_dir_all(harness.scratch()).expect("the scratch folder");
@@ -4833,14 +4953,6 @@ mod tests {
     /// keeps no process holding any unit, so "busy" never holds here.
     fn reaper_units(scratch: &Path, now_ms: u64) -> Vec<PathBuf> {
         const IDLE_MS: u64 = 14 * 24 * 60 * 60 * 1000;
-        const KNOWN_PROJECTS: [&str; 6] = [
-            "figmatic",
-            "acowtancy",
-            "acowtancy-desktop",
-            "underlay",
-            "praxis",
-            "nucleus",
-        ];
         let mut units: Vec<PathBuf> = Vec::new();
         let mut names: Vec<String> = std::fs::read_dir(scratch)
             .expect("the scratch folder")
@@ -4854,13 +4966,7 @@ mod tests {
             if metadata.file_type().is_symlink() || name == "oxide" {
                 continue;
             }
-            if path.join(".effigy-scratch.json").exists()
-                || (name.len() == 8
-                    && name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-                    && !KNOWN_PROJECTS.contains(&name.as_str()))
-            {
+            if path.join(".effigy-scratch.json").exists() {
                 continue;
             }
             if metadata.is_dir() && !name.contains('.') {
@@ -4870,7 +4976,12 @@ mod tests {
                     .map(|entry| entry.file_name().to_string_lossy().to_string())
                     .collect();
                 children.sort();
-                units.extend(children.into_iter().map(|child| path.join(child)));
+                units.extend(
+                    children
+                        .into_iter()
+                        .map(|child| path.join(child))
+                        .filter(|child| !child.join(".effigy-scratch.json").exists()),
+                );
             } else {
                 units.push(path);
             }
@@ -4933,7 +5044,7 @@ mod tests {
         std::fs::create_dir_all(adhoc_dotted.join("inner")).expect("the dotted unit");
         age_tree(&adhoc_dotted, 20);
 
-        // Names the reaper leaves alone, and one it would have deleted.
+        // The Oxide project and the marked Effigy root are skipped by the reaper.
         let oxide_child = harness.project("oxide").join("old-child");
         std::fs::create_dir_all(&oxide_child).expect("the oxide child");
         age_tree(&oxide_child, 20);
@@ -4947,14 +5058,14 @@ mod tests {
         std::fs::create_dir_all(&effigy).expect("the effigy run");
         effigy_marker(&effigy, 0xFFFF_FFFE, false, None);
         age_tree(&effigy, 20);
-        // A known project whose name is eight characters: the host reaper exempts
-        // it from its run-name skip, so its old children are units it deletes.
+        // Plain eight-character project names have no special treatment in the
+        // current host reaper; their old children are units it deletes.
         let underlay_old = harness.project("underlay").join("old-child");
         std::fs::create_dir_all(&underlay_old).expect("the unit");
         std::fs::write(underlay_old.join("payload.txt"), b"bytes").expect("a payload");
         age_tree(&underlay_old, 20);
-        // `figmatic` is the other known eight-character project: Barge reaches it
-        // the same way, so a second old child proves the rule is not one name.
+        // A second named project and the arbitrary `abcdefgh` above prove the
+        // model does not rely on a known-names list.
         let figmatic_old = harness.project("figmatic").join("old-child");
         std::fs::create_dir_all(&figmatic_old).expect("the unit");
         age_tree(&figmatic_old, 20);
@@ -5001,16 +5112,16 @@ mod tests {
         let eight_character: Vec<PathBuf> = reaper
             .iter()
             .filter(|unit| {
-                unit.parent()
-                    .and_then(Path::file_name)
-                    .is_some_and(|name| name == "underlay" || name == "figmatic")
+                unit.parent().and_then(Path::file_name).is_some_and(|name| {
+                    name == "underlay" || name == "figmatic" || name == "abcdefgh"
+                })
             })
             .cloned()
             .collect();
         assert_eq!(
             eight_character.len(),
-            2,
-            "both known eight-character projects are in the reaper's set: {reaper:?}"
+            3,
+            "all eight-character projects are in the reaper's set: {reaper:?}"
         );
         let mut first_expected: Vec<PathBuf> = reaper
             .iter()
@@ -5059,6 +5170,7 @@ mod tests {
             .expect("the ad-hoc claim is withdrawn");
         harness.claim("underlay", 14 * 24 * 60 * 60);
         harness.claim("figmatic", 14 * 24 * 60 * 60);
+        harness.claim("abcdefgh", 14 * 24 * 60 * 60);
         let second = harness.plan_at(now);
         let mut second_barge: Vec<PathBuf> = second
             .plan
