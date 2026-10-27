@@ -200,7 +200,7 @@ def build_environment(staging, pool, pin, instance):
                    and not k.startswith("OXIDE_")}
     for name in ("TMPDIR", "TMP", "TEMP"):
         environment[name] = str(staging)
-    environment["OXIDE_POOL"] = str(pool)
+    environment["OXIDE_POOL"] = str(pool / "p")
     environment["OXIDE_CONFIG"] = str(staging / "o.toml")
     (staging / "o.toml").write_text("")
     environment[BUILD_PIN_VARIABLE] = pin
@@ -327,7 +327,7 @@ def verify_pool(pool, boot_device, expected=None):
             or stat.S_IMODE(info.st_mode) != 0o700 or info.st_dev != boot_device
             or (expected is not None and identity != expected)):
         raise Refusal(f"unverified pool retained at {pool}")
-    if len(os.fsencode(pool / "payload/slots/s-12345678/quick-1/scratch")) > 91:
+    if len(os.fsencode(pool / "p/payload/slots/s-12345678/quick-1/scratch")) > 91:
         raise Refusal(f"socket path too long; pool retained at {pool}")
     return identity
 

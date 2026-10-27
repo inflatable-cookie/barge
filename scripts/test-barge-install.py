@@ -93,7 +93,7 @@ class InstallerFixtures(unittest.TestCase):
             environment = installer.build_environment(staging, self.home, "a" * 40, "b" * 32)
         self.assertNotIn("CARGO_TARGET_DIR", environment)
         self.assertNotIn("CARGO_BUILD_BUILD_DIR", environment)
-        self.assertEqual(environment["OXIDE_POOL"], str(self.home))
+        self.assertEqual(environment["OXIDE_POOL"], str(self.home / "p"))
         self.assertEqual(environment["TMPDIR"], str(staging))
         self.assertEqual(environment["BARGE_BUILD_PIN"], "a" * 40)
 
