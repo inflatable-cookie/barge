@@ -32,7 +32,7 @@ use crate::area::{
     ReserveParticipation, RootConclusion, RootKind, RootSpec,
 };
 use crate::contract::{RowSet, LISTING_NAME_ROWS, MARKER_CAP_BYTES, ROOT_ROWS};
-use crate::custody::{IdentityProof, ObservedRoot, PendingIntent};
+use crate::custody::PendingIntent;
 use crate::delete::{self, DeleteBounds, PendingRow};
 use crate::digest::sha256_hex;
 use crate::error::{Error, ErrorKind, Result};
@@ -45,6 +45,16 @@ use crate::registry::{
     VolumeRecord,
 };
 use crate::state::{self, StatePaths};
+use crate::unit::{
+    DeletionUnit, MarkerFamily as UnitMarkerFamily, UnitGrant, UnitKind, UnitMarker,
+};
+
+#[derive(Debug, Clone)]
+struct ObservedRoot {
+    device: DeviceId,
+    inode: u64,
+    marker_digest: String,
+}
 
 /// The namespace every scratch root's marker records. Barge's own folder is not
 /// a consumer area, so it uses its own fixed identity.
@@ -101,7 +111,7 @@ pub const MARKER_FILES: [&str; 3] = [
 
 /// The longest unit name a plan row or state key may carry. A longer name is
 /// unknown and is reported, never acted on.
-const MAX_UNIT_NAME_BYTES: usize = state::UNIT_NAME_MAX_BYTES;
+const MAX_UNIT_NAME_BYTES: usize = 255;
 
 /// The longest legacy claim's idle age: a century, so a value the platform
 /// cannot represent is refused rather than truncated.
@@ -472,7 +482,7 @@ pub fn conclude(
     observer: &dyn ProcessObserver,
     request: &ConcludeRequest<'_>,
 ) -> Result<ConcludeReport> {
-    state::validate_unit_name("root_id", request.root_id)?;
+    state::validate_identifier("root_id", request.root_id)?;
     area::validate_name("holder", request.holder)?;
     if let Some(project) = request.project {
         area::validate_name("project", project)?;
@@ -620,7 +630,7 @@ pub fn conclude(
         let intents = state::read_intents(state_paths, crate::contract::INTENT_ROWS)?;
         if let Some(intent) = PendingIntent::pending(&intents.records)
             .into_iter()
-            .find(|intent| intent.root_id == request.root_id)
+            .find(|intent| intent.name == request.root_id)
         {
             return Err(Error::new(
                 ErrorKind::CustodyNotProven,
@@ -963,16 +973,6 @@ pub fn unmarked_provenance_digest_parts(
 ) -> String {
     sha256_hex(
         format!("barge.unmarked-unit/1\n{volume_uuid}\n{name}\n{device}\n{inode}\n").as_bytes(),
-    )
-}
-
-/// The provenance digest an observed unmarked unit carries.
-pub fn unmarked_provenance_digest(observed: &ObservedRoot) -> String {
-    unmarked_provenance_digest_parts(
-        &observed.volume_uuid,
-        &observed.root_id,
-        observed.device.get(),
-        observed.inode,
     )
 }
 
@@ -1417,6 +1417,8 @@ pub struct PlanRow {
     pub family: UnitFamily,
     /// The unit's absolute path, as the walk reached it.
     pub path: PathBuf,
+    /// The observed unit kind, bound into the plan digest.
+    pub kind: UnitKind,
     /// The unit's device.
     pub device: u64,
     /// The unit's inode on that device.
@@ -1734,7 +1736,7 @@ pub fn sweep(
             }
             Err(error) => return Err(error),
         };
-        let Some(observed) = fresh else {
+        let Some(fresh) = fresh else {
             skipped.push(SkippedRow {
                 name: row.name.clone(),
                 scope: row.scope.clone(),
@@ -1742,7 +1744,10 @@ pub fn sweep(
             });
             continue;
         };
-        if observed.marker_digest != row.marker_digest
+        let observed = fresh.observed;
+        if fresh.row.family != row.family
+            || fresh.row.kind != row.kind
+            || observed.marker_digest != row.marker_digest
             || observed.device.get() != row.device
             || observed.inode != row.inode
         {
@@ -1754,52 +1759,71 @@ pub fn sweep(
             });
             continue;
         }
-        let folder = row.scope.parent_folder(&scratch);
-        let declaration = scratch_declaration(&record, &folder);
-        let proof = match row.family {
-            UnitFamily::Native => IdentityProof::OwnedRoot,
-            UnitFamily::OxideScratch => IdentityProof::Family {
-                marker: OXIDE_MARKER_FILE,
-            },
-            UnitFamily::EffigyScratch => IdentityProof::Family {
-                marker: EFFIGY_MARKER_FILE,
-            },
-            UnitFamily::Unmarked => IdentityProof::Unmarked,
+        let declaration = scratch_declaration(&record, &scratch);
+        let (parent, claim) = match &row.scope {
+            UnitScope::Project { name } => (name.clone(), format!("project:{name}")),
+            UnitScope::TopLevel => (String::new(), "top_level_adhoc".to_owned()),
         };
-        // The authority that authorized this row is re-verified inside the
-        // deletion's own locked window, against the registry record re-read under
-        // the volume lock: the full current eligibility policy (delegation or
-        // claim, unit shape, the claim's idle age) and the recorded identity. A
-        // withdrawal or a stricter replacement between the plan and the effect
-        // refuses the unit, and a change attempted after the window waits for it.
-        let authorization = delete::Authorization {
-            what: "the recorded scratch grant and its current eligibility policy",
-            check: &|fresh: &VolumeRecord| {
-                authorize_under(
-                    dirs,
-                    facts,
-                    mounts,
-                    observer,
-                    state_paths,
-                    fresh,
-                    row,
-                    request.now_ms,
-                )
-            },
+        let (marker, grant) = match row.family {
+            UnitFamily::Native => (
+                Some(UnitMarker::new(
+                    UnitMarkerFamily::Barge,
+                    row.marker_digest.clone(),
+                )),
+                UnitGrant::native_root(row.name.clone()),
+            ),
+            UnitFamily::OxideScratch => (
+                Some(UnitMarker::new(
+                    UnitMarkerFamily::OxideScratch,
+                    row.marker_digest.clone(),
+                )),
+                UnitGrant::delegation(UnitMarkerFamily::OxideScratch),
+            ),
+            UnitFamily::EffigyScratch => (
+                Some(UnitMarker::new(
+                    UnitMarkerFamily::EffigyScratch,
+                    row.marker_digest.clone(),
+                )),
+                UnitGrant::delegation(UnitMarkerFamily::EffigyScratch),
+            ),
+            UnitFamily::Unmarked => (None, UnitGrant::claim(claim)),
         };
-        match delete::delete_unit_on_volume(
+        let kind = row.kind;
+        let unit = DeletionUnit {
+            volume_uuid: request.volume_uuid.clone(),
+            root_dir: record.root_dir.clone(),
+            folder: scratch.clone(),
+            parent,
+            name: row.name.clone(),
+            kind,
+            device: observed.device,
+            inode: observed.inode,
+            marker,
+            grant,
+            plan_digest: digest.clone(),
+        };
+        let authorization = |fresh: &VolumeRecord| {
+            authorize_under(
+                dirs,
+                facts,
+                mounts,
+                observer,
+                state_paths,
+                fresh,
+                row,
+                request.now_ms,
+            )
+        };
+        match delete::delete_unit_authorized(
             state_paths,
             dirs,
             facts,
             mounts,
             observer,
-            request.volume_uuid,
             &declaration,
             None,
-            &observed,
-            &digest,
+            &unit,
             request.delete_bounds,
-            proof,
             Some(&authorization),
         ) {
             Ok(report) => {
@@ -1818,7 +1842,8 @@ pub fn sweep(
                     intent_seen = true;
                     pending.push(PendingRow {
                         intent_id: report.intent_id.clone(),
-                        root_id: report.root_id.clone(),
+                        unit_name: report.unit_name.clone(),
+                        unit_kind: report.unit_kind.clone(),
                         phase: report.phase,
                         reason: report
                             .reason
@@ -1935,7 +1960,6 @@ struct SweepContext<'a> {
     observer: &'a dyn ProcessObserver,
     state_paths: &'a StatePaths,
     record: &'a VolumeRecord,
-    scratch: &'a str,
     device: DeviceId,
     now_ms: u64,
     grants: &'a ScratchGrants,
@@ -2005,9 +2029,11 @@ fn authorize_under(
         .with_detail("scope", row.scope.key().into())
         .with_detail("family", row.family.as_str().into()));
     };
-    if current.marker_digest != row.marker_digest
-        || current.device.get() != row.device
-        || current.inode != row.inode
+    if current.row.family != row.family
+        || current.row.kind != row.kind
+        || current.observed.marker_digest != row.marker_digest
+        || current.observed.device.get() != row.device
+        || current.observed.inode != row.inode
     {
         return Err(Error::new(
             ErrorKind::RefusedBoundary,
@@ -2085,7 +2111,6 @@ fn build_plan(
         observer,
         state_paths,
         record,
-        scratch: &scratch,
         device: handle.identity().device,
         now_ms,
         grants: &record.scratch_grants,
@@ -2562,7 +2587,13 @@ fn assess(
             reason: "the unit is on another device".to_owned(),
         });
     }
-    let holds = area::read_holds(ctx.state_paths, ctx.observer, name)?;
+    let holds = if state::is_identifier(name) {
+        area::read_holds(ctx.state_paths, ctx.observer, name)?
+    } else if area::validate_name("unit_name", name).is_ok() {
+        area::read_unit_holds(ctx.state_paths, ctx.observer, name)?
+    } else {
+        area::HoldReading::empty()
+    };
     if !holds.is_idle() {
         return Ok(AssessmentOutcome::Kept {
             state: family.as_str().to_owned(),
@@ -2652,14 +2683,9 @@ fn assess_unmarked_file(
         facts.inode,
     );
     let observed = ObservedRoot {
-        root_id: name.to_owned(),
-        volume_uuid: ctx.record.volume_uuid.clone(),
-        root_dir: ctx.record.root_dir.clone(),
-        folder: scope.parent_folder(ctx.scratch),
         device: facts.device,
         inode: facts.inode,
         marker_digest: digest.clone(),
-        path: path.to_path_buf(),
     };
     Ok(Assessed::Eligible(
         Box::new(plan_row(
@@ -2667,6 +2693,7 @@ fn assess_unmarked_file(
             scope,
             UnitFamily::Unmarked,
             path,
+            UnitKind::File,
             facts.device.get(),
             facts.inode,
             None,
@@ -2775,6 +2802,7 @@ fn assess_native(
             scope,
             UnitFamily::Native,
             path,
+            UnitKind::Directory,
             unit.identity().device.get(),
             unit.identity().inode,
             Some(area::ROOT_MARKER_FILE.to_owned()),
@@ -2784,7 +2812,7 @@ fn assess_native(
             conclusion.concluded_ms,
             "native root: positive, exclusive and evidence, older than the native age",
         )),
-        observed(ctx, name, scope, path, unit, digest),
+        observed(unit, digest),
     ))
 }
 
@@ -2959,6 +2987,7 @@ fn assess_oxide(
             scope,
             UnitFamily::OxideScratch,
             path,
+            UnitKind::Directory,
             unit.identity().device.get(),
             unit.identity().inode,
             Some(OXIDE_MARKER_FILE.to_owned()),
@@ -2968,7 +2997,7 @@ fn assess_oxide(
             concluded_ms,
             "delegated oxide root: positive, exclusive and evidence, older than seven days",
         )),
-        observed(ctx, name, scope, path, unit, digest),
+        observed(unit, digest),
     ))
 }
 
@@ -3092,6 +3121,7 @@ fn assess_effigy(
             scope,
             UnitFamily::EffigyScratch,
             path,
+            UnitKind::Directory,
             unit.identity().device.get(),
             unit.identity().inode,
             Some(EFFIGY_MARKER_FILE.to_owned()),
@@ -3101,7 +3131,7 @@ fn assess_effigy(
             order_ms,
             detail,
         )),
-        observed(ctx, name, scope, path, unit, digest),
+        observed(unit, digest),
     ))
 }
 
@@ -3157,6 +3187,7 @@ fn assess_unmarked(
             scope,
             UnitFamily::Unmarked,
             path,
+            UnitKind::Directory,
             identity.device.get(),
             identity.inode,
             None,
@@ -3166,7 +3197,7 @@ fn assess_unmarked(
             newest,
             "claimed unmarked unit: no marker, no symlink inside and older than the claim's idle age",
         )),
-        observed(ctx, name, scope, path, unit, digest),
+        observed(unit, digest),
     ))
 }
 
@@ -3236,6 +3267,7 @@ fn plan_row(
     scope: &UnitScope,
     family: UnitFamily,
     path: &Path,
+    kind: UnitKind,
     device: u64,
     inode: u64,
     marker_file: Option<String>,
@@ -3250,6 +3282,7 @@ fn plan_row(
         scope: scope.clone(),
         family,
         path: path.to_path_buf(),
+        kind,
         device,
         inode,
         marker_file,
@@ -3262,23 +3295,11 @@ fn plan_row(
     }
 }
 
-fn observed(
-    ctx: &SweepContext<'_>,
-    name: &str,
-    scope: &UnitScope,
-    path: &Path,
-    unit: &DirHandle,
-    marker_digest: String,
-) -> ObservedRoot {
+fn observed(unit: &DirHandle, marker_digest: String) -> ObservedRoot {
     ObservedRoot {
-        root_id: name.to_owned(),
-        volume_uuid: ctx.record.volume_uuid.clone(),
-        root_dir: ctx.record.root_dir.clone(),
-        folder: scope.parent_folder(ctx.scratch),
         device: unit.identity().device,
         inode: unit.identity().inode,
         marker_digest,
-        path: path.to_path_buf(),
     }
 }
 
@@ -3294,7 +3315,7 @@ fn reassess(
     scope: &UnitScope,
     name: &str,
     now_ms: u64,
-) -> Result<Option<ObservedRoot>> {
+) -> Result<Option<Assessment>> {
     let record = area::registered_volume(state_paths, volume_uuid)?;
     record.declared_durability()?;
     reassess_under(
@@ -3325,7 +3346,7 @@ fn reassess_under(
     scope: &UnitScope,
     name: &str,
     now_ms: u64,
-) -> Result<Option<ObservedRoot>> {
+) -> Result<Option<Assessment>> {
     let scratch = scratch_folder(record);
     let folder = scope.parent_folder(&scratch);
     let Some((path, handle)) = area::open_folder(
@@ -3350,7 +3371,6 @@ fn reassess_under(
         observer,
         state_paths,
         record,
-        scratch: &scratch,
         device: handle.identity().device,
         now_ms,
         grants: &record.scratch_grants,
@@ -3359,7 +3379,7 @@ fn reassess_under(
     let family = unit_family(&ctx, &handle, name, &unit_path)?;
     let mut budget = Budget::new(SweepBounds::default());
     match assess(&ctx, &handle, name, &unit_path, scope, family, &mut budget)? {
-        AssessmentOutcome::Eligible(assessment) => Ok(Some(assessment.observed)),
+        AssessmentOutcome::Eligible(assessment) => Ok(Some(*assessment)),
         AssessmentOutcome::Kept { .. } => Ok(None),
     }
 }
@@ -3407,7 +3427,6 @@ mod tests {
         self, ConclusionClosure, ConclusionOutcome, HoldRequest, HoldScope, KeptReason, NestedScope,
     };
     use crate::contract::MARKER_CAP_BYTES;
-    use crate::custody::ObservedRoot;
     use crate::delete::DeleteBounds;
     use crate::error::ErrorKind;
     use crate::os::{DirHandle, DirOps, ProcessObserver};
@@ -4187,6 +4206,12 @@ mod tests {
         assert!(path.is_dir(), "nothing was deleted");
         let expected = plan_digest(&plan.plan).expect("the plan digest");
         assert_eq!(plan.plan_digest, expected);
+        let mut changed_kind = plan.plan.clone();
+        changed_kind.candidates.rows[0].kind = crate::unit::UnitKind::File;
+        assert_ne!(
+            plan_digest(&changed_kind).expect("changed plan digest"),
+            expected
+        );
         assert!(harness.expire(days, &expected).deleted.count == 1);
     }
 
@@ -4647,7 +4672,7 @@ mod tests {
         let days = NATIVE_AGE_SECONDS / (24 * 60 * 60) + 1;
         let plan = harness.plan(days);
         let faults = Faults::new();
-        faults.failing_remove_prefix(state::QUARANTINE_PREFIX, 3);
+        faults.failing_remove_prefix(state::CAPTURE_PREFIX, 3);
         let report = harness.expire_with(&faults, days, &plan.plan_digest);
         assert!(report.has_pending(), "{:?}", report.deleted.rows);
         assert_eq!(
@@ -5213,8 +5238,18 @@ mod tests {
             parent: &DirHandle,
             from: &str,
             to: &str,
-        ) -> crate::error::Result<()> {
+        ) -> crate::error::Result<crate::os::RenameOutcome> {
             self.inner.rename_child(parent, from, to)
+        }
+
+        fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> crate::error::Result<()> {
+            self.inner.set_dir_mode(handle, mode)
+        }
+        fn dir_facts(&self, handle: &DirHandle) -> crate::error::Result<crate::os::EntryFacts> {
+            self.inner.dir_facts(handle)
+        }
+        fn recheck_dir(&self, handle: &DirHandle) -> crate::error::Result<crate::os::DirId> {
+            self.inner.recheck_dir(handle)
         }
 
         fn random_bytes(&self, length: usize) -> crate::error::Result<Vec<u8>> {
@@ -5324,21 +5359,14 @@ mod tests {
 
     #[test]
     fn the_unmarked_provenance_digest_is_stable_and_identity_bound() {
-        let observed = ObservedRoot {
-            root_id: "leftover".to_owned(),
-            volume_uuid: crate::os::VolumeUuid::parse(FIXTURE_UUID).expect("the UUID"),
-            root_dir: String::new(),
-            folder: "scratch/alpha".to_owned(),
-            device: crate::os::DeviceId::new(7),
-            inode: 11,
-            marker_digest: String::new(),
-            path: PathBuf::from("/fixture/leftover"),
-        };
-        let first = super::unmarked_provenance_digest(&observed);
-        let second = unmarked_provenance_digest_parts(&observed.volume_uuid, "leftover", 7, 11);
+        let uuid = crate::os::VolumeUuid::parse(FIXTURE_UUID).expect("the UUID");
+        let first = unmarked_provenance_digest_parts(&uuid, "leftover", 7, 11);
+        let second = unmarked_provenance_digest_parts(&uuid, "leftover", 7, 11);
         assert_eq!(first, second);
-        let changed = unmarked_provenance_digest_parts(&observed.volume_uuid, "leftover", 7, 12);
-        assert_ne!(first, changed);
+        assert_ne!(
+            first,
+            unmarked_provenance_digest_parts(&uuid, "leftover", 7, 12)
+        );
         let policy = SweepPolicy::design();
         assert_eq!(policy.native_age_seconds, NATIVE_AGE_SECONDS);
         assert_eq!(policy.oxide_age_seconds, OXIDE_AGE_SECONDS);
@@ -5440,6 +5468,7 @@ mod tests {
             },
             family,
             path: harness.project("alpha").join(name),
+            kind: crate::unit::UnitKind::Directory,
             device: 0,
             inode: 0,
             marker_file: None,
@@ -5483,9 +5512,9 @@ mod tests {
                 )
                 .expect("the unit reassesses")
                 .unwrap_or_else(|| panic!("`{name}` is eligible under the record"));
-                row.device = found.device.get();
-                row.inode = found.inode;
-                row.marker_digest = found.marker_digest;
+                row.device = found.observed.device.get();
+                row.inode = found.observed.inode;
+                row.marker_digest = found.observed.marker_digest;
                 row
             };
         let unmarked = observed_row(&claimed, "leftover", UnitFamily::Unmarked);
@@ -5583,6 +5612,24 @@ mod tests {
             "the delegation is the marker family's authority"
         );
 
+        let mut wrong_kind = unmarked.clone();
+        wrong_kind.kind = crate::unit::UnitKind::File;
+        assert_eq!(
+            super::authorize_under(
+                &platform,
+                &facts,
+                &mounts,
+                &observer,
+                &harness.fixture.state,
+                &claimed,
+                &wrong_kind,
+                now
+            )
+            .expect_err("a changed unit kind refuses")
+            .kind(),
+            ErrorKind::RefusedBoundary
+        );
+
         // An identity that is not the plan's is refused under a current policy.
         let mut moved = unmarked.clone();
         moved.inode = moved.inode.saturating_add(1);
@@ -5608,100 +5655,75 @@ mod tests {
         let harness = Harness::new("scratch-auth-window");
         let root = harness.alloc("project-a", "owner");
         let (device, inode) = identity(&root);
-        let record = harness.fixture.record.clone();
-        let folder = format!("{}/project-a", scratch_folder(&record));
-        let declaration = super::scratch_declaration(&record, &folder);
-        let marker = std::fs::read(root.join(area::ROOT_MARKER_FILE)).expect("the marker");
-        let observed = ObservedRoot {
-            root_id: root
-                .file_name()
-                .expect("a root name")
-                .to_string_lossy()
-                .to_string(),
+        let record = &harness.fixture.record;
+        let name = root.file_name().unwrap().to_string_lossy().to_string();
+        let declaration = super::scratch_declaration(record, &scratch_folder(record));
+        let marker = std::fs::read(root.join(area::ROOT_MARKER_FILE)).expect("marker");
+        let unit = crate::unit::DeletionUnit {
             volume_uuid: harness.fixture.uuid.clone(),
             root_dir: record.root_dir.clone(),
-            folder,
+            folder: scratch_folder(record),
+            parent: "project-a".to_owned(),
+            name: name.clone(),
+            kind: crate::unit::UnitKind::Directory,
             device: crate::os::DeviceId::new(device),
             inode,
-            marker_digest: crate::digest::sha256_hex(&marker),
-            path: root.clone(),
-        };
-        let digest = "ab".repeat(32);
-        let refused = crate::delete::Authorization {
-            what: "the recorded scratch grant",
-            check: &|_record: &crate::registry::VolumeRecord| {
-                Err(crate::error::Error::new(
-                    ErrorKind::RefusedBoundary,
-                    "the recorded grant no longer covers `project:project-a`",
-                ))
-            },
+            marker: Some(crate::unit::UnitMarker::new(
+                crate::unit::MarkerFamily::Barge,
+                crate::digest::sha256_hex(&marker),
+            )),
+            grant: crate::unit::UnitGrant::native_root(&name),
+            plan_digest: "ab".repeat(32),
         };
         let observer = harness.fixture.observer();
         let facts = harness.fixture.facts();
         let mounts = harness.fixture.mounts();
         let platform = harness.fixture.platform();
-        let error = crate::delete::delete_unit_on_volume(
-            &harness.fixture.state,
-            &platform,
-            &facts,
-            &mounts,
-            &observer,
-            &harness.fixture.uuid,
-            &declaration,
-            None,
-            &observed,
-            &digest,
-            DeleteBounds {
-                retry_pause: std::time::Duration::ZERO,
-                ..DeleteBounds::default()
-            },
-            crate::custody::IdentityProof::OwnedRoot,
-            Some(&refused),
-        )
-        .expect_err("the withdrawn grant refuses the effect");
-        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
-        assert_eq!(
-            error
-                .detail()
-                .get("authorization")
-                .and_then(|value| value.as_str()),
-            Some("the recorded scratch grant")
-        );
-        assert!(root.exists(), "nothing was renamed or deleted");
-        let intents = state::read_intents(&harness.fixture.state, 64).expect("the journal");
-        assert!(
-            intents.pending().next().is_none(),
-            "no intent was written under withdrawn authority"
-        );
-
-        // The same deletion under a current grant proceeds, so the refusal above
-        // is the authority and not the plumbing. The allocation's owner hold is
-        // released first: custody, not this check, decides a live holder's root.
-        area::release(&harness.fixture.state, &observed.root_id, "owner")
-            .expect("the owner hold is released");
-        let current = crate::delete::Authorization {
-            what: "the recorded scratch grant",
-            check: &|_record: &crate::registry::VolumeRecord| Ok(()),
+        let refuse = |_record: &crate::registry::VolumeRecord| {
+            Err(crate::error::Error::new(
+                ErrorKind::RefusedBoundary,
+                "grant withdrawn",
+            ))
         };
-        let report = crate::delete::delete_unit_on_volume(
+        let bounds = DeleteBounds {
+            retry_pause: std::time::Duration::ZERO,
+            ..DeleteBounds::default()
+        };
+        let error = crate::delete::delete_unit_authorized(
             &harness.fixture.state,
             &platform,
             &facts,
             &mounts,
             &observer,
-            &harness.fixture.uuid,
             &declaration,
             None,
-            &observed,
-            &digest,
-            DeleteBounds {
-                retry_pause: std::time::Duration::ZERO,
-                ..DeleteBounds::default()
-            },
-            crate::custody::IdentityProof::OwnedRoot,
+            &unit,
+            bounds,
+            Some(&refuse),
+        )
+        .expect_err("withdrawn grant refuses");
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        assert!(root.exists());
+        assert!(state::read_intents(&harness.fixture.state, 64)
+            .unwrap()
+            .pending()
+            .next()
+            .is_none());
+        area::release(&harness.fixture.state, &name, "owner").expect("release");
+        let current = |_record: &crate::registry::VolumeRecord| Ok(());
+        let report = crate::delete::delete_unit_authorized(
+            &harness.fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &declaration,
+            None,
+            &unit,
+            bounds,
             Some(&current),
         )
-        .expect("the deletion reports");
+        .expect("delete reports");
         assert!(report.is_deleted(), "{report:?}");
         assert!(!root.exists());
     }
@@ -5975,8 +5997,6 @@ mod tests {
             let file = harness.scratch().join(&name);
             std::fs::write(&file, b"payload").expect("the ad-hoc file");
             let (device, inode) = identity(&file);
-            let digest =
-                unmarked_provenance_digest_parts(&harness.fixture.uuid, &name, device, inode);
             let intent_id = format!("{:032x}", index + 11);
             let quarantine_name = format!("{}{intent_id}", state::QUARANTINE_PREFIX);
             std::fs::rename(&file, harness.scratch().join(&quarantine_name))
@@ -5985,16 +6005,22 @@ mod tests {
             let intent = state::IntentRecord {
                 schema: crate::contract::INTENT_SCHEMA.to_owned(),
                 intent_id: intent_id.clone(),
-                root_id: name.clone(),
                 volume_uuid: harness.fixture.uuid.clone(),
                 mount_hint: harness.fixture.root.clone(),
                 root_dir: record.root_dir.clone(),
                 folder: scratch_folder(&record),
-                root_name: name.clone(),
-                quarantine_name: quarantine_name.clone(),
-                device,
-                inode,
-                marker_digest: digest,
+                unit: state::IntentUnit {
+                    parent: String::new(),
+                    name: name.clone(),
+                    kind: crate::unit::UnitKind::File,
+                    device,
+                    inode,
+                    marker: None,
+                    capture_name: quarantine_name.clone(),
+                    grant: crate::unit::UnitGrant::claim("top_level_adhoc"),
+                },
+                captures: Vec::new(),
+                foreign_captures: Vec::new(),
                 plan_digest: "ab".repeat(32),
                 phase: IntentPhase::Intent,
                 generation: 1,
@@ -6006,7 +6032,13 @@ mod tests {
                 let _volume = locks
                     .lock_volume(&harness.fixture.uuid)
                     .expect("the volume lock");
-                let _root = locks.lock_root(&intent.root_id).expect("the root lock");
+                let _root = locks
+                    .lock_unit(&state::unit_lock_key(
+                        &intent.volume_uuid,
+                        &intent.unit.parent,
+                        &intent.unit.name,
+                    ))
+                    .expect("the unit lock");
                 let write = locks.begin_intent_write().expect("the intent step");
                 state::publish_intent(&write, &harness.fixture.state, &intent)
                     .expect("the intent publishes");
@@ -6055,7 +6087,8 @@ mod tests {
             resumed: 0,
             pending: vec![crate::delete::PendingRow {
                 intent_id: "0123456789abcdef0123456789abcdef".to_owned(),
-                root_id: "leftover".to_owned(),
+                unit_name: "leftover".to_owned(),
+                unit_kind: "file".to_owned(),
                 phase: crate::state::IntentPhase::Renamed,
                 reason: "the area folder is gone but the marker-last phase was not recorded"
                     .to_owned(),

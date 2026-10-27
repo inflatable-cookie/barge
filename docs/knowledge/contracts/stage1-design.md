@@ -883,8 +883,9 @@ and the effect keeps the unit:
 - a legacy claim is bound to the volume's scratch folder and to exactly the scope
   it declares, derived from the unit's place rather than from which folder string
   the caller passed: `project:<name>` is a child of `<scratch>/<name>/`, and
-  `top_level_adhoc` is an entry directly under `<scratch>/` that is a file or
-  whose name contains a dot. The claim's recorded unit shape must match its
+  `top_level_adhoc` is an entry directly under `<scratch>/` that is a file,
+  whose name contains a dot, or is a bare eight-character run-shaped directory
+  under the explicit O-005 collision ruling. The claim's recorded unit shape must match its
   scope (`child` for a project, `entry` for the top level), so a claim never
   authorizes a unit outside its declared scope or a shape it did not declare.
 
@@ -1276,7 +1277,7 @@ data, marker and record are left unchanged and reported.
 | Crash between marker and payload | marker present, root empty | root is a valid empty run root; expiry may take it under the ordinary policy; nothing is inferred as concluded |
 | Crash between intent and rename | intent `intent`, root still in place | replay rolls back the intent and re-evaluates the root; not a completion |
 | Crash between rename and `renamed` phase | quarantine leaf exists with recorded identity | replay resumes deletion from the recorded identity |
-| Crash after `marker_last` before `deleted` | marker absent, quarantine leaf may be present | both-absent proof settles; otherwise pending |
+| Crash after `marker_last` before `removed` | marker absent, quarantine leaf may be present | replay removes a matching captured leaf; an absent leaf without durable `removed` stays pending |
 | Conclusion racing expiry | conclusion write requires a live hold; expiry requires `positive` closure | a root with a live hold is never eligible; a concluded root's marker identity is re-verified before its rename |
 | `root_dir` changed while a root exists | recorded path vs configured resolution | recorded beats configured; `describe` reports both; no move |
 | Same mount, different volume | UUID/device mismatch | refuse `volume_mismatch`; never use, never delete |
@@ -2106,10 +2107,10 @@ Choices S4 made where this design left the mechanic to the slice:
 - **The unit vocabulary.** The sweep recognises both layouts: a marked
   directory directly under the scratch root is one unit, and a child of an
   unmarked project folder is one unit. `oxide-validation/` is never a unit and no
-  claim may cover it; the `oxide` project and a bare `[a-z0-9]{8}` directory are
-  never *claimed*, though a marked family root inside either is still classified
-  (that is where Oxide's proof roots live) and a delegation covers it. A dotted
-  or non-directory top-level entry is one `top_level_adhoc` entry. An entry named
+  claim may cover it; the `oxide` project is never claimed, though marked family
+  roots inside it are classified under delegation. Eight-character names follow
+  the explicit O-005 collision ruling below. A dotted or non-directory top-level
+  entry is one `top_level_adhoc` entry. An entry named
   `.barge-prune-*` is a pending deletion's quarantine leaf, is never a unit, and
   is settled only by a replay.
 - **The policy constants.** Scratch is Barge's own folder, not a declared area,
@@ -2128,7 +2129,7 @@ Choices S4 made where this design left the mechanic to the slice:
   subset of what that family's own sweep would.
 - **The plan is the authorization.** `barge.scratch.plan/1` holds only stable
   facts (the volume, folder, policy constants, the candidate rows with their
-  marker identity, and the kept rows with their reasons) and its SHA-256 is the
+  marker identity and unit kind, and the kept rows with their reasons) and its SHA-256 is the
   digest. A real run requires `--plan-sha256`; it recomputes the plan and refuses
   when the digest differs, changing nothing else. Because a change to any unit's
   eligibility changes the plan, that is a whole-run refusal rather than a
@@ -2145,23 +2146,16 @@ Choices S4 made where this design left the mechanic to the slice:
   with the declared-by name and time, into the volume's `scratch_grants`; either
   can be withdrawn without touching data. Barge records the declaration and
   cannot authenticate its author, so the review is the operator's; the verbs
-  refuse a claim naming `oxide`, a run-shaped name or a dotted name, and refuse a
-  unit shape that does not match its scope.
-- **The foreign and unmarked deletion proof.** S5's custody takes an
-  `IdentityProof`: an owned root's `barge.root/1` marker, a delegated family's
-  marker bytes, or — for a claimed unmarked unit — a provenance digest over the
-  volume, the unit name, its device and inode, which replay recomputes from the
-  intent's own fields. A unit that acquired any recognised marker since the
-  observation is `unknown` and never deleted on the older authority. The
-  `barge.intent/1` field set is unchanged; `root_id`/`root_name` and the hold and
-  lock keys accept a bounded single-component unit name as well as a Barge root
-  id, because a granted unit's name is whatever the filesystem gave it. The
-  marker a proof names is unlinked last; a claimed unmarked unit has none, so its
-  emptied leaf is removed last. A claimed `top_level_adhoc` unit may be a regular
-  file (the host reaper's own unit shape): custody proves it by the provenance
-  digest over its own device and inode, the quarantine rename moves it, the
-  marker-last phase is recorded with nothing to unlink, and the leaf file is
-  removed — the same phase machine, journal and replay, with no contents walk.
+  refuse a claim naming `oxide` or a dotted name, and refuse a unit shape that
+  does not match its scope. Eight-character names follow O-005 below.
+- **The foreign and unmarked deletion proof.** S4 passes the previewed kind,
+  identity, optional family marker and recorded grant to S5's shared deletion
+  unit. Custody re-reads those facts and the grant before the intent; a newly
+  marked unit is kept. `barge.intent/2` records the unit and its private capture
+  name; S5 captures, verifies and journals every removal and replays only from
+  recorded identity. A marker is removed last; a file has no contents or marker.
+  The durable `removed` phase alone proves the final unlink. `barge.intent/1`
+  remains readable as a Barge-marked directory unit.
 - **Custody drops its own descriptor.** S5's identity check opened the root to
   read its device and inode, and the same-uid scan then matched that descriptor,
   so every real deletion would have been refused. The handle is dropped before
@@ -2214,8 +2208,8 @@ Choices S4 made where this design left the mechanic to the slice:
   makes the run `infrastructure`, unqualified, aborted before any case (exit 4),
   with the product's own reason recorded in the receipt; any other probe outcome
   is an apparatus defect, never a pass. No product rule, path exception or case
-  oracle changes; an unreadable same-effective-uid descriptor is still `Unknown`
-  and still refuses.
+  oracle changes; hidden descriptors of a verified platform binary follow the
+  named OS blind-spot ruling, while unverified hidden descriptors still refuse.
 - **Grants are re-verified in the deletion's window, policy included.** The
   plan's assessment reads the grants, but the authority that matters is read
   again inside S5's locked deletion: `delete_unit_on_volume` takes the volume
@@ -2245,7 +2239,7 @@ Choices S4 made where this design left the mechanic to the slice:
   file, and replay no longer opens such a leaf as a directory (`O_DIRECTORY`
   would fail and leave the intent pending forever). A verified file leaf reaches
   its own phase handling: `renamed` finishes the unit, `marker_last` removes the
-  leaf and settles.
+  leaf through the same verified capture path and records `removed` before settlement.
 - **An unsettled replay is unsettled.** `has_pending` covers both a new pending
   intent and a replay that stopped short (`replay.pending`), so a real run with
   an empty candidate plan and an unresolved earlier intent exits `3` instead of

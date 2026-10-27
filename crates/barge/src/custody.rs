@@ -666,7 +666,7 @@ fn decide(
 /// - a legacy claim covers exactly the scope it declares, relative to the scratch
 ///   folder: `project:<name>` is a child of `<scratch>/<name>/`, and
 ///   `top_level_adhoc` is an entry directly under `<scratch>/` that is a file or
-///   whose name contains a dot. The claim's recorded unit shape must match its
+///   whose name contains a dot, or is a bare eight-character run-shaped name. The claim's recorded unit shape must match its
 ///   scope, so a `project` claim never authorizes a top-level entry and the
 ///   reverse.
 ///
@@ -716,7 +716,11 @@ fn grant_still_recorded(
                     (registry::ClaimScope::TopLevelAdhoc, registry::ClaimUnit::Entry) => {
                         unit.grant.reference == "top_level_adhoc"
                             && scope == scratch
-                            && (unit.kind == UnitKind::File || unit.name.contains('.'))
+                            && (unit.kind == UnitKind::File
+                                || unit.name.contains('.')
+                                || (unit.name.len() == 8
+                                    && unit.name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                                    && !record.scratch_grants.claims.iter().any(|other| matches!(&other.scope, registry::ClaimScope::Project { name } if name == &unit.name))))
                     }
                     (registry::ClaimScope::Project { name }, registry::ClaimUnit::Child) => {
                         unit.grant.reference == format!("project:{name}")
@@ -1764,6 +1768,18 @@ mod tests {
             holder.take_unit(&file).name(),
             "safe",
             "a top-level file is an entry the claim covers"
+        );
+        std::fs::create_dir(holder.area.join("underlay")).expect("run-shaped directory");
+        let run = holder.planted_unit(
+            "",
+            "underlay",
+            None,
+            crate::unit::UnitGrant::claim("top_level_adhoc"),
+        );
+        assert_eq!(
+            holder.take_unit(&run).name(),
+            "safe",
+            "the O-005 claim covers the run-shaped entry"
         );
     }
 

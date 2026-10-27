@@ -883,7 +883,7 @@ class Proof:
         phase = pending[0]["phase"]
         if phase not in ("renamed", "marker_last"):
             raise Fault("case", f"the pending intent is at `{phase}`")
-        leaf = os.path.join(folder, pending[0]["quarantine_name"])
+        leaf = os.path.join(folder, pending[0]["unit"]["capture_name"])
         if not os.path.isdir(leaf):
             raise Fault("case", "the quarantine leaf was not kept")
         reason = document.get("data", {}).get("pending", {}).get("rows", [{}])[0].get("reason")
@@ -931,7 +931,7 @@ class Proof:
         if len(pending) != 1:
             raise Fault("case", f"expected one pending intent after the pull, found {len(pending)}")
         intent = pending[0]
-        kept_name = intent["quarantine_name"]
+        kept_name = intent["unit"]["capture_name"]
         self.reattach()
         # Only now, after re-attach, is the on-image identity checkable: the kept
         # quarantine leaf, its marker, and the device and inode the intent recorded.
@@ -941,11 +941,11 @@ class Proof:
         if not os.path.isfile(os.path.join(kept, ".barge-root.json")):
             raise Fault("case", "the kept leaf lost its marker")
         device, inode = self.identity(kept)
-        if (device, inode) != (intent["device"], intent["inode"]):
+        if (device, inode) != (intent["unit"]["device"], intent["unit"]["inode"]):
             raise Fault(
                 "case",
                 f"the kept leaf's identity is {device}:{inode}, not the intent's "
-                f"{intent['device']}:{intent['inode']}",
+                f"{intent['unit']['device']}:{intent['unit']['inode']}",
             )
         digest_after, plan = self.empty_plan_digest()
         if plan["candidates"]["count"] != 0:
@@ -1060,8 +1060,8 @@ class Proof:
         # finishes the rest from the recorded identity alone. Nothing else is
         # touched here: the payloads go through Barge's own delete.
         for intent in self.pending_intents():
-            folder = os.path.join(self.mount, intent["folder"])
-            leaf = os.path.join(folder, intent["quarantine_name"])
+            folder = os.path.join(self.mount, intent["root_dir"], intent["folder"], intent["unit"]["parent"])
+            leaf = os.path.join(folder, intent["unit"]["capture_name"])
             if not os.path.isdir(leaf):
                 continue
             for name in os.listdir(leaf):

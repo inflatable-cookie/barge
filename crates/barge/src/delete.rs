@@ -323,6 +323,35 @@ pub fn delete_unit_on_volume(
     unit: &DeletionUnit,
     bounds: DeleteBounds,
 ) -> Result<DeleteReport> {
+    delete_unit_authorized(
+        state_paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        declaration,
+        stored,
+        unit,
+        bounds,
+        None,
+    )
+}
+
+type EligibilityCheck<'a> = dyn Fn(&registry::VolumeRecord) -> Result<()> + 'a;
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn delete_unit_authorized(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    declaration: &AreaDeclaration,
+    stored: Option<&AreaDocument>,
+    unit: &DeletionUnit,
+    bounds: DeleteBounds,
+    authorize: Option<&EligibilityCheck<'_>>,
+) -> Result<DeleteReport> {
     // The unit's own record is validated first: its parent, name, kind, marker,
     // grant and plan digest each have one well-formed shape, and the grant must
     // be the form its marker family needs.
@@ -403,6 +432,9 @@ pub fn delete_unit_on_volume(
     // record that changed while the plan ran is refused rather than trusted.
     let record = area::registered_volume(state_paths, &volume_uuid)?;
     record.declared_durability()?;
+    if let Some(authorize) = authorize {
+        authorize(&record)?;
+    }
     let Some((area_path, area_handle)) = area::open_folder(
         dirs,
         facts,
