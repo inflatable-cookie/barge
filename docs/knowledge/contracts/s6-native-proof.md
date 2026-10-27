@@ -534,3 +534,24 @@ it ran at. A receipt from a different head proves nothing about this one.
   a real drive's flush cost.
 - No qualification of Oxide's or Effigy's own adoption, and no change to Oxide.
 - The image's own detach and flush cost is not a model of a real unplug.
+
+
+The source review at `e60297db53f17260a2371ab54e6f19c8e8a4cce6`
+(Queue reviewer run `7a68bc2a-6f92-4cb8-acfb-5f179d48f952`)
+identified public-name check/mutate races in settings and link undo, marker
+removal before late settings validation, and a failed covering harness test:
+`Fixture::new` collided with `AlreadyExists` at line 51 because its label, PID
+and subsecond clock did not allocate exclusively. These are source findings;
+old-head native packets do not close them or qualify changed source.
+
+Undo now journals exclusive captures and verifies captured identities before
+mutation, including capturing settings and their marker before removing either
+([owning recovery contract](stage1-design.md#package-cache-placements)). Pure
+counterfactuals replace entries at the capture syscall, edit settings during
+marker observation, and occupy an original name after capture; each must keep
+foreign bytes, marker/data and recovery evidence. Harness fixtures use
+`mktemp -d` exclusive allocation, with a concurrent same-label regression.
+The native selectors, supervisor pin, bounds, nine-case trace and host scope
+are unchanged. This source correction activates no native sequence; new exact-
+head diagnostic, author and independent reviewer runs still require separate
+owner activations.

@@ -20,7 +20,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The pinned qualified supervisor digest, exactly as the plan and the script
 /// state it.
@@ -41,14 +40,24 @@ struct Fixture {
 impl Fixture {
     fn new(label: &str) -> Self {
         let base = std::env::temp_dir();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.subsec_nanos());
-        let path = base.join(format!(
-            "barge-native-harness-{label}-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&path).expect("the fixture directory is created");
+        let output = Command::new("/usr/bin/mktemp")
+            .arg("-d")
+            .arg(base.join(format!(
+                "barge-native-harness-{label}-{}.XXXXXXXX",
+                std::process::id()
+            )))
+            .output()
+            .expect("mktemp starts");
+        assert!(
+            output.status.success(),
+            "exclusive fixture allocation: {}",
+            stderr(&output)
+        );
+        let path = PathBuf::from(
+            String::from_utf8(output.stdout)
+                .expect("fixture path is UTF-8")
+                .trim_end(),
+        );
         Self { path }
     }
 
@@ -1735,4 +1744,21 @@ run_case fixture "" case_body "8"
         .output()
         .expect("pure fixture case allocation starts");
     assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
+fn concurrent_same_label_fixtures_get_distinct_exclusive_directories() {
+    let paths = std::thread::scope(|scope| {
+        let jobs: Vec<_> = (0..16)
+            .map(|_| scope.spawn(|| Fixture::new("same-label")))
+            .collect();
+        jobs.into_iter()
+            .map(|job| job.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let unique: BTreeSet<_> = paths.iter().map(|fixture| fixture.path.clone()).collect();
+    assert_eq!(unique.len(), paths.len());
+    for fixture in &paths {
+        assert!(fixture.path.is_dir());
+    }
 }

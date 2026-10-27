@@ -233,6 +233,7 @@ state/
   areas/<namespace>/<area>.json barge.area/1
   placements/<id>.json          barge.placement/1
   cache-adopt-<kind>.json       barge.cache-adopt/1 (pending cache recovery)
+  cache-undo-<kind>.json        barge.cache-undo/1 (pending undo captures)
   holds/<root-id>/<holder>.json barge.hold/1
   intents/<intent-id>.json      barge.intent/1
   locks/                        registry.lock, volume-<uuid>.lock, root-<id>.lock
@@ -769,6 +770,27 @@ a `link` removes the link and restores an empty directory where one was
 replaced, or removes the link where the original was absent; a `held-root` undo
 removes only the marker it wrote, and refuses if the directory's identity
 changed. Undo never reverses a relocation; that operation's own undo does.
+
+The implementation uses exclusive capture for settings, published links and
+adopted markers, following the [capture rule](#capture-verify-unlink). A bounded
+`barge.cache-undo/1` journal (at most two effects and 64 KiB per kind) records the
+parent identity, original and private random names, expected file snapshot or
+link identity, captured facts and phase before an unlink. Settings and their
+held-root marker are both captured and verified before either is removed.
+Restored settings are staged under the recorded private name plus `.restore`
+and published exclusively at the original name; a concurrent replacement is
+never overwritten. An unchanged setting is put back without rewriting it.
+An empty directory is restored exclusively with its recorded mode.
+
+A mismatch is durably recorded before exclusive put-back. A taken original
+name, unreadable capture, failed put-back or interruption keeps the journal,
+placement record and any private objects; another adopt or undo refuses while
+that journal exists. Recovery requires inspection of those recorded identities;
+there is no automatic retry or inference of successful removal from absence.
+Only a completed undo removes its journal after removing the placement record.
+The residual is the capture rule's same-user discovery of a private random name
+within the capture-to-unlink window, rather than a check at the public name.
+
 
 Absent volume (Q-001): a cache placement fails clearly, naming the drive to
 attach. There is never a silent internal fallback, no re-download to the

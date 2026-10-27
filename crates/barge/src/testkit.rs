@@ -456,6 +456,8 @@ pub struct Faults {
     /// A fixture link a racer publishes after the temporary link is created,
     /// before the caller attempts its exclusive rename.
     pub occupy_link_path: RefCell<Option<(PathBuf, PathBuf)>>,
+    /// A one-shot fixture seam immediately before an exclusive capture rename.
+    pub capture_probe: RefCell<Option<ObserveProbe>>,
     /// Fail one readback after publishing this settings file.
     pub fail_settings_readback: RefCell<Option<String>>,
     settings_readback_armed: Cell<bool>,
@@ -1138,6 +1140,11 @@ impl DirOps for Faults {
             if let Some(probe) = self.put_back_probe.borrow().as_ref() {
                 let answer = probe(from);
                 *self.put_back_result.borrow_mut() = Some(answer);
+            }
+        }
+        if to.starts_with(crate::state::CAPTURE_PREFIX) {
+            if let Some(probe) = self.capture_probe.borrow().as_ref() {
+                probe(from);
             }
         }
         let outcome = self.inner.rename_child(parent, from, to)?;

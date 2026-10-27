@@ -41,6 +41,8 @@
 //! explicitly: its unit and counterfactual tests run on fixture directories,
 //! fixture settings files and fixture volumes.
 
+mod undo_capture;
+
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -1160,6 +1162,7 @@ pub fn adopt(
     observer: &dyn ProcessObserver,
     request: &AdoptRequest<'_>,
 ) -> Result<AdoptReport> {
+    undo_capture::require_no_pending(state, request.kind)?;
     if read_adopt_intent(state, request.kind)?.is_some() {
         return Err(unknown(
             "cache adoption is pending; use cache undo --kind to recover before another adopt",
@@ -1174,6 +1177,7 @@ pub fn adopt(
     state.initialize()?;
     let mut locks = LockSet::new(state.clone());
     let _volume_lock = locks.lock_volume(request.volume_uuid)?;
+    undo_capture::require_no_pending(state, request.kind)?;
     if read_adopt_intent(state, request.kind)?.is_some() {
         return Err(unknown("another cache adoption is pending"));
     }
@@ -3187,6 +3191,16 @@ pub fn undo(
     observer: &dyn ProcessObserver,
     request: &UndoRequest<'_>,
 ) -> Result<UndoReport> {
+    for kind in [
+        CacheKind::NpmCache,
+        CacheKind::BunCache,
+        CacheKind::CargoRegistry,
+        CacheKind::CargoGit,
+    ] {
+        if request.kind.is_none_or(|requested| requested == kind) {
+            undo_capture::require_no_pending(state, kind)?;
+        }
+    }
     let mut pending = if let Some(kind) = request.kind {
         read_adopt_intent(state, kind)?
     } else {
@@ -3304,6 +3318,12 @@ pub fn undo(
             (None, None) => "no placement named".to_owned(),
         })
     })?;
+    let _undo_lock = if !request.plan && recovery_volume.is_none() {
+        Some(recovery_locks.lock_volume(&record.volume_uuid)?)
+    } else {
+        None
+    };
+    undo_capture::require_no_pending(state, record.kind)?;
     let effective_uid = observer.effective_uid()?;
     let result = match &record.form {
         PlacementForm::Setting(form) => undo_setting(
@@ -3359,6 +3379,7 @@ fn undo_setting(
             ));
         }
     }
+    let settings_present = found.is_some();
     let mut changes = Vec::new();
     let restored_bytes = match &form.before {
         Some(before) => {
@@ -3414,85 +3435,55 @@ fn undo_setting(
             None
         }
     };
-    // A setting placement may also have adopted its cache directory in place;
-    // that marker is part of the same record's undo.
-    let marker_changes = match &form.held_root {
-        Some(held) => remove_adopted_marker(
-            state,
-            dirs,
-            facts,
-            mounts,
-            record,
-            held,
-            effective_uid,
-            request.plan,
-        )?,
-        None => Vec::new(),
-    };
-    changes.extend(marker_changes);
+    // Observe both effects without removing either. Capture and verify the
+    // settings first and the marker second, before committing any mutation.
+    let marker = form
+        .held_root
+        .as_ref()
+        .map(|held| observe_adopted_marker(state, dirs, facts, mounts, record, held, effective_uid))
+        .transpose()?;
+    if let Some((_, marker_changes)) = &marker {
+        changes.extend(marker_changes.clone());
+    }
     if request.plan {
         return Ok(undo_report(request, record, changes));
     }
-    match (&form.before, restored_bytes) {
-        (Some(before), Some(restored)) => {
-            let name = file_name_of(&form.settings_path)?;
-            let (parent_handle, _) = open_parent(dirs, &form.settings_path)?;
-            let (after_facts, after_bytes) =
-                read_settings(dirs, &form.settings_path)?.ok_or_else(|| {
-                    unknown(format!(
-                        "{} disappeared while it was restored",
-                        form.settings_path.display()
-                    ))
-                })?;
-            if snapshot_of(&after_facts, &after_bytes)? != form.after {
-                return Err(diverged(
-                    &form.settings_path,
-                    &form.after.digest,
-                    "file identity or bytes changed before restore",
-                ));
+    let mut captured = undo_capture::Captures::new(state, dirs, record, effective_uid);
+    let setting_index = if settings_present {
+        Some(captured.file(&form.settings_path, form.after.clone())?)
+    } else {
+        None
+    };
+    let marker_index = match (&form.held_root, marker) {
+        (Some(held), Some((snapshot, _))) => Some(captured.marker(held, snapshot)?),
+        _ => None,
+    };
+    captured.capture_all()?;
+    if let Some(index) = setting_index {
+        match (&form.before, restored_bytes) {
+            (Some(before), Some(_)) if before.bytes == form.after.bytes => {
+                captured.return_unchanged(index)?;
             }
-            if after_bytes != restored {
-                let mode = if before.mode == 0 {
-                    after_facts.mode & 0o777
-                } else {
-                    before.mode
-                };
-                confirm_setting_at(dirs, &parent_handle, &name, &form.after)?;
-                dirs.publish_child_file(&parent_handle, &name, &restored, mode)?;
-                let (_, written) = read_settings(dirs, &form.settings_path)?.ok_or_else(|| {
-                    unknown(format!(
-                        "{} disappeared while it was restored",
-                        form.settings_path.display()
-                    ))
-                })?;
-                if written != restored {
-                    return Err(unknown(format!(
-                        "{} does not hold the bytes undo wrote",
-                        form.settings_path.display()
-                    )));
-                }
+            (Some(before), Some(restored)) => {
+                captured.restore_file(
+                    index,
+                    &restored,
+                    if before.mode == 0 {
+                        form.after.mode
+                    } else {
+                        before.mode
+                    },
+                )?;
+                captured.remove(index)?;
             }
-        }
-        (None, _) => {
-            if let Some((facts, bytes)) = read_settings(dirs, &form.settings_path)? {
-                if snapshot_of(&facts, &bytes)? != form.after {
-                    return Err(unknown("settings identity or bytes changed before unlink"));
-                }
-                let (parent, name) = open_parent(dirs, &form.settings_path)?;
-                if entry_identity(dirs, &form.settings_path)?
-                    != (form.after.device, form.after.inode)
-                {
-                    return Err(unknown("settings replaced before unlink"));
-                }
-                confirm_setting_at(dirs, &parent, &name, &form.after)?;
-                dirs.remove_child(&parent, &name, RemoveKind::File)?;
-            }
-        }
-        (Some(_), None) => {
-            return Err(unknown("the settings restore had no bytes to write"));
+            (None, _) => captured.remove(index)?,
+            (Some(_), None) => return Err(unknown("settings restore has no bytes")),
         }
     }
-    remove_record(state, &record.placement_id)?;
+    if let Some(index) = marker_index {
+        captured.remove(index)?;
+    }
+    captured.finish()?;
     Ok(UndoReport {
         plan: false,
         placement_id: record.placement_id.clone(),
@@ -3538,7 +3529,7 @@ fn undo_link(
     }
     // Custody is required before a link removal, exactly as it is before a swap
     // or a delete: the owned root must be the recorded one, and no same-uid
-    // process may hold it open. `remove_adopted_marker` needs the same proofs for
+    // process may hold it open. `observe_adopted_marker` needs the same proofs for
     // a held root; this is the link form's own.
     let observed = observed_link_root(state, dirs, facts, mounts, observer, record, form)?;
     changes.push(format!("remove the link {}", form.link_path.display()));
@@ -3552,14 +3543,9 @@ fn undo_link(
         return Ok(undo_report(request, record, changes));
     }
     take_link_custody(state, dirs, facts, mounts, observer, &observed)?;
-    let (parent, name) = open_parent(dirs, &form.link_path)?;
-    if form.published_identity != Some(entry_identity(dirs, &form.link_path)?)
-        || dirs.read_link(&form.link_path)?.as_ref() != Some(&form.target)
-    {
-        return Err(unknown(
-            "published link identity or text changed before unlink",
-        ));
-    }
+    let identity = form
+        .published_identity
+        .ok_or_else(|| unknown("published link identity is missing; undo refuses"))?;
     let restore_mode = if form.restore == LinkRestore::EmptyDirectory {
         Some(
             form.original_mode
@@ -3568,27 +3554,15 @@ fn undo_link(
     } else {
         None
     };
-    let current = dirs
-        .child_facts(&parent, &name)?
-        .ok_or_else(|| unknown("link vanished before unlink"))?;
-    if current.kind != EntryKind::Symlink
-        || form.published_identity != Some((current.device.get(), current.inode))
-    {
-        return Err(unknown("link replaced immediately before unlink"));
-    }
-    dirs.remove_child(&parent, &name, RemoveKind::File)?;
+    let mut captured = undo_capture::Captures::new(state, dirs, record, observer.effective_uid()?);
+    let index = captured.link(&form.link_path, identity)?;
+    captured.capture_all()?;
     if let Some(mode) = restore_mode {
-        let identity = dirs.create_child_dir(&parent, &name, mode)?;
-        let opened = dirs.open_child_dir(&parent, &name)?;
-        if opened.identity() != identity {
-            return Err(Error::new(
-                ErrorKind::RefusedContainment,
-                format!("{} changed while it was restored", form.link_path.display()),
-            ));
-        }
-        dirs.set_dir_mode(&opened, mode)?;
+        let (parent, name) = open_parent(dirs, &form.link_path)?;
+        restore_empty_directory(dirs, &parent, &name, mode)?;
     }
-    remove_record(state, &record.placement_id)?;
+    captured.remove(index)?;
+    captured.finish()?;
     Ok(UndoReport {
         plan: false,
         placement_id: record.placement_id.clone(),
@@ -3716,7 +3690,7 @@ fn take_link_custody(
 /// device, and its marker bytes digest to the recorded digest. Anything else is
 /// unknown state and nothing is removed.
 #[allow(clippy::too_many_arguments)]
-fn remove_adopted_marker(
+fn observe_adopted_marker(
     state: &StatePaths,
     dirs: &dyn DirOps,
     facts: &dyn VolumeFacts,
@@ -3724,8 +3698,7 @@ fn remove_adopted_marker(
     record: &PlacementRecord,
     held: &HeldRoot,
     effective_uid: u32,
-    plan: bool,
-) -> Result<Vec<String>> {
+) -> Result<(SettingsSnapshot, Vec<String>)> {
     // The marker lives on the volume, so the volume must be the recorded one
     // before the directory's identity is proved.
     let volume = area::registered_volume(state, &record.volume_uuid)?;
@@ -3752,6 +3725,9 @@ fn remove_adopted_marker(
         .with_detail("recorded_inode", held.inode.into()));
     }
     let handle = dirs.open_path(&held.path)?;
+    if (handle.identity().device.get(), handle.identity().inode) != (held.device, held.inode) {
+        return Err(unknown("held root changed between observation and open"));
+    }
     let expectation = MarkerExpectation {
         volume_uuid: &record.volume_uuid,
         resolved_path: &held.path,
@@ -3775,22 +3751,20 @@ fn remove_adopted_marker(
             .with_detail("path", held.path.display().to_string().into()))
         }
     }
-    if !plan {
-        match dirs.remove_child(&handle, area::ROOT_MARKER_FILE, RemoveKind::File)? {
-            crate::os::ChildRemoval::Absent => {
-                return Err(unknown(format!(
-                    "the marker in {} disappeared while undo ran",
-                    held.path.display()
-                )))
-            }
-            crate::os::ChildRemoval::Removed | crate::os::ChildRemoval::NotEmpty => {}
-        }
+    let path = held.path.join(area::ROOT_MARKER_FILE);
+    let (marker_facts, bytes) = read_settings(dirs, &path)?
+        .ok_or_else(|| unknown("adopted marker disappeared while observed"))?;
+    if sha256_hex(&bytes) != held.marker_digest {
+        return Err(unknown("adopted marker changed after observation"));
     }
-    Ok(vec![format!(
-        "remove the marker {} wrote in {}; nothing else is touched",
-        area::ROOT_MARKER_FILE,
-        held.path.display()
-    )])
+    Ok((
+        snapshot_of(&marker_facts, &bytes)?,
+        vec![format!(
+            "remove the marker {} wrote in {}; nothing else is touched",
+            area::ROOT_MARKER_FILE,
+            held.path.display()
+        )],
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3822,7 +3796,7 @@ fn undo_held(
             }
         }
     }
-    let changes = remove_adopted_marker(
+    let (snapshot, changes) = observe_adopted_marker(
         state,
         dirs,
         facts,
@@ -3830,12 +3804,15 @@ fn undo_held(
         record,
         &form.held_root,
         effective_uid,
-        request.plan,
     )?;
     if request.plan {
         return Ok(undo_report(request, record, changes));
     }
-    remove_record(state, &record.placement_id)?;
+    let mut captured = undo_capture::Captures::new(state, dirs, record, effective_uid);
+    let index = captured.marker(&form.held_root, snapshot)?;
+    captured.capture_all()?;
+    captured.remove(index)?;
+    captured.finish()?;
     Ok(UndoReport {
         plan: false,
         placement_id: record.placement_id.clone(),
@@ -5476,13 +5453,9 @@ mod tests {
         fixture.adopt(&request).unwrap();
         let dirs = crate::testkit::Faults::new();
         let name = original.clone();
-        let calls = std::cell::Cell::new(0usize);
-        *dirs.observe_probe.borrow_mut() = Some(Box::new(move |entry| {
+        *dirs.capture_probe.borrow_mut() = Some(Box::new(move |entry| {
             if entry == ".npmrc" {
-                calls.set(calls.get() + 1);
-                if calls.get() == 3 {
-                    std::fs::write(&name, b"cache=/concurrent-edit\n").unwrap();
-                }
+                std::fs::write(&name, b"cache=/concurrent-edit\n").unwrap();
             }
         }));
         assert!(undo(
@@ -5540,6 +5513,213 @@ mod tests {
         assert!(original.is_symlink());
         assert_eq!(read_placements(&fixture.state).unwrap().records.len(), 1);
     }
+    #[test]
+    fn replaced_link_at_the_capture_syscall_is_preserved_and_recorded() {
+        let fixture = Fixture::new("cache-link-capture-race");
+        std::fs::create_dir_all(fixture.home.path().join(".cargo")).unwrap();
+        fixture
+            .adopt(&fixture.request(CacheKind::CargoRegistry))
+            .unwrap();
+        let path = fixture.home.path().join(".cargo/registry");
+        let old = fixture.home.path().join("original-link");
+        let moved = path.clone();
+        let dirs = crate::testkit::Faults::new();
+        *dirs.capture_probe.borrow_mut() = Some(Box::new(move |name| {
+            if name == "registry" {
+                std::fs::rename(&moved, &old).unwrap();
+                std::fs::write(&moved, b"raced file must survive").unwrap();
+            }
+        }));
+        let result = undo(
+            &fixture.state,
+            &dirs,
+            fixture.facts.as_ref(),
+            &fixture.volume.mounts(),
+            &fixture.volume.observer(),
+            &UndoRequest {
+                placement_id: None,
+                kind: Some(CacheKind::CargoRegistry),
+                plan: false,
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"raced file must survive");
+        let bytes = std::fs::read(super::undo_capture::journal_path(
+            &fixture.state,
+            CacheKind::CargoRegistry,
+        ))
+        .unwrap();
+        let journal: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(journal["phase"].as_str().unwrap().starts_with("refused:"));
+        assert_eq!(journal["effects"][0]["put_back"], "renamed");
+        assert_eq!(read_placements(&fixture.state).unwrap().records.len(), 1);
+        assert!(fixture
+            .undo(&UndoRequest {
+                placement_id: None,
+                kind: Some(CacheKind::CargoRegistry),
+                plan: false
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn settings_replaced_at_capture_are_neither_overwritten_nor_removed() {
+        for existing in [false, true] {
+            let fixture = Fixture::new("cache-setting-capture-race");
+            let path = fixture.home.path().join(".npmrc");
+            if existing {
+                std::fs::write(&path, b"cache=/old\n").unwrap();
+            }
+            let mut request = fixture.request(CacheKind::NpmCache);
+            request.write_setting = true;
+            fixture.adopt(&request).unwrap();
+            let old = fixture.home.path().join("adopted-setting");
+            let moved = path.clone();
+            let dirs = crate::testkit::Faults::new();
+            *dirs.capture_probe.borrow_mut() = Some(Box::new(move |name| {
+                if name == ".npmrc" {
+                    std::fs::rename(&moved, &old).unwrap();
+                    std::fs::write(&moved, b"concurrent setting edit\n").unwrap();
+                }
+            }));
+            assert!(undo(
+                &fixture.state,
+                &dirs,
+                fixture.facts.as_ref(),
+                &fixture.volume.mounts(),
+                &fixture.volume.observer(),
+                &UndoRequest {
+                    placement_id: None,
+                    kind: Some(CacheKind::NpmCache),
+                    plan: false
+                }
+            )
+            .is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"concurrent setting edit\n");
+            assert_eq!(read_placements(&fixture.state).unwrap().records.len(), 1);
+        }
+    }
+
+    #[test]
+    fn marker_capture_race_puts_settings_and_foreign_marker_back_without_unlink() {
+        let fixture = Fixture::new("cache-setting-marker-capture-race");
+        let target = fixture.caches().join("npm");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("payload"), b"cache data").unwrap();
+        let path = fixture.home.path().join(".npmrc");
+        std::fs::write(&path, format!("cache={}\n", target.display())).unwrap();
+        let mut request = fixture.request(CacheKind::NpmCache);
+        request.adopt_existing_root = true;
+        fixture.adopt(&request).unwrap();
+        let setting = std::fs::read(&path).unwrap();
+        let marker = target.join(area::ROOT_MARKER_FILE);
+        let moved = marker.clone();
+        let old = target.join("original-marker");
+        let dirs = crate::testkit::Faults::new();
+        *dirs.capture_probe.borrow_mut() = Some(Box::new(move |name| {
+            if name == area::ROOT_MARKER_FILE {
+                std::fs::rename(&moved, &old).unwrap();
+                std::fs::write(&moved, b"foreign marker").unwrap();
+            }
+        }));
+        assert!(undo(
+            &fixture.state,
+            &dirs,
+            fixture.facts.as_ref(),
+            &fixture.volume.mounts(),
+            &fixture.volume.observer(),
+            &UndoRequest {
+                placement_id: None,
+                kind: Some(CacheKind::NpmCache),
+                plan: false
+            }
+        )
+        .is_err());
+        assert_eq!(std::fs::read(path).unwrap(), setting);
+        assert_eq!(std::fs::read(marker).unwrap(), b"foreign marker");
+        assert_eq!(
+            std::fs::read(target.join("payload")).unwrap(),
+            b"cache data"
+        );
+    }
+
+    #[test]
+    fn a_taken_original_name_keeps_both_the_foreign_entry_and_capture() {
+        let fixture = Fixture::new("cache-undo-taken-name");
+        std::fs::create_dir_all(fixture.home.path().join(".cargo")).unwrap();
+        fixture
+            .adopt(&fixture.request(CacheKind::CargoRegistry))
+            .unwrap();
+        let dirs = crate::testkit::Faults::new();
+        dirs.occupying_after_capture("registry");
+        assert!(undo(
+            &fixture.state,
+            &dirs,
+            fixture.facts.as_ref(),
+            &fixture.volume.mounts(),
+            &fixture.volume.observer(),
+            &UndoRequest {
+                placement_id: None,
+                kind: Some(CacheKind::CargoRegistry),
+                plan: false
+            }
+        )
+        .is_err());
+        let parent = fixture.home.path().join(".cargo");
+        assert_eq!(
+            std::fs::read(parent.join("registry")).unwrap(),
+            b"a racer took this name back"
+        );
+        let journal: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(super::undo_capture::journal_path(
+                &fixture.state,
+                CacheKind::CargoRegistry,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(journal["effects"][0]["put_back"], "taken");
+        let private = journal["effects"][0]["private"].as_str().unwrap();
+        assert!(parent.join(private).is_symlink());
+    }
+
+    #[test]
+    fn late_settings_divergence_keeps_the_adopted_marker() {
+        let fixture = Fixture::new("cache-setting-marker-late-edit");
+        let target = fixture.caches().join("npm");
+        std::fs::create_dir_all(&target).unwrap();
+        let path = fixture.home.path().join(".npmrc");
+        std::fs::write(&path, format!("cache={}\n", target.display())).unwrap();
+        let mut request = fixture.request(CacheKind::NpmCache);
+        request.adopt_existing_root = true;
+        fixture.adopt(&request).unwrap();
+        let marker = target.join(area::ROOT_MARKER_FILE);
+        let original_marker = std::fs::read(&marker).unwrap();
+        let edited = path.clone();
+        let fired = std::cell::Cell::new(false);
+        let dirs = crate::testkit::Faults::new();
+        *dirs.observe_probe.borrow_mut() = Some(Box::new(move |name| {
+            if name == area::ROOT_MARKER_FILE && !fired.replace(true) {
+                std::fs::write(&edited, b"cache=/concurrent\n").unwrap();
+            }
+        }));
+        assert!(undo(
+            &fixture.state,
+            &dirs,
+            fixture.facts.as_ref(),
+            &fixture.volume.mounts(),
+            &fixture.volume.observer(),
+            &UndoRequest {
+                placement_id: None,
+                kind: Some(CacheKind::NpmCache),
+                plan: false
+            }
+        )
+        .is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"cache=/concurrent\n");
+        assert_eq!(std::fs::read(marker).unwrap(), original_marker);
+    }
+
     #[test]
     fn interrupted_marker_readback_recovers_only_the_planned_marker() {
         let fixture = Fixture::new("cache-marker-intent-readback");
