@@ -2291,14 +2291,11 @@ Choices S4 made where this design left the mechanic to the slice:
 - **A failed ordinary detach keeps the backing.** Cleanup detaches ordinarily and
   stops there: it never force-detaches by mount path, and a failed detach leaves
   the image attached and its backing in place and makes the receipt unqualified.
-  The proof uses no forced detach at all. The pull case is the brief's ordinary
-  detach mid-delete; if that ordinary detach is refused, the case is left
-  unproved rather than satisfied by a forced detach of the same image. The pull
-  case pauses the captured unit via the proof-only interposer, kills its owned
-  process group, confirms it empty, then detaches ordinarily and replays.
+  The amended brief permits one forced detach in the live pull case, only after
+  rebinding the owned image and whole disk. Every other detach remains ordinary.
 - **The native's oracles are the design's behaviours.** The allocation case
   launches both allocations before awaiting either; the pull case uses the
-  ordinary detach mid-delete (a refusal leaves it unproved), and checks the
+  approved forced owned-image pull mid-delete, and checks the
   quarantine leaf and its recorded device and inode *after* re-attaching, before
   the replay.
 - **The native ENOTEMPTY injection.** The fixed case compiles a proof-only
@@ -2392,7 +2389,8 @@ together, on owned scratch only:
   and prove the unconcluded one survives; plant Finder metadata plus an unknown
   entry and prove the delete stops and the root survives; delete a clean root
   whole and prove the marker is removed last; inject `ENOTEMPTY` and prove the
-  pending intent; pull the volume (ordinary `hdiutil detach`) mid-delete and
+  pending intent; force-detach only the positively rebound owned whole disk
+  while the CLI holds the captured unit mid-delete, then
   prove a pending intent with the quarantine leaf kept, then replay after
   re-attach; prove a stale mount point is never written to; plant one Oxide
   marker, one Effigy marker and one unmarked unit, prove all three survive with
@@ -2408,7 +2406,8 @@ together, on owned scratch only:
   absent-volume refusal, then replay after re-attach. A forced detach of the
   proof image's own positively identified whole-disk device is allowed in this
   one case only as a fallback, if the ordinary-only proof cannot be made to
-  work. That needs its own brief amendment and fresh proofs. Every other
+  work. Brief v3 authorizes this fallback with fresh proofs after the
+  crash-then-detach alternative failed to demonstrate a live pull. Every other
   detach stays ordinary.
 
 ### HIGH premise checklist and elevation path

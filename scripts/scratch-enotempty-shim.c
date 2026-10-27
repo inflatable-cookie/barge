@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <signal.h>
 
 static dev_t target_dev;
 static ino_t target_ino;
@@ -20,6 +21,9 @@ static const char *pause_log;
 static dev_t pause_dev;
 static ino_t pause_ino;
 static int pause_ready;
+static volatile sig_atomic_t pause_released;
+
+static void release_pause(int signo) { (void)signo; pause_released = 1; }
 
 __attribute__((constructor)) static void configure(void) {
     struct stat st;
@@ -29,7 +33,7 @@ __attribute__((constructor)) static void configure(void) {
         && lstat(pause_path, &st) == 0 && S_ISDIR(st.st_mode)) {
         pause_dev = st.st_dev;
         pause_ino = st.st_ino;
-        pause_ready = 1;
+        if (signal(SIGUSR1, release_pause) != SIG_ERR) pause_ready = 1;
     }
     target_path = getenv("BARGE_PROOF_ENOTEMPTY_PATH");
     log_path = getenv("BARGE_PROOF_ENOTEMPTY_LOG");
@@ -54,7 +58,8 @@ static int proof_unlinkat(int dirfd, const char *path, int flags) {
                 (unsigned long long)pause_dev, (unsigned long long)pause_ino);
             if (length > 0 && (size_t)length < sizeof(line) && write(fd, line, (size_t)length) == length) {
                 (void)close(fd);
-                for (;;) (void)pause();
+                while (!pause_released) (void)usleep(10000);
+                pause_ready = 0;
             }
             (void)close(fd);
         }

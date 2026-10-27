@@ -21,8 +21,8 @@ guard's image is really deleted by `barge scratch expire`, so the custody scan
 that decides it is the Barge binary's own same-uid scan with the product's bounds
 and barge#012's bounded EPERM re-observation. A product custody refusal
 classifies the run `infrastructure` and aborts unqualified (exit 4) before any
-case. The proof uses no forced detach: the pull case is the brief's ordinary
-detach, and a refusal leaves it unproved.
+case. The live pull case force-detaches only its rebound owned whole disk; all
+other detaches are ordinary, and an uncertain detach leaves the proof unqualified.
 """
 
 import argparse

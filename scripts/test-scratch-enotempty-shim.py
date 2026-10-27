@@ -93,16 +93,28 @@ def main():
                 raise RuntimeError("the pause did not pin and hold the renamed unit")
             if not (root / "quarantined" / "payload").exists() or (root / "pass-unit" / "other").exists():
                 raise RuntimeError("the pause target or unrelated pass-through was wrong")
+            os.kill(process.pid, signal.SIGUSR1)
+            if process.wait(timeout=5) != 0 or (root / "quarantined" / "payload").exists():
+                raise RuntimeError("the released pause did not resume the original unlink")
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=5)
-        if process.returncode != -signal.SIGKILL:
-            raise RuntimeError("the paused child did not stop by SIGKILL")
         # The case must observe `removed`, never infer it from `deleted`.
         spec = importlib.util.spec_from_file_location("scratch_proof", SOURCE.with_name("test-scratch-expiry.py"))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        evidence_dir = root / "evidence"
+        evidence_dir.mkdir()
+        backing = root / "backing"
+        backing.write_bytes(b"fixture backing")
+        retained = pathlib.Path(module.retain_backing(str(backing), str(evidence_dir), str(root)))
+        if retained.stat().st_ino != backing.stat().st_ino:
+            raise RuntimeError("retained backing does not share the original inode")
+        backing.unlink()
+        if retained.read_bytes() != b"fixture backing":
+            raise RuntimeError("retained backing was lost with the original name")
+        retained.unlink()
         proof = module.Proof("unused", None, False)
         proof.state = str(root / "state")
         journal_dir = root / "state" / "intents"
