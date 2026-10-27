@@ -21,7 +21,8 @@ both and handle unknown versions rather than assuming a compatible shape. The
 The planner runs `effigy barge:install` or `effigy barge:reinstall` only after
 reviewed merge; Tom must authorize the first host install. Set
 `BARGE_INSTALL_PIN` to a pushed-main commit and `BARGE_INSTALL_SCRATCH` to an
-existing private owned scratch directory. The installer authenticates the pin
+fresh, empty, private owned scratch directory with a short path (Oxide
+requires a Unix-socket path no longer than 91 bytes). The installer authenticates the pin
 against origin/main, builds its archive offline and locked using Oxide, verifies
 the binary's build identity, and installs at `~/.local/bin/barge`. Initial
 install refuses an existing PATH entry or destination. Reinstall replaces only

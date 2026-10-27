@@ -21,7 +21,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 HOME = Path(os.environ["HOME"])
@@ -200,16 +199,16 @@ def build_environment(staging, pin, instance):
                    and not k.startswith("OXIDE_")}
     for name in ("TMPDIR", "TMP", "TEMP"):
         environment[name] = str(staging)
-    environment["OXIDE_POOL"] = str(staging / "pool")
-    environment["OXIDE_CONFIG"] = str(staging / "oxide.toml")
-    (staging / "oxide.toml").write_text("")
+    environment["OXIDE_POOL"] = str(staging / "p")
+    environment["OXIDE_CONFIG"] = str(staging / "o.toml")
+    (staging / "o.toml").write_text("")
     environment[BUILD_PIN_VARIABLE] = pin
     environment[BUILD_INSTANCE_VARIABLE] = instance
     return environment
 
 
 def build(pin, instance, staging):
-    source = staging / "source"
+    source = staging / "s"
     source.mkdir()
     (source / "target").mkdir()
     archive = subprocess.Popen(
@@ -320,6 +319,17 @@ def install(built, expected):
     return built_hash, installed
 
 
+def cleanup_staging(staging):
+    """Remove only the installer-owned entries, never the caller's directory."""
+    for name in ("s", "p"):
+        item = staging / name
+        if item.exists():
+            shutil.rmtree(item)
+    config = staging / "o.toml"
+    if config.exists():
+        config.unlink()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -348,7 +358,13 @@ def main():
                 or not stat.S_ISDIR(info.st_mode)
                 or info.st_uid != os.getuid() or info.st_mode & 0o022):
             raise Refusal("BARGE_INSTALL_SCRATCH must be an absolute, private, owned real directory")
-        staging = Path(tempfile.mkdtemp(prefix="barge-install.", dir=scratch))
+        if any(scratch.iterdir()):
+            raise Refusal("BARGE_INSTALL_SCRATCH must be empty and exclusively owned")
+        socket_bound = scratch / "p/payload/slots/s-12345678/quick-1/scratch"
+        if len(os.fsencode(socket_bound)) > 91:
+            raise Refusal("BARGE_INSTALL_SCRATCH is too long for Oxide's socket bound")
+        staging = scratch
+        (staging / "p").mkdir()
         print(f"staging {staging}")
         instance = new_instance()
         built, versions = build(pin, instance, staging)
@@ -360,7 +376,7 @@ def main():
     except (Refusal, subprocess.CalledProcessError, OSError, KeyError, ValueError) as error:
         print(f"barge:install refused: {error}", file=sys.stderr)
         if staging is not None:
-            shutil.rmtree(staging)
+            cleanup_staging(staging)
         return 1
     receipt = {
         "mode": "initial" if previous is None else "replace",
@@ -383,9 +399,9 @@ def main():
     except (Refusal, OSError) as error:
         print(f"barge:install installed but cannot write a receipt: {error}", file=sys.stderr)
         print(json.dumps(receipt, indent=2))
-        shutil.rmtree(staging)
+        cleanup_staging(staging)
         return 1
-    shutil.rmtree(staging)
+    cleanup_staging(staging)
     print(json.dumps(receipt, indent=2))
     print(f"receipt {path}")
     return 0
