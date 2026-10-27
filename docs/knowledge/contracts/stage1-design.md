@@ -2399,12 +2399,17 @@ Choices S7 made where this design left the mechanic to the slice:
   immediately before its effect starts, and again after each attempt, so a slow
   re-assessment can never let an effect begin inside the stop window. The clock
   also travels into the deletion and the replay themselves (`DeleteBounds.deadline`),
-  which check it at their own durable boundaries: once it is spent no intent record
-  is written (the unit is kept with a per-unit refusal and nothing is journaled), no
-  quarantine rename starts (the intent stays pending for a later replay), and a
-  replay's first durable step is not taken. Slow locks, a slow registry re-read or a
-  slow custody scan therefore cannot carry an effect past the stop window, however
-  much preflight they consume. So neither a stage with many units nor a long journal
+  which check it at their own durable boundaries. A deletion checks it **after the
+  volume, unit and intent-write locks are held and immediately before the intent
+  record is published**, so a lock wait cannot carry the record past the stop
+  window: a spent clock writes no intent, journals nothing and keeps the unit. It
+  checks again immediately before the quarantine rename, so no destructive step
+  starts on a spent clock and the intent stays pending for a later replay. A replay
+  checks it **before it can do anything at all** — its first possible durable act
+  is the settle that follows an absent folder or parent at the `removed` phase — and
+  again after its own preflight and locks, so an overrun never records a completion.
+  Slow locks, a slow registry re-read or a slow custody scan therefore cannot carry
+  an effect past the stop window, however much preflight they consume. So neither a stage with many units nor a long journal
   of earlier intents can outlive the run's bound and then be reported as a success. Reaching it sets `timed_out`,
   reports every stage and candidate the run did not reach with counts, and forces
   exit `3` — including when the plan had no candidate at all and only a replay

@@ -2709,7 +2709,7 @@ mod tests {
         assert!(
             area_stage.skipped.rows[0]
                 .reason
-                .contains("first durable step"),
+                .contains("intent was published"),
             "{}",
             area_stage.skipped.rows[0].reason
         );

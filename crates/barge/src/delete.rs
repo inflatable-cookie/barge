@@ -512,18 +512,18 @@ pub(crate) fn delete_unit_authorized(
         captures: Vec::new(),
         foreign_captures: Vec::new(),
     };
-    // The first durable step is this intent record. The preflight above — locks,
-    // the registry re-read, the area and parent walks, the custody scan — can be
-    // slow, so the caller's clock is checked here, at that boundary: a spent clock
-    // leaves no record and no effect behind, and the unit is kept.
+    let write = locks.begin_intent_write()?;
+    // The first durable step is this intent record, and the lock waits above (and
+    // the whole preflight before them) can consume the stop window. The clock is
+    // therefore checked here, at the last moment before the record: a spent clock
+    // writes no intent, changes nothing, and keeps the unit.
     if expired(bounds.deadline) {
         return Err(Error::new(
             ErrorKind::RefusedBoundary,
-            "the run's wall clock was reached before this deletion's first durable step; the unit is kept",
+            "the run's wall clock was reached before this deletion's intent was published; the unit is kept",
         )
         .with_detail("unit", unit.name.clone().into()));
     }
-    let write = locks.begin_intent_write()?;
     state::publish_intent(&write, state_paths, &intent)?;
 
     // The effect may not start on a custody verdict that has aged: it is
@@ -2627,6 +2627,12 @@ fn replay_one(
     intent: &IntentRecord,
     bounds: DeleteBounds,
 ) -> Result<ReplayOutcome> {
+    // The clock is checked before anything this replay can do, because the first
+    // thing it can do is durable: the settle that follows an absent folder or
+    // parent at the `removed` phase. A spent clock leaves that intent pending.
+    if expired(bounds.deadline) {
+        return Ok(ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned()));
+    }
     let opened = area::open_folder(
         dirs,
         facts,
@@ -3888,7 +3894,7 @@ mod tests {
         .expect_err("a spent clock refuses before the first durable step");
         assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
         assert!(
-            error.message().contains("first durable step"),
+            error.message().contains("intent was published"),
             "{}",
             error.message()
         );
@@ -3990,6 +3996,57 @@ mod tests {
             report.pending[0].reason
         );
         assert_eq!(prepared.pending_intents().len(), 1);
+    }
+
+    #[test]
+    fn a_spent_deadline_never_settles_a_removed_intent_on_an_absent_folder() {
+        let prepared = prepared("replay-deadline-removed");
+        let root = prepared.unit_path().clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        publish(&prepared, &[]);
+        rename_to_quarantine(&prepared);
+        std::fs::remove_dir_all(prepared.quarantine()).expect("the leaf is removed");
+        publish(
+            &prepared,
+            &[
+                IntentPhase::Renamed,
+                IntentPhase::MarkerLast,
+                IntentPhase::Removed,
+            ],
+        );
+        // The area folder itself is gone, which is the replay's earliest durable
+        // decision: at the `removed` phase it would settle. A spent clock must stop
+        // it before that, so no completion is recorded on an overrun.
+        std::fs::remove_dir_all(&prepared.area).expect("the area folder is removed");
+
+        let faults = Faults::new();
+        let facts = prepared.fixture.facts();
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let report = replay_with(
+            &prepared.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            prepared.bounds(),
+            Some(Instant::now()),
+        )
+        .expect("the replay reports");
+        assert_eq!(report.settled, 0, "{report:?}");
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(
+            report.pending[0].reason.contains("wall clock"),
+            "{}",
+            report.pending[0].reason
+        );
+        let intents = prepared.pending_intents();
+        assert_eq!(intents.len(), 1, "the intent stays pending");
+        assert_eq!(
+            intents[0].phase,
+            IntentPhase::Removed,
+            "no settle was recorded"
+        );
     }
 
     #[test]
