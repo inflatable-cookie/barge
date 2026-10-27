@@ -6272,8 +6272,37 @@ mod tests {
             .rows
             .iter()
             .any(|row| row.name == "underlay" && row.reason.contains("eight-character")));
-        // A top_level_adhoc claim reads the folder itself as one ad-hoc unit.
+        let run = harness.scratch().join("underlay");
+        assert!(
+            !reaper_units(&harness.scratch(), now).contains(&run),
+            "the host reaper does not delete this eight-character directory as a unit"
+        );
+        let no_claim = harness.expire_at(now, &bare.plan_digest);
+        assert_eq!(no_claim.deleted.count, 0);
+        assert!(
+            run.is_dir(),
+            "the real sweep keeps the unit without a claim"
+        );
+        // The ruled exception: a top-level claim reads the folder itself as one unit.
         harness.adhoc_claim(14 * 24 * 60 * 60);
+        let conflicting = ScratchClaim {
+            scope: ClaimScope::Project {
+                name: "underlay".to_owned(),
+            },
+            unit: ClaimUnit::Child,
+            unmarked_idle_seconds: 60,
+            families_excluded: vec![],
+            declared_by: "operator".to_owned(),
+            declared_ms: state::now_ms(),
+        };
+        let error = declare_claim(
+            &harness.fixture.state,
+            &harness.fixture.uuid,
+            &conflicting,
+            false,
+        )
+        .expect_err("project and top-level claims cannot overlap");
+        assert_eq!(error.kind(), ErrorKind::Usage);
         let adhoc = harness.plan_at(now);
         assert_eq!(adhoc.plan.candidates.count, 1);
         assert_eq!(adhoc.plan.candidates.rows[0].name, "underlay");

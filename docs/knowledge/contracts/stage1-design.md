@@ -664,9 +664,11 @@ the data:
   ([registry](#registry-of-volumes)); one claim per scope, with its declared
   idle age, unit shape and excluded families.
 - `scope.kind` is `project` (children of `<scratch>/<project>/`) or
-  `top_level_adhoc` (entries directly under `<scratch>/` whose name contains a
-  dot, or that are not directories, matching the reaper's units). A claim never
-  covers the scratch root as a whole and never covers a named project folder.
+  `top_level_adhoc` (entries directly under `<scratch>/` that are files, have a
+  dot in their name, or are bare eight-character directories under the O-005
+  collision ruling). That last case is a ruled exception to the reaper's set;
+  without a claim it is kept. A claim never covers the scratch root as a whole;
+  an eight-character project claim and a top-level claim cannot overlap.
 - A claimed unit is eligible only when it carries no marker of any recognised
   family, is not a symlink at any level, the owning project folder (when the
   scope is a project) has a valid claim, the newest entry in the unit is older
@@ -2330,10 +2332,11 @@ that are files or have a dot in the name; a unit goes once its newest entry is
 fourteen days old and no process has it open; it never follows a symlink, never
 deletes outside `scratch/`, skips the `oxide` project and Effigy-marked and
 bare eight-character directories, keeps a busy unit, retries `ENOTEMPTY` and
-stops at a run budget. Barge must reach the same set of deletable units only
-through recorded grants, and must be at least as conservative on every one of
-those conditions; the test asserts both the equivalence under grants and the
-difference without them (nothing deleted, everything reported).
+stops at a run budget. Through recorded grants, Barge reaches the same set and
+is at least as conservative on those conditions, apart from the explicit O-005
+ruling: an unmarked bare eight-character directory can be deleted as one unit
+under a top-level claim, although the reaper skips it. The tests pin both that
+exception and the no-grant result (nothing deleted, everything reported).
 
 ### Test fixtures on the real OS
 

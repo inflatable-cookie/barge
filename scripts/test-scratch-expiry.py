@@ -33,6 +33,7 @@ receipt, because premise 6 requires naming each one.
 """
 
 import argparse
+import ast
 import hashlib
 import inspect
 import json
@@ -91,6 +92,8 @@ ENVIRONMENT = {
     "TEMP": "the guard's owned scratch, kept equal to TMPDIR",
     "BARGE_STATE_DIR": "the private fixture state directory this proof creates",
     "BARGE_PROOF_BIN": "the barge binary this proof exercises",
+    "BARGE_PROOF_SUPERVISOR": "the optional path to the hash-pinned Oxide supervisor",
+    "OXIDE_PROOF_EVIDENCE": "the supervisor's evidence directory for the default receipt",
     "HOME": "a private fixture home, so no real account state is read or written",
     "CARGO_HOME": "a private fixture Cargo home; this proof builds nothing",
 }
@@ -1250,7 +1253,7 @@ class Proof:
             missing = [need for need in needs if need not in passed]
             skip = Skip(f"a dependency did not pass: {', '.join(missing)}") if missing else None
             if skip is None and self.fault is not None:
-                skip = Skip("a diagnostic fault is latched; only the fault's dependents are skipped")
+                skip = Skip("a diagnostic fault is latched; all remaining cases depend on the failed case in the linear chain")
             if skip is not None:
                 self.results.append({"case": name, "status": "skipped", "detail": str(skip)})
                 continue
@@ -1318,6 +1321,7 @@ class Proof:
             "case_evidence": self.case_evidence,
             "premises": PREMISES,
             "environment": sorted(ENVIRONMENT),
+            "environment_purposes": dict(ENVIRONMENT),
             "supervisor_sha256": SUPERVISOR_SHA256,
             "bin_sha256": sha256_file(self.binary) if os.path.isfile(self.binary) else None,
             "owned_scratch": self.root,
@@ -1450,6 +1454,73 @@ def preflight_problems():
     return problems
 
 
+def environment_hooks(source):
+    """Find explicitly accessed or assigned environment keys in one proof source.
+
+    The proof uses os.environ and the child environment dictionaries `env` and
+    `self.env`. Reject computed keys and dynamic updates so they cannot silently
+    escape the inventory. Copying the inherited environment itself does not name
+    a hook; individual accesses and child overrides do.
+    """
+    hooks = set()
+    problems = []
+
+    def environment(node):
+        return (isinstance(node, ast.Name) and node.id == "env") or (
+            isinstance(node, ast.Attribute) and (
+                (isinstance(node.value, ast.Name) and node.value.id == "os" and node.attr == "environ")
+                or (isinstance(node.value, ast.Name) and node.value.id == "self" and node.attr == "env")
+            )
+        )
+
+    def add_key(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            hooks.add(node.value)
+        else:
+            problems.append("an environment key is not a literal")
+
+    for node in ast.walk(ast.parse(source)):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "os"
+                and node.func.attr == "getenv"):
+            if node.args:
+                add_key(node.args[0])
+            else:
+                problems.append("an environment read has no key")
+        elif isinstance(node, ast.Subscript) and environment(node.value):
+            add_key(node.slice)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and environment(node.func.value)):
+            if node.func.attr == "get" and node.args:
+                add_key(node.args[0])
+            elif node.func.attr == "update" and not node.args:
+                for keyword in node.keywords:
+                    if keyword.arg is None:
+                        problems.append("an environment update has dynamic keys")
+                    else:
+                        hooks.add(keyword.arg)
+            else:
+                problems.append(f"an environment operation cannot be inventoried: {node.func.attr}")
+    return hooks, problems
+
+
+def environment_inventory_problems(sources, declared):
+    hooks = set()
+    problems = []
+    for source in sources:
+        found, errors = environment_hooks(source)
+        hooks.update(found)
+        problems.extend(errors)
+    for name in sorted(hooks - set(declared)):
+        problems.append(f"the environment record omits {name}")
+    for name in sorted(set(declared) - hooks):
+        problems.append(f"the environment record names an unused hook {name}")
+    for name, purpose in declared.items():
+        if not isinstance(purpose, str) or not purpose.strip():
+            problems.append(f"the environment hook {name} has no recorded purpose")
+    return problems
+
+
 def self_check():
     """The proof's own apparatus: the case map and its dispatch, pins, premises.
 
@@ -1464,7 +1535,10 @@ def self_check():
         problems.append("the case map does not name nine distinct cases")
     known = set(names)
     seen = set()
-    for name, needs in CASES:
+    for index, (name, needs) in enumerate(CASES):
+        expected_needs = [] if index == 0 else [CASES[index - 1][0]]
+        if needs != expected_needs:
+            problems.append(f"{name} does not follow the linear dependency chain")
         for need in needs:
             if need not in known:
                 problems.append(f"{name} depends on unknown case {need}")
@@ -1538,16 +1612,22 @@ def self_check():
         problems.append("the expiry evidence projection does not tolerate an empty document")
     if len(PREMISES) != 9:
         problems.append("the premise record does not name nine premises")
-    for hook in ("TMPDIR", "BARGE_STATE_DIR", "BARGE_PROOF_BIN", "HOME", "CARGO_HOME"):
-        if hook not in ENVIRONMENT:
-            problems.append(f"the environment record omits {hook}")
-    for hook in ENVIRONMENT.values():
-        if not hook:
-            problems.append("an environment hook has no recorded purpose")
-    if not set(ENVIRONMENT) <= {
-        "TMPDIR", "TMP", "TEMP", "BARGE_STATE_DIR", "BARGE_PROOF_BIN", "HOME", "CARGO_HOME",
-    }:
-        problems.append("the environment record names a hook the case script does not read")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    sources = []
+    for name in ("test-scratch-expiry.py", "run-scratch-expiry-native.py"):
+        with open(os.path.join(script_dir, name), encoding="utf-8") as source_file:
+            sources.append(source_file.read())
+    problems.extend(environment_inventory_problems(sources, ENVIRONMENT))
+    # Counterfactuals: missing, extra and dynamically named hooks must all refuse.
+    sample = 'os.environ.get("EXAMPLE")'
+    if not environment_inventory_problems([sample], {}):
+        problems.append("an omitted environment hook is not detected")
+    if not environment_inventory_problems([sample], {"EXAMPLE": "purpose", "EXTRA": "purpose"}):
+        problems.append("an unused environment hook is not detected")
+    if not environment_inventory_problems(['os.environ.get(variable)'], {}):
+        problems.append("a dynamic environment hook is not detected")
+    if not environment_inventory_problems(['os.getenv("MISSING")'], {}):
+        problems.append("an omitted os.getenv hook is not detected")
     return problems
 
 
