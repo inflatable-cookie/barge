@@ -2291,12 +2291,11 @@ Choices S4 made where this design left the mechanic to the slice:
 - **A failed ordinary detach keeps the backing.** Cleanup detaches ordinarily and
   stops there: it never force-detaches by mount path, and a failed detach leaves
   the image attached and its backing in place and makes the receipt unqualified.
-  The proof uses no forced detach at all. The pull case is the brief's ordinary
-  detach mid-delete; if that ordinary detach is refused, the case is left
-  unproved rather than satisfied by a forced detach of the same image.
+  The surprise-removal case alone force-detaches the positively rebound owned
+  image whole-disk device; all other detaches remain ordinary.
 - **The native's oracles are the design's behaviours.** The allocation case
   launches both allocations before awaiting either; the pull case uses the
-  ordinary detach mid-delete (a refusal leaves it unproved), and checks the
+  owned-image surprise removal mid-delete, and checks the
   quarantine leaf and its recorded device and inode *after* re-attaching, before
   the replay.
 - **The native ENOTEMPTY injection.** The fixed case compiles a proof-only
@@ -2390,7 +2389,7 @@ together, on owned scratch only:
   and prove the unconcluded one survives; plant Finder metadata plus an unknown
   entry and prove the delete stops and the root survives; delete a clean root
   whole and prove the marker is removed last; inject `ENOTEMPTY` and prove the
-  pending intent; pull the volume (ordinary `hdiutil detach`) mid-delete and
+  pending intent; pull the volume (force-detach only the verified owned whole-disk device as the surprise-removal premise) mid-delete and
   prove a pending intent with the quarantine leaf kept, then replay after
   re-attach; prove a stale mount point is never written to; plant one Oxide
   marker, one Effigy marker and one unmarked unit, prove all three survive with
