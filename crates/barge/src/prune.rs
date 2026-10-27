@@ -2466,21 +2466,40 @@ mod tests {
             .scratch
             .as_ref()
             .expect("the scratch stage ran");
-        assert_eq!(scratch_stage.deleted.count, 1, "{scratch_stage:?}");
+        // The resumed walk is bounded by the run clock too, so a removal that
+        // outlives it stops the deletion instead of finishing outside the bound: the
+        // first unit's intent is left pending with the wall-clock reason and the
+        // second planned unit is never attempted.
+        assert_eq!(scratch_stage.deleted.count, 0, "{scratch_stage:?}");
+        assert_eq!(scratch_stage.pending.count, 1, "{scratch_stage:?}");
+        assert!(
+            scratch_stage.pending.rows[0].reason.contains("wall clock"),
+            "{}",
+            scratch_stage.pending.rows[0].reason
+        );
         assert_eq!(scratch_stage.skipped.count, 1);
         assert!(
-            scratch_stage.skipped.rows[0].reason.contains("wall clock"),
+            scratch_stage.skipped.rows[0]
+                .reason
+                .contains("pending intent"),
             "{}",
             scratch_stage.skipped.rows[0].reason
         );
-        assert_eq!(report.unreached.count, 1);
-        assert_eq!(report.unreached.rows[0].stage, "scratch");
-        assert_eq!(report.unreached.rows[0].candidates, 1);
-        // The effect that ran is accounted for, and the one that never started is
-        // still there.
-        let exists = [first.exists(), second.exists()];
-        assert_eq!(exists.iter().filter(|present| !**present).count(), 1);
-        assert_eq!(exists.iter().filter(|present| **present).count(), 1);
+        assert!(report.timed_out, "{report:?}");
+        assert!(report.needs_human());
+        // The stop is recorded in the journal, whatever name the in-flight deletion
+        // had reached, so the work it left is recoverable and reported.
+        let intents = state::read_intents(&harness.fixture.state, 64).expect("the journal reads");
+        assert_eq!(intents.records.len(), 1, "the stop is journalled");
+        assert_ne!(
+            intents.records[0].phase,
+            state::IntentPhase::Deleted,
+            "no completion was recorded"
+        );
+        assert!(
+            first.exists() || second.exists(),
+            "the unit the stop left unstarted is still there"
+        );
     }
 
     #[test]

@@ -2411,10 +2411,16 @@ Choices S7 made where this design left the mechanic to the slice:
   or a parent can itself consume the clock, **again after its own preflight and
   locks**, **again after the leaf and marker observations and immediately before
   its phase decision** — which is where a replay resumes a deletion, rolls an
-  intent back or advances the journal — and **again inside `settle` with the
-  volume, unit and intent-write locks held and immediately before the `deleted`
-  phase is advanced**, so an overrun never records a completion and never resumes a
-  deletion inside the stop window.
+  intent back or advances the journal — **again immediately before every journal
+  write it performs** (the rollback's removal, the reconcile that records a rename,
+  and each completion phase, whether it comes from the replay's own leaf removal or
+  from the shared completion path), and **again inside `settle` with the volume,
+  unit and intent-write locks held and immediately before the `deleted` phase is
+  advanced**. The resumed walk itself is bounded by **the earlier of its per-root
+  deadline and the run's clock**, and its stop reason names whichever bound
+  actually stopped it, so a resumed deletion can never keep walking past the run's
+  stop window on its own 120 s budget. An overrun therefore never records a
+  completion and never resumes a deletion inside the stop window.
   Slow locks, a slow registry re-read or a slow custody scan therefore cannot carry
   an effect past the stop window, however much preflight they consume. So neither a stage with many units nor a long journal
   of earlier intents can outlive the run's bound and then be reported as a success. Reaching it sets `timed_out`,
