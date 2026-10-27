@@ -1728,6 +1728,7 @@ fn adopt_directory(
             }
             let folder = re_resolve(dirs, facts, mounts, observer, record)?;
             let root = area::create_root_in_feature(
+                state,
                 dirs,
                 observer,
                 &folder,
@@ -2133,6 +2134,7 @@ fn adopt_directory(
             // the empty directory back, so a failed adopt never leaves the tool's
             // path missing.
             let root = match area::create_root_in_feature(
+                state,
                 dirs,
                 observer,
                 &folder,
@@ -2401,6 +2403,8 @@ fn adopt_in_place(
         allocated_bytes: facts.allocated_bytes,
     };
     let root_id = hex_encode(&dirs.random_bytes(16)?);
+    let mut locks = LockSet::new(state.clone());
+    let root_lock = locks.lock_root(&root_id)?;
     let mut intent =
         read_adopt_intent(state, kind)?.ok_or_else(|| unknown("marker intent missing"))?;
     intent.marker_plan = Some(MarkerPlan {
@@ -2419,6 +2423,23 @@ fn adopt_in_place(
         origin: RootOrigin::AdoptedExisting,
     };
     let marker = area::write_marker(dirs, &handle, &write, effective_uid)?;
+    let owned = area::OwnedRoot {
+        root_id: marker.root_id.clone(),
+        nonce: marker.nonce.clone(),
+        kind: RootKind::CacheRoot,
+        area: cache_area(),
+        volume_uuid: record.volume_uuid.clone(),
+        path: path.to_path_buf(),
+        identity: handle.identity(),
+        marker_digest: marker.marker_digest.clone(),
+        created_ms: marker.created_ms,
+    };
+    let identity = crate::identity::from_owned(
+        &owned,
+        &folder.mount_point,
+        crate::identity::IdentityOrigin::AdoptedExisting,
+    )?;
+    crate::identity::write_once(state, dirs, &root_lock, effective_uid, &identity)?;
     let held = HeldRoot {
         path: path.to_path_buf(),
         root_id: marker.root_id,
@@ -4783,6 +4804,17 @@ mod tests {
             PlacementForm::Setting(form) => {
                 let held = form.held_root.as_ref().expect("the directory is adopted");
                 assert_eq!(held.path, npm);
+                let uid = crate::os::ProcessObserver::effective_uid(&fixture.platform()).unwrap();
+                let identity =
+                    crate::identity::read(&fixture.state, &fixture.platform(), &held.root_id, uid)
+                        .unwrap()
+                        .expect("identity recorded");
+                assert_eq!(
+                    identity.origin,
+                    crate::identity::IdentityOrigin::AdoptedExisting
+                );
+                assert_eq!(identity.inode, held.inode);
+                assert_eq!(identity.nonce, held.nonce);
             }
             other => panic!("expected the setting form, got {}", other.name()),
         }

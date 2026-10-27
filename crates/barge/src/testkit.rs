@@ -1391,8 +1391,14 @@ impl VolumeFixture {
         let platform = self.platform();
         let observer = self.observer();
         let resolved = self.resolved(record, declaration);
-        let root = area::create_root(&platform, &observer, &resolved, RootSpec { kind })
-            .expect("the root is created");
+        let root = area::create_root(
+            &self.state,
+            &platform,
+            &observer,
+            &resolved,
+            RootSpec { kind },
+        )
+        .expect("the root is created");
         let resolved = self.resolved(record, declaration);
         (root, resolved)
     }

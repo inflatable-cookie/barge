@@ -1149,6 +1149,7 @@ pub fn ensure_child_directory(
 /// and no effective declaration, because a feature folder has no consumer
 /// policies to apply.
 pub fn create_root_in_feature(
+    state: &StatePaths,
     dirs: &dyn DirOps,
     observer: &dyn ProcessObserver,
     folder: &FeatureFolder,
@@ -1156,10 +1157,13 @@ pub fn create_root_in_feature(
     area: MarkerArea,
 ) -> Result<OwnedRoot> {
     let effective_uid = observer.effective_uid()?;
+    state.initialize()?;
     let folder_handle = ensure_folder(dirs, &folder.dirs, effective_uid)?;
     let mut last_error: Option<Error> = None;
     for _ in 0..ROOT_ID_ATTEMPTS {
         let root_id = hex(16, dirs.random_bytes(16)?);
+        let mut locks = state::LockSet::new(state.clone());
+        let root_lock = locks.lock_root(&root_id)?;
         match dirs.create_child_dir(&folder_handle, &root_id, ROOT_DIRECTORY_MODE) {
             Ok(identity) => {
                 let root = dirs.open_child_dir(&folder_handle, &root_id)?;
@@ -1181,7 +1185,7 @@ pub fn create_root_in_feature(
                     origin: RootOrigin::Created,
                 };
                 let marker = write_marker(dirs, &root, &write, effective_uid)?;
-                return Ok(OwnedRoot {
+                let owned = OwnedRoot {
                     root_id,
                     nonce: marker.nonce,
                     kind,
@@ -1191,7 +1195,14 @@ pub fn create_root_in_feature(
                     identity: root.identity(),
                     marker_digest: marker.marker_digest,
                     created_ms: marker.created_ms,
-                });
+                };
+                let identity = crate::identity::from_owned(
+                    &owned,
+                    &folder.mount_point,
+                    crate::identity::IdentityOrigin::Created,
+                )?;
+                crate::identity::write_once(state, dirs, &root_lock, effective_uid, &identity)?;
+                return Ok(owned);
             }
             Err(error) => {
                 if dirs.child_facts(&folder_handle, &root_id)?.is_some() {
@@ -1393,16 +1404,20 @@ pub fn open_folder(
 /// payload. A name that is already taken is retried with a new id, so two
 /// creators can never receive the same root.
 pub fn create_root(
+    state: &StatePaths,
     dirs: &dyn DirOps,
     observer: &dyn ProcessObserver,
     resolved: &ResolvedArea,
     spec: RootSpec,
 ) -> Result<OwnedRoot> {
     let effective_uid = observer.effective_uid()?;
+    state.initialize()?;
     let area_handle = ensure_area_folder(dirs, resolved, effective_uid)?;
     let mut last_error: Option<Error> = None;
     for _ in 0..ROOT_ID_ATTEMPTS {
         let root_id = hex(16, dirs.random_bytes(16)?);
+        let mut locks = state::LockSet::new(state.clone());
+        let root_lock = locks.lock_root(&root_id)?;
         match dirs.create_child_dir(&area_handle, &root_id, ROOT_DIRECTORY_MODE) {
             Ok(identity) => {
                 let root = dirs.open_child_dir(&area_handle, &root_id)?;
@@ -1413,7 +1428,15 @@ pub fn create_root(
                     )
                     .with_detail("root_id", root_id.into()));
                 }
-                return write_root_marker(dirs, resolved, &root, &root_id, spec, effective_uid);
+                let owned =
+                    write_root_marker(dirs, resolved, &root, &root_id, spec, effective_uid)?;
+                let identity = crate::identity::from_owned(
+                    &owned,
+                    &resolved.mount_point,
+                    crate::identity::IdentityOrigin::Created,
+                )?;
+                crate::identity::write_once(state, dirs, &root_lock, effective_uid, &identity)?;
+                return Ok(owned);
             }
             Err(error) => {
                 // A taken name is the race the design expects: retry with a
@@ -1524,7 +1547,7 @@ pub fn create_root_on_volume(
         declaration,
         stored,
     )?;
-    let root = create_root(dirs, observer, &volume.resolved, spec)?;
+    let root = create_root(state, dirs, observer, &volume.resolved, spec)?;
     Ok((volume, root))
 }
 
@@ -3932,6 +3955,7 @@ mod tests {
             let observer = self.observer();
             let resolved = self.resolved(record, declaration);
             let root = super::create_root(
+                &self.state,
                 &platform,
                 &observer,
                 &resolved,
@@ -4445,6 +4469,7 @@ mod tests {
         // The created root's marker records the caller's effective declaration
         // exactly.
         let root = super::create_root(
+            &fixture.state,
             &platform,
             &observer,
             &resolved,
@@ -4514,6 +4539,27 @@ mod tests {
             MarkerState::Owned(marker) => marker,
             other => panic!("the marker is owned: {other:?}"),
         };
+        let persisted = crate::identity::read(
+            &fixture.state,
+            &fixture.platform(),
+            &root.root_id,
+            fixture.observer().effective_uid().unwrap(),
+        )
+        .unwrap()
+        .expect("identity is recorded");
+        assert_eq!(persisted.nonce, root.nonce);
+        assert_eq!(persisted.inode, root.identity.inode);
+        assert_eq!(persisted.origin, crate::identity::IdentityOrigin::Created);
+        let mut locks = LockSet::new(fixture.state.clone());
+        let lock = locks.lock_root(&root.root_id).unwrap();
+        assert!(crate::identity::write_once(
+            &fixture.state,
+            &fixture.platform(),
+            &lock,
+            fixture.observer().effective_uid().unwrap(),
+            &persisted
+        )
+        .is_err());
         assert_eq!(marker.root_id, root.root_id);
         assert_eq!(marker.kind, RootKind::AreaRoot);
         assert_eq!(marker.volume_uuid, fixture.uuid);
@@ -4532,6 +4578,52 @@ mod tests {
         let (second, _) = fixture.create_root(&fixture.record, &declaration);
         assert_ne!(second.root_id, root.root_id);
         assert_ne!(second.nonce, root.nonce);
+    }
+
+    #[test]
+    fn durable_identity_verifies_the_opened_root_and_refuses_mismatches() {
+        let fixture = Fixture::new("identity-verification");
+        let declaration = fixture.declaration("example/pool");
+        let (root, _) = fixture.create_root(&fixture.record, &declaration);
+        let platform = fixture.platform();
+        let observer = fixture.observer();
+        let uid = observer.effective_uid().unwrap();
+        let candidates = vec![fixture.root.clone()];
+        let verify = |candidates: &[PathBuf]| {
+            crate::identity::verify(
+                &fixture.state,
+                &platform,
+                &fixture.facts(),
+                &fixture.mounts(),
+                uid,
+                &root.root_id,
+                candidates,
+            )
+        };
+        assert!(matches!(
+            verify(&candidates),
+            crate::identity::IdentityVerdict::Verified { .. }
+        ));
+        assert_eq!(
+            verify(&[fixture.root.clone(), fixture.root.clone()]),
+            crate::identity::IdentityVerdict::Unknown {
+                reason: crate::identity::IdentityReason::DuplicateVolumeUuid
+            }
+        );
+        let marker_path = marker_path(&root);
+        let bytes = std::fs::read(&marker_path).unwrap();
+        rewrite_marker(&marker_path, |value| {
+            value["nonce"] = "0123456789abcdef0123456789abcdef".into()
+        });
+        assert_eq!(
+            verify(&candidates),
+            crate::identity::IdentityVerdict::Unknown {
+                reason: crate::identity::IdentityReason::MarkerIdentityMismatch
+            }
+        );
+        std::fs::write(&marker_path, bytes).unwrap();
+        std::fs::remove_dir_all(&root.path).unwrap();
+        assert_eq!(verify(&candidates), crate::identity::IdentityVerdict::Gone);
     }
 
     #[test]
@@ -5037,6 +5129,7 @@ mod tests {
         let planted = resolved.path.join("0".repeat(32));
         // The area folder is created first, then the planted root name exists.
         let first = super::create_root(
+            &fixture.state,
             &dirs,
             &observer,
             &resolved,
@@ -5052,6 +5145,7 @@ mod tests {
             calls: RefCell::new(0),
         };
         let second = super::create_root(
+            &fixture.state,
             &dirs,
             &observer,
             &resolved,
@@ -5139,6 +5233,7 @@ mod tests {
         let resolved = fixture.resolved(&fixture.record, &declaration);
         let observer = fixture.observer();
         let error = super::create_root(
+            &fixture.state,
             &dirs,
             &observer,
             &resolved,

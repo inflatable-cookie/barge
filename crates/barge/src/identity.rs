@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::area::{folder_components, MarkerArea, RootKind};
 use crate::error::{Error, ErrorKind, Result};
-use crate::os::VolumeUuid;
-use crate::state::validate_identifier;
+use crate::os::{DirHandle, DirId, DirOps, EntryKind, RenameOutcome, VolumeUuid};
+use crate::state::{validate_identifier, LockMode, LockRank, StateLock, StatePaths};
 
 /// The provenance of a durable root identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +75,245 @@ impl RootIdentity {
     }
 }
 
+/// Construct a record from a root just written through an opened descriptor.
+pub fn from_owned(
+    root: &crate::area::OwnedRoot,
+    mount: &std::path::Path,
+    origin: IdentityOrigin,
+) -> Result<RootIdentity> {
+    let relative = root
+        .path
+        .strip_prefix(mount)
+        .map_err(|_| Error::new(ErrorKind::UnknownState, "root is outside its mount"))?
+        .to_str()
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "root path is not UTF-8"))?;
+    let record = RootIdentity {
+        schema: "barge.root.identity/1".to_owned(),
+        root_id: root.root_id.clone(),
+        nonce: root.nonce.clone(),
+        volume_uuid: root.volume_uuid.as_str().to_owned(),
+        mount_relative_path: relative.to_owned(),
+        inode: root.identity.inode,
+        device_at_record: root.identity.device.get(),
+        mount_at_record: mount.to_path_buf(),
+        kind: root.kind,
+        area: MarkerArea::identity(&root.area.namespace, &root.area.area),
+        origin,
+        marker_generation_at_record: 1,
+        recorded_ms: crate::state::now_ms(),
+    };
+    record.validate()?;
+    Ok(record)
+}
+
+const IDENTITY_CAP: usize = 4096;
+
+fn private_directory(
+    dirs: &dyn DirOps,
+    parent: &DirHandle,
+    name: &str,
+    uid: u32,
+    create: bool,
+) -> Result<Option<DirHandle>> {
+    let mut facts = dirs.child_facts(parent, name)?;
+    if facts.is_none() && create {
+        match dirs.create_child_dir(parent, name, 0o700) {
+            Ok(_) => {
+                dirs.sync_dir(parent)?;
+            }
+            Err(error) => {
+                if dirs.child_facts(parent, name)?.is_none() {
+                    return Err(error);
+                }
+            }
+        }
+        facts = dirs.child_facts(parent, name)?;
+    }
+    let Some(facts) = facts else {
+        return Ok(None);
+    };
+    if facts.kind != EntryKind::Directory
+        || facts.uid != uid
+        || !facts.is_private()
+        || facts.device != parent.identity().device
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "identity state directory is not private and owned",
+        ));
+    }
+    let handle = dirs.open_child_dir(parent, name)?;
+    if handle.identity()
+        != (DirId {
+            device: facts.device,
+            inode: facts.inode,
+        })
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "identity state directory changed during open",
+        ));
+    }
+    Ok(Some(handle))
+}
+
+fn identity_directory(
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    root_id: &str,
+    uid: u32,
+    create: bool,
+) -> Result<Option<DirHandle>> {
+    validate_identifier("root_id", root_id)?;
+    let state_dir = dirs.open_path(state.root())?;
+    let facts = dirs.dir_facts(&state_dir)?;
+    if facts.kind != EntryKind::Directory || facts.uid != uid || !facts.is_private() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "state directory is not private and owned",
+        ));
+    }
+    let Some(roots) = private_directory(dirs, &state_dir, "roots", uid, create)? else {
+        return Ok(None);
+    };
+    private_directory(dirs, &roots, root_id, uid, create)
+}
+
+/// Read the immutable record without creating state. Missing remains distinct
+/// from invalid, and no link or foreign or nonprivate file is accepted.
+pub fn read(
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    root_id: &str,
+    uid: u32,
+) -> Result<Option<RootIdentity>> {
+    if !state.is_initialized()? {
+        return Ok(None);
+    }
+    let Some(directory) = identity_directory(state, dirs, root_id, uid, false)? else {
+        return Ok(None);
+    };
+    let Some(before) = dirs.child_facts(&directory, "identity.json")? else {
+        return Ok(None);
+    };
+    if before.kind != EntryKind::File
+        || before.uid != uid
+        || !before.is_private()
+        || before.size > IDENTITY_CAP as u64
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "identity record is not a private owned regular file",
+        ));
+    }
+    let bytes = dirs
+        .read_child_file(&directory, "identity.json", IDENTITY_CAP)?
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "identity record disappeared"))?;
+    let after = dirs
+        .child_facts(&directory, "identity.json")?
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "identity record disappeared"))?;
+    if before != after || dirs.recheck_dir(&directory)? != directory.identity() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "identity record changed during read",
+        ));
+    }
+    let record: RootIdentity = serde_json::from_slice(&bytes).map_err(|error| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!("invalid identity record: {error}"),
+        )
+    })?;
+    record.validate()?;
+    if record.root_id != root_id {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "identity record names another root",
+        ));
+    }
+    Ok(Some(record))
+}
+
+/// Publish once under the matching exclusive root lock. A pre-existing record
+/// is never replaced, including if it appears during publication.
+pub fn write_once(
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    lock: &StateLock,
+    uid: u32,
+    record: &RootIdentity,
+) -> Result<()> {
+    record.validate()?;
+    if lock.rank() != LockRank::Root
+        || lock.mode() != LockMode::Exclusive
+        || lock.path() != state.root_lock_path(&record.root_id)?
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "identity write requires its exclusive root lock",
+        ));
+    }
+    let directory = identity_directory(state, dirs, &record.root_id, uid, true)?
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "identity directory missing"))?;
+    if dirs.child_facts(&directory, "identity.json")?.is_some() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "identity record already exists",
+        ));
+    }
+    let mut bytes = serde_json::to_vec_pretty(record)
+        .map_err(|error| Error::new(ErrorKind::Io, format!("cannot encode identity: {error}")))?;
+    bytes.push(b'\n');
+    if bytes.len() > IDENTITY_CAP {
+        return Err(Error::new(
+            ErrorKind::ResourceBound,
+            "identity record exceeds cap",
+        ));
+    }
+    let random = dirs.random_bytes(16)?;
+    let stage = format!(
+        ".identity-{}",
+        random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    if dirs.child_facts(&directory, &stage)?.is_some() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "identity staging name occupied",
+        ));
+    }
+    dirs.publish_child_file(&directory, &stage, &bytes, 0o600)?;
+    let staged = dirs
+        .child_facts(&directory, &stage)?
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "identity staging file disappeared"))?;
+    if staged.kind != EntryKind::File
+        || staged.uid != uid
+        || !staged.is_private()
+        || dirs.recheck_dir(&directory)? != directory.identity()
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "identity staging binding changed",
+        ));
+    }
+    if dirs.rename_child(&directory, &stage, "identity.json")? == RenameOutcome::TargetExists {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "identity record appeared before publication",
+        ));
+    }
+    dirs.sync_dir(&directory)?;
+    if read(state, dirs, &record.root_id, uid)?.as_ref() != Some(record) {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "published identity did not read back",
+        ));
+    }
+    Ok(())
+}
+
 /// Facts read from the verified volume and its opened root for one observation.
 /// Callers must obtain these through the descriptor walk; no stored verdict is
 /// authority for a later use.
@@ -107,12 +346,14 @@ pub enum IdentityVerdict {
     Unknown {
         reason: IdentityReason,
     },
+    Gone,
 }
 
 /// The reason an observation cannot establish the recorded identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityReason {
+    IdentityRecordMissing,
     IdentityRecordInvalid,
     VolumeUnverified,
     DuplicateVolumeUuid,
@@ -120,6 +361,182 @@ pub enum IdentityReason {
     PathChanged,
     InodeChanged,
     MarkerIdentityMismatch,
+    MarkerAbsent,
+    MarkerUnreadable,
+    MarkerForeignOwner,
+    MarkerVersionUnknown,
+    MarkerSchemaDivergent,
+    MarkerGenerationUnexpected,
+}
+
+/// Verify against a complete, freshly observed set of mounts for the UUID.
+/// The caller supplies that census; an unavailable census must never be passed
+/// as an empty or complete set. All filesystem facts are read again here.
+pub fn verify(
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn crate::os::VolumeFacts,
+    mounts: &dyn crate::os::MountRoot,
+    uid: u32,
+    root_id: &str,
+    candidates: &[PathBuf],
+) -> IdentityVerdict {
+    let unknown = |reason| IdentityVerdict::Unknown { reason };
+    let record = match read(state, dirs, root_id, uid) {
+        Ok(Some(record)) => record,
+        Ok(None) => return unknown(IdentityReason::IdentityRecordMissing),
+        Err(_) => return unknown(IdentityReason::IdentityRecordInvalid),
+    };
+    if candidates.len() > 1 {
+        return unknown(IdentityReason::DuplicateVolumeUuid);
+    }
+    let Some(mount) = candidates.first() else {
+        return unknown(IdentityReason::VolumeUnverified);
+    };
+    let Ok(uuid) = VolumeUuid::parse(&record.volume_uuid) else {
+        return unknown(IdentityReason::IdentityRecordInvalid);
+    };
+    let expected = crate::os::ExpectedVolume {
+        volume_uuid: &uuid,
+        mount_hint: None,
+    };
+    let Ok(volume) = crate::os::verify_volume(facts, mounts, mount, &expected) else {
+        return unknown(IdentityReason::VolumeUnverified);
+    };
+    let Ok(mut current) = dirs.open_path(volume.path()) else {
+        return unknown(IdentityReason::VolumeUnverified);
+    };
+    if current.identity().device != volume.identity().device {
+        return unknown(IdentityReason::VolumeUnverified);
+    }
+    let Ok(components) = folder_components("mount_relative_path", &record.mount_relative_path)
+    else {
+        return unknown(IdentityReason::IdentityRecordInvalid);
+    };
+    for (index, component) in components.iter().enumerate() {
+        let entry = match dirs.child_facts(&current, component) {
+            Ok(Some(entry)) => entry,
+            Ok(None) if index + 1 != components.len() => {
+                return unknown(IdentityReason::PathChanged)
+            }
+            Ok(None) => {
+                return if volume.reverify(facts).is_ok() {
+                    IdentityVerdict::Gone
+                } else {
+                    unknown(IdentityReason::VolumeUnverified)
+                }
+            }
+            Err(_) => return unknown(IdentityReason::NotARealDirectory),
+        };
+        if entry.kind != EntryKind::Directory
+            || entry.uid != uid
+            || entry.device != volume.identity().device
+        {
+            return unknown(IdentityReason::NotARealDirectory);
+        }
+        let Ok(opened) = dirs.open_child_dir(&current, component) else {
+            return unknown(IdentityReason::PathChanged);
+        };
+        if opened.identity()
+            != (DirId {
+                device: entry.device,
+                inode: entry.inode,
+            })
+        {
+            return unknown(IdentityReason::PathChanged);
+        }
+        current = opened;
+    }
+    if current.identity().inode != record.inode {
+        return unknown(IdentityReason::InodeChanged);
+    }
+    let marker_facts = match dirs.child_facts(&current, crate::area::ROOT_MARKER_FILE) {
+        Ok(Some(value)) => value,
+        Ok(None) => return unknown(IdentityReason::MarkerAbsent),
+        Err(_) => return unknown(IdentityReason::MarkerUnreadable),
+    };
+    if marker_facts.uid != uid {
+        return unknown(IdentityReason::MarkerForeignOwner);
+    }
+    if marker_facts.kind != EntryKind::File
+        || !marker_facts.is_private()
+        || marker_facts.size > 4096
+    {
+        return unknown(IdentityReason::MarkerUnreadable);
+    }
+    let bytes = match dirs.read_child_file(&current, crate::area::ROOT_MARKER_FILE, 4096) {
+        Ok(Some(bytes)) => bytes,
+        _ => return unknown(IdentityReason::MarkerUnreadable),
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return unknown(IdentityReason::MarkerSchemaDivergent),
+    };
+    if !matches!(
+        value.get("schema").and_then(serde_json::Value::as_str),
+        Some("barge.root/1" | "barge.root/2")
+    ) {
+        return unknown(IdentityReason::MarkerVersionUnknown);
+    }
+    let marker: crate::area::RootMarker = match serde_json::from_slice(&bytes) {
+        Ok(marker) => marker,
+        Err(_) => return unknown(IdentityReason::MarkerSchemaDivergent),
+    };
+    if marker.schema == "barge.root/2"
+        && (marker.mount_relative_path.as_deref() != Some(record.mount_relative_path.as_str())
+            || marker.mount_at_record.as_ref() != Some(&record.mount_at_record))
+    {
+        return unknown(IdentityReason::PathChanged);
+    }
+    if marker.owner != "barge" {
+        return unknown(IdentityReason::MarkerForeignOwner);
+    }
+    if !matches!(
+        (marker.kind, marker.generation, marker.conclusion.is_some()),
+        (_, 1, false) | (RootKind::ScratchRun, 2, true)
+    ) {
+        return unknown(IdentityReason::MarkerGenerationUnexpected);
+    }
+    let expectation = crate::area::MarkerExpectation {
+        volume_uuid: &uuid,
+        resolved_path: &mount.join(&record.mount_relative_path),
+        effective_uid: uid,
+        now_ms: crate::state::now_ms(),
+    };
+    if !matches!(
+        crate::area::read_marker(dirs, &current, &expectation),
+        crate::area::MarkerState::Owned(_)
+    ) {
+        return unknown(IdentityReason::MarkerSchemaDivergent);
+    }
+    if dirs
+        .child_facts(&current, crate::area::ROOT_MARKER_FILE)
+        .ok()
+        .flatten()
+        .as_ref()
+        != Some(&marker_facts)
+        || dirs.recheck_dir(&current).ok() != Some(current.identity())
+        || volume.reverify(facts).is_err()
+    {
+        return unknown(IdentityReason::PathChanged);
+    }
+    compare(
+        &record,
+        &RootObservation {
+            matching_mounts: candidates.len(),
+            volume_uuid: uuid.as_str().to_owned(),
+            mount: mount.clone(),
+            device: current.identity().device.get(),
+            inode: current.identity().inode,
+            root_uid: uid,
+            effective_uid: uid,
+            root_id: marker.root_id,
+            nonce: marker.nonce,
+            mount_relative_path: record.mount_relative_path.clone(),
+            kind: marker.kind,
+            area: marker.area,
+        },
+    )
 }
 
 /// Compare an already walked root with its immutable record. A device change

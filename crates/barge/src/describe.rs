@@ -1585,6 +1585,7 @@ mod tests {
         )
         .expect("the area resolves");
         let root = crate::area::create_root(
+            &state,
             platform,
             &volume,
             &resolved,
