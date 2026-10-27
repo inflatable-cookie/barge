@@ -321,6 +321,7 @@ struct FoundRoot {
     path: PathBuf,
     marker: area::RootMarker,
     marker_digest: String,
+    mount_point: PathBuf,
 }
 
 /// What a bounded search for one root found.
@@ -363,6 +364,7 @@ fn find_in_folder(
     let expectation = MarkerExpectation {
         volume_uuid: &record.volume_uuid,
         resolved_path: &root_path,
+        mount_point: record.mount_hint.as_deref(),
         effective_uid: observer.effective_uid()?,
         now_ms,
     };
@@ -399,6 +401,10 @@ fn find_in_folder(
         }
     }
     Ok(Some(FoundRoot {
+        mount_point: record
+            .mount_hint
+            .clone()
+            .ok_or_else(|| Error::new(ErrorKind::UnknownState, "verified mount hint missing"))?,
         folder: folder.to_owned(),
         root,
         path: root_path,
@@ -674,6 +680,7 @@ fn write_conclusion(
     let expectation = MarkerExpectation {
         volume_uuid,
         resolved_path: &found.path,
+        mount_point: Some(&found.mount_point),
         effective_uid: observer.effective_uid()?,
         now_ms: state::now_ms(),
     };
@@ -2477,6 +2484,7 @@ fn unit_family(
     let expectation = MarkerExpectation {
         volume_uuid: &ctx.record.volume_uuid,
         resolved_path: path,
+        mount_point: ctx.record.mount_hint.as_deref(),
         effective_uid: ctx.observer.effective_uid()?,
         now_ms: ctx.now_ms,
     };
@@ -2730,6 +2738,7 @@ fn assess_native(
     let expectation = MarkerExpectation {
         volume_uuid: &ctx.record.volume_uuid,
         resolved_path: path,
+        mount_point: ctx.record.mount_hint.as_deref(),
         effective_uid: ctx.observer.effective_uid()?,
         now_ms: ctx.now_ms,
     };
@@ -5525,7 +5534,7 @@ mod tests {
                     &std::fs::read(&self.marker).expect("the racing marker"),
                 )
                 .expect("the racing marker parses");
-                value["generation"] = serde_json::json!(99);
+                value["nonce"] = serde_json::json!("0123456789abcdef0123456789abcdef");
                 write_marker(&self.marker, &serde_json::to_vec(&value).unwrap());
             }
             Ok(bytes)

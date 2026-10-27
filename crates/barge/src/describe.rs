@@ -137,11 +137,49 @@ pub struct DescribeData {
     pub roots: RowSet<RootObservation>,
     /// Foreign observations, bounded to the observation row cap.
     pub observations: RowSet<ObservationRow>,
+    /// Identity facts used across a remount.
+    #[serde(default)]
+    pub identity: IdentityCapability,
     /// The writer-custody capability this build offers, its named limits, and
     /// the fact that no kernel proof is claimed (slice S5). An older document
     /// without this field still reads.
     #[serde(default)]
     pub custody: crate::custody::CustodyReport,
+}
+
+/// Which root identity facts survive a remount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityCapability {
+    pub capability: String,
+    pub stable_facts: Vec<String>,
+    pub device_role: String,
+}
+
+impl Default for IdentityCapability {
+    fn default() -> Self {
+        Self {
+            capability: "volume_uuid_root_id_nonce_inode_relative_path".into(),
+            stable_facts: [
+                "volume_uuid",
+                "root_id",
+                "nonce",
+                "inode",
+                "mount_relative_path",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            device_role: "within_run_only".into(),
+        }
+    }
+}
+
+/// A complete live census, or a reason the count is unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MountCensus {
+    Complete { count: usize, paths: Vec<PathBuf> },
+    Unknown { reason: String },
 }
 
 /// The `data` of `barge.inspect/1`.
@@ -206,6 +244,9 @@ pub struct VolumeRow {
     /// The last observed mount point; used to find the volume, never as
     /// identity.
     pub mount_hint: Option<PathBuf>,
+    /// The current census; unknown is never reported as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mounts: Option<MountCensus>,
     /// When the volume is attached.
     pub availability: Availability,
     /// What the data on it is.
@@ -237,6 +278,7 @@ impl VolumeRow {
         Self {
             volume_uuid: record.volume_uuid.as_str().to_owned(),
             mount_hint: record.mount_hint.clone(),
+            mounts: None,
             availability: record.availability,
             durability: record.durability,
             root_dir: record.root_dir.clone(),
@@ -407,7 +449,19 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
     let volume_rows: Vec<VolumeRow> = registry
         .volumes()
         .iter()
-        .map(VolumeRow::from_record)
+        .map(|record| {
+            let mut row = VolumeRow::from_record(record);
+            row.mounts = Some(match request.facts.mount_census(&record.volume_uuid) {
+                Ok(paths) => MountCensus::Complete {
+                    count: paths.len(),
+                    paths,
+                },
+                Err(error) => MountCensus::Unknown {
+                    reason: error.to_string(),
+                },
+            });
+            row
+        })
         .collect();
     let volume_total = volume_rows.len();
     let area_rows: Vec<AreaRow> = declarations
@@ -441,6 +495,7 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
         roots,
         observations: RowSet::bounded(observation_rows, observation_total, OBSERVATION_ROWS),
         custody: crate::custody::capability_report(),
+        identity: IdentityCapability::default(),
     })
 }
 
@@ -1463,6 +1518,13 @@ mod tests {
     }
 
     impl crate::os::VolumeFacts for FixtureVolume {
+        fn mount_census(&self, uuid: &crate::os::VolumeUuid) -> Result<Vec<PathBuf>> {
+            Ok(if uuid == &self.uuid {
+                vec![self.root.clone()]
+            } else {
+                Vec::new()
+            })
+        }
         fn identify(&self, _path: &Path) -> Result<crate::os::VolumeIdentity> {
             Ok(crate::os::VolumeIdentity {
                 mount_point: self.root.clone(),
@@ -1585,6 +1647,7 @@ mod tests {
         )
         .expect("the area resolves");
         let root = crate::area::create_root(
+            &state,
             platform,
             &volume,
             &resolved,
@@ -1605,6 +1668,17 @@ mod tests {
             observer: &volume,
         };
         let data = describe(&request).expect("describe reads");
+        assert_eq!(
+            data.identity.capability,
+            "volume_uuid_root_id_nonce_inode_relative_path"
+        );
+        assert_eq!(
+            data.volumes.rows[0].mounts,
+            Some(super::MountCensus::Complete {
+                count: 1,
+                paths: vec![volume_dir.clone()]
+            })
+        );
         assert_eq!(data.areas.count, 1, "the declared area is reported");
         assert_eq!(data.roots.count, 1, "the owned root is reported");
         let row = &data.roots.rows[0];

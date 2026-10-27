@@ -488,11 +488,11 @@ impl MarkerArea {
     }
 }
 
-/// One `barge.root/1` marker: the identity and provenance of an owned root.
+/// One versioned marker: the identity and provenance of an owned root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RootMarker {
-    /// Always `barge.root/1`.
+    /// `barge.root/1` or `barge.root/2`.
     pub schema: String,
     /// The root's fresh 128-bit id, as 32 hexadecimal digits.
     pub root_id: String,
@@ -508,7 +508,14 @@ pub struct RootMarker {
     pub area: MarkerArea,
     /// The absolute path Barge resolved when it created the root. It is an
     /// observation for humans; the descriptor walk remains the authority.
-    pub resolved_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_path: Option<PathBuf>,
+    /// The root path below the recorded mount, for version 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_relative_path: Option<String>,
+    /// The mount observed when version 2 was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_at_record: Option<PathBuf>,
     /// When the marker was written.
     pub created_ms: u64,
     /// Increases on every change; a root starts at 1.
@@ -566,6 +573,8 @@ pub struct MarkerExpectation<'a> {
     pub volume_uuid: &'a VolumeUuid,
     /// The absolute path the descriptor walk actually reached.
     pub resolved_path: &'a Path,
+    /// The verified live mount, when path validation is required.
+    pub mount_point: Option<&'a Path>,
     /// The account's effective uid.
     pub effective_uid: u32,
     /// The current time, so a future-dated marker is refused.
@@ -1142,6 +1151,7 @@ pub fn ensure_child_directory(
 /// and no effective declaration, because a feature folder has no consumer
 /// policies to apply.
 pub fn create_root_in_feature(
+    state: &StatePaths,
     dirs: &dyn DirOps,
     observer: &dyn ProcessObserver,
     folder: &FeatureFolder,
@@ -1149,10 +1159,13 @@ pub fn create_root_in_feature(
     area: MarkerArea,
 ) -> Result<OwnedRoot> {
     let effective_uid = observer.effective_uid()?;
+    state.initialize()?;
     let folder_handle = ensure_folder(dirs, &folder.dirs, effective_uid)?;
     let mut last_error: Option<Error> = None;
     for _ in 0..ROOT_ID_ATTEMPTS {
         let root_id = hex(16, dirs.random_bytes(16)?);
+        let mut locks = state::LockSet::new(state.clone());
+        let root_lock = locks.lock_root(&root_id)?;
         match dirs.create_child_dir(&folder_handle, &root_id, ROOT_DIRECTORY_MODE) {
             Ok(identity) => {
                 let root = dirs.open_child_dir(&folder_handle, &root_id)?;
@@ -1168,12 +1181,13 @@ pub fn create_root_in_feature(
                     root_id: Some(&root_id),
                     volume_uuid: &folder.volume_uuid,
                     resolved_path: &path,
+                    mount_point: &folder.mount_point,
                     area: area.clone(),
                     kind,
                     origin: RootOrigin::Created,
                 };
                 let marker = write_marker(dirs, &root, &write, effective_uid)?;
-                return Ok(OwnedRoot {
+                let owned = OwnedRoot {
                     root_id,
                     nonce: marker.nonce,
                     kind,
@@ -1183,7 +1197,14 @@ pub fn create_root_in_feature(
                     identity: root.identity(),
                     marker_digest: marker.marker_digest,
                     created_ms: marker.created_ms,
-                });
+                };
+                let identity = crate::identity::from_owned(
+                    &owned,
+                    &folder.mount_point,
+                    crate::identity::IdentityOrigin::Created,
+                )?;
+                crate::identity::write_once(state, dirs, &root_lock, effective_uid, &identity)?;
+                return Ok(owned);
             }
             Err(error) => {
                 if dirs.child_facts(&folder_handle, &root_id)?.is_some() {
@@ -1385,16 +1406,20 @@ pub fn open_folder(
 /// payload. A name that is already taken is retried with a new id, so two
 /// creators can never receive the same root.
 pub fn create_root(
+    state: &StatePaths,
     dirs: &dyn DirOps,
     observer: &dyn ProcessObserver,
     resolved: &ResolvedArea,
     spec: RootSpec,
 ) -> Result<OwnedRoot> {
     let effective_uid = observer.effective_uid()?;
+    state.initialize()?;
     let area_handle = ensure_area_folder(dirs, resolved, effective_uid)?;
     let mut last_error: Option<Error> = None;
     for _ in 0..ROOT_ID_ATTEMPTS {
         let root_id = hex(16, dirs.random_bytes(16)?);
+        let mut locks = state::LockSet::new(state.clone());
+        let root_lock = locks.lock_root(&root_id)?;
         match dirs.create_child_dir(&area_handle, &root_id, ROOT_DIRECTORY_MODE) {
             Ok(identity) => {
                 let root = dirs.open_child_dir(&area_handle, &root_id)?;
@@ -1405,7 +1430,15 @@ pub fn create_root(
                     )
                     .with_detail("root_id", root_id.into()));
                 }
-                return write_root_marker(dirs, resolved, &root, &root_id, spec, effective_uid);
+                let owned =
+                    write_root_marker(dirs, resolved, &root, &root_id, spec, effective_uid)?;
+                let identity = crate::identity::from_owned(
+                    &owned,
+                    &resolved.mount_point,
+                    crate::identity::IdentityOrigin::Created,
+                )?;
+                crate::identity::write_once(state, dirs, &root_lock, effective_uid, &identity)?;
+                return Ok(owned);
             }
             Err(error) => {
                 // A taken name is the race the design expects: retry with a
@@ -1516,7 +1549,7 @@ pub fn create_root_on_volume(
         declaration,
         stored,
     )?;
-    let root = create_root(dirs, observer, &volume.resolved, spec)?;
+    let root = create_root(state, dirs, observer, &volume.resolved, spec)?;
     Ok((volume, root))
 }
 
@@ -1683,6 +1716,8 @@ pub struct MarkerWrite<'a> {
     pub volume_uuid: &'a VolumeUuid,
     /// The absolute path the descriptor walk actually reached for the root.
     pub resolved_path: &'a Path,
+    /// The verified mount containing the root.
+    pub mount_point: &'a Path,
     /// The area identity the root belongs to.
     pub area: MarkerArea,
     /// What the root is for.
@@ -1705,7 +1740,7 @@ pub struct MarkerIdentity {
     pub created_ms: u64,
 }
 
-/// Write one `barge.root/1` marker into an already opened root directory.
+/// Write one `barge.root/2` marker into an already opened root directory.
 ///
 /// This is the one marker writer: creation and in-place adoption both use it, so
 /// the field set, the caps, the mode and the read-back proof cannot drift apart.
@@ -1728,6 +1763,13 @@ pub fn write_marker(
     };
     let nonce = hex(16, dirs.random_bytes(16)?);
     let created_ms = state::now_ms();
+    let relative = write
+        .resolved_path
+        .strip_prefix(write.mount_point)
+        .map_err(|_| unknown_marker("root path is outside the verified mount".to_owned()))?
+        .to_str()
+        .ok_or_else(|| unknown_marker("root path is not UTF-8".to_owned()))?;
+    folder_components("mount_relative_path", relative)?;
     let marker = RootMarker {
         schema: crate::contract::ROOT_SCHEMA.to_owned(),
         root_id: root_id.clone(),
@@ -1736,7 +1778,9 @@ pub fn write_marker(
         owner: "barge".to_owned(),
         kind: write.kind,
         area: write.area.clone(),
-        resolved_path: write.resolved_path.to_path_buf(),
+        resolved_path: None,
+        mount_relative_path: Some(relative.to_owned()),
+        mount_at_record: Some(write.mount_point.to_path_buf()),
         created_ms,
         generation: 1,
         origin: write.origin,
@@ -1745,6 +1789,7 @@ pub fn write_marker(
     let expectation = MarkerExpectation {
         volume_uuid: write.volume_uuid,
         resolved_path: write.resolved_path,
+        mount_point: Some(write.mount_point),
         effective_uid,
         now_ms: created_ms,
     };
@@ -1859,6 +1904,7 @@ fn write_root_marker(
         root_id: Some(root_id),
         volume_uuid: &resolved.volume_uuid,
         resolved_path: &path,
+        mount_point: &resolved.mount_point,
         area: MarkerArea {
             namespace: resolved.declaration.namespace.clone(),
             area: resolved.declaration.area.clone(),
@@ -1892,7 +1938,7 @@ fn describe_marker(state: &MarkerState) -> String {
 /// Read and validate one root's marker strictly.
 ///
 /// The marker must be a private regular file of this user, at most the marker
-/// cap, and must parse with exactly the fields `barge.root/1` defines. It is
+/// cap, and must parse with exactly the fields its version defines. It is
 /// owned only when its volume UUID, resolved path, id and nonce shapes and
 /// timestamps all agree with what was actually walked. Everything else is
 /// unknown, never reused and never deletable.
@@ -1964,6 +2010,22 @@ pub fn read_marker_with_digest(
             ))
         }
     };
+    // Serde's optional fields accept explicit null as well as absence. The two
+    // versions have disjoint path fields, so reject even null cross-version keys.
+    let shape: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(shape) => shape,
+        Err(error) => return unknown(format!("marker shape is unreadable: {error}")),
+    };
+    let cross_version_field = match marker.schema.as_str() {
+        "barge.root/1" => {
+            shape.get("mount_relative_path").is_some() || shape.get("mount_at_record").is_some()
+        }
+        "barge.root/2" => shape.get("resolved_path").is_some(),
+        _ => false,
+    };
+    if cross_version_field {
+        return unknown("marker carries path fields from another version".to_owned());
+    }
     // The bytes were read, so the digest is a fact even when the marker does not
     // validate where it was found: custody and replay carry the expected digest
     // themselves, and a quarantined leaf's marker necessarily fails the path
@@ -1982,7 +2044,7 @@ pub fn read_marker_with_digest(
 impl RootMarker {
     /// Validate every field of a marker against what was actually walked.
     fn validate(&self, expectation: &MarkerExpectation<'_>) -> Result<()> {
-        if self.schema != crate::contract::ROOT_SCHEMA {
+        if self.schema != crate::contract::ROOT_SCHEMA && self.schema != "barge.root/1" {
             return Err(unknown_marker(format!(
                 "`{}` is not the `{}` major this build reads",
                 self.schema,
@@ -1991,6 +2053,13 @@ impl RootMarker {
         }
         state::validate_identifier("root_id", &self.root_id)?;
         state::validate_identifier("nonce", &self.nonce)?;
+        if self.root_id.bytes().any(|byte| byte.is_ascii_uppercase())
+            || self.nonce.bytes().any(|byte| byte.is_ascii_uppercase())
+        {
+            return Err(unknown_marker(
+                "marker identifiers must be lowercase".to_owned(),
+            ));
+        }
         if &self.volume_uuid != expectation.volume_uuid {
             return Err(unknown_marker(format!(
                 "the marker records volume {}, not the verified {}",
@@ -2005,12 +2074,40 @@ impl RootMarker {
         }
         validate_name("area.namespace", &self.area.namespace)?;
         validate_name("area.area", &self.area.area)?;
-        if self.resolved_path != expectation.resolved_path {
-            return Err(unknown_marker(format!(
-                "the marker records {}, but the walk reached {}",
-                self.resolved_path.display(),
-                expectation.resolved_path.display()
-            )));
+        match self.schema.as_str() {
+            "barge.root/1" => {
+                if self.mount_relative_path.is_some()
+                    || self.mount_at_record.is_some()
+                    || self.resolved_path.as_deref() != Some(expectation.resolved_path)
+                {
+                    return Err(unknown_marker(
+                        "v1 marker path differs from the walk".to_owned(),
+                    ));
+                }
+            }
+            "barge.root/2" => {
+                let relative = self
+                    .mount_relative_path
+                    .as_deref()
+                    .ok_or_else(|| unknown_marker("v2 marker lacks relative path".to_owned()))?;
+                folder_components("mount_relative_path", relative)?;
+                let mount = self
+                    .mount_at_record
+                    .as_ref()
+                    .ok_or_else(|| unknown_marker("v2 marker lacks recorded mount".to_owned()))?;
+                if !mount.is_absolute()
+                    || self.resolved_path.is_some()
+                    || expectation
+                        .mount_point
+                        .and_then(|mount| expectation.resolved_path.strip_prefix(mount).ok())
+                        != Some(Path::new(relative))
+                {
+                    return Err(unknown_marker(
+                        "v2 marker path differs from the walk".to_owned(),
+                    ));
+                }
+            }
+            _ => return Err(unknown_marker("unknown marker version".to_owned())),
         }
         if self.created_ms > expectation.now_ms {
             return Err(unknown_marker(format!(
@@ -2018,7 +2115,10 @@ impl RootMarker {
                 self.created_ms - expectation.now_ms
             )));
         }
-        if self.generation == 0 {
+        if !matches!(
+            (self.kind, self.generation, self.conclusion.is_some()),
+            (_, 1, false) | (RootKind::ScratchRun, 2, true)
+        ) {
             return Err(unknown_marker(
                 "the marker's generation starts at 1".to_owned(),
             ));
@@ -3122,6 +3222,7 @@ pub fn list_roots(
         let expectation = MarkerExpectation {
             volume_uuid: &resolved.volume_uuid,
             resolved_path: &configured_path,
+            mount_point: Some(&resolved.mount_point),
             effective_uid,
             now_ms,
         };
@@ -3193,7 +3294,16 @@ fn observe_root(
             row.kind = Some(marker.kind);
             row.namespace = Some(marker.area.namespace.clone());
             row.area = Some(marker.area.area.clone());
-            row.recorded_path = Some(marker.resolved_path.clone());
+            row.recorded_path = Some(
+                marker
+                    .mount_at_record
+                    .as_ref()
+                    .zip(marker.mount_relative_path.as_ref())
+                    .map_or_else(
+                        || marker.resolved_path.clone().unwrap_or_default(),
+                        |(mount, relative)| mount.join(relative),
+                    ),
+            );
             row.created_ms = Some(marker.created_ms);
             row.last_activity_ms = Some(marker.created_ms.max(directory_modified_ms.unwrap_or(0)));
         }
@@ -3401,6 +3511,13 @@ mod tests {
     }
 
     impl VolumeFacts for FakeVolume {
+        fn mount_census(&self, uuid: &VolumeUuid) -> Result<Vec<PathBuf>> {
+            Ok(if self.present && &self.uuid == uuid {
+                vec![self.root.clone()]
+            } else {
+                Vec::new()
+            })
+        }
         fn identify(&self, _path: &Path) -> Result<VolumeIdentity> {
             if !self.present {
                 return Err(Error::new(
@@ -3852,6 +3969,7 @@ mod tests {
             let observer = self.observer();
             let resolved = self.resolved(record, declaration);
             let root = super::create_root(
+                &self.state,
                 &platform,
                 &observer,
                 &resolved,
@@ -3888,6 +4006,7 @@ mod tests {
             &MarkerExpectation {
                 volume_uuid: &fixture.uuid,
                 resolved_path: &path,
+                mount_point: Some(&resolved.mount_point),
                 effective_uid: observer.effective_uid().expect("the uid"),
                 now_ms: crate::state::now_ms(),
             },
@@ -4365,6 +4484,7 @@ mod tests {
         // The created root's marker records the caller's effective declaration
         // exactly.
         let root = super::create_root(
+            &fixture.state,
             &platform,
             &observer,
             &resolved,
@@ -4434,17 +4554,149 @@ mod tests {
             MarkerState::Owned(marker) => marker,
             other => panic!("the marker is owned: {other:?}"),
         };
+        let persisted = crate::identity::read(
+            &fixture.state,
+            &fixture.platform(),
+            &root.root_id,
+            fixture.observer().effective_uid().unwrap(),
+        )
+        .unwrap()
+        .expect("identity is recorded");
+        assert_eq!(persisted.nonce, root.nonce);
+        assert_eq!(persisted.inode, root.identity.inode);
+        assert_eq!(persisted.origin, crate::identity::IdentityOrigin::Created);
+        let mut locks = LockSet::new(fixture.state.clone());
+        let lock = locks.lock_root(&root.root_id).unwrap();
+        assert!(crate::identity::write_once(
+            &fixture.state,
+            &fixture.platform(),
+            &lock,
+            fixture.observer().effective_uid().unwrap(),
+            &persisted
+        )
+        .is_err());
         assert_eq!(marker.root_id, root.root_id);
         assert_eq!(marker.kind, RootKind::AreaRoot);
         assert_eq!(marker.volume_uuid, fixture.uuid);
         assert_eq!(marker.origin, super::RootOrigin::Created);
-        assert_eq!(marker.resolved_path, root.path);
+        assert_eq!(
+            marker
+                .mount_at_record
+                .as_ref()
+                .unwrap()
+                .join(marker.mount_relative_path.as_ref().unwrap()),
+            root.path
+        );
         assert!(marker.conclusion.is_none());
 
         // A second creation gets a different root, never a shared one.
         let (second, _) = fixture.create_root(&fixture.record, &declaration);
         assert_ne!(second.root_id, root.root_id);
         assert_ne!(second.nonce, root.nonce);
+    }
+
+    #[test]
+    fn durable_identity_verifies_the_opened_root_and_refuses_mismatches() {
+        let fixture = Fixture::new("identity-verification");
+        let declaration = fixture.declaration("example/pool");
+        let (root, _) = fixture.create_root(&fixture.record, &declaration);
+        let platform = fixture.platform();
+        let observer = fixture.observer();
+        let uid = observer.effective_uid().unwrap();
+        let verify = || {
+            crate::identity::verify(
+                &fixture.state,
+                &platform,
+                &fixture.facts(),
+                &fixture.mounts(),
+                uid,
+                &root.root_id,
+            )
+        };
+        assert!(matches!(
+            verify(),
+            crate::identity::IdentityVerdict::Verified { .. }
+        ));
+        struct Duplicate(FakeVolume);
+        impl VolumeFacts for Duplicate {
+            fn identify(&self, path: &Path) -> Result<VolumeIdentity> {
+                self.0.identify(path)
+            }
+            fn mount_census(&self, _: &VolumeUuid) -> Result<Vec<PathBuf>> {
+                Ok(vec![self.0.root.clone(), self.0.root.clone()])
+            }
+        }
+        assert_eq!(
+            crate::identity::verify(
+                &fixture.state,
+                &platform,
+                &Duplicate(fixture.facts()),
+                &fixture.mounts(),
+                uid,
+                &root.root_id
+            ),
+            crate::identity::IdentityVerdict::Unknown {
+                reason: crate::identity::IdentityReason::DuplicateVolumeUuid
+            }
+        );
+        let identity_path = fixture
+            .state
+            .root()
+            .join("roots")
+            .join(&root.root_id)
+            .join("identity.json");
+        let identity_bytes = std::fs::read(&identity_path).unwrap();
+        let mut identity: serde_json::Value = serde_json::from_slice(&identity_bytes).unwrap();
+        identity["device_at_record"] = (root.identity.device.get() + 1).into();
+        std::fs::write(&identity_path, serde_json::to_vec(&identity).unwrap()).unwrap();
+        assert!(matches!(
+            verify(),
+            crate::identity::IdentityVerdict::Verified {
+                remount: crate::identity::RemountEvidence { changed: true, .. },
+                ..
+            }
+        ));
+        assert_ne!(
+            identity["device_at_record"].as_u64().unwrap(),
+            root.identity.device.get()
+        );
+        identity["inode"] = (root.identity.inode + 1).into();
+        std::fs::write(&identity_path, serde_json::to_vec(&identity).unwrap()).unwrap();
+        assert_eq!(
+            verify(),
+            crate::identity::IdentityVerdict::Unknown {
+                reason: crate::identity::IdentityReason::InodeChanged
+            }
+        );
+        std::fs::write(&identity_path, identity_bytes).unwrap();
+        let foreign = Adjust::new().with_foreign_owner(ROOT_MARKER_FILE);
+        assert_eq!(
+            crate::identity::verify(
+                &fixture.state,
+                &foreign,
+                &fixture.facts(),
+                &fixture.mounts(),
+                uid,
+                &root.root_id
+            ),
+            crate::identity::IdentityVerdict::Unknown {
+                reason: crate::identity::IdentityReason::MarkerForeignOwner
+            }
+        );
+        let marker_path = marker_path(&root);
+        let bytes = std::fs::read(&marker_path).unwrap();
+        rewrite_marker(&marker_path, |value| {
+            value["nonce"] = "0123456789abcdef0123456789abcdef".into()
+        });
+        assert_eq!(
+            verify(),
+            crate::identity::IdentityVerdict::Unknown {
+                reason: crate::identity::IdentityReason::MarkerIdentityMismatch
+            }
+        );
+        std::fs::write(&marker_path, bytes).unwrap();
+        std::fs::remove_dir_all(&root.path).unwrap();
+        assert_eq!(verify(), crate::identity::IdentityVerdict::Gone);
     }
 
     #[test]
@@ -4492,6 +4744,7 @@ mod tests {
             &MarkerExpectation {
                 volume_uuid: &fixture.uuid,
                 resolved_path: &root.path,
+                mount_point: Some(&resolved.mount_point),
                 effective_uid: observer.effective_uid().expect("the uid"),
                 now_ms: crate::state::now_ms(),
             },
@@ -4528,6 +4781,31 @@ mod tests {
     }
 
     #[test]
+    fn v1_remains_readable_at_its_exact_recorded_path() {
+        let fixture = Fixture::new("marker-v1");
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let path = marker_path(&root);
+        rewrite_marker(&path, |value| {
+            value["schema"] = "barge.root/1".into();
+            value["resolved_path"] = root.path.to_string_lossy().to_string().into();
+            value.as_object_mut().unwrap().remove("mount_relative_path");
+            value.as_object_mut().unwrap().remove("mount_at_record");
+        });
+        assert!(matches!(
+            read_owned(&fixture, &resolved, &root.root_id),
+            MarkerState::Owned(_)
+        ));
+        rewrite_marker(&path, |value| {
+            value["resolved_path"] = "/different/mount/root".into()
+        });
+        assert!(matches!(
+            read_owned(&fixture, &resolved, &root.root_id),
+            MarkerState::Unknown { .. }
+        ));
+    }
+
+    #[test]
     fn an_unknown_version_or_divergent_marker_is_not_owned() {
         let fixture = Fixture::new("marker-version");
         let declaration = fixture.declaration("example/pool");
@@ -4537,7 +4815,7 @@ mod tests {
 
         for edit in [
             (|value: &mut serde_json::Value| {
-                value["schema"] = "barge.root/2".into();
+                value["schema"] = "barge.root/3".into();
             }) as fn(&mut serde_json::Value),
             |value: &mut serde_json::Value| {
                 value["owner"] = "someone-else".into();
@@ -4572,6 +4850,17 @@ mod tests {
                 "a divergent marker is never owned: {state:?}"
             );
         }
+        std::fs::write(&path, &valid).expect("the marker is restored");
+        rewrite_marker(&path, |value| {
+            value["mount_relative_path"] = root.root_id.clone().into()
+        });
+        assert!(
+            matches!(
+                read_owned(&fixture, &resolved, &root.root_id),
+                MarkerState::Unknown { .. }
+            ),
+            "a matching suffix is not the whole path"
+        );
         std::fs::write(&path, &valid).expect("the marker is restored");
         assert!(matches!(
             read_owned(&fixture, &resolved, &root.root_id),
@@ -4925,6 +5214,7 @@ mod tests {
         let planted = resolved.path.join("0".repeat(32));
         // The area folder is created first, then the planted root name exists.
         let first = super::create_root(
+            &fixture.state,
             &dirs,
             &observer,
             &resolved,
@@ -4940,6 +5230,7 @@ mod tests {
             calls: RefCell::new(0),
         };
         let second = super::create_root(
+            &fixture.state,
             &dirs,
             &observer,
             &resolved,
@@ -5027,6 +5318,7 @@ mod tests {
         let resolved = fixture.resolved(&fixture.record, &declaration);
         let observer = fixture.observer();
         let error = super::create_root(
+            &fixture.state,
             &dirs,
             &observer,
             &resolved,

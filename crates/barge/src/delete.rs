@@ -1098,7 +1098,7 @@ enum MarkerBytes {
 /// Read one captured leaf's marker digest, from the filename the intent recorded.
 ///
 /// A Barge marker is read by [`area::read_marker_with_digest`], so it must still
-/// be a `barge.root/1` document; a foreign family's marker is read as the bytes
+/// be a versioned Barge root document; a foreign family's marker is read as the bytes
 /// at its own pinned filename. The marker records the unit's creation path, which
 /// the rename did not change, so the expectation is only what lets the bytes be
 /// read; the caller compares the digest.
@@ -1112,6 +1112,7 @@ fn leaf_marker_digest(
     let expectation = MarkerExpectation {
         volume_uuid: &intent.volume_uuid,
         resolved_path: Path::new(""),
+        mount_point: None,
         effective_uid: observer.effective_uid()?,
         now_ms: state::now_ms(),
     };

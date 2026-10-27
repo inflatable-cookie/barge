@@ -19,9 +19,18 @@ CLI shape, the state directory, the registry, areas, root markers, holds,
 custody, whole-unit deletion and the plan/intent mechanics this contract
 extends. Where they differ, they win and this file is corrected.
 
+The marker writer emits `barge.root/2`; the reader also accepts `barge.root/1`
+at its exact recorded path. The v1 mount-prefix relaxation remains in F2.
+Creation and in-place cache adoption record the immutable identity under a root
+lock; verification reads a fresh bounded mount census. `barge describe` reports
+the identity capability and each registered UUID's census, with unavailable
+censuses reported as unknown. `barge area root identify --volume <uuid> --path
+<mount-relative-path>` explicitly identifies a root without a record only after
+verifying its volume and marker and obtaining safe custody. It never overwrites
+a record.
+
 No part of this contract authorizes a native run, a real drive, a mount or host
-setting change, a data move, a deletion, or any change to Oxide. It is design
-only.
+setting change, a data move, a deletion, or any change to Oxide.
 
 ## Scope and authority
 
@@ -1132,17 +1141,11 @@ qualification claim, and none contradicts a frozen ruling.
   (for example a per-volume registration receipt written at registration time)
   is worth the coupling. If the operator wants clones treated as unknown, that
   is a scope decision, not a design detail.
-- **O4-002 — Repairing a root that has no identity record.** S3 has landed and
-  records no durable identity, so roots it created, a root adopted before F1, and
-  a root whose creation crashes between the marker and the identity write all
-  have a valid marker and no identity record. Proposed: never automatic; one
-  explicit operator command that takes the root lock, verifies the marker and
-  the volume, requires custody `Safe`, writes a record with
-  `origin: identified`, and reports exactly what it decided. The alternative is
-  that such a root can only ever be kept and released by hand — a space prune can
-  still reclaim it, which is part of what makes the alternative tolerable. The
-  operator's choice is needed before F1 lands, because it decides whether a
-  repair verb exists at all.
+- **O4-002 — Repairing a root that has no identity record.** Tom's ruling
+  `d9a9cd37` chooses one explicit operator command, never automatic. It takes
+  the root lock, verifies the marker and volume, requires custody `Safe`, writes
+  `origin: identified` once, and reports the decision and custody evidence.
+  A missing record is otherwise unknown and never establishes release authority.
 - **O4-003 — The `barge.root/1` prefix relaxation.** Stage 1's v1 marker records
   an absolute `resolved_path`, and S3 writes it and validates it against the path
   it walked, so the relaxation is live from the first day rather than a

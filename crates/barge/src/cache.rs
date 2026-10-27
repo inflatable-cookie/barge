@@ -1046,6 +1046,7 @@ fn recover_marker_observation(
     let expectation = MarkerExpectation {
         volume_uuid: &intent.volume.volume_uuid,
         resolved_path: &plan.path,
+        mount_point: Some(&folder.mount_point),
         effective_uid: observer.effective_uid()?,
         now_ms: state::now_ms(),
     };
@@ -1728,6 +1729,7 @@ fn adopt_directory(
             }
             let folder = re_resolve(dirs, facts, mounts, observer, record)?;
             let root = area::create_root_in_feature(
+                state,
                 dirs,
                 observer,
                 &folder,
@@ -2133,6 +2135,7 @@ fn adopt_directory(
             // the empty directory back, so a failed adopt never leaves the tool's
             // path missing.
             let root = match area::create_root_in_feature(
+                state,
                 dirs,
                 observer,
                 &folder,
@@ -2362,6 +2365,7 @@ fn adopt_in_place(
     let expectation = MarkerExpectation {
         volume_uuid: &record.volume_uuid,
         resolved_path: path,
+        mount_point: Some(&folder.mount_point),
         effective_uid,
         now_ms: state::now_ms(),
     };
@@ -2401,6 +2405,8 @@ fn adopt_in_place(
         allocated_bytes: facts.allocated_bytes,
     };
     let root_id = hex_encode(&dirs.random_bytes(16)?);
+    let mut locks = LockSet::new(state.clone());
+    let root_lock = locks.lock_root(&root_id)?;
     let mut intent =
         read_adopt_intent(state, kind)?.ok_or_else(|| unknown("marker intent missing"))?;
     intent.marker_plan = Some(MarkerPlan {
@@ -2413,11 +2419,29 @@ fn adopt_in_place(
         root_id: Some(&root_id),
         volume_uuid: &record.volume_uuid,
         resolved_path: path,
+        mount_point: &folder.mount_point,
         area: cache_area(),
         kind: RootKind::CacheRoot,
         origin: RootOrigin::AdoptedExisting,
     };
     let marker = area::write_marker(dirs, &handle, &write, effective_uid)?;
+    let owned = area::OwnedRoot {
+        root_id: marker.root_id.clone(),
+        nonce: marker.nonce.clone(),
+        kind: RootKind::CacheRoot,
+        area: cache_area(),
+        volume_uuid: record.volume_uuid.clone(),
+        path: path.to_path_buf(),
+        identity: handle.identity(),
+        marker_digest: marker.marker_digest.clone(),
+        created_ms: marker.created_ms,
+    };
+    let identity = crate::identity::from_owned(
+        &owned,
+        &folder.mount_point,
+        crate::identity::IdentityOrigin::AdoptedExisting,
+    )?;
+    crate::identity::write_once(state, dirs, &root_lock, effective_uid, &identity)?;
     let held = HeldRoot {
         path: path.to_path_buf(),
         root_id: marker.root_id,
@@ -3628,6 +3652,7 @@ fn observed_link_root(
     let expectation = MarkerExpectation {
         volume_uuid: &record.volume_uuid,
         resolved_path: &root_path,
+        mount_point: volume.mount_hint.as_deref(),
         effective_uid,
         now_ms: state::now_ms(),
     };
@@ -3748,6 +3773,7 @@ fn observe_adopted_marker(
     let expectation = MarkerExpectation {
         volume_uuid: &record.volume_uuid,
         resolved_path: &held.path,
+        mount_point: volume.mount_hint.as_deref(),
         effective_uid,
         now_ms: state::now_ms(),
     };
@@ -4782,6 +4808,17 @@ mod tests {
             PlacementForm::Setting(form) => {
                 let held = form.held_root.as_ref().expect("the directory is adopted");
                 assert_eq!(held.path, npm);
+                let uid = crate::os::ProcessObserver::effective_uid(&fixture.platform()).unwrap();
+                let identity =
+                    crate::identity::read(&fixture.state, &fixture.platform(), &held.root_id, uid)
+                        .unwrap()
+                        .expect("identity recorded");
+                assert_eq!(
+                    identity.origin,
+                    crate::identity::IdentityOrigin::AdoptedExisting
+                );
+                assert_eq!(identity.inode, held.inode);
+                assert_eq!(identity.nonce, held.nonce);
             }
             other => panic!("expected the setting form, got {}", other.name()),
         }
@@ -4807,6 +4844,48 @@ mod tests {
             })
             .collect();
         assert_eq!(after_tree, before_tree, "the cache data is untouched");
+    }
+
+    #[test]
+    fn adopted_directory_with_a_non_id_name_can_be_explicitly_identified() {
+        let fixture = Fixture::new("cache-identify-held");
+        let npm = fixture.caches().join("npm");
+        std::fs::create_dir_all(&npm).unwrap();
+        fixture.write(".npmrc", &format!("cache={}\n", npm.display()));
+        let mut request = fixture.request(CacheKind::NpmCache);
+        request.adopt_existing_root = true;
+        let placement = fixture.adopt(&request).unwrap().placement.unwrap();
+        let PlacementForm::Setting(form) = placement.form else {
+            panic!("setting expected")
+        };
+        let held = form.held_root.unwrap();
+        let identity_path = fixture
+            .state
+            .root()
+            .join("roots")
+            .join(&held.root_id)
+            .join("identity.json");
+        std::fs::remove_file(&identity_path).unwrap();
+        let relative = npm
+            .strip_prefix(&fixture.volume.root)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let report = crate::identity::identify(
+            &fixture.state,
+            &fixture.platform(),
+            fixture.facts.as_ref(),
+            &fixture.volume.mounts(),
+            &fixture.volume.observer(),
+            &fixture.volume.uuid,
+            relative,
+        )
+        .unwrap();
+        assert_eq!(report.record.root_id, held.root_id);
+        assert_eq!(
+            report.record.origin,
+            crate::identity::IdentityOrigin::Identified
+        );
     }
 
     #[test]
