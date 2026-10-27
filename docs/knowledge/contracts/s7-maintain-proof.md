@@ -132,10 +132,13 @@ run would replay.
    two — the scratch stage first, then the area stage — leaves the fresh root and
    its marker in place, and reports nothing pending with exit `0`.
 2. **`a_tampered_plan_refuses`.** `--plan-out` writes the exact preview bytes; the
-   case proves their SHA-256 is the preview's digest, appends one byte, and
-   requires exit `2` with `usage` and "do not match", with the planned root still
-   present. The preview's authentic bytes and digest then authorise the real run,
-   which deletes the root that plan named.
+   case proves their SHA-256 is the preview's digest and writes a *separate*
+   tampered copy with one byte appended, so the preview's own file is never
+   modified. The tampered copy with the preview's digest requires exit `2` with
+   `usage` and "do not match", with the planned root still present, and the
+   authentic file is re-read and proved unchanged. The preview's authentic bytes
+   and digest then authorise the real run, which deletes the root that plan
+   named.
 3. **`a_hold_between_preview_and_real_stops_that_unit`.** Two aged roots, one
    preview. A hold is taken through `barge area hold` with the proof's own live
    pid, which the product reads as live. The real run authorised by that same

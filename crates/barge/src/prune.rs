@@ -1029,14 +1029,26 @@ fn run(
                 continue;
             };
             let declaration = document.declaration();
-            let Some(age_seconds) = prune_age_seconds(&declaration.prune) else {
+            // The comparison is against the policy the preview saved, never
+            // against a value derived from the current declaration: a declaration
+            // edited between the preview and the effect must not decide the age
+            // this plan's units are judged by.
+            if prune_age_seconds(&area_plan.policy).is_none() {
                 stage.skipped = all_skipped(
                     area_plan,
-                    "the declaration no longer declares a prune policy",
+                    "the plan's step declares no prune policy, so no unit is acted on",
                 );
                 outcome.areas.push(stage);
                 continue;
-            };
+            }
+            if declaration.prune != area_plan.policy {
+                stage.skipped = all_skipped(
+                    area_plan,
+                    "the declaration's prune policy changed since the plan; the planned units are kept",
+                );
+                outcome.areas.push(stage);
+                continue;
+            }
             // A folder override that moved the area between the plan and the
             // effect keeps this area's units: the plan named paths the current
             // configuration no longer resolves.
@@ -1090,7 +1102,7 @@ fn run(
                         volume_plan.record_generation,
                         document,
                         candidate,
-                        age_seconds,
+                        &area_plan.policy,
                         request.now_ms,
                     )
                 };
@@ -1313,7 +1325,7 @@ fn reverify_area_root(
     planned_generation: u64,
     document: &AreaDocument,
     candidate: &PruneRootRow,
-    age_seconds: u64,
+    planned_policy: &PrunePolicy,
     now_ms: u64,
 ) -> Result<()> {
     if record.generation != planned_generation {
@@ -1335,11 +1347,23 @@ fn reverify_area_root(
         ));
     };
     let declaration = stored.declaration();
-    if prune_age_seconds(&declaration.prune) != Some(age_seconds) {
+    // Re-read under the effect lock: the current declaration must still declare
+    // exactly the policy the preview saved, so a policy edited in this run's own
+    // window cannot decide the age the plan's units are judged by.
+    let Some(age_seconds) = prune_age_seconds(planned_policy) else {
         return Err(Error::new(
             ErrorKind::RefusedBoundary,
             format!(
-                "the prune policy of {}/{} changed between the plan and the effect; the root is kept",
+                "the plan's step for {}/{} declares no prune policy; the root is kept",
+                stored.namespace, stored.area
+            ),
+        ));
+    };
+    if &declaration.prune != planned_policy {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "the prune policy of {}/{} changed since the plan; the root is kept",
                 stored.namespace, stored.area
             ),
         ));
@@ -2093,6 +2117,102 @@ mod tests {
         assert_eq!(volume.areas[0].skipped.count, 1);
         assert!(root.path.is_dir(), "the planned unit is kept");
         assert!(report.needs_human());
+    }
+
+    #[test]
+    fn an_area_policy_change_between_the_plan_and_the_effect_keeps_that_area() {
+        let harness = Harness::new("maintain-policy-changed");
+        let root = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        assert_eq!(harness.area_plan(&preview).candidates.count, 1);
+
+        // The declaration's policy is edited after the preview. The plan's own
+        // saved policy is the authorization, so nothing in that area is acted on
+        // under the new policy — even when the new policy would also cover the
+        // root — and the run still completes.
+        let mut changed = harness.declaration();
+        changed.prune = PrunePolicy::OldestIdleAfter {
+            age_seconds: AREA_AGE_SECONDS * 2,
+        };
+        area::declare(&harness.fixture.state, &changed, harness.now_ms)
+            .expect("the area is redeclared");
+        let report = harness.real(&preview).expect("the run reports");
+        let area_stage = &report.volumes.rows[0].areas[0];
+        assert_eq!(area_stage.deleted.count, 0, "{area_stage:?}");
+        assert_eq!(area_stage.skipped.count, 1);
+        assert!(
+            area_stage.skipped.rows[0]
+                .reason
+                .contains("prune policy changed since the plan"),
+            "{}",
+            area_stage.skipped.rows[0].reason
+        );
+        assert!(root.path.is_dir(), "the planned unit is kept");
+        assert_eq!(report.pending.count, 0);
+        assert!(!report.needs_human(), "{report:?}");
+    }
+
+    #[test]
+    fn an_area_policy_change_inside_the_effect_window_keeps_that_area_s_units() {
+        let harness = Harness::new("maintain-policy-changed-in-window");
+        let first = harness.create_root(RootKind::AreaRoot);
+        let second = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        assert_eq!(harness.area_plan(&preview).candidates.count, 2);
+
+        // The declaration is edited inside the run's own window: the probe fires
+        // at the deletion's present check, after the stage's policy comparison and
+        // before the effect-lock re-verification, so the refusal comes from the
+        // re-read under the lock.
+        let target = first.root_id.clone();
+        let state = harness.fixture.state.clone();
+        let mut changed = harness.declaration();
+        changed.prune = PrunePolicy::OldestIdleAfter {
+            age_seconds: AREA_AGE_SECONDS * 2,
+        };
+        let seen = std::cell::Cell::new(0usize);
+        let faults = Faults::new();
+        faults.observing(Box::new(move |name: &str| {
+            if name != target {
+                return;
+            }
+            let count = seen.get() + 1;
+            seen.set(count);
+            if count != 1 {
+                return;
+            }
+            area::declare(&state, &changed, state::now_ms())
+                .expect("the area is redeclared inside the window");
+        }));
+        let report = harness
+            .real_with(&faults, harness.aged(), &preview)
+            .expect("the run reports");
+        let area_stage = &report.volumes.rows[0].areas[0];
+        // The other root may already have gone under the planned policy before the
+        // probe fired; every unit re-verified after the change is kept by the
+        // effect-lock comparison, and every planned unit is accounted for.
+        assert_eq!(
+            area_stage.deleted.count + area_stage.skipped.count,
+            2,
+            "{area_stage:?}"
+        );
+        assert!(!area_stage.skipped.rows.is_empty());
+        assert!(
+            area_stage.skipped.rows.iter().all(|row| row
+                .reason
+                .contains("prune policy of example/pool changed since the plan")),
+            "{:?}",
+            area_stage.skipped.rows
+        );
+        for row in &area_stage.skipped.rows {
+            let path = if row.name == first.root_id {
+                &first.path
+            } else {
+                &second.path
+            };
+            assert!(path.is_dir(), "a kept root survives the window");
+        }
+        assert_eq!(report.pending.count, 0);
     }
 
     #[test]

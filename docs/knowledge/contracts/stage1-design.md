@@ -2358,9 +2358,12 @@ Choices S7 made where this design left the mechanic to the slice:
   units and their identities, and every unit is re-verified immediately before
   its effect: the scratch stage re-reads its unit's grant, marker, identity,
   holds and age through S4's `reassess` and the deletion's own authorization,
-  and each area root is re-read under the volume lock (declaration, policy age,
-  identity, marker digest, holds, idleness and the registry record's
-  generation). A unit that changed in between — a live hold, a withdrawn
+  and each area root is re-read under the volume lock (declaration, identity,
+  marker digest, holds, idleness and the registry record's generation). The
+  area's policy is compared with the policy the preview saved, never with a value
+  derived from the current declaration, both before the stage and again under the
+  effect lock, so a declaration edited in either window cannot decide the age the
+  plan's units are judged by. A unit that changed in between — a live hold, a withdrawn
   delegation or claim, a marker that appeared, a changed identity or revision,
   or a volume whose record left the registry or moved its `root_dir` — is kept
   and reported as that unit (or that volume's units) only, and the rest of the

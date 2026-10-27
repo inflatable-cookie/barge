@@ -771,18 +771,23 @@ class Proof:
     def case_a_tampered_plan_refuses(self):
         root = self.create_area_root()
         self.age_area_root(root["path"])
-        plan_file = os.path.join(self.root, "case2-plan.json")
+        plan_file = self.plan_path("case2")
+        tampered_file = self.plan_path("case2-tampered")
         _code, preview = self.preview(expect=0, plan_out=plan_file)
         digest = preview["data"]["plan_digest"]
         with open(plan_file, "rb") as handle:
             saved = handle.read()
         assert hashlib.sha256(saved).hexdigest() == digest, "the preview wrote the exact bytes"
-        with open(plan_file, "wb") as handle:
+        # The tampered copy is a different file: the preview's own bytes must stay
+        # intact, or the expected-success step below could never run.
+        with open(tampered_file, "wb") as handle:
             handle.write(saved + b" ")
-        code, document = self.real(digest, plan_file=plan_file, expect=2)
+        code, document = self.real(digest, tampered_file, expect=2)
         assert document["error"]["kind"] == "usage", document["error"]
         assert "do not match" in document["error"]["message"], document["error"]["message"]
         assert os.path.isdir(root["path"]), "a tampered plan changed nothing"
+        with open(plan_file, "rb") as handle:
+            assert handle.read() == saved, "the authentic preview bytes are untouched"
         # The preview's own bytes and digest then authorise the run, and it
         # deletes the unit that plan named.
         code_ok, real = self.real(digest, plan_file, expect=0)
