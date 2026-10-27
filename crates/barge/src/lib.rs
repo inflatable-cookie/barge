@@ -33,6 +33,7 @@ pub mod describe;
 pub mod diagnostic;
 pub mod digest;
 pub mod error;
+pub mod identity;
 pub mod inspect;
 pub mod os;
 pub mod prune;
