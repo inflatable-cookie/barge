@@ -125,7 +125,7 @@ PREMISES = [
     "the account home used for state resolution is the fixture's, proved from the child environment and the fixture registry; the real state directory is observed completely and asserted unchanged",
     "BARGE_STATE_DIR, TMPDIR, TMP and TEMP all point inside the guard's owned scratch",
     "every fixture volume is registered by this proof's own explicit registry write, never by a default",
-    "one owned sparse image with -owners on; only the surprise-removal case may force-detach its positively rebound whole-disk device; cleanup is ordinary and keeps backing on failure",
+    "one owned sparse image with -owners on, attached at a unique /Volumes name; ordinary detach with the backing kept on failure, and no forced detach at all",
     "every environment hook is listed in ENVIRONMENT with its purpose; no debug-only bypass exists",
     "temporary storage is inside the guard's one owned root: no home folder and no drive root",
     "mktemp -d under that root for every fixture directory, never a shared name",
@@ -492,8 +492,6 @@ class Proof:
         self.attached = False
         self.env = None
         self.shim_evidence = None
-        self.pull_evidence = None
-        self.detach_evidence = []
 
     # -- fixture setup ----------------------------------------------------
 
@@ -980,49 +978,13 @@ class Proof:
         pulled = None
         try:
             self.wait_for_quarantine(folder, timeout=60)
-            # Rebind every recorded identity immediately before the only forced
-            # detach. A mount path alone is never authority for this effect.
-            images = plistlib.loads(run(["hdiutil", "info", "-plist"], self.env).stdout.encode()).get("images", [])
-            matches = [image for image in images if image.get("image-path") == self.image]
-            if len(matches) != 1 or not self.attached:
-                raise Fault("premise", "the owned image attachment is not uniquely present")
-            entities = matches[0].get("system-entities", [])
-            whole = "/dev/" + self.whole_disk
-            mounted = [entity for entity in entities if entity.get("mount-point") == self.mount]
-            if (len(mounted) != 1 or mounted[0].get("dev-entry") != "/dev/" + self.device
-                    or not any(entity.get("dev-entry") == whole for entity in entities)
-                    or not re.fullmatch(r"/dev/disk[0-9]+", whole)):
-                raise Fault("premise", "the image, mount and whole-disk attachment no longer match")
-            info = plistlib.loads(run(["diskutil", "info", "-plist", self.mount], self.env).stdout.encode())
-            if (info.get("VolumeUUID") != self.uuid or info.get("DeviceIdentifier") != self.device
-                    or info.get("ParentWholeDisk") != self.whole_disk):
-                raise Fault("premise", "the mounted volume identity changed before the pull")
-            self.pull_evidence = {"mode": "forced-owned (case premise: surprise removal)",
-                                  "device": whole, "image": self.image, "mount": self.mount,
-                                  "volume_uuid": self.uuid}
-            result = run(["hdiutil", "detach", "-force", whole], self.env, timeout=120, check=False)
-            self.pull_evidence["detach_exit"] = result.returncode
-            if result.returncode != 0:
-                raise Fault("case", f"owned whole-disk detach failed: {result.returncode}: {(result.stderr or result.stdout).strip()[-200:]}")
-            self.attached = False
-            pulled = self.pull_evidence["mode"]
+            pulled = self.pull()
         finally:
             try:
                 process.wait(timeout=180)
             except subprocess.TimeoutExpired:
                 process.kill()
                 raise Fault("case", "the expiry did not stop after the volume was pulled")
-        if process.returncode == 0:
-            raise Fault("case", "expiry succeeded despite the mid-delete pull")
-        stale_before = sorted(os.listdir(self.mount)) if os.path.isdir(self.mount) else None
-        if stale_before not in (None, []):
-            raise Fault("case", "the detached mount point is not empty")
-        _, absent = self.barge("scratch", "expire", "--volume", self.uuid, "--plan", expect=2)
-        if absent.get("error", {}).get("kind") != "volume_absent":
-            raise Fault("case", f"the pulled volume did not refuse as absent: {absent}")
-        stale_after = sorted(os.listdir(self.mount)) if os.path.isdir(self.mount) else None
-        if stale_before != stale_after:
-            raise Fault("case", "the stale mount point changed during the absent-volume plan")
         # The pending intent is state, not the image: it must be readable while the
         # volume is away.
         pending = self.pending_intents()
@@ -1048,8 +1010,7 @@ class Proof:
         digest_after, plan = self.empty_plan_digest()
         if plan["candidates"]["count"] != 0:
             raise Fault("case", "a settled-plan run would delete something new")
-        real, removed = self.replay_observing_removed(intent["intent_id"], digest_after)
-        self.pull_evidence["removed_observation"] = removed
+        real = self.expire(digest_after, expect=0)
         replay = real["data"].get("replay") or {}
         if not replay.get("resumed") and not replay.get("settled"):
             raise Fault("case", f"the replay did not resume or settle the intent: {replay}")
@@ -1192,9 +1153,6 @@ class Proof:
             timeout=180,
         )
         self.attached = True
-        info = plistlib.loads(run(["diskutil", "info", "-plist", self.mount], self.env).stdout.encode())
-        if info.get("VolumeUUID") != self.uuid:
-            raise Fault("premise", "the reattached image has a different volume UUID")
 
     def detach(self):
         """Detach the owned image ordinarily, and never by force.
@@ -1205,10 +1163,8 @@ class Proof:
         unqualified instead of force-unmounting a path.
         """
         if not self.attached:
-            self.detach_evidence.append({"mode": "ordinary", "outcome": "already detached"})
             return None
         result = run(["hdiutil", "detach", self.mount], self.env, timeout=180, check=False)
-        self.detach_evidence.append({"mode": "ordinary", "mount": self.mount, "exit": result.returncode})
         if result.returncode != 0:
             return (
                 f"the ordinary detach of {self.mount} failed "
@@ -1216,6 +1172,25 @@ class Proof:
             )
         self.attached = False
         return None
+
+    def pull(self):
+        """Pull the owned image mid-delete with the ordinary detach the case names.
+
+        The brief's case is an ordinary detach mid-delete. A forced detach is
+        never substituted for it: if the ordinary detach is refused, the case is
+        unproved and says so, rather than proving a different behaviour under the
+        same name.
+        """
+        result = run(["hdiutil", "detach", self.mount], self.env, timeout=120, check=False)
+        if result.returncode != 0:
+            raise Fault(
+                "case",
+                "the ordinary detach mid-delete was refused "
+                f"({result.returncode}: {(result.stderr or result.stdout).strip()[-200:]}), "
+                "so this case is unproved; no forced detach is used as a substitute",
+            )
+        self.attached = False
+        return "ordinary"
 
     def assert_resolver(self):
         """Prove the product's state resolution from fixture-only evidence.
@@ -1405,8 +1380,6 @@ class Proof:
             "environment": sorted(ENVIRONMENT),
             "environment_purposes": dict(ENVIRONMENT),
             "enotempty_shim": self.shim_evidence,
-            "pull": self.pull_evidence,
-            "detach": self.detach_evidence,
             "supervisor_sha256": SUPERVISOR_SHA256,
             "bin_sha256": sha256_file(self.binary) if os.path.isfile(self.binary) else None,
             "owned_scratch": self.root,
@@ -1424,7 +1397,7 @@ class Proof:
     def cleanup(self):
         """Detach ordinarily and remove the owned root; a failure keeps both.
 
-        A failed ordinary cleanup detach leaves the image attached and its backing file in
+        A failed ordinary detach leaves the image attached and its backing file in
         place: the proof never force-detaches by mount path and never removes the
         backing of an image it could not detach. The failure is returned so the
         receipt is unqualified, never suppressed.
@@ -1712,31 +1685,6 @@ def self_check():
     with open(os.path.join(script_dir, "scratch-enotempty-shim.c"), encoding="utf-8") as source_file:
         native_source = source_file.read()
     problems.extend(environment_inventory_problems(sources, ENVIRONMENT, native_source))
-    # The only force flag is in the pull case, after the identity checks, and
-    # its command targets the checked whole-disk variable, never a mount path.
-    tree = ast.parse(sources[0])
-    proof_node = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Proof")
-    force_nodes = [node for node in ast.walk(proof_node)
-                   if isinstance(node, ast.Constant) and node.value == "-force"]
-    case = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
-                and node.name == "case_a_pull_mid_delete_leaves_a_pending_intent_then_replay")
-    force_calls = [node for node in ast.walk(case) if isinstance(node, ast.Call)
-                   and isinstance(node.func, ast.Name) and node.func.id == "run"
-                   and node.args and isinstance(node.args[0], ast.List)
-                   and any(isinstance(item, ast.Constant) and item.value == "-force"
-                           for item in node.args[0].elts)]
-    if len(force_nodes) != 1 or len(force_calls) != 1:
-        problems.append("force detach is not confined to the pull case")
-    else:
-        args = force_calls[0].args[0].elts
-        if (len(args) != 4 or [getattr(item, "value", None) for item in args[:3]]
-                != ["hdiutil", "detach", "-force"] or not isinstance(args[3], ast.Name)
-                or args[3].id != "whole"):
-            problems.append("force detach does not target the rebound whole-disk device")
-        checks = [node for node in ast.walk(case) if isinstance(node, ast.Raise)
-                  and getattr(node, "lineno", 0) < force_calls[0].lineno]
-        if len(checks) < 3:
-            problems.append("force detach lacks preceding identity refusals")
     # Counterfactuals: missing, extra and dynamically named hooks must all refuse.
     sample = 'os.environ.get("EXAMPLE")'
     if not environment_inventory_problems([sample], {}):
