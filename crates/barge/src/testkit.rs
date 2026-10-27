@@ -488,6 +488,9 @@ pub struct Faults {
     /// Names a racer takes back as soon as they are captured, so a put-back finds
     /// its own name occupied.
     pub occupy_after_capture: RefCell<Vec<String>>,
+    /// One-shot pauses inside the removal of a name prefix, so a test can hold an
+    /// effect open across the caller's wall clock. Each entry fires once.
+    pub sleeping_removals: RefCell<Vec<(String, std::time::Duration)>>,
     /// A probe the test runs the moment the walk observes an entry, so it can
     /// change the fixture in the window a real fault would happen in.
     pub observe_probe: RefCell<Option<ObserveProbe>>,
@@ -832,6 +835,16 @@ impl Faults {
         self.fail_facts_after_mode.set(true);
     }
 
+    /// Pause once inside the removal of a name with this prefix: the effect is
+    /// open when the caller's wall clock is reached, so its accounting can be
+    /// stated. The deletion renames its unit to a private leaf, so a prefix is
+    /// what a test can name in advance.
+    pub fn sleeping_remove_prefix(&self, prefix: &str, pause: std::time::Duration) {
+        self.sleeping_removals
+            .borrow_mut()
+            .push((prefix.to_owned(), pause));
+    }
+
     /// Take the entry named `name` back as soon as it is captured away from its
     /// name, so a put-back finds its original name occupied.
     pub fn occupying_after_capture(&self, name: &str) {
@@ -1104,6 +1117,19 @@ impl DirOps for Faults {
             // and its unlink: the removal answers "already gone".
             let _ = self.inner.remove_child(parent, name, kind);
             return Ok(ChildRemoval::Absent);
+        }
+        // A one-shot pause inside the effect, before the removal really happens:
+        // the deletion is in flight and the caller's clock can run out here.
+        {
+            let mut pauses = self.sleeping_removals.borrow_mut();
+            if let Some(index) = pauses
+                .iter()
+                .position(|(prefix, _)| name.starts_with(prefix.as_str()))
+            {
+                let (_, pause) = pauses.remove(index);
+                drop(pauses);
+                std::thread::sleep(pause);
+            }
         }
         if kind == RemoveKind::Directory {
             let mut prefixes = self.not_empty_prefix.borrow_mut();

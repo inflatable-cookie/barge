@@ -2394,12 +2394,16 @@ Choices S7 made where this design left the mechanic to the slice:
   scratch stage and every replay path inside it: `scratch::expire_plan` checks it
   before the intent replay and before each planned unit's effect, and
   `delete::replay_pending` stops starting intent replays at it and reports each
-  intent it did not reach as still pending with the wall-clock reason. So neither
-  a stage with many units nor a long journal of earlier intents can outlive the
+  intent it did not reach as still pending with the wall-clock reason. The clock is
+  checked again **at the effect boundary**, after a unit's re-verification and
+  immediately before its effect starts, and again after each attempt, so a slow
+  re-assessment can never let an effect begin inside the stop window. So neither a
+  stage with many units nor a long journal of earlier intents can outlive the
   run's bound and then be reported as a success. Reaching it sets `timed_out`,
   reports every stage and candidate the run did not reach with counts, and forces
   exit `3` — including when the plan had no candidate at all and only a replay
-  consumed the clock. A deletion that was already running when the clock was
+  consumed the clock, and including a stage whose last unit was re-verified and
+  then skipped for its own reason after the clock had already passed. A deletion that was already running when the clock was
   reached is not counted as unreached: it stays in `deleted` or `pending`, the run
   is still a timeout, and only the units after it are reported as unreached. A
   timeout is never success.

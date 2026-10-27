@@ -1916,6 +1916,20 @@ pub fn expire_plan(
             ),
             UnitFamily::Unmarked => (None, UnitGrant::claim(claim)),
         };
+        // Re-verification above reads markers, holds and directories and can be
+        // slow, so the clock is checked again here, at the effect boundary: an
+        // effect never starts inside the stop window because the check that
+        // preceded it was cheap.
+        if expired(deadline) {
+            timed_out = true;
+            unreached = unreached.saturating_add(1);
+            skipped.push(SkippedRow {
+                name: row.name.clone(),
+                scope: row.scope.clone(),
+                reason: WALL_CLOCK_REASON.to_owned(),
+            });
+            continue;
+        }
         let kind = row.kind;
         let unit = DeletionUnit {
             volume_uuid: record.volume_uuid.clone(),
@@ -1995,6 +2009,12 @@ pub fn expire_plan(
         if expired(deadline) {
             timed_out = true;
         }
+    }
+    // A stage whose last candidate was re-verified and then skipped — refused,
+    // no longer eligible, or its identity changed — still crossed the clock, so
+    // the stage reports the timeout instead of a success.
+    if expired(deadline) {
+        timed_out = true;
     }
     let deleted_total = deleted.len();
     let pending_total = pending.len();

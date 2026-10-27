@@ -51,7 +51,13 @@ verifies and then executes Oxide's qualified shared supervisor:
 resolves every case name to a `case_<name>` method, no case method is
 undispatched, each dependency is evaluated first, the nine premises are recorded
 and traced, the environment inventory covers every hook the source reads or sets,
-and the script contains no force detach. It also holds the ordering the case
+and the script contains no force detach. It also parses the argv the outer half
+hands the guard — `argument_parser().parse_args(inner[2:])` for both `counted` and
+`diagnostic` — and requires `--inner <mode>` and `--binary <path>` to come back
+unchanged, with the counterfactual that an executable in the positional `mode`
+slot is refused. That guard exists because the first activated diagnostic at
+`24c5018` failed exactly there; it is pure, so it runs before any native starts
+without spawning a process or creating an image. It also holds the ordering the case
 bodies need — the planned-deletion cases before the absent-volume case, the
 pending-intent case last — that the absent-volume records are registered by that
 one case, and that it restores the one-volume registry in a `finally` block, so a
@@ -190,6 +196,38 @@ Each run is separately activated, and the diagnostics of a failed run are
 recorded below rather than promoted. A run whose classification is
 `infrastructure` (the product's own descriptor census could not complete) is a
 host capability result, not a case result, and it never qualifies a head.
+
+## Recorded diagnostics
+
+None of these qualify a head. A diagnostic that fails is recorded here rather
+than promoted, and every one needs a fresh, separately owner-activated run at the
+head it is meant to describe.
+
+### 2026-10-27 — head `24c5018`, first owner-activated diagnostic: failed before any case
+
+- **Selector and mode:** `effigy maintain:native:diagnostic` (heavy admission) at
+  `24c5018dbc15236fab46469157c5ed194fe18042`; one invocation, no retry.
+- **Outcome:** exit `2` after 36 s. No case ran, no image was created and no
+  premise was executed: the proof's own receipt `s7-maintain-receipt.json` does
+  not exist, so nothing here is evidence for any pass gate.
+- **Cause (apparatus, not product):** the outer half handed the guard
+  `… --inner diagnostic <binary>`, putting the executable in the positional
+  `mode` slot; the inner parser refused it (`argument mode: invalid choice`) and
+  the script exited before `setup()`. The guard's own receipt records that argv
+  verbatim, and it closed cleanly (`closure: closed`, `status 2`, `fault None`,
+  `deadline False`, census `certain` with `0` members, owned-byte peak `4096` of
+  `536870912` B).
+- **Fix in this change:** the inner argv is
+  `… --inner <mode> --binary <path>`, built by `inner_command()` and
+  `supervisor_command()`, and `self_check` now parses it for both modes (see
+  above). No product rule changed.
+- **Preserved packet (unchanged):** guard evidence
+  `/Volumes/Builds/scratch/barge/oxide-proof.033ykvxz/evidence/` — `receipt.json`
+  `8155d637f353071b4ac757b3d235edfae63892d1f2158005a01a988b1a89659e`,
+  `stderr.log` `8be7038b609e64a956dd10e22c13b4fc2328f7f605b0b7d56be8fb074b36f315`,
+  `stdout.log` (empty) `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`;
+  selector log `/Volumes/Builds/scratch/barge/run.yjEpaa/diagnostic.log`
+  `9cd2d60ffa0ca0de57609457b83a947a16328a025936d0c7706a32f9a9fa0849`.
 
 ## What this proof does not claim
 

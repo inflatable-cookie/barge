@@ -47,6 +47,8 @@ missing proof.
 
 import argparse
 import ast
+import contextlib
+import io
 import hashlib
 import json
 import os
@@ -1152,6 +1154,7 @@ def preflight_problems():
         problems.append("an omitted environment hook is not detected")
     if not environment_inventory_problems(['os.environ.get(variable)'], {}):
         problems.append("a dynamic environment hook is not detected")
+    problems.extend(argv_guard_problems())
     with open(SCRIPT_PATH, encoding="utf-8") as handle:
         source = handle.read()
     tree = ast.parse(source)
@@ -1303,15 +1306,75 @@ def outer_half(mode, binary):
     env.pop("OXIDE_TASK_SCRATCH_ROOT", None)
     env.pop("DYLD_INSERT_LIBRARIES", None)
     env["BARGE_PROOF_BIN"] = binary
-    command = [
+    result = subprocess.run(supervisor_command(supervisor, mode, binary), env=env)
+    return result.returncode
+
+
+def inner_command(mode, binary):
+    """The argv the supervisor runs: this script, its mode, and the binary.
+
+    The executable is passed through `--binary`, never as the positional `mode`:
+    a native run whose inner invocation cannot parse would fail before any case,
+    which is why `self_check` parses this argv with this script's own parser.
+    """
+    return [sys.executable, SCRIPT_PATH, "--inner", mode, "--binary", binary]
+
+
+def supervisor_command(supervisor, mode, binary):
+    """The whole supervised command: the pinned supervisor, then the inner argv."""
+    return [
         sys.executable, supervisor,
         "--limit", str(LIMIT_SECONDS),
         "--scratch-budget-mib", str(SCRATCH_BUDGET_MIB),
         "--root-parent", DESIGNATED_SCRATCH,
-        "--", sys.executable, SCRIPT_PATH, "--inner", mode, binary,
+        "--", *inner_command(mode, binary),
     ]
-    result = subprocess.run(command, env=env)
-    return result.returncode
+
+
+def argv_guard_problems():
+    """Prove the outer command and the inner parser agree, for both modes.
+
+    Pure: it builds the argv the supervisor would run and parses the part after
+    this script with this script's own parser. No process is spawned, no image is
+    created and no filesystem is touched. It also states the counterfactual — the
+    broken shape that put the binary in the positional `mode` slot must fail to
+    parse — so a future edit cannot remove the guard's teeth.
+    """
+    problems = []
+    binary = "/nonexistent/barge-proof-binary"
+    for mode in ("counted", "diagnostic"):
+        command = supervisor_command("/nonexistent/bounded-test.py", mode, binary)
+        if command[command.index("--") + 1:] != inner_command(mode, binary):
+            problems.append(f"the {mode} command does not end in this script's inner argv")
+        inner = inner_command(mode, binary)
+        if inner[1] != SCRIPT_PATH:
+            problems.append(f"the {mode} inner argv does not name this script")
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                parsed = argument_parser().parse_args(inner[2:])
+        except SystemExit:
+            problems.append(f"the {mode} inner argv does not parse with this script's parser")
+            continue
+        if parsed.inner != mode:
+            problems.append(f"the {mode} inner argv parses --inner as {parsed.inner!r}")
+        if parsed.binary != binary:
+            problems.append(f"the {mode} inner argv parses --binary as {parsed.binary!r}")
+        if parsed.mode is not None:
+            problems.append(
+                f"the {mode} inner argv puts {parsed.mode!r} in the positional mode slot"
+            )
+        # Counterfactual: the executable in the positional slot must be refused.
+        broken = [sys.executable, SCRIPT_PATH, "--inner", mode, binary]
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                argument_parser().parse_args(broken[2:])
+            except SystemExit:
+                pass
+            else:
+                problems.append(
+                    f"an executable in the positional mode slot is accepted for {mode}"
+                )
+    return problems
 
 
 def inner_half(mode, binary, receipt_path):
@@ -1431,13 +1494,19 @@ def inner_half(mode, binary, receipt_path):
     return 3 if mode == "diagnostic" else 1
 
 
-def main(argv):
+def argument_parser():
+    """This script's own parser, so the self-check parses what `main` parses."""
     parser = argparse.ArgumentParser(description="Barge's maintain native proof")
     parser.add_argument("mode", nargs="?", default=None, choices=[None, "counted", "diagnostic"])
     parser.add_argument("--self-check", action="store_true")
     parser.add_argument("--inner", default=None, choices=[None, "counted", "diagnostic"])
     parser.add_argument("--binary", default=None)
     parser.add_argument("--receipt", default=None)
+    return parser
+
+
+def main(argv):
+    parser = argument_parser()
     options = parser.parse_args(argv)
 
     if options.self_check:
@@ -1454,6 +1523,12 @@ def main(argv):
                 "mib": IMAGE_MIB,
             },
             "supervisor": {"name": SUPERVISOR_NAME, "sha256": SUPERVISOR_SHA256},
+            "argv_guard": {
+                "modes": ["counted", "diagnostic"],
+                "inner": inner_command("diagnostic", "<binary>"),
+                "counterfactual": "an executable in the positional mode slot is refused",
+                "spawns": False,
+            },
             "environment": ENVIRONMENT,
             "problems": problems,
             "ok": not problems,

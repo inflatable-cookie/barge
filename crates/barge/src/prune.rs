@@ -952,7 +952,8 @@ fn run(
                 });
                 fill_unreached_areas(
                     &mut outcome,
-                    volume_plan,
+                    &volume_plan.volume_uuid,
+                    &volume_plan.areas.rows,
                     &mut unreached,
                     "the run's wall clock was reached before this area",
                 );
@@ -1020,7 +1021,8 @@ fn run(
                 // are reported as unreached below.
                 fill_unreached_areas(
                     &mut outcome,
-                    volume_plan,
+                    &volume_plan.volume_uuid,
+                    &volume_plan.areas.rows,
                     &mut unreached,
                     "the run's wall clock was reached before this area",
                 );
@@ -1124,6 +1126,17 @@ fn run(
                     continue;
                 }
                 let unit = area_unit(record, area_plan, candidate, &digest);
+                // The per-unit re-verification runs inside the deletion and can be
+                // slow, so the clock is checked here at the effect boundary: the
+                // deletion never starts inside the stop window.
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    skipped.push(AreaSkippedRow {
+                        name: candidate.name.clone(),
+                        reason: "the run's wall clock was reached before this effect".to_owned(),
+                    });
+                    continue;
+                }
                 let authorize = |fresh: &VolumeRecord| {
                     reverify_area_root(
                         state_paths,
@@ -1191,6 +1204,12 @@ fn run(
                         stopped = outcome.detail.clone();
                     }
                 }
+                // An attempt that ended past the clock — deleted, pending or
+                // refused — is still an overrun, so no later effect starts and the
+                // run reports the timeout.
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                }
             }
             pending.extend(stage_pending.iter().cloned());
             let deleted_total = deleted.len();
@@ -1200,12 +1219,40 @@ fn run(
             stage.skipped = RowSet::bounded(skipped, skipped_total, ROOT_ROWS);
             stage.pending = RowSet::bounded(stage_pending, stage_pending_total, ROOT_ROWS);
             outcome.areas.push(stage);
-            if stopped.is_some() {
+            if stopped.is_some() || timed_out {
+                // The run cannot continue: the remaining areas of this volume are
+                // reported with counts, and the later volumes below. A stop names
+                // its own stage; the clock names every stage it did not reach.
+                let index = volume_plan
+                    .areas
+                    .rows
+                    .iter()
+                    .position(|plan| {
+                        plan.namespace == area_plan.namespace && plan.area == area_plan.area
+                    })
+                    .map_or(volume_plan.areas.rows.len(), |index| index + 1);
+                let reason = if timed_out {
+                    "the run's wall clock was reached before this area"
+                } else {
+                    "the run stopped before this area"
+                };
+                fill_unreached_areas(
+                    &mut outcome,
+                    &volume_plan.volume_uuid,
+                    &volume_plan.areas.rows[index.min(volume_plan.areas.rows.len())..],
+                    &mut unreached,
+                    reason,
+                );
                 volumes.push(outcome);
                 break 'volumes;
             }
         }
         volumes.push(outcome);
+    }
+    // A run that crossed its own clock at any point — including in its last
+    // effect or re-verification — is a timeout, never a success.
+    if Instant::now() >= deadline {
+        timed_out = true;
     }
     if timed_out || stopped.is_some() {
         // Report what the run did not reach, with counts, so the unfinished part
@@ -1266,14 +1313,15 @@ fn unreached_stage_rows(volume_plan: &VolumePlan) -> Vec<(String, usize)> {
 /// clock stopped never presents the unfinished part as done.
 fn fill_unreached_areas(
     outcome: &mut VolumeOutcome,
-    volume_plan: &VolumePlan,
+    volume_uuid: &str,
+    remaining: &[AreaPrunePlan],
     unreached: &mut Vec<UnreachedRow>,
     reason: &str,
 ) {
-    for area_plan in &volume_plan.areas.rows {
+    for area_plan in remaining {
         if area_plan.candidates.count > 0 {
             unreached.push(UnreachedRow {
-                volume_uuid: volume_plan.volume_uuid.clone(),
+                volume_uuid: volume_uuid.to_owned(),
                 stage: format!("area:{}/{}", area_plan.namespace, area_plan.area),
                 candidates: area_plan.candidates.count,
             });
@@ -2389,23 +2437,11 @@ mod tests {
             .expect("a scratch stage");
         assert_eq!(stage.plan.candidates.count, 2);
 
-        // The first unit's effect outlives the run's two-second clock: it is still
-        // this run's work, and the unit after it is never attempted.
-        let names = [first.clone(), second.clone()];
-        let slept = std::cell::Cell::new(false);
+        // The first unit's effect outlives the run's two-second clock: the pause
+        // sits inside the deletion, after the effect boundary, so the unit is
+        // this run's work while the unit after it is never attempted.
         let faults = Faults::new();
-        faults.observing(Box::new(move |name: &str| {
-            if slept.get() {
-                return;
-            }
-            if names
-                .iter()
-                .any(|path| path.file_name().and_then(|part| part.to_str()) == Some(name))
-            {
-                slept.set(true);
-                std::thread::sleep(Duration::from_millis(2_300));
-            }
-        }));
+        faults.sleeping_remove_prefix(crate::state::CAPTURE_PREFIX, Duration::from_millis(2_300));
         let report = harness
             .real_with_bounds(
                 &faults,
@@ -2497,6 +2533,134 @@ mod tests {
             stage.replay.is_some(),
             "the replay started before the clock was reached"
         );
+    }
+
+    #[test]
+    fn a_slow_reverification_stops_the_effect_at_the_run_s_wall_clock() {
+        let harness = Harness::new("maintain-clock-boundary");
+        let root = harness.scratch_root("alpha", "owner");
+        harness.conclude_and_release(&root, "owner");
+        let preview = harness.preview();
+        assert_eq!(preview.candidates, 1);
+        let name = root
+            .file_name()
+            .and_then(|part| part.to_str())
+            .expect("a root name")
+            .to_owned();
+
+        // The unit's re-verification outlives the two-second clock. The effect
+        // must not start: the check at the effect boundary keeps the unit and
+        // reports it as unreached, even though re-verification found it eligible.
+        let slept = std::cell::Cell::new(false);
+        let faults = Faults::new();
+        faults.observing(Box::new(move |observed: &str| {
+            if slept.get() || observed != name {
+                return;
+            }
+            slept.set(true);
+            std::thread::sleep(Duration::from_millis(2_300));
+        }));
+        let report = harness
+            .real_with_bounds(
+                &faults,
+                harness.aged(),
+                &preview,
+                MaintainBounds {
+                    wall: Duration::from_secs(2),
+                    stop_margin: Duration::ZERO,
+                },
+            )
+            .expect("the run reports its timeout");
+        assert!(report.timed_out, "{report:?}");
+        assert!(report.needs_human());
+        let stage = report.volumes.rows[0]
+            .scratch
+            .as_ref()
+            .expect("the scratch stage ran");
+        assert_eq!(stage.deleted.count, 0, "{stage:?}");
+        assert_eq!(stage.skipped.count, 1);
+        assert!(
+            stage.skipped.rows[0].reason.contains("wall clock"),
+            "{}",
+            stage.skipped.rows[0].reason
+        );
+        assert_eq!(report.unreached.count, 1);
+        assert_eq!(report.unreached.rows[0].candidates, 1);
+        assert!(root.is_dir(), "the unit is kept");
+    }
+
+    #[test]
+    fn a_slow_reverification_that_makes_the_last_unit_ineligible_is_still_a_timeout() {
+        let harness = Harness::new("maintain-clock-final-ineligible");
+        let root = harness.scratch_root("alpha", "owner");
+        harness.conclude_and_release(&root, "owner");
+        let preview = harness.preview();
+        assert_eq!(preview.candidates, 1);
+        let name = root
+            .file_name()
+            .and_then(|part| part.to_str())
+            .expect("a root name")
+            .to_owned();
+        let root_id = name.clone();
+        let state = harness.fixture.state.clone();
+
+        // The re-verification both outlives the clock and makes the unit
+        // ineligible: the last candidate is skipped for its own reason, and that
+        // skip must still report the overrun instead of a success.
+        let slept = std::cell::Cell::new(false);
+        let faults = Faults::new();
+        faults.observing(Box::new(move |observed: &str| {
+            if slept.get() || observed != name {
+                return;
+            }
+            slept.set(true);
+            let directory = state.holds_dir().join(&root_id);
+            std::fs::create_dir_all(&directory).expect("the holds directory");
+            let path = directory.join("racer.json");
+            std::fs::write(
+                &path,
+                VolumeFixture::hold_record(
+                    &root_id,
+                    "racer",
+                    std::process::id(),
+                    7_000_000,
+                    FIXTURE_BOOT,
+                ),
+            )
+            .expect("the racer's hold");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("the hold is private");
+            std::thread::sleep(Duration::from_millis(2_300));
+        }));
+        let report = harness
+            .real_with_bounds(
+                &faults,
+                harness.aged(),
+                &preview,
+                MaintainBounds {
+                    wall: Duration::from_secs(2),
+                    stop_margin: Duration::ZERO,
+                },
+            )
+            .expect("the run reports its timeout");
+        assert!(report.timed_out, "{report:?}");
+        assert!(report.needs_human());
+        let stage = report.volumes.rows[0]
+            .scratch
+            .as_ref()
+            .expect("the scratch stage ran");
+        assert_eq!(stage.deleted.count, 0, "{stage:?}");
+        assert_eq!(stage.skipped.count, 1);
+        assert!(
+            stage.skipped.rows[0].reason.contains("no longer eligible"),
+            "{}",
+            stage.skipped.rows[0].reason
+        );
+        assert_eq!(
+            report.unreached.count, 0,
+            "no effect was refused by the clock"
+        );
+        assert!(root.is_dir(), "the unit is kept");
     }
 
     #[test]
