@@ -49,8 +49,9 @@ default = false
 # repository hash-pins (`scripts/run-scratch-expiry-native.py`) rather than
 # writing a second supervisor. One owned APFS sparse image of at most 128 MiB
 # attached `-owners on` inside the guard's own scratch, a 300 s wall clock, 512
-# MiB of monitored scratch, ordinary detach with the backing kept, and
-# `--plan` effect-free. The nine cases are exactly the design's list.
+# MiB of monitored scratch, ordinary detach with the backing kept, except for
+# the one approved forced detach of the rebound owned disk in the live pull case.
+# `--plan` is effect-free. The nine cases are exactly the design's list.
 #
 # HELD for owner activation: this declaration activates nothing, and no native
 # receipt exists yet. The owner runs one uncounted diagnostic and then one

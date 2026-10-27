@@ -2401,14 +2401,10 @@ together, on owned scratch only:
   Oxide's or Effigy's adoption.
 - Pull mid-delete (Tom, 2026-10-27, decision 7e4f14c8). An ordinary detach
   refuses (`EBUSY`) while the deleting process holds descriptors on the image.
-  The preferred proof is therefore ordinary-only: hold the CLI at a declared
-  shim pause after capture, `SIGKILL` its group, detach ordinarily, prove the
-  absent-volume refusal, then replay after re-attach. A forced detach of the
-  proof image's own positively identified whole-disk device is allowed in this
-  one case only as a fallback, if the ordinary-only proof cannot be made to
-  work. Brief v3 authorizes this fallback with fresh proofs after the
-  crash-then-detach alternative failed to demonstrate a live pull. Every other
-  detach stays ordinary.
+  Brief v3 requires one forced detach of the immediately rebound, owned image's
+  whole-disk device while the CLI holds the captured unit. The crash-then-ordinary
+  detach alternative does not demonstrate a live pull. Every other detach,
+  including cleanup, remains ordinary; fresh exact-head proofs are required.
 
 ### HIGH premise checklist and elevation path
 
