@@ -2132,6 +2132,10 @@ Choices S4 made where this design left the mechanic to the slice:
   run whose recorded process is positively gone, or one whose liveness cannot be
   decided and whose creation is older than seven days. Barge thus deletes a
   subset of what that family's own sweep would.
+- **Nested markers in marked roots.** Before a native or delegated root is
+  planned, a bounded no-follow walk checks for recognised markers other than the
+  unit's own top-level marker. A nested marker or incomplete walk keeps and
+  reports the root; the shared deletion walk checks again before capture.
 - **The plan is the authorization.** `barge.scratch.plan/1` holds only stable
   facts (the volume, folder, policy constants, the candidate rows with their
   marker identity and unit kind, and the kept rows with their reasons) and its SHA-256 is the
@@ -2336,12 +2340,13 @@ fourteen days old and no process has it open; it never follows a symlink, never
 deletes outside `scratch/`, skips the `oxide` project and Effigy-marked units,
 keeps a busy unit, retries `ENOTEMPTY` and stops at a run budget. Since
 2026-10-27 all other plain-named top-level directories are projects; the prior
-script is backed up as `reap.py.bak-20261027`. Through recorded grants, Barge
+script is backed up as `reap.py.bak-20261027`. For unmarked units under recorded claims, Barge
 reaches the same set and is at least as conservative on those conditions, apart
 from the explicit O-005
 ruling: an unmarked bare eight-character directory can be deleted as one unit
 under a top-level claim, although the reaper treats it as a project and only
-considers its children. The tests pin both that exception and the no-grant result (nothing deleted, everything reported).
+considers its children. Separately delegated families follow their own recorded
+eligibility, even when the reaper skips them. The tests pin that exception and the no-grant result (nothing deleted, everything reported).
 
 ### Test fixtures on the real OS
 

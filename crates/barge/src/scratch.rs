@@ -2630,12 +2630,25 @@ fn assess(
                 })
             }
         };
-        match family {
+        let assessment = match family {
             UnitFamily::Native => assess_native(ctx, &unit, path, name, scope),
             UnitFamily::OxideScratch => assess_oxide(ctx, &unit, path, name, scope),
             UnitFamily::EffigyScratch => assess_effigy(ctx, &unit, path, name, scope),
             UnitFamily::Unmarked => assess_unmarked(ctx, &unit, &facts, path, name, scope, budget),
-        }?
+        }?;
+        if let Assessed::Eligible(row, _) = &assessment {
+            if let Some(marker) = row.marker_file.as_deref() {
+                if let Some(reason) =
+                    nested_marker_in_tree(ctx.dirs, &unit, marker, 0, Path::new(""), budget)?
+                {
+                    return Ok(AssessmentOutcome::Kept {
+                        state: family.as_str().to_owned(),
+                        reason,
+                    });
+                }
+            }
+        }
+        assessment
     };
     Ok(match outcome {
         Assessed::Eligible(row, observed) => AssessmentOutcome::Eligible(Box::new(Assessment {
@@ -3206,6 +3219,75 @@ fn assess_unmarked(
         )),
         observed(unit, digest),
     ))
+}
+
+/// Refuse a marked candidate whose bounded tree contains another recognised
+/// marker. The unit's own marker is the sole top-level exception; links are
+/// never followed, and S5 still decides whether other entries are removable.
+fn nested_marker_in_tree(
+    dirs: &dyn DirOps,
+    handle: &DirHandle,
+    own_marker: &str,
+    depth: usize,
+    relative: &Path,
+    budget: &mut Budget,
+) -> Result<Option<String>> {
+    if depth > delete::DELETE_DEPTH || !budget.spend(1) {
+        return Ok(Some(
+            "the bounded marker walk could not complete".to_owned(),
+        ));
+    }
+    let listing = match dirs.list_children(handle, LISTING_NAME_ROWS) {
+        Ok(listing) if !listing.truncated => listing,
+        Ok(_) => {
+            return Ok(Some(
+                "the marker walk reached the directory listing bound".to_owned(),
+            ))
+        }
+        Err(error) => {
+            return Ok(Some(format!(
+                "the marker walk cannot list the unit: {error}"
+            )))
+        }
+    };
+    for entry in &listing.entries {
+        if !budget.spend(1) {
+            return Ok(Some("the marker walk reached the sweep budget".to_owned()));
+        }
+        let path = relative.join(&entry.name);
+        if crate::unit::MarkerFamily::from_marker_file(&entry.name).is_some()
+            && !(depth == 0 && entry.name == own_marker)
+        {
+            return Ok(Some(format!(
+                "recognised marker `{}` inside the unit is not covered by its grant",
+                path.display()
+            )));
+        }
+        if entry.facts.kind == EntryKind::Directory {
+            let child = match dirs.open_child_dir(handle, &entry.name) {
+                Ok(child) => child,
+                Err(error) => {
+                    return Ok(Some(format!(
+                        "the marker walk cannot open `{}`: {error}",
+                        path.display()
+                    )))
+                }
+            };
+            let identity = child.identity();
+            if identity.device != entry.facts.device || identity.inode != entry.facts.inode {
+                return Ok(Some(format!(
+                    "`{}` changed during the marker walk",
+                    path.display()
+                )));
+            }
+            if let Some(reason) =
+                nested_marker_in_tree(dirs, &child, own_marker, depth + 1, &path, budget)?
+            {
+                return Ok(Some(reason));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// The newest modification time in one claimed unit's tree, refusing a symlink
@@ -4768,6 +4850,114 @@ mod tests {
         assert!(!report.volume_present);
         assert_eq!(report.plan.candidates.count, 0);
         assert!(!harness.fixture.root.join("scratch").exists());
+    }
+
+    #[test]
+    fn nested_markers_keep_native_and_delegated_roots_out_of_the_plan() {
+        for outer in [
+            UnitFamily::Native,
+            UnitFamily::OxideScratch,
+            UnitFamily::EffigyScratch,
+        ] {
+            for marker in crate::unit::RECOGNISED_MARKER_FILES {
+                let harness = Harness::new("nested-marked-root");
+                let root = match outer {
+                    UnitFamily::Native => {
+                        let root = harness.alloc("alpha", "owner");
+                        harness.conclude(
+                            &root,
+                            "owner",
+                            ConclusionOutcome::Closed,
+                            ConclusionClosure::Positive,
+                            KeptReason::Evidence,
+                            NestedScope::Exclusive,
+                        );
+                        root
+                    }
+                    UnitFamily::OxideScratch => {
+                        let root = harness.project("oxide").join("oxide-proof.old");
+                        std::fs::create_dir_all(&root).expect("oxide root");
+                        oxide_marker(
+                            &root,
+                            "exclusive",
+                            "evidence",
+                            Some(state::now_ms() - 30 * DAY_MS),
+                        );
+                        harness.delegate(MarkerFamily::OxideScratch);
+                        root
+                    }
+                    UnitFamily::EffigyScratch => {
+                        let root = harness.scratch().join("run.effigy");
+                        std::fs::create_dir_all(&root).expect("effigy root");
+                        effigy_marker(
+                            &root,
+                            0xFFFF_FFFE,
+                            true,
+                            Some(state::now_ms() - 30 * DAY_MS),
+                        );
+                        harness.delegate(MarkerFamily::EffigyScratch);
+                        root
+                    }
+                    UnitFamily::Unmarked => unreachable!(),
+                };
+                let nested = root.join("inner-run/deeper");
+                std::fs::create_dir_all(&nested).expect("nested root");
+                std::fs::write(nested.join(marker), b"foreign").expect("nested marker");
+                let plan = harness.plan(8);
+                assert_eq!(plan.plan.candidates.count, 0, "{outer:?} {marker}");
+                let name = root.file_name().unwrap().to_string_lossy();
+                assert!(harness
+                    .kept_reason(&plan, &name)
+                    .contains(&format!("inner-run/deeper/{marker}")));
+                let real = harness.expire(8, &plan.plan_digest);
+                assert_eq!(real.deleted.count, 0);
+                assert_eq!(real.pending.count, 0);
+                assert!(nested.join(marker).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn a_bounded_marked_root_walk_keeps_the_root_and_reports_truncation() {
+        let harness = Harness::new("marked-root-walk-bound");
+        let root = harness.scratch().join("run.effigy");
+        std::fs::create_dir_all(&root).expect("root");
+        effigy_marker(
+            &root,
+            0xFFFF_FFFE,
+            true,
+            Some(state::now_ms() - 30 * DAY_MS),
+        );
+        for index in 0..20 {
+            std::fs::write(root.join(format!("payload-{index}")), b"x").expect("payload");
+        }
+        harness.delegate(MarkerFamily::EffigyScratch);
+        let request = SweepRequest {
+            volume_uuid: &harness.fixture.uuid,
+            preview: true,
+            plan_digest: None,
+            bounds: SweepBounds {
+                examine: 8,
+                timeout: super::SWEEP_TIMEOUT,
+            },
+            delete_bounds: DeleteBounds::default(),
+            now_ms: state::now_ms(),
+        };
+        let report = sweep(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.fixture.facts(),
+            &harness.fixture.mounts(),
+            &harness.fixture.observer(),
+            &request,
+        )
+        .expect("preview");
+        assert!(report.plan.truncated);
+        assert_eq!(report.plan.candidates.count, 0);
+        assert!(harness
+            .kept_reason(&report, "run.effigy")
+            .contains("budget"));
+        assert!(root.exists());
     }
 
     #[test]

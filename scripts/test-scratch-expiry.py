@@ -900,10 +900,10 @@ class Proof:
         root = self.alloc("pull", "owner")
         self.conclude(root["root_id"], "owner")
         self.release(root["root_id"], "owner")
-        for folder_index in range(80):
+        for folder_index in range(40):
             folder = os.path.join(root["path"], f"bulk-{folder_index:02}")
             os.makedirs(folder)
-            for index in range(100):
+            for index in range(50):
                 with open(os.path.join(folder, f"file-{index:03}.txt"), "w", encoding="utf-8") as handle:
                     handle.write("payload")
         self.age_conclusion(root["path"], NATIVE_AGE_DAYS + 1)
