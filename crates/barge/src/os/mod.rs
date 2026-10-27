@@ -11,6 +11,7 @@ use std::path::Path;
 
 mod absence;
 mod facts;
+mod space;
 pub use absence::{prove_absence, AbsenceProof, AbsenceVolume, AncestorExpected};
 
 #[cfg(target_os = "macos")]
@@ -24,6 +25,8 @@ pub use facts::{
     RetryEvidence, RetryResolution, SelfExclusion, VerifiedVolume, VolumeFacts, VolumeIdentity,
     VolumeLocator, VolumeUuid, BLIND_SPOT_RECORDS, RETRY_RECORDS,
 };
+
+pub use space::{Flush, SpaceFacts, SpaceMeasurement};
 
 #[cfg(target_os = "macos")]
 pub use macos::MacOs;

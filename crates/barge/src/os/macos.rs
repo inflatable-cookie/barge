@@ -24,7 +24,7 @@ use crate::os::facts::{
     DescriptorScanRequest, DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, FileSystem,
     MountPoint, MountRoot, OpenDescriptor, PlatformBlindSpot, PlatformStatus, ProcessIdentity,
     ProcessObserver, RemoveKind, RenameOutcome, RetriedUnreadable, RetryEvidence, RetryResolution,
-    VolumeFacts, VolumeIdentity, VolumeLocator, VolumeUuid, BLIND_SPOT_RECORDS,
+    VerifiedVolume, VolumeFacts, VolumeIdentity, VolumeLocator, VolumeUuid, BLIND_SPOT_RECORDS,
 };
 
 /// The largest symbolic-link text Barge reads, so a link cannot make a record
@@ -316,6 +316,81 @@ impl super::AbsenceVolume for MacOs {
             ));
         }
         Ok(identity)
+    }
+}
+
+impl MacOs {
+    // Open the mount root and compare the identity read on that very descriptor.
+    fn space_descriptor(&self, volume: &VerifiedVolume) -> Result<File> {
+        volume.reverify(self)?;
+        let path = &volume.identity().mount_point;
+        self.mount_root(path)?;
+        let descriptor = open_directory(path)?;
+        if read_identity(&descriptor, path)? != *volume.identity() {
+            return Err(Error::new(
+                ErrorKind::VolumeMismatch,
+                "volume changed before space operation",
+            ));
+        }
+        Ok(descriptor)
+    }
+}
+
+impl super::SpaceFacts for MacOs {
+    fn measure_space(&self, volume: &VerifiedVolume) -> Result<super::SpaceMeasurement> {
+        let descriptor = self.space_descriptor(volume)?;
+        let path = &volume.identity().mount_point;
+        let status = read_statfs(descriptor.as_raw_fd(), path)?;
+        if read_identity(&descriptor, path)? != *volume.identity() {
+            return Err(Error::new(
+                ErrorKind::VolumeMismatch,
+                "volume changed during space measurement",
+            ));
+        }
+        volume.reverify(self)?;
+        super::SpaceMeasurement::from_blocks(
+            Some(u64::from(status.f_bsize)),
+            Some(status.f_bavail),
+            Some(status.f_bfree),
+            Some(status.f_blocks),
+            crate::state::now_ms(),
+            volume.identity().device,
+        )
+    }
+}
+
+impl super::Flush for MacOs {
+    fn flush_volume(&self, volume: &VerifiedVolume) -> Result<()> {
+        const SYNC_VOLUME_FULLSYNC: libc::c_int = 0x01;
+        const SYNC_VOLUME_WAIT: libc::c_int = 0x02;
+        extern "C" {
+            fn fsync_volume_np(fd: libc::c_int, flags: libc::c_int) -> libc::c_int;
+        }
+        let descriptor = self.space_descriptor(volume)?;
+        // SAFETY: the descriptor stays open for the call and both flags are documented.
+        let result = unsafe {
+            fsync_volume_np(
+                descriptor.as_raw_fd(),
+                SYNC_VOLUME_FULLSYNC | SYNC_VOLUME_WAIT,
+            )
+        };
+        if result != 0 {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "volume flush failed: {}",
+                    io::Error::from_raw_os_error(result)
+                ),
+            ));
+        }
+        let path = &volume.identity().mount_point;
+        if read_identity(&descriptor, path)? != *volume.identity() {
+            return Err(Error::new(
+                ErrorKind::VolumeMismatch,
+                "volume changed during flush",
+            ));
+        }
+        volume.reverify(self)
     }
 }
 

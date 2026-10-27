@@ -42,7 +42,7 @@ use barge::scratch::{
 };
 use barge::state::{self, StatePaths};
 
-const USAGE: &str = "usage: barge <describe|inspect|area|cache|diagnostic|scratch> [--json]
+const USAGE: &str = "usage: barge <describe|inspect|space|area|cache|diagnostic|scratch> [--json]
        barge diagnostic descriptor-census --root <existing-directory>
        barge area declare --namespace <ns> --area <name> --folder <folder> [--override <uuid>=<folder>]... --absent <fail:drive|wait|fallback:path> --prune <none|oldest-idle:seconds> --reserve <counts|excluded>
        barge area show --namespace <ns> --area <name>
@@ -223,6 +223,13 @@ fn dispatch(args: &[String]) -> Result<Report, Error> {
         describe::INSPECT_COMMAND => {
             no_extra_arguments(rest)?;
             inspect().map(Box::new).map(Report::Inspect)
+        }
+        "space" => {
+            no_extra_arguments(rest)?;
+            let platform = os::platform();
+            let report = barge::space::report(&state_paths()?, &platform, &platform, &platform)?;
+            let human = format!("space: {} registered volumes\n", report.volumes.count);
+            Report::verb(barge::space::SPACE_SCHEMA, "space", &report, human)
         }
         "area" => area(rest),
         "cache" => cache(rest),

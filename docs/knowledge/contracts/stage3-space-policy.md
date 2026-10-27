@@ -864,6 +864,12 @@ rows, `unknown` never read as absent or default.
 }
 ```
 
+For T1, `areas`, `scratch`, `caches` and `attribution` are required keys
+whose value is `null` while the later slices have not computed them. Null means
+unavailable, not zero or an empty set. Readers require these keys and accept the
+populated shapes above as later slices provide them (Tom, 2026-10-27, decision
+`ceaa90b1`). A missing policy remains undeclared.
+
 `state` is one of `above_reserve`, `below_reserve`, `below_floor`,
 `policy_undeclared`, `volume_absent`, `space_unknown`, `durability_forbids`.
 A report never prunes and never writes, and it takes only the shared volume lock,
@@ -1351,3 +1357,13 @@ a reviewer may prefer. None blocks the design from being reviewed as a whole.
 7. **Is the `activity` record the right place for last-use?** Alternative:
    rewrite the root marker, which the frozen marker contract forbids, or rely on
    hold-file mtimes, which are not durable and disappear on release.
+
+### Implemented measurement surface
+
+The library's `os::SpaceFacts` reports checked `fstatfs` block counts with
+source, completion time and device provenance; `os::Flush` exposes the macOS
+whole-volume flush. `barge space` reads the registry and measures present
+registered volumes without creating files. Until registration gains space
+policy, its rows identify that policy as undeclared; an absent registered volume
+is reported as absent. Area attribution and policy decisions belong to their
+later slices.

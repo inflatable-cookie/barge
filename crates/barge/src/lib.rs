@@ -38,6 +38,7 @@ pub mod os;
 pub mod prune;
 pub mod registry;
 pub mod scratch;
+pub mod space;
 pub mod state;
 pub mod unit;
 
