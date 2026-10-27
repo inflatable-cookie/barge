@@ -1,0 +1,84 @@
+"""Synthetic installer fixtures. All mutable paths live below caller TMPDIR."""
+import datetime
+import importlib.util
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+spec = importlib.util.spec_from_file_location("installer", Path(__file__).with_name("barge-install.py"))
+installer = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(installer)
+
+
+class InstallerFixtures(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="barge-fixture-", dir=os.environ["TMPDIR"])
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.home = root / "home"
+        (self.home / ".local/bin").mkdir(parents=True)
+        self.dest = self.home / ".local/bin/barge"
+        self.receipts = self.home / ".local/state/barge/install"
+        self.patches = [patch.object(installer, "HOME", self.home),
+                        patch.object(installer, "DESTINATION", self.dest),
+                        patch.object(installer, "RECEIPTS", self.receipts),
+                        patch.dict(os.environ, {"PATH": str(root / "empty")})]
+        for item in self.patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_initial_refusals(self):
+        self.assertEqual(installer.preflight(False), (None, None))
+        self.dest.write_text("foreign")
+        with self.assertRaises(installer.Refusal):
+            installer.preflight(False)
+        self.dest.unlink()
+        other = Path(self.temp.name) / "empty"
+        other.mkdir()
+        (other / "barge").symlink_to("missing")
+        with self.assertRaises(installer.Refusal):
+            installer.preflight(False)
+
+    def test_receipts_and_replacement(self):
+        built = Path(self.temp.name) / "built"
+        built.write_bytes(b"first")
+        _, installed = installer.install(built, None)
+        started = datetime.datetime.now(datetime.timezone.utc)
+        receipt = {"installed": installed, "build_instance": "a" * 32}
+        first = installer.write_receipt(receipt, started, "b" * 40)
+        previous, expected = installer.preflight(True)
+        self.assertEqual(previous[0], first)
+        built.write_bytes(b"second")
+        _, installed = installer.install(built, expected)
+        receipt = {"installed": installed, "build_instance": "c" * 32}
+        second = installer.write_receipt(receipt, started + datetime.timedelta(microseconds=1), "b" * 40)
+        self.assertEqual(json.loads(second.read_text())["installed"]["sha256"], installer.sha256(self.dest))
+        self.assertTrue(first.exists())
+        self.dest.write_bytes(b"tampered")
+        with self.assertRaises(installer.Refusal):
+            installer.preflight(True)
+
+    def test_pin_and_identity_refuse(self):
+        for pin in (None, "main", "a" * 39):
+            with self.assertRaises(installer.Refusal):
+                installer.authenticate_pin(pin)
+        fake = Path(self.temp.name) / "fake"
+        fake.write_text('#!/bin/sh\necho "{}"\n')
+        fake.chmod(0o700)
+        with self.assertRaises(installer.Refusal):
+            installer.build_identity(fake, "a" * 40, "b" * 32)
+
+    def test_changed_destination_refuses(self):
+        built = Path(self.temp.name) / "built"
+        built.write_bytes(b"binary")
+        self.dest.write_bytes(b"other")
+        with self.assertRaises(installer.Refusal):
+            installer.install(built, None)
+        self.assertEqual(self.dest.read_bytes(), b"other")
+
+
+if __name__ == "__main__":
+    unittest.main()

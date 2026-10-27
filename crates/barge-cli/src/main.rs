@@ -63,6 +63,16 @@ const USAGE: &str = "usage: barge <describe|inspect|area|cache|diagnostic|scratc
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() == 1 && args[0] == "__barge-build-identity" {
+        let identity = serde_json::json!({
+            "build_pin": option_env!("BARGE_BUILD_PIN"),
+            "build_instance": option_env!("BARGE_BUILD_INSTANCE"),
+        });
+        return match write_stdout(format!("{identity}\n").as_bytes()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
     let json = args.iter().any(|argument| argument == "--json");
     let command = command_name(&args);
 
