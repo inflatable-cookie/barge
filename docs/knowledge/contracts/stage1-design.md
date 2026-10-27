@@ -654,25 +654,30 @@ marker, and never applies its own seven-day rule to one.
 `reap.py` deletes each child of every project folder under `scratch/` after
 their newest entry is fourteen days old and no process has them open, deletes
 top-level entries that are files or whose names contain a dot as single units
-the same way, and skips only symlinks, the `oxide` project, Effigy-marked
-directories and bare eight-character run names. That behaviour is the thing to
-replace, so the design reproduces it as an explicit grant instead of an
-implicit name rule. A legacy claim is declared once, per scope, by the owner of
+the same way, and skips symlinks, the `oxide` project and Effigy-marked units.
+Since 2026-10-27 it treats every other plain-named directory as a project, without
+name-shape or known-project lists (the prior script was saved as
+`reap.py.bak-20261027`). Barge requires an explicit grant instead of inferring
+ownership from a name. A legacy claim is declared once, per scope, by the owner of
 the data:
 
 - The record shape is the volume's `scratch_grants`
   ([registry](#registry-of-volumes)); one claim per scope, with its declared
   idle age, unit shape and excluded families.
 - `scope.kind` is `project` (children of `<scratch>/<project>/`) or
-  `top_level_adhoc` (entries directly under `<scratch>/` whose name contains a
-  dot, or that are not directories, matching the reaper's units). A claim never
-  covers the scratch root as a whole and never covers a named project folder.
-- A claimed unit is eligible only when it carries no marker of any recognised
-  family, is not a symlink at any level, the owning project folder (when the
+  `top_level_adhoc` (entries directly under `<scratch>/` that are files, have a
+  dot in their name, or are bare eight-character directories under the O-005
+  collision ruling). That last case is a ruled exception to the reaper's set;
+  without a claim it is kept. A claim never covers the scratch root as a whole;
+  an eight-character project claim and a top-level claim cannot overlap.
+- A claimed unit is eligible only when no marker of any recognised family is
+  present anywhere in its bounded tree, it is not a symlink at any level, the owning project folder (when the
   scope is a project) has a valid claim, the newest entry in the unit is older
   than the claimed idle age, no hold covers it, custody is `Safe`, and the
   delete is whole-unit with the Finder and `ENOTEMPTY` rules below. A unit that
-  becomes marked between plan and effect is kept.
+  becomes marked between plan and effect is kept. A walk that hits its bound is
+  unknown and never planned; S5 independently stops before capturing a nested
+  recognised marker and keeps the intent pending.
 - A claim is reversible and per scope. Removing it returns the scope to
   keep-and-report without touching data.
 - A claim is an operator declaration, recorded in the volume's `scratch_grants`
@@ -883,8 +888,9 @@ and the effect keeps the unit:
 - a legacy claim is bound to the volume's scratch folder and to exactly the scope
   it declares, derived from the unit's place rather than from which folder string
   the caller passed: `project:<name>` is a child of `<scratch>/<name>/`, and
-  `top_level_adhoc` is an entry directly under `<scratch>/` that is a file or
-  whose name contains a dot. The claim's recorded unit shape must match its
+  `top_level_adhoc` is an entry directly under `<scratch>/` that is a file,
+  whose name contains a dot, or is a bare eight-character run-shaped directory
+  under the explicit O-005 collision ruling. The claim's recorded unit shape must match its
   scope (`child` for a project, `entry` for the top level), so a claim never
   authorizes a unit outside its declared scope or a shape it did not declare.
 
@@ -1276,7 +1282,7 @@ data, marker and record are left unchanged and reported.
 | Crash between marker and payload | marker present, root empty | root is a valid empty run root; expiry may take it under the ordinary policy; nothing is inferred as concluded |
 | Crash between intent and rename | intent `intent`, root still in place | replay rolls back the intent and re-evaluates the root; not a completion |
 | Crash between rename and `renamed` phase | quarantine leaf exists with recorded identity | replay resumes deletion from the recorded identity |
-| Crash after `marker_last` before `deleted` | marker absent, quarantine leaf may be present | both-absent proof settles; otherwise pending |
+| Crash after `marker_last` before `removed` | marker absent, quarantine leaf may be present | replay removes a matching captured leaf; an absent leaf without durable `removed` stays pending |
 | Conclusion racing expiry | conclusion write requires a live hold; expiry requires `positive` closure | a root with a live hold is never eligible; a concluded root's marker identity is re-verified before its rename |
 | `root_dir` changed while a root exists | recorded path vs configured resolution | recorded beats configured; `describe` reports both; no move |
 | Same mount, different volume | UUID/device mismatch | refuse `volume_mismatch`; never use, never delete |
@@ -2079,6 +2085,235 @@ It grants no custody authority, writes nothing and never substitutes for the
 operation's own scan. The [proof contract](s6-native-proof.md#the-harness-preflight)
 owns its apparatus use, receipt interpretation and activation limits.
 
+- **S4** is this slice: project scratch allocation and conclusion, the expiry
+  sweep with its plan and digest, the recorded grants (foreign-family
+  delegations and legacy claims) with their declaration verbs, and the
+  `barge scratch` documents. It deletes only through S5's custody and delete
+  path, and its one bounded native carries the scratch and deletion cases
+  together. Its tests use injected volume facts over real local directories and
+  never read or write a real drive or the real account state.
+
+Choices S4 made where this design left the mechanic to the slice:
+
+- **Family field sets, pinned.** The Oxide marker is exactly the twelve fields
+  its supervisor's `MARKER_KEYS` names, all required: `version` (integer 1),
+  `run_id` (32 lowercase hex), `root` (the absolute root path), `owner_uid`,
+  `device`, `inode`, `created_unix` and `concluded_unix` in seconds,
+  `outcome`/`closure`/`kept_reason`/`nested_scope` as their pinned value sets,
+  plus the source's own conclusion consistency (a concluded root is `closed`
+  with a positive closure). The file must be a private regular file of this user
+  at most 4 KiB, only `version` 1 is read, and the marker's `root`, `owner_uid`,
+  `device` and `inode` must equal the unit the walk reached. The Effigy marker is
+  exactly its `Marker` fields, with `task`, `checkout`, `pid`, `pid_start`, and
+  the optional `keep`/`concluded_ms` defaulted as that struct defaults them;
+  `run` and `created_ms` are required, `pid_start` is text, and an extra field is
+  refused. Every strict-parse failure keeps the unit and is reported with its
+  reason, never as absent.
+- **The unit vocabulary.** The sweep recognises both layouts: a marked
+  directory directly under the scratch root is one unit, and a child of an
+  unmarked project folder is one unit. `oxide-validation/` is never a unit and no
+  claim may cover it; the `oxide` project is never claimed, though marked family
+  roots inside it are classified under delegation. Eight-character names follow
+  the explicit O-005 collision ruling below. A dotted or non-directory top-level
+  entry is one `top_level_adhoc` entry. An entry named
+  `.barge-prune-*` is a pending deletion's quarantine leaf, is never a unit, and
+  is settled only by a replay.
+- **The policy constants.** Scratch is Barge's own folder, not a declared area,
+  and `barge.registry/1`'s frozen field set has no scratch knob, so the design's
+  ages are constants the plan reports: native and Oxide seven days, Effigy's keep
+  retention 24 hours and its undecidable-liveness age seven days. Adding an
+  override needs a registry field and its own slice; a flag would be an
+  unrecorded policy.
+- **Effigy eligibility is at least as conservative as Effigy's own sweep.** A
+  recorded `pid` that is positively alive keeps the directory however old it is,
+  because Barge cannot prove it is a different process from the marker's text
+  start identity (and a live pid whose identity is unreadable is kept the same
+  way). Eligible is a kept conclusion older than 24 hours, or an *unconcluded*
+  run whose recorded process is positively gone, or one whose liveness cannot be
+  decided and whose creation is older than seven days. Barge thus deletes a
+  subset of what that family's own sweep would.
+- **Nested markers in marked roots.** Before a native or delegated root is
+  planned, a bounded no-follow walk checks for recognised markers other than the
+  unit's own top-level marker. A nested marker or incomplete walk keeps and
+  reports the root; the shared deletion walk checks again before capture.
+- **The plan is the authorization.** `barge.scratch.plan/1` holds only stable
+  facts (the volume, folder, policy constants, the candidate rows with their
+  marker identity and unit kind, and the kept rows with their reasons) and its SHA-256 is the
+  digest. A real run requires `--plan-sha256`; it recomputes the plan and refuses
+  when the digest differs, changing nothing else. Because a change to any unit's
+  eligibility changes the plan, that is a whole-run refusal rather than a
+  partial run, which is the conservative reading of "the real run takes exactly
+  that plan". A change *inside* the run's own plan-to-effect window is caught by
+  the per-candidate re-verification, which abandons only the affected unit.
+- **Order of a real run.** Replay first would make the preview's digest
+  unreproducible, so the order is: compute the plan, require its digest, replay
+  every pending intent from its recorded identity, then for each candidate
+  re-read the grant under the volume, re-assess the unit and delete it. A preview
+  never replays.
+- **Grant declaration verbs (O-009).** `barge scratch delegate` records one
+  family's delegation and `barge scratch claim` one scope's legacy claim, each
+  with the declared-by name and time, into the volume's `scratch_grants`; either
+  can be withdrawn without touching data. Barge records the declaration and
+  cannot authenticate its author, so the review is the operator's; the verbs
+  refuse a claim naming `oxide` or a dotted name, and refuse a unit shape that
+  does not match its scope. Eight-character names follow O-005 below.
+- **The foreign and unmarked deletion proof.** S4 passes the previewed kind,
+  identity, optional family marker and recorded grant to S5's shared deletion
+  unit. Custody re-reads those facts and the grant before the intent; a newly
+  marked unit is kept. `barge.intent/2` records the unit and its private capture
+  name; S5 captures, verifies and journals every removal and replays only from
+  recorded identity. A marker is removed last; a file has no contents or marker.
+  The durable `removed` phase alone proves the final unlink. `barge.intent/1`
+  remains readable as a Barge-marked directory unit.
+- **Custody drops its own descriptor.** S5's identity check opened the root to
+  read its device and inode, and the same-uid scan then matched that descriptor,
+  so every real deletion would have been refused. The handle is dropped before
+  the scan. A caller's own open handle, including an Oxide-linked caller's, is
+  still observed and still blocks the delete.
+- **Conclusion and the owner hold.** Allocation records the consumer as the
+  root's owner in a `barge.hold/1` whose purpose is the fixed owner string, so
+  "the recorded owner" is a recorded fact. Conclusion requires that hold to be
+  live, re-reads the marker immediately before writing, refuses a second
+  conclusion (terminal), and records a positive closure only when no other hold
+  on the root is live or undecidable and no pending intent names it.
+- **Volume absence.** `barge scratch expire` on a permanent volume refuses
+  `volume_absent` loudly and writes nothing; on an ephemeral volume it reports
+  `volume_present: false`, an empty plan and no effect. Neither recreates or
+  writes a stale mount point.
+- **Command documents.** `barge.scratch.alloc/1`, `barge.scratch.conclude/1`,
+  `barge.scratch.expire/1` (with `barge.scratch.plan/1` inside it),
+  `barge.scratch.grants/1`, `barge.scratch.delegate/1`, `barge.scratch.claim/1`
+  and `barge.scratch.revoke/1`. They are command documents and are not added to
+  `barge.describe/1`'s `formats` list.
+- **Bounds as applied.** A sweep examines 4096 entries within 1 s, reports
+  `truncated` and counts when it stops, lists a directory to 200 000 names, walks
+  a claimed unit to 12 levels for its newest entry, and keeps the deletion's own
+  120 s per-root deadline and three `ENOTEMPTY` attempts. The plan and its rows
+  use the root row cap.
+- **What the native proves, and what it does not.** The proof's case map is
+  bound to its dispatch by its own self-check: every case name resolves to a
+  `case_<name>` method, no case method is undispatched, and every dependency is
+  evaluated first, so a renamed case cannot pass unnoticed. Its `ENOTEMPTY` case
+  injects a writer that recreates an entry inside the quarantined leaf while the
+  delete runs; a native cannot inject a platform fault at an exact step, so the
+  case asserts the design's observable — one pending intent and the kept leaf,
+  whichever conservative stop the race produces — and the marker-last
+  `ENOTEMPTY` retry itself stays proved by the counted unit counterfactual.
+- **The native's same-uid observability preflight (owner ruling, then the
+  Supervisor's execution-identity correction).** Some hosts refuse
+  `proc_pidinfo` on processes of their own effective user — observed here as
+  `EPERM` on system daemons — and custody correctly reads an unreadable process as
+  `Unknown` and refuses. Whether this account may read its own processes is an
+  environment capability, not a product fact, so before any case, inside the same
+  qualified supervisor, the census is taken by **Barge's own binary, never by the
+  proof's Python**: one probe root is allocated, positively concluded, released
+  and aged in the guard's owned image, then really deleted by
+  `barge scratch expire`. That deletion's custody runs the product's
+  same-effective-uid descriptor scan — the same observer, the same bounds, the
+  same foreign-uid classification and exited-process handling, and barge#012's
+  bounded same-uid `EPERM` re-observation — so the scan's execution identity is
+  exactly the one every case's deletion uses. A product custody refusal (an
+  unreadable same-uid process after its bounded re-observation, or a scan bound)
+  makes the run `infrastructure`, unqualified, aborted before any case (exit 4),
+  with the product's own reason recorded in the receipt; any other probe outcome
+  is an apparatus defect, never a pass. No product rule, path exception or case
+  oracle changes; hidden descriptors of a verified platform binary follow the
+  named OS blind-spot ruling, while unverified hidden descriptors still refuse.
+- **Grants are re-verified in the deletion's window, policy included.** The
+  plan's assessment reads the grants, but the authority that matters is read
+  again inside S5's locked deletion: `delete_unit_on_volume` takes the volume
+  lock, re-reads the registry record, and runs the caller's own authorization
+  check on it before custody or the intent. S4's check re-evaluates the **whole
+  current eligibility policy** under that record — the family delegation or the
+  scope's claim, the claim's unit shape and the claim's own idle age — and
+  compares the recorded identity, so replacing a claim with a stricter one
+  between the plan and the effect refuses the unit instead of authorizing it under
+  the older policy. A withdrawal or stricter replacement before that point refuses
+  with `refused_boundary` and no effect; a change attempted after it waits for the
+  window. Grant writes therefore take the registry lock and then the volume lock,
+  in the documented order, and re-read and modify the document under both: a
+  concurrent writer's declaration is merged rather than discarded, and a stale
+  document can never restore withdrawn authority. The write's registration
+  preflight runs before the state layout exists, so a grant verb naming an
+  unregistered volume refuses and creates no directory, lock or file; the locked
+  re-read still re-checks presence before publishing.
+- **Conclusion facts are validated, not just recorded.** A positive closure is
+  only written for a `closed` outcome, so a retained, unclosed or failed run can
+  never carry the one closure that expires it. The expiry reader applies the same
+  rule to both families: a native conclusion whose `outcome` is not `closed` is
+  never eligible, and an Oxide marker must have a 32-hex `run_id`, `outcome:
+  closed`, and a readable, non-future `created_unix` that is not later than its
+  conclusion — an unusable value is kept, never defaulted to zero.
+- **A quarantined file unit replays.** A claimed ad-hoc entry may be a regular
+  file, and replay no longer opens such a leaf as a directory (`O_DIRECTORY`
+  would fail and leave the intent pending forever). A verified file leaf reaches
+  its own phase handling: `renamed` finishes the unit, `marker_last` removes the
+  leaf through the same verified capture path and records `removed` before settlement.
+- **An unsettled replay is unsettled.** `has_pending` covers both a new pending
+  intent and a replay that stopped short (`replay.pending`), so a real run with
+  an empty candidate plan and an unresolved earlier intent exits `3` instead of
+  reporting success.
+- **The examination budget is charged per entry.** A claimed unit's walk spends
+  one examination for every entry it reads, not one per directory, so a unit
+  holding thousands of files cannot be walked past the plan's own bound; the
+  deadline is checked by the same spend. A project folder whose listing stopped
+  at the name bound sets the plan's `truncated` flag instead of presenting a
+  partial plan as whole.
+- **The native's same-uid census is the product's own.** The preflight no longer
+  observes the host from Python at all: the Barge binary runs the scan through a
+  real probe deletion, so the census is the product's `MacOs` custody scan with
+  its own declared bounds (4096 processes, 65 536 descriptors, 10 s per scan, and
+  barge#012's three retries inside a 250 ms settle window), its foreign-effective-
+  uid exclusion, its exited-process handling and its bounded `EPERM`
+  re-observation. An unreadable same-uid process or a bound is `infrastructure`,
+  unqualified, before any case, and the receipt records the census outcome and the
+  product's reason.
+- **Premise 2 is a complete-content assertion.** The proof observes the real
+  account state before the run and after it through descriptors: the state
+  directory is opened with `O_NOFOLLOW` and every name relative to its parent's
+  descriptor with `O_NOFOLLOW`, so a symlinked or swapped path is an incomplete
+  observation and never a followed one, and each entry's name, kind, mode, size,
+  mtime and bytes are hashed. The entry cap, the byte cap, the deadline, a short
+  read (fewer bytes than the file's own facts report), a file that grew, or any
+  size or mtime change between the entry's facts, its open and the end of its
+  read make the observation `incomplete`; the deadline is re-checked after every
+  file read and again before a complete observation is reported, so a read or
+  filesystem step that finished past the bound cannot be labelled complete. Two
+  incomplete observations never prove equality, and an incomplete or changed
+  reading makes the receipt unqualified.
+  The resolver is proved from fixture-only evidence, never from `describe` (which
+  observes live Oxide state), and from the environment the **child commands** run
+  with rather than the proof process's own: the child's `BARGE_STATE_DIR` must be
+  the fixture state directory and its `HOME` the private fixture home, distinct
+  from the password-database account home, and a delegation recorded through a
+  state-only verb must land in the proof's fixture registry with its withdrawal
+  removing it.
+- **A failed ordinary detach keeps the backing.** Cleanup detaches ordinarily and
+  stops there: it never force-detaches by mount path, and a failed detach leaves
+  the image attached and its backing in place and makes the receipt unqualified.
+  The amended brief permits one forced detach in the live pull case, only after
+  rebinding the owned image and whole disk. Every other detach remains ordinary.
+- **The native's oracles are the design's behaviours.** The allocation case
+  launches both allocations before awaiting either; the pull case uses the
+  approved forced owned-image pull mid-delete, and checks the
+  quarantine leaf and its recorded device and inode *after* re-attaching, before
+  the replay.
+- **The native ENOTEMPTY injection.** The fixed case compiles a proof-only
+  interposer under the supervisor's scratch and injects it into one real Barge
+  CLI invocation. Before Barge renames the exact fixture directory, the shim
+  pins its device and inode from `BARGE_PROOF_ENOTEMPTY_PATH`; it returns
+  `ENOTEMPTY` on three matching `unlinkat(AT_REMOVEDIR)` calls, logs each to
+  supervisor evidence and passes every other call through. The receipt carries
+  both source and library hashes, exact-target firings, the pending reason and
+  an observed durable `removed` phase on unshimmed replay. Missing observations
+  fail the case. A separate unshimmed unit of the same shape must delete normally.
+  The runner always supplies the designated scratch parent to the qualified
+  supervisor and does not inherit an adopted scratch root or injection hooks.
+- **What S4 does not claim.** No real-drive sweep, no reaper or LaunchAgent
+  change, no Oxide or Effigy adoption, and no native receipt until the owner
+  activates the runs. `scratch:expiry:native` and its `:diagnostic` twin are
+  declared and held.
+
 ## Proposed validation
 
 Design-only validation for this contract is `effigy docs:check` once, run from
@@ -2112,12 +2347,16 @@ The host reaper's current behaviours are the counterfactual baseline for scratch
 expiry: units are the children of each project folder and the top-level entries
 that are files or have a dot in the name; a unit goes once its newest entry is
 fourteen days old and no process has it open; it never follows a symlink, never
-deletes outside `scratch/`, skips the `oxide` project and Effigy-marked and
-bare eight-character directories, keeps a busy unit, retries `ENOTEMPTY` and
-stops at a run budget. Barge must reach the same set of deletable units only
-through recorded grants, and must be at least as conservative on every one of
-those conditions; the test asserts both the equivalence under grants and the
-difference without them (nothing deleted, everything reported).
+deletes outside `scratch/`, skips the `oxide` project and Effigy-marked units,
+keeps a busy unit, retries `ENOTEMPTY` and stops at a run budget. Since
+2026-10-27 all other plain-named top-level directories are projects; the prior
+script is backed up as `reap.py.bak-20261027`. For unmarked units under recorded claims, Barge
+reaches the same set and is at least as conservative on those conditions, apart
+from the explicit O-005
+ruling: an unmarked bare eight-character directory can be deleted as one unit
+under a top-level claim, although the reaper treats it as a project and only
+considers its children. Separately delegated families follow their own recorded
+eligibility, even when the reaper skips them. The tests pin that exception and the no-grant result (nothing deleted, everything reported).
 
 ### Test fixtures on the real OS
 
@@ -2150,7 +2389,8 @@ together, on owned scratch only:
   and prove the unconcluded one survives; plant Finder metadata plus an unknown
   entry and prove the delete stops and the root survives; delete a clean root
   whole and prove the marker is removed last; inject `ENOTEMPTY` and prove the
-  pending intent; pull the volume (ordinary `hdiutil detach`) mid-delete and
+  pending intent; force-detach only the positively rebound owned whole disk
+  while the CLI holds the captured unit mid-delete, then
   prove a pending intent with the quarantine leaf kept, then replay after
   re-attach; prove a stale mount point is never written to; plant one Oxide
   marker, one Effigy marker and one unmarked unit, prove all three survive with
@@ -2161,13 +2401,10 @@ together, on owned scratch only:
   Oxide's or Effigy's adoption.
 - Pull mid-delete (Tom, 2026-10-27, decision 7e4f14c8). An ordinary detach
   refuses (`EBUSY`) while the deleting process holds descriptors on the image.
-  The preferred proof is therefore ordinary-only: hold the CLI at a declared
-  shim pause after capture, `SIGKILL` its group, detach ordinarily, prove the
-  absent-volume refusal, then replay after re-attach. A forced detach of the
-  proof image's own positively identified whole-disk device is allowed in this
-  one case only as a fallback, if the ordinary-only proof cannot be made to
-  work. That needs its own brief amendment and fresh proofs. Every other
-  detach stays ordinary.
+  Brief v3 requires one forced detach of the immediately rebound, owned image's
+  whole-disk device while the CLI holds the captured unit. The crash-then-ordinary
+  detach alternative does not demonstrate a live pull. Every other detach,
+  including cleanup, remains ordinary; fresh exact-head proofs are required.
 
 ### HIGH premise checklist and elevation path
 
@@ -2243,6 +2480,26 @@ the one reading the owner should confirm before implementation starts.
   name; the implementation brief must decide the collision rule for a project
   literally named with eight lowercase characters and no marker: proposed, it is
   a project folder and is never treated as a run root.
+
+  **Implementation note (architect ruling, Oxide Supervisor message 2ff249cb,
+  2026-10-26).** The collision rule is decided by the claim, never by the name,
+  and S4 implements it this way:
+
+  - An explicit recorded `project:<name>` claim is valid for **any** project name
+    the unit vocabulary allows — including an eight-character `underlay` or
+    `figmatic`. There is no known-names list anywhere in the classifier: a name
+    never establishes ownership, and a project claim never depends on one.
+  - Marker precedence is unchanged: an Effigy- or Oxide-marked root inside a
+    claimed project folder is that family's unit and needs the family's own
+    delegation. A project claim covers only unmarked children.
+  - An unmarked eight-character top-level directory with **no** project claim
+    survives and is reported; it is an ad-hoc unit only when a `top_level_adhoc`
+    claim covers it, and only then is the directory itself deletable.
+  - A `project:<name>` claim for an eight-character name and a `top_level_adhoc`
+    claim may not both be recorded: the same directory could be read either way,
+    so the second declaration refuses and the operator withdraws one first. That
+    is why the reaper's replacement stays the design's staged sequence of
+    declarations rather than one switch.
 - **O-006 — Host job identity and schedule.** Proposed: one host job calling
   `barge maintain` with preview-then-real, replacing only the reaper's scratch
   part; Oxide's prune entry stays until stage 4. The plist content, label,

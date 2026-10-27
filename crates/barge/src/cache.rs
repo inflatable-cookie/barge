@@ -3595,7 +3595,7 @@ fn observed_link_root(
     observer: &dyn ProcessObserver,
     record: &PlacementRecord,
     form: &LinkForm,
-) -> Result<custody::ObservedRoot> {
+) -> Result<crate::unit::DeletionUnit> {
     let effective_uid = observer.effective_uid()?;
     let volume = area::registered_volume(state, &record.volume_uuid)?;
     let opened = area::open_folder(
@@ -3655,15 +3655,23 @@ fn observed_link_root(
             .with_detail("path", root_path.display().to_string().into()))
         }
     }
-    Ok(custody::ObservedRoot {
-        root_id: form.root_id.clone(),
+    // Custody uses the shared unit identity. The digest here binds the
+    // observed marker for this read-only custody check; it authorizes no delete.
+    Ok(crate::unit::DeletionUnit {
         volume_uuid: record.volume_uuid.clone(),
         root_dir: record.root_dir.clone(),
         folder: record.folder.clone(),
+        parent: String::new(),
+        name: form.root_id.clone(),
+        kind: crate::unit::UnitKind::Directory,
         device: root.identity().device,
         inode: root.identity().inode,
-        marker_digest: form.marker_digest.clone(),
-        path: root_path,
+        marker: Some(crate::unit::UnitMarker::new(
+            crate::unit::MarkerFamily::Barge,
+            form.marker_digest.clone(),
+        )),
+        grant: crate::unit::UnitGrant::native_root(&form.root_id),
+        plan_digest: form.marker_digest.clone(),
     })
 }
 
@@ -3674,7 +3682,7 @@ fn take_link_custody(
     facts: &dyn VolumeFacts,
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
-    observed: &custody::ObservedRoot,
+    observed: &crate::unit::DeletionUnit,
 ) -> Result<()> {
     let intents = state::read_intents(state, crate::contract::INTENT_ROWS)?;
     let pending = PendingIntent::pending(&intents.records);
