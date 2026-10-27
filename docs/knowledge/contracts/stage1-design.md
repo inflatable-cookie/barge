@@ -765,7 +765,8 @@ with its own gate; nothing in this design moves consumer data.
 
 `barge cache undo --json` reverses exactly the recorded form: a `setting`
 restores the recorded bytes only if the file still has the exact after-bytes
-Barge wrote (otherwise it refuses and reports the divergence, changing nothing);
+Barge wrote (a missing after-file also refuses, even if adopt created it;
+divergence preserves the setting, any held-root marker and the placement record);
 a `link` removes the link and restores an empty directory where one was
 replaced, or removes the link where the original was absent; a `held-root` undo
 removes only the marker it wrote, and refuses if the directory's identity

@@ -3369,36 +3369,28 @@ fn undo_setting(
     form: &SettingForm,
     effective_uid: u32,
 ) -> Result<UndoReport> {
-    let found = read_settings(dirs, &form.settings_path)?;
-    if let Some((facts, bytes)) = &found {
-        if snapshot_of(facts, bytes)? != form.after {
-            return Err(diverged(
+    // Absence after adopt is divergence even when adopt created the file.
+    // Require the recorded after-file before observing or capturing its marker.
+    let (after_facts, after_bytes) =
+        read_settings(dirs, &form.settings_path)?.ok_or_else(|| {
+            diverged(
                 &form.settings_path,
                 &form.after.digest,
-                "file identity or bytes changed since adopt",
-            ));
-        }
+                "the file is absent",
+            )
+        })?;
+    if snapshot_of(&after_facts, &after_bytes)? != form.after {
+        return Err(diverged(
+            &form.settings_path,
+            &form.after.digest,
+            "file identity or bytes changed since adopt",
+        ));
     }
-    let settings_present = found.is_some();
     let mut changes = Vec::new();
     let restored_bytes = match &form.before {
         Some(before) => {
-            let Some((_, bytes)) = found else {
-                return Err(diverged(
-                    &form.settings_path,
-                    &form.after.digest,
-                    "the file is absent",
-                ));
-            };
-            if sha256_hex(&bytes) != form.after.digest {
-                return Err(diverged(
-                    &form.settings_path,
-                    &form.after.digest,
-                    &sha256_hex(&bytes),
-                ));
-            }
             let restored = decode_hex(&before.bytes)?;
-            if restored == bytes {
+            if restored == after_bytes {
                 changes.push(format!(
                     "{} already holds its pre-adopt bytes; undo writes nothing",
                     form.settings_path.display()
@@ -3413,25 +3405,10 @@ fn undo_setting(
             Some(restored)
         }
         None => {
-            match found {
-                Some((_, bytes)) => {
-                    if sha256_hex(&bytes) != form.after.digest {
-                        return Err(diverged(
-                            &form.settings_path,
-                            &form.after.digest,
-                            &sha256_hex(&bytes),
-                        ));
-                    }
-                    changes.push(format!(
-                        "remove {}, which adopt created",
-                        form.settings_path.display()
-                    ));
-                }
-                None => changes.push(format!(
-                    "{} is already absent, as it was before adopt",
-                    form.settings_path.display()
-                )),
-            }
+            changes.push(format!(
+                "remove {}, which adopt created",
+                form.settings_path.display()
+            ));
             None
         }
     };
@@ -3449,36 +3426,30 @@ fn undo_setting(
         return Ok(undo_report(request, record, changes));
     }
     let mut captured = undo_capture::Captures::new(state, dirs, record, effective_uid);
-    let setting_index = if settings_present {
-        Some(captured.file(&form.settings_path, form.after.clone())?)
-    } else {
-        None
-    };
+    let setting_index = captured.file(&form.settings_path, form.after.clone())?;
     let marker_index = match (&form.held_root, marker) {
         (Some(held), Some((snapshot, _))) => Some(captured.marker(held, snapshot)?),
         _ => None,
     };
     captured.capture_all()?;
-    if let Some(index) = setting_index {
-        match (&form.before, restored_bytes) {
-            (Some(before), Some(_)) if before.bytes == form.after.bytes => {
-                captured.return_unchanged(index)?;
-            }
-            (Some(before), Some(restored)) => {
-                captured.restore_file(
-                    index,
-                    &restored,
-                    if before.mode == 0 {
-                        form.after.mode
-                    } else {
-                        before.mode
-                    },
-                )?;
-                captured.remove(index)?;
-            }
-            (None, _) => captured.remove(index)?,
-            (Some(_), None) => return Err(unknown("settings restore has no bytes")),
+    match (&form.before, restored_bytes) {
+        (Some(before), Some(_)) if before.bytes == form.after.bytes => {
+            captured.return_unchanged(setting_index)?;
         }
+        (Some(before), Some(restored)) => {
+            captured.restore_file(
+                setting_index,
+                &restored,
+                if before.mode == 0 {
+                    form.after.mode
+                } else {
+                    before.mode
+                },
+            )?;
+            captured.remove(setting_index)?;
+        }
+        (None, _) => captured.remove(setting_index)?,
+        (Some(_), None) => return Err(unknown("settings restore has no bytes")),
     }
     if let Some(index) = marker_index {
         captured.remove(index)?;
@@ -5439,6 +5410,51 @@ mod tests {
             assert_eq!(
                 std::fs::metadata(original).unwrap().permissions().mode() & 0o7777,
                 mode
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_an_adopt_created_setting_refuses_undo_without_effects() {
+        let fixture = Fixture::new("cache-setting-deleted-after-adopt");
+        let settings = fixture.home.path().join(".npmrc");
+        assert!(!settings.exists());
+        let cache = fixture.caches().join("npm");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("payload"), b"kept cache data").unwrap();
+        let mut request = fixture.request(CacheKind::NpmCache);
+        request.write_setting = true;
+        request.adopt_existing_root = true;
+        let record = fixture.adopt(&request).unwrap().placement.unwrap();
+        let PlacementForm::Setting(form) = &record.form else {
+            panic!("a setting placement")
+        };
+        assert!(form.before.is_none());
+        assert!(form.held_root.is_some());
+        assert!(settings.is_file());
+        std::fs::remove_file(&settings).unwrap();
+        let marker = cache.join(area::ROOT_MARKER_FILE);
+        let marker_facts = facts(&marker);
+        let before_home = tree(fixture.home.path());
+        let before_state = tree(fixture.state.root());
+        let before_volume = tree(&fixture.volume.root);
+        for plan in [true, false] {
+            let error = fixture
+                .undo(&UndoRequest {
+                    placement_id: None,
+                    kind: Some(CacheKind::NpmCache),
+                    plan,
+                })
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::UnknownState);
+            assert!(!settings.exists());
+            assert_eq!(tree(fixture.home.path()), before_home);
+            assert_eq!(tree(fixture.state.root()), before_state);
+            assert_eq!(tree(&fixture.volume.root), before_volume);
+            assert_eq!(facts(&marker), marker_facts);
+            assert_eq!(
+                read_placements(&fixture.state).unwrap().records,
+                vec![record.clone()]
             );
         }
     }
