@@ -199,6 +199,12 @@ pub trait VolumeFacts {
     fn identify(&self, path: &Path) -> Result<VolumeIdentity>;
 }
 
+/// Bounded, current mount enumeration by kernel volume UUID.
+pub trait VolumeLocator {
+    /// Return every matching live mount, or refuse an incomplete observation.
+    fn mounts_for_uuid(&self, uuid: &VolumeUuid) -> Result<Vec<MountPoint>>;
+}
+
 /// Whether a path is the mount root of a volume Barge may manage.
 pub trait MountRoot {
     /// Prove `path` is a mount root: a real directory of this user that the

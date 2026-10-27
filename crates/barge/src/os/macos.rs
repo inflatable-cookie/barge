@@ -24,7 +24,7 @@ use crate::os::facts::{
     DescriptorScanRequest, DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, FileSystem,
     MountPoint, MountRoot, OpenDescriptor, PlatformBlindSpot, PlatformStatus, ProcessIdentity,
     ProcessObserver, RemoveKind, RenameOutcome, RetriedUnreadable, RetryEvidence, RetryResolution,
-    VolumeFacts, VolumeIdentity, VolumeUuid, BLIND_SPOT_RECORDS,
+    VolumeFacts, VolumeIdentity, VolumeLocator, VolumeUuid, BLIND_SPOT_RECORDS,
 };
 
 /// The largest symbolic-link text Barge reads, so a link cannot make a record
@@ -163,6 +163,107 @@ impl VolumeFacts for MacOs {
         let descriptor = open_directory(path)?;
         read_identity(&descriptor, path)
     }
+}
+
+impl VolumeLocator for MacOs {
+    fn mounts_for_uuid(&self, uuid: &VolumeUuid) -> Result<Vec<MountPoint>> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let table = mount_table()?;
+        let mut matches = Vec::new();
+        for entry in &table {
+            if Instant::now() >= deadline {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "mount enumeration deadline reached",
+                ));
+            }
+            let end = entry
+                .f_mntonname
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or_else(|| Error::new(ErrorKind::UnknownState, "unterminated mount name"))?;
+            let name_bytes: Vec<u8> = entry.f_mntonname[..end]
+                .iter()
+                .map(|byte| *byte as u8)
+                .collect();
+            let name = OsStr::from_bytes(&name_bytes);
+            let path = PathBuf::from(name);
+            if !is_under_volumes_parent(&path) {
+                continue;
+            }
+            let descriptor = open_directory(&path).map_err(|_| {
+                Error::new(
+                    ErrorKind::UnknownState,
+                    "mount candidate could not be opened",
+                )
+            })?;
+            let identity = read_identity(&descriptor, &path).map_err(|_| {
+                Error::new(
+                    ErrorKind::UnknownState,
+                    "mount candidate could not be identified",
+                )
+            })?;
+            if identity.mount_point != path {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "mount candidate changed during enumeration",
+                ));
+            }
+            let candidate_uuid = identity.volume_uuid.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::UnknownState,
+                    "mount candidate UUID is unreadable",
+                )
+            })?;
+            if &candidate_uuid == uuid {
+                matches.push(MountPoint::new(path));
+                if matches.len() > 64 {
+                    return Err(Error::new(
+                        ErrorKind::UnknownState,
+                        "mount candidate bound reached",
+                    ));
+                }
+            }
+        }
+        let after = mount_table()?;
+        if Instant::now() >= deadline
+            || table.len() != after.len()
+            || table.iter().zip(&after).any(|(a, b)| {
+                a.f_mntonname != b.f_mntonname
+                    || a.f_mntfromname != b.f_mntfromname
+                    || a.f_flags != b.f_flags
+            })
+        {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "mount table changed during enumeration",
+            ));
+        }
+        Ok(matches)
+    }
+}
+
+/// Read the complete bounded mount table. One extra slot detects truncation.
+fn mount_table() -> Result<Vec<libc::statfs>> {
+    const CAPACITY: usize = 257;
+    // SAFETY: statfs is a plain C structure and zero is a valid initial buffer.
+    let mut entries: Vec<libc::statfs> = (0..CAPACITY)
+        .map(|_| unsafe { std::mem::zeroed() })
+        .collect();
+    let bytes = i32::try_from(CAPACITY * std::mem::size_of::<libc::statfs>())
+        .map_err(|_| Error::new(ErrorKind::UnknownState, "mount table buffer is too large"))?;
+    // SAFETY: entries owns a writable buffer of exactly `bytes` bytes.
+    let count = unsafe { libc::getfsstat(entries.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
+    let count = usize::try_from(count)
+        .map_err(|_| Error::new(ErrorKind::UnknownState, "mount table is unreadable"))?;
+    if count > 256 {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "mount table is truncated or exceeds its bound",
+        ));
+    }
+    entries.truncate(count);
+    Ok(entries)
 }
 
 impl MountRoot for MacOs {
