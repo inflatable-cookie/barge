@@ -2450,7 +2450,7 @@ mod tests {
 
         // A real run that stops on its leaf capture leaves a pending intent; the
         // unit's visible name is gone, so the next plan has no candidate at all.
-        let mut capture_faults = Faults::new();
+        let capture_faults = Faults::new();
         capture_faults.failing_remove_prefix(state::CAPTURE_PREFIX, 3);
         let stopped = harness
             .real_with(&capture_faults, harness.aged(), &first)
