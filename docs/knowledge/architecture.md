@@ -16,8 +16,13 @@ design](contracts/stage1-design.md).
   root on a volume, its fallback policy and its owner. A placement is adopted
   explicitly and can be undone explicitly.
 - **Owned root.** A directory Barge created, carrying an owner marker with a
-  random identity, the volume UUID and the placement it serves. Only owned
-  roots are ever deleted, and only whole.
+  random identity, the volume UUID and the placement it serves.
+- **Deletion unit.** The one thing deletion acts on: a directory or a file,
+  inside an area folder, with an optional marker of a recognised family (Barge's
+  own, Effigy's or Oxide's) and the recorded grant that authorises it. An owned
+  root is the Barge-marked directory case; S4's delegated and claimed scratch
+  units are the others. Nothing else is ever deleted, and a unit is only ever
+  deleted whole.
 - **Scratch area.** A per-project tree under the volume's `scratch/<project>`,
   with marked run roots and expiry.
 - **Writer custody.** Before any move, swap or delete, Barge proves that no
@@ -157,9 +162,9 @@ macOS on APFS only for now (Tom, 2026-10-26, Q-005). Every platform-specific fac
   is declared per kind and is visible when it happens.
 - Low space prunes the oldest idle owned data first; only the floor refuses
   work.
-- Deletion is whole-root, of owned roots only, and tolerates Finder metadata
-  (`.DS_Store`, `._*`) recreated mid-delete. Any other unexpected entry stops
-  the delete and keeps the root.
+- Deletion is whole-unit, only of a unit the plan named with a matching grant,
+  and tolerates Finder metadata (`.DS_Store`, `._*`) recreated mid-delete. Any
+  other unexpected entry stops the delete and keeps the unit.
 - A command that will refuse changes nothing first.
 - Unknown is never treated as absent, idle or empty.
 

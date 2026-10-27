@@ -20,10 +20,11 @@
 //!   then volume, then root, then the intent write. Acquiring out of order is
 //!   refused, and [`LockSet::observe_registry`] takes only a shared lock and only
 //!   when the lock file already exists, so a read-only command creates nothing.
-//! - [`IntentRecord`]: one durable `barge.intent/1` phase record. Slice S5 writes
-//!   every phase before the effect it authorises, so a crash leaves a pending
-//!   intent that replay resolves from the recorded identity and never from an
-//!   inference.
+//! - [`IntentRecord`]: one durable `barge.intent/2` phase record for a deletion
+//!   unit. Slice S5 writes every phase before the effect it authorises, so a
+//!   crash leaves a pending intent that replay resolves from the recorded unit
+//!   identity and never from an inference; `barge.intent/1` stays readable and
+//!   maps to a Barge-marked directory unit.
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind as IoErrorKind, Read, Write};
@@ -178,6 +179,23 @@ impl StatePaths {
         Ok(self.locks_dir().join(format!("root-{root_id}.lock")))
     }
 
+    /// One deletion unit's lock file, third in the fixed order.
+    ///
+    /// A unit whose name is a Barge root id takes that root's lock, which is the
+    /// lock a hold on it takes too; any other unit is locked under the key
+    /// [`unit_lock_key`] derives. The key is a SHA-256, so a unit name can never
+    /// name a path outside `locks/`.
+    pub fn unit_lock_path(&self, key: &str) -> Result<PathBuf> {
+        if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("`{key}` is not a 64-hex-digit unit lock key"),
+            )
+            .with_detail("unit_lock_key", key.to_owned().into()));
+        }
+        Ok(self.locks_dir().join(format!("unit-{key}.lock")))
+    }
+
     /// Whether the state directory exists as a directory. An unreadable path or
     /// a non-directory at that path is unknown state, never "not initialized".
     pub fn is_initialized(&self) -> Result<bool> {
@@ -265,12 +283,25 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
     })
 }
 
+/// Whether a value is one of Barge's 128-bit identifiers: exactly 32 hex digits.
+pub fn is_identifier(value: &str) -> bool {
+    value.len() == 32 && value.chars().all(|character| character.is_ascii_hexdigit())
+}
+
+/// The lock key a deletion unit whose name is not a Barge root id locks under.
+///
+/// It is the SHA-256 of the unit's volume, parent and name, so the same unit locks
+/// under the same key on every run and two units never collide on one lock file.
+pub fn unit_lock_key(volume_uuid: &VolumeUuid, parent: &str, name: &str) -> String {
+    crate::digest::sha256_hex(
+        format!("barge.lock.unit/1\n{volume_uuid}\n{parent}\n{name}").as_bytes(),
+    )
+}
+
 /// Validate one identifier used in a file name: the design's 128-bit ids are
 /// lowercase hexadecimal, so anything else is refused rather than encoded.
 pub fn validate_identifier(field: &str, value: &str) -> Result<()> {
-    let well_formed =
-        value.len() == 32 && value.chars().all(|character| character.is_ascii_hexdigit());
-    if well_formed {
+    if is_identifier(value) {
         return Ok(());
     }
     Err(Error::new(
@@ -889,6 +920,13 @@ impl LockSet {
         self.acquire_exclusive(LockRank::Root, &path)
     }
 
+    /// Take one deletion unit's lock by its [`unit_lock_key`]: the third rank,
+    /// exclusive, so two deletions or replays of one unit never interleave.
+    pub fn lock_unit(&mut self, key: &str) -> Result<StateLock> {
+        let path = self.state.unit_lock_path(key)?;
+        self.acquire_exclusive(LockRank::Root, &path)
+    }
+
     /// Observe the registry: a shared lock, and only when the lock file exists.
     /// A read-only command creates no lock, no file and no directory.
     pub fn observe_registry(&mut self) -> Result<Option<StateLock>> {
@@ -986,41 +1024,112 @@ impl IntentPhase {
     }
 }
 
-/// One durable `barge.intent/1` record: the identity a deletion acts on, and the
+/// The unit one `barge.intent/2` record acts on: the plan's expectation, exactly
+/// as the deletion verified it, plus the private name the unit is captured under.
+///
+/// It is the durable half of [`crate::unit::DeletionUnit`]: the unit's name and
+/// kind, the optional marker with its filename and family, the expected device
+/// and inode, the grant the deletion rests on, and the planned private capture
+/// name - recorded **before** the capture, so the private name a replay may later
+/// unlink is never one the journal does not name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentUnit {
+    /// The parent directory relative to the area folder; `""` is the folder
+    /// itself.
+    pub parent: String,
+    /// The unit's name inside that parent.
+    pub name: String,
+    /// Whether the unit is a directory or one file.
+    pub kind: crate::unit::UnitKind,
+    /// The device the plan recorded.
+    pub device: u64,
+    /// The inode the plan recorded.
+    pub inode: u64,
+    /// The marker the plan read, when the unit carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker: Option<crate::unit::UnitMarker>,
+    /// The private `.barge-prune-<intent-id>` name the unit was captured to
+    /// inside its parent, recorded before the capture.
+    pub capture_name: String,
+    /// The recorded grant the deletion rests on.
+    pub grant: crate::unit::UnitGrant,
+}
+
+impl IntentUnit {
+    /// Validate every recorded fact strictly.
+    ///
+    /// The record's field set is the v2 major's, so a reader refuses a v1 record
+    /// read as v2 and the reverse. `capture_name` must be exactly this intent's
+    /// quarantine name, so a record can never name another operation's private
+    /// name.
+    pub fn validate(&self, intent_id: &str) -> Result<()> {
+        crate::unit::validate_parent(&self.parent)?;
+        validate_entry_name(&self.name)?;
+        if self.name == "." || self.name == ".." {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("`{}` is not a unit name", self.name),
+            )
+            .with_detail("intent_id", intent_id.to_owned().into()));
+        }
+        let expected = format!("{QUARANTINE_PREFIX}{intent_id}");
+        if self.capture_name != expected {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "the intent's private capture name is `{}`, not `{expected}`",
+                    self.capture_name
+                ),
+            )
+            .with_detail("intent_id", intent_id.to_owned().into()));
+        }
+        self.grant.validate()?;
+        match (&self.marker, self.kind) {
+            (Some(marker), crate::unit::UnitKind::Directory) => marker.validate()?,
+            (Some(_), crate::unit::UnitKind::File) => {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "a file unit never carries a marker, which is a file inside a directory"
+                        .to_owned(),
+                )
+                .with_detail("intent_id", intent_id.to_owned().into()))
+            }
+            (None, _) => {}
+        }
+        crate::unit::validate_grant_shape(self.marker.as_ref(), self.kind, &self.grant, &self.name)
+    }
+}
+
+/// One durable `barge.intent/2` record: the unit a deletion acts on, and the
 /// phase it has reached.
 ///
 /// The record never states a conclusion about data it has not observed. A replay
-/// resolves it only from the recorded device, inode and marker digest, which is
-/// why they are recorded before the first effect. It also carries the captured
-/// objects the deletion could not put back, so a replay never mistakes one of
-/// them for an ordinary entry it may delete.
+/// resolves it only from the recorded unit - its kind, name, parent, device,
+/// inode, marker bytes and grant - which is why they are recorded before the
+/// first effect. It also carries the captured objects the deletion could not put
+/// back, so a replay never mistakes one of them for an ordinary entry it may
+/// delete.
+///
+/// `barge.intent/1` stays readable: [`read_intent`] maps a v1 record to a
+/// Barge-marked directory unit, which is exactly the shape v1 could describe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IntentRecord {
-    /// Always `barge.intent/1`.
+    /// Always `barge.intent/2`.
     pub schema: String,
     /// The intent's fresh 128-bit id, which also names the quarantine leaf.
     pub intent_id: String,
-    /// The owned root the deletion acts on.
-    pub root_id: String,
     /// The verified volume's UUID.
     pub volume_uuid: VolumeUuid,
     /// The mount point observed when the intent was written.
     pub mount_hint: PathBuf,
-    /// The volume's `root_dir` the root was resolved under.
+    /// The volume's `root_dir` the unit was resolved under.
     pub root_dir: String,
-    /// The area folder the root was resolved in.
+    /// The area folder the unit was resolved in.
     pub folder: String,
-    /// The root directory's name inside that folder.
-    pub root_name: String,
-    /// The quarantine leaf's name inside that folder.
-    pub quarantine_name: String,
-    /// The root's device, as read through its descriptor.
-    pub device: u64,
-    /// The root's inode, as read through its descriptor.
-    pub inode: u64,
-    /// The SHA-256 of the root's marker bytes.
-    pub marker_digest: String,
+    /// The unit the deletion acts on.
+    pub unit: IntentUnit,
     /// The SHA-256 of the plan that authorised the deletion.
     pub plan_digest: String,
     /// The phase the deletion reached.
@@ -1048,6 +1157,34 @@ impl IntentRecord {
         self.phase.is_pending()
     }
 
+    /// The unit's name, as a report and a lock name it.
+    pub fn unit_name(&self) -> &str {
+        &self.unit.name
+    }
+
+    /// The planned private capture name the unit is held under inside its parent.
+    pub fn capture_name(&self) -> &str {
+        &self.unit.capture_name
+    }
+
+    /// The deletion unit the record describes, with the plan digest and area
+    /// folder it recorded.
+    pub fn deletion_unit(&self) -> crate::unit::DeletionUnit {
+        crate::unit::DeletionUnit {
+            volume_uuid: self.volume_uuid.clone(),
+            root_dir: self.root_dir.clone(),
+            folder: self.folder.clone(),
+            parent: self.unit.parent.clone(),
+            name: self.unit.name.clone(),
+            kind: self.unit.kind,
+            device: crate::os::DeviceId::new(self.unit.device),
+            inode: self.unit.inode,
+            marker: self.unit.marker.clone(),
+            grant: self.unit.grant.clone(),
+            plan_digest: self.plan_digest.clone(),
+        }
+    }
+
     /// Validate every recorded fact strictly. A record that does not validate is
     /// unknown, never an intent to act on.
     pub fn validate(&self) -> Result<()> {
@@ -1063,31 +1200,13 @@ impl IntentRecord {
             .with_detail("intent_id", self.intent_id.clone().into()));
         }
         validate_identifier("intent_id", &self.intent_id)?;
-        validate_identifier("root_id", &self.root_id)?;
-        let quarantine = format!("{QUARANTINE_PREFIX}{}", self.intent_id);
-        if self.quarantine_name != quarantine {
-            return Err(Error::new(
-                ErrorKind::UnknownState,
-                format!(
-                    "the intent's quarantine name is `{}`, not `{quarantine}`",
-                    self.quarantine_name
-                ),
-            )
-            .with_detail("intent_id", self.intent_id.clone().into()));
-        }
-        if self.root_name != self.root_id {
-            return Err(Error::new(
-                ErrorKind::UnknownState,
-                "the intent's root name is not the root id".to_owned(),
-            )
-            .with_detail("intent_id", self.intent_id.clone().into()));
-        }
+        self.unit.validate(&self.intent_id)?;
         crate::registry::validate_folder("root_dir", &self.root_dir, true)?;
         crate::registry::validate_folder("folder", &self.folder, false)?;
-        if !is_hex(self.marker_digest.as_str(), 64) || !is_hex(self.plan_digest.as_str(), 64) {
+        if !is_hex(self.plan_digest.as_str(), 64) {
             return Err(Error::new(
                 ErrorKind::UnknownState,
-                "the intent's marker or plan digest is not a SHA-256 hex string".to_owned(),
+                "the intent's plan digest is not a SHA-256 hex string".to_owned(),
             )
             .with_detail("intent_id", self.intent_id.clone().into()));
         }
@@ -1119,7 +1238,7 @@ impl IntentRecord {
             .with_detail("intent_id", self.intent_id.clone().into()));
         }
         for capture in &self.captures {
-            capture.validate(&self.quarantine_name)?;
+            capture.validate(self.capture_name())?;
         }
         if self.foreign_captures.len() > INTENT_FOREIGN_CAPTURES {
             return Err(Error::new(
@@ -1132,6 +1251,97 @@ impl IntentRecord {
             foreign.validate()?;
         }
         Ok(())
+    }
+}
+
+/// One `barge.intent/1` record, exactly as S5 first wrote it.
+///
+/// It is the field set of the previous major, `deny_unknown_fields` included, so
+/// a v2 document cannot be read as v1 (it carries `unit` and no `root_id`) and a
+/// v1 document cannot be read as v2. [`read_intent`] maps it to the general
+/// record, where a v1 root is a Barge-marked directory unit directly inside its
+/// area folder - the only shape v1 could describe.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntentV1 {
+    schema: String,
+    intent_id: String,
+    root_id: String,
+    volume_uuid: VolumeUuid,
+    mount_hint: PathBuf,
+    root_dir: String,
+    folder: String,
+    root_name: String,
+    quarantine_name: String,
+    device: u64,
+    inode: u64,
+    marker_digest: String,
+    plan_digest: String,
+    phase: IntentPhase,
+    generation: u64,
+    recorded_ms: u64,
+    phase_ms: u64,
+    #[serde(default)]
+    captures: Vec<CaptureRecord>,
+    #[serde(default)]
+    foreign_captures: Vec<ForeignCapture>,
+}
+
+impl IntentV1 {
+    /// Map a v1 record to the general record, refusing one that does not hold
+    /// v1's own invariants.
+    fn upgrade(self) -> Result<IntentRecord> {
+        if self.schema != crate::contract::INTENT_SCHEMA_V1 {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "`{}` is not the `{}` major",
+                    self.schema,
+                    crate::contract::INTENT_SCHEMA_V1
+                ),
+            )
+            .with_detail("intent_id", self.intent_id.clone().into()));
+        }
+        // v1 named a Barge-owned root, and a root id is a Barge identifier. The
+        // quarantine leaf and the marker are v1's, unchanged, so the mapping
+        // invents nothing the record did not already say.
+        validate_identifier("root_id", &self.root_id)?;
+        if self.root_name != self.root_id {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "the intent's root name is not the root id".to_owned(),
+            )
+            .with_detail("intent_id", self.intent_id.clone().into()));
+        }
+        let unit = IntentUnit {
+            parent: String::new(),
+            name: self.root_id.clone(),
+            kind: crate::unit::UnitKind::Directory,
+            device: self.device,
+            inode: self.inode,
+            marker: Some(crate::unit::UnitMarker::new(
+                crate::unit::MarkerFamily::Barge,
+                self.marker_digest,
+            )),
+            capture_name: self.quarantine_name,
+            grant: crate::unit::UnitGrant::native_root(self.root_id.clone()),
+        };
+        Ok(IntentRecord {
+            schema: crate::contract::INTENT_SCHEMA.to_owned(),
+            intent_id: self.intent_id,
+            volume_uuid: self.volume_uuid,
+            mount_hint: self.mount_hint,
+            root_dir: self.root_dir,
+            folder: self.folder,
+            unit,
+            plan_digest: self.plan_digest,
+            phase: self.phase,
+            generation: self.generation,
+            recorded_ms: self.recorded_ms,
+            phase_ms: self.phase_ms,
+            captures: self.captures,
+            foreign_captures: self.foreign_captures,
+        })
     }
 }
 
@@ -1244,7 +1454,11 @@ impl CaptureRecord {
 }
 
 /// One entry name as a record keeps it: exactly one component.
-fn validate_entry_name(name: &str) -> Result<()> {
+///
+/// It is the shape a deletion unit's name and any recorded entry name must have:
+/// non-empty UTF-8, at most the platform's 255 bytes, and no separator, so a name
+/// never escapes the directory a descriptor-relative walk reached.
+pub fn validate_entry_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 255 || name == "." || name == ".." || name.contains('/') {
         return Err(Error::new(
             ErrorKind::UnknownState,
@@ -1624,7 +1838,20 @@ pub fn read_intent(state: &StatePaths, intent_id: &str) -> Result<IntentRecord> 
         }
         ReadOutcome::Refused(error) => return Err(error),
     };
-    let record: IntentRecord = serde_json::from_slice(&bytes).map_err(|error| {
+    // The major decides the field set: a v1 record is read as v1 and mapped, a
+    // current record as itself, and an unknown major refuses rather than being
+    // guessed at. Both shapes deny an unknown field, so a document whose fields
+    // do not match its major is refused too.
+    // The document is parsed twice, and the second parse is the one that decides:
+    // the first reads only the major, because it decides which field set is the
+    // document's. The record itself is then deserialized **from the original
+    // bytes**, never from the first parse's value: `serde_json::Value` keeps the
+    // last of two identical members, and a reader that reused it would let a
+    // duplicate `foreign_captures` (or `schema`, or any nested field) erase the
+    // evidence the earlier member recorded. The version-specific structs deny
+    // unknown fields and refuse a repeated one, so a duplicated member is an
+    // unreadable record rather than an ambiguous one.
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
         Error::new(
             ErrorKind::UnknownState,
             format!(
@@ -1635,6 +1862,48 @@ pub fn read_intent(state: &StatePaths, intent_id: &str) -> Result<IntentRecord> 
         )
         .with_detail("path", path.display().to_string().into())
     })?;
+    let schema = value
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "{} records no schema, so its field set is unknown",
+                    path.display()
+                ),
+            )
+            .with_detail("path", path.display().to_string().into())
+        })?;
+    let parse = |error: serde_json::Error| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!("{} is not a `{schema}` document: {error}", path.display()),
+        )
+        .with_detail("path", path.display().to_string().into())
+        .with_detail("schema", schema.to_owned().into())
+    };
+    let record = match schema.as_str() {
+        crate::contract::INTENT_SCHEMA => {
+            serde_json::from_slice::<IntentRecord>(&bytes).map_err(parse)?
+        }
+        crate::contract::INTENT_SCHEMA_V1 => serde_json::from_slice::<IntentV1>(&bytes)
+            .map_err(parse)?
+            .upgrade()?,
+        other => {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "`{other}` is not an intent major this build reads; it reads `{}` and `{}`",
+                    crate::contract::INTENT_SCHEMA,
+                    crate::contract::INTENT_SCHEMA_V1
+                ),
+            )
+            .with_detail("path", path.display().to_string().into())
+            .with_detail("schema", other.to_owned().into()))
+        }
+    };
     record.validate()?;
     Ok(record)
 }
@@ -2147,8 +2416,8 @@ mod intent_tests {
 
     use super::{
         advance_intent, publish_intent, read_intent, read_intents, record_foreign_capture,
-        CapturedObject, ForeignCapture, IntentPhase, IntentRecord, LockSet, PutBackOutcome,
-        StatePaths, CAPTURE_PREFIX, INTENT_FOREIGN_CAPTURES, QUARANTINE_PREFIX,
+        CapturedObject, ForeignCapture, IntentPhase, IntentRecord, IntentUnit, LockSet,
+        PutBackOutcome, StatePaths, CAPTURE_PREFIX, INTENT_FOREIGN_CAPTURES, QUARANTINE_PREFIX,
     };
     use crate::error::ErrorKind;
     use crate::os::VolumeUuid;
@@ -2175,16 +2444,23 @@ mod intent_tests {
         IntentRecord {
             schema: crate::contract::INTENT_SCHEMA.to_owned(),
             intent_id: intent_id.clone(),
-            root_id: format!("{:032x}", 8),
             volume_uuid: uuid.clone(),
             mount_hint: PathBuf::from("/Volumes/Builds"),
             root_dir: String::new(),
             folder: "example/pool".to_owned(),
-            root_name: format!("{:032x}", 8),
-            quarantine_name: format!("{QUARANTINE_PREFIX}{intent_id}"),
-            device: 16_777_219,
-            inode: 4_242,
-            marker_digest: "a".repeat(64),
+            unit: IntentUnit {
+                parent: String::new(),
+                name: format!("{:032x}", 8),
+                kind: crate::unit::UnitKind::Directory,
+                device: 16_777_219,
+                inode: 4_242,
+                marker: Some(crate::unit::UnitMarker::new(
+                    crate::unit::MarkerFamily::Barge,
+                    "a".repeat(64),
+                )),
+                capture_name: format!("{QUARANTINE_PREFIX}{intent_id}"),
+                grant: crate::unit::UnitGrant::native_root(format!("{:032x}", 8)),
+            },
             plan_digest: "b".repeat(64),
             phase: IntentPhase::Intent,
             generation: 1,
@@ -2201,7 +2477,7 @@ mod intent_tests {
         let intent = record(&uuid);
         let mut locks = LockSet::new(state.clone());
         let _volume = locks.lock_volume(&uuid).expect("the volume lock");
-        let _root = locks.lock_root(&intent.root_id).expect("the root lock");
+        let _root = locks.lock_root(&intent.unit.name).expect("the root lock");
         let write = locks.begin_intent_write().expect("the intent step");
 
         publish_intent(&write, &state, &intent).expect("the intent publishes");
@@ -2255,6 +2531,185 @@ mod intent_tests {
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
 
+    /// A `barge.intent/1` record exactly as S5 first wrote it.
+    fn v1_value(uuid: &VolumeUuid, intent_id: &str) -> serde_json::Value {
+        let root_id = format!("{:032x}", 8);
+        serde_json::json!({
+            "schema": "barge.intent/1",
+            "intent_id": intent_id,
+            "root_id": root_id,
+            "volume_uuid": uuid.to_string(),
+            "mount_hint": "/Volumes/Builds",
+            "root_dir": "",
+            "folder": "example/pool",
+            "root_name": root_id,
+            "quarantine_name": format!("{QUARANTINE_PREFIX}{intent_id}"),
+            "device": 16_777_219,
+            "inode": 4_242,
+            "marker_digest": "a".repeat(64),
+            "plan_digest": "b".repeat(64),
+            "phase": "renamed",
+            "generation": 2,
+            "recorded_ms": 1,
+            "phase_ms": 2,
+        })
+    }
+
+    #[test]
+    fn a_v1_record_reads_as_a_barge_marked_directory_unit() {
+        let (_dir, state, uuid) = fixture("intent-v1");
+        let intent_id = format!("{:032x}", 9);
+        let path = super::intent_path(&state, &intent_id).expect("the path");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&v1_value(&uuid, &intent_id)).expect("the record encodes"),
+        )
+        .expect("the v1 record is written");
+
+        let read = read_intent(&state, &intent_id).expect("a v1 record stays readable");
+        assert_eq!(read.schema, crate::contract::INTENT_SCHEMA);
+        assert_eq!(read.unit.kind, crate::unit::UnitKind::Directory);
+        assert_eq!(read.unit.parent, "");
+        assert_eq!(read.unit.name, format!("{:032x}", 8));
+        assert_eq!(
+            read.unit.capture_name,
+            format!("{QUARANTINE_PREFIX}{intent_id}")
+        );
+        assert_eq!(read.unit.device, 16_777_219);
+        assert_eq!(read.unit.inode, 4_242);
+        let marker = read.unit.marker.as_ref().expect("a v1 root is marked");
+        assert_eq!(marker.family, crate::unit::MarkerFamily::Barge);
+        assert_eq!(marker.filename, crate::unit::BARGE_MARKER_FILE);
+        assert_eq!(marker.digest, "a".repeat(64));
+        assert_eq!(
+            read.unit.grant,
+            crate::unit::UnitGrant::native_root(format!("{:032x}", 8))
+        );
+        assert_eq!(read.phase, crate::state::IntentPhase::Renamed);
+    }
+
+    #[test]
+    fn an_intent_field_set_that_does_not_match_its_major_is_refused() {
+        let (_dir, state, uuid) = fixture("intent-field-set");
+        let intent_id = format!("{:032x}", 10);
+        let path = super::intent_path(&state, &intent_id).expect("the path");
+        let mut v1_with_a_v2_field = v1_value(&uuid, &intent_id);
+        v1_with_a_v2_field["unit"] = serde_json::json!({"name": "late"});
+        let v2 = serde_json::to_value(record(&uuid)).expect("the record encodes");
+        let mut v2_with_a_v1_field = v2.clone();
+        v2_with_a_v1_field["root_id"] = serde_json::json!(format!("{:032x}", 8));
+        let mut v2_without_its_unit = v2;
+        v2_without_its_unit
+            .as_object_mut()
+            .expect("an object")
+            .remove("unit");
+        for (label, value) in [
+            ("a v1 field set with a v2 field", v1_with_a_v2_field),
+            ("a v2 field set with a v1 field", v2_with_a_v1_field),
+            ("a v2 field set without its unit", v2_without_its_unit),
+        ] {
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&value).expect("the record encodes"),
+            )
+            .expect("the record is written");
+            let error = read_intent(&state, &intent_id).expect_err(label);
+            assert_eq!(error.kind(), ErrorKind::UnknownState, "{label}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_intent_major_is_unknown_state() {
+        let (_dir, state, uuid) = fixture("intent-major");
+        let intent_id = format!("{:032x}", 11);
+        let path = super::intent_path(&state, &intent_id).expect("the path");
+        let mut value = serde_json::to_value(record(&uuid)).expect("the record encodes");
+        value["schema"] = serde_json::Value::String("barge.intent/3".to_owned());
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&value).expect("the record encodes"),
+        )
+        .expect("the record is written");
+        let error = read_intent(&state, &intent_id).expect_err("an unknown major refuses");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(
+            error.to_string().contains("barge.intent/3"),
+            "the refusal names the major: {error}"
+        );
+    }
+
+    #[test]
+    fn a_v2_record_with_a_duplicate_field_is_refused() {
+        // A JSON object with two identical members is ambiguous: a reader that kept
+        // the last one would erase the foreign-capture evidence the first member
+        // recorded, or resolve a duplicated schema/unit to one shape. The strict
+        // record refuses it instead.
+        let (_dir, state, uuid) = fixture("intent-duplicate-v2");
+        let intent_id = format!("{:032x}", 12);
+        let path = super::intent_path(&state, &intent_id).expect("the path");
+        let mut intent = record(&uuid);
+        intent.foreign_captures = vec![leftover("payload.txt", 1)];
+        let text =
+            String::from_utf8(serde_json::to_vec_pretty(&intent).expect("the record encodes"))
+                .expect("the record is text");
+        assert!(
+            text.contains("foreign_captures"),
+            "the record carries the evidence"
+        );
+        let unit = serde_json::to_string(&intent.unit).expect("the unit encodes");
+        let cases = [
+            (
+                "the foreign evidence and then an empty list",
+                crate::testkit::append_json_member(&text, "\"foreign_captures\":[]"),
+            ),
+            (
+                "the schema twice",
+                crate::testkit::append_json_member(&text, "\"schema\":\"barge.intent/1\""),
+            ),
+            (
+                "the unit twice",
+                crate::testkit::append_json_member(&text, &format!("\"unit\":{unit}")),
+            ),
+        ];
+        for (label, document) in cases {
+            std::fs::write(&path, document).expect("the record is written");
+            let error = read_intent(&state, &intent_id).expect_err(label);
+            assert_eq!(error.kind(), ErrorKind::UnknownState, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_v1_record_with_a_duplicate_field_is_refused() {
+        let (_dir, state, uuid) = fixture("intent-duplicate-v1");
+        let intent_id = format!("{:032x}", 13);
+        let path = super::intent_path(&state, &intent_id).expect("the path");
+        let value = v1_value(&uuid, &intent_id);
+        let text =
+            String::from_utf8(serde_json::to_vec_pretty(&value).expect("the record encodes"))
+                .expect("the record is text");
+        let cases = [
+            (
+                "the root id twice",
+                crate::testkit::append_json_member(
+                    &text,
+                    "\"root_id\":\"0000000000000000000000000000000f\"",
+                ),
+            ),
+            (
+                "the marker digest twice",
+                crate::testkit::append_json_member(
+                    &text,
+                    &format!("\"marker_digest\":\"{}\"", "b".repeat(64)),
+                ),
+            ),
+        ];
+        for (label, document) in cases {
+            std::fs::write(&path, document).expect("the record is written");
+            let error = read_intent(&state, &intent_id).expect_err(label);
+            assert_eq!(error.kind(), ErrorKind::UnknownState, "{label}");
+        }
+    }
+
     fn leftover(original: &str, nonce: u8) -> ForeignCapture {
         ForeignCapture {
             private: format!("{CAPTURE_PREFIX}{}", format!("{nonce:02x}").repeat(16)),
@@ -2278,7 +2733,7 @@ mod intent_tests {
         let intent = record(&uuid);
         let mut locks = LockSet::new(state.clone());
         let _volume = locks.lock_volume(&uuid).expect("the volume lock");
-        let _root = locks.lock_root(&intent.root_id).expect("the root lock");
+        let _root = locks.lock_root(&intent.unit.name).expect("the root lock");
         let write = locks.begin_intent_write().expect("the intent step");
         publish_intent(&write, &state, &intent).expect("the intent publishes");
 
@@ -2386,7 +2841,7 @@ mod intent_tests {
         let intent = record(&uuid);
         let mut locks = LockSet::new(state.clone());
         let _volume = locks.lock_volume(&uuid).expect("the volume lock");
-        let _root = locks.lock_root(&intent.root_id).expect("the root lock");
+        let _root = locks.lock_root(&intent.unit.name).expect("the root lock");
         let write = locks.begin_intent_write().expect("the intent step");
         publish_intent(&write, &state, &intent).expect("the intent publishes");
 

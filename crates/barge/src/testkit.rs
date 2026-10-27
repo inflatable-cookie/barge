@@ -1386,6 +1386,19 @@ impl VolumeFixture {
     }
 }
 
+/// Append one more member before a JSON object document's closing brace, so a test
+/// can write a document that repeats a key.
+///
+/// `serde_json`'s own value type keeps the last of two identical members, so this is
+/// how a test states the document a strict reader must refuse rather than resolve.
+pub fn append_json_member(text: &str, member: &str) -> String {
+    let trimmed = text.trim_end();
+    let end = trimmed.rfind('}').expect("a JSON object document");
+    let body = trimmed[..end]
+        .trim_end_matches(|character: char| character.is_whitespace() || character == ',');
+    format!("{body},{member}{}\n", &trimmed[end..])
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

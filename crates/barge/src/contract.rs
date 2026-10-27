@@ -82,7 +82,14 @@ pub const ROOT_SCHEMA: &str = "barge.root/1";
 /// One hold file's format.
 pub const HOLD_SCHEMA: &str = "barge.hold/1";
 /// One intent journal record's format.
-pub const INTENT_SCHEMA: &str = "barge.intent/1";
+///
+/// The major moved to `/2` when custody and deletion were generalised from
+/// Barge-marked roots to deletion units (directory or file, optional marker,
+/// recorded grant). `/1` stays readable and maps to a Barge-marked directory
+/// unit (stage 1 design, "Intent journal").
+pub const INTENT_SCHEMA: &str = "barge.intent/2";
+/// The previous intent major, still read as a Barge-marked directory unit.
+pub const INTENT_SCHEMA_V1: &str = "barge.intent/1";
 
 /// Every format version Barge speaks, as `describe` reports them. A format's
 /// major changes only when its document changes incompatibly; the previous
@@ -315,7 +322,7 @@ mod tests {
         assert_eq!(formats.placement, "barge.placement/1");
         assert_eq!(formats.root, "barge.root/1");
         assert_eq!(formats.hold, "barge.hold/1");
-        assert_eq!(formats.intent, "barge.intent/1");
+        assert_eq!(formats.intent, "barge.intent/2");
     }
 
     #[test]

@@ -35,6 +35,7 @@ pub mod prune;
 pub mod registry;
 pub mod scratch;
 pub mod state;
+pub mod unit;
 
 #[cfg(test)]
 #[allow(dead_code)]

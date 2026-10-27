@@ -38,7 +38,7 @@ state and registration records; read-only import and inspection of Oxide's and
 Effigy's existing on-disk state; per-volume `root_dir` and folder overrides; the
 area declaration API and its record; project scratch allocation, conclusion and
 expiry; npm, bun and Cargo registry/git cache placements with in-place adoption;
-writer custody and safe whole-root deletion; the scheduled-job interface; the
+writer custody and safe whole-unit deletion; the scheduled-job interface; the
 failure and race matrix; finite implementation slices with dependencies; the
 proposed test matrix.
 
@@ -113,8 +113,9 @@ Library modules, each with one job:
 | `area` | Area declaration, path resolution, root creation, holds, root listing, prune planning. |
 | `scratch` | Project scratch allocation, conclusion, expiry sweep. |
 | `cache` | Cache kinds, the three placement forms (`setting`, `held-root`, `link`) and undo. |
-| `custody` | Writer-custody evidence, verdicts, deletion authorization. |
-| `delete` | Whole-root deletion, Finder tolerance, quarantine and replay. |
+| `unit` | The deletion unit custody and deletion act on: a directory or a file, its parent, the plan's expected identity, its optional marker and family, its recorded grant and the plan digest. |
+| `custody` | Writer-custody evidence for a deletion unit, verdicts, deletion authorization. |
+| `delete` | Whole-unit deletion, Finder tolerance, quarantine and replay. |
 | `prune` | Area prune policy evaluation, plan/preview, intent journal. |
 | `describe` | The versioned documents the library and CLI return. |
 
@@ -233,8 +234,9 @@ state/
   areas/<namespace>/<area>.json barge.area/1
   placements/<id>.json          barge.placement/1
   holds/<root-id>/<holder>.json barge.hold/1
-  intents/<intent-id>.json      barge.intent/1
-  locks/                        registry.lock, volume-<uuid>.lock, root-<id>.lock
+  intents/<intent-id>.json      barge.intent/2   (barge.intent/1 still read)
+  locks/                        registry.lock, volume-<uuid>.lock, root-<id>.lock,
+                                unit-<key>.lock
   journal/                      bounded append-only prune/delete observations
 ```
 
@@ -245,9 +247,13 @@ deadline) and strictly validated; a registry that fails validation makes every
 mutating command refuse, and is never rebuilt from markers.
 
 Lock order is fixed and documented so two processes cannot deadlock: registry
-lock → volume lock → root lock → intent write. The registry lock is never held
-across a deletion or a volume walk; a long delete holds the volume and root
-locks and re-reads the registry state it needs before publishing its intent.
+lock → volume lock → root lock (a Barge root id, or a unit's own derived key) →
+intent write. The registry lock is never held across a deletion or a volume walk;
+a long delete holds the volume and unit locks and re-reads the registry state it
+needs before publishing its intent. A unit whose name is a Barge root id takes
+that root's lock, which is the lock a hold on it takes too; any other unit takes
+`unit-<key>.lock`, keyed by the SHA-256 of its volume, parent and name, so a unit
+name can never name a path outside `locks/`.
 
 ### Registry of volumes
 
@@ -803,6 +809,54 @@ Today `<account home>/.npmrc` and `/.bunfig.toml` point at
 
 ## Writer custody and safe deletion
 
+### Deletion units
+
+Custody and deletion act on one **deletion unit** (S5's follow-up, barge#016).
+A unit is the thing a plan names and the effect acts on:
+
+- a **parent**: a relative path inside one area folder, `""` for a direct child
+  of it, opened descriptor-relative component by component and re-checked to be
+  on the unit's device - never re-resolved from a string;
+- the **unit name**, one entry inside that parent;
+- its **kind**: `directory` or `file`;
+- the **expected identity** the plan recorded: device, inode and kind, re-read
+  and matched by custody before the first effect;
+- an **optional marker**: its filename and family (`barge`, `effigy_scratch`,
+  `oxide_scratch`), plus the SHA-256 of the bytes the plan read. A file never
+  carries one; a Barge-owned root is exactly a directory unit whose marker is
+  `.barge-root.json` of the `barge` family;
+- the **grant** the deletion rests on; and
+- the **plan digest** that authorised it.
+
+Barge's own roots are therefore the `kind: directory, marker: barge` case of the
+same unit, and S4's units - a delegated Effigy or Oxide run, a claimed unmarked
+directory, a claimed top-level file - are the other cases. One delete path and
+one journal shape serve all of them, so no slice keeps a second delete of its
+own: a file unit is captured, verified and unlinked under the same rule a
+directory's entries are, and there is no unlink by name anywhere.
+
+Every unit needs a recorded grant, and the grant must be the form its marker
+family needs: a **native root** for Barge's own marker, that family's
+**delegation** for a foreign marker, and a legacy **claim** for an unmarked
+unit. The intent records the grant's kind and reference, and custody re-reads the
+volume's `scratch_grants` when it decides, so a grant revoked between the plan
+and the effect keeps the unit:
+
+- a foreign family's delegation covers that family's marked units **inside the
+  volume's scratch folder** (`folders.scratch`, default `scratch/`) and nothing
+  else on the volume; and
+- a legacy claim is bound to the volume's scratch folder and to exactly the scope
+  it declares, derived from the unit's place rather than from which folder string
+  the caller passed: `project:<name>` is a child of `<scratch>/<name>/`, and
+  `top_level_adhoc` is an entry directly under `<scratch>/` that is a file or
+  whose name contains a dot. The claim's recorded unit shape must match its
+  scope (`child` for a project, `entry` for the top level), so a claim never
+  authorizes a unit outside its declared scope or a shape it did not declare.
+
+A unit whose grant does not cover its marker family is refused before any effect,
+so a missing or mismatched grant can never become a deletion, and a unit that
+becomes marked between the plan and the effect is kept.
+
 ### Capability limits on macOS and APFS
 
 There is no unprivileged macOS primitive that positively proves "no process has
@@ -843,11 +897,15 @@ Unsafe(reason)      -- a holder or an open descriptor was found
 Safe(evidence)      -- authorizes swap or delete
 ```
 
-`Safe` requires all of: every recorded hold for the root released or positively
-stale; the same-uid open-descriptor scan complete within its bound and empty for
-this root; the root's device, inode and marker digest equal to the observation
-the caller was given; the volume verified; and no pending intent naming another
-root. The scan classifies every candidate from the kernel's own process table by
+`Safe` requires all of: the unit's record and grant well formed and the grant
+the form its marker family needs; every recorded hold for the unit released or
+positively stale (Barge holds are keyed by a Barge root id, so a unit Barge never
+created has none to read); the same-uid open-descriptor scan complete within its
+bound and empty for this unit; the unit's device, inode and kind equal to the
+observation the caller was given; its marker, when it records one, still holding
+exactly the bytes the caller observed at its family's own filename, and a unit
+that records no marker carrying none of the three recognised families; the
+volume verified; and no pending intent naming another unit. The scan classifies every candidate from the kernel's own process table by
 its effective uid **before** it inspects any descriptor: a process of another
 effective uid is counted and reported in the evidence as not observed, which is
 the named blind spot and does not block `Safe`; only this account's processes
@@ -876,33 +934,36 @@ errors makes the verdict `Unknown`,
 which is a refusal. Deletion and swap take a `Safe` value by type, so a caller
 cannot pass a boolean.
 
-Custody is taken before a link swap, before a root's quarantine rename, and
+Custody is taken before a link swap, before a unit's quarantine rename, and
 before a link removal, and it is re-checked after the intent publish and before
 the first destructive step. It is not a lease on the data: a consumer that is
 mid-write without a hold is a consumer Barge cannot see, which is exactly the
 limit above and the reason adoption is explicit and holds are the documented
 protocol.
 
-### Whole-root deletion, Finder metadata and quarantine
+### Whole-unit deletion, Finder metadata and quarantine
 
-Deletion is whole-root only, of owned roots only, descriptor-relative, and
-bounded:
+Deletion is whole-unit only, of units the plan named with a matching grant,
+descriptor-relative, and bounded:
 
-1. Verify the root and its marker; take custody; write
-   `barge.intent/1` (`intent` phase) recording root id, marker digest, device,
-   inode, volume UUID, plan digest and time. The intent is durable before any
-   rename.
-2. Rename the root inside its area to `.barge-prune-<intent-id>` with the
+1. Verify the unit and its marker (or, for a unit that records none, that it
+   stayed unmarked); take custody; write `barge.intent/2` (`intent` phase)
+   recording the unit's kind, name and parent, its marker filename and family,
+   the planned private capture name, the expected device and inode, the grant
+   reference, the volume UUID, the plan digest and the time. The private name is
+   recorded **before** the capture, and the intent is durable before any rename.
+2. Rename the unit inside its parent to `.barge-prune-<intent-id>` with the
    platform's exclusive rename (`renameatx_np` with `RENAME_EXCL` on macOS),
    then record the `renamed` phase. The rename is atomic and never replaces an
    existing name: a taken target refuses and the intent stays pending. A
-   cross-device or changed-inode result stops before deletion.
-3. Walk and delete through descriptors opened from the area's descriptor:
-   `openat` with `O_NOFOLLOW` per directory, and every entry removed through
-   **capture, verify, record, unlink** (below): the capture and its verdict are
-   durable before the unlink, never following a symlink, with a depth
-   bound (12) and per-directory name bound (200 000) and a per-root deadline
-   (120 s).
+   cross-device or changed-kind, changed-inode result stops before deletion.
+3. For a directory, walk and delete through descriptors opened from the parent's
+   descriptor: `openat` with `O_NOFOLLOW` per directory, and every entry removed
+   through **capture, verify, record, unlink** (below): the capture and its
+   verdict are durable before the unlink, never following a symlink, with a depth
+   bound (12) and per-directory name bound (200 000) and a per-unit deadline
+   (120 s). A file unit has no contents to walk: it goes straight to its own
+   capture and unlink under the same rule.
 4. Finder tolerance is exactly Oxide's two forms and nothing broader:
    `.DS_Store`, or `._` followed by a nonempty name. A Finder-named **regular
    file** is verified by class whether the classification recorded it or Finder
@@ -910,9 +971,9 @@ bounded:
    owned by this user, on the directory's device, inside the size bound - because
    Finder's store has no stable inode to match. A directory, a link or anything
    else that happens to carry a Finder name is not Finder metadata.
-   Every other unexpected entry stops the deletion and keeps the root. Finder
-   metadata is deleted as part of the whole root; it never establishes
-   ownership, never makes a root reusable and never permits a narrower delete.
+   Every other unexpected entry stops the deletion and keeps the unit. Finder
+   metadata is deleted as part of the whole unit; it never establishes
+   ownership, never makes a unit reusable and never permits a narrower delete.
 5. `ENOTEMPTY`/`EEXIST` from `rmdir`/`unlink` retries the enclosing directory at
    most three times with a one-second pause, because Finder can recreate
    `.DS_Store` mid-delete. Each retry re-deletes only what the walk already
@@ -920,22 +981,27 @@ bounded:
    captured one. After the third failure the intent stays pending, the
    quarantine leaf is kept, and the command exits `3`. It does not widen what it
    deletes.
-6. The marker is unlinked last, through the same capture and verify as every
-   other entry. Only after that may the quarantine leaf be removed, and it is
-   **captured and verified again first**: the visible `.barge-prune-<intent-id>`
-   name is exclusively renamed to a `.barge-del-*` private name, the captured
-   object's device and inode are checked against the intent's, and only that
-   captured object is removed. A swap at the area level therefore puts its own
-   object back and stops the deletion instead of being removed by name. Then the
-   `removed` phase is recorded, and the `deleted` phase settles the intent.
+6. The unit's marker, when it records one, is unlinked last, through the same
+   capture and verify as every other entry; a unit that records no marker records
+   no marker step and goes from its contents to its leaf. Only after that may the
+   captured leaf be removed, and it is **captured and verified again first**: the
+   visible `.barge-prune-<intent-id>` name is exclusively renamed to a
+   `.barge-del-*` private name, the captured object's kind, device and inode are
+   checked against the intent's, and only that captured object is removed - a
+   directory after its contents, a file by its own unlink. A swap in the unit's
+   parent therefore puts its own object back and stops the deletion instead of
+   being removed by name. Then the `removed` phase is recorded, and the `deleted`
+   phase settles the intent.
 7. On replay, a pending intent is resolved only from its recorded identity, and
    replay's windows are conservative. It first restores every recorded mode, then:
-   - it resumes the deletion only when the quarantine leaf is still at its visible
-     `.barge-prune-<intent-id>` name with the intent's device and inode and the
-     marker digest matches its record, and the phase is `renamed`;
+   - it resumes the deletion only when the captured leaf is still at its visible
+     `.barge-prune-<intent-id>` name with the intent's kind, device and inode and,
+     when the unit records one, the marker digest matches its record, and the phase
+     is `renamed`;
    - at `marker_last` it resumes the leaf's own capture and removal only when the
-     leaf is at that visible name and the marker is positively **absent**, which is
-     the state that phase records; the leaf is then captured, verified and removed
+     leaf is at that visible name and the unit's marker is positively **absent**
+     (which a unit that records no marker satisfies by construction), which is the
+     state that phase records; the leaf is then captured, verified and removed
      under the capture rule, and `removed` is recorded;
    - within a resumed walk it re-verifies each **recorded, verified** capture -
      device, inode and kind, all read through the descriptor it verified - and then
@@ -1051,7 +1117,13 @@ barge#014 brief). An absent name is never proof that Barge deleted its object.
    after an ordinary entry's unlink a stop can still leave that finished capture in
    the last published snapshot, and a replay then reads it as a missing capture,
    reports it and stays pending rather than guessing. That is the conservative
-   window the phase machine closes with `removed`. Every capture whose verification
+   window the phase machine closes with `removed`. A snapshot published while a
+   replay finishes a leftover also **keeps every capture the intent already
+   records that it has not reached yet**: those objects are still under their
+   private names, and dropping their record would leave them unverifiable if the
+   replay then stopped. The chain therefore starts from the intent's recorded
+   captures, in their outermost-first order, and a capture enters or leaves it
+   only around the unlink it authorises. Every capture whose verification
    failed is durably appended to `foreign_captures` - private name, original name,
    observed device/inode/type, the identity actually found - **before** its
    put-back is attempted. A replay may **re-verify and remove a recorded, verified
@@ -1075,11 +1147,13 @@ barge#014 brief). An absent name is never proof that Barge deleted its object.
    before it even reads the marker or decides the phase - and refuses to go on when
    a recorded name no longer holds the recorded object, or is gone.
 
-Deletion never touches a foreign marker family, a marker-less directory, an
-`adopted_existing` root without an explicit plan entry, a root on another
-device, or a path outside the area. A whole-root delete of an adopted existing
-cache root deletes the consumer's data, so it is allowed only through the area's
-declared prune policy or an explicit operator command that names the root.
+Deletion never touches a unit the plan did not name with a grant that covers
+it: a foreign marker family without that family's recorded delegation, a
+marker-less unit without a recorded legacy claim, an `adopted_existing` root
+without an explicit plan entry, a unit on another device, or a path outside the
+area. A whole-unit delete of an adopted existing cache root deletes the
+consumer's data, so it is allowed only through the area's declared prune policy
+or an explicit operator command that names the unit.
 
 ## Scheduling without a daemon
 
@@ -1255,7 +1329,7 @@ No slice authorizes a native run, a host change or a data move on its own.
 | S2 | Account state directory, atomic publish, locks, bounded reads, `barge.registry/1` with read-only import of Oxide's `removable.json`/`pools.json` and `barge inspect` | S1 |
 | S3 | Path containment and the descriptor walk, area declarations (`barge.area/1`), owned roots and markers, holds, root listing, `barge area` verbs | S1, S2 |
 | S4 | Scratch allocation, conclusion, expiry sweep with plan/digest, grants (foreign-family delegations and legacy claims) with their recorded declarations, `barge scratch` verbs | S3 |
-| S5 | Custody state machine, same-uid descriptor observation, intent journal, quarantine, whole-root delete with Finder and ENOTEMPTY rules, replay and settlement | S3 |
+| S5 | Custody state machine for a deletion unit, same-uid descriptor observation, intent journal, quarantine, whole-unit delete with Finder and ENOTEMPTY rules, replay and settlement | S3 |
 | S6 | Cache kinds, the three placement forms (`setting`, `held-root`, `link`), adopt/undo with byte-level and link/root identity proofs, refusal of a non-empty real directory, in-place adoption of today's hand-made placements | S3, S5 |
 | S7 | `barge maintain` preview/real, exit codes, `describe` completion, host-job handoff contract (the plist change itself stays an operator gate) | S4, S5, S6 |
 | S8 | Consumer adoption: Oxide declares its areas and switches scratch, caches, registration, then owned-root mechanics; Effigy moves to Barge scratch. Separate briefs, Oxide's own Queue project, explicit operator gates | S1–S7, separately qualified |
@@ -1422,9 +1496,14 @@ Choices S3 made where this design left the mechanic to the slice:
   `truncated` and counts when it stops early.
 
 - **S5** is this slice: the custody state machine with `Safe` required by type,
-  the bounded same-uid descriptor observation behind `os`, the `barge.intent/1`
-  journal, the quarantine rename, whole-root deletion with the Finder and
-  `ENOTEMPTY` rules, and replay and settlement. It is a library capability only:
+  the bounded same-uid descriptor observation behind `os`, the `barge.intent/2`
+  journal, the quarantine rename, whole-unit deletion with the Finder and
+  `ENOTEMPTY` rules, and replay and settlement. Its follow-up (barge#016)
+  generalised custody and the journal from a Barge-marked root to a deletion
+  unit - a directory or a file, an optional marker of a recorded family, and the
+  grant that authorises it - so S4's sweep deletes only through this one path and
+  keeps none of its own; `barge.intent/1` stays readable and maps to a
+  Barge-marked directory unit. It is a library capability only:
   no CLI verb deletes, nothing is scheduled, no drive or real account state is
   touched by its tests, and its native proof belongs to S4. Its unit and
   counterfactual tests run on fixture directories with injected OS facts.
@@ -1600,13 +1679,31 @@ Choices S5 made where this design left the mechanic to the slice:
   when every recorded identity positively disagrees. S3 decided that case stale;
   S5 corrects it, because `Unknown` blocks deletion and a wrong stale would let a
   reused pid's hold be ignored.
-- **The intent record.** `barge.intent/1` sits at
+- **The intent record** (generalised under barge#016). `barge.intent/2` sits at
   `state/intents/<intent-id>.json`, at most 4 KiB, with exactly `schema`,
-  `intent_id`, `root_id`, `volume_uuid`, `mount_hint`, `root_dir`, `folder`,
-  `root_name`, `quarantine_name`, `device`, `inode`, `marker_digest`,
-  `plan_digest`, `phase`, `generation`, `recorded_ms`, `phase_ms`, an optional
-  `captures` list and an optional `foreign_captures` list. The phases are
-  `intent`, `renamed`, `marker_last`, `removed` and `deleted`. `captures` is the
+  `intent_id`, `volume_uuid`, `mount_hint`, `root_dir`, `folder`, a `unit`
+  object, `plan_digest`, `phase`, `generation`, `recorded_ms`, `phase_ms`, an
+  optional `captures` list and an optional `foreign_captures` list. The `unit`
+  object carries exactly the unit's `parent`, `name`, `kind` (`directory` or
+  `file`), its expected `device` and `inode`, an optional `marker` (filename,
+  family and digest), the planned private `capture_name` and the `grant`
+  (kind and reference). The capture name is the
+  `.barge-prune-<intent-id>` leaf in the unit's parent, recorded **before** the
+  capture and re-derived and checked on every read, never trusted as free text.
+  The phases are `intent`, `renamed`, `marker_last`, `removed` and `deleted`.
+  The major moved because the old field set could describe only a Barge-marked
+  directory: `barge.intent/1` stays readable, is read as its own field set and
+  maps to a directory unit directly inside its area folder, marked
+  `.barge-root.json` of the `barge` family, under the native-root grant - the
+  only shape v1 could describe - and the next publish writes v2. A reader
+  refuses an unknown major, and refuses a document whose fields do not match its
+  major (both shapes deny unknown fields), so a v1 record cannot be read as v2
+  or the reverse. The document is parsed twice - once for its major, and then
+  **from its own bytes** into that major's struct - so a repeated JSON member
+  (`schema`, `foreign_captures`, `unit`, or any nested field) is refused as
+  unknown state rather than silently resolved to its last value; a reader that
+  reused the first parse's value would let a duplicate `foreign_captures` erase
+  the recorded mismatch evidence a replay depends on. `captures` is the
   in-flight chain of recorded captures - at most twenty, one per depth level plus
   headroom, and never more than the record's 4 KiB cap allows - and
   each entry carries the private name, the original name, the device, inode and
@@ -1635,14 +1732,16 @@ Choices S5 made where this design left the mechanic to the slice:
   read back. The journal read is bounded at 4096 records; a stray name, an
   unreadable record or a truncated journal is `unknown_state`, never a skipped
   intent.
-- **Deletion order.** The intent is durable, custody is re-decided, the root is
-  renamed, `renamed` is durable, the volume and the leaf's identity are
-  re-verified, the tree is classified once without mutation, then deleted, then
-  the marker is unlinked last, `marker_last` is durable, the leaf is captured and
-  verified again under a private name and that capture is durable, the captured
-  leaf is removed, `removed` is durable, and `deleted` settles the intent. The
-  two-pass walk is what makes "an
-  unknown entry stops the delete and keeps the root" literal: nothing is
+- **Deletion order.** The intent is durable, custody is re-decided, the unit is
+  renamed inside its parent, `renamed` is durable, the volume and the leaf's
+  identity are re-verified, a directory's tree is classified once without
+  mutation, then deleted, then the unit's marker - when it records one - is
+  unlinked last, `marker_last` is durable, the leaf is captured and verified
+  again under a private name and that capture is durable, the captured leaf is
+  removed (a file by its own unlink), `removed` is durable, and `deleted` settles
+  the intent. A file unit has no contents to classify: its own verified identity
+  is the whole unit. The two-pass walk is what makes "an
+  unknown entry stops the delete and keeps the unit" literal: nothing is
   unlinked until every entry is classified, and the delete pass removes only what
   was classified plus Finder metadata that appeared again. Finder metadata is the
   two named forms *as a regular file* of this user on this device: a directory, a
@@ -1662,7 +1761,7 @@ Choices S5 made where this design left the mechanic to the slice:
   with both names reported, and the deletion stops with the intent pending.
   Directories are recursed through the descriptor of the verified inode,
   re-verified before `AT_REMOVEDIR`, and `ENOTEMPTY` stops. The guarantee is
-  stated in "Whole-root deletion, Finder metadata and quarantine".
+  stated in "Whole-unit deletion, Finder metadata and quarantine".
 - **A mismatch is never unlinked, and no replay resumes it** (corrected here under
   barge#014's exact-head reviews). The first form of the capture rule let a replay
   capture a leftover private name again and verify it against a *fresh*
