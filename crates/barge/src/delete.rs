@@ -2750,6 +2750,15 @@ fn replay_one(
         _ => None,
     };
 
+    // The leaf and marker observations above, and the mode restoration before
+    // them, can all be slow. The phase decision below is where a replay resumes a
+    // deletion, rolls an intent back or advances the journal — every durable step
+    // this replay has left — so the clock is checked again here, at that boundary:
+    // a spent window leaves the intent pending and changes nothing further.
+    if expired(bounds.deadline) {
+        return Ok(ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned()));
+    }
+
     match intent.phase {
         IntentPhase::Intent => {
             // The rename may not have happened: if the unit is still in place
@@ -4175,6 +4184,54 @@ mod tests {
             prepared.pending_intents().is_empty(),
             "the intent is settled"
         );
+    }
+
+    #[test]
+    fn a_slow_leaf_observation_never_resumes_a_renamed_intent_past_the_clock() {
+        let prepared = prepared("replay-resume-deadline");
+        let root = prepared.unit_path().clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        publish(&prepared, &[]);
+        rename_to_quarantine(&prepared);
+        publish(&prepared, &[IntentPhase::Renamed]);
+
+        // The entry and lock checks pass; the leaf observation that follows them
+        // takes the rest of the caller's clock. A replay must not resume the
+        // deletion or advance the journal after that: the leaf stays and the
+        // intent stays pending.
+        let faults = Faults::new();
+        faults.sleeping_observation_prefix(QUARANTINE_PREFIX, Duration::from_millis(2_300));
+        let facts = prepared.fixture.facts();
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let mut bounds = prepared.bounds();
+        bounds.deadline = Some(Instant::now() + Duration::from_secs(2));
+        let report = replay_with(
+            &prepared.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            bounds,
+            bounds.deadline,
+        )
+        .expect("the replay reports");
+        assert_eq!(report.resumed, 0, "{report:?}");
+        assert_eq!(report.settled, 0, "{report:?}");
+        assert_eq!(report.entries_removed, 0, "{report:?}");
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(
+            report.pending[0].reason.contains("wall clock"),
+            "{}",
+            report.pending[0].reason
+        );
+        assert!(
+            prepared.quarantine().join("payload.txt").is_file(),
+            "the resumed deletion never started"
+        );
+        let intents = prepared.pending_intents();
+        assert_eq!(intents.len(), 1, "the intent stays pending");
+        assert_eq!(intents[0].phase, IntentPhase::Renamed, "no phase advanced");
     }
 
     #[test]
