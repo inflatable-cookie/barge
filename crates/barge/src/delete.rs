@@ -1211,6 +1211,15 @@ impl<'a> WalkState<'a> {
                 if facts.kind == EntryKind::Directory {
                     let original = relative.join(&capture.original);
                     let child = self.dirs.open_child_dir(handle, &entry.name)?;
+                    // The recursion is into the recorded capture and nothing else: a
+                    // name swapped between the read and the open stops the walk.
+                    let opened = child.identity();
+                    if opened.device.get() != capture.device || opened.inode != capture.inode {
+                        return Ok(Walk::Stop(format!(
+                            "`{}` opened as device {} inode {}, not the recorded capture on device {} inode {}, so it is not classified",
+                            entry.name, opened.device, opened.inode, capture.device, capture.inode
+                        )));
+                    }
                     if let Walk::Stop(reason) = self.classify(&child, depth + 1, &original)? {
                         return Ok(Walk::Stop(reason));
                     }
@@ -1221,6 +1230,16 @@ impl<'a> WalkState<'a> {
             self.expected.insert(path.clone());
             if facts.kind == EntryKind::Directory {
                 let child = self.dirs.open_child_dir(handle, &entry.name)?;
+                // Only the directory the classification observed is walked: a name
+                // swapped between the read and the open stops the classification,
+                // so nothing unverified is ever classified or recorded as expected.
+                let opened = child.identity();
+                if opened.device != facts.device || opened.inode != facts.inode {
+                    return Ok(Walk::Stop(format!(
+                        "`{}` opened as device {} inode {}, not the observed {} / {}, so it is not classified",
+                        entry.name, opened.device, opened.inode, facts.device, facts.inode
+                    )));
+                }
                 if let Walk::Stop(reason) = self.classify(&child, depth + 1, &path)? {
                     return Ok(Walk::Stop(reason));
                 }
@@ -2210,17 +2229,17 @@ fn replay_one(
     };
     // The modes this deletion recorded come back first, before any other deletion
     // or reconciliation action - before the marker is even read - so no object is
-    // left with a changed mode while a replay decides what to do next.
+    // left with a changed mode while a replay decides what to do next. A leaf
+    // captured under its own private name is reached from the area folder, so its
+    // recorded mode is restored even when the visible quarantine name is empty.
     if intent.phase != IntentPhase::Deleted {
-        if let Some(leaf) = leaf_handle.as_ref() {
-            match restore_recorded_modes(dirs, &area_handle, leaf, intent) {
-                Ok(None) => {}
-                Ok(Some(reason)) => return Ok(ReplayOutcome::Pending(reason)),
-                Err(error) => {
-                    return Ok(ReplayOutcome::Pending(format!(
-                        "the recorded modes could not be restored: {error}"
-                    )))
-                }
+        match restore_recorded_modes(dirs, &area_handle, leaf_handle.as_ref(), intent) {
+            Ok(None) => {}
+            Ok(Some(reason)) => return Ok(ReplayOutcome::Pending(reason)),
+            Err(error) => {
+                return Ok(ReplayOutcome::Pending(format!(
+                    "the recorded modes could not be restored: {error}"
+                )))
             }
         }
     }
@@ -2412,7 +2431,7 @@ fn marker_matches(digest: &Option<MarkerBytes>, intent: &IntentRecord) -> bool {
 fn restore_recorded_modes(
     dirs: &dyn DirOps,
     area: &DirHandle,
-    leaf: &DirHandle,
+    leaf: Option<&DirHandle>,
     intent: &IntentRecord,
 ) -> Result<Option<String>> {
     let mut current: Option<DirHandle> = None;
@@ -2426,10 +2445,24 @@ fn restore_recorded_modes(
         } else {
             match &current {
                 Some(handle) => handle,
-                None => leaf,
+                None => match leaf {
+                    Some(leaf) => leaf,
+                    None => {
+                        return Ok(Some(format!(
+                            "`{}` is recorded inside the quarantine leaf, but the leaf is not at the recorded name, so nothing is restored",
+                            record.private
+                        )))
+                    }
+                },
             }
         };
         let Some(facts) = dirs.child_facts(parent, &record.private)? else {
+            if at_leaf {
+                // The quarantine leaf itself is gone. Its absence is decided by the
+                // phase, not here: the durable `removed` phase proves Barge removed
+                // it, and without that phase the replay stays unknown.
+                continue;
+            }
             // The intent records this capture and the name is gone. Nothing proves
             // Barge unlinked it - the durable `removed` phase is the only such
             // proof - so an absence is unknown and the intent stays pending.
@@ -2778,6 +2811,27 @@ mod tests {
         bounds: DeleteBounds,
     ) -> crate::error::Result<ReplayReport> {
         replay_pending(state_paths, dirs, facts, mounts, observer, bounds)
+    }
+
+    /// Record one capture on the prepared intent, after its phases are published.
+    fn publish_capture(prepared: &Prepared, record: &state::CaptureRecord) {
+        let mut locks = LockSet::new(prepared.fixture.state.clone());
+        let _volume = locks
+            .lock_volume(&prepared.fixture.uuid)
+            .expect("the volume lock");
+        let _root = locks
+            .lock_root(&prepared.observed.root_id)
+            .expect("the root lock");
+        let write = locks.begin_intent_write().expect("the intent step");
+        let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
+        let intent = intents.records.first().expect("the intent");
+        state::record_captures(
+            &write,
+            &prepared.fixture.state,
+            intent,
+            std::slice::from_ref(record),
+        )
+        .expect("the capture is recorded");
     }
 
     fn rename_to_quarantine(prepared: &Prepared) {
@@ -3717,6 +3771,83 @@ mod tests {
             "{:?}",
             replay.pending[0].reason
         );
+    }
+
+    #[test]
+    fn classification_never_recurses_into_a_swapped_directory() {
+        // The classification walks only the directory it observed: a swap between
+        // the read and the open stops it, so no unverified directory is classified
+        // or recorded as expected.
+        let prepared = prepared("classify-swapped-directory");
+        let root = prepared.observed.path.clone();
+        VolumeFixture::payload(&root, "sub/inside.txt", b"bytes");
+        let faults = Faults::new();
+        faults.swapping_dir_on_open("sub");
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert!(
+            report
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("so it is not classified"),
+            "{:?}",
+            report.reason
+        );
+        let leaf = report.quarantine.clone();
+        assert!(
+            find_entry(&leaf, "sub").is_some(),
+            "the racer's directory is kept"
+        );
+        let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
+        assert!(intents.records[0].phase.is_pending());
+        assert!(
+            intents.records[0].captures.is_empty(),
+            "nothing was captured or recorded from the swapped directory"
+        );
+    }
+
+    #[test]
+    fn replay_restores_a_captured_leaf_mode_when_the_visible_name_is_empty() {
+        // The leaf can be captured under its own private name, so the visible
+        // quarantine name is empty. Its recorded mode is still restored first,
+        // reached from the area folder.
+        let prepared = prepared("replay-captured-leaf-mode");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        publish(&prepared, &[IntentPhase::Renamed, IntentPhase::MarkerLast]);
+        rename_to_quarantine(&prepared);
+        let leaf = prepared.quarantine();
+        let private = format!("{CAPTURE_PREFIX}{}", "ad".repeat(16));
+        let captured = area.join(&private);
+        std::fs::rename(&leaf, &captured).expect("the leaf is captured under its private name");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&captured, std::fs::Permissions::from_mode(0o700))
+                .expect("the captured leaf is writable");
+        }
+        let record = state::CaptureRecord {
+            private,
+            original: prepared.pending_intents()[0].quarantine_name.clone(),
+            device: prepared.observed.device.get(),
+            inode: prepared.observed.inode,
+            kind: "directory".to_owned(),
+            verdict: state::CaptureVerdict::Observed,
+            mode: Some(0o040500),
+        };
+        publish_capture(&prepared, &record);
+        assert_eq!(mode_of(&captured), 0o700);
+
+        let replay = prepared.replay();
+        assert_eq!(
+            mode_of(&captured),
+            0o500,
+            "the captured leaf's recorded mode is restored from the area folder"
+        );
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
     }
 
     #[test]

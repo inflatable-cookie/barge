@@ -484,6 +484,9 @@ pub struct Faults {
     /// Whether the next private-name open swaps the name for a foreign directory,
     /// as another process moving the capture does between a read and its open.
     pub swap_on_capture_open: Cell<bool>,
+    /// A name whose next open happens after another process moved it away and put
+    /// its own directory there, as it does between a read and an open.
+    pub swap_on_dir_open: RefCell<Option<String>>,
     /// A device the descriptor a capture is verified through reports, so the
     /// parent binding fails and the captured facts cannot be read.
     pub parent_device_shift: Cell<Option<DeviceId>>,
@@ -716,6 +719,11 @@ impl Faults {
         self.swap_on_capture_open.set(true);
     }
 
+    /// Move `name` away and put a foreign directory there, once, at its next open.
+    pub fn swapping_dir_on_open(&self, name: &str) {
+        *self.swap_on_dir_open.borrow_mut() = Some(name.to_owned());
+    }
+
     /// Run `probe` the moment a mode is set, and keep its answer.
     pub fn probing_mode(&self, probe: ModeProbe) {
         *self.mode_probe.borrow_mut() = Some(probe);
@@ -923,6 +931,15 @@ impl DirOps for Faults {
     }
 
     fn open_child_dir(&self, parent: &DirHandle, name: &str) -> Result<DirHandle> {
+        let swap = self
+            .swap_on_dir_open
+            .borrow_mut()
+            .take_if(|held| held.as_str() == name);
+        if let Some(target) = swap {
+            let moved = format!("{target}.moved");
+            let _ = self.inner.rename_child(parent, &target, &moved);
+            let _ = self.inner.create_child_dir(parent, &target, 0o755);
+        }
         if self.swap_on_capture_open.get() && name.starts_with(crate::state::CAPTURE_PREFIX) {
             self.swap_on_capture_open.set(false);
             // Another process moved the captured object away and put its own
