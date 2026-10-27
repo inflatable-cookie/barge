@@ -1942,6 +1942,15 @@ together, on owned scratch only:
 - Explicitly not claimed: a real USB/Thunderbolt surprise removal, a real
   drive's flush cost, the internal SSD write saving, and any qualification of
   Oxide's or Effigy's adoption.
+- Pull mid-delete (Tom, 2026-10-27, decision 7e4f14c8). An ordinary detach
+  refuses (`EBUSY`) while the deleting process holds descriptors on the image.
+  The preferred proof is therefore ordinary-only: hold the CLI at a declared
+  shim pause after capture, `SIGKILL` its group, detach ordinarily, prove the
+  absent-volume refusal, then replay after re-attach. A forced detach of the
+  proof image's own positively identified whole-disk device is allowed in this
+  one case only as a fallback, if the ordinary-only proof cannot be made to
+  work. That needs its own brief amendment and fresh proofs. Every other
+  detach stays ordinary.
 
 ### HIGH premise checklist and elevation path
 
