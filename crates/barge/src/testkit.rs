@@ -458,6 +458,8 @@ pub struct Faults {
     pub occupy_link_path: RefCell<Option<(PathBuf, PathBuf)>>,
     /// A one-shot fixture seam immediately before an exclusive capture rename.
     pub capture_probe: RefCell<Option<ObserveProbe>>,
+    /// Observe publication destinations just before an exclusive rename.
+    pub publication_probe: RefCell<Option<ObserveProbe>>,
     /// Fail one readback after publishing this settings file.
     pub fail_settings_readback: RefCell<Option<String>>,
     settings_readback_armed: Cell<bool>,
@@ -1062,7 +1064,10 @@ impl DirOps for Faults {
         name: &str,
         cap: usize,
     ) -> Result<Option<Vec<u8>>> {
-        if self.settings_readback_armed.replace(false) {
+        if self.settings_readback_armed.get()
+            && self.fail_settings_readback.borrow().as_deref() == Some(name)
+        {
+            self.settings_readback_armed.set(false);
             return Err(Error::new(
                 ErrorKind::Io,
                 "injected interrupted settings readback",
@@ -1147,8 +1152,14 @@ impl DirOps for Faults {
                 probe(from);
             }
         }
+        if let Some(probe) = self.publication_probe.borrow().as_ref() {
+            probe(to);
+        }
         let outcome = self.inner.rename_child(parent, from, to)?;
         if outcome == RenameOutcome::Renamed {
+            if self.fail_settings_readback.borrow().as_deref() == Some(to) {
+                self.settings_readback_armed.set(true);
+            }
             self.maybe_occupy(parent, from, to);
             if let Some(volume) = &self.volume {
                 volume.shift_device();

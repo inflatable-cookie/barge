@@ -10,6 +10,7 @@ use super::*;
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Expected {
+    Absent,
     File { snapshot: SettingsSnapshot },
     Link { device: u64, inode: u64 },
 }
@@ -23,6 +24,7 @@ struct Effect {
     private: String,
     expected: Expected,
     captured: Option<(u64, u64, String, u32)>,
+    publication: Option<SettingsSnapshot>,
     phase: String,
     put_back: String,
 }
@@ -30,6 +32,7 @@ struct Effect {
 #[derive(Serialize)]
 struct Journal {
     schema: &'static str,
+    operation: &'static str,
     placement_id: String,
     effective_uid: u32,
     phase: String,
@@ -80,6 +83,7 @@ impl<'a> Captures<'a> {
             kind: record.kind,
             journal: Journal {
                 schema: "barge.cache-undo/1",
+                operation: "undo",
                 placement_id: record.placement_id.clone(),
                 effective_uid: uid,
                 phase: "prepared".to_owned(),
@@ -87,6 +91,35 @@ impl<'a> Captures<'a> {
             },
             parents: Vec::new(),
         }
+    }
+
+    pub(super) fn for_adopt(
+        state: &'a StatePaths,
+        dirs: &'a dyn DirOps,
+        kind: CacheKind,
+        uid: u32,
+        operation: &'static str,
+    ) -> Result<Self> {
+        let intent = read_adopt_intent(state, kind)?
+            .ok_or_else(|| unknown("capture requires a pending adoption intent"))?;
+        Ok(Self {
+            state,
+            dirs,
+            kind,
+            journal: Journal {
+                schema: "barge.cache-undo/1",
+                operation,
+                placement_id: intent.id,
+                effective_uid: uid,
+                phase: "prepared".to_owned(),
+                effects: Vec::new(),
+            },
+            parents: Vec::new(),
+        })
+    }
+
+    pub(super) fn absent_file(&mut self, path: &Path) -> Result<usize> {
+        self.add(path, Expected::Absent)
     }
 
     pub(super) fn file(&mut self, path: &Path, snapshot: SettingsSnapshot) -> Result<usize> {
@@ -135,6 +168,7 @@ impl<'a> Captures<'a> {
             ),
             expected,
             captured: None,
+            publication: None,
             phase: "planned".to_owned(),
             put_back: "not_attempted".to_owned(),
         });
@@ -156,6 +190,12 @@ impl<'a> Captures<'a> {
         if self.dirs.recheck_dir(parent)? != parent.identity() {
             return Err(unknown("undo capture parent binding changed"));
         }
+        if matches!(effect.expected, Expected::Absent) {
+            if self.dirs.child_facts(parent, &effect.original)?.is_some() {
+                return Err(unknown("entry appeared before exclusive publication"));
+            }
+            return Ok(());
+        }
         let facts = self
             .dirs
             .child_facts(parent, &effect.private)?
@@ -164,6 +204,7 @@ impl<'a> Captures<'a> {
             return Err(unknown("undo capture belongs to another account"));
         }
         match &effect.expected {
+            Expected::Absent => Err(unknown("unexpected absent capture")),
             Expected::File { snapshot } => {
                 if facts.kind != EntryKind::File {
                     return Err(unknown("undo captured a non-file"));
@@ -205,6 +246,10 @@ impl<'a> Captures<'a> {
 
     fn capture_all_impl(&mut self) -> Result<()> {
         for index in 0..self.parents.len() {
+            if matches!(self.journal.effects[index].expected, Expected::Absent) {
+                self.verify(index)?;
+                continue;
+            }
             let mut renamed = false;
             for _ in 0..8 {
                 let effect = &self.journal.effects[index];
@@ -267,7 +312,9 @@ impl<'a> Captures<'a> {
 
     fn put_back_all(&mut self) -> Result<()> {
         for index in (0..self.parents.len()).rev() {
-            if self.journal.effects[index].phase == "planned" {
+            if self.journal.effects[index].phase == "planned"
+                || matches!(self.journal.effects[index].expected, Expected::Absent)
+            {
                 continue;
             }
             self.journal.effects[index].put_back = "pending".to_owned();
@@ -295,7 +342,12 @@ impl<'a> Captures<'a> {
 
     /// Publish restored bytes exclusively at the now-vacant original name;
     /// `publish_child_file` is used only for our recorded random staging name.
-    pub(super) fn restore_file(&mut self, index: usize, bytes: &[u8], mode: u32) -> Result<()> {
+    pub(super) fn restore_file(
+        &mut self,
+        index: usize,
+        bytes: &[u8],
+        mode: u32,
+    ) -> Result<SettingsSnapshot> {
         self.verify(index)?;
         let effect = &self.journal.effects[index];
         let stage = format!("{}.restore", effect.private);
@@ -303,6 +355,14 @@ impl<'a> Captures<'a> {
         self.save()?;
         self.dirs
             .publish_child_file(&self.parents[index], &stage, bytes, mode)?;
+        let staged_facts = self
+            .dirs
+            .child_facts(&self.parents[index], &stage)?
+            .ok_or_else(|| unknown("staged settings vanished"))?;
+        let snapshot = snapshot_of(&staged_facts, bytes)?;
+        confirm_setting_at(self.dirs, &self.parents[index], &stage, &snapshot)?;
+        self.journal.effects[index].publication = Some(snapshot.clone());
+        self.save()?;
         let effect = &self.journal.effects[index];
         match self
             .dirs
@@ -316,7 +376,8 @@ impl<'a> Captures<'a> {
             }
         }
         self.journal.effects[index].phase = "restore_published".to_owned();
-        self.save()
+        self.save()?;
+        Ok(snapshot)
     }
 
     pub(super) fn return_unchanged(&mut self, index: usize) -> Result<()> {
@@ -359,6 +420,12 @@ impl<'a> Captures<'a> {
         self.journal.phase = "complete".to_owned();
         self.save()?;
         remove_record(self.state, &self.journal.placement_id)?;
+        self.settle()
+    }
+
+    pub(super) fn settle(&mut self) -> Result<()> {
+        self.journal.phase = "complete".to_owned();
+        self.save()?;
         std::fs::remove_file(journal_path(self.state, self.kind))
             .map_err(|error| unknown(format!("cannot remove completed undo journal: {error}")))?;
         std::fs::File::open(self.state.root())

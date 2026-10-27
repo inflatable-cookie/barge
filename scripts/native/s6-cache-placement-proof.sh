@@ -109,6 +109,7 @@ if [[ -z "${OXIDE_PROOF_EVIDENCE:-}" ]]; then
   exec /usr/bin/python3 "$SUPERVISOR" \
     --limit "$LIMIT_SECONDS" \
     --scratch-budget-mib "$SCRATCH_BUDGET_MIB" \
+    --root-parent /Volumes/Builds/scratch/barge \
     -- "$SCRIPT_PATH" "$MODE" "$BARGE_BIN_INPUT"
 fi
 

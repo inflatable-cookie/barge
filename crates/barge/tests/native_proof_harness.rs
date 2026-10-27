@@ -1762,3 +1762,66 @@ fn concurrent_same_label_fixtures_get_distinct_exclusive_directories() {
         assert!(fixture.path.is_dir());
     }
 }
+
+#[test]
+fn both_native_modes_pin_barge_root_parent_instead_of_the_oxide_default() {
+    let fixture = Fixture::new("root-parent-selection");
+    let supervisor = fixture.write("supervisor.py", b"fixture, never executed", 0o644);
+    let interpreter = fixture.write(
+        "capture-arguments.py",
+        br#"#!/usr/bin/python3
+import json,sys
+args=sys.argv[1:]
+def select(tokens):
+    if '--root-parent' in tokens:
+        return tokens[tokens.index('--root-parent')+1]
+    # Qualified supervisor's selected-volume default, modelled without a sweep.
+    return '/Volumes/Builds/scratch/oxide'
+index=args.index('--root-parent')
+without=args[:index]+args[index+2:]
+print(json.dumps({'selected':select(args),'default_without_flag':select(without),'args':args}))
+"#,
+        0o755,
+    );
+    let binary = fixture.write("barge", b"not executed", 0o755);
+    let source = std::fs::read_to_string(proof_script())
+        .unwrap()
+        .replace(PINNED_SUPERVISOR_SHA256, &digest_of(&supervisor))
+        .replace(
+            "exec /usr/bin/python3",
+            &format!("exec {}", interpreter.display()),
+        );
+    let instrumented = fixture.write("outer.sh", source.as_bytes(), 0o644);
+    let manifest =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../effigy.toml"))
+            .unwrap();
+    for mode in ["diagnostic", "counted"] {
+        assert!(manifest.contains(&format!(
+            "scripts/native/s6-cache-placement-proof.sh {mode}"
+        )));
+        let output = Command::new("/bin/bash")
+            .arg(&instrumented)
+            .arg(mode)
+            .arg(&binary)
+            .env("BARGE_S6_SUPERVISOR", &supervisor)
+            .env("HOME", &fixture.path)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env_remove("OXIDE_PROOF_EVIDENCE")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(document["selected"], "/Volumes/Builds/scratch/barge");
+        assert_eq!(
+            document["default_without_flag"],
+            "/Volumes/Builds/scratch/oxide"
+        );
+        let args = document["args"].as_array().unwrap();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--limit" && pair[1] == "300"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--scratch-budget-mib" && pair[1] == "512"));
+    }
+}

@@ -778,6 +778,17 @@ adopted markers, following the [capture rule](#capture-verify-unlink). A bounded
 parent identity, original and private random names, expected file snapshot or
 link identity, captured facts and phase before an unlink. Settings and their
 held-root marker are both captured and verified before either is removed.
+Settings adoption and failed-adoption rollback use this same capture journal
+with an explicit operation field. Existing settings are captured and verified
+against the pre-adopt snapshot before new bytes are published exclusively; an
+absent settings path and the backup path also use exclusive publication. The
+private staged file's identity is recorded before publication and copied into
+the adoption intent before the capture journal is settled. Recovery requires
+that recorded after-identity, rather than accepting newly observed matching
+bytes. Rollback captures and verifies its recorded setting/link/marker effects
+before any restoration or unlink; a raced replacement preserves pending
+intent/capture evidence and is never overwritten or deleted.
+
 Restored settings are staged under the recorded private name plus `.restore`
 and published exclusively at the original name; a concurrent replacement is
 never overwritten. An unchanged setting is put back without rewriting it.

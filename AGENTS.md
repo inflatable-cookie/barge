@@ -41,7 +41,10 @@ lists the commands. Each covers what it names:
   and then verified against that identity; nothing is written. Evidence, not a
   test.
 - `effigy docs:check` — the Northstar link and retired-concept checks plus
-  `git diff --check HEAD`. Check its exit code.
+  `git diff --check HEAD`. Check its exit code. The check wrapper resolves the
+  installed Northstar skill from the effective account (or repository override)
+  and passes its explicit path, so a private fixture `HOME` does not hide it;
+  missing or ambiguous skill installations still refuse.
 
 RustQuality strict is active for the Rust source, manifests, tests and their
 documentation: `docs/knowledge/contracts/language-quality-activation.json` opts

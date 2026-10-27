@@ -851,6 +851,8 @@ struct AdoptIntent {
     original: PathBuf,
     before: OriginalState,
     expected_setting: Option<String>,
+    #[serde(default)]
+    setting_after: Option<SettingsSnapshot>,
     target: Option<PathBuf>,
     marker_before: Option<SettingsSnapshot>,
     marker_plan: Option<MarkerPlan>,
@@ -1079,7 +1081,8 @@ fn pending_record(dirs: &dyn DirOps, intent: &AdoptIntent) -> Result<PlacementRe
     } else if let Some(key) = intent.kind.setting_key() {
         let (facts, bytes) = read_settings(dirs, &intent.original)?
             .ok_or_else(|| unknown("pending setting is absent"))?;
-        if intent.expected_setting.as_deref() != Some(hex_encode(&bytes).as_str()) {
+        let expected = intent.setting_after.as_ref().ok_or_else(|| unknown("pending setting has no observed publication identity; preserve intent for inspection"))?;
+        if snapshot_of(&facts, &bytes)? != *expected {
             return Err(unknown(
                 "pending setting diverged; recovery changes nothing",
             ));
@@ -1228,6 +1231,7 @@ pub fn adopt(
         original,
         before,
         expected_setting,
+        setting_after: None,
         target,
         marker_before,
         marker_plan: None,
@@ -1252,7 +1256,13 @@ pub fn adopt(
                                 publication: None,
                                 held_root: held.clone(),
                             };
-                            let _ = rollback_marker(dirs, &pending.volume, &form, uid);
+                            let _ = rollback_publication(
+                                state,
+                                dirs,
+                                pending.kind,
+                                uid,
+                                &PlacementForm::HeldRoot(form),
+                            );
                         }
                     }
                 }
@@ -1568,29 +1578,50 @@ fn adopt_setting(
     };
     let file_parent = parent_of(original)?;
     let file_name = file_name_of(original)?;
-    let (parent, _) = open_parent(dirs, original)?;
     let before = match &found {
         Some((facts, bytes)) => Some(snapshot_of(facts, bytes)?),
         None => None,
     };
     let backup_name = format!(".{file_name}{SETTING_BACKUP_SUFFIX}");
     let backup_path = found.as_ref().map(|_| file_parent.join(&backup_name));
-    if changed {
-        if let Some((facts, bytes)) = &found {
-            // The backup is written first, so a failed edit leaves the original
-            // readable beside it.
-            dirs.publish_child_file(&parent, &backup_name, bytes, facts.mode & 0o777)?;
+    let published = if changed {
+        let mut captured = undo_capture::Captures::for_adopt(
+            state,
+            dirs,
+            request.kind,
+            effective_uid,
+            "adopt-setting",
+        )?;
+        let setting_index = match &before {
+            Some(snapshot) => captured.file(original, snapshot.clone())?,
+            None => captured.absent_file(original)?,
+        };
+        let backup_index = if backup_path.is_some() {
+            Some(captured.absent_file(&file_parent.join(&backup_name))?)
+        } else {
+            None
+        };
+        captured.capture_all()?;
+        if let (Some(index), Some((backup_facts, bytes))) = (backup_index, &found) {
+            captured.restore_file(index, bytes, backup_facts.mode & 0o777)?;
         }
         let mode = found
             .as_ref()
             .map_or(0o600, |(facts, _)| facts.mode & 0o777);
-        if let Some(before) = &before {
-            confirm_setting_at(dirs, &parent, &file_name, before)?;
-        } else if dirs.child_facts(&parent, &file_name)?.is_some() {
-            return Err(unknown("settings appeared before adopt publication"));
+        let snapshot = captured.restore_file(setting_index, &after_bytes, mode)?;
+        let mut intent = read_adopt_intent(state, request.kind)?
+            .ok_or_else(|| unknown("adopt intent missing after settings publication"))?;
+        intent.setting_after = Some(snapshot.clone());
+        intent.expected_setting = None;
+        write_adopt_intent(state, &intent)?;
+        if before.is_some() {
+            captured.remove(setting_index)?;
         }
-        dirs.publish_child_file(&parent, &file_name, &after_bytes, mode)?;
-    }
+        captured.settle()?;
+        Some(snapshot)
+    } else {
+        None
+    };
     // Read the file back: the record holds what is on disk, not what was meant
     // to be written.
     let (after_facts, after_written) = read_settings(dirs, original)?.ok_or_else(|| {
@@ -1599,15 +1630,19 @@ fn adopt_setting(
             original.display()
         ))
     })?;
-    if changed && after_written != after_bytes {
+    let after_snapshot = snapshot_of(&after_facts, &after_written)?;
+    if published
+        .as_ref()
+        .is_some_and(|expected| *expected != after_snapshot)
+        || (changed && after_written != after_bytes)
+    {
         return Err(unknown(format!(
             "{} does not hold the bytes that were just written",
             original.display()
         )));
     }
     let after = snapshot_of(&after_facts, &after_written)?;
-    let rollback = before.clone();
-    let adopted_marker = data_held_root.clone();
+
     let form = PlacementForm::Setting(Box::new(SettingForm {
         settings_path: original.to_path_buf(),
         key: key.clone(),
@@ -1627,54 +1662,12 @@ fn adopt_setting(
         record,
         &folder,
         target,
-        form,
+        form.clone(),
     );
     let record = match finished {
         Ok(record) => record,
         Err(error) => {
-            // The effect is applied but its record cannot be published, so a
-            // later undo could not prove it. Put every byte back and say what
-            // was rolled back instead of leaving a change no record authorizes.
-            let mut rolled_back = Vec::new();
-            match &rollback {
-                Some(snapshot) => match decode_hex(&snapshot.bytes) {
-                    Ok(bytes) => match dirs.publish_child_file(
-                        &parent,
-                        &file_name,
-                        &bytes,
-                        snapshot.mode,
-                    ) {
-                        Ok(()) => rolled_back.push(format!(
-                            "restored {} to its pre-adopt bytes",
-                            original.display()
-                        )),
-                        Err(write_error) => rolled_back.push(format!(
-                            "could not restore {}: {write_error}",
-                            original.display()
-                        )),
-                    },
-                    Err(_) => rolled_back.push(format!(
-                        "the recorded pre-adopt bytes of {} did not decode; it is left as adopt wrote it",
-                        original.display()
-                    )),
-                },
-                None => match dirs.remove_child(&parent, &file_name, RemoveKind::File) {
-                    Ok(_) => rolled_back
-                        .push(format!("removed {} again", original.display())),
-                    Err(remove_error) => rolled_back.push(format!(
-                        "could not remove {}: {remove_error}",
-                        original.display()
-                    )),
-                },
-            }
-            if let Some(held) = &adopted_marker {
-                let form = HeldRootForm {
-                    path: held.path.clone(),
-                    publication: None,
-                    held_root: held.clone(),
-                };
-                rolled_back.extend(rollback_marker(dirs, record, &form, effective_uid));
-            }
+            let rolled_back = rollback_publication(state, dirs, request.kind, effective_uid, &form);
             return Err(error.with_detail("rolled_back", rolled_back.into()));
         }
     };
@@ -1754,8 +1747,13 @@ fn adopt_directory(
                 .ok_or_else(|| unknown("adopt intent missing"))?;
             intent.link = Some(link_form.clone());
             write_adopt_intent(state, &intent)?;
-            publish_link(state, request.kind, dirs, original, &root.path)?;
-            link_form.published_identity = Some(entry_identity(dirs, original)?);
+            link_form.published_identity = Some(publish_link(
+                state,
+                request.kind,
+                dirs,
+                original,
+                &root.path,
+            )?);
             let form = PlacementForm::Link(link_form.clone());
             let record = match finish_record(
                 state,
@@ -1769,7 +1767,13 @@ fn adopt_directory(
             ) {
                 Ok(record) => record,
                 Err(error) => {
-                    let rolled_back = rollback_link(dirs, &link_form, 0o755);
+                    let rolled_back = rollback_publication(
+                        state,
+                        dirs,
+                        request.kind,
+                        effective_uid,
+                        &PlacementForm::Link(link_form.clone()),
+                    );
                     return Err(error.with_detail("rolled_back", rolled_back.into()));
                 }
             };
@@ -1902,7 +1906,13 @@ fn adopt_directory(
             ) {
                 Ok(record) => record,
                 Err(error) => {
-                    let rolled_back = rollback_marker(dirs, record, &held_form, effective_uid);
+                    let rolled_back = rollback_publication(
+                        state,
+                        dirs,
+                        request.kind,
+                        effective_uid,
+                        &PlacementForm::HeldRoot(held_form.clone()),
+                    );
                     return Err(error.with_detail("rolled_back", rolled_back.into()));
                 }
             };
@@ -1959,8 +1969,13 @@ fn adopt_directory(
                     ) {
                         Ok(record) => record,
                         Err(error) => {
-                            let rolled_back =
-                                rollback_marker(dirs, record, &held_form, effective_uid);
+                            let rolled_back = rollback_publication(
+                                state,
+                                dirs,
+                                request.kind,
+                                effective_uid,
+                                &PlacementForm::HeldRoot(held_form.clone()),
+                            );
                             return Err(error.with_detail("rolled_back", rolled_back.into()));
                         }
                     };
@@ -2037,7 +2052,13 @@ fn adopt_directory(
                 ) {
                     Ok(record) => record,
                     Err(error) => {
-                        let rolled_back = rollback_marker(dirs, record, &held_form, effective_uid);
+                        let rolled_back = rollback_publication(
+                            state,
+                            dirs,
+                            request.kind,
+                            effective_uid,
+                            &PlacementForm::HeldRoot(held_form.clone()),
+                        );
                         return Err(error.with_detail("rolled_back", rolled_back.into()));
                     }
                 };
@@ -2137,11 +2158,15 @@ fn adopt_directory(
                 .ok_or_else(|| unknown("adopt intent missing"))?;
             intent.link = Some(link_form.clone());
             write_adopt_intent(state, &intent)?;
-            if let Err(error) = publish_link(state, request.kind, dirs, original, &root.path) {
-                let _ = restore_empty_directory(dirs, &parent, &name, mode);
-                return Err(error);
-            }
-            link_form.published_identity = Some(entry_identity(dirs, original)?);
+            link_form.published_identity = Some(
+                match publish_link(state, request.kind, dirs, original, &root.path) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        let _ = restore_empty_directory(dirs, &parent, &name, mode);
+                        return Err(error);
+                    }
+                },
+            );
             let form = PlacementForm::Link(link_form.clone());
             let record = match finish_record(
                 state,
@@ -2155,7 +2180,13 @@ fn adopt_directory(
             ) {
                 Ok(record) => record,
                 Err(error) => {
-                    let rolled_back = rollback_link(dirs, &link_form, mode);
+                    let rolled_back = rollback_publication(
+                        state,
+                        dirs,
+                        request.kind,
+                        effective_uid,
+                        &PlacementForm::Link(link_form.clone()),
+                    );
                     return Err(error.with_detail("rolled_back", rolled_back.into()));
                 }
             };
@@ -2419,103 +2450,93 @@ fn restore_empty_directory(
     dirs.set_dir_mode(&handle, mode)
 }
 
-/// Undo the filesystem effect of a link adopt whose record could not be
-/// published, so no link is stranded without the record that proves it.
-///
-/// The owned root the link pointed at is deliberately left in place: it carries
-/// its own marker, holds no payload of its own and is the kind of empty owned
-/// root an area's prune policy may take. S6 removes nothing on the volume.
-fn rollback_link(dirs: &dyn DirOps, form: &LinkForm, restore_mode: u32) -> Vec<String> {
-    let mut notes = Vec::new();
-    let (parent, name) = match open_parent(dirs, &form.link_path) {
-        Ok(opened) => opened,
-        Err(error) => {
-            notes.push(format!(
-                "could not reopen {} to remove its link: {error}",
-                form.link_path.display()
-            ));
-            return notes;
-        }
-    };
-    match dirs.remove_child(&parent, &name, RemoveKind::File) {
-        Ok(crate::os::ChildRemoval::Removed | crate::os::ChildRemoval::Absent) => {
-            notes.push(format!("removed the link {}", form.link_path.display()))
-        }
-        Ok(crate::os::ChildRemoval::NotEmpty) => notes.push(format!(
-            "{} is not a removable link",
-            form.link_path.display()
-        )),
-        Err(error) => notes.push(format!(
-            "could not remove the link {}: {error}",
-            form.link_path.display()
-        )),
-    }
-    if form.restore == LinkRestore::EmptyDirectory {
-        match restore_empty_directory(dirs, &parent, &name, restore_mode) {
-            Ok(_) => notes.push(format!(
-                "restored the empty directory {}",
-                form.link_path.display()
-            )),
-            Err(error) => notes.push(format!(
-                "could not restore the empty directory {}: {error}",
-                form.link_path.display()
-            )),
-        }
-    }
-    notes
-}
-
-/// Remove the marker an in-place adopt just wrote when its record could not be
-/// published, so no root is marked and no placement record proves it.
-fn rollback_marker(
+/// Rollback owns no public name merely because adopt once wrote it. Capture
+/// every effect and verify it against the recorded publication before mutation.
+fn rollback_publication(
+    state: &StatePaths,
     dirs: &dyn DirOps,
-    volume: &VolumeRecord,
-    form: &HeldRootForm,
-    effective_uid: u32,
+    kind: CacheKind,
+    uid: u32,
+    form: &PlacementForm,
 ) -> Vec<String> {
-    let mut notes = Vec::new();
-    let held = &form.held_root;
-    let handle = match dirs.open_path(&held.path) {
-        Ok(handle) => handle,
-        Err(error) => {
-            notes.push(format!(
-                "could not reopen {} to remove its marker: {error}",
-                held.path.display()
-            ));
-            return notes;
-        }
-    };
-    let expectation = MarkerExpectation {
-        volume_uuid: &volume.volume_uuid,
-        resolved_path: &held.path,
-        effective_uid,
-        now_ms: state::now_ms(),
-    };
-    match area::read_marker_with_digest(dirs, &handle, &expectation) {
-        (MarkerState::Owned(marker), Some(digest))
-            if marker.root_id == held.root_id && digest == held.marker_digest =>
-        {
-            match dirs.remove_child(&handle, area::ROOT_MARKER_FILE, RemoveKind::File) {
-                Ok(_) => notes.push(format!(
-                    "removed the marker {} from {}",
-                    area::ROOT_MARKER_FILE,
-                    held.path.display()
-                )),
-                Err(error) => notes.push(format!(
-                    "could not remove the marker in {}: {error}",
-                    held.path.display()
-                )),
-            }
-        }
-        _ => notes.push(format!(
-            "the marker just written in {} could not be proved; it is left for a human",
-            held.path.display()
-        )),
+    match rollback_captured(state, dirs, kind, uid, form) {
+        Ok(()) => vec!["rolled back only verified captured adoption effects".to_owned()],
+        Err(error) => vec![format!(
+            "rollback refused; preserve publication, adoption intent and capture journal: {error}"
+        )],
     }
-    notes
 }
 
-/// Build and publish one placement record under a fresh id.
+fn rollback_captured(
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    kind: CacheKind,
+    uid: u32,
+    form: &PlacementForm,
+) -> Result<()> {
+    let mut captured = undo_capture::Captures::for_adopt(state, dirs, kind, uid, "adopt-rollback")?;
+    let held = match form {
+        PlacementForm::Setting(setting) => setting.held_root.as_ref(),
+        PlacementForm::HeldRoot(held) => Some(&held.held_root),
+        PlacementForm::Link(_) => None,
+    };
+    let publication = match form {
+        PlacementForm::Setting(setting) => {
+            Some(captured.file(&setting.settings_path, setting.after.clone())?)
+        }
+        PlacementForm::Link(link) => Some(
+            captured.link(
+                &link.link_path,
+                link.published_identity
+                    .ok_or_else(|| unknown("rollback has no published link identity"))?,
+            )?,
+        ),
+        PlacementForm::HeldRoot(_) => None,
+    };
+    let marker = held
+        .map(|held| {
+            let snapshot = marker_snapshot(dirs, Some(&held.path))?
+                .ok_or_else(|| unknown("rollback marker is absent"))?;
+            if snapshot.digest != held.marker_digest {
+                return Err(unknown("rollback marker diverged"));
+            }
+            captured.marker(held, snapshot)
+        })
+        .transpose()?;
+    captured.capture_all()?;
+    if let Some(index) = publication {
+        match form {
+            PlacementForm::Setting(setting) if !setting.changed => {
+                captured.return_unchanged(index)?
+            }
+            PlacementForm::Setting(setting) => {
+                if let Some(before) = &setting.before {
+                    captured.restore_file(index, &decode_hex(&before.bytes)?, before.mode)?;
+                }
+                captured.remove(index)?;
+            }
+            PlacementForm::Link(link) => {
+                if link.restore == LinkRestore::EmptyDirectory {
+                    let (parent, name) = open_parent(dirs, &link.link_path)?;
+                    restore_empty_directory(
+                        dirs,
+                        &parent,
+                        &name,
+                        link.original_mode
+                            .ok_or_else(|| unknown("rollback lacks original mode"))?,
+                    )?;
+                }
+                captured.remove(index)?;
+            }
+            PlacementForm::HeldRoot(_) => return Err(unknown("unexpected held-root publication")),
+        }
+    }
+    if let Some(index) = marker {
+        captured.remove(index)?;
+    }
+    captured.settle()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finish_record(
     state: &StatePaths,
@@ -2545,6 +2566,7 @@ fn finish_record(
         read_adopt_intent(state, kind)?.ok_or_else(|| unknown("adopt intent is missing"))?;
     intent.candidate = Some(record.clone());
     intent.expected_setting = None; // candidate carries the exact after bytes; keep the journal bounded.
+    intent.setting_after = None;
     write_adopt_intent(state, &intent)?;
     publish_record(state, &record)?;
     let path = placement_path(state, &record.placement_id)?;
@@ -2574,7 +2596,7 @@ fn publish_link(
     dirs: &dyn DirOps,
     original: &Path,
     target: &Path,
-) -> Result<()> {
+) -> Result<(u64, u64)> {
     let (parent, name) = open_parent(dirs, original)?;
     let facts = dirs.path_facts(original)?;
     if let Some(facts) = facts {
@@ -2590,6 +2612,19 @@ fn publish_link(
     }
     let temporary = format!(".{name}.barge-link-{}", hex_encode(&dirs.random_bytes(8)?));
     dirs.create_child_symlink(&parent, &temporary, target)?;
+    let identity = dirs
+        .child_facts(&parent, &temporary)?
+        .ok_or_else(|| unknown("temporary link vanished"))?;
+    if identity.kind != EntryKind::Symlink {
+        return Err(unknown("temporary link was replaced"));
+    }
+    let identity = (identity.device.get(), identity.inode);
+    let mut intent =
+        read_adopt_intent(state, kind)?.ok_or_else(|| unknown("publication intent missing"))?;
+    if let Some(link) = &mut intent.link {
+        link.published_identity = Some(identity);
+    }
+    write_adopt_intent(state, &intent)?;
     let publication = match dirs.rename_child(&parent, &temporary, &name) {
         Ok(RenameOutcome::Renamed) => Ok(()),
         Ok(RenameOutcome::TargetExists) => Err(Error::new(
@@ -2606,14 +2641,11 @@ fn publish_link(
         let _ = dirs.remove_child(&parent, &temporary, RemoveKind::File);
         return Err(error);
     }
-    let mut intent =
-        read_adopt_intent(state, kind)?.ok_or_else(|| unknown("publication intent missing"))?;
-    if let Some(link) = &mut intent.link {
-        link.published_identity = Some(entry_identity(dirs, original)?);
+    if entry_identity(dirs, original)? != identity {
+        return Err(unknown("published link was concurrently replaced"));
     }
-    write_adopt_intent(state, &intent)?;
     match dirs.read_link(original)? {
-        Some(text) if text == target => Ok(()),
+        Some(text) if text == target => Ok(identity),
         Some(text) => Err(unknown(format!(
             "{} publishes {}, not the recorded {}",
             original.display(),
@@ -3252,7 +3284,13 @@ pub fn undo(
                         publication: None,
                         held_root: held.clone(),
                     };
-                    let _ = rollback_marker(dirs, &intent.volume, &form, observer.effective_uid()?);
+                    let _ = rollback_publication(
+                        state,
+                        dirs,
+                        intent.kind,
+                        observer.effective_uid()?,
+                        &PlacementForm::HeldRoot(form),
+                    );
                 }
             }
         }
@@ -4365,19 +4403,41 @@ mod tests {
 
     #[test]
     fn a_matching_link_that_races_publication_is_refused_and_kept() {
-        let fixture = TempDir::new("cache-link-publication-race");
-        let original = fixture.join("original");
-        let target = fixture.write("payload", b"cache data");
+        let fixture = Fixture::new("cache-link-publication-race");
+        let public = fixture.home.path().join("public");
+        std::fs::create_dir(&public).unwrap();
+        let original = public.join("original");
+        let target = public.join("payload");
+        std::fs::write(&target, b"cache data").unwrap();
+        let intent = super::AdoptIntent {
+            schema: "barge.cache-adopt/1".to_owned(),
+            id: "ab".repeat(16),
+            kind: CacheKind::CargoRegistry,
+            volume: fixture.volume.record.clone(),
+            original: original.clone(),
+            before: super::OriginalState::Absent,
+            expected_setting: None,
+            setting_after: None,
+            target: Some(target.clone()),
+            marker_before: None,
+            marker_plan: None,
+            held: None,
+            candidate: None,
+            link: Some(LinkForm {
+                link_path: original.clone(),
+                target: target.clone(),
+                restore: LinkRestore::Absent,
+                original_mode: None,
+                published_identity: None,
+                root_id: "cd".repeat(16),
+                marker_digest: "ef".repeat(32),
+            }),
+        };
+        super::begin_adopt_intent(&fixture.state, &intent).unwrap();
         let dirs = crate::testkit::Faults::new();
         *dirs.occupy_link_path.borrow_mut() = Some((original.clone(), target.clone()));
         let error = super::publish_link(
-            &StatePaths::resolve(
-                &FakeAccount {
-                    home: fixture.path().to_path_buf(),
-                },
-                Some(&fixture.join("state")),
-            )
-            .unwrap(),
+            &fixture.state,
             CacheKind::CargoRegistry,
             &dirs,
             &original,
@@ -4390,7 +4450,7 @@ mod tests {
         assert_eq!(std::fs::read_link(&original).unwrap(), target);
         assert_eq!(std::fs::read(&target).unwrap(), b"cache data");
         assert_eq!(
-            std::fs::read_dir(fixture.path()).unwrap().count(),
+            std::fs::read_dir(&public).unwrap().count(),
             2,
             "only the racer link and payload remain"
         );
@@ -5248,6 +5308,219 @@ mod tests {
         }
     }
     #[test]
+    fn adoption_capture_keeps_a_concurrent_settings_edit_and_pending_evidence() {
+        let fixture = Fixture::new("cache-adopt-setting-capture-edit");
+        let settings = fixture.write(".npmrc", "cache=/old\n");
+        let raced = settings.clone();
+        let dirs = crate::testkit::Faults::new();
+        *dirs.capture_probe.borrow_mut() = Some(Box::new(move |name| {
+            if name == ".npmrc" {
+                std::fs::write(&raced, b"cache=/concurrent\n").unwrap();
+            }
+        }));
+        let mut request = fixture.request(CacheKind::NpmCache);
+        request.write_setting = true;
+        assert!(adopt(
+            &fixture.state,
+            &fixture.account,
+            &dirs,
+            fixture.facts.as_ref(),
+            &fixture.volume.mounts(),
+            &fixture.volume.observer(),
+            &request
+        )
+        .is_err());
+        assert_eq!(read(&settings), b"cache=/concurrent\n");
+        assert!(
+            super::read_adopt_intent(&fixture.state, CacheKind::NpmCache)
+                .unwrap()
+                .is_some()
+        );
+        assert!(super::undo_capture::journal_path(&fixture.state, CacheKind::NpmCache).is_file());
+    }
+
+    #[test]
+    fn adoption_exclusive_publication_never_overwrites_a_taken_settings_name() {
+        for existing in [false, true] {
+            let fixture = Fixture::new("cache-adopt-setting-publication-race");
+            let settings = fixture.home.path().join(".npmrc");
+            if existing {
+                std::fs::write(&settings, b"cache=/old\n").unwrap();
+            }
+            let raced = settings.clone();
+            let dirs = crate::testkit::Faults::new();
+            *dirs.publication_probe.borrow_mut() = Some(Box::new(move |name| {
+                if name == ".npmrc" {
+                    std::fs::write(&raced, b"cache=/concurrent\n").unwrap();
+                }
+            }));
+            let mut request = fixture.request(CacheKind::NpmCache);
+            request.write_setting = true;
+            assert!(adopt(
+                &fixture.state,
+                &fixture.account,
+                &dirs,
+                fixture.facts.as_ref(),
+                &fixture.volume.mounts(),
+                &fixture.volume.observer(),
+                &request
+            )
+            .is_err());
+            assert_eq!(read(&settings), b"cache=/concurrent\n");
+            let journal = std::fs::read(super::undo_capture::journal_path(
+                &fixture.state,
+                CacheKind::NpmCache,
+            ))
+            .unwrap();
+            let journal: serde_json::Value = serde_json::from_slice(&journal).unwrap();
+            if existing {
+                let private = journal["effects"][0]["private"].as_str().unwrap();
+                assert_eq!(read(&fixture.home.path().join(private)), b"cache=/old\n");
+            }
+            assert!(
+                super::read_adopt_intent(&fixture.state, CacheKind::NpmCache)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn failed_adoption_settings_rollback_keeps_replacement_and_marker() {
+        let fixture = Fixture::new("cache-setting-rollback-replacement");
+        let settings = fixture.write(".npmrc", "cache=/old\n");
+        let raced = settings.clone();
+        let calls = std::cell::Cell::new(0usize);
+        let dirs = crate::testkit::Faults::new();
+        *dirs.capture_probe.borrow_mut() = Some(Box::new(move |name| {
+            if name == ".npmrc" {
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    std::fs::write(&raced, b"cache=/concurrent\n").unwrap();
+                }
+            }
+        }));
+        let mut request = fixture.request(CacheKind::NpmCache);
+        request.write_setting = true;
+        request.adopt_existing_root = true;
+        fixture.deny_record_writes();
+        assert!(adopt(
+            &fixture.state,
+            &fixture.account,
+            &dirs,
+            fixture.facts.as_ref(),
+            &fixture.volume.mounts(),
+            &fixture.volume.observer(),
+            &request
+        )
+        .is_err());
+        fixture.allow_record_writes();
+        assert_eq!(read(&settings), b"cache=/concurrent\n");
+        assert!(fixture
+            .caches()
+            .join("npm")
+            .join(area::ROOT_MARKER_FILE)
+            .is_file());
+        assert!(
+            super::read_adopt_intent(&fixture.state, CacheKind::NpmCache)
+                .unwrap()
+                .is_some()
+        );
+        assert!(super::undo_capture::journal_path(&fixture.state, CacheKind::NpmCache).is_file());
+    }
+
+    #[test]
+    fn failed_adoption_link_rollback_keeps_a_replaced_public_link() {
+        for empty in [false, true] {
+            let fixture = Fixture::new("cache-link-rollback-replacement");
+            let original = fixture.home.path().join(".cargo/registry");
+            std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+            if empty {
+                std::fs::create_dir(&original).unwrap();
+            }
+            let raced = original.clone();
+            let held = fixture.home.path().join("moved-owned-link");
+            let dirs = crate::testkit::Faults::new();
+            *dirs.capture_probe.borrow_mut() = Some(Box::new(move |name| {
+                if name == "registry" {
+                    std::fs::rename(&raced, &held).unwrap();
+                    std::fs::write(&raced, b"foreign file").unwrap();
+                }
+            }));
+            fixture.deny_record_writes();
+            assert!(adopt(
+                &fixture.state,
+                &fixture.account,
+                &dirs,
+                fixture.facts.as_ref(),
+                &fixture.volume.mounts(),
+                &fixture.volume.observer(),
+                &fixture.request(CacheKind::CargoRegistry)
+            )
+            .is_err());
+            fixture.allow_record_writes();
+            assert_eq!(read(&original), b"foreign file");
+            assert!(
+                super::read_adopt_intent(&fixture.state, CacheKind::CargoRegistry)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                super::undo_capture::journal_path(&fixture.state, CacheKind::CargoRegistry)
+                    .is_file()
+            );
+        }
+    }
+
+    #[test]
+    fn failed_adoption_marker_rollback_preserves_a_concurrent_marker_replacement() {
+        let fixture = Fixture::new("cache-marker-rollback-replacement");
+        let target = fixture.caches().join("cargo/registry");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("payload"), b"data").unwrap();
+        let original = fixture.home.path().join(".cargo/registry");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &original).unwrap();
+        let raced = target.join(area::ROOT_MARKER_FILE);
+        let old = target.join("moved-owned-marker");
+        let dirs = crate::testkit::Faults::new();
+        *dirs.capture_probe.borrow_mut() = Some(Box::new(move |name| {
+            if name == area::ROOT_MARKER_FILE {
+                std::fs::rename(&raced, &old).unwrap();
+                std::fs::write(&raced, b"foreign marker").unwrap();
+            }
+        }));
+        let mut request = fixture.request(CacheKind::CargoRegistry);
+        request.adopt_existing_root = true;
+        fixture.deny_record_writes();
+        assert!(adopt(
+            &fixture.state,
+            &fixture.account,
+            &dirs,
+            fixture.facts.as_ref(),
+            &fixture.volume.mounts(),
+            &fixture.volume.observer(),
+            &request
+        )
+        .is_err());
+        fixture.allow_record_writes();
+        assert_eq!(
+            read(&target.join(area::ROOT_MARKER_FILE)),
+            b"foreign marker"
+        );
+        assert_eq!(read(&target.join("payload")), b"data");
+        assert!(original.is_symlink());
+        assert!(
+            super::read_adopt_intent(&fixture.state, CacheKind::CargoRegistry)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            super::undo_capture::journal_path(&fixture.state, CacheKind::CargoRegistry).is_file()
+        );
+    }
+
+    #[test]
     fn setting_readback_failure_keeps_durable_recovery_before_bytes() {
         let fixture = Fixture::new("cache-adopt-intent-readback");
         let original = fixture.home.path().join(".npmrc");
@@ -5315,6 +5588,7 @@ mod tests {
             original: original.clone(),
             before,
             expected_setting: None,
+            setting_after: None,
             target: None,
             marker_before: None,
             marker_plan: None,

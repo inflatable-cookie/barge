@@ -3,8 +3,8 @@ alias = "barge"
 
 [tasks]
 "docs:check" = [
-  "effigy skill run northstar/check-links",
-  "effigy skill run northstar/retired-concepts",
+  "python3 scripts/check-docs.py check-links",
+  "python3 scripts/check-docs.py retired-concepts",
   "git diff --check HEAD",
 ]
 # Ordinary Rust selectors run through the installed `oxide`, never raw `cargo`

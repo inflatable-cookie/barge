@@ -42,7 +42,7 @@ script verifies and then executes Oxide's qualified shared supervisor:
 | Path | `~/Dev/projects/oxide/scripts/bounded-test.py` |
 | SHA-256 | `bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924` |
 | Bytes checked | 3397 lines at the head this plan was written against |
-| Invocation | `/usr/bin/python3 <supervisor> --limit 300 --scratch-budget-mib 512 -- <script> <mode> <binary>` |
+| Invocation | `/usr/bin/python3 <supervisor> --limit 300 --scratch-budget-mib 512 --root-parent /Volumes/Builds/scratch/barge -- <script> <mode> <binary>` |
 | Mode | any: it is a Python file Oxide keeps mode `0644`, so a readable regular file is the gate and the digest is the identity; the execute bit is never required and its mode is never changed |
 | Refusal | an unreadable or non-regular file, different bytes, or a missing CLI → exit `125`, nothing run |
 
@@ -64,6 +64,7 @@ the digest is compared before the supervisor is executed.
 | Owned scratch | 512 MiB monitored by the supervisor |
 | Owned APFS image | one sparse image, 128 MiB, `hdiutil ... -owners on` |
 | Evidence | `$OXIDE_PROOF_EVIDENCE/s6-cache-placement-receipt.json`, never removed by cleanup |
+| Guard root parent | explicit `/Volumes/Builds/scratch/barge` in both modes; startup selection, sweep and evidence never use the Oxide default |
 | Run root | one `mktemp -d "$TMPDIR/barge-s6-run.XXXXXX"` inside the guard's owned scratch |
 | Preflight sentinel | one child per case in the guarded session, alive for at most 2 s, then terminated and reaped inside the same 2 s |
 | Detach | ordinary; a forced detach is allowed only for this image's own whole-disk device, and a failed detach keeps the backing file |
@@ -555,3 +556,14 @@ The native selectors, supervisor pin, bounds, nine-case trace and host scope
 are unchanged. This source correction activates no native sequence; new exact-
 head diagnostic, author and independent reviewer runs still require separate
 owner activations.
+
+
+The independent reviewer packet at `8bd36163fb1679524910cb92bc48f8ddc0a91c66`
+(review run `6dd96e7d-f483-48f4-8a9f-47f9fb0c012e`) recorded a guard startup
+sweep of `/Volumes/Builds/scratch/oxide`: twelve roots examined and zero removed.
+It is insufficient under S6's isolation bound. Both modes now pass the qualified
+supervisor's explicit `--root-parent /Volumes/Builds/scratch/barge`; a pure outer-
+argument fixture holds that flag and demonstrates that omitting it would select
+the modelled Oxide subtree default, without running a supervisor or sweep.
+This source change spends all old-head native packets. New source review and
+separate owner activations are required before any fresh native sequence.
