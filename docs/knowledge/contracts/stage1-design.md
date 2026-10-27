@@ -2299,6 +2299,17 @@ Choices S4 made where this design left the mechanic to the slice:
   ordinary detach mid-delete (a refusal leaves it unproved), and checks the
   quarantine leaf and its recorded device and inode *after* re-attaching, before
   the replay.
+- **The native ENOTEMPTY injection.** The fixed case compiles a proof-only
+  interposer under the supervisor's scratch and injects it into one real Barge
+  CLI invocation. Before Barge renames the exact fixture directory, the shim
+  pins its device and inode from `BARGE_PROOF_ENOTEMPTY_PATH`; it returns
+  `ENOTEMPTY` on three matching `unlinkat(AT_REMOVEDIR)` calls, logs each to
+  supervisor evidence and passes every other call through. The receipt carries
+  both source and library hashes, exact-target firings, the pending reason and
+  an observed durable `removed` phase on unshimmed replay. Missing observations
+  fail the case. A separate unshimmed unit of the same shape must delete normally.
+  The runner always supplies the designated scratch parent to the qualified
+  supervisor and does not inherit an adopted scratch root or injection hooks.
 - **What S4 does not claim.** No real-drive sweep, no reaper or LaunchAgent
   change, no Oxide or Effigy adoption, and no native receipt until the owner
   activates the runs. `scratch:expiry:native` and its `:diagnostic` twin are

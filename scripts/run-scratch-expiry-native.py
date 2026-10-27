@@ -78,8 +78,9 @@ def main(argv):
         "--limit", str(WALL_LIMIT_S),
         "--scratch-budget-mib", str(SCRATCH_MIB),
     ]
-    if os.path.isdir(DESIGNATED_SCRATCH):
-        command += ["--root-parent", DESIGNATED_SCRATCH]
+    if not os.path.isdir(DESIGNATED_SCRATCH):
+        return refuse(f"the designated scratch parent is not present: {DESIGNATED_SCRATCH}")
+    command += ["--root-parent", DESIGNATED_SCRATCH]
     command += ["--", sys.executable, case_script]
     if options.receipt:
         # An explicit receipt path is only honoured when it is inside the guard's
@@ -89,6 +90,13 @@ def main(argv):
     if options.diagnostic:
         command.append("--diagnostic")
     env = dict(os.environ)
+    # The native owns its root under the explicitly named parent, never a
+    # caller's adopted scratch root or an inherited injection environment.
+    env.pop("OXIDE_TASK_SCRATCH_ROOT", None)
+    env.pop("DYLD_INSERT_LIBRARIES", None)
+    env.pop("BARGE_PROOF_ENOTEMPTY_PATH", None)
+    env.pop("BARGE_PROOF_ENOTEMPTY_LOG", None)
+    env.pop("BARGE_PROOF_ENOTEMPTY_COUNT", None)
     env["BARGE_PROOF_BIN"] = binary
     result = subprocess.run(command, env=env)
     return result.returncode

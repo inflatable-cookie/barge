@@ -40,11 +40,13 @@ import json
 import os
 import plistlib
 import pwd
+import re
 import shutil
 import stat as stat_module
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 
@@ -93,7 +95,12 @@ ENVIRONMENT = {
     "BARGE_STATE_DIR": "the private fixture state directory this proof creates",
     "BARGE_PROOF_BIN": "the barge binary this proof exercises",
     "BARGE_PROOF_SUPERVISOR": "the optional path to the hash-pinned Oxide supervisor",
-    "OXIDE_PROOF_EVIDENCE": "the supervisor's evidence directory for the default receipt",
+    "OXIDE_PROOF_EVIDENCE": "the supervisor's evidence directory for the default receipt and injection log",
+    "OXIDE_TASK_SCRATCH_ROOT": "discarded by the runner so the qualified supervisor creates its own root",
+    "DYLD_INSERT_LIBRARIES": "the proof-only interposer, supplied only to the injected CLI case",
+    "BARGE_PROOF_ENOTEMPTY_PATH": "the exact fixture directory whose identity is pinned before deletion",
+    "BARGE_PROOF_ENOTEMPTY_LOG": "the supervisor evidence file recording each injected failure",
+    "BARGE_PROOF_ENOTEMPTY_COUNT": "the bounded number of injected failures, fixed at three",
     "HOME": "a private fixture home, so no real account state is read or written",
     "CARGO_HOME": "a private fixture Cargo home; this proof builds nothing",
 }
@@ -484,6 +491,7 @@ class Proof:
         self.resolver = None
         self.attached = False
         self.env = None
+        self.shim_evidence = None
 
     # -- fixture setup ----------------------------------------------------
 
@@ -506,6 +514,10 @@ class Proof:
         self.home = tempfile.mkdtemp(prefix="home-", dir=self.root)
         self.state = tempfile.mkdtemp(prefix="state-", dir=self.root)
         self.env = dict(os.environ)
+        self.env.pop("DYLD_INSERT_LIBRARIES", None)
+        self.env.pop("BARGE_PROOF_ENOTEMPTY_PATH", None)
+        self.env.pop("BARGE_PROOF_ENOTEMPTY_LOG", None)
+        self.env.pop("BARGE_PROOF_ENOTEMPTY_COUNT", None)
         self.env.update(
             HOME=self.home,
             CARGO_HOME=os.path.join(self.home, "cargo"),
@@ -831,70 +843,115 @@ class Proof:
             raise Fault("case", "the clean root is still there")
         return f"deleted whole: {deleted[0]['entries_removed']} entries, marker last"
 
+    def replay_observing_removed(self, intent_id, digest):
+        """Run unshimmed replay and observe the durable removed phase, never infer it."""
+        journal = os.path.join(self.state, "intents", intent_id + ".json")
+        observed = []
+        done = threading.Event()
+
+        def watch():
+            while not done.is_set():
+                try:
+                    with open(journal, encoding="utf-8") as handle:
+                        record = json.load(handle)
+                    if record.get("intent_id") == intent_id and record.get("phase") == "removed":
+                        observed.append({"phase": "removed", "generation": record.get("generation")})
+                        return
+                except (OSError, ValueError):
+                    pass
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        try:
+            document = self.expire(digest, expect=0)
+        finally:
+            done.set()
+            watcher.join(timeout=5)
+        if watcher.is_alive() or not observed:
+            raise Fault("case", "the durable removed phase was not observed; settlement alone is not its receipt")
+        return document, observed[0]
+
     def case_an_injected_enotempty_leaves_a_pending_intent(self):
+        # The control has the same nested-directory shape, without the shim.
+        control = self.alloc("enotempty-control", "owner")
+        os.mkdir(os.path.join(control["path"], "target"))
+        self.conclude(control["root_id"], "owner")
+        self.release(control["root_id"], "owner")
+        self.age_conclusion(control["path"], NATIVE_AGE_DAYS + 1)
+        normal = self.expire(self.plan()["data"]["plan_digest"], expect=0)
+        if normal["data"]["deleted"]["count"] != 1 or os.path.exists(control["path"]):
+            raise Fault("case", "the unshimmed control did not delete the same unit shape")
+
         root = self.alloc("enotempty", "owner")
+        target = os.path.join(root["path"], "target")
+        os.mkdir(target)
         self.conclude(root["root_id"], "owner")
         self.release(root["root_id"], "owner")
-        for index in range(200):
-            with open(os.path.join(root["path"], f"file-{index}.txt"), "w", encoding="utf-8") as handle:
-                handle.write("payload")
         self.age_conclusion(root["path"], NATIVE_AGE_DAYS + 1)
-        document = self.plan()
-        digest = document["data"]["plan_digest"]
-        folder = self.project("enotempty")
-        command = [
-            self.binary, "scratch", "expire", "--volume", self.uuid,
-            "--plan-sha256", digest, "--json",
-        ]
-        process = subprocess.Popen(
-            command, env=self.env, cwd=self.root,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        # A writer keeps recreating an entry inside the quarantined leaf while the
-        # deletion runs, so the delete meets an entry it did not classify (or a
-        # leaf that is not empty when it is removed). Both are the conservative
-        # stop the design names: the intent stays pending and the leaf is kept.
-        # The marker-last `ENOTEMPTY` retry itself is proved by the counted unit
-        # counterfactual (`delete::tests::enotempty_three_times_...`); a native
-        # cannot inject a platform fault at an exact step.
-        planted_rounds = 0
+        digest = self.plan()["data"]["plan_digest"]
+        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scratch-enotempty-shim.c")
+        library = os.path.join(self.root, "enotempty-shim.dylib")
+        run(["clang", "-dynamiclib", "-Wall", "-Wextra", "-Werror", source, "-o", library], self.env, cwd=self.root)
+        self.shim_evidence = {"source_sha256": sha256_file(source),
+                              "dylib_sha256": sha256_file(library)}
+        evidence = os.environ.get("OXIDE_PROOF_EVIDENCE")
+        guard_root = os.path.dirname(os.path.realpath(os.environ.get("TMPDIR", "")))
+        designated_parent = os.path.realpath("/Volumes/Builds/scratch/barge")
+        if (os.path.dirname(guard_root) != designated_parent or not evidence
+                or not os.path.isdir(evidence)
+                or os.path.commonpath([guard_root, os.path.realpath(evidence)]) != guard_root):
+            raise Fault("premise", "the supervisor scratch or evidence is outside the designated owned root")
+        log = os.path.join(evidence, "scratch-enotempty-firings.log")
+        if os.path.lexists(log):
+            raise Fault("premise", "the injection evidence log already exists")
+        sentinel = os.path.join(self.root, "outside-image-sentinel")
+        with open(sentinel, "wb") as handle:
+            handle.write(b"outside image remains unchanged")
+        sentinel_digest = sha256_file(sentinel)
+        target_device, target_inode = self.identity(target)
+        env = dict(self.env)
+        env.update(DYLD_INSERT_LIBRARIES=library, BARGE_PROOF_ENOTEMPTY_PATH=target,
+                   BARGE_PROOF_ENOTEMPTY_LOG=log, BARGE_PROOF_ENOTEMPTY_COUNT="3")
+        command = [self.binary, "scratch", "expire", "--volume", self.uuid,
+                   "--plan-sha256", digest, "--json"]
+        result = run(command, env, cwd=self.root, timeout=120, check=False)
         try:
-            leaf = self.wait_for_quarantine(folder, timeout=60)
-            planted = os.path.join(leaf, ".DS_Store")
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                try:
-                    os.makedirs(planted, exist_ok=True)
-                    planted_rounds += 1
-                except OSError:
-                    pass
-                if not os.path.isdir(leaf):
-                    break
-                time.sleep(0.01)
-        finally:
-            process.wait(timeout=180)
-        document = json.loads(process.stdout.read() or "{}")
-        if process.returncode not in (0, 3):
-            raise Fault("case", f"the expiry exited {process.returncode}: {document}")
+            document = json.loads(result.stdout)
+        except ValueError as error:
+            raise Fault("case", f"the injected CLI returned no JSON: {error}") from error
+        if result.returncode != 3:
+            raise Fault("case", f"the injected expiry exited {result.returncode}, not 3: {document}")
+        if not os.path.isfile(log):
+            raise Fault("case", "the interposer did not record a firing")
+        with open(log, encoding="utf-8") as handle:
+            firings = handle.read().splitlines()
+        expected = f"{target}\t{target_device}\t{target_inode}"
+        if len(firings) != 3 or any(line != expected for line in firings):
+            raise Fault("case", f"the injection log does not prove three exact-target firings: {firings}")
         pending = self.pending_intents()
-        if len(pending) != 1:
-            raise Fault(
-                "case",
-                f"expected one pending intent after the plant, found {len(pending)} "
-                f"(exit {process.returncode}, planted {planted_rounds} times)",
-            )
-        phase = pending[0]["phase"]
-        if phase not in ("renamed", "marker_last"):
-            raise Fault("case", f"the pending intent is at `{phase}`")
-        leaf = os.path.join(folder, pending[0]["unit"]["capture_name"])
-        if not os.path.isdir(leaf):
-            raise Fault("case", "the quarantine leaf was not kept")
-        reason = document.get("data", {}).get("pending", {}).get("rows", [{}])[0].get("reason")
-        self.settle_pending()
-        return (
-            f"a mid-delete entry stopped the delete at `{phase}` ({reason}); "
-            "the leaf was kept and the replay settled it"
-        )
+        if len(pending) != 1 or document["data"]["pending"]["count"] != 1:
+            raise Fault("case", f"the injected failure did not leave one pending intent: {pending}")
+        reason = document["data"]["pending"]["rows"][0]["reason"]
+        if "not empty" not in reason:
+            raise Fault("case", f"the pending reason did not prove ENOTEMPTY: {reason}")
+        if sha256_file(sentinel) != sentinel_digest:
+            raise Fault("case", "the outside-image sentinel changed")
+        intent_id = pending[0]["intent_id"]
+        self.shim_evidence.update(target=target, device=target_device, inode=target_inode,
+                                  firing_log=log, firings=len(firings), reason=reason,
+                                  outside_image_sha256=sentinel_digest)
+        replay, removed = self.replay_observing_removed(intent_id, self.empty_plan_digest()[0])
+        self.shim_evidence["removed_observation"] = removed
+        if self.pending_intents() or not replay["data"]["replay"]["resumed"]:
+            raise Fault("case", "the unshimmed replay did not finish the pending intent")
+        intent_file = os.path.join(self.state, "intents", intent_id + ".json")
+        with open(intent_file, encoding="utf-8") as handle:
+            settled = json.load(handle)
+        if settled["phase"] != "deleted" or settled["generation"] <= removed["generation"]:
+            raise Fault("case", f"the replay did not record removal and settlement: {settled}")
+        if sha256_file(sentinel) != sentinel_digest:
+            raise Fault("case", "the outside-image sentinel changed during replay")
+        return "three exact-target ENOTEMPTY injections left a pending intent; unshimmed replay settled it"
 
     def case_a_pull_mid_delete_leaves_a_pending_intent_then_replay(self):
         root = self.alloc("pull", "owner")
@@ -1322,6 +1379,7 @@ class Proof:
             "premises": PREMISES,
             "environment": sorted(ENVIRONMENT),
             "environment_purposes": dict(ENVIRONMENT),
+            "enotempty_shim": self.shim_evidence,
             "supervisor_sha256": SUPERVISOR_SHA256,
             "bin_sha256": sha256_file(self.binary) if os.path.isfile(self.binary) else None,
             "owned_scratch": self.root,
@@ -1491,7 +1549,7 @@ def environment_hooks(source):
             add_key(node.slice)
         elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
               and environment(node.func.value)):
-            if node.func.attr == "get" and node.args:
+            if node.func.attr in ("get", "pop") and node.args:
                 add_key(node.args[0])
             elif node.func.attr == "update" and not node.args:
                 for keyword in node.keywords:
@@ -1504,13 +1562,20 @@ def environment_hooks(source):
     return hooks, problems
 
 
-def environment_inventory_problems(sources, declared):
+def environment_inventory_problems(sources, declared, native_source=""):
+
     hooks = set()
     problems = []
     for source in sources:
         found, errors = environment_hooks(source)
         hooks.update(found)
         problems.extend(errors)
+    for match in re.finditer(r"\bgetenv\s*\(([^)]*)\)", native_source):
+        argument = match.group(1).strip()
+        if re.fullmatch(r'"[A-Z][A-Z0-9_]*"', argument):
+            hooks.add(argument[1:-1])
+        else:
+            problems.append("a native environment key is not a literal")
     for name in sorted(hooks - set(declared)):
         problems.append(f"the environment record omits {name}")
     for name in sorted(set(declared) - hooks):
@@ -1617,7 +1682,9 @@ def self_check():
     for name in ("test-scratch-expiry.py", "run-scratch-expiry-native.py"):
         with open(os.path.join(script_dir, name), encoding="utf-8") as source_file:
             sources.append(source_file.read())
-    problems.extend(environment_inventory_problems(sources, ENVIRONMENT))
+    with open(os.path.join(script_dir, "scratch-enotempty-shim.c"), encoding="utf-8") as source_file:
+        native_source = source_file.read()
+    problems.extend(environment_inventory_problems(sources, ENVIRONMENT, native_source))
     # Counterfactuals: missing, extra and dynamically named hooks must all refuse.
     sample = 'os.environ.get("EXAMPLE")'
     if not environment_inventory_problems([sample], {}):
@@ -1628,6 +1695,8 @@ def self_check():
         problems.append("a dynamic environment hook is not detected")
     if not environment_inventory_problems(['os.getenv("MISSING")'], {}):
         problems.append("an omitted os.getenv hook is not detected")
+    if not environment_inventory_problems([], {}, 'getenv("MISSING")'):
+        problems.append("an omitted native environment hook is not detected")
     return problems
 
 

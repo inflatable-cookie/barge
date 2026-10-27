@@ -78,3 +78,7 @@ run = "python3 scripts/run-scratch-expiry-native.py --diagnostic"
 # No image, no scratch, no child process.
 [tasks."scratch:expiry:test"]
 run = "python3 scripts/test-scratch-expiry.py --self-check"
+
+# Proof-only interposer exercise: fresh caller scratch, no image or native proof.
+[tasks."scratch:expiry:shim:test"]
+run = "python3 scripts/test-scratch-enotempty-shim.py"

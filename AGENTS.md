@@ -48,6 +48,8 @@ lists the commands. Each covers what it names:
 - `effigy scratch:expiry:test` — the scratch native proof's own apparatus
   self-check: its case map, the hash-pinned supervisor and the premise record.
   No image, no scratch and no child process.
+- `effigy scratch:expiry:shim:test` — the proof-only interposer exercise, in
+  fresh caller scratch; no image and no native proof.
 - `effigy scratch:expiry:native` and `effigy scratch:expiry:native:diagnostic`
   — S4's one bounded native under Oxide's qualified shared supervisor. HELD for
   owner activation: the declarations activate nothing, `BARGE_PROOF_BIN` names
