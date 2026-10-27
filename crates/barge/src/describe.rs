@@ -845,6 +845,7 @@ mod tests {
                 folders: FolderOverrides::none(),
                 origin: RecordOrigin::Declared,
                 scratch_grants: ScratchGrants::none(),
+                space: None,
                 generation: 1,
                 registered_ms: 1_792_525_019_847,
             }]);
@@ -1405,6 +1406,7 @@ mod tests {
             },
             origin: RecordOrigin::ObservedOxide,
             scratch_grants: ScratchGrants::none(),
+            space: None,
             generation: 1,
             registered_ms: 0,
         };
@@ -1544,6 +1546,7 @@ mod tests {
             folders: FolderOverrides::none(),
             origin: RecordOrigin::Declared,
             scratch_grants: ScratchGrants::none(),
+            space: None,
             generation: 1,
             registered_ms: 1_792_525_019_847,
         };

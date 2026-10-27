@@ -203,6 +203,23 @@ impl ScratchGrants {
     }
 }
 
+/// A space policy explicitly declared by an operator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpacePolicy {
+    /// Free-space threshold that triggers pruning.
+    pub reserve_bytes: u64,
+    /// Free-space threshold that stops work.
+    pub floor_bytes: u64,
+    /// Person who declared the policy.
+    pub declared_by: String,
+    /// Time the policy was declared.
+    pub declared_ms: u64,
+}
+
+/// The floor written when a registration omits an explicit floor.
+pub const DEFAULT_FLOOR_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
 /// One registered volume.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -225,6 +242,9 @@ pub struct VolumeRecord {
     pub origin: RecordOrigin,
     /// The recorded scratch-deletion authority for this volume.
     pub scratch_grants: ScratchGrants,
+    /// An absent policy is undeclared, never unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<SpacePolicy>,
     /// Increases on every change, so a stale reader is detectable.
     pub generation: u64,
     /// When this record was written.
@@ -259,6 +279,15 @@ impl VolumeRecord {
         )
         .with_detail("volume_uuid", self.volume_uuid.as_str().into())
         .with_detail("durability", "undeclared".into()))
+    }
+
+    /// Return the declared policy or refuse a space-gated operation.
+    pub fn declared_space(&self) -> Result<&SpacePolicy> {
+        self.space.as_ref().ok_or_else(|| {
+            Error::new(ErrorKind::UnknownState, "volume space policy is undeclared")
+                .with_detail("volume_uuid", self.volume_uuid.as_str().into())
+                .with_detail("space_undeclared", true.into())
+        })
     }
 
     /// Whether this record and `other` describe the same volume with the same
@@ -296,6 +325,18 @@ impl VolumeRecord {
             validate_folder("folders.caches", caches, false)?;
         }
         self.scratch_grants.validate()?;
+        if let Some(space) = &self.space {
+            if space.reserve_bytes == 0
+                || space.floor_bytes == 0
+                || space.declared_by.trim().is_empty()
+            {
+                return Err(invalid(
+                    "a space policy requires positive thresholds and a declarer",
+                    "space",
+                    self.volume_uuid.as_str(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -666,7 +707,8 @@ mod tests {
     use super::{
         read, validate_component, validate_folder, Availability, ClaimScope, ClaimUnit, Durability,
         FolderOverrides, MarkerFamily, RecordOrigin, Registry, RegistryDocument, RegistryWriter,
-        ScratchClaim, ScratchDelegation, ScratchGrants, VolumeRecord, REGISTRY_SIZE_CAP_BYTES,
+        ScratchClaim, ScratchDelegation, ScratchGrants, SpacePolicy, VolumeRecord,
+        REGISTRY_SIZE_CAP_BYTES, REGISTRY_VOLUME_ROWS,
     };
     use crate::error::{ErrorKind, Result};
     use crate::os::{AccountFacts, VolumeUuid};
@@ -722,6 +764,7 @@ mod tests {
             folders: FolderOverrides::none(),
             origin: RecordOrigin::Declared,
             scratch_grants: ScratchGrants::none(),
+            space: None,
             generation: 1,
             registered_ms: 1_792_525_019_847,
         }
@@ -739,6 +782,44 @@ mod tests {
             LockSet::with_deadline(state.clone(), Deadline::after(Duration::from_secs(5)));
         let lock = locks.lock_registry()?;
         RegistryWriter::new(state).publish(&lock, next)
+    }
+
+    #[test]
+    fn space_policy_is_optional_strict_and_never_inferred() {
+        let original = record("A6AC3ED7-33EA-46B4-8082-7254CF291ED2");
+        let value = serde_json::to_value(&original).expect("record encodes");
+        assert!(value.get("space").is_none());
+        let decoded: VolumeRecord = serde_json::from_value(value).expect("old record reads");
+        assert_eq!(
+            decoded
+                .declared_space()
+                .expect_err("undeclared refuses")
+                .kind(),
+            ErrorKind::UnknownState
+        );
+        let mut declared = original;
+        declared.space = Some(SpacePolicy {
+            reserve_bytes: 20,
+            floor_bytes: 30,
+            declared_by: "operator".to_owned(),
+            declared_ms: 1,
+        });
+        document(vec![declared.clone()])
+            .validate(REGISTRY_VOLUME_ROWS)
+            .expect("floor above reserve is legal");
+        let value = serde_json::to_value(&declared).expect("record encodes");
+        assert_eq!(
+            serde_json::from_value::<VolumeRecord>(value.clone()).expect("policy reads"),
+            declared
+        );
+        let mut unknown = value;
+        unknown["space"]["unexpected"] = true.into();
+        assert!(serde_json::from_value::<VolumeRecord>(unknown).is_err());
+        let policy = declared.space.as_mut().expect("declared");
+        policy.floor_bytes = 0;
+        assert!(document(vec![declared])
+            .validate(REGISTRY_VOLUME_ROWS)
+            .is_err());
     }
 
     #[test]

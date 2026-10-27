@@ -3711,6 +3711,7 @@ mod tests {
                 folders: FolderOverrides::none(),
                 origin: RecordOrigin::Declared,
                 scratch_grants: ScratchGrants::none(),
+                space: None,
                 generation: 1,
                 registered_ms: 1_792_525_019_847,
             };
