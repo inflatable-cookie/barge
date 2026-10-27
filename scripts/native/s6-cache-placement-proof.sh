@@ -116,6 +116,7 @@ fi
 
 readonly EVIDENCE="$OXIDE_PROOF_EVIDENCE"
 readonly RECEIPT="$EVIDENCE/s6-cache-placement-receipt.json"
+readonly RECEIPT_HOME="$EVIDENCE/receipt-home"
 # Every case's full log is retained beside the receipt, so a failed case is
 # identified by its CLI error document long after the guard's scratch is gone.
 readonly CASE_LOGS="$EVIDENCE/cases"
@@ -174,6 +175,7 @@ export TMP="$TMPDIR"
 export TEMP="$TMPDIR"
 unset CARGO_TARGET_DIR || true
 mkdir -p "$HOME" "$CARGO_HOME" "$BARGE_STATE_DIR" "$RUN/backing" "$RUN/cases" "$CASE_LOGS"
+mkdir -m 700 "$RECEIPT_HOME" || refuse "cannot create the private receipt runtime home"
 
 # Premise 2: the real account state, read once before and once after, so the
 # receipt proves it was not touched. It is only ever read.
@@ -341,9 +343,19 @@ detach_image() {
 
 # ---- the receipt ------------------------------------------------------------
 
+# >>> s6-runtime-receipt
+receipt_python() (
+  # Runtime startup must not recreate the removed fixture HOME. Ignore Python
+  # startup hooks and disable bytecode; keep any OS runtime cache in evidence.
+  export HOME="$RECEIPT_HOME"
+  exec /usr/bin/python3 -I -B -S "$@"
+)
+# <<< s6-runtime-receipt
+
 write_receipt() {
   # >>> s6-receipt
   local exit_status="$1"
+  S6_RUN="$RUN" \
   S6_DETACH_TSV="$DETACH_TSV" \
   S6_CLEANUP_DISPOSITION="$CLEANUP_DISPOSITION" \
   S6_ATTACHED="$ATTACHED" \
@@ -381,8 +393,8 @@ write_receipt() {
   S6_IMAGE_MIB="$IMAGE_MIB" \
   S6_LIMIT="$LIMIT_SECONDS" \
   S6_SCRATCH_MIB="$SCRATCH_BUDGET_MIB" \
-  /usr/bin/python3 - <<'PY'
-import json, os, sys, time
+  receipt_python - <<'PY'
+import json, os, stat, sys, time
 
 mode = os.environ["S6_MODE"]
 cases = []
@@ -468,13 +480,19 @@ premises = [
         "premise": "Every flag and environment hook used is listed with its purpose; no debug-only product bypass exists.",
         "trace": ["receipt: flags_and_hooks"],
         "evidence": {
+            "receipt_runtime": {
+                "home": os.path.join(os.environ["S6_EVIDENCE"], "receipt-home"),
+                "interpreter_flags": {"-I": "ignore inherited Python paths and startup hooks",
+                                      "-B": "disable bytecode writes",
+                                      "-S": "disable site startup"},
+            },
             "hooks": [
                 {"name": "OXIDE_TASK_SCRATCH_ROOT", "purpose": "the supervisor's owned scratch; every fixture lives inside it"},
                 {"name": "TMPDIR/TMP/TEMP", "purpose": "the guard's owned scratch, inherited from the supervisor"},
                 {"name": "OXIDE_PROOF_EVIDENCE", "purpose": "where this receipt is written"},
                 {"name": "BARGE_STATE_DIR", "purpose": "the product's documented fixture-only state directory"},
                 {"name": "BARGE_ACCOUNT_HOME", "purpose": "the product's documented fixture-only account home; a normal run leaves it unset"},
-                {"name": "HOME/CARGO_HOME", "purpose": "the private fixture home and cargo home"},
+                {"name": "HOME/CARGO_HOME", "purpose": "private case home/cargo home; receipt runtime HOME is isolated in evidence"},
                 {"name": "BARGE_S6_SUPERVISOR", "purpose": "the pinned supervisor path (this script's input, not a product hook)"},
                 {"name": "BARGE_S6_BINARY", "purpose": "the CLI built from the same head (this script's input, not a product hook)"},
             ],
@@ -684,13 +702,80 @@ receipt = {
     "exit_status": int(os.environ["S6_EXIT"]),
 }
 
-with open(os.environ["S6_RECEIPT"], "w", encoding="utf-8") as handle:
-    json.dump(receipt, handle, indent=1, sort_keys=False)
-    handle.write("\n")
+def write_document():
+    with open(os.environ["S6_RECEIPT"], "w", encoding="utf-8") as handle:
+        json.dump(receipt, handle, indent=1, sort_keys=False)
+        handle.write("\n")
 
-print(json.dumps({"schema": receipt["schema"], "qualified": qualified, "mode": mode,
+
+def nofollow_absence(path):
+    # Walk from / by directory descriptors; a symlink or unreadable ancestor is
+    # uncertainty, never evidence that a dangling target is absent.
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        parts = [part for part in path.split("/") if part]
+        if not path.startswith("/") or not parts or any(p in (".", "..") for p in parts):
+            raise ValueError("expected absolute owned path")
+        for index, part in enumerate(parts):
+            try:
+                facts = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return {"path": path, "status": "absent"}
+            if index == len(parts) - 1:
+                return {"path": path, "status": "present", "mode": facts.st_mode}
+            if not stat.S_ISDIR(facts.st_mode):
+                return {"path": path, "status": "unknown", "problem": "non-directory ancestor"}
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+    except (OSError, ValueError) as error:
+        return {"path": path, "status": "unknown", "problem": str(error)}
+    finally:
+        os.close(fd)
+
+
+def verify_cleanup():
+    observations = [nofollow_absence(os.environ[key]) for key in ("S6_RUN", "S6_BACKING")]
+    absent = all(item["status"] == "absent" for item in observations)
+    checks = receipt.setdefault("cleanup_verification", [])
+    checks.append({"after_receipt_write": True, "absent": absent, "observations": observations})
+    complete = all(check["absent"] for check in checks)
+    receipt["detach_complete"] = detach_complete and complete
+    receipt["qualified"] = qualified and complete
+    if os.environ["S6_CLEANUP_DISPOSITION"] == "removed" and not complete:
+        detach["cleanup_disposition"] = "post_receipt_remainder"
+        detach["retention_required"] = True
+        receipt["exit_status"] = int(os.environ["S6_EXIT"]) or 1
+    return absent
+
+
+# Publish only an unqualified provisional receipt until writer startup and the
+# first write have finished. A clean final publication is checked again; failure
+# is latched and written without deleting/retrying any remainder.
+receipt["qualified"] = False
+receipt["detach_complete"] = False
+receipt["detach"]["cleanup_disposition"] = (
+    "pending_verification" if os.environ["S6_CLEANUP_DISPOSITION"] == "removed"
+    else os.environ["S6_CLEANUP_DISPOSITION"]
+)
+write_document()
+absent = verify_cleanup()
+if absent and os.environ["S6_CLEANUP_DISPOSITION"] == "removed":
+    detach["cleanup_disposition"] = "removed"
+write_document()
+final_absent = verify_cleanup()
+if not final_absent or not absent:
+    # Never promote a failed first observation after a later state change.
+    receipt["qualified"] = False
+    receipt["detach_complete"] = False
+    write_document()
+
+print(json.dumps({"schema": receipt["schema"], "qualified": receipt["qualified"], "mode": mode,
                   "head": receipt["head"], "summary": summary,
                   "receipt": os.environ["S6_RECEIPT"]}, separators=(",", ":")))
+if os.environ["S6_CLEANUP_DISPOSITION"] == "removed" and not (absent and final_absent):
+    raise SystemExit(1)
+
 PY
   # <<< s6-receipt
 }
@@ -713,7 +798,7 @@ cleanup() {
     status=1
     printf 's6: kept the run root %s (image %s)\n' "$RUN" "$BACKING" >&2
   fi
-  write_receipt "$status" || { printf 's6: the receipt could not be written\n' >&2; status=1; }
+  write_receipt "$status" || { printf 's6: receipt publication or cleanup verification failed\n' >&2; status=1; }
   exit "$status"
 }
 # <<< s6-cleanup

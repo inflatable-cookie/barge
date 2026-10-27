@@ -1219,10 +1219,41 @@ fn fabricated_receipt(
     std::fs::write(root.join("detach.tsv"), detach).expect("detach evidence written");
 
     let receipt_path = root.join("receipt.json");
+    if detach_mode == "root-link" {
+        std::os::unix::fs::symlink(root.join("missing"), root.join("removed-run"))
+            .expect("a dangling fixture root link");
+    }
+    if detach_mode == "backing-link" {
+        std::os::unix::fs::symlink(root.join("missing"), root.join("fixture.sparseimage"))
+            .expect("a dangling fixture backing link");
+    }
+    if detach_mode == "ancestor-link" {
+        std::os::unix::fs::symlink(root.join("missing"), root.join("ancestor"))
+            .expect("a dangling ancestor link");
+    }
+    let run_path = if detach_mode == "ancestor-link" {
+        root.join("ancestor/removed-run")
+    } else {
+        root.join("removed-run")
+    };
     let body = receipt_body();
+    let body = if detach_mode == "recreated" {
+        body.replace(
+            "        handle.write(\"\\n\")",
+            "        handle.write(\"\\n\")\n        os.makedirs(os.path.join(os.environ[\"S6_RUN\"], \"receipt-cache\"), exist_ok=True)",
+        )
+    } else if detach_mode == "late-recreated" {
+        body.replace(
+            "        handle.write(\"\\n\")",
+            "        handle.write(\"\\n\")\n        globals()[\"receipt_writes\"] = globals().get(\"receipt_writes\", 0) + 1\n        if receipt_writes == 2:\n            os.makedirs(os.path.join(os.environ[\"S6_RUN\"], \"receipt-cache\"))",
+        )
+    } else {
+        body
+    };
     let program = fixture.write("receipt.py", body.as_bytes(), 0o644);
     let output = Command::new("/usr/bin/python3")
         .arg(&program)
+        .env("S6_RUN", &run_path)
         .env("S6_DETACH_TSV", root.join("detach.tsv"))
         .env(
             "S6_CLEANUP_DISPOSITION",
@@ -1272,9 +1303,14 @@ fn fabricated_receipt(
         .env("S6_SCRATCH_MIB", "512")
         .output()
         .expect("the receipt body runs");
-    assert!(
+    let expects_remainder = matches!(
+        detach_mode,
+        "recreated" | "late-recreated" | "root-link" | "backing-link" | "ancestor-link"
+    );
+    assert_eq!(
         output.status.success(),
-        "the receipt body failed: {}",
+        !expects_remainder,
+        "{detach_mode}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let text = std::fs::read_to_string(&receipt_path).expect("the receipt is written");
@@ -1527,4 +1563,88 @@ cleanup
             assert!(attempts.contains("cleanup\tforce\t/dev/disk42\t/dev/disk42s1\tdisk42\t"));
         }
     }
+}
+
+#[test]
+fn receipt_side_recreation_and_dangling_links_cannot_report_cleanup_success() {
+    for mode in [
+        "recreated",
+        "late-recreated",
+        "root-link",
+        "backing-link",
+        "ancestor-link",
+    ] {
+        let (fixture, document) =
+            fabricated_receipt("receipt-remainder", &BTreeMap::new(), true, mode);
+        assert_eq!(document["summary"]["passed"], 9);
+        assert_eq!(document["qualified"], false, "{mode}");
+        assert_eq!(document["detach_complete"], false);
+        assert_eq!(document["exit_status"], 1);
+        assert_eq!(
+            document["detach"]["cleanup_disposition"],
+            "post_receipt_remainder"
+        );
+        let checks = document["cleanup_verification"]
+            .as_array()
+            .expect("cleanup observations");
+        assert!(checks.iter().any(|check| check["absent"] == false));
+        assert_eq!(
+            document["cleanup_verification"][0]["after_receipt_write"],
+            true
+        );
+        if mode == "recreated" || mode == "late-recreated" {
+            assert!(
+                fixture.path.join("removed-run/receipt-cache").is_dir(),
+                "the failed remainder is preserved"
+            );
+        } else {
+            let name = match mode {
+                "root-link" => "removed-run",
+                "ancestor-link" => "ancestor",
+                _ => "fixture.sparseimage",
+            };
+            assert!(std::fs::symlink_metadata(fixture.path.join(name))
+                .expect("link retained")
+                .file_type()
+                .is_symlink());
+        }
+    }
+    let (_fixture, clean) =
+        fabricated_receipt("receipt-absent", &BTreeMap::new(), true, "ordinary");
+    assert_eq!(clean["qualified"], true);
+    assert_eq!(clean["detach_complete"], true);
+    assert_eq!(clean["cleanup_verification"][0]["absent"], true);
+}
+
+#[test]
+fn the_receipt_runtime_ignores_fixture_home_and_python_startup_cache_hooks() {
+    let fixture = Fixture::new("receipt-runtime");
+    let runtime = source_between("# >>> s6-runtime-receipt", "# <<< s6-runtime-receipt");
+    let body = r#"
+RECEIPT_HOME="$PWD/runtime-home"
+mkdir "$RECEIPT_HOME"
+export HOME="$PWD/removed-run/home"
+export PYTHONPYCACHEPREFIX="$PWD/removed-run/pycache"
+export PYTHONPATH="$PWD/removed-run/modules"
+receipt_python - "$RECEIPT_HOME" <<'PY'
+import os, sys
+assert os.environ['HOME'] == sys.argv[1]
+assert sys.flags.isolated and sys.flags.no_site and sys.dont_write_bytecode
+assert os.environ['PYTHONPATH'] not in sys.path
+assert sys.pycache_prefix is None
+import json, collections
+PY
+[[ ! -e "$PWD/removed-run" && ! -L "$PWD/removed-run" ]]
+"#;
+    let script = fixture.write(
+        "runtime.sh",
+        format!("set -euo pipefail\n{runtime}\n{body}").as_bytes(),
+        0o644,
+    );
+    let output = Command::new("/bin/bash")
+        .arg(script)
+        .current_dir(&fixture.path)
+        .output()
+        .expect("isolated receipt runtime starts");
+    assert!(output.status.success(), "{}", stderr(&output));
 }

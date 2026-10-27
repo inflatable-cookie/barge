@@ -175,13 +175,30 @@ The script always writes `$OXIDE_PROOF_EVIDENCE/s6-cache-placement-receipt.json`
   invocation; an interrupted attempt has a null exit status and cannot qualify. `ordinary_case_succeeded`
   requires a successful ordinary case attempt; `force_attempted` is explicit.
   Cleanup records `cleanup_disposition` (`removed`, `kept`, `remove_failed`),
-  `attached`, `retention_required` and the observed `backing_present`. Evidence
+  `attached`, `retention_required` and the observed `backing_present`. `removed`
+  is provisional until receipt-side no-follow verification succeeds. Evidence
   tables and attempt output logs remain beside the receipt after fixture removal.
   Qualification requires ordinary success for both the case and final cleanup,
   removal of fixture scratch, and no force, failed attempt or retention latch.
   A failed ordinary attempt is never retried: only cleanup may bind the owned
   whole disk and attempt force once. A binding mismatch or detach failure keeps
   the backing; even a successful force cleanup retains it and cannot qualify.
+- `cleanup_verification` — observations after the provisional receipt write of
+  both the fixture `RUN` and backing path, walking ancestor directories by file
+  descriptors with `O_NOFOLLOW` and inspecting entries without following links.
+  Missing entries establish absence; present entries, dangling links and unreadable
+  or replaced ancestors cannot establish it. The final receipt write is checked
+  again before exit. A remainder/uncertainty latches `qualified: false`,
+  `detach_complete: false`, `post_receipt_remainder`, retention and a nonzero
+  exit. No deletion or native retry follows the check; failed observations and
+  remainder are preserved. `detach_complete` is now serialized explicitly.
+
+  The receipt interpreter uses `-I -B -S` (isolated startup, no bytecode, no site
+  hooks) and a private `HOME` at `$OXIDE_PROOF_EVIDENCE/receipt-home`, outside the
+  removed fixture. The case's original fixture `HOME` remains the recorded proof
+  fact. Runtime cache paths stay inside evidence; the writer cannot use a removed
+  case home as its runtime home. Pure fixtures test this launcher against inherited
+  Python cache/path hooks and inject receipt-side recreation after removal.
 - `preflight` — the probe names, the descriptor primitive, the guarded session,
   the sentinel's 2 s bound, how many preflights ran, the failure (or `null`),
   `status` (`passed`, or `infrastructure` on an abort), `aborted`, and one
@@ -437,6 +454,37 @@ fixtures cover ordinary success, failed ordinary detach with successful or
 failed force cleanup, rejected whole-disk binding, failed final detach and failed scratch removal;
 receipt fixtures reject passing labels without complete ordinary evidence.
 No fresh native is activated by this source correction.
+
+### Incomplete-cleanup diagnostic at 8f4cfd6
+
+Owner activation `8752e3d5-1931-4d21-ba0e-8a049b81873a` ran the diagnostic once
+at `8f4cfd653d876a389faf9586b02b21d35b021395`. The selector exited 0 with nine
+passing cases, nine passing censuses and the recorded premise fold 9/9. Both
+ordinary mount detach attempts (case and cleanup, bound device `/dev/disk13s1`)
+returned 0; no force was attempted. The receipt remained unqualified. Historical
+evidence is `/Volumes/Builds/scratch/barge/run.RzgRaK/scratch/supervisor-evidence.p8omtetq`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `s6-cache-placement-receipt.json` | `b41e84cce4c62afaa48560c6e7160c4ed55681144ee7020d18f92fc10608eba3` |
+| Guard `receipt.json` | `d0123737334ffdd451c297938e35b28a1c4220fb1af69c0af519209fed5e73cb` |
+
+Post-run no-follow inspection found the mount and backing absent, but the fixture
+root remained despite receipt `cleanup_disposition: removed`. Its private
+`ordinary-detach` home contained a `Library/Caches/com.apple.python` tree with 33
+bytecode files (414,605 bytes). Inspection recorded 53 remaining entries and
+preserved the remainder without another removal or native invocation. The writer
+started Python after removing `RUN` while `HOME` still named that fixture: the
+observed tree is consistent with receipt runtime startup, but attribution remains
+an inference. The recorded fold is not proof of complete cleanup.
+
+The guard reported closed/status 0, no fault/deadline and a certain empty census;
+its stop signal records returned `EPERM` before leader reap and settlement.
+Reserve minimum was 538,292,301,824 bytes over 85 samples; scratch peak was
+13,299,712 of 536,870,912 bytes. Real Barge state remained absent; real npm/bun
+setting digests and Cargo link identities were unchanged. This is spent evidence,
+not a clean diagnostic or authorization for counted native. This correction
+preserves that evidence and remainder and activates no native run.
 
 ## Activation order
 
