@@ -1068,6 +1068,17 @@ pub fn resolve_feature(
     })
 }
 
+/// Duplicate the verified existing feature walk without creating anything.
+pub(crate) fn open_existing_feature(
+    dirs: &dyn DirOps,
+    folder: &FeatureFolder,
+) -> Result<Option<DirHandle>> {
+    match &folder.dirs {
+        Direction::Existing { handle } => dirs.duplicate_dir(handle).map(Some),
+        Direction::Missing { .. } => Ok(None),
+    }
+}
+
 /// Open one of Barge's own feature folders, creating the folder chain when it is
 /// missing.
 ///

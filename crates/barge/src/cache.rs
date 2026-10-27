@@ -41,7 +41,7 @@
 //! explicitly: its unit and counterfactual tests run on fixture directories,
 //! fixture settings files and fixture volumes.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -322,6 +322,12 @@ pub struct LinkForm {
     pub target: PathBuf,
     /// What the original path was before the link.
     pub restore: LinkRestore,
+    /// Original empty-directory permission bits; absent on old records (undo refuses).
+    #[serde(default)]
+    pub original_mode: Option<u32>,
+    /// Device and inode of the link actually published, never inferred from text.
+    #[serde(default)]
+    pub published_identity: Option<(u64, u64)>,
     /// The owned root's id, so the target's name is never trusted alone.
     pub root_id: String,
     /// The SHA-256 of the owned root's marker bytes.
@@ -831,6 +837,442 @@ enum Inspection {
     Other(EntryFacts),
 }
 
+/// Durable, bounded recovery authority for one cache adoption. It is separate
+/// from deletion intents: replay never interprets a cache change as a delete.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdoptIntent {
+    schema: String,
+    id: String,
+    kind: CacheKind,
+    volume: VolumeRecord,
+    original: PathBuf,
+    before: OriginalState,
+    expected_setting: Option<String>,
+    target: Option<PathBuf>,
+    marker_before: Option<SettingsSnapshot>,
+    marker_plan: Option<MarkerPlan>,
+    link: Option<LinkForm>,
+    held: Option<HeldRoot>,
+    candidate: Option<PlacementRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarkerPlan {
+    path: PathBuf,
+    root_id: String,
+    observed: PreAdoption,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum OriginalState {
+    Absent,
+    File {
+        snapshot: SettingsSnapshot,
+    },
+    Directory {
+        device: u64,
+        inode: u64,
+        mode: u32,
+        entries: u64,
+    },
+    Link {
+        device: u64,
+        inode: u64,
+        target: PathBuf,
+    },
+}
+
+fn original_state(dirs: &dyn DirOps, path: &Path) -> Result<OriginalState> {
+    match inspect(dirs, path)? {
+        Inspection::Absent => Ok(OriginalState::Absent),
+        Inspection::File(_) => {
+            let (facts, bytes) =
+                read_settings(dirs, path)?.ok_or_else(|| unknown("settings vanished"))?;
+            Ok(OriginalState::File {
+                snapshot: snapshot_of(&facts, &bytes)?,
+            })
+        }
+        Inspection::Directory(facts) => Ok(OriginalState::Directory {
+            device: facts.device.get(),
+            inode: facts.inode,
+            mode: facts.permission_mode(),
+            entries: bounded_entries(dirs, path)?.0,
+        }),
+        Inspection::Symlink(target) => {
+            let (device, inode) = entry_identity(dirs, path)?;
+            Ok(OriginalState::Link {
+                device,
+                inode,
+                target,
+            })
+        }
+        Inspection::Other(_) => Err(unknown("unsupported original entry")),
+    }
+}
+
+fn adopt_intent_path(state: &StatePaths, kind: CacheKind) -> PathBuf {
+    state
+        .root()
+        .join(format!("cache-adopt-{}.json", kind.as_str()))
+}
+
+fn read_adopt_intent(state: &StatePaths, kind: CacheKind) -> Result<Option<AdoptIntent>> {
+    let path = adopt_intent_path(state, kind);
+    match state::read_bounded(
+        &path,
+        &Bounds::new(PLACEMENT_CAP_BYTES, 1, Deadline::after(READ_DEADLINE)),
+    ) {
+        ReadOutcome::Absent => Ok(None),
+        ReadOutcome::Refused(error) => Err(error),
+        ReadOutcome::Present(bytes) => {
+            let intent: AdoptIntent = serde_json::from_slice(&bytes)
+                .map_err(|e| unknown(format!("invalid cache adopt intent: {e}")))?;
+            if intent.schema != "barge.cache-adopt/1"
+                || intent.kind != kind
+                || !intent.original.is_absolute()
+            {
+                return Err(unknown("cache adopt intent identity is invalid"));
+            }
+            state::validate_identifier("intent_id", &intent.id)?;
+            if let Some(candidate) = &intent.candidate {
+                candidate.validate()?;
+            }
+            Ok(Some(intent))
+        }
+    }
+}
+
+fn write_adopt_intent(state: &StatePaths, intent: &AdoptIntent) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(intent).map_err(|e| unknown(e.to_string()))?;
+    if bytes.len() > PLACEMENT_CAP_BYTES {
+        return Err(Error::new(
+            ErrorKind::ResourceBound,
+            "cache adoption intent exceeds its cap",
+        ));
+    }
+    state::publish_atomic(&adopt_intent_path(state, intent.kind), &bytes)
+}
+
+/// Atomically claim a kind without replacing another volume's pending adopt.
+/// The private staged file is synced first; hard-link publication is exclusive.
+fn begin_adopt_intent(state: &StatePaths, intent: &AdoptIntent) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(intent).map_err(|e| unknown(e.to_string()))?;
+    if bytes.len() > PLACEMENT_CAP_BYTES {
+        return Err(Error::new(
+            ErrorKind::ResourceBound,
+            "cache adoption intent exceeds its cap",
+        ));
+    }
+    let staged = state
+        .root()
+        .join(format!(".cache-adopt-{}.pending", intent.id));
+    state::publish_atomic(&staged, &bytes)?;
+    let publication = std::fs::hard_link(&staged, adopt_intent_path(state, intent.kind));
+    let _ = std::fs::remove_file(&staged);
+    publication.map_err(|e| {
+        Error::new(
+            ErrorKind::Locked,
+            format!("cache adoption intent was already claimed or cannot be published: {e}"),
+        )
+    })?;
+    std::fs::File::open(state.root())
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| unknown(format!("cannot sync adoption claim: {e}")))
+}
+
+fn clear_adopt_intent(state: &StatePaths, kind: CacheKind) -> Result<()> {
+    let path = adopt_intent_path(state, kind);
+    std::fs::remove_file(&path)
+        .map_err(|e| unknown(format!("cannot settle cache adoption intent: {e}")))?;
+    std::fs::File::open(state.root())
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| unknown(format!("cannot sync intent settlement: {e}")))
+}
+
+fn marker_snapshot(dirs: &dyn DirOps, target: Option<&Path>) -> Result<Option<SettingsSnapshot>> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    if dirs.path_facts(target)?.is_none() {
+        return Ok(None);
+    }
+    read_settings(dirs, &target.join(area::ROOT_MARKER_FILE))?
+        .map(|(facts, bytes)| snapshot_of(&facts, &bytes))
+        .transpose()
+}
+
+fn adoption_restored(dirs: &dyn DirOps, intent: &AdoptIntent) -> Result<bool> {
+    let current = original_state(dirs, &intent.original)?;
+    let original_matches = current == intent.before
+        || matches!((&intent.before, &current), (OriginalState::File { snapshot: a }, OriginalState::File { snapshot: b }) if a.bytes == b.bytes && a.mode == b.mode)
+        || matches!((&intent.before, &current),
+        (OriginalState::Directory { mode: a, entries: 0, .. }, OriginalState::Directory { mode: b, entries: 0, .. }) if a == b);
+    Ok(
+        original_matches
+            && marker_snapshot(dirs, intent.target.as_deref())? == intent.marker_before,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_marker_observation(
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    intent: &mut AdoptIntent,
+) -> Result<()> {
+    if intent.held.is_some() {
+        return Ok(());
+    }
+    let Some(plan) = &intent.marker_plan else {
+        return Ok(());
+    };
+    let folder = re_resolve(dirs, facts, mounts, observer, &intent.volume)?;
+    let handle = prove_cache_path(dirs, &folder, &plan.path)?
+        .ok_or_else(|| unknown("pending marker directory is absent"))?;
+    if handle.identity().device.get() != plan.observed.device
+        || handle.identity().inode != plan.observed.inode
+    {
+        return Err(unknown("pending marker directory identity changed"));
+    }
+    let expectation = MarkerExpectation {
+        volume_uuid: &intent.volume.volume_uuid,
+        resolved_path: &plan.path,
+        effective_uid: observer.effective_uid()?,
+        now_ms: state::now_ms(),
+    };
+    match area::read_marker_with_digest(dirs, &handle, &expectation) {
+        (MarkerState::Absent, _) => Ok(()),
+        (MarkerState::Owned(marker), Some(digest)) if marker.root_id == plan.root_id => {
+            intent.held = Some(HeldRoot {
+                path: plan.path.clone(),
+                root_id: marker.root_id,
+                nonce: marker.nonce,
+                device: plan.observed.device,
+                inode: plan.observed.inode,
+                marker_digest: digest,
+                observed: plan.observed.clone(),
+            });
+            write_adopt_intent(state, intent)
+        }
+        _ => Err(unknown(
+            "pending marker is not the planned publication; keep it and the intent",
+        )),
+    }
+}
+
+fn pending_record(dirs: &dyn DirOps, intent: &AdoptIntent) -> Result<PlacementRecord> {
+    if let Some(candidate) = &intent.candidate {
+        return Ok(candidate.clone());
+    }
+    let (path, form) = if let Some(link) = &intent.link {
+        if link.published_identity.is_none() {
+            return Err(unknown("link publication identity was not durably observed; keep intent and publication for operator recovery"));
+        }
+        (link.target.clone(), PlacementForm::Link(link.clone()))
+    } else if let Some(key) = intent.kind.setting_key() {
+        let (facts, bytes) = read_settings(dirs, &intent.original)?
+            .ok_or_else(|| unknown("pending setting is absent"))?;
+        if intent.expected_setting.as_deref() != Some(hex_encode(&bytes).as_str()) {
+            return Err(unknown(
+                "pending setting diverged; recovery changes nothing",
+            ));
+        }
+        let before = match &intent.before {
+            OriginalState::File { snapshot } => Some(snapshot.clone()),
+            OriginalState::Absent => None,
+            _ => return Err(unknown("invalid setting intent")),
+        };
+        let path = intent
+            .target
+            .clone()
+            .ok_or_else(|| unknown("pending setting target missing"))?;
+        (
+            path.clone(),
+            PlacementForm::Setting(Box::new(SettingForm {
+                settings_path: intent.original.clone(),
+                key,
+                changed: before
+                    .as_ref()
+                    .is_none_or(|before| before.bytes != hex_encode(&bytes)),
+                before,
+                after: snapshot_of(&facts, &bytes)?,
+                backup_path: None,
+                data_path: path,
+                created_directory: false,
+                held_root: intent.held.clone(),
+            })),
+        )
+    } else if let Some(held) = &intent.held {
+        let publication = match &intent.before {
+            OriginalState::Link { target, .. } => Some(HeldRootLink {
+                link_path: intent.original.clone(),
+                target: target.clone(),
+            }),
+            _ => None,
+        };
+        (
+            held.path.clone(),
+            PlacementForm::HeldRoot(HeldRootForm {
+                path: held.path.clone(),
+                publication,
+                held_root: held.clone(),
+            }),
+        )
+    } else {
+        return Err(unknown("adopt effects lack a complete observed identity; intent and before state are retained for operator recovery"));
+    };
+    let record = PlacementRecord {
+        schema: PLACEMENT_SCHEMA.to_owned(),
+        placement_id: intent.id.clone(),
+        kind: intent.kind,
+        original_path: intent.original.clone(),
+        volume_uuid: intent.volume.volume_uuid.clone(),
+        root_dir: intent.volume.root_dir.clone(),
+        folder: intent
+            .volume
+            .folders
+            .caches
+            .clone()
+            .unwrap_or_else(|| "caches".to_owned()),
+        recorded_path: path,
+        adopted_ms: state::now_ms(),
+        generation: 1,
+        form,
+    };
+    record.validate()?;
+    Ok(record)
+}
+
+/// The readonly preview runs first. The volume lock and synced recovery intent
+/// precede every cache effect, including folder creation and marker publication.
+#[allow(clippy::too_many_arguments)]
+pub fn adopt(
+    state: &StatePaths,
+    account: &dyn AccountFacts,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    request: &AdoptRequest<'_>,
+) -> Result<AdoptReport> {
+    if read_adopt_intent(state, request.kind)?.is_some() {
+        return Err(unknown(
+            "cache adoption is pending; use cache undo --kind to recover before another adopt",
+        ));
+    }
+    let mut preview = request.clone();
+    preview.plan = true;
+    let plan = adopt_impl(state, account, dirs, facts, mounts, observer, &preview)?;
+    if request.plan {
+        return Ok(plan);
+    }
+    state.initialize()?;
+    let mut locks = LockSet::new(state.clone());
+    let _volume_lock = locks.lock_volume(request.volume_uuid)?;
+    if read_adopt_intent(state, request.kind)?.is_some() {
+        return Err(unknown("another cache adoption is pending"));
+    }
+    let volume = area::registered_volume(state, request.volume_uuid)?;
+    let folder = re_resolve(dirs, facts, mounts, observer, &volume)?;
+    let original = account
+        .account_home()?
+        .join(request.kind.original_relative_path());
+    let before = original_state(dirs, &original)?;
+    let (target, expected_setting) = if let Some(key) = request.kind.setting_key() {
+        let found = read_settings(dirs, &original)?;
+        let current = match &found {
+            Some((facts, bytes)) => setting_value(&key, bytes, facts)?,
+            None => None,
+        };
+        let target = current
+            .filter(|value| is_under(value, &folder.path))
+            .map_or_else(
+                || folder.path.join(request.kind.folder_name()),
+                PathBuf::from,
+            );
+        let bytes = write_setting_value(
+            &key,
+            found
+                .as_ref()
+                .map_or(b"".as_slice(), |(_, bytes)| bytes.as_slice()),
+            &target,
+        )?;
+        (Some(target), Some(hex_encode(&bytes)))
+    } else {
+        (
+            match &before {
+                OriginalState::Link { target, .. } => Some(target.clone()),
+                OriginalState::Directory { .. } if is_under_path(&original, &folder.path) => {
+                    Some(original.clone())
+                }
+                _ => None,
+            },
+            None,
+        )
+    };
+    let marker_before = marker_snapshot(dirs, target.as_deref())?;
+    let intent = AdoptIntent {
+        schema: "barge.cache-adopt/1".to_owned(),
+        id: hex_encode(&dirs.random_bytes(16)?),
+        kind: request.kind,
+        volume,
+        original,
+        before,
+        expected_setting,
+        target,
+        marker_before,
+        marker_plan: None,
+        link: None,
+        held: None,
+        candidate: None,
+    };
+    begin_adopt_intent(state, &intent)?;
+    let result = adopt_impl(state, account, dirs, facts, mounts, observer, request);
+    match result {
+        Ok(report) => {
+            clear_adopt_intent(state, request.kind)?;
+            Ok(report)
+        }
+        Err(error) => {
+            if let Some(pending) = read_adopt_intent(state, request.kind)? {
+                if original_state(dirs, &pending.original)? == pending.before {
+                    if let Some(held) = &pending.held {
+                        if let Ok(uid) = observer.effective_uid() {
+                            let form = HeldRootForm {
+                                path: held.path.clone(),
+                                publication: None,
+                                held_root: held.clone(),
+                            };
+                            let _ = rollback_marker(dirs, &pending.volume, &form, uid);
+                        }
+                    }
+                }
+                if adoption_restored(dirs, &pending)? && pending.candidate.is_none() {
+                    clear_adopt_intent(state, request.kind)?;
+                    return Err(error);
+                }
+            }
+            Err(error
+                .with_detail(
+                    "pending_adopt_intent",
+                    adopt_intent_path(state, request.kind)
+                        .display()
+                        .to_string()
+                        .into(),
+                )
+                .with_detail(
+                    "recovery",
+                    "cache undo --kind; divergence is kept and refused".into(),
+                ))
+        }
+    }
+}
+
 /// Adopt one cache kind onto one registered volume, mutating nothing a refusal
 /// or a preview cannot prove.
 ///
@@ -840,7 +1282,7 @@ enum Inspection {
 /// path and a link into an unregistered place are refused with a plan and
 /// nothing is renamed, linked, written or deleted.
 #[allow(clippy::too_many_arguments)]
-pub fn adopt(
+fn adopt_impl(
     state: &StatePaths,
     account: &dyn AccountFacts,
     dirs: &dyn DirOps,
@@ -1048,6 +1490,8 @@ fn adopt_setting(
         _ => intended,
     };
 
+    prove_cache_path(dirs, folder, &target)?;
+
     // A preview reports the intended effects and changes nothing.
     let mut changes = Vec::new();
     let mut notes = Vec::new();
@@ -1099,14 +1543,20 @@ fn adopt_setting(
     // Every effect from here is authorized: the state layout and the volume lock
     // are taken before anything on the volume or in the settings file is
     // touched, and the folder is re-resolved under that lock.
-    state.initialize()?;
-    let mut locks = LockSet::new(state.clone());
-    let _volume_lock = locks.lock_volume(&record.volume_uuid)?;
     let folder = re_resolve(dirs, facts, mounts, observer, record)?;
     let created_directory = create_cache_directory(dirs, observer, record, Some(&folder), &target)?;
+    let folder = re_resolve(dirs, facts, mounts, observer, record)?;
     let mut data_held_root = None;
     if request.adopt_existing_root && dirs.path_facts(&target)?.is_some() {
-        data_held_root = Some(adopt_in_place(dirs, record, &target, effective_uid)?);
+        data_held_root = Some(adopt_in_place(
+            state,
+            request.kind,
+            dirs,
+            record,
+            &folder,
+            &target,
+            effective_uid,
+        )?);
     }
     let after_bytes = match &found {
         Some((_, bytes)) => write_setting_value(key, bytes, &target)?,
@@ -1114,7 +1564,7 @@ fn adopt_setting(
     };
     let file_parent = parent_of(original)?;
     let file_name = file_name_of(original)?;
-    let parent = dirs.open_path(file_parent)?;
+    let (parent, _) = open_parent(dirs, original)?;
     let before = match &found {
         Some((facts, bytes)) => Some(snapshot_of(facts, bytes)?),
         None => None,
@@ -1130,6 +1580,11 @@ fn adopt_setting(
         let mode = found
             .as_ref()
             .map_or(0o600, |(facts, _)| facts.mode & 0o777);
+        if let Some(before) = &before {
+            confirm_setting_at(dirs, &parent, &file_name, before)?;
+        } else if dirs.child_facts(&parent, &file_name)?.is_some() {
+            return Err(unknown("settings appeared before adopt publication"));
+        }
         dirs.publish_child_file(&parent, &file_name, &after_bytes, mode)?;
     }
     // Read the file back: the record holds what is on disk, not what was meant
@@ -1274,9 +1729,6 @@ fn adopt_directory(
                     notes: Vec::new(),
                 });
             }
-            state.initialize()?;
-            let mut locks = LockSet::new(state.clone());
-            let _volume_lock = locks.lock_volume(&record.volume_uuid)?;
             let folder = re_resolve(dirs, facts, mounts, observer, record)?;
             let root = area::create_root_in_feature(
                 dirs,
@@ -1285,14 +1737,21 @@ fn adopt_directory(
                 RootKind::CacheRoot,
                 cache_area(),
             )?;
-            publish_link(dirs, original, &root.path)?;
-            let link_form = LinkForm {
+            let mut link_form = LinkForm {
                 link_path: original.to_path_buf(),
                 target: root.path.clone(),
                 restore: LinkRestore::Absent,
+                original_mode: None,
+                published_identity: None,
                 root_id: root.root_id,
                 marker_digest: root.marker_digest,
             };
+            let mut intent = read_adopt_intent(state, request.kind)?
+                .ok_or_else(|| unknown("adopt intent missing"))?;
+            intent.link = Some(link_form.clone());
+            write_adopt_intent(state, &intent)?;
+            publish_link(state, request.kind, dirs, original, &root.path)?;
+            link_form.published_identity = Some(entry_identity(dirs, original)?);
             let form = PlacementForm::Link(link_form.clone());
             let record = match finish_record(
                 state,
@@ -1349,6 +1808,7 @@ fn adopt_directory(
                 .with_detail("intended_value", folder.path.display().to_string().into())
                 .with_detail("link_path", original.display().to_string().into()));
             }
+            prove_cache_path(dirs, folder, &target)?;
             let target_facts = dirs.path_facts(&target)?;
             let Some(target_facts) = target_facts else {
                 return Err(unknown(format!(
@@ -1407,11 +1867,16 @@ fn adopt_directory(
                     notes: Vec::new(),
                 });
             }
-            state.initialize()?;
-            let mut locks = LockSet::new(state.clone());
-            let _volume_lock = locks.lock_volume(&record.volume_uuid)?;
             let folder = re_resolve(dirs, facts, mounts, observer, record)?;
-            let held = adopt_in_place(dirs, record, &target, effective_uid)?;
+            let held = adopt_in_place(
+                state,
+                request.kind,
+                dirs,
+                record,
+                &folder,
+                &target,
+                effective_uid,
+            )?;
             let held_form = HeldRootForm {
                 path: target.clone(),
                 publication: Some(HeldRootLink {
@@ -1462,11 +1927,16 @@ fn adopt_directory(
                             notes: Vec::new(),
                         });
                     }
-                    state.initialize()?;
-                    let mut locks = LockSet::new(state.clone());
-                    let _volume_lock = locks.lock_volume(&record.volume_uuid)?;
                     let folder = re_resolve(dirs, facts, mounts, observer, record)?;
-                    let held = adopt_in_place(dirs, record, original, effective_uid)?;
+                    let held = adopt_in_place(
+                        state,
+                        request.kind,
+                        dirs,
+                        record,
+                        &folder,
+                        original,
+                        effective_uid,
+                    )?;
                     let held_form = HeldRootForm {
                         path: original.to_path_buf(),
                         publication: None,
@@ -1511,6 +1981,7 @@ fn adopt_directory(
             // An empty real directory: on the volume it is adopted in place, off
             // it a link may replace it after an empty-directory proof.
             if on_volume {
+                prove_cache_path(dirs, folder, original)?;
                 if !request.adopt_existing_root {
                     return Err(plan_error(
                         format!(
@@ -1534,11 +2005,16 @@ fn adopt_directory(
                         notes: Vec::new(),
                     });
                 }
-                state.initialize()?;
-                let mut locks = LockSet::new(state.clone());
-                let _volume_lock = locks.lock_volume(&record.volume_uuid)?;
                 let folder = re_resolve(dirs, facts, mounts, observer, record)?;
-                let held = adopt_in_place(dirs, record, original, effective_uid)?;
+                let held = adopt_in_place(
+                    state,
+                    request.kind,
+                    dirs,
+                    record,
+                    &folder,
+                    original,
+                    effective_uid,
+                )?;
                 let held_form = HeldRootForm {
                     path: original.to_path_buf(),
                     publication: None,
@@ -1603,14 +2079,11 @@ fn adopt_directory(
                     notes: Vec::new(),
                 });
             }
-            state.initialize()?;
-            let mut locks = LockSet::new(state.clone());
-            let _volume_lock = locks.lock_volume(&record.volume_uuid)?;
             let folder = re_resolve(dirs, facts, mounts, observer, record)?;
             // The empty directory is proved and removed before anything is
             // created on the volume, so a refusal here changes nothing at all.
             let (parent, name) = open_parent(dirs, original)?;
-            let mode = dir_facts.mode & 0o777;
+            let mode = dir_facts.permission_mode();
             confirm_empty_directory(dirs, observer, original, &dir_facts)?;
             match dirs.remove_child(&parent, &name, RemoveKind::Directory)? {
                 crate::os::ChildRemoval::Removed => {}
@@ -1643,21 +2116,28 @@ fn adopt_directory(
             ) {
                 Ok(root) => root,
                 Err(error) => {
-                    let _ = dirs.create_child_dir(&parent, &name, mode);
+                    let _ = restore_empty_directory(dirs, &parent, &name, mode);
                     return Err(error);
                 }
             };
-            if let Err(error) = publish_link(dirs, original, &root.path) {
-                let _ = dirs.create_child_dir(&parent, &name, mode);
-                return Err(error);
-            }
-            let link_form = LinkForm {
+            let mut link_form = LinkForm {
                 link_path: original.to_path_buf(),
                 target: root.path.clone(),
                 restore: LinkRestore::EmptyDirectory,
+                original_mode: Some(mode),
+                published_identity: None,
                 root_id: root.root_id,
                 marker_digest: root.marker_digest,
             };
+            let mut intent = read_adopt_intent(state, request.kind)?
+                .ok_or_else(|| unknown("adopt intent missing"))?;
+            intent.link = Some(link_form.clone());
+            write_adopt_intent(state, &intent)?;
+            if let Err(error) = publish_link(state, request.kind, dirs, original, &root.path) {
+                let _ = restore_empty_directory(dirs, &parent, &name, mode);
+                return Err(error);
+            }
+            link_form.published_identity = Some(entry_identity(dirs, original)?);
             let form = PlacementForm::Link(link_form.clone());
             let record = match finish_record(
                 state,
@@ -1756,23 +2236,37 @@ fn create_cache_directory(
     if !is_under_path(target, &feature.path) {
         return Ok(false);
     }
-    let Some(name) = target.file_name().and_then(std::ffi::OsStr::to_str) else {
-        return Ok(false);
-    };
-    if dirs.path_facts(target)?.is_some() {
+    if prove_cache_path(dirs, feature, target)?.is_some() {
         return Ok(false);
     }
-    let (parent, _) = area::open_or_create_feature(dirs, observer, feature)?;
-    let device = volume_device(dirs, record)?;
-    area::ensure_child_directory(dirs, observer, &parent, name, device)?;
+    let (mut parent, _) = area::open_or_create_feature(dirs, observer, feature)?;
+    let device = parent.identity().device;
+    for component in target
+        .strip_prefix(&feature.path)
+        .map_err(|_| unknown("cache path escaped"))?
+        .components()
+    {
+        let Component::Normal(name) = component else {
+            return Err(unknown("invalid cache component"));
+        };
+        let name = name
+            .to_str()
+            .ok_or_else(|| unknown("non-UTF8 cache component"))?;
+        parent = area::ensure_child_directory(dirs, observer, &parent, name, device)?;
+    }
+    let _ = record;
     Ok(true)
 }
 
 /// Adopt one directory in place: observe it, then write its marker. Nothing is
 /// renamed, linked, copied or moved.
+#[allow(clippy::too_many_arguments)]
 fn adopt_in_place(
+    state: &StatePaths,
+    kind: CacheKind,
     dirs: &dyn DirOps,
     record: &VolumeRecord,
+    folder: &FeatureFolder,
     path: &Path,
     effective_uid: u32,
 ) -> Result<HeldRoot> {
@@ -1816,7 +2310,8 @@ fn adopt_in_place(
         .with_detail("path", path.display().to_string().into())
         .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
     }
-    let handle = dirs.open_path(path)?;
+    let handle =
+        prove_cache_path(dirs, folder, path)?.ok_or_else(|| unknown("cache target disappeared"))?;
     if handle.identity()
         != (crate::os::DirId {
             device: facts.device,
@@ -1870,8 +2365,17 @@ fn adopt_in_place(
         newest_modified_ms: newest,
         allocated_bytes: facts.allocated_bytes,
     };
+    let root_id = hex_encode(&dirs.random_bytes(16)?);
+    let mut intent =
+        read_adopt_intent(state, kind)?.ok_or_else(|| unknown("marker intent missing"))?;
+    intent.marker_plan = Some(MarkerPlan {
+        path: path.to_path_buf(),
+        root_id: root_id.clone(),
+        observed: observed.clone(),
+    });
+    write_adopt_intent(state, &intent)?;
     let write = MarkerWrite {
-        root_id: None,
+        root_id: Some(&root_id),
         volume_uuid: &record.volume_uuid,
         resolved_path: path,
         area: cache_area(),
@@ -1879,7 +2383,7 @@ fn adopt_in_place(
         origin: RootOrigin::AdoptedExisting,
     };
     let marker = area::write_marker(dirs, &handle, &write, effective_uid)?;
-    Ok(HeldRoot {
+    let held = HeldRoot {
         path: path.to_path_buf(),
         root_id: marker.root_id,
         nonce: marker.nonce,
@@ -1887,7 +2391,28 @@ fn adopt_in_place(
         inode: facts.inode,
         marker_digest: marker.marker_digest,
         observed,
-    })
+    };
+    let mut intent =
+        read_adopt_intent(state, kind)?.ok_or_else(|| unknown("marker intent missing"))?;
+    intent.held = Some(held.clone());
+    write_adopt_intent(state, &intent)?;
+    Ok(held)
+}
+
+fn restore_empty_directory(
+    dirs: &dyn DirOps,
+    parent: &DirHandle,
+    name: &str,
+    mode: u32,
+) -> Result<()> {
+    let identity = dirs.create_child_dir(parent, name, mode)?;
+    let handle = dirs.open_child_dir(parent, name)?;
+    if handle.identity() != identity {
+        return Err(unknown(
+            "restored directory was replaced before mode restoration",
+        ));
+    }
+    dirs.set_dir_mode(&handle, mode)
 }
 
 /// Undo the filesystem effect of a link adopt whose record could not be
@@ -1922,7 +2447,7 @@ fn rollback_link(dirs: &dyn DirOps, form: &LinkForm, restore_mode: u32) -> Vec<S
         )),
     }
     if form.restore == LinkRestore::EmptyDirectory {
-        match dirs.create_child_dir(&parent, &name, restore_mode & 0o777) {
+        match restore_empty_directory(dirs, &parent, &name, restore_mode) {
             Ok(_) => notes.push(format!(
                 "restored the empty directory {}",
                 form.link_path.display()
@@ -2012,13 +2537,40 @@ fn finish_record(
         form,
     };
     record.validate()?;
+    let mut intent =
+        read_adopt_intent(state, kind)?.ok_or_else(|| unknown("adopt intent is missing"))?;
+    intent.candidate = Some(record.clone());
+    intent.expected_setting = None; // candidate carries the exact after bytes; keep the journal bounded.
+    write_adopt_intent(state, &intent)?;
     publish_record(state, &record)?;
+    let path = placement_path(state, &record.placement_id)?;
+    match state::read_bounded(
+        &path,
+        &Bounds::new(PLACEMENT_CAP_BYTES, 1, Deadline::after(READ_DEADLINE)),
+    ) {
+        ReadOutcome::Present(bytes)
+            if serde_json::from_slice::<PlacementRecord>(&bytes)
+                .ok()
+                .as_ref()
+                == Some(&record) => {}
+        _ => {
+            return Err(unknown(
+                "placement publication readback is uncertain; keep the recovery intent",
+            ))
+        }
+    }
     Ok(record)
 }
 
 /// Publish a symbolic link at `original` through a temporary name, then prove
 /// the text that is published.
-fn publish_link(dirs: &dyn DirOps, original: &Path, target: &Path) -> Result<()> {
+fn publish_link(
+    state: &StatePaths,
+    kind: CacheKind,
+    dirs: &dyn DirOps,
+    original: &Path,
+    target: &Path,
+) -> Result<()> {
     let (parent, name) = open_parent(dirs, original)?;
     let facts = dirs.path_facts(original)?;
     if let Some(facts) = facts {
@@ -2050,6 +2602,12 @@ fn publish_link(dirs: &dyn DirOps, original: &Path, target: &Path) -> Result<()>
         let _ = dirs.remove_child(&parent, &temporary, RemoveKind::File);
         return Err(error);
     }
+    let mut intent =
+        read_adopt_intent(state, kind)?.ok_or_else(|| unknown("publication intent missing"))?;
+    if let Some(link) = &mut intent.link {
+        link.published_identity = Some(entry_identity(dirs, original)?);
+    }
+    write_adopt_intent(state, &intent)?;
     match dirs.read_link(original)? {
         Some(text) if text == target => Ok(()),
         Some(text) => Err(unknown(format!(
@@ -2185,28 +2743,39 @@ fn confirm_empty_directory(
 fn open_parent(dirs: &dyn DirOps, path: &Path) -> Result<(DirHandle, String)> {
     let parent = parent_of(path)?;
     let name = file_name_of(path)?;
-    let facts = dirs.path_facts(parent)?;
-    match facts {
-        Some(facts) if facts.kind == EntryKind::Directory => {}
-        Some(facts) => {
-            return Err(Error::new(
-                ErrorKind::RefusedBoundary,
-                format!(
-                    "{} is a {} and cannot hold a placement",
-                    parent.display(),
-                    facts.kind.as_str()
-                ),
-            )
-            .with_detail("path", parent.display().to_string().into()))
-        }
-        None => {
-            return Err(
-                unknown(format!("the directory {} does not exist", parent.display()))
-                    .with_detail("path", parent.display().to_string().into()),
-            )
+    let mut handle = dirs.open_path(Path::new("/"))?;
+    for component in parent.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .ok_or_else(|| unknown("non-UTF8 parent component"))?;
+                let entry = dirs
+                    .child_facts(&handle, part)?
+                    .ok_or_else(|| unknown("placement parent is absent"))?;
+                if entry.kind != EntryKind::Directory {
+                    return Err(Error::new(
+                        ErrorKind::RefusedContainment,
+                        "placement parent is a link or non-directory",
+                    ));
+                }
+                let child = dirs.open_child_dir(&handle, part)?;
+                if child.identity().device != entry.device || child.identity().inode != entry.inode
+                {
+                    return Err(unknown("placement parent changed during walk"));
+                }
+                handle = child;
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::RefusedContainment,
+                    "invalid parent component",
+                ))
+            }
         }
     }
-    Ok((dirs.open_path(parent)?, name))
+    Ok((handle, name))
 }
 
 fn parent_of(path: &Path) -> Result<&Path> {
@@ -2231,9 +2800,66 @@ fn file_name_of(path: &Path) -> Result<String> {
         })
 }
 
+fn entry_identity(dirs: &dyn DirOps, path: &Path) -> Result<(u64, u64)> {
+    let entry = dirs
+        .path_facts(path)?
+        .ok_or_else(|| unknown("publication disappeared"))?;
+    Ok((entry.device.get(), entry.inode))
+}
+
+/// Read-only descriptor walk from the verified feature folder. No ancestor may
+/// be a symlink, cross device, or change identity between check and open.
+fn prove_cache_path(
+    dirs: &dyn DirOps,
+    folder: &FeatureFolder,
+    path: &Path,
+) -> Result<Option<DirHandle>> {
+    if !is_under_path(path, &folder.path) {
+        return Err(Error::new(
+            ErrorKind::RefusedContainment,
+            "cache path escaped its verified folder",
+        ));
+    }
+    let Some(mut handle) = area::open_existing_feature(dirs, folder)? else {
+        return Ok(None);
+    };
+    let device = handle.identity().device;
+    for part in path
+        .strip_prefix(&folder.path)
+        .map_err(|_| unknown("cache prefix changed"))?
+        .components()
+    {
+        let Component::Normal(name) = part else {
+            return Err(unknown("invalid cache path component"));
+        };
+        let name = name
+            .to_str()
+            .ok_or_else(|| unknown("non-UTF8 cache path component"))?;
+        let Some(entry) = dirs.child_facts(&handle, name)? else {
+            return Ok(None);
+        };
+        if entry.kind != EntryKind::Directory || entry.device != device {
+            return Err(Error::new(
+                ErrorKind::RefusedContainment,
+                "cache ancestor is not a real directory on the verified device",
+            ));
+        }
+        let child = dirs.open_child_dir(&handle, name)?;
+        if child.identity().device != entry.device || child.identity().inode != entry.inode {
+            return Err(unknown("cache component changed during walk"));
+        }
+        handle = child;
+    }
+    Ok(Some(handle))
+}
+
 /// Whether `path` is at or under `root`, by whole components.
 pub fn is_under_path(path: &Path, root: &Path) -> bool {
-    path == root || path.starts_with(root)
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+        && (path == root || path.starts_with(root))
 }
 
 fn is_under(value: &str, root: &Path) -> bool {
@@ -2245,9 +2871,8 @@ fn is_under(value: &str, root: &Path) -> bool {
 
 /// Read one settings file: its facts and exact bytes, or `None` when absent.
 fn read_settings(dirs: &dyn DirOps, path: &Path) -> Result<Option<(EntryFacts, Vec<u8>)>> {
-    let parent = parent_of(path)?;
-    let name = file_name_of(path)?;
-    let Some(facts) = dirs.path_facts(path)? else {
+    let (handle, name) = open_parent(dirs, path)?;
+    let Some(facts) = dirs.child_facts(&handle, &name)? else {
         return Ok(None);
     };
     if facts.kind != EntryKind::File {
@@ -2273,11 +2898,35 @@ fn read_settings(dirs: &dyn DirOps, path: &Path) -> Result<Option<(EntryFacts, V
         .with_detail("path", path.display().to_string().into())
         .with_detail("cap", SETTING_CAP_BYTES.into()));
     }
-    let handle = dirs.open_path(parent)?;
     let bytes = dirs
         .read_child_file(&handle, &name, SETTING_CAP_BYTES)?
         .ok_or_else(|| unknown(format!("{} disappeared while it was read", path.display())))?;
+    if dirs.child_facts(&handle, &name)?.as_ref() != Some(&facts) {
+        return Err(unknown("settings identity changed during read"));
+    }
     Ok(Some((facts, bytes)))
+}
+
+fn confirm_setting_at(
+    dirs: &dyn DirOps,
+    parent: &DirHandle,
+    name: &str,
+    expected: &SettingsSnapshot,
+) -> Result<()> {
+    let facts = dirs
+        .child_facts(parent, name)?
+        .ok_or_else(|| unknown("settings vanished before mutation"))?;
+    let bytes = dirs
+        .read_child_file(parent, name, SETTING_CAP_BYTES)?
+        .ok_or_else(|| unknown("settings vanished before mutation"))?;
+    if snapshot_of(&facts, &bytes)? != *expected
+        || dirs.child_facts(parent, name)?.as_ref() != Some(&facts)
+    {
+        return Err(unknown(
+            "settings identity or bytes changed immediately before mutation",
+        ));
+    }
+    Ok(())
 }
 
 fn snapshot_of(facts: &EntryFacts, bytes: &[u8]) -> Result<SettingsSnapshot> {
@@ -2538,7 +3187,105 @@ pub fn undo(
     observer: &dyn ProcessObserver,
     request: &UndoRequest<'_>,
 ) -> Result<UndoReport> {
+    let mut pending = if let Some(kind) = request.kind {
+        read_adopt_intent(state, kind)?
+    } else {
+        let mut found = None;
+        for kind in [
+            CacheKind::NpmCache,
+            CacheKind::BunCache,
+            CacheKind::CargoRegistry,
+            CacheKind::CargoGit,
+        ] {
+            if let Some(intent) = read_adopt_intent(state, kind)? {
+                if request.placement_id == Some(intent.id.as_str())
+                    || intent.candidate.as_ref().is_some_and(|record| {
+                        request.placement_id == Some(record.placement_id.as_str())
+                    })
+                {
+                    found = Some(intent);
+                    break;
+                }
+            }
+        }
+        found
+    };
+    let mut recovery_locks = LockSet::new(state.clone());
+    let recovery_volume = pending
+        .as_ref()
+        .map(|intent| intent.volume.volume_uuid.clone());
+    let _recovery_lock = if !request.plan {
+        recovery_volume
+            .as_ref()
+            .map(|uuid| recovery_locks.lock_volume(uuid))
+            .transpose()?
+    } else {
+        None
+    };
+    if !request.plan {
+        if let Some(intent) = &pending {
+            pending = read_adopt_intent(state, intent.kind)?;
+        }
+    }
+    if let Some(intent) = &mut pending {
+        if !request.plan {
+            let _verified = re_resolve(dirs, facts, mounts, observer, &intent.volume)?;
+            recover_marker_observation(state, dirs, facts, mounts, observer, intent)?;
+            if original_state(dirs, &intent.original)? == intent.before {
+                if let Some(held) = &intent.held {
+                    let form = HeldRootForm {
+                        path: held.path.clone(),
+                        publication: None,
+                        held_root: held.clone(),
+                    };
+                    let _ = rollback_marker(dirs, &intent.volume, &form, observer.effective_uid()?);
+                }
+            }
+        }
+    }
+    if let Some(intent) = &pending {
+        if !request.plan
+            && matches!(intent.before, OriginalState::Directory { entries: 0, .. })
+            && matches!(
+                original_state(dirs, &intent.original)?,
+                OriginalState::Absent
+            )
+        {
+            let OriginalState::Directory { mode, .. } = intent.before else {
+                return Err(unknown("invalid directory intent"));
+            };
+            let (parent, name) = open_parent(dirs, &intent.original)?;
+            restore_empty_directory(dirs, &parent, &name, mode)?;
+        }
+        if adoption_restored(dirs, intent)? {
+            if !request.plan {
+                if let Some(candidate) = &intent.candidate {
+                    let existing = read_placements(state)?;
+                    if let Some(stored) = existing.find_id(&candidate.placement_id) {
+                        if stored != candidate {
+                            return Err(unknown(
+                                "pending publication differs from recovery candidate",
+                            ));
+                        }
+                        remove_record(state, &candidate.placement_id)?;
+                    }
+                }
+                clear_adopt_intent(state, intent.kind)?;
+            }
+            return Ok(UndoReport {
+                plan: request.plan,
+                placement_id: intent.id.clone(),
+                kind: intent.kind,
+                changes: vec!["settle the proved rolled-back adoption intent".to_owned()],
+                removed: !request.plan,
+            });
+        }
+    }
     let set = read_placements(state)?;
+    let recovering = pending
+        .as_ref()
+        .map(|intent| pending_record(dirs, intent))
+        .transpose()?;
     let record = match (request.placement_id, request.kind) {
         (Some(id), _) => set.find_id(id).cloned(),
         (None, Some(kind)) => set.find_kind(kind).cloned(),
@@ -2549,6 +3296,7 @@ pub fn undo(
             ))
         }
     }
+    .or(recovering)
     .ok_or_else(|| {
         unknown(match (request.placement_id, request.kind) {
             (Some(id), _) => format!("placement {id} is not stored"),
@@ -2557,7 +3305,7 @@ pub fn undo(
         })
     })?;
     let effective_uid = observer.effective_uid()?;
-    match &record.form {
+    let result = match &record.form {
         PlacementForm::Setting(form) => undo_setting(
             state,
             dirs,
@@ -2581,7 +3329,13 @@ pub fn undo(
             form,
             effective_uid,
         ),
+    };
+    if result.as_ref().is_ok_and(|report| report.removed) {
+        if let Some(intent) = pending {
+            clear_adopt_intent(state, intent.kind)?;
+        }
     }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2596,6 +3350,15 @@ fn undo_setting(
     effective_uid: u32,
 ) -> Result<UndoReport> {
     let found = read_settings(dirs, &form.settings_path)?;
+    if let Some((facts, bytes)) = &found {
+        if snapshot_of(facts, bytes)? != form.after {
+            return Err(diverged(
+                &form.settings_path,
+                &form.after.digest,
+                "file identity or bytes changed since adopt",
+            ));
+        }
+    }
     let mut changes = Vec::new();
     let restored_bytes = match &form.before {
         Some(before) => {
@@ -2672,9 +3435,8 @@ fn undo_setting(
     }
     match (&form.before, restored_bytes) {
         (Some(before), Some(restored)) => {
-            let parent = parent_of(&form.settings_path)?;
             let name = file_name_of(&form.settings_path)?;
-            let parent_handle = dirs.open_path(parent)?;
+            let (parent_handle, _) = open_parent(dirs, &form.settings_path)?;
             let (after_facts, after_bytes) =
                 read_settings(dirs, &form.settings_path)?.ok_or_else(|| {
                     unknown(format!(
@@ -2682,12 +3444,20 @@ fn undo_setting(
                         form.settings_path.display()
                     ))
                 })?;
+            if snapshot_of(&after_facts, &after_bytes)? != form.after {
+                return Err(diverged(
+                    &form.settings_path,
+                    &form.after.digest,
+                    "file identity or bytes changed before restore",
+                ));
+            }
             if after_bytes != restored {
                 let mode = if before.mode == 0 {
                     after_facts.mode & 0o777
                 } else {
                     before.mode
                 };
+                confirm_setting_at(dirs, &parent_handle, &name, &form.after)?;
                 dirs.publish_child_file(&parent_handle, &name, &restored, mode)?;
                 let (_, written) = read_settings(dirs, &form.settings_path)?.ok_or_else(|| {
                     unknown(format!(
@@ -2704,8 +3474,17 @@ fn undo_setting(
             }
         }
         (None, _) => {
-            if form.settings_path.exists() {
+            if let Some((facts, bytes)) = read_settings(dirs, &form.settings_path)? {
+                if snapshot_of(&facts, &bytes)? != form.after {
+                    return Err(unknown("settings identity or bytes changed before unlink"));
+                }
                 let (parent, name) = open_parent(dirs, &form.settings_path)?;
+                if entry_identity(dirs, &form.settings_path)?
+                    != (form.after.device, form.after.inode)
+                {
+                    return Err(unknown("settings replaced before unlink"));
+                }
+                confirm_setting_at(dirs, &parent, &name, &form.after)?;
                 dirs.remove_child(&parent, &name, RemoveKind::File)?;
             }
         }
@@ -2774,9 +3553,32 @@ fn undo_link(
     }
     take_link_custody(state, dirs, facts, mounts, observer, &observed)?;
     let (parent, name) = open_parent(dirs, &form.link_path)?;
+    if form.published_identity != Some(entry_identity(dirs, &form.link_path)?)
+        || dirs.read_link(&form.link_path)?.as_ref() != Some(&form.target)
+    {
+        return Err(unknown(
+            "published link identity or text changed before unlink",
+        ));
+    }
+    let restore_mode = if form.restore == LinkRestore::EmptyDirectory {
+        Some(
+            form.original_mode
+                .ok_or_else(|| unknown("original directory mode is missing; undo refuses"))?,
+        )
+    } else {
+        None
+    };
+    let current = dirs
+        .child_facts(&parent, &name)?
+        .ok_or_else(|| unknown("link vanished before unlink"))?;
+    if current.kind != EntryKind::Symlink
+        || form.published_identity != Some((current.device.get(), current.inode))
+    {
+        return Err(unknown("link replaced immediately before unlink"));
+    }
     dirs.remove_child(&parent, &name, RemoveKind::File)?;
-    if form.restore == LinkRestore::EmptyDirectory {
-        let identity = dirs.create_child_dir(&parent, &name, 0o755)?;
+    if let Some(mode) = restore_mode {
+        let identity = dirs.create_child_dir(&parent, &name, mode)?;
         let opened = dirs.open_child_dir(&parent, &name)?;
         if opened.identity() != identity {
             return Err(Error::new(
@@ -2784,6 +3586,7 @@ fn undo_link(
                 format!("{} changed while it was restored", form.link_path.display()),
             ));
         }
+        dirs.set_dir_mode(&opened, mode)?;
     }
     remove_record(state, &record.placement_id)?;
     Ok(UndoReport {
@@ -3619,7 +4422,20 @@ mod tests {
         let target = fixture.write("payload", b"cache data");
         let dirs = crate::testkit::Faults::new();
         *dirs.occupy_link_path.borrow_mut() = Some((original.clone(), target.clone()));
-        let error = super::publish_link(&dirs, &original, &target).expect_err(
+        let error = super::publish_link(
+            &StatePaths::resolve(
+                &FakeAccount {
+                    home: fixture.path().to_path_buf(),
+                },
+                Some(&fixture.join("state")),
+            )
+            .unwrap(),
+            CacheKind::CargoRegistry,
+            &dirs,
+            &original,
+            &target,
+        )
+        .expect_err(
             "an existing target is never a successful publication, even with matching text",
         );
         assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
@@ -4482,5 +5298,285 @@ mod tests {
             PlacementForm::Link(LinkForm { .. }) => panic!("expected the held-root form"),
             PlacementForm::Setting(_) => panic!("expected the held-root form"),
         }
+    }
+    #[test]
+    fn setting_readback_failure_keeps_durable_recovery_before_bytes() {
+        let fixture = Fixture::new("cache-adopt-intent-readback");
+        let original = fixture.home.path().join(".npmrc");
+        std::fs::write(&original, b"cache=/old/cache\nother=kept\n").unwrap();
+        let dirs = crate::testkit::Faults::new();
+        *dirs.fail_settings_readback.borrow_mut() = Some(".npmrc".to_owned());
+        let mut request = fixture.request(CacheKind::NpmCache);
+        request.write_setting = true;
+        let error = adopt(
+            &fixture.state,
+            &fixture.account,
+            &dirs,
+            fixture.facts.as_ref(),
+            &fixture.volume.mounts(),
+            &fixture.volume.observer(),
+            &request,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Io);
+        let pending = super::read_adopt_intent(&fixture.state, CacheKind::NpmCache)
+            .unwrap()
+            .unwrap();
+        let super::OriginalState::File { snapshot } = &pending.before else {
+            panic!("before bytes missing")
+        };
+        assert_eq!(
+            super::decode_hex(&snapshot.bytes).unwrap(),
+            b"cache=/old/cache\nother=kept\n"
+        );
+        assert!(
+            fixture.adopt(&request).is_err(),
+            "pending intent prevents another adoption"
+        );
+        fixture
+            .undo(&UndoRequest {
+                placement_id: None,
+                kind: Some(CacheKind::NpmCache),
+                plan: false,
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&original).unwrap(),
+            b"cache=/old/cache\nother=kept\n"
+        );
+        assert!(
+            super::read_adopt_intent(&fixture.state, CacheKind::NpmCache)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn interrupted_empty_directory_removal_replays_its_exact_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new("cache-intent-empty-replay");
+        let original = fixture.home.path().join(".cargo/git");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let before = super::original_state(&fixture.platform(), &original).unwrap();
+        let pending = super::AdoptIntent {
+            schema: "barge.cache-adopt/1".to_owned(),
+            id: "ab".repeat(16),
+            kind: CacheKind::CargoGit,
+            volume: fixture.volume.record.clone(),
+            original: original.clone(),
+            before,
+            expected_setting: None,
+            target: None,
+            marker_before: None,
+            marker_plan: None,
+            link: None,
+            held: None,
+            candidate: None,
+        };
+        super::begin_adopt_intent(&fixture.state, &pending).unwrap();
+        let mut competing = pending.clone();
+        competing.id = "cd".repeat(16);
+        assert!(super::begin_adopt_intent(&fixture.state, &competing).is_err());
+        assert_eq!(
+            super::read_adopt_intent(&fixture.state, CacheKind::CargoGit)
+                .unwrap()
+                .unwrap()
+                .id,
+            pending.id
+        );
+        std::fs::remove_dir(&original).unwrap();
+        fixture.facts.present.set(false);
+        assert!(fixture
+            .undo(&UndoRequest {
+                placement_id: None,
+                kind: Some(CacheKind::CargoGit),
+                plan: false
+            })
+            .is_err());
+        assert!(
+            !original.exists(),
+            "replay must not restore on an unverified volume"
+        );
+        fixture.facts.present.set(true);
+        fixture
+            .undo(&UndoRequest {
+                placement_id: None,
+                kind: Some(CacheKind::CargoGit),
+                plan: false,
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().permissions().mode() & 0o7777,
+            0o770
+        );
+        assert!(
+            super::read_adopt_intent(&fixture.state, CacheKind::CargoGit)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cache_targets_refuse_parent_components_and_symlinked_ancestors() {
+        for escape in ["parent", "symlink"] {
+            let fixture = Fixture::new("cache-containment-escape");
+            let outside = fixture.home.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::create_dir_all(fixture.caches()).unwrap();
+            let target = if escape == "parent" {
+                fixture.caches().join("../outside/cache")
+            } else {
+                std::os::unix::fs::symlink(&outside, fixture.caches().join("alias")).unwrap();
+                fixture.caches().join("alias/cache")
+            };
+            let original = fixture.home.path().join(".npmrc");
+            let bytes = format!("cache={}\n", target.display());
+            std::fs::write(&original, &bytes).unwrap();
+            let mut request = fixture.request(CacheKind::NpmCache);
+            request.adopt_existing_root = true;
+            assert!(fixture.adopt(&request).is_err(), "{escape}");
+            assert_eq!(std::fs::read_to_string(&original).unwrap(), bytes);
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn empty_directory_undo_restores_nondefault_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o700, 0o770] {
+            let fixture = Fixture::new("cache-undo-mode");
+            let original = fixture.home.path().join(".cargo/git");
+            std::fs::create_dir_all(&original).unwrap();
+            std::fs::set_permissions(&original, std::fs::Permissions::from_mode(mode)).unwrap();
+            fixture
+                .adopt(&fixture.request(CacheKind::CargoGit))
+                .unwrap();
+            fixture
+                .undo(&UndoRequest {
+                    placement_id: None,
+                    kind: Some(CacheKind::CargoGit),
+                    plan: false,
+                })
+                .unwrap();
+            assert_eq!(
+                std::fs::metadata(original).unwrap().permissions().mode() & 0o7777,
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn settings_diverging_during_undo_are_not_overwritten() {
+        let fixture = Fixture::new("cache-setting-undo-race");
+        let original = fixture.home.path().join(".npmrc");
+        std::fs::write(&original, b"cache=/old\n").unwrap();
+        let mut request = fixture.request(CacheKind::NpmCache);
+        request.write_setting = true;
+        fixture.adopt(&request).unwrap();
+        let dirs = crate::testkit::Faults::new();
+        let name = original.clone();
+        let calls = std::cell::Cell::new(0usize);
+        *dirs.observe_probe.borrow_mut() = Some(Box::new(move |entry| {
+            if entry == ".npmrc" {
+                calls.set(calls.get() + 1);
+                if calls.get() == 3 {
+                    std::fs::write(&name, b"cache=/concurrent-edit\n").unwrap();
+                }
+            }
+        }));
+        assert!(undo(
+            &fixture.state,
+            &dirs,
+            fixture.facts.as_ref(),
+            &fixture.volume.mounts(),
+            &fixture.volume.observer(),
+            &UndoRequest {
+                placement_id: None,
+                kind: Some(CacheKind::NpmCache),
+                plan: false
+            }
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(&original).unwrap(),
+            b"cache=/concurrent-edit\n"
+        );
+        assert_eq!(read_placements(&fixture.state).unwrap().records.len(), 1);
+    }
+
+    #[test]
+    fn same_text_link_replaced_during_custody_is_kept() {
+        let fixture = Fixture::new("cache-link-undo-race");
+        std::fs::create_dir_all(fixture.home.path().join(".cargo")).unwrap();
+        fixture
+            .adopt(&fixture.request(CacheKind::CargoRegistry))
+            .unwrap();
+        let original = fixture.home.path().join(".cargo/registry");
+        let target = std::fs::read_link(&original).unwrap();
+        let dirs = crate::testkit::Faults::new();
+        let name = original.clone();
+        let old = fixture.home.path().join("old-link");
+        let fired = std::cell::Cell::new(false);
+        *dirs.observe_probe.borrow_mut() = Some(Box::new(move |entry| {
+            if entry == area::ROOT_MARKER_FILE && !fired.replace(true) {
+                std::fs::rename(&name, &old).unwrap();
+                std::os::unix::fs::symlink(&target, &name).unwrap();
+            }
+        }));
+        assert!(undo(
+            &fixture.state,
+            &dirs,
+            fixture.facts.as_ref(),
+            &fixture.volume.mounts(),
+            &fixture.volume.observer(),
+            &UndoRequest {
+                placement_id: None,
+                kind: Some(CacheKind::CargoRegistry),
+                plan: false
+            }
+        )
+        .is_err());
+        assert!(original.is_symlink());
+        assert_eq!(read_placements(&fixture.state).unwrap().records.len(), 1);
+    }
+    #[test]
+    fn interrupted_marker_readback_recovers_only_the_planned_marker() {
+        let fixture = Fixture::new("cache-marker-intent-readback");
+        let target = fixture.caches().join("cargo/registry");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("payload"), b"kept data").unwrap();
+        std::fs::create_dir_all(fixture.home.path().join(".cargo")).unwrap();
+        let original = fixture.home.path().join(".cargo/registry");
+        std::os::unix::fs::symlink(&target, &original).unwrap();
+        let dirs = crate::testkit::Faults::new();
+        *dirs.fail_settings_readback.borrow_mut() = Some(area::ROOT_MARKER_FILE.to_owned());
+        let mut request = fixture.request(CacheKind::CargoRegistry);
+        request.adopt_existing_root = true;
+        assert!(adopt(
+            &fixture.state,
+            &fixture.account,
+            &dirs,
+            fixture.facts.as_ref(),
+            &fixture.volume.mounts(),
+            &fixture.volume.observer(),
+            &request
+        )
+        .is_err());
+        let intent = super::read_adopt_intent(&fixture.state, CacheKind::CargoRegistry)
+            .unwrap()
+            .unwrap();
+        assert!(intent.marker_plan.is_some());
+        assert!(target.join(area::ROOT_MARKER_FILE).exists());
+        fixture
+            .undo(&UndoRequest {
+                placement_id: None,
+                kind: Some(CacheKind::CargoRegistry),
+                plan: false,
+            })
+            .unwrap();
+        assert!(!target.join(area::ROOT_MARKER_FILE).exists());
+        assert_eq!(std::fs::read(target.join("payload")).unwrap(), b"kept data");
+        assert_eq!(std::fs::read_link(original).unwrap(), target);
     }
 }

@@ -232,6 +232,7 @@ state/
   registry.json                 barge.registry/1   (volumes, folder overrides)
   areas/<namespace>/<area>.json barge.area/1
   placements/<id>.json          barge.placement/1
+  cache-adopt-<kind>.json       barge.cache-adopt/1 (pending cache recovery)
   holds/<root-id>/<holder>.json barge.hold/1
   intents/<intent-id>.json      barge.intent/1
   locks/                        registry.lock, volume-<uuid>.lock, root-<id>.lock
@@ -1772,6 +1773,31 @@ Choices S5 made where this design left the mechanic to the slice:
   No real account's setting, link or cache was adopted by this slice; adopting
   Tom's real npm, bun or Cargo placements stays a separate operator gate, and
   its tests run on fixture homes, fixture settings files and fixture volumes.
+
+S6 adoption now publishes a synced `barge.cache-adopt/1` recovery record under
+its volume lock before cache effects. There is at most one pending record per
+kind (four kinds), with the placement read cap of 64 KiB. A synced private
+staging file is claimed through exclusive hard-link publication, so a competing
+volume cannot replace the same kind's journal. Replay holds the volume lock and
+reverifies that volume before restoring any path. It retains the original
+file bytes/identity or directory mode, expected setting bytes, a pre-publication
+marker root id/directory identity, observed link publication identity and the
+placement candidate before its final publication/readback. `cache undo --kind`
+replays only matching observed effects; it restores an interrupted empty-directory
+removal with the recorded mode. Divergence or an unobserved publication identity
+keeps the intent and effect for explicit operator recovery. A pending adoption
+blocks another adoption. Cache recovery records are distinct from deletion
+intents and never authorize deleting cache payload.
+
+Cache targets are walked from the verified caches descriptor, checking every
+existing component's kind, device and opened identity and refusing `..` or
+symlink ancestry. Missing suffixes are created component by component only in
+explicit adoption. Undo rechecks a settings file's exact snapshot through its
+opened parent immediately before mutation, and a link's stored device/inode
+immediately after custody and before unlink. Link records retain original
+empty-directory permission bits; restoration verifies the newly created
+identity before applying the exact mode through its descriptor. Older records
+without the required link identity or mode refuse destructive undo.
 
 Choices S6 made where this design left the mechanic to the slice:
 

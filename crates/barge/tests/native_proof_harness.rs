@@ -606,7 +606,7 @@ fn every_case_is_preflighted_before_its_body_and_aborts_the_run() {
             .find("# ---- run --")
             .expect("the run section exists")];
     let preflight_at = run_case
-        .find("preflight \"$id\" \"$dir/preflight\"")
+        .find("preflight \"$id\" \"$probe\"")
         .expect("the case is preflighted");
     let body_at = run_case.find("if \"$body\"").expect("the case body runs");
     assert!(
@@ -1218,6 +1218,20 @@ fn fabricated_receipt(
     };
     std::fs::write(root.join("detach.tsv"), detach).expect("detach evidence written");
 
+    let mut plans = String::new();
+    for case in declared
+        .keys()
+        .filter(|case| case.as_str() != "plan-effect-free")
+    {
+        let path = root.join(format!("{case}-plan.json"));
+        std::fs::write(
+            &path,
+            br#"{"ok":true,"data":{"plan":true,"placement":null}}"#,
+        )
+        .expect("fixture adoption plan");
+        plans.push_str(&format!("{case}\t{}\t0\n", path.display()));
+    }
+    std::fs::write(root.join("adopt-plans.tsv"), plans).expect("fixture plans manifest");
     let receipt_path = root.join("receipt.json");
     if detach_mode == "root-link" {
         std::os::unix::fs::symlink(root.join("missing"), root.join("removed-run"))
@@ -1253,6 +1267,7 @@ fn fabricated_receipt(
     let program = fixture.write("receipt.py", body.as_bytes(), 0o644);
     let output = Command::new("/usr/bin/python3")
         .arg(&program)
+        .env("S6_ADOPT_PLANS", root.join("adopt-plans.tsv"))
         .env("S6_RUN", &run_path)
         .env("S6_DETACH_TSV", root.join("detach.tsv"))
         .env(
@@ -1646,5 +1661,78 @@ PY
         .current_dir(&fixture.path)
         .output()
         .expect("isolated receipt runtime starts");
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
+fn each_adoption_records_a_valid_plan_before_the_effect_call() {
+    let fixture = Fixture::new("adopt-recorded-plan");
+    let wrapper = source_between("barge_cli() {", "assert_json() {");
+    let assertion = source_between("assert_json() {", "json_field() {");
+    let binary = fixture.write(
+        "barge-fixture",
+        br#"#!/bin/bash
+printf '%s\n' "$*" >>"$CALL_LOG"
+printf '{"ok":true,"data":{"plan":true,"placement":null}}\n'
+"#,
+        0o755,
+    );
+    let digest = digest_of(&binary);
+    let body = r#"
+BARGE_BIN="$PWD/barge-fixture"
+CURRENT_CASE=fixture
+CASE_PLAN_DIR="$(mktemp -d "$PWD/plans.XXXXXX")"
+ADOPT_PLANS="$PWD/adopt-plans.tsv"
+export CALL_LOG="$PWD/calls"
+barge_cli "$PWD/adopt.json" cache adopt --kind cargo-registry --volume fixture --json
+[[ -s "$ADOPT_PLANS" ]]
+[[ "$(wc -l <"$CALL_LOG" | tr -d ' ')" == 2 ]]
+head -n 1 "$CALL_LOG" | grep -q -- --plan
+! tail -n 1 "$CALL_LOG" | grep -q -- --plan
+"#;
+    let script = fixture.write("plan.sh", format!("set -euo pipefail\nBARGE_BIN_SHA256={digest}\nbarge_cli() {{{wrapper}\nassert_json() {{{assertion}\n{body}").as_bytes(), 0o644);
+    let output = Command::new("/bin/bash")
+        .arg(script)
+        .current_dir(&fixture.path)
+        .output()
+        .expect("pure plan wrapper starts");
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
+fn repeated_case_invocations_allocate_distinct_fixture_directories() {
+    let fixture = Fixture::new("case-mktemp");
+    let runner = source_between("run_case() {", "# ---- run ---");
+    let body = r#"
+RUN="$PWD/run"
+MOUNT="$PWD/image"
+EVIDENCE="$PWD/evidence"
+CASE_LOGS="$EVIDENCE/cases"
+mkdir -p "$RUN/cases" "$MOUNT" "$EVIDENCE/plans" "$CASE_LOGS"
+STOPPED=""
+FIRST_FAULT=""
+MODE=diagnostic
+preflight() { [[ -d "$2" ]]; }
+write_registry() { printf '%s\n' "$1" >>"$PWD/state-paths"; }
+record() { [[ "$2" == pass ]]; }
+case_body() {
+  [[ -d "$HOME" && -d "$BARGE_STATE_DIR" && -d "$CASE_OUT" && -d "$CARGO_HOME" ]]
+  printf '%s\n' "$HOME" >>"$PWD/home-paths"
+}
+run_case fixture "" case_body "8"
+run_case fixture "" case_body "8"
+[[ "$(sort -u "$PWD/home-paths" | wc -l | tr -d ' ')" == 2 ]]
+[[ "$(sort -u "$PWD/state-paths" | wc -l | tr -d ' ')" == 2 ]]
+"#;
+    let script = fixture.write(
+        "case.sh",
+        format!("set -euo pipefail\nrun_case() {{{runner}\n{body}").as_bytes(),
+        0o644,
+    );
+    let output = Command::new("/bin/bash")
+        .arg(script)
+        .current_dir(&fixture.path)
+        .output()
+        .expect("pure fixture case allocation starts");
     assert!(output.status.success(), "{}", stderr(&output));
 }

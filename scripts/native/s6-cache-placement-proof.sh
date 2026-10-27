@@ -120,6 +120,8 @@ readonly RECEIPT_HOME="$EVIDENCE/receipt-home"
 # Every case's full log is retained beside the receipt, so a failed case is
 # identified by its CLI error document long after the guard's scratch is gone.
 readonly CASE_LOGS="$EVIDENCE/cases"
+readonly ADOPT_PLANS="$EVIDENCE/adopt-plans.tsv"
+: >"$ADOPT_PLANS"
 
 refuse() {
   printf 's6: %s\n' "$*" >&2
@@ -174,7 +176,7 @@ export BARGE_ACCOUNT_HOME="$RUN/home"
 export TMP="$TMPDIR"
 export TEMP="$TMPDIR"
 unset CARGO_TARGET_DIR || true
-mkdir -p "$HOME" "$CARGO_HOME" "$BARGE_STATE_DIR" "$RUN/backing" "$RUN/cases" "$CASE_LOGS"
+mkdir -p "$HOME" "$CARGO_HOME" "$BARGE_STATE_DIR" "$RUN/backing" "$RUN/cases" "$CASE_LOGS" "$EVIDENCE/plans"
 mkdir -m 700 "$RECEIPT_HOME" || refuse "cannot create the private receipt runtime home"
 
 # Premise 2: the real account state, read once before and once after, so the
@@ -355,6 +357,7 @@ receipt_python() (
 write_receipt() {
   # >>> s6-receipt
   local exit_status="$1"
+  S6_ADOPT_PLANS="$ADOPT_PLANS" \
   S6_RUN="$RUN" \
   S6_DETACH_TSV="$DETACH_TSV" \
   S6_CLEANUP_DISPOSITION="$CLEANUP_DISPOSITION" \
@@ -509,8 +512,8 @@ premises = [
     {
         "id": 8,
         "premise": "mktemp -d under that root for every fixture directory, never a shared name.",
-        "trace": ["run_case creates cases/<id>/{home,state,out}"],
-        "evidence": {"run_root_pattern": "barge-s6-run.XXXXXX", "case_dirs": "cases/<case-id>/{home,state,out}"},
+        "trace": ["run_case uses mktemp -d for each case/home/state/out/preflight/image fixture"],
+        "evidence": {"run_root_pattern": "barge-s6-run.XXXXXX", "case_dirs": "cases/<case-id>.XXXXXX/{home,state,out,preflight,cargo-home}.XXXXXX"},
     },
     {
         "id": 9,
@@ -606,6 +609,19 @@ preflight = {
     "observations": preflight_observations,
 }
 
+adopt_plans = []
+plan_table = os.environ.get("S6_ADOPT_PLANS")
+if plan_table and os.path.exists(plan_table):
+    with open(plan_table, encoding="utf-8") as handle:
+        for line in handle:
+            case, path, status = line.rstrip("\n").split("\t")
+            with open(path, encoding="utf-8") as plan_file:
+                document = json.load(plan_file)
+            valid = (document.get("ok") is False or
+                     (document.get("ok") is True and document.get("data", {}).get("plan") is True
+                      and document.get("data", {}).get("placement") is None))
+            adopt_plans.append({"case": case, "path": path, "exit_status": int(status), "valid": valid})
+
 all_cases = {"absent-path", "empty-directory", "setting-unchanged", "setting-written",
              "diverged-undo", "non-empty-refused", "hand-made-in-place",
              "plan-effect-free", "ordinary-detach"}
@@ -654,6 +670,7 @@ detach_complete = (
 
 qualified = (
     detach_complete
+    and {row["case"] for row in adopt_plans if row["valid"]} >= all_cases - {"plan-effect-free"}
     and mode == "counted"
     and failed == 0
     and skipped == 0
@@ -695,6 +712,7 @@ receipt = {
     "preflight": preflight,
     "premises": premises,
     "premise_trace": premise_trace,
+    "adopt_plans": adopt_plans,
     "cases": cases,
     "summary": summary,
     "started_ms": int(os.environ["S6_STARTED"]),
@@ -828,6 +846,14 @@ barge_cli() {
   if [[ "$(shasum -a 256 "$BARGE_BIN" | awk '{print $1}')" != "$BARGE_BIN_SHA256" ]]; then
     printf 'the Barge binary changed after guarded startup; refusing invocation\n' >&2
     return 125
+  fi
+  if [[ "${1:-}" == cache && "${2:-}" == adopt && " $* " != *" --plan "* ]]; then
+    local plan plan_status=0
+    plan="$(mktemp "$CASE_PLAN_DIR/$(basename "$out").plan.XXXXXX")" || return 125
+    "$BARGE_BIN" "$@" --plan >"$plan" 2>"$plan.stderr" || plan_status=$?
+    assert_json "$plan" 'doc.get("ok") is False or (doc.get("ok") is True and doc["data"]["plan"] is True and doc["data"]["placement"] is None)' || return 125
+    printf '%s\t%s\t%s\n' "$CURRENT_CASE" "$plan" "$plan_status" >>"$ADOPT_PLANS" || return 125
+    printf 'recorded adopt plan %s (exit %s) before effects\n' "$plan" "$plan_status"
   fi
   "$BARGE_BIN" "$@" >"$out" 2>"$out.stderr" || status=$?
   if [[ "$status" -ne 0 ]]; then
@@ -1202,11 +1228,11 @@ write_premise_trace() {
 2|ordinary-detach|the absent-volume refusal is read from the fixture state directory's own registry
 3|absent-path|the adopted cache target is under the case's caches folder on the owned image
 3|plan-effect-free|describe's state.dir is the case's BARGE_STATE_DIR inside the run root
-4|absent-path|the link is published only by an explicit cache adopt --kind --volume
-4|empty-directory|the empty directory becomes a link only through the explicit adopt
-4|setting-unchanged|the already-pointing setting is recorded by the explicit adopt with no byte written
-4|setting-written|the setting is written only by the explicit adopt with --write-setting
-4|hand-made-in-place|the existing root is adopted only with the explicit --adopt-existing-root
+4|absent-path|a JSON --plan is retained before the explicit cache adopt --kind --volume
+4|empty-directory|a JSON --plan is retained before the explicit empty-directory adopt
+4|setting-unchanged|the unchanged-setting adoption records its JSON plan before effects
+4|setting-written|the setting-write JSON plan is recorded before explicit --write-setting
+4|hand-made-in-place|the in-place JSON plan is retained before explicit --adopt-existing-root
 4|plan-effect-free|--plan reports the intended effects and adopts nothing
 5|ordinary-detach|an ordinary hdiutil detach makes the cache unavailable naming the drive, and a re-attach makes it work again
 6|absent-path|the adopt uses only --kind, --volume and --json
@@ -1217,9 +1243,9 @@ write_premise_trace() {
 7|empty-directory|the restored directory is the fixture home's, inside the run root
 7|hand-made-in-place|the adopted root and its marker are on the owned image, under the case's caches folder
 7|plan-effect-free|the state directory the CLI used is inside the run root
-8|absent-path|the case's home, state and out are case-scoped under the mktemp run root
-8|hand-made-in-place|the case's caches folder is case-scoped under the owned image
-8|plan-effect-free|the plan case's own state directory is case-scoped
+8|absent-path|case, home, state, out and preflight are separately created by mktemp -d
+8|hand-made-in-place|the image fixture parent is created by mktemp -d on the owned image
+8|plan-effect-free|the plan case's own state directory is created by mktemp -d
 9|absent-path|the per-case preflight ran before this case with both descriptor probes
 9|empty-directory|the per-case preflight ran before this case with both descriptor probes
 9|setting-unchanged|the per-case preflight ran before this case with both descriptor probes
@@ -1418,9 +1444,14 @@ STOPPED=""
 
 run_case() {
   local id="$1" depends="$2" body="$3" premises="$4"
-  local dir="$RUN/cases/$id"
+  local dir
+  dir="$(mktemp -d "$RUN/cases/$id.XXXXXX")" || refuse "cannot allocate private case fixture"
   local log="$CASE_LOGS/$id.log"
-  mkdir -p "$dir/home" "$dir/state" "$dir/out"
+  local home state_dir out probe image_case cargo_home
+  home="$(mktemp -d "$dir/home.XXXXXX")" || refuse "cannot allocate private case fixture"
+  state_dir="$(mktemp -d "$dir/state.XXXXXX")" || refuse "cannot allocate private case fixture"
+  out="$(mktemp -d "$dir/out.XXXXXX")" || refuse "cannot allocate private case fixture"
+  probe="$(mktemp -d "$dir/preflight.XXXXXX")" || refuse "cannot allocate private case fixture"
   if [[ -n "$STOPPED" ]]; then
     record "$id" "skipped" "the counted run stopped at $STOPPED" "$premises"
     return 0
@@ -1432,17 +1463,22 @@ run_case() {
   # The harness preflight precedes every case that runs. A failed probe is an
   # infrastructure abort, not a product result: stop every remaining case and
   # let the run's verdict refuse the receipt.
-  if ! preflight "$id" "$dir/preflight"; then
+  if ! preflight "$id" "$probe"; then
     record "$id" "skipped" "infrastructure abort: $PREFLIGHT_FAILURE" "$premises"
     STOPPED="$id"
     return 0
   fi
-  export HOME="$dir/home"
-  export BARGE_STATE_DIR="$dir/state"
-  export BARGE_ACCOUNT_HOME="$dir/home"
-  CASE_OUT="$dir/out"
-  CASE_CACHES="$MOUNT/cases/$id/caches"
-  write_registry "$dir/state" "cases/$id" || {
+  export HOME="$home"
+  cargo_home="$(mktemp -d "$dir/cargo-home.XXXXXX")" || refuse "cannot create private Cargo home"
+  export CARGO_HOME="$cargo_home"
+  export BARGE_STATE_DIR="$state_dir"
+  export BARGE_ACCOUNT_HOME="$home"
+  CURRENT_CASE="$id"
+  CASE_PLAN_DIR="$(mktemp -d "$EVIDENCE/plans/$id.XXXXXX")" || refuse "cannot allocate private case fixture"
+  CASE_OUT="$out"
+  image_case="$(mktemp -d "$MOUNT/$id.XXXXXX")" || refuse "cannot allocate private case fixture"
+  CASE_CACHES="$image_case/caches"
+  write_registry "$state_dir" "$(basename "$image_case")" || {
     record "$id" "fail" "the fixture registry could not be written" "$premises"
     FIRST_FAULT="${FIRST_FAULT:-$id}"
     return 0

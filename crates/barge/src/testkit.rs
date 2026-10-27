@@ -456,6 +456,9 @@ pub struct Faults {
     /// A fixture link a racer publishes after the temporary link is created,
     /// before the caller attempts its exclusive rename.
     pub occupy_link_path: RefCell<Option<(PathBuf, PathBuf)>>,
+    /// Fail one readback after publishing this settings file.
+    pub fail_settings_readback: RefCell<Option<String>>,
+    settings_readback_armed: Cell<bool>,
     /// A name whose facts report another owner.
     pub foreign_uid_name: Option<String>,
     /// A name whose facts report another device.
@@ -1044,7 +1047,11 @@ impl DirOps for Faults {
         bytes: &[u8],
         mode: u32,
     ) -> Result<()> {
-        self.inner.publish_child_file(parent, name, bytes, mode)
+        self.inner.publish_child_file(parent, name, bytes, mode)?;
+        if self.fail_settings_readback.borrow().as_deref() == Some(name) {
+            self.settings_readback_armed.set(true);
+        }
+        Ok(())
     }
 
     fn read_child_file(
@@ -1053,6 +1060,12 @@ impl DirOps for Faults {
         name: &str,
         cap: usize,
     ) -> Result<Option<Vec<u8>>> {
+        if self.settings_readback_armed.replace(false) {
+            return Err(Error::new(
+                ErrorKind::Io,
+                "injected interrupted settings readback",
+            ));
+        }
         self.inner.read_child_file(parent, name, cap)
     }
 

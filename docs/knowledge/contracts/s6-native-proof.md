@@ -74,7 +74,7 @@ the digest is compared before the supervisor is executed.
   a unique `/Volumes/BargeProof<hex>`; every case's `caches/` folder lives on it
   under a case-scoped `root_dir`.
 - A private `HOME`, `CARGO_HOME`, state directory and account home inside the run
-  root, one set per case (`cases/<case-id>/{home,state,out}`), so no two cases
+  root, one set per case (`cases/<case-id>.XXXXXX/{home,state,out}.XXXXXX`), so no two cases
   share a settings file, a registry or a placement record.
 - One fixture `barge.registry/1` per case, in that case's private state
   directory, registering the image at the exact volume UUID the kernel reports.
@@ -89,14 +89,14 @@ mount, and the evidence directory.
 
 | # | Premise | How the run establishes it | Case bodies and the assertions that trace it |
 | --- | --- | --- | --- |
-| 1 | A private `HOME`, `CARGO_HOME` and state directory, so no real account state is read or written | every case exports `HOME`, `CARGO_HOME`, `BARGE_STATE_DIR` and `BARGE_ACCOUNT_HOME` inside `cases/<id>/`; the receipt records all four | `plan-effect-free`: `describe` reports the fixture account home and the fixture state directory; `setting-written`: the setting and its undo are the fixture `~/.npmrc` only; `hand-made-in-place`: the adopted link is the fixture `~/.cargo` link, not the real one |
+| 1 | A private `HOME`, `CARGO_HOME` and state directory, so no real account state is read or written | every case exports `HOME`, `CARGO_HOME`, `BARGE_STATE_DIR` and `BARGE_ACCOUNT_HOME` inside `cases/<id>.XXXXXX/`; the receipt records all four | `plan-effect-free`: `describe` reports the fixture account home and the fixture state directory; `setting-written`: the setting and its undo are the fixture `~/.npmrc` only; `hand-made-in-place`: the adopted link is the fixture `~/.cargo` link, not the real one |
 | 2 | The account home used for state resolution is the fixture's, and the real account state is untouched (before/after digest) | `BARGE_ACCOUNT_HOME` is the fixture home, so the CLI's account facts and `describe.state.home` name it; the real state directory is digested before the first case and again in cleanup | `plan-effect-free`: `describe.state.home.account` is the fixture home; `ordinary-detach`: the absent-volume refusal comes from the fixture state registry; the receipt's `real_state` holds both digests and `unchanged` |
 | 3 | Environment isolation: `BARGE_STATE_DIR`, `TMPDIR`/`TMP`/`TEMP` and every inherited scratch point inside the guard's owned scratch; no inherited real paths | the guard sets `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP` and `TEMP` inside its owned root; the script asserts `TMPDIR` is under `OXIDE_TASK_SCRATCH_ROOT` before the first fixture and refuses otherwise; `CARGO_TARGET_DIR` is unset | `absent-path`: the adopted cache target is under the case's `caches/` folder on the owned image; `plan-effect-free`: `describe.state.dir` is the case's `BARGE_STATE_DIR` inside the run root |
-| 4 | Explicit adoption only: every fixture placement is adopted with an explicit command and a recorded plan, never by an implicit default | every adopt is an explicit `barge cache adopt --kind … --volume …`; the in-place form additionally requires `--adopt-existing-root`; the plan case proves a plan writes nothing | `absent-path`, `empty-directory`, `setting-unchanged`: the link/setting is published only by the explicit adopt; `setting-written`: requires `--write-setting`; `hand-made-in-place`: requires `--adopt-existing-root`; `plan-effect-free`: `--plan` reports the effects and adopts nothing |
+| 4 | Explicit adoption only: every fixture placement is adopted with an explicit command and a recorded plan, never by an implicit default | every effectful adopt first retains its matching JSON `--plan` document under evidence and asserts a preview or a refusal, then invokes the explicit `barge cache adopt --kind … --volume …`; the in-place form additionally requires `--adopt-existing-root`; the plan case proves a plan writes nothing | `absent-path`, `empty-directory`, `setting-unchanged`: the link/setting is published only by the explicit adopt; `setting-written`: requires `--write-setting`; `hand-made-in-place`: requires `--adopt-existing-root`; `plan-effect-free`: `--plan` reports the effects and adopts nothing |
 | 5 | Owned image with ownership enabled (`-owners on`), ordinary detach, never a forced detach of anything but the owned image's own whole-disk device | `hdiutil attach -owners on -mountpoint <unique /Volumes/…>`; `detach_image case` requires an observed zero exit from ordinary detach; after failure, cleanup alone may reach for `-force` on the whole-disk device bound to the attachment device; there is no ordinary retry, the failure is latched, and the backing is retained | `ordinary-detach`: an ordinary `hdiutil detach` makes the cache unavailable naming the drive, and an ordinary re-attach makes it work again |
 | 6 | Every flag and environment hook used is listed with its purpose; no debug-only product bypass exists | the receipt's `premises[6].evidence` lists every hook and every product flag; the product has no debug or force bypass | `absent-path`: only `--kind`, `--volume` and `--json`; `setting-written`: the write needs the explicit `--write-setting`; `hand-made-in-place`: the in-place form needs `--adopt-existing-root`; `plan-effect-free`: the preview uses `--plan` |
 | 7 | Temporary storage: everything inside the guard's one owned root; no home folder, no drive root, no fixed `/tmp/<name>` | the run root is `mktemp -d "$TMPDIR/…"`; the image backing, per-case homes and state all live under it; cleanup removes it only after positively observed ordinary detach | `absent-path`: the adopted root and link target are the case's `caches/` folder on the owned image; `empty-directory`: the restored directory is the fixture home's inside the run root; `hand-made-in-place`: the adopted root and marker are on the owned image; `plan-effect-free`: the state directory is inside the run root |
-| 8 | `mktemp -d` under that root for every fixture directory, never a shared name | one `mktemp -d` run root, then `cases/<case-id>/{home,state,out}` created fresh per case under it; no fixed name is used | `absent-path`, `hand-made-in-place`, `plan-effect-free`: each case's home, state, out and caches folder is case-scoped under the run root |
+| 8 | `mktemp -d` under that root for every fixture directory, never a shared name | separate `mktemp -d` calls create the run, case container, home, state, output, Cargo home, preflight and image fixture parent; canonical tool paths inside those containers model the tools | `absent-path`, `hand-made-in-place`, `plan-effect-free`: each case's home, state, out and caches folder is case-scoped under the run root |
 | 9 | The qualified runner bytes and selector are named and hash-pinned; Barge adds no second supervisor, session or accounting harness | the supervisor path and SHA-256 are constants in the script and in this plan; the script gates it as a readable regular Python file, runs it with `/usr/bin/python3` and refuses different bytes; before every case the preflight re-checks the pin and session, then makes the two required descriptor probes in the same guarded session and aborts the run if either is unavailable | all nine cases: the per-case preflight ran before the case with both descriptor probes, and the receipt's `preflight.observations` and `premise_trace` name it |
 
 The case column is not prose only. `write_premise_trace` ships one row per
@@ -199,6 +199,13 @@ The script always writes `$OXIDE_PROOF_EVIDENCE/s6-cache-placement-receipt.json`
   fact. Runtime cache paths stay inside evidence; the writer cannot use a removed
   case home as its runtime home. Pure fixtures test this launcher against inherited
   Python cache/path hooks and inject receipt-side recreation after removal.
+- `adopt_plans` — one uniquely retained JSON `--plan` document for each adopt
+  invocation, recorded before its effect call with case/path/exit status. The CLI
+  wrapper asserts an effect-free preview or an explicit refusal before continuing;
+  qualification requires valid recorded plans across all adopting case bodies.
+  Case containers, homes, state, output, Cargo home, preflight and image parents
+  now each use `mktemp -d`; these operations are named in premises 4 and 8 and
+  exercised by pure harness tests, including two allocations of the same case id.
 - `preflight` — the probe names, the descriptor primitive, the guarded session,
   the sentinel's 2 s bound, how many preflights ran, the failure (or `null`),
   `status` (`passed`, or `infrastructure` on an abort), `aborted`, and one
@@ -485,6 +492,27 @@ Reserve minimum was 538,292,301,824 bytes over 85 samples; scratch peak was
 setting digests and Cargo link identities were unchanged. This is spent evidence,
 not a clean diagnostic or authorization for counted native. This correction
 preserves that evidence and remainder and activates no native run.
+
+### Source safety correction after bb5832b
+
+The later independent source review identified adoption recovery, containment,
+undo revalidation/mode and premise-body defects despite earlier native case
+success. This revision adds durable cache-adoption recovery and counterfactual
+source tests for interrupted settings/marker readback, interrupted empty-directory
+removal, parent/symlink escapes, a settings edit during undo, a same-text link
+replacement during custody and nondefault directory modes. The implementation
+mechanics are recorded in the [S6 design status](stage1-design.md#implementation-status).
+Premises 4 and 8 now name retained per-adoption plan documents and actual
+`mktemp -d` fixture allocation rather than inferring either from case isolation.
+
+The uncounted diagnostic at `bb5832b89149a25a8c074911e79aad24b080e95b`
+(native receipt SHA-256 `8673aba424b3aae65282291eaea03267cf2989ef2310a902f7a90b3a3b0532a3`)
+and counted author run there
+(`57dd72309daeaa9ab7b6962873dbb1d9f801e85b71ea9428ca42186a03725065`)
+remain historical old-head evidence. They cannot qualify this changed source.
+The revised head requires fresh independent source review and separately owner-
+activated diagnostic, author and independent reviewer native sessions. This
+source revision activates none; the merge hold remains.
 
 ## Activation order
 
