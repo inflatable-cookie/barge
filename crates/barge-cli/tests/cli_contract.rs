@@ -11,15 +11,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-/// A fixture directory that removes itself, created under this process's own
-/// temporary directory and never at a fixed path.
+/// The variable that names the run root one invocation's fixtures live in.
+///
+/// A caller that must confine a run's writes to one directory it owns names that
+/// directory here, exactly as the library's testkit does; unset, the process's own
+/// temporary directory is the base.
+const SCRATCH_ROOT_ENV: &str = "BARGE_TEST_SCRATCH_ROOT";
+
+/// A fixture directory that removes itself, created inside this invocation's run
+/// root and never at a fixed path.
 struct Fixture {
     path: PathBuf,
 }
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        let base = std::env::temp_dir();
+        let base = match std::env::var_os(SCRATCH_ROOT_ENV) {
+            Some(root) if !root.is_empty() => PathBuf::from(root),
+            _ => std::env::temp_dir(),
+        };
+        std::fs::create_dir_all(&base).expect("the fixture base is created");
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.subsec_nanos());

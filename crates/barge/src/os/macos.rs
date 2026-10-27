@@ -22,8 +22,8 @@ use crate::os::facts::{
     AccountFacts, BlindSpotEvidence, ChildEntry, ChildListing, ChildRemoval, DescriptorScan,
     DescriptorScanRequest, DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, FileSystem,
     MountPoint, MountRoot, OpenDescriptor, PlatformBlindSpot, PlatformStatus, ProcessIdentity,
-    ProcessObserver, RemoveKind, RetriedUnreadable, RetryEvidence, RetryResolution, VolumeFacts,
-    VolumeIdentity, VolumeUuid, BLIND_SPOT_RECORDS,
+    ProcessObserver, RemoveKind, RenameOutcome, RetriedUnreadable, RetryEvidence, RetryResolution,
+    VolumeFacts, VolumeIdentity, VolumeUuid, BLIND_SPOT_RECORDS,
 };
 
 /// The parent every managed volume mounts directly under.
@@ -2097,6 +2097,14 @@ impl DirOps for MacOs {
         let mut entries = Vec::new();
         let mut total = 0usize;
         let mut truncated = false;
+        // `dup` shares the directory offset with the caller's handle, and a
+        // directory stream reads from that offset, so a second listing through the
+        // same handle would otherwise start where the first ended and answer empty.
+        // A listing is always the directory's names from the first one.
+        // SAFETY: `stream` is the directory stream created above.
+        unsafe {
+            libc::rewinddir(stream);
+        }
         loop {
             // SAFETY: `__error` returns this thread's errno location.
             unsafe {
@@ -2194,16 +2202,33 @@ impl DirOps for MacOs {
         }
     }
 
-    fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<()> {
+    fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<RenameOutcome> {
         let directory = parent_descriptor(parent, from)?;
         let source = name_cstring(from)?;
         let target = name_cstring(to)?;
         // SAFETY: both names are NUL-terminated components inside the same open
-        // directory, which is exactly what makes the rename atomic.
-        if unsafe { libc::renameat(directory, source.as_ptr(), directory, target.as_ptr()) } == 0 {
-            return Ok(());
+        // directory, which is what makes the rename atomic, and `RENAME_EXCL` is
+        // libc's own flag for the platform's exclusive rename. The exclusive
+        // form never replaces an existing target name.
+        if unsafe {
+            libc::renameatx_np(
+                directory,
+                source.as_ptr(),
+                directory,
+                target.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        } == 0
+        {
+            return Ok(RenameOutcome::Renamed);
         }
         let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            // The target name is taken. Nothing was renamed, so the caller
+            // decides: a capture retries with a fresh private name, and a
+            // put-back reports both names and stops.
+            return Ok(RenameOutcome::TargetExists);
+        }
         let kind = match error.raw_os_error() {
             Some(libc::EXDEV) => ErrorKind::VolumeMismatch,
             Some(libc::ENOENT | libc::ENXIO | libc::EIO | libc::ENODEV) => ErrorKind::VolumeAbsent,
@@ -2215,6 +2240,47 @@ impl DirOps for MacOs {
                 .with_detail("to", to.into())
                 .with_detail("os_error", error.to_string().into()),
         )
+    }
+
+    fn dir_facts(&self, handle: &DirHandle) -> Result<EntryFacts> {
+        let descriptor = handle.descriptor().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Usage,
+                "the handle has no open descriptor to read".to_owned(),
+            )
+        })?;
+        Ok(entry_facts(&fstat(descriptor, Path::new("facts"))?))
+    }
+
+    fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> Result<()> {
+        let descriptor = handle.descriptor().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Usage,
+                "the handle has no open descriptor to chmod".to_owned(),
+            )
+        })?;
+        // SAFETY: the descriptor is open for this call and `mode` is one of the
+        // permission bits `fchmod` takes. It acts on the opened directory itself,
+        // so no link is followed and no name is resolved again.
+        if unsafe { libc::fchmod(descriptor.as_raw_fd(), mode as libc::mode_t) } != 0 {
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!("cannot set the directory mode to {mode:#o}"),
+            )
+            .with_detail("mode", mode.to_string().into())
+            .with_detail("os_error", io::Error::last_os_error().to_string().into()));
+        }
+        Ok(())
+    }
+
+    fn recheck_dir(&self, handle: &DirHandle) -> Result<DirId> {
+        let descriptor = handle.descriptor().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Usage,
+                "the handle has no open descriptor to re-read".to_owned(),
+            )
+        })?;
+        read_dir_identity(descriptor, Path::new("recheck"))
     }
 }
 
@@ -2583,6 +2649,7 @@ fn entry_facts(status: &libc::stat) -> EntryFacts {
         inode: status.st_ino,
         uid: status.st_uid,
         mode: u32::from(status.st_mode) & 0o7777,
+        st_mode: u32::from(status.st_mode),
         size: u64::try_from(status.st_size).unwrap_or(0),
         modified_ms: modified_ms(status),
     }

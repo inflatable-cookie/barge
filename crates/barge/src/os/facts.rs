@@ -282,6 +282,9 @@ pub struct EntryFacts {
     pub uid: u32,
     /// The permission bits, so a marker or hold file's privacy is checkable.
     pub mode: u32,
+    /// The platform's full `st_mode`, including the file-type bits, so a record
+    /// that has to restore the mode keeps everything `stat` reported.
+    pub st_mode: u32,
     /// The size in bytes; a marker is refused over its cap before it is read.
     pub size: u64,
     /// The modification time, when the platform reports one.
@@ -293,6 +296,11 @@ impl EntryFacts {
     /// authoritative record is written with.
     pub const fn is_private(&self) -> bool {
         self.mode & 0o077 == 0
+    }
+
+    /// The bits `chmod` takes, which are the full mode's permission part.
+    pub const fn permission_mode(&self) -> u32 {
+        self.st_mode & 0o7777
     }
 }
 
@@ -395,6 +403,11 @@ pub trait DirOps {
 
     /// Publish `bytes` at one child name atomically: a private temporary file in
     /// the same directory, synced, renamed into place and the directory synced.
+    ///
+    /// This is the one rename that replaces: a state file is republished over its
+    /// own bytes, and the temporary it replaces is this call's own private name,
+    /// never an entry Barge read from a volume. Every rename of a volume entry goes
+    /// through `rename_child`, which refuses an existing target name.
     fn publish_child_file(
         &self,
         parent: &DirHandle,
@@ -427,10 +440,39 @@ pub trait DirOps {
         kind: RemoveKind,
     ) -> Result<ChildRemoval>;
 
-    /// Rename one child inside its own directory, atomically. A cross-device
+    /// Rename one child inside its own directory, atomically and exclusively.
+    ///
+    /// The platform's exclusive rename refuses when the target name already
+    /// exists, reporting [`RenameOutcome::TargetExists`] with nothing renamed,
+    /// so no caller can replace an entry it did not verify. A cross-device
     /// request is refused by the platform and surfaces as a failure, never as a
     /// copy.
-    fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<()>;
+    fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<RenameOutcome>;
+
+    /// Set one opened directory's permission mode through its own descriptor.
+    ///
+    /// It is how a deletion reaches what is inside a captured directory that its
+    /// owner cannot write to, and it is descriptor-based, so no name is resolved
+    /// again: the mode is applied to the object the handle was opened as, never to
+    /// whatever a racer may have put at the name. The caller records the original
+    /// mode durably before it calls this.
+    fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> Result<()>;
+
+    /// One opened directory's own facts, read through its descriptor.
+    ///
+    /// The facts describe the object the handle was opened as, never whatever a
+    /// name holds now, so a caller decides about the same object it verified: a
+    /// mode recorded from these facts is the mode of the directory it will chmod.
+    fn dir_facts(&self, handle: &DirHandle) -> Result<EntryFacts>;
+
+    /// Re-read one opened directory's own identity through its descriptor: the
+    /// parent binding a capture or an unlink relies on.
+    ///
+    /// The descriptor is the binding, so this re-reads the same directory rather
+    /// than resolving a path again; a volume that was pulled, remounted or
+    /// replaced is visible as a different device, and the caller stops before it
+    /// unlinks anything through it.
+    fn recheck_dir(&self, handle: &DirHandle) -> Result<DirId>;
 
     /// Fresh random bytes from the platform's entropy source, used for a root's
     /// id and nonce.
@@ -444,6 +486,20 @@ pub enum RemoveKind {
     File,
     /// A directory, which must be empty.
     Directory,
+}
+
+/// What one exclusive rename found.
+///
+/// There is no "replaced" answer: an existing target name is refused as
+/// [`TargetExists`](Self::TargetExists) with both entries left where they were,
+/// which is what keeps a rename from destroying an object the caller never
+/// verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameOutcome {
+    /// The source is now at the target name, and the target name held nothing.
+    Renamed,
+    /// The target name was already taken, so nothing was renamed.
+    TargetExists,
 }
 
 /// What one child removal found.

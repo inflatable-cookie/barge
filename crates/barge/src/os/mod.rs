@@ -18,9 +18,9 @@ pub use facts::{
     AccountFacts, BlindSpotEvidence, ChildEntry, ChildListing, ChildRemoval, DescriptorScan,
     DescriptorScanRequest, DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind,
     ExpectedVolume, FileSystem, MountPoint, MountRoot, OpenDescriptor, PlatformBlindSpot,
-    PlatformStatus, ProcessIdentity, ProcessObserver, RemoveKind, RetriedUnreadable, RetryEvidence,
-    RetryResolution, SelfExclusion, VerifiedVolume, VolumeFacts, VolumeIdentity, VolumeUuid,
-    BLIND_SPOT_RECORDS, RETRY_RECORDS,
+    PlatformStatus, ProcessIdentity, ProcessObserver, RemoveKind, RenameOutcome, RetriedUnreadable,
+    RetryEvidence, RetryResolution, SelfExclusion, VerifiedVolume, VolumeFacts, VolumeIdentity,
+    VolumeUuid, BLIND_SPOT_RECORDS, RETRY_RECORDS,
 };
 
 #[cfg(target_os = "macos")]
