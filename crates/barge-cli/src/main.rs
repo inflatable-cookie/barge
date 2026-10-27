@@ -753,6 +753,14 @@ fn write_plan_file(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 /// The human summary of `barge.maintain/1`.
 fn maintain_summary(report: &MaintainReport) -> String {
     let mut lines = Vec::new();
+    // A preview has no volume outcomes, so its loud rows come from the plan.
+    for volume in &report.plan.volumes.rows {
+        if report.preview && volume.loud {
+            if let Some(detail) = &volume.detail {
+                lines.push(format!("warning: {detail}"));
+            }
+        }
+    }
     for volume in &report.volumes.rows {
         if volume.loud {
             if let Some(detail) = &volume.detail {

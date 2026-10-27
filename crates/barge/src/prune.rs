@@ -1120,9 +1120,9 @@ fn run(
         }
         volumes.push(outcome);
     }
-    if timed_out {
-        // Report what the wall clock stopped before, with counts, so the
-        // unfinished part is never reported as done.
+    if timed_out || stopped.is_some() {
+        // Report what the run did not reach, with counts, so the unfinished part
+        // is never reported as done.
         for volume_plan in &plan.volumes.rows {
             if volumes
                 .iter()
