@@ -913,6 +913,300 @@ fn walk_folder(
     })
 }
 
+/// Walk `root_dir` and then one feature folder from an opened mount root.
+///
+/// Every component goes through the same descriptor walk: checked with `lstat`,
+/// refused unless it is this account's real directory on this device, opened
+/// without following a link and compared with the checked identity. The first
+/// absent component ends the walk and the rest are reported as still to create,
+/// so resolution creates nothing and a caller that creates knows exactly what is
+/// missing.
+fn walk_folder_chain(
+    dirs: &dyn DirOps,
+    root_handle: DirHandle,
+    base: &Path,
+    device: DeviceId,
+    effective_uid: u32,
+    root_dir: &str,
+    folder: &str,
+) -> Result<Walk> {
+    let root_dir_components = if root_dir.is_empty() {
+        Vec::new()
+    } else {
+        folder_components("root_dir", root_dir)?
+    };
+    let walked_root = walk_folder(
+        dirs,
+        root_handle,
+        &root_dir_components,
+        device,
+        base,
+        effective_uid,
+    )?;
+    let folder_components = folder_components("folder", folder)?;
+    if walked_root.exists() {
+        return walk_folder(
+            dirs,
+            walked_root.handle,
+            &folder_components,
+            device,
+            &walked_root.path,
+            effective_uid,
+        );
+    }
+    // The root_dir itself is missing, so everything under it is still to
+    // create; the path is the composed observation either way.
+    let mut path = walked_root.path.clone();
+    for component in &folder_components {
+        path.push(component);
+    }
+    Ok(Walk {
+        handle: walked_root.handle,
+        remaining: walked_root
+            .remaining
+            .iter()
+            .chain(folder_components.iter())
+            .cloned()
+            .collect(),
+        path,
+    })
+}
+
+/// Barge's own feature folders under `root_dir` (architecture, "Locations on a
+/// volume"): the two folders Barge implements itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feature {
+    /// Per-project scratch areas.
+    Scratch,
+    /// Package-cache placements.
+    Caches,
+}
+
+/// The folder name one volume gives one of Barge's own features: the record's
+/// override, else the design's default name.
+pub fn feature_folder(record: &VolumeRecord, feature: Feature) -> Result<String> {
+    let (override_folder, default) = match feature {
+        Feature::Scratch => (record.folders.scratch.clone(), "scratch"),
+        Feature::Caches => (record.folders.caches.clone(), "caches"),
+    };
+    let folder = override_folder.unwrap_or_else(|| default.to_owned());
+    folder_components("folder", &folder)?;
+    Ok(folder)
+}
+
+/// One of Barge's own feature folders, resolved for one volume.
+///
+/// It is the cache placement's half of [`ResolvedArea`]: the same descriptor
+/// walk, the same containment, and no declaration, because `caches/` is Barge's
+/// own folder rather than a consumer area.
+#[derive(Debug)]
+pub struct FeatureFolder {
+    /// The verified volume's UUID.
+    pub volume_uuid: VolumeUuid,
+    /// The proved mount root.
+    pub mount_point: PathBuf,
+    /// The volume's recorded `root_dir`; `""` is the mount root.
+    pub root_dir: String,
+    /// The effective folder name for this volume.
+    pub folder: String,
+    /// The absolute path the configuration resolves to.
+    pub path: PathBuf,
+    dirs: Direction,
+}
+
+impl FeatureFolder {
+    /// Whether the folder exists. Resolution creates nothing.
+    pub fn exists(&self) -> bool {
+        matches!(self.dirs, Direction::Existing { .. })
+    }
+}
+
+/// Resolve one of Barge's own feature folders for one volume, creating nothing.
+pub fn resolve_feature(
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    record: &VolumeRecord,
+    feature: Feature,
+) -> Result<FeatureFolder> {
+    // An undeclared durability refuses every placement use, exactly as it
+    // refuses an area use: expending data is never inferred.
+    record.declared_durability()?;
+    let root = VolumeRoot::open(dirs, facts, mounts, record)?;
+    let effective_uid = observer.effective_uid()?;
+    let device = root.identity().device;
+    let base = root.mount_point().to_path_buf();
+    let folder = feature_folder(record, feature)?;
+    let walked = walk_folder_chain(
+        dirs,
+        root.into_handle(),
+        &base,
+        device,
+        effective_uid,
+        &record.root_dir,
+        &folder,
+    )?;
+    let dirs_state = if walked.exists() {
+        Direction::Existing {
+            handle: walked.handle,
+        }
+    } else {
+        Direction::Missing {
+            handle: walked.handle,
+            remaining: walked.remaining,
+            device,
+        }
+    };
+    Ok(FeatureFolder {
+        volume_uuid: record.volume_uuid.clone(),
+        mount_point: base,
+        root_dir: record.root_dir.clone(),
+        folder,
+        path: walked.path,
+        dirs: dirs_state,
+    })
+}
+
+/// Duplicate the verified existing feature walk without creating anything.
+pub(crate) fn open_existing_feature(
+    dirs: &dyn DirOps,
+    folder: &FeatureFolder,
+) -> Result<Option<DirHandle>> {
+    match &folder.dirs {
+        Direction::Existing { handle } => dirs.duplicate_dir(handle).map(Some),
+        Direction::Missing { .. } => Ok(None),
+    }
+}
+
+/// Open one of Barge's own feature folders, creating the folder chain when it is
+/// missing.
+///
+/// The creation path is the same one the area roots use: every existing
+/// component must be this account's real directory on this device, and every
+/// created one is opened again and compared with the identity the platform
+/// returned.
+pub fn open_or_create_feature(
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    folder: &FeatureFolder,
+) -> Result<(DirHandle, PathBuf)> {
+    let effective_uid = observer.effective_uid()?;
+    let handle = ensure_folder(dirs, &folder.dirs, effective_uid)?;
+    Ok((handle, folder.path.clone()))
+}
+
+/// Ensure one child directory of an opened folder exists.
+///
+/// An entry that is already there is adopted only when it is a real directory of
+/// this account on `device` and the opened directory is the one that was
+/// checked; anything else is a containment refusal rather than an adoption.
+pub fn ensure_child_directory(
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    parent: &DirHandle,
+    name: &str,
+    device: DeviceId,
+) -> Result<DirHandle> {
+    validate_name("folder", name)?;
+    let effective_uid = observer.effective_uid()?;
+    match dirs.child_facts(parent, name)? {
+        Some(facts) => adopt_existing_component(dirs, parent, name, &facts, device, effective_uid),
+        None => match dirs.create_child_dir(parent, name, AREA_DIRECTORY_MODE) {
+            Ok(identity) => {
+                let opened = dirs.open_child_dir(parent, name)?;
+                if opened.identity() != identity {
+                    return Err(containment(
+                        "folder",
+                        name,
+                        "the component changed while it was created",
+                    ));
+                }
+                Ok(opened)
+            }
+            Err(error) => {
+                let Some(facts) = dirs.child_facts(parent, name)? else {
+                    return Err(error);
+                };
+                adopt_existing_component(dirs, parent, name, &facts, device, effective_uid)
+            }
+        },
+    }
+}
+
+/// Create one owned root inside one of Barge's own feature folders.
+///
+/// The folder chain is created when it is missing, through the same adoption
+/// proof the area path uses, and the root is created exclusively with a fresh
+/// 128-bit id and `0700`. The marker records the area identity the caller names
+/// and no effective declaration, because a feature folder has no consumer
+/// policies to apply.
+pub fn create_root_in_feature(
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    folder: &FeatureFolder,
+    kind: RootKind,
+    area: MarkerArea,
+) -> Result<OwnedRoot> {
+    let effective_uid = observer.effective_uid()?;
+    let folder_handle = ensure_folder(dirs, &folder.dirs, effective_uid)?;
+    let mut last_error: Option<Error> = None;
+    for _ in 0..ROOT_ID_ATTEMPTS {
+        let root_id = hex(16, dirs.random_bytes(16)?);
+        match dirs.create_child_dir(&folder_handle, &root_id, ROOT_DIRECTORY_MODE) {
+            Ok(identity) => {
+                let root = dirs.open_child_dir(&folder_handle, &root_id)?;
+                if root.identity() != identity {
+                    return Err(Error::new(
+                        ErrorKind::RefusedContainment,
+                        format!("the root `{root_id}` changed while it was created"),
+                    )
+                    .with_detail("root_id", root_id.into()));
+                }
+                let path = folder.path.join(&root_id);
+                let write = MarkerWrite {
+                    root_id: Some(&root_id),
+                    volume_uuid: &folder.volume_uuid,
+                    resolved_path: &path,
+                    area: area.clone(),
+                    kind,
+                    origin: RootOrigin::Created,
+                };
+                let marker = write_marker(dirs, &root, &write, effective_uid)?;
+                return Ok(OwnedRoot {
+                    root_id,
+                    nonce: marker.nonce,
+                    kind,
+                    area,
+                    volume_uuid: folder.volume_uuid.clone(),
+                    path,
+                    identity: root.identity(),
+                    marker_digest: marker.marker_digest,
+                    created_ms: marker.created_ms,
+                });
+            }
+            Err(error) => {
+                if dirs.child_facts(&folder_handle, &root_id)?.is_some() {
+                    last_error = Some(error);
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+    Err(Error::new(
+        ErrorKind::ResourceBound,
+        format!("could not find a fresh root id after {ROOT_ID_ATTEMPTS} attempts"),
+    )
+    .with_detail("attempts", ROOT_ID_ATTEMPTS.into())
+    .with_detail(
+        "last_error",
+        last_error
+            .map_or_else(String::new, |error| error.to_string())
+            .into(),
+    ))
+}
+
 /// A declared area resolved for one volume: the deepest directory that exists,
 /// the components still to create, and the effective declaration.
 #[derive(Debug)]
@@ -995,49 +1289,16 @@ pub fn resolve(
     let base = root.mount_point().to_path_buf();
     let root_handle = root.into_handle();
 
-    let root_dir_components = if record.root_dir.is_empty() {
-        Vec::new()
-    } else {
-        folder_components("root_dir", &record.root_dir)?
-    };
-    let walked_root = walk_folder(
+    let folder = effective_folder(record, caller)?;
+    let walked = walk_folder_chain(
         dirs,
         root_handle,
-        &root_dir_components,
-        device,
         &base,
+        device,
         effective_uid,
+        &record.root_dir,
+        &folder,
     )?;
-
-    let folder = effective_folder(record, caller)?;
-    let folder_components = folder_components("folder", &folder)?;
-    let walked = if walked_root.exists() {
-        walk_folder(
-            dirs,
-            walked_root.handle,
-            &folder_components,
-            device,
-            &walked_root.path,
-            effective_uid,
-        )?
-    } else {
-        // The root_dir itself is missing, so everything under it is still to
-        // create; the path is the composed observation either way.
-        let mut path = walked_root.path.clone();
-        for component in &folder_components {
-            path.push(component);
-        }
-        Walk {
-            handle: walked_root.handle,
-            remaining: walked_root
-                .remaining
-                .iter()
-                .chain(folder_components.iter())
-                .cloned()
-                .collect(),
-            path,
-        }
-    };
 
     let declaration = EffectiveDeclaration::new(caller, stored, folder);
     let dirs_state = if walked.exists() {
@@ -1134,7 +1395,6 @@ pub fn create_root(
     let mut last_error: Option<Error> = None;
     for _ in 0..ROOT_ID_ATTEMPTS {
         let root_id = hex(16, dirs.random_bytes(16)?);
-        let nonce = hex(16, dirs.random_bytes(16)?);
         match dirs.create_child_dir(&area_handle, &root_id, ROOT_DIRECTORY_MODE) {
             Ok(identity) => {
                 let root = dirs.open_child_dir(&area_handle, &root_id)?;
@@ -1145,15 +1405,7 @@ pub fn create_root(
                     )
                     .with_detail("root_id", root_id.into()));
                 }
-                return write_root_marker(
-                    dirs,
-                    resolved,
-                    &root,
-                    &root_id,
-                    &nonce,
-                    spec,
-                    effective_uid,
-                );
+                return write_root_marker(dirs, resolved, &root, &root_id, spec, effective_uid);
             }
             Err(error) => {
                 // A taken name is the race the design expects: retry with a
@@ -1348,7 +1600,17 @@ fn ensure_area_folder(
     resolved: &ResolvedArea,
     effective_uid: u32,
 ) -> Result<DirHandle> {
-    match &resolved.dirs {
+    ensure_folder(dirs, &resolved.dirs, effective_uid)
+}
+
+/// Create any missing folder component, refusing to adopt anything that is
+/// already there but is not this account's directory.
+fn ensure_folder(
+    dirs: &dyn DirOps,
+    dirs_state: &Direction,
+    effective_uid: u32,
+) -> Result<DirHandle> {
+    match dirs_state {
         Direction::Existing { handle } => dirs.duplicate_dir(handle),
         Direction::Missing {
             handle,
@@ -1411,42 +1673,82 @@ fn ensure_area_folder(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_root_marker(
+#[derive(Debug, Clone)]
+pub struct MarkerWrite<'a> {
+    /// The root id, when the directory already has one. Creation names the
+    /// directory before its marker exists, so the two cannot disagree; `None`
+    /// means this write chooses a fresh id.
+    pub root_id: Option<&'a str>,
+    /// The verified volume's UUID.
+    pub volume_uuid: &'a VolumeUuid,
+    /// The absolute path the descriptor walk actually reached for the root.
+    pub resolved_path: &'a Path,
+    /// The area identity the root belongs to.
+    pub area: MarkerArea,
+    /// What the root is for.
+    pub kind: RootKind,
+    /// Whether Barge created the directory or adopted it in place.
+    pub origin: RootOrigin,
+}
+
+/// The identity one marker write established, as its caller records it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarkerIdentity {
+    /// The fresh 128-bit root id the marker records.
+    pub root_id: String,
+    /// The fresh nonce the marker records.
+    pub nonce: String,
+    /// The SHA-256 of the exact marker bytes written.
+    pub marker_digest: String,
+    /// When the marker was written.
+    pub created_ms: u64,
+}
+
+/// Write one `barge.root/1` marker into an already opened root directory.
+///
+/// This is the one marker writer: creation and in-place adoption both use it, so
+/// the field set, the caps, the mode and the read-back proof cannot drift apart.
+/// The marker is validated against what was actually walked before it is
+/// published through a private synced file and an exclusive rename. A raced-in
+/// entry is kept, with the staging file available as recovery evidence. Readback
+/// proves the published inode, nonce and digest rather than just the root id.
+pub fn write_marker(
     dirs: &dyn DirOps,
-    resolved: &ResolvedArea,
     root: &DirHandle,
-    root_id: &str,
-    nonce: &str,
-    spec: RootSpec,
+    write: &MarkerWrite<'_>,
     effective_uid: u32,
-) -> Result<OwnedRoot> {
+) -> Result<MarkerIdentity> {
+    let root_id = match write.root_id {
+        Some(root_id) => {
+            state::validate_identifier("root_id", root_id)?;
+            root_id.to_owned()
+        }
+        None => hex(16, dirs.random_bytes(16)?),
+    };
+    let nonce = hex(16, dirs.random_bytes(16)?);
     let created_ms = state::now_ms();
-    let path = resolved.path.join(root_id);
     let marker = RootMarker {
         schema: crate::contract::ROOT_SCHEMA.to_owned(),
-        root_id: root_id.to_owned(),
-        nonce: nonce.to_owned(),
-        volume_uuid: resolved.volume_uuid.clone(),
+        root_id: root_id.clone(),
+        nonce: nonce.clone(),
+        volume_uuid: write.volume_uuid.clone(),
         owner: "barge".to_owned(),
-        kind: spec.kind,
-        area: MarkerArea {
-            namespace: resolved.declaration.namespace.clone(),
-            area: resolved.declaration.area.clone(),
-            effective: Some(resolved.declaration.clone()),
-        },
-        resolved_path: path.clone(),
+        kind: write.kind,
+        area: write.area.clone(),
+        resolved_path: write.resolved_path.to_path_buf(),
         created_ms,
         generation: 1,
-        origin: RootOrigin::Created,
+        origin: write.origin,
         conclusion: None,
     };
-    marker.validate(&MarkerExpectation {
-        volume_uuid: &resolved.volume_uuid,
-        resolved_path: &path,
+    let expectation = MarkerExpectation {
+        volume_uuid: write.volume_uuid,
+        resolved_path: write.resolved_path,
         effective_uid,
         now_ms: created_ms,
-    })?;
+    };
+    marker.validate(&expectation)?;
     let mut bytes = serde_json::to_vec_pretty(&marker).map_err(|error| {
         Error::new(
             ErrorKind::Io,
@@ -1466,18 +1768,66 @@ fn write_root_marker(
         .with_detail("cap", MARKER_CAP_BYTES.into()));
     }
     let digest = sha256_hex(&bytes);
-    dirs.publish_child_file(root, ROOT_MARKER_FILE, &bytes, RECORD_MODE)?;
-    // Read the marker back so creation proves what is on disk, not what was
-    // meant to be written.
-    let expectation = MarkerExpectation {
-        volume_uuid: &resolved.volume_uuid,
-        resolved_path: &path,
-        effective_uid,
-        now_ms: created_ms,
-    };
-    match read_marker(dirs, root, &expectation) {
-        MarkerState::Owned(back) if back.root_id == root_id => {}
-        other => {
+    // The intended root id is already durable in an in-place adoption's intent.
+    // Keep this private staging name on uncertainty; never replace the marker
+    // that another writer may have created since the caller observed absence.
+    let staged = format!(".barge-marker-{root_id}");
+    if dirs.child_facts(root, &staged)?.is_some() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "marker staging name is already occupied",
+        ));
+    }
+    dirs.publish_child_file(root, &staged, &bytes, RECORD_MODE)?;
+    let staged_facts = dirs
+        .child_facts(root, &staged)?
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "staged marker disappeared"))?;
+    if staged_facts.kind != EntryKind::File
+        || staged_facts.uid != effective_uid
+        || staged_facts.device != root.identity().device
+        || dirs.recheck_dir(root)? != root.identity()
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "staged marker or parent binding changed",
+        ));
+    }
+    if dirs.rename_child(root, &staged, ROOT_MARKER_FILE)? == os::RenameOutcome::TargetExists {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "a marker appeared before publication; no existing entry was replaced",
+        )
+        .with_detail(
+            "path",
+            write
+                .resolved_path
+                .join(ROOT_MARKER_FILE)
+                .display()
+                .to_string()
+                .into(),
+        )
+        .with_detail(
+            "staged_marker",
+            write
+                .resolved_path
+                .join(&staged)
+                .display()
+                .to_string()
+                .into(),
+        ));
+    }
+    dirs.sync_dir(root)?;
+    let published = dirs.child_facts(root, ROOT_MARKER_FILE)?;
+    if published.as_ref() != Some(&staged_facts) {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "published marker identity changed",
+        ));
+    }
+    match read_marker_with_digest(dirs, root, &expectation) {
+        (MarkerState::Owned(back), Some(back_digest))
+            if back.root_id == root_id && back.nonce == nonce && back_digest == digest => {}
+        (other, _) => {
             return Err(Error::new(
                 ErrorKind::UnknownState,
                 format!(
@@ -1488,16 +1838,46 @@ fn write_root_marker(
             .with_detail("root_id", root_id.into()));
         }
     }
-    Ok(OwnedRoot {
-        root_id: root_id.to_owned(),
-        nonce: nonce.to_owned(),
+    Ok(MarkerIdentity {
+        root_id,
+        nonce,
+        marker_digest: digest,
+        created_ms,
+    })
+}
+
+fn write_root_marker(
+    dirs: &dyn DirOps,
+    resolved: &ResolvedArea,
+    root: &DirHandle,
+    root_id: &str,
+    spec: RootSpec,
+    effective_uid: u32,
+) -> Result<OwnedRoot> {
+    let path = resolved.path.join(root_id);
+    let write = MarkerWrite {
+        root_id: Some(root_id),
+        volume_uuid: &resolved.volume_uuid,
+        resolved_path: &path,
+        area: MarkerArea {
+            namespace: resolved.declaration.namespace.clone(),
+            area: resolved.declaration.area.clone(),
+            effective: Some(resolved.declaration.clone()),
+        },
         kind: spec.kind,
-        area: marker.area,
+        origin: RootOrigin::Created,
+    };
+    let identity = write_marker(dirs, root, &write, effective_uid)?;
+    Ok(OwnedRoot {
+        root_id: identity.root_id,
+        nonce: identity.nonce,
+        kind: spec.kind,
+        area: write.area,
         volume_uuid: resolved.volume_uuid.clone(),
         path,
         identity: root.identity(),
-        marker_digest: digest,
-        created_ms,
+        marker_digest: identity.marker_digest,
+        created_ms: identity.created_ms,
     })
 }
 
@@ -1813,7 +2193,7 @@ pub fn read_declarations(state: &StatePaths) -> Result<DeclarationSet> {
 ///
 /// A symlink or a non-directory at the path is unknown state: Barge reads its
 /// own state directory and never through a link.
-fn read_directory(path: &Path) -> Result<Option<Vec<String>>> {
+pub(crate) fn read_directory(path: &Path) -> Result<Option<Vec<String>>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -3283,6 +3663,19 @@ mod tests {
             self.inner.recheck_dir(handle)
         }
 
+        fn create_child_symlink(
+            &self,
+            parent: &DirHandle,
+            name: &str,
+            target: &Path,
+        ) -> Result<()> {
+            self.inner.create_child_symlink(parent, name, target)
+        }
+
+        fn read_link(&self, path: &Path) -> Result<Option<PathBuf>> {
+            self.inner.read_link(path)
+        }
+
         fn random_bytes(&self, length: usize) -> Result<Vec<u8>> {
             self.inner.random_bytes(length)
         }
@@ -4497,6 +4890,18 @@ mod tests {
             }
             fn recheck_dir(&self, handle: &DirHandle) -> Result<DirId> {
                 self.inner.recheck_dir(handle)
+            }
+
+            fn create_child_symlink(
+                &self,
+                parent: &DirHandle,
+                name: &str,
+                target: &Path,
+            ) -> Result<()> {
+                self.inner.create_child_symlink(parent, name, target)
+            }
+            fn read_link(&self, path: &Path) -> Result<Option<PathBuf>> {
+                self.inner.read_link(path)
             }
             fn random_bytes(&self, length: usize) -> Result<Vec<u8>> {
                 let mut calls = self.calls.borrow_mut();

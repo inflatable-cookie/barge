@@ -75,7 +75,41 @@ fn stdout_document(output: &Output) -> Value {
 }
 
 /// The usage's first line; the full text names every area verb too.
-const USAGE: &str = "usage: barge <describe|inspect|area> [--json]";
+const USAGE: &str = "usage: barge <describe|inspect|area|cache|diagnostic> [--json]";
+
+#[test]
+fn descriptor_census_refuses_bad_arguments_and_missing_roots_without_scanning() {
+    let (fixture, state_dir) = absent_state_dir("descriptor-census");
+    for args in [
+        vec![
+            "diagnostic",
+            "descriptor-census",
+            "--root",
+            "relative",
+            "--json",
+        ],
+        vec!["diagnostic", "descriptor-census", "--json"],
+        vec!["diagnostic", "wrong-verb", "--json"],
+    ] {
+        let output = run_in(&args, &state_dir);
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+    }
+    let absent = fixture.join("absent");
+    let output = run_in(
+        &[
+            "diagnostic",
+            "descriptor-census",
+            "--root",
+            absent.to_str().unwrap(),
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert!(!output.status.success());
+    assert_eq!(stdout_document(&output)["ok"], false);
+    assert!(!absent.exists() && !state_dir.exists());
+}
 
 #[test]
 fn describe_json_prints_one_document_and_creates_nothing() {
@@ -732,4 +766,123 @@ fn a_registered_but_absent_volume_refuses_creation_before_taking_a_lock() {
         "an absent volume creates no lock file"
     );
     assert!(!mount.exists(), "the absent mount point is never recreated");
+}
+
+/// Run one `cache` verb with `--json`.
+fn run_cache(args: &[&str], state_dir: &Path) -> Output {
+    let mut full = vec!["cache"];
+    full.extend_from_slice(args);
+    full.push("--json");
+    run_in(&full, state_dir)
+}
+
+#[test]
+fn cache_list_prints_one_document_and_creates_nothing() {
+    let (_fixture, state_dir) = absent_state_dir("cache-list");
+    let output = run_cache(&["list"], &state_dir);
+    assert_eq!(output.status.code(), Some(0), "cache list succeeds");
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.cache.list/1");
+    assert_eq!(document["command"], "cache.list");
+    assert_eq!(document["ok"], true);
+    let placements = &document["data"]["placements"];
+    assert_eq!(placements["count"], 0);
+    assert_eq!(placements["total"], 0);
+    assert_eq!(placements["truncated"], false);
+    assert!(placements["rows"].is_array());
+    assert!(
+        !state_dir.exists(),
+        "a read-only verb creates no state directory"
+    );
+}
+
+#[test]
+fn cache_adopt_refuses_an_unregistered_volume_before_any_effect() {
+    let (_fixture, state_dir) = absent_state_dir("cache-adopt-unregistered");
+    let output = run_cache(
+        &[
+            "adopt",
+            "--kind",
+            "npm-cache",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+        ],
+        &state_dir,
+    );
+    // The registry is absent, so no volume is registered: unknown state, and
+    // nothing is created, linked or written.
+    assert_eq!(output.status.code(), Some(3));
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.error/1");
+    assert_eq!(document["error"]["kind"], "unknown_state");
+    assert!(!state_dir.exists());
+}
+
+#[test]
+fn cache_adopt_accepts_its_bare_flags() {
+    // `--plan`, `--write-setting` and `--adopt-existing-root` take no value: the
+    // refusal must be about the unregistered volume, not about a missing value.
+    let (_fixture, state_dir) = absent_state_dir("cache-adopt-flags");
+    let output = run_cache(
+        &[
+            "adopt",
+            "--kind",
+            "cargo-registry",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "--plan",
+            "--adopt-existing-root",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "unknown_state", "{document}");
+}
+
+#[test]
+fn cache_undo_needs_exactly_one_selector() {
+    let (_fixture, state_dir) = absent_state_dir("cache-undo-selector");
+    let output = run_cache(&["undo"], &state_dir);
+    assert_eq!(output.status.code(), Some(2));
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "usage");
+    let output = run_cache(
+        &[
+            "undo",
+            "--kind",
+            "npm-cache",
+            "--placement",
+            "0123456789abcdef0123456789abcdef",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "usage");
+    assert!(!state_dir.exists());
+}
+
+#[test]
+fn an_unknown_cache_kind_or_form_is_a_usage_refusal() {
+    let (_fixture, state_dir) = absent_state_dir("cache-unknown-kind");
+    let output = run_cache(
+        &[
+            "adopt",
+            "--kind",
+            "yarn-cache",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "usage");
+    assert!(
+        document["error"]["detail"]["usage"]
+            .as_str()
+            .is_some_and(|usage| usage.contains("barge cache adopt")),
+        "the usage names the cache verbs"
+    );
 }

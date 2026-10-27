@@ -1,0 +1,1827 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+//! The S6 native proof's harness preconditions.
+//!
+//! The elevated S6 native proof runs one fixed script
+//! (`scripts/native/s6-cache-placement-proof.sh`) as its whole command, and that
+//! script executes Oxide's qualified shared supervisor
+//! (`~/Dev/projects/oxide/scripts/bounded-test.py`) at pinned bytes. The
+//! supervisor is a Python file that Oxide keeps mode 0644 and runs with
+//! `python3`, so the script's gate must be readability plus the digest, never
+//! the execute bit: an owner-activated run once refused a 0644 supervisor
+//! ("is not executable") and never started the guard.
+//!
+//! These tests prove the harness contract without running any part of the
+//! proof: they read the script's source for the pin, the readable-regular-file
+//! gate and the interpreter invocation, and they drive the script's outer half
+//! against fixture supervisors whose bytes are not the pinned ones, so a 0644
+//! file must get past the mode gate and be refused for its digest.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+/// The pinned qualified supervisor digest, exactly as the plan and the script
+/// state it.
+const PINNED_SUPERVISOR_SHA256: &str =
+    "bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924";
+
+/// The fixed script under test.
+fn proof_script() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/native/s6-cache-placement-proof.sh")
+}
+
+/// A temporary directory that removes itself, created under this process's own
+/// temporary directory and never at a fixed path.
+struct Fixture {
+    path: PathBuf,
+}
+
+impl Fixture {
+    fn new(label: &str) -> Self {
+        let base = std::env::temp_dir();
+        let output = Command::new("/usr/bin/mktemp")
+            .arg("-d")
+            .arg(base.join(format!(
+                "barge-native-harness-{label}-{}.XXXXXXXX",
+                std::process::id()
+            )))
+            .output()
+            .expect("mktemp starts");
+        assert!(
+            output.status.success(),
+            "exclusive fixture allocation: {}",
+            stderr(&output)
+        );
+        let path = PathBuf::from(
+            String::from_utf8(output.stdout)
+                .expect("fixture path is UTF-8")
+                .trim_end(),
+        );
+        Self { path }
+    }
+
+    fn write(&self, name: &str, bytes: &[u8], mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.path.join(name);
+        std::fs::write(&path, bytes).expect("the fixture file is written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("the fixture mode is set");
+        path
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Run the fixed script's outer half with a fixture supervisor.
+///
+/// `OXIDE_PROOF_EVIDENCE` is removed so the script takes its outer path; it must
+/// never reach the interpreter with a fixture whose digest is not the pinned
+/// one.
+fn run_outer_half(supervisor: &Path, binary: &Path) -> Output {
+    Command::new("/bin/bash")
+        .arg(proof_script())
+        .arg("diagnostic")
+        .arg(binary)
+        .env("BARGE_S6_SUPERVISOR", supervisor)
+        .env_remove("OXIDE_PROOF_EVIDENCE")
+        .env_remove("OXIDE_TASK_SCRATCH_ROOT")
+        .output()
+        .expect("the proof script starts")
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn the_script_pins_the_supervisor_bytes_and_runs_them_with_python() {
+    let source = std::fs::read_to_string(proof_script()).expect("the proof script is readable");
+
+    assert!(
+        source.contains(&format!(
+            "readonly SUPERVISOR_SHA256=\"{PINNED_SUPERVISOR_SHA256}\""
+        )),
+        "the exact pinned supervisor digest is a constant"
+    );
+    assert!(
+        !source.contains("! -x \"$SUPERVISOR\""),
+        "the supervisor's execute bit must never be a precondition"
+    );
+    assert!(
+        source.contains("[[ ! -f \"$SUPERVISOR\" || ! -r \"$SUPERVISOR\" ]]"),
+        "the supervisor is gated as a readable regular file"
+    );
+    assert!(
+        source.contains("exec /usr/bin/python3 \"$SUPERVISOR\""),
+        "the pinned bytes are executed by /usr/bin/python3"
+    );
+    assert!(
+        !source.contains("chmod"),
+        "the proof never changes the supervisor's mode"
+    );
+    assert!(
+        source.contains("readonly LIMIT_SECONDS=300"),
+        "the task's 300 s wall clock is the fixed bound"
+    );
+    assert!(
+        source.contains("readonly SCRATCH_BUDGET_MIB=512"),
+        "the task's 512 MiB monitored scratch is the fixed bound"
+    );
+    assert!(
+        source.contains("--limit \"$LIMIT_SECONDS\"")
+            && source.contains("--scratch-budget-mib \"$SCRATCH_BUDGET_MIB\""),
+        "both bounds are passed to the pinned supervisor"
+    );
+    // A failing CLI call must name itself: every case goes through the wrapper,
+    // which echoes the invocation, the document and its stderr into the case log.
+    assert!(
+        source.contains("barge_cli() {") && !source.contains("\"$BARGE_BIN\" cache"),
+        "every case's CLI call goes through the evidence-capturing wrapper"
+    );
+    assert!(
+        source.contains("stdout: ") && source.contains("stderr: "),
+        "the wrapper echoes the CLI document and its stderr"
+    );
+    // Every case log is retained beside the receipt, and the receipt names it.
+    assert!(
+        source.contains("readonly CASE_LOGS=\"$EVIDENCE/cases\""),
+        "case logs are retained in the supervisor's evidence directory"
+    );
+    assert!(
+        source.contains("\"log\": log if os.path.exists(log) else None"),
+        "the receipt names each retained case log"
+    );
+    // The hand-made layout case creates its tool directory before linking.
+    assert!(
+        source.contains("mkdir -p \"$HOME/.cargo\"\n  ln -s \"$target\""),
+        "the hand-made case creates $HOME/.cargo before linking"
+    );
+}
+
+#[test]
+fn a_0644_supervisor_is_accepted_by_the_mode_gate_and_refused_by_the_pin() {
+    let fixture = Fixture::new("supervisor-0644");
+    let supervisor = fixture.write(
+        "bounded-test.py",
+        b"#!/usr/bin/env python3\nprint('a different supervisor')\n",
+        0o644,
+    );
+    let binary = fixture.write("barge", b"#!/bin/sh\nexit 0\n", 0o755);
+
+    let output = run_outer_half(&supervisor, &binary);
+    assert_eq!(
+        output.status.code(),
+        Some(125),
+        "a different supervisor is refused before anything runs"
+    );
+    let message = stderr(&output);
+    assert!(
+        message.contains("not the pinned") && message.contains(PINNED_SUPERVISOR_SHA256),
+        "the refusal names the pinned digest: {message}"
+    );
+    assert!(
+        !message.contains("not executable") && !message.contains("readable regular file"),
+        "a 0644 supervisor is not refused for its mode: {message}"
+    );
+}
+
+#[test]
+fn an_executable_supervisor_with_other_bytes_is_refused_for_the_same_reason() {
+    let fixture = Fixture::new("supervisor-0755");
+    let supervisor = fixture.write(
+        "bounded-test.py",
+        b"#!/usr/bin/env python3\nprint('also a different supervisor')\n",
+        0o755,
+    );
+    let binary = fixture.write("barge", b"#!/bin/sh\nexit 0\n", 0o755);
+
+    let output = run_outer_half(&supervisor, &binary);
+    assert_eq!(output.status.code(), Some(125));
+    let message = stderr(&output);
+    assert!(
+        message.contains("not the pinned") && message.contains(PINNED_SUPERVISOR_SHA256),
+        "the digest is the gate, not the mode: {message}"
+    );
+}
+
+// ---- the per-case harness preflight ----------------------------------------
+//
+// Every case that runs is preceded by two required descriptor observations made
+// through the same macOS primitive the product's observer uses:
+// `proc_pidinfo(PROC_PIDLISTFDS)` for the listing and
+// `proc_pidinfo(PROC_PIDTBSDINFO)` for the same-uid "kinfo" fact. One sentinel
+// child is started in the shared supervisor's guarded session, listed while it
+// is alive, then terminated and reaped inside the fixed bound; and one
+// pre-existing process of this account is listed after the same fact. Either
+// capability failing is an infrastructure abort, never a case result.
+//
+// The probe bodies are delimited in the script so these tests can run them
+// directly, below the elevated tier, against a fixture supervisor and fixture
+// scratch. No image, supervisor, selector or native case runs here.
+
+/// The delimiters around the probe block.
+const PREFLIGHT_BEGIN: &str = "# >>> s6-preflight";
+const PREFLIGHT_END: &str = "# <<< s6-preflight";
+
+/// The proof script's source.
+fn proof_source() -> String {
+    std::fs::read_to_string(proof_script()).expect("the proof script is readable")
+}
+
+/// The probe block, exactly as shipped.
+fn preflight_block() -> String {
+    let source = proof_source();
+    let start = source
+        .find(PREFLIGHT_BEGIN)
+        .expect("the preflight block has a begin marker")
+        + PREFLIGHT_BEGIN.len();
+    let rest = &source[start..];
+    let end = rest
+        .find(PREFLIGHT_END)
+        .expect("the preflight block has an end marker");
+    let block = rest[..end].to_string();
+    for function in [
+        "descriptor_observation() {",
+        "preflight_sentinel() {",
+        "preflight_existing_descriptors() {",
+    ] {
+        assert!(block.contains(function), "the block defines {function}");
+    }
+    block
+}
+
+/// The SHA-256 of one fixture file, computed the same way the script does.
+fn digest_of(path: &Path) -> String {
+    let output = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+        .expect("shasum runs");
+    assert!(output.status.success(), "shasum succeeds");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .expect("a digest is printed")
+        .to_string()
+}
+
+/// One preflight fixture: a private root, its scratch, a fixture supervisor and
+/// the shipped probe block, run in one bash process.
+struct ProbeRun {
+    fixture: Fixture,
+    output: Output,
+}
+
+impl ProbeRun {
+    fn root(&self) -> &Path {
+        &self.fixture.path
+    }
+
+    fn stdout(&self) -> String {
+        String::from_utf8_lossy(&self.output.stdout).into_owned()
+    }
+
+    fn stderr(&self) -> String {
+        String::from_utf8_lossy(&self.output.stderr).into_owned()
+    }
+
+    /// The observations the probes appended, one row of tab-separated fields.
+    fn observations(&self) -> Vec<Vec<String>> {
+        let path = self.root().join("observations.tsv");
+        let text = std::fs::read_to_string(path).expect("the observation file is readable");
+        text.lines()
+            .map(|line| line.split('\t').map(str::to_string).collect())
+            .collect()
+    }
+
+    fn observation(&self, probe: &str) -> Option<Vec<String>> {
+        self.observations()
+            .into_iter()
+            .find(|row| row.get(1).is_some_and(|name| name == probe))
+    }
+}
+
+/// Run the shipped probe block in a fresh fixture.
+///
+/// `pinned` is the digest the fixture supervisor is held to; `None` uses the
+/// fixture's own digest, so the supervisor probe passes.
+fn run_probe_block(label: &str, pinned: Option<&str>, body: &str) -> ProbeRun {
+    let fixture = Fixture::new(label);
+    let root = fixture.path.clone();
+    std::fs::create_dir_all(root.join("scratch")).expect("the fixture scratch is created");
+    let supervisor = fixture.write(
+        "supervisor.py",
+        b"#!/usr/bin/env python3\nprint('fixture supervisor')\n",
+        0o644,
+    );
+    let digest = digest_of(&supervisor);
+    let pinned = pinned.unwrap_or(&digest).to_string();
+    let block = preflight_block();
+    fixture.write("preflight-block.sh", block.as_bytes(), 0o644);
+    let script = format!(
+        "set -uo pipefail\n\
+         ROOT=\"{root}\"\n\
+         PREFLIGHT_SESSION=\"$(/bin/ps -o sess= -p $$ | tr -d ' ')\"\n\
+         PREFLIGHT_SENTINEL_BOUND_SECONDS=2\n\
+         PREFLIGHT_RUNS=0\n\
+         PREFLIGHT_FAILURE=\"\"\n\
+         PREFLIGHT_LAST_SENTINEL=\"\"\n\
+         PREFLIGHT_LAST_CENSUS=\"\"\n\
+         PREFLIGHT_TSV=\"$ROOT/observations.tsv\"\n\
+         : >\"$PREFLIGHT_TSV\"\n\
+         SUPERVISOR=\"$ROOT/supervisor.py\"\n\
+         SUPERVISOR_SHA256=\"{pinned}\"\n\
+         OXIDE_TASK_SCRATCH_ROOT=\"$ROOT/scratch\"\n\
+         TMPDIR=\"$ROOT/scratch\"\n\
+         source \"$ROOT/preflight-block.sh\"\n\
+         preflight_existing_descriptors() {{\n\
+         \x20 PREFLIGHT_LAST_CENSUS='{{\"status\":\"passed\",\"processes\":2,\"descriptors\":5}}'\n\
+         }}\n\
+         printf 'HARNESS_SESSION=%s\\n' \"$PREFLIGHT_SESSION\"\n\
+         {body}\n",
+        root = root.display(),
+        pinned = pinned,
+        body = body
+    );
+    let harness = fixture.write("harness.sh", script.as_bytes(), 0o644);
+    let output = Command::new("/bin/bash")
+        .arg(&harness)
+        .output()
+        .expect("the probe harness runs");
+    ProbeRun { fixture, output }
+}
+
+/// One `name=value` line's value.
+fn named_line(text: &str, prefix: &str) -> String {
+    text.lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("{prefix} is printed: {text}"))
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn the_probe_block_uses_the_kernel_descriptor_primitive_and_reaps_its_sentinel() {
+    let block = preflight_block();
+    // The same primitive the product's observer uses, for both halves.
+    assert!(
+        block.contains("PROC_PIDLISTFDS = 1"),
+        "the listing flavor is the kernel's"
+    );
+    assert!(
+        block.contains("PROC_PIDTBSDINFO = 3"),
+        "the same-uid fact is the kernel's"
+    );
+    assert!(
+        block.contains("libc.proc_pidinfo(pid, PROC_PIDTBSDINFO"),
+        "the kinfo fact is read before any listing"
+    );
+    assert!(
+        block.contains("libc.proc_pidinfo(\n    pid, PROC_PIDLISTFDS"),
+        "the listing is the real proc_pidinfo call"
+    );
+    assert!(
+        block
+            .find("reported_uid, problem = kinfo(pid)")
+            .expect("the kinfo fact is read")
+            < block
+                .find("PROC_PIDLISTFDS, 0, buf")
+                .expect("the listing follows the fact"),
+        "the same-uid fact precedes the descriptor listing"
+    );
+    // The sentinel is this shell's own child, terminated and reaped inside a
+    // bound, so nothing escapes into the session after the preflight.
+    assert!(
+        block.contains("pid=$!"),
+        "the sentinel is a child of this shell"
+    );
+    assert!(
+        block.contains("kill -TERM \"$pid\""),
+        "the sentinel is terminated"
+    );
+    assert!(
+        block.contains("kill -KILL \"$pid\""),
+        "a stuck sentinel is still bounded"
+    );
+    assert!(block.contains("wait \"$pid\""), "the sentinel is reaped");
+    assert!(
+        proof_source().contains("readonly PREFLIGHT_SENTINEL_BOUND_SECONDS=2"),
+        "the sentinel bound is a fixed constant"
+    );
+    // No escape hatch: no new session, no detached child.
+    for escape in ["setsid", "nohup", "disown", "set -m"] {
+        assert!(
+            !proof_source().contains(escape),
+            "the proof never uses {escape} to leave the guarded session"
+        );
+    }
+}
+
+#[test]
+fn a_successful_preflight_proves_both_descriptor_listings() {
+    let run = run_probe_block(
+        "preflight-ok",
+        None,
+        "if preflight \"case-one\" \"$ROOT/case-one/preflight\"; then\n\
+         \x20 printf 'PREFLIGHT=ok runs=%s\\n' \"$PREFLIGHT_RUNS\"\n\
+         else\n\
+         \x20 printf 'PREFLIGHT=failed %s\\n' \"$PREFLIGHT_FAILURE\"\n\
+         fi\n\
+         printf 'IDENTITY='; cat \"$ROOT/case-one/preflight/sentinel.identity\"",
+    );
+    assert_eq!(
+        run.output.status.code(),
+        Some(0),
+        "stderr: {}",
+        run.stderr()
+    );
+    let stdout = run.stdout();
+    assert!(
+        stdout.contains("PREFLIGHT=ok runs=1"),
+        "{stdout} {}",
+        run.stderr()
+    );
+    let session = named_line(&stdout, "HARNESS_SESSION=");
+    let identity = named_line(&stdout, "IDENTITY=");
+    let identity_session = identity
+        .split_once("session=")
+        .expect("the sentinel records its session")
+        .1
+        .trim();
+    assert_eq!(
+        identity_session, session,
+        "the sentinel ran in this session"
+    );
+
+    let sentinel = run
+        .observation("sentinel-descriptors")
+        .expect("the sentinel's descriptor listing is recorded");
+    let fields: Vec<&str> = sentinel[2].split_whitespace().collect();
+    assert_eq!(fields.first().copied(), Some("sentinel"), "{sentinel:?}");
+    assert!(
+        fields[2].parse::<u32>().expect("a descriptor count") >= 1,
+        "the live sentinel's descriptors were listed: {sentinel:?}"
+    );
+    assert_eq!(fields[4], "9", "the identity descriptor is observed");
+    assert_eq!(fields[5], "1", "the identity descriptor is a live vnode");
+
+    // Full-census policy is exercised separately against injected kernel facts;
+    // the preflight wrapper must record its result alongside the live sentinel.
+    let existing = run
+        .observation("full-census")
+        .expect("the census is recorded");
+    let census: serde_json::Value = serde_json::from_str(&existing[2]).expect("census JSON");
+    assert_eq!(census["status"], "passed");
+    assert_eq!(census["processes"], 2);
+
+    assert!(
+        run.observation("supervisor").is_some(),
+        "the supplemental supervisor identity check is recorded too"
+    );
+
+    let pid = identity
+        .strip_prefix("pid=")
+        .expect("the identity names its pid")
+        .split_whitespace()
+        .next()
+        .expect("the pid is a field");
+    let gone = Command::new("/bin/kill")
+        .arg("-0")
+        .arg(pid)
+        .output()
+        .expect("kill -0 runs");
+    assert!(
+        !gone.status.success(),
+        "the sentinel was reaped, not left in the session"
+    );
+}
+
+#[test]
+fn a_failed_supervisor_probe_aborts_before_the_sentinel() {
+    let run = run_probe_block(
+        "preflight-pin-fail",
+        Some("0000000000000000000000000000000000000000000000000000000000000000"),
+        "if preflight \"case-x\" \"$ROOT/case-x/preflight\"; then\n\
+         \x20 printf 'PREFLIGHT=unexpected\\n'\n\
+         else\n\
+         \x20 printf 'PREFLIGHT=failed %s\\n' \"$PREFLIGHT_FAILURE\"\n\
+         fi",
+    );
+    let stdout = run.stdout();
+    assert!(
+        stdout.contains("PREFLIGHT=failed supervisor probe failed before case-x"),
+        "{stdout} {}",
+        run.stderr()
+    );
+    assert!(
+        run.observations().is_empty(),
+        "no probe observation is recorded on an abort"
+    );
+    assert!(
+        !run.root()
+            .join("case-x/preflight/sentinel.identity")
+            .exists(),
+        "the sentinel never starts when the supervisor probe fails"
+    );
+    assert!(
+        run.stderr().contains("not the pinned"),
+        "the refusal names the pin: {}",
+        run.stderr()
+    );
+}
+
+#[test]
+fn a_failed_sentinel_descriptor_probe_aborts_the_case() {
+    let run = run_probe_block(
+        "preflight-sentinel-fail",
+        None,
+        "printf 'x' >\"$ROOT/blocker\"\n\
+         if preflight \"case-y\" \"$ROOT/blocker/probe\"; then\n\
+         \x20 printf 'PREFLIGHT=unexpected\\n'\n\
+         else\n\
+         \x20 printf 'PREFLIGHT=failed %s\\n' \"$PREFLIGHT_FAILURE\"\n\
+         fi",
+    );
+    let stdout = run.stdout();
+    assert!(
+        stdout.contains("PREFLIGHT=failed sentinel descriptor probe failed before case-y"),
+        "{stdout} {}",
+        run.stderr()
+    );
+    assert!(
+        run.observations().is_empty(),
+        "an aborted preflight records no observation"
+    );
+    assert!(
+        run.stderr()
+            .contains("cannot create the sentinel probe directory"),
+        "the sentinel failure names itself: {}",
+        run.stderr()
+    );
+}
+
+#[test]
+fn an_unavailable_existing_process_listing_aborts_the_case() {
+    let run = run_probe_block(
+        "preflight-existing-fail",
+        None,
+        "preflight_existing_descriptors() {\n\
+         \x20 PREFLIGHT_LAST_CENSUS='{\"status\":\"infrastructure\",\"pid\":1299,\"command\":\"fixture\",\"problem\":\"EPERM\"}'\n\
+         \x20 return 1\n\
+         }\n\
+         if preflight case-z \"$ROOT/case-z/preflight\"; then\n\
+         \x20 printf 'EXISTING=unexpected\\n'\n\
+         else\n\
+         \x20 printf 'EXISTING=failed\\n'\n\
+         fi",
+    );
+    assert!(run.stdout().contains("EXISTING=failed"), "{}", run.stderr());
+    let census = run
+        .observation("full-census")
+        .expect("failed census retained");
+    assert!(census[2].contains("1299") && census[2].contains("EPERM"));
+    assert!(census[2].contains("fixture"));
+}
+
+#[test]
+fn the_preflight_refuses_a_changed_session() {
+    let run = run_probe_block(
+        "preflight-session-fail",
+        None,
+        "if preflight_supervisor \"$SUPERVISOR\" \"$SUPERVISOR_SHA256\" 999999; then\n\
+         \x20 printf 'SESSION=unexpected\\n'\n\
+         else\n\
+         \x20 printf 'SESSION=failed\\n'\n\
+         fi",
+    );
+    assert!(run.stdout().contains("SESSION=failed"), "{}", run.stderr());
+    assert!(
+        run.stderr().contains("is not the guarded session"),
+        "the session check names the guard: {}",
+        run.stderr()
+    );
+}
+
+#[test]
+fn every_case_is_preflighted_before_its_body_and_aborts_the_run() {
+    let source = proof_source();
+    let run_case = &source[source.find("run_case() {").expect("run_case exists")
+        ..source
+            .find("# ---- run --")
+            .expect("the run section exists")];
+    let preflight_at = run_case
+        .find("preflight \"$id\" \"$probe\"")
+        .expect("the case is preflighted");
+    let body_at = run_case.find("if \"$body\"").expect("the case body runs");
+    assert!(
+        preflight_at < body_at,
+        "the preflight precedes every case body"
+    );
+    assert!(
+        run_case
+            .contains("record \"$id\" \"skipped\" \"infrastructure abort: $PREFLIGHT_FAILURE\"")
+            && run_case.contains("STOPPED=\"$id\""),
+        "a failed probe stops the run instead of being recorded as a case result"
+    );
+    let preflight = &source[source.find("preflight() {").expect("preflight exists")
+        ..source.find(PREFLIGHT_END).expect("the block ends")];
+    assert!(
+        preflight.contains("preflight_sentinel")
+            && preflight.contains("preflight_existing_descriptors"),
+        "both required descriptor probes run before a case"
+    );
+    assert!(
+        source.contains("refuse \"preflight infrastructure abort: $PREFLIGHT_FAILURE"),
+        "the run refuses with an infrastructure status, not a case failure"
+    );
+    assert!(
+        source.contains("\"aborted\": preflight_failure is not None")
+            && source.contains("and preflight_failure is None")
+            && source.contains("and int(os.environ[\"S6_PREFLIGHT_RUNS\"]) == len(cases)"),
+        "the receipt records the abort and can never be qualified by it"
+    );
+}
+
+/// Extract only the shipped oracle or case under test; never start the proof.
+fn source_between(begin: &str, end: &str) -> String {
+    let source = proof_source();
+    let start = source.find(begin).expect("the block begins") + begin.len();
+    let rest = &source[start..];
+    rest[..rest.find(end).expect("the block ends")].to_string()
+}
+
+#[test]
+fn the_full_census_uses_the_same_barge_command_and_rejects_incomplete_documents() {
+    let block = source_between("preflight_existing_descriptors() {", "\npreflight() {");
+    assert!(block.contains("barge_cli \"$probe_dir/census.json\" diagnostic descriptor-census --root \"$probe_dir\" --json"));
+    assert!(
+        !proof_source().contains("ctypes.POINTER(ctypes.c_int)"),
+        "no parallel Python census remains"
+    );
+    for (mode, expected) in [
+        ("passed", 0),
+        ("infrastructure", 1),
+        ("bounds", 1),
+        ("error", 1),
+        ("malformed", 1),
+    ] {
+        let fixture = Fixture::new("same-barge-census");
+        let body = r#"
+ROOT="$PWD"
+mkdir "$ROOT/probe"
+barge_cli() {
+  [[ "$2" == diagnostic && "$3" == descriptor-census && "$4" == --root && "$6" == --json ]] || return 99
+  /usr/bin/python3 - "$1" "$5" "$S6_CENSUS_FIXTURE" <<'PY'
+import json, sys
+out, root, mode = sys.argv[1:]
+data = {"status": mode, "root": root, "process_limit": 4096,
+        "descriptor_limit": 65536, "timeout_ms": 10000, "processes": 2, "descriptors": 5}
+if mode == 'bounds':
+    data.update(status='passed', process_limit=9999)
+if mode == 'infrastructure':
+    data.update(problem='pid 42 unreadable', retry={'retried_unreadable': 1})
+doc = {"schema": "barge.diagnostic.descriptor-census/1", "command": "diagnostic.descriptor-census",
+       "ok": True, "data": data}
+if mode == 'error':
+    doc = {"ok": False, "error": {"message": "cannot start census"}}
+with open(out, 'w') as f:
+    f.write('not-json' if mode == 'malformed' else json.dumps(doc))
+PY
+}
+preflight_existing_descriptors "$ROOT/probe"
+result=$?
+printf '%s\n' "$PREFLIGHT_LAST_CENSUS"
+exit "$result"
+"#;
+        let script = fixture.write(
+            "census.sh",
+            format!("set -uo pipefail\npreflight_existing_descriptors() {{{block}\n{body}")
+                .as_bytes(),
+            0o644,
+        );
+        let output = Command::new("/bin/bash")
+            .arg(script)
+            .current_dir(&fixture.path)
+            .env("S6_CENSUS_FIXTURE", mode)
+            .output()
+            .expect("the pure census wrapper fixture runs");
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{mode}: {}",
+            stderr(&output)
+        );
+        let doc: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("normalized census JSON");
+        assert_eq!(
+            doc["status"],
+            if mode == "passed" {
+                "passed"
+            } else {
+                "infrastructure"
+            }
+        );
+        if mode == "infrastructure" {
+            assert_eq!(doc["retry"]["retried_unreadable"], 1);
+        }
+    }
+}
+
+#[test]
+fn the_adopted_tree_oracle_tolerates_only_the_root_marker_metadata_changes() {
+    let fixture = Fixture::new("adopted-tree-oracle");
+    let oracle = source_between(
+        "# >>> s6-adopted-tree-digest",
+        "# <<< s6-adopted-tree-digest",
+    );
+    let body = r#"
+mkdir -p cache/nested
+printf 'registry data' >cache/payload
+printf 'nested marker is payload' >cache/nested/.barge-root.json
+ln -s payload cache/payload-link
+before="$(digest_tree_excluding cache .barge-root.json)"
+printf marker >cache/.barge-root.json
+touch -mt 200001010000 cache
+[[ "$(digest_tree_excluding cache .barge-root.json)" == "$before" ]]
+rm cache/.barge-root.json
+touch -mt 200101010000 cache
+[[ "$(digest_tree_excluding cache .barge-root.json)" == "$before" ]]
+
+# Same-size changed bytes with the original mtime still have to be noticed.
+/usr/bin/python3 - <<'PY'
+import os
+p = 'cache/payload'
+s = os.stat(p)
+with open(p, 'wb') as f:
+    f.write(b'registry DATA')
+os.utime(p, ns=(s.st_atime_ns, s.st_mtime_ns))
+PY
+[[ "$(digest_tree_excluding cache .barge-root.json)" != "$before" ]]
+before="$(digest_tree_excluding cache .barge-root.json)"
+mv cache/payload cache/renamed
+[[ "$(digest_tree_excluding cache .barge-root.json)" != "$before" ]]
+mv cache/renamed cache/payload
+[[ "$(digest_tree_excluding cache .barge-root.json)" == "$before" ]]
+
+rm cache/payload-link
+ln -s other-payload cache/payload-link
+[[ "$(digest_tree_excluding cache .barge-root.json)" != "$before" ]]
+before="$(digest_tree_excluding cache .barge-root.json)"
+printf changed >cache/nested/.barge-root.json
+[[ "$(digest_tree_excluding cache .barge-root.json)" != "$before" ]]
+if digest_tree_excluding missing .barge-root.json; then
+  echo 'an unreadable tree was accepted' >&2
+  exit 1
+fi
+"#;
+    let script = fixture.write(
+        "oracle.sh",
+        format!("set -euo pipefail\n{oracle}\n{body}").as_bytes(),
+        0o644,
+    );
+    let output = Command::new("/bin/bash")
+        .arg(script)
+        .current_dir(&fixture.path)
+        .output()
+        .expect("the pure oracle fixture runs");
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
+fn the_hand_made_case_uses_one_oracle_for_adopt_and_undo_and_keeps_the_link() {
+    let oracle = source_between(
+        "# >>> s6-adopted-tree-digest",
+        "# <<< s6-adopted-tree-digest",
+    );
+    let case = source_between(
+        "\ncase_hand_made_in_place() {",
+        "\ncase_plan_effect_free() {",
+    );
+    // Model only marker publication/removal, without a CLI, supervisor or image.
+    // JSON conformance belongs to the product tests; here the shipped case must
+    // tolerate the expected root changes and refuse payload/link changes.
+    let body = r#"
+export HOME="$PWD/home"
+CASE_CACHES="$PWD/caches"
+CASE_OUT="$PWD/out"
+UUID=fixture
+mkdir -p "$HOME" "$CASE_OUT"
+assert_json() { return 0; }
+barge_cli() {
+  local target="$CASE_CACHES/cargo/registry"
+  if [[ "$3" == adopt ]]; then
+    printf marker >"$target/.barge-root.json"
+    touch -mt 200001010000 "$target"
+    case "$S6_FIXTURE_CHANGE" in
+      payload) printf changed >"$target/payload" ;;
+      moved) mv "$target/payload" "$target/renamed" ;;
+      link)
+        rm "$HOME/.cargo/registry"
+        ln -s "$CASE_CACHES/other" "$HOME/.cargo/registry"
+        ;;
+      swapped-link)
+        mv "$HOME/.cargo/registry" "$HOME/.cargo/old-link"
+        ln -s "$target" "$HOME/.cargo/registry"
+        ;;
+    esac
+  else
+    rm "$target/.barge-root.json"
+    touch -mt 200101010000 "$target"
+    if [[ "$S6_FIXTURE_CHANGE" == undo-payload ]]; then
+      printf changed >"$target/payload"
+    fi
+  fi
+}
+case_hand_made_in_place
+"#;
+    for (change, expected) in [
+        ("none", 0),
+        ("payload", 1),
+        ("moved", 1),
+        ("link", 1),
+        ("swapped-link", 1),
+        ("undo-payload", 1),
+    ] {
+        let fixture = Fixture::new(&format!("hand-made-{change}"));
+        let script = fixture.write(
+            "case.sh",
+            format!("set -uo pipefail\n{oracle}\ncase_hand_made_in_place() {{{case}\n{body}")
+                .as_bytes(),
+            0o644,
+        );
+        let output = Command::new("/bin/bash")
+            .arg(script)
+            .current_dir(&fixture.path)
+            .env("S6_FIXTURE_CHANGE", change)
+            .output()
+            .expect("the pure hand-made case fixture runs");
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{change}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn the_shipped_verdict_executes_without_stray_prose_and_preserves_failures() {
+    let source = proof_source();
+    let start = source
+        .find("# The run's own verdict:")
+        .expect("the verdict begins");
+    let verdict = &source[start..];
+    for (preflight, fault, expected) in [("", "", 0), ("", "case", 1), ("probe", "", 125)] {
+        let fixture = Fixture::new("verdict");
+        let script = fixture.write(
+            "verdict.sh",
+            format!(
+                "set -uo pipefail\nrefuse() {{ exit 125; }}\nMODE=diagnostic\nRECEIPT=fixture\n{verdict}"
+            )
+            .as_bytes(),
+            0o644,
+        );
+        let output = Command::new("/bin/bash")
+            .arg(script)
+            .env("PREFLIGHT_FAILURE", preflight)
+            .env("FIRST_FAULT", fault)
+            .output()
+            .expect("the pure verdict fixture runs");
+        assert_eq!(output.status.code(), Some(expected), "{}", stderr(&output));
+        assert!(
+            !stderr(&output).contains("command not found"),
+            "only verdict commands execute: {}",
+            stderr(&output)
+        );
+    }
+}
+
+// ---- the nine-premise trace ------------------------------------------------
+//
+// The design's nine-premise HIGH checklist must be traced through the case
+// bodies, not asserted in prose. The script ships one row per
+// (premise, case, concrete assertion) in `write_premise_trace`, every `run_case`
+// declares the premise ids its body demonstrates, and the receipt folds the two
+// against the recorded case results and requires all nine for a counted pass.
+// These tests run the shipped trace writer and the shipped receipt body, and
+// prove the map is complete, that the plan, the trace and the case list agree,
+// and that the receipt can only qualify a run whose mapped cases all passed.
+
+/// The delimiters around the shipped premise trace.
+const TRACE_BEGIN: &str = "# >>> s6-premise-trace";
+const TRACE_END: &str = "# <<< s6-premise-trace";
+
+/// The delimiters around the shipped receipt body.
+const RECEIPT_BEGIN: &str = "# >>> s6-receipt";
+const RECEIPT_END: &str = "# <<< s6-receipt";
+
+/// The shipped premise trace, exactly as written before the cases run.
+fn premise_trace_block() -> String {
+    let source = proof_source();
+    let start = source
+        .find(TRACE_BEGIN)
+        .expect("the premise trace has a begin marker")
+        + TRACE_BEGIN.len();
+    let rest = &source[start..];
+    let end = rest
+        .find(TRACE_END)
+        .expect("the premise trace has an end marker");
+    let block = rest[..end].to_string();
+    assert!(
+        block.contains("write_premise_trace() {"),
+        "the block writes the trace"
+    );
+    block
+}
+
+/// The shipped receipt body, the Python between `<<'PY'` and its terminator.
+fn receipt_body() -> String {
+    let source = proof_source();
+    let start = source
+        .find(RECEIPT_BEGIN)
+        .expect("the receipt has a begin marker")
+        + RECEIPT_BEGIN.len();
+    let end = source[start..]
+        .find(RECEIPT_END)
+        .expect("the receipt has an end marker")
+        + start;
+    let block = &source[start..end];
+    let mut body = Vec::new();
+    let mut started = false;
+    let mut closed = false;
+    for line in block.lines() {
+        if !started {
+            if line.contains("<<'PY'") {
+                started = true;
+            }
+            continue;
+        }
+        if line == "PY" {
+            closed = true;
+            break;
+        }
+        body.push(line);
+    }
+    assert!(started, "the receipt body starts at its heredoc");
+    assert!(closed, "the receipt heredoc closes");
+    assert!(
+        body.iter().any(|line| line.contains("import json")),
+        "the receipt body is the Python program"
+    );
+    body.join("\n")
+}
+
+/// One traced row: a premise, the case body that asserts it, and the assertion.
+struct PremiseRow {
+    premise: u32,
+    case: String,
+    asserts: String,
+}
+
+/// Run the shipped trace writer against a fixture run root.
+fn shipped_premise_rows() -> (Fixture, Vec<PremiseRow>) {
+    let fixture = Fixture::new("premise-trace");
+    let root = &fixture.path;
+    fixture.write("trace-block.sh", premise_trace_block().as_bytes(), 0o644);
+    let script = format!(
+        "set -uo pipefail\n\
+         ROOT=\"{root}\"\n\
+         PREMISE_TRACE_TSV=\"$ROOT/premise-trace.tsv\"\n\
+         : >\"$PREMISE_TRACE_TSV\"\n\
+         source \"$ROOT/trace-block.sh\"\n\
+         write_premise_trace\n\
+         cat \"$PREMISE_TRACE_TSV\"\n",
+        root = root.display()
+    );
+    let harness = fixture.write("trace.sh", script.as_bytes(), 0o644);
+    let output = Command::new("/bin/bash")
+        .arg(&harness)
+        .output()
+        .expect("the trace writer runs");
+    assert!(
+        output.status.success(),
+        "the trace writer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let rows = text
+        .lines()
+        .map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            assert_eq!(
+                fields.len(),
+                3,
+                "one row is premise, case and assertion: {line}"
+            );
+            PremiseRow {
+                premise: fields[0].parse::<u32>().expect("a premise id is a number"),
+                case: fields[1].to_string(),
+                asserts: fields[2].to_string(),
+            }
+        })
+        .collect();
+    (fixture, rows)
+}
+
+/// Every case body the runner declares, with the premise ids it demonstrates.
+fn declared_case_premises() -> BTreeMap<String, BTreeSet<u32>> {
+    let source = proof_source();
+    let mut declared = BTreeMap::new();
+    for line in source.lines() {
+        let Some(rest) = line.strip_prefix("run_case ") else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        assert_eq!(
+            fields.len(),
+            4,
+            "run_case takes id, depends, body and premises: {line}"
+        );
+        let id = fields[0].to_string();
+        let premises: BTreeSet<u32> = fields[3]
+            .trim_matches('"')
+            .split(',')
+            .filter(|part| !part.is_empty())
+            .map(|part| part.parse::<u32>().expect("a premise id is a number"))
+            .collect();
+        assert!(!premises.is_empty(), "{id} declares at least one premise");
+        declared.insert(id, premises);
+    }
+    declared
+}
+
+#[test]
+fn the_premise_trace_maps_every_premise_to_a_case_body() {
+    let (_fixture, rows) = shipped_premise_rows();
+    assert!(!rows.is_empty(), "the trace writes rows");
+
+    let declared = declared_case_premises();
+    let mut premise_rows: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
+    let mut case_rows: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    for row in &rows {
+        assert!(
+            !row.asserts.trim().is_empty(),
+            "premise {} for {} names its concrete assertion",
+            row.premise,
+            row.case
+        );
+        assert!(
+            declared.contains_key(&row.case),
+            "a trace row cites a declared case body: {}",
+            row.case
+        );
+        premise_rows
+            .entry(row.premise)
+            .or_default()
+            .insert(row.case.clone());
+        case_rows
+            .entry(row.case.clone())
+            .or_default()
+            .insert(row.premise);
+    }
+
+    let premises: BTreeSet<u32> = (1..=9).collect();
+    assert_eq!(
+        premise_rows.keys().copied().collect::<BTreeSet<u32>>(),
+        premises,
+        "every premise 1-9 is mapped to a case body"
+    );
+    assert_eq!(
+        case_rows.keys().cloned().collect::<BTreeSet<String>>(),
+        declared.keys().cloned().collect::<BTreeSet<String>>(),
+        "every case body is mapped at least once"
+    );
+    for (case, expected) in &declared {
+        assert_eq!(
+            case_rows.get(case),
+            Some(expected),
+            "{case}: the declared premises equal the citing rows"
+        );
+    }
+
+    // The receipt turns the shipped rows into evidence and needs all nine.
+    let source = proof_source();
+    assert!(
+        source.contains("S6_PREMISE_TRACE=\"$PREMISE_TRACE_TSV\""),
+        "the receipt reads the shipped trace file"
+    );
+    assert!(
+        source.contains("\"asserts\": asserts"),
+        "each observation carries its concrete assertion"
+    );
+    assert!(
+        source.contains("\"premise_trace\": premise_trace"),
+        "the receipt carries the folded trace"
+    );
+    assert!(
+        source.contains("and premise_trace[\"complete\"]"),
+        "a counted receipt needs a complete premise trace"
+    );
+    assert!(
+        source.contains("record \"$id\" \"pass\" \"$(tr '\\n' ';' <\"$log\")\" \"$premises\""),
+        "each case row records the premise ids it was declared for"
+    );
+    let trace_call = source
+        .find("\nwrite_premise_trace\n")
+        .expect("the trace is written at startup");
+    let first_case = source
+        .find("\nrun_case absent-path ")
+        .expect("the cases run");
+    assert!(
+        trace_call < first_case,
+        "the trace is written before the first case runs"
+    );
+
+    // The plan carries the same map, one row per premise and one per case.
+    let docs = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/knowledge/contracts/s6-native-proof.md"),
+    )
+    .expect("the proof plan is readable");
+    assert!(docs.contains("## The premise trace in the receipt"));
+    for premise in 1..=9 {
+        assert!(
+            docs.contains(&format!("\n| {premise} | ")),
+            "the plan has a premise row for {premise}"
+        );
+    }
+    for case in declared.keys() {
+        assert!(
+            docs.contains(&format!("| `{case}` |")),
+            "the plan has a case row for {case}"
+        );
+    }
+}
+
+/// Run the shipped receipt body against fabricated evidence and return the
+/// receipt document it wrote.
+fn fabricated_receipt(
+    label: &str,
+    statuses: &BTreeMap<String, &str>,
+    census_passed: bool,
+    detach_mode: &str,
+) -> (Fixture, serde_json::Value) {
+    let (trace_fixture, rows) = shipped_premise_rows();
+    let fixture = Fixture::new(label);
+    let root = &fixture.path;
+    let declared = declared_case_premises();
+    std::fs::create_dir_all(root.join("cases")).expect("the case log directory is created");
+
+    let mut cases = String::new();
+    for (case, premises) in &declared {
+        let ids = premises
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<String>>()
+            .join(",");
+        let status = statuses.get(case).copied().unwrap_or("pass");
+        cases.push_str(&format!("{case}\t{status}\tthe {case} case log\t{ids}\n"));
+    }
+    std::fs::write(root.join("cases.tsv"), cases).expect("the fabricated cases are written");
+
+    let mut trace = String::new();
+    for row in &rows {
+        trace.push_str(&format!("{}\t{}\t{}\n", row.premise, row.case, row.asserts));
+    }
+    std::fs::write(root.join("premise-trace.tsv"), trace).expect("the fabricated trace is written");
+
+    let mut preflight = String::new();
+    for case in declared.keys() {
+        preflight.push_str(&format!("{case}\tsupervisor\tsession=1 pinned=fixture\n"));
+        preflight.push_str(&format!(
+            "{case}\tsentinel-descriptors\tsentinel 501 4 2 9 1\n"
+        ));
+        let status = if census_passed {
+            "passed"
+        } else {
+            "infrastructure"
+        };
+        let census = serde_json::json!({
+            "status": status, "processes": 2, "descriptors": 5,
+            "os_blind_spot": {"processes": 1, "opaque_descriptors": 2,
+                "records": [{"pid": 43, "start": 321, "command": "platform-fixture", "opaque_descriptors": 2}]}
+        });
+        preflight.push_str(&format!("{case}\tfull-census\t{census}\n"));
+    }
+    std::fs::write(root.join("preflight.tsv"), preflight)
+        .expect("the fabricated preflight observations are written");
+
+    let ordinary = "case\tordinary\tfixture-mount\t/dev/disk42s1\t\t0\tcase.log\n";
+    let cleanup = "cleanup\tordinary\tfixture-mount\t/dev/disk42s1\t\t0\tcleanup.log\n";
+    let detach = match detach_mode {
+        "missing" => String::new(),
+        "pending" => format!(
+            "{ordinary}cleanup\tordinary\tfixture-mount\t/dev/disk42s1\t\tpending\tcleanup.log\n"
+        ),
+        "force" => format!(
+            "{ordinary}cleanup\tordinary\tfixture-mount\t/dev/disk42s1\t\t1\tcleanup.log\n\
+             cleanup\tforce\t/dev/disk42\t/dev/disk42s1\tdisk42\t0\tforce.log\n"
+        ),
+        _ => format!("{ordinary}{cleanup}"),
+    };
+    std::fs::write(root.join("detach.tsv"), detach).expect("detach evidence written");
+
+    let mut plans = String::new();
+    for case in declared
+        .keys()
+        .filter(|case| case.as_str() != "plan-effect-free")
+    {
+        let path = root.join(format!("{case}-plan.json"));
+        std::fs::write(
+            &path,
+            br#"{"ok":true,"data":{"plan":true,"placement":null}}"#,
+        )
+        .expect("fixture adoption plan");
+        plans.push_str(&format!("{case}\t{}\t0\n", path.display()));
+    }
+    std::fs::write(root.join("adopt-plans.tsv"), plans).expect("fixture plans manifest");
+    let receipt_path = root.join("receipt.json");
+    if detach_mode == "root-link" {
+        std::os::unix::fs::symlink(root.join("missing"), root.join("removed-run"))
+            .expect("a dangling fixture root link");
+    }
+    if detach_mode == "backing-link" {
+        std::os::unix::fs::symlink(root.join("missing"), root.join("fixture.sparseimage"))
+            .expect("a dangling fixture backing link");
+    }
+    if detach_mode == "ancestor-link" {
+        std::os::unix::fs::symlink(root.join("missing"), root.join("ancestor"))
+            .expect("a dangling ancestor link");
+    }
+    let run_path = if detach_mode == "ancestor-link" {
+        root.join("ancestor/removed-run")
+    } else {
+        root.join("removed-run")
+    };
+    let body = receipt_body();
+    let body = if detach_mode == "recreated" {
+        body.replace(
+            "        handle.write(\"\\n\")",
+            "        handle.write(\"\\n\")\n        os.makedirs(os.path.join(os.environ[\"S6_RUN\"], \"receipt-cache\"), exist_ok=True)",
+        )
+    } else if detach_mode == "late-recreated" {
+        body.replace(
+            "        handle.write(\"\\n\")",
+            "        handle.write(\"\\n\")\n        globals()[\"receipt_writes\"] = globals().get(\"receipt_writes\", 0) + 1\n        if receipt_writes == 2:\n            os.makedirs(os.path.join(os.environ[\"S6_RUN\"], \"receipt-cache\"))",
+        )
+    } else {
+        body
+    };
+    let program = fixture.write("receipt.py", body.as_bytes(), 0o644);
+    let output = Command::new("/usr/bin/python3")
+        .arg(&program)
+        .env("S6_ADOPT_PLANS", root.join("adopt-plans.tsv"))
+        .env("S6_RUN", &run_path)
+        .env("S6_DETACH_TSV", root.join("detach.tsv"))
+        .env(
+            "S6_CLEANUP_DISPOSITION",
+            if detach_mode == "kept" {
+                "kept"
+            } else {
+                "removed"
+            },
+        )
+        .env("S6_ATTACHED", "0")
+        .env(
+            "S6_KEEP_BACKING",
+            if detach_mode == "kept" { "1" } else { "0" },
+        )
+        .env("S6_MODE", "counted")
+        .env("S6_EXIT", "0")
+        .env("S6_RECEIPT", &receipt_path)
+        .env("S6_EVIDENCE", root)
+        .env("S6_CASES", root.join("cases.tsv"))
+        .env("S6_PREMISE_TRACE", root.join("premise-trace.tsv"))
+        .env("S6_PREFLIGHT_TSV", root.join("preflight.tsv"))
+        .env("S6_PREFLIGHT_RUNS", declared.len().to_string())
+        .env("S6_PREFLIGHT_FAILURE", "")
+        .env("S6_PREFLIGHT_SESSION", "1")
+        .env("S6_PREFLIGHT_BOUND", "2")
+        .env("S6_CASE_LOGS", root.join("cases"))
+        .env("S6_HEAD", "fixture-head")
+        .env("S6_REPO", root)
+        .env("S6_BINARY", "/bin/true")
+        .env("S6_BINARY_SHA256", "fixture-binary-sha256")
+        .env("S6_SUPERVISOR", "/bin/true")
+        .env("S6_SUPERVISOR_SHA", "fixture-supervisor")
+        .env("S6_VOLUME", "BargeProofFixture")
+        .env("S6_MOUNT", "/Volumes/BargeProofFixture")
+        .env("S6_BACKING", root.join("fixture.sparseimage"))
+        .env("S6_SCRATCH", root.join("scratch"))
+        .env("S6_TMPDIR", root.join("scratch"))
+        .env("S6_HOME", root.join("home"))
+        .env("S6_CARGO_HOME", root.join("cargo-home"))
+        .env("S6_STATE", root.join("state"))
+        .env("S6_REAL_STATE", root.join("real-state"))
+        .env("S6_REAL_BEFORE", "same")
+        .env("S6_REAL_AFTER", "same")
+        .env("S6_STARTED", "1")
+        .env("S6_IMAGE_MIB", "128")
+        .env("S6_LIMIT", "300")
+        .env("S6_SCRATCH_MIB", "512")
+        .output()
+        .expect("the receipt body runs");
+    let expects_remainder = matches!(
+        detach_mode,
+        "recreated" | "late-recreated" | "root-link" | "backing-link" | "ancestor-link"
+    );
+    assert_eq!(
+        output.status.success(),
+        !expects_remainder,
+        "{detach_mode}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = std::fs::read_to_string(&receipt_path).expect("the receipt is written");
+    let document = serde_json::from_str(&text).expect("the receipt is one JSON document");
+    drop(trace_fixture);
+    (fixture, document)
+}
+
+#[test]
+fn the_receipt_folds_the_premise_trace_against_case_results() {
+    let mut statuses = BTreeMap::new();
+    let (_fixture, document) =
+        fabricated_receipt("premise-receipt-pass", &statuses, true, "ordinary");
+    assert_eq!(
+        document["qualified"], true,
+        "a clean fixture receipt qualifies"
+    );
+    assert_eq!(document["premise_trace"]["premises"], 9);
+    assert_eq!(document["premise_trace"]["covered"], 9);
+    assert_eq!(document["premise_trace"]["complete"].as_bool(), Some(true));
+    let censuses = document["preflight"]["censuses"]
+        .as_array()
+        .expect("censuses retained");
+    assert_eq!(censuses.len(), 9);
+    assert!(
+        censuses
+            .iter()
+            .all(|row| row["os_blind_spot"]["records"][0]["pid"] == 43),
+        "the receipt preserves the product's named blind spots, not just its pass status"
+    );
+    assert!(censuses
+        .iter()
+        .all(|row| row["status"] == "passed" && row["processes"] == 2));
+    let premises = document["premises"]
+        .as_array()
+        .expect("the receipt lists the premises");
+    assert_eq!(premises.len(), 9);
+    for premise in premises {
+        assert_eq!(premise["covered"].as_bool(), Some(true), "{premise}");
+        let observations = premise["observations"]
+            .as_array()
+            .expect("each premise lists its observations");
+        assert!(!observations.is_empty(), "{premise}");
+        for observation in observations {
+            assert_eq!(observation["status"], "pass", "{observation}");
+            assert!(
+                observation["asserts"]
+                    .as_str()
+                    .is_some_and(|assertion| !assertion.is_empty()),
+                "{observation}"
+            );
+            assert!(
+                observation["evidence"]
+                    .as_str()
+                    .is_some_and(|evidence| evidence.contains("case log")),
+                "the case's own evidence line is folded in: {observation}"
+            );
+        }
+    }
+    let case_rows = document["cases"].as_array().expect("the cases are listed");
+    for case in case_rows {
+        assert!(
+            case["premises"]
+                .as_array()
+                .is_some_and(|ids| !ids.is_empty()),
+            "each case row carries the premises it was declared for: {case}"
+        );
+    }
+
+    let (_fixture, document) =
+        fabricated_receipt("census-receipt-fail", &statuses, false, "ordinary");
+    assert_eq!(
+        document["qualified"], false,
+        "failed censuses cannot qualify passing cases"
+    );
+    statuses.insert("ordinary-detach".to_string(), "fail");
+    let (_fixture, document) =
+        fabricated_receipt("premise-receipt-fail", &statuses, true, "ordinary");
+    assert_eq!(
+        document["qualified"], false,
+        "a failed case never qualifies"
+    );
+    assert_eq!(document["premise_trace"]["complete"].as_bool(), Some(false));
+    let missing = document["premise_trace"]["missing"]
+        .as_array()
+        .expect("the receipt names the missing premises");
+    let missing: Vec<u64> = missing
+        .iter()
+        .map(|value| value.as_u64().expect("a premise id"))
+        .collect();
+    assert_eq!(
+        missing,
+        vec![2, 5, 9],
+        "only this case's premises are missing"
+    );
+    let premises = document["premises"]
+        .as_array()
+        .expect("the receipt lists the premises");
+    let premise_five = premises
+        .iter()
+        .find(|premise| premise["id"] == 5)
+        .expect("premise 5 is listed");
+    assert_eq!(premise_five["covered"].as_bool(), Some(false));
+    assert!(
+        premise_five["missing"]
+            .as_array()
+            .is_some_and(|cases| cases.iter().any(|case| case == "ordinary-detach")),
+        "the premise names the case that did not pass: {premise_five}"
+    );
+}
+
+#[test]
+fn a_passing_case_label_cannot_qualify_force_missing_or_retained_detach_evidence() {
+    for mode in ["force", "missing", "kept", "pending"] {
+        let (_fixture, document) =
+            fabricated_receipt("detach-receipt", &BTreeMap::new(), true, mode);
+        assert_eq!(document["summary"]["passed"], 9);
+        assert_eq!(document["qualified"], false, "{mode}: {document}");
+        if mode == "force" {
+            assert_eq!(document["detach"]["force_attempted"], true);
+            assert_eq!(
+                document["detach"]["attempts"][2]["bound_device"],
+                "/dev/disk42s1"
+            );
+            assert_eq!(document["detach"]["attempts"][2]["whole_disk"], "disk42");
+        }
+    }
+}
+
+#[test]
+fn ordinary_failure_is_not_a_case_pass_and_cleanup_never_retries_it() {
+    let detach = source_between("# >>> s6-detach", "# <<< s6-detach");
+    let cleanup = source_between("# >>> s6-cleanup", "# <<< s6-cleanup");
+    let body = r#"
+EVIDENCE="$PWD"
+RUN="$PWD/fixture-run"
+mkdir "$RUN"
+printf backing >"$RUN/backing"
+BACKING="$RUN/backing"
+MOUNT=fixture-mount
+DEVICE=/dev/disk42s1
+DETACH_TSV="$PWD/detach.tsv"
+: >"$DETACH_TSV"
+ATTACHED=1
+KEEP_BACKING=0
+ORDINARY_DETACH_FAILED=0
+LAST_DETACH=none
+DETACH_ATTEMPTS=0
+CLEANUP_DISPOSITION=pending
+REAL_STATE=fixture
+hdiutil() {
+  printf '%s\n' "$*" >>"$PWD/commands"
+  [[ "$1" == detach ]] || return 90
+  if [[ "$2" == fixture-mount ]]; then
+    if [[ "$MODE" == interrupted ]]; then
+      # Model EXIT cleanup before the ordinary attempt returns an outcome.
+      PHASE=cleanup
+      ( exit 7 )
+      cleanup
+    fi
+    [[ "$MODE" == pass || "$MODE" == remove-fail || ( "$MODE" == cleanup-fail && "$PHASE" == case ) ]]
+  else
+    [[ "$2" == /dev/disk42 && "$3" == -force && "$PHASE" == cleanup ]] || return 91
+    [[ "$MODE" != force-fail ]]
+  fi
+}
+diskutil() {
+  [[ "$1" == info && "$2" == /dev/disk42s1 ]] || return 92
+  if [[ "$MODE" == binding-fail ]]; then
+    printf 'Part of Whole: disk99\n'
+  else
+    printf 'Part of Whole: disk42\n'
+  fi
+}
+rm() { [[ "$MODE" != remove-fail ]] && command rm "$@"; }
+digest_tree() { printf unchanged; }
+write_receipt() {
+  printf '%s %s %s %s %s %s\n' "$1" "$ATTACHED" "$KEEP_BACKING" "$CLEANUP_DISPOSITION" "$CASE_RESULT" "$LAST_DETACH" >"$PWD/state"
+}
+PHASE=case
+CASE_RESULT=0
+detach_image case || CASE_RESULT=$?
+[[ "$CASE_RESULT" != 0 || "$LAST_DETACH" == ordinary ]] || exit 93
+# Only a successful ordinary case can re-attach for the rest of the proof.
+if [[ "$CASE_RESULT" == 0 ]]; then ATTACHED=1; fi
+PHASE=cleanup
+( exit "$CASE_RESULT" )
+cleanup
+"#;
+    for (mode, expected, state) in [
+        ("pass", 0, "0 0 0 removed 0 ordinary"),
+        ("force-pass", 1, "1 0 1 kept 1 force"),
+        ("force-fail", 1, "1 1 1 kept 1 none"),
+        ("binding-fail", 1, "1 1 1 kept 1 none"),
+        ("cleanup-fail", 1, "1 0 1 kept 0 force"),
+        ("remove-fail", 1, "1 0 1 remove_failed 0 ordinary"),
+        ("interrupted", 1, "1 0 1 kept 0 force"),
+    ] {
+        let fixture = Fixture::new("detach-cleanup");
+        let script = fixture.write(
+            "detach.sh",
+            format!("set -uo pipefail\n{detach}\n{cleanup}\n{body}").as_bytes(),
+            0o644,
+        );
+        let output = Command::new("/bin/bash")
+            .arg(script)
+            .current_dir(&fixture.path)
+            .env("MODE", mode)
+            .output()
+            .expect("fixture detach functions run without native commands");
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{mode}: {}",
+            stderr(&output)
+        );
+        let actual = std::fs::read_to_string(fixture.path.join("state")).expect("cleanup state");
+        assert_eq!(actual.trim(), state, "{mode}");
+        let attempts =
+            std::fs::read_to_string(fixture.path.join("detach.tsv")).expect("detach evidence");
+        let ordinary: Vec<_> = attempts
+            .lines()
+            .filter(|row| row.contains("\tordinary\t") && !row.contains("\tpending\t"))
+            .collect();
+        assert_eq!(
+            ordinary.len(),
+            if mode == "interrupted" {
+                0
+            } else if mode == "pass" || mode == "cleanup-fail" || mode == "remove-fail" {
+                2
+            } else {
+                1
+            },
+            "a spent detach is never retried: {attempts}"
+        );
+        assert_eq!(
+            fixture.path.join("fixture-run/backing").exists(),
+            expected != 0
+        );
+        assert!(attempts
+            .lines()
+            .all(|row| row.split('\t').nth(3) == Some("/dev/disk42s1")));
+        if mode == "binding-fail" {
+            assert!(
+                !attempts.contains("\tforce\t"),
+                "an unbound disk is never detached"
+            );
+        }
+        if mode != "pass" && mode != "binding-fail" && mode != "remove-fail" {
+            assert!(attempts.contains("cleanup\tforce\t/dev/disk42\t/dev/disk42s1\tdisk42\t"));
+        }
+    }
+}
+
+#[test]
+fn receipt_side_recreation_and_dangling_links_cannot_report_cleanup_success() {
+    for mode in [
+        "recreated",
+        "late-recreated",
+        "root-link",
+        "backing-link",
+        "ancestor-link",
+    ] {
+        let (fixture, document) =
+            fabricated_receipt("receipt-remainder", &BTreeMap::new(), true, mode);
+        assert_eq!(document["summary"]["passed"], 9);
+        assert_eq!(document["qualified"], false, "{mode}");
+        assert_eq!(document["detach_complete"], false);
+        assert_eq!(document["exit_status"], 1);
+        assert_eq!(
+            document["detach"]["cleanup_disposition"],
+            "post_receipt_remainder"
+        );
+        let checks = document["cleanup_verification"]
+            .as_array()
+            .expect("cleanup observations");
+        assert!(checks.iter().any(|check| check["absent"] == false));
+        assert_eq!(
+            document["cleanup_verification"][0]["after_receipt_write"],
+            true
+        );
+        if mode == "recreated" || mode == "late-recreated" {
+            assert!(
+                fixture.path.join("removed-run/receipt-cache").is_dir(),
+                "the failed remainder is preserved"
+            );
+        } else {
+            let name = match mode {
+                "root-link" => "removed-run",
+                "ancestor-link" => "ancestor",
+                _ => "fixture.sparseimage",
+            };
+            assert!(std::fs::symlink_metadata(fixture.path.join(name))
+                .expect("link retained")
+                .file_type()
+                .is_symlink());
+        }
+    }
+    let (_fixture, clean) =
+        fabricated_receipt("receipt-absent", &BTreeMap::new(), true, "ordinary");
+    assert_eq!(clean["qualified"], true);
+    assert_eq!(clean["detach_complete"], true);
+    assert_eq!(clean["cleanup_verification"][0]["absent"], true);
+}
+
+#[test]
+fn the_receipt_runtime_ignores_fixture_home_and_python_startup_cache_hooks() {
+    let fixture = Fixture::new("receipt-runtime");
+    let runtime = source_between("# >>> s6-runtime-receipt", "# <<< s6-runtime-receipt");
+    let body = r#"
+RECEIPT_HOME="$PWD/runtime-home"
+mkdir "$RECEIPT_HOME"
+export HOME="$PWD/removed-run/home"
+export PYTHONPYCACHEPREFIX="$PWD/removed-run/pycache"
+export PYTHONPATH="$PWD/removed-run/modules"
+receipt_python - "$RECEIPT_HOME" <<'PY'
+import os, sys
+assert os.environ['HOME'] == sys.argv[1]
+assert sys.flags.isolated and sys.flags.no_site and sys.dont_write_bytecode
+assert os.environ['PYTHONPATH'] not in sys.path
+assert sys.pycache_prefix is None
+import json, collections
+PY
+[[ ! -e "$PWD/removed-run" && ! -L "$PWD/removed-run" ]]
+"#;
+    let script = fixture.write(
+        "runtime.sh",
+        format!("set -euo pipefail\n{runtime}\n{body}").as_bytes(),
+        0o644,
+    );
+    let output = Command::new("/bin/bash")
+        .arg(script)
+        .current_dir(&fixture.path)
+        .output()
+        .expect("isolated receipt runtime starts");
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
+fn each_adoption_records_a_valid_plan_before_the_effect_call() {
+    let fixture = Fixture::new("adopt-recorded-plan");
+    let wrapper = source_between("barge_cli() {", "assert_json() {");
+    let assertion = source_between("assert_json() {", "json_field() {");
+    let binary = fixture.write(
+        "barge-fixture",
+        br#"#!/bin/bash
+printf '%s\n' "$*" >>"$CALL_LOG"
+printf '{"ok":true,"data":{"plan":true,"placement":null}}\n'
+"#,
+        0o755,
+    );
+    let digest = digest_of(&binary);
+    let body = r#"
+BARGE_BIN="$PWD/barge-fixture"
+CURRENT_CASE=fixture
+CASE_PLAN_DIR="$(mktemp -d "$PWD/plans.XXXXXX")"
+ADOPT_PLANS="$PWD/adopt-plans.tsv"
+export CALL_LOG="$PWD/calls"
+barge_cli "$PWD/adopt.json" cache adopt --kind cargo-registry --volume fixture --json
+[[ -s "$ADOPT_PLANS" ]]
+[[ "$(wc -l <"$CALL_LOG" | tr -d ' ')" == 2 ]]
+head -n 1 "$CALL_LOG" | grep -q -- --plan
+! tail -n 1 "$CALL_LOG" | grep -q -- --plan
+"#;
+    let script = fixture.write("plan.sh", format!("set -euo pipefail\nBARGE_BIN_SHA256={digest}\nbarge_cli() {{{wrapper}\nassert_json() {{{assertion}\n{body}").as_bytes(), 0o644);
+    let output = Command::new("/bin/bash")
+        .arg(script)
+        .current_dir(&fixture.path)
+        .output()
+        .expect("pure plan wrapper starts");
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
+fn repeated_case_invocations_allocate_distinct_fixture_directories() {
+    let fixture = Fixture::new("case-mktemp");
+    let runner = source_between("run_case() {", "# ---- run ---");
+    let body = r#"
+RUN="$PWD/run"
+MOUNT="$PWD/image"
+EVIDENCE="$PWD/evidence"
+CASE_LOGS="$EVIDENCE/cases"
+mkdir -p "$RUN/cases" "$MOUNT" "$EVIDENCE/plans" "$CASE_LOGS"
+STOPPED=""
+FIRST_FAULT=""
+MODE=diagnostic
+preflight() { [[ -d "$2" ]]; }
+write_registry() { printf '%s\n' "$1" >>"$PWD/state-paths"; }
+record() { [[ "$2" == pass ]]; }
+case_body() {
+  [[ -d "$HOME" && -d "$BARGE_STATE_DIR" && -d "$CASE_OUT" && -d "$CARGO_HOME" ]]
+  printf '%s\n' "$HOME" >>"$PWD/home-paths"
+}
+run_case fixture "" case_body "8"
+run_case fixture "" case_body "8"
+[[ "$(sort -u "$PWD/home-paths" | wc -l | tr -d ' ')" == 2 ]]
+[[ "$(sort -u "$PWD/state-paths" | wc -l | tr -d ' ')" == 2 ]]
+"#;
+    let script = fixture.write(
+        "case.sh",
+        format!("set -euo pipefail\nrun_case() {{{runner}\n{body}").as_bytes(),
+        0o644,
+    );
+    let output = Command::new("/bin/bash")
+        .arg(script)
+        .current_dir(&fixture.path)
+        .output()
+        .expect("pure fixture case allocation starts");
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
+fn concurrent_same_label_fixtures_get_distinct_exclusive_directories() {
+    let paths = std::thread::scope(|scope| {
+        let jobs: Vec<_> = (0..16)
+            .map(|_| scope.spawn(|| Fixture::new("same-label")))
+            .collect();
+        jobs.into_iter()
+            .map(|job| job.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let unique: BTreeSet<_> = paths.iter().map(|fixture| fixture.path.clone()).collect();
+    assert_eq!(unique.len(), paths.len());
+    for fixture in &paths {
+        assert!(fixture.path.is_dir());
+    }
+}
+
+#[test]
+fn both_native_modes_pin_barge_root_parent_instead_of_the_oxide_default() {
+    let fixture = Fixture::new("root-parent-selection");
+    let supervisor = fixture.write("supervisor.py", b"fixture, never executed", 0o644);
+    let interpreter = fixture.write(
+        "capture-arguments.py",
+        br#"#!/usr/bin/python3
+import json,sys
+args=sys.argv[1:]
+def select(tokens):
+    if '--root-parent' in tokens:
+        return tokens[tokens.index('--root-parent')+1]
+    # Qualified supervisor's selected-volume default, modelled without a sweep.
+    return '/Volumes/Builds/scratch/oxide'
+index=args.index('--root-parent')
+without=args[:index]+args[index+2:]
+print(json.dumps({'selected':select(args),'default_without_flag':select(without),'args':args}))
+"#,
+        0o755,
+    );
+    let binary = fixture.write("barge", b"not executed", 0o755);
+    let source = std::fs::read_to_string(proof_script())
+        .unwrap()
+        .replace(PINNED_SUPERVISOR_SHA256, &digest_of(&supervisor))
+        .replace(
+            "exec /usr/bin/python3",
+            &format!("exec {}", interpreter.display()),
+        );
+    let instrumented = fixture.write("outer.sh", source.as_bytes(), 0o644);
+    let manifest =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../effigy.toml"))
+            .unwrap();
+    for mode in ["diagnostic", "counted"] {
+        assert!(manifest.contains(&format!(
+            "scripts/native/s6-cache-placement-proof.sh {mode}"
+        )));
+        let output = Command::new("/bin/bash")
+            .arg(&instrumented)
+            .arg(mode)
+            .arg(&binary)
+            .env("BARGE_S6_SUPERVISOR", &supervisor)
+            .env("HOME", &fixture.path)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env_remove("OXIDE_PROOF_EVIDENCE")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(document["selected"], "/Volumes/Builds/scratch/barge");
+        assert_eq!(
+            document["default_without_flag"],
+            "/Volumes/Builds/scratch/oxide"
+        );
+        let args = document["args"].as_array().unwrap();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--limit" && pair[1] == "300"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--scratch-budget-mib" && pair[1] == "512"));
+    }
+}

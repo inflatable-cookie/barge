@@ -42,6 +42,16 @@ use crate::os::{AccountFacts, VolumeUuid};
 /// leaves it unset, so a stray environment cannot move the account's authority.
 pub const STATE_DIR_ENV: &str = "BARGE_STATE_DIR";
 
+/// The documented fixture-only override of the account home.
+///
+/// State and a placement's original paths resolve from the password database's
+/// home, never from `$HOME`, so a fixture or a native proof cannot isolate
+/// itself by moving `HOME` alone. This variable is that seam's sibling of
+/// [`STATE_DIR_ENV`]: it exists for fixtures and the native proof, a normal run
+/// leaves it unset, and setting it moves only the account home — never the
+/// volume registry, which still needs [`STATE_DIR_ENV`] or a separate account.
+pub const ACCOUNT_HOME_ENV: &str = "BARGE_ACCOUNT_HOME";
+
 /// The read deadline for one bounded file (design, "Bounded resources").
 pub const READ_DEADLINE: Duration = Duration::from_secs(10);
 

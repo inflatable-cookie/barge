@@ -14,8 +14,10 @@
 //! [`read`] refuses it, and every mutating path starts there, so a corrupt
 //! registry stops all authority instead of being replaced by a guess.
 //!
-//! Slice S2 lands the registry. Slice S3 adds area records and slice S6 the
-//! placement records beside it.
+//! Slice S2 lands the registry. Slice S3 adds area records beside it, in
+//! `area`, and slice S6 the placement records, in `cache`: each record kind
+//! lives with the mechanics that write it, and this module stays the volume
+//! registry the others read first.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;

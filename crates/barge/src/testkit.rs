@@ -453,6 +453,18 @@ pub type ModeProbe = Box<dyn Fn(u32) -> bool>;
 #[derive(Default)]
 pub struct Faults {
     inner: MacOs,
+    /// A fixture link a racer publishes after the temporary link is created,
+    /// before the caller attempts its exclusive rename.
+    pub occupy_link_path: RefCell<Option<(PathBuf, PathBuf)>>,
+    /// A one-shot fixture seam immediately before an exclusive capture rename.
+    pub capture_probe: RefCell<Option<ObserveProbe>>,
+    /// Observe publication destinations just before an exclusive rename.
+    pub publication_probe: RefCell<Option<ObserveProbe>>,
+    /// Counterfactual seam immediately before the old replacing file publish.
+    pub replacing_publication_probe: RefCell<Option<ObserveProbe>>,
+    /// Fail one readback after publishing this settings file.
+    pub fail_settings_readback: RefCell<Option<String>>,
+    settings_readback_armed: Cell<bool>,
     /// A name whose facts report another owner.
     pub foreign_uid_name: Option<String>,
     /// A name whose facts report another device.
@@ -1041,7 +1053,14 @@ impl DirOps for Faults {
         bytes: &[u8],
         mode: u32,
     ) -> Result<()> {
-        self.inner.publish_child_file(parent, name, bytes, mode)
+        if let Some(probe) = self.replacing_publication_probe.borrow().as_ref() {
+            probe(name);
+        }
+        self.inner.publish_child_file(parent, name, bytes, mode)?;
+        if self.fail_settings_readback.borrow().as_deref() == Some(name) {
+            self.settings_readback_armed.set(true);
+        }
+        Ok(())
     }
 
     fn read_child_file(
@@ -1050,6 +1069,15 @@ impl DirOps for Faults {
         name: &str,
         cap: usize,
     ) -> Result<Option<Vec<u8>>> {
+        if self.settings_readback_armed.get()
+            && self.fail_settings_readback.borrow().as_deref() == Some(name)
+        {
+            self.settings_readback_armed.set(false);
+            return Err(Error::new(
+                ErrorKind::Io,
+                "injected interrupted settings readback",
+            ));
+        }
         self.inner.read_child_file(parent, name, cap)
     }
 
@@ -1124,8 +1152,19 @@ impl DirOps for Faults {
                 *self.put_back_result.borrow_mut() = Some(answer);
             }
         }
+        if to.starts_with(crate::state::CAPTURE_PREFIX) {
+            if let Some(probe) = self.capture_probe.borrow().as_ref() {
+                probe(from);
+            }
+        }
+        if let Some(probe) = self.publication_probe.borrow().as_ref() {
+            probe(to);
+        }
         let outcome = self.inner.rename_child(parent, from, to)?;
         if outcome == RenameOutcome::Renamed {
+            if self.fail_settings_readback.borrow().as_deref() == Some(to) {
+                self.settings_readback_armed.set(true);
+            }
             self.maybe_occupy(parent, from, to);
             if let Some(volume) = &self.volume {
                 volume.shift_device();
@@ -1164,6 +1203,19 @@ impl DirOps for Faults {
             });
         }
         Ok(identity)
+    }
+
+    fn create_child_symlink(&self, parent: &DirHandle, name: &str, target: &Path) -> Result<()> {
+        self.inner.create_child_symlink(parent, name, target)?;
+        if let Some((path, text)) = self.occupy_link_path.borrow_mut().take() {
+            std::os::unix::fs::symlink(text, path)
+                .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn read_link(&self, path: &Path) -> Result<Option<PathBuf>> {
+        self.inner.read_link(path)
     }
 
     fn random_bytes(&self, length: usize) -> Result<Vec<u8>> {

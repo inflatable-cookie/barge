@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -25,6 +26,10 @@ use crate::os::facts::{
     ProcessObserver, RemoveKind, RenameOutcome, RetriedUnreadable, RetryEvidence, RetryResolution,
     VolumeFacts, VolumeIdentity, VolumeUuid, BLIND_SPOT_RECORDS,
 };
+
+/// The largest symbolic-link text Barge reads, so a link cannot make a record
+/// grow without limit. Cache placement targets are ordinary volume paths.
+const MAX_LINK_BYTES: usize = 4096;
 
 /// The parent every managed volume mounts directly under.
 const VOLUMES_PARENT: &str = "/Volumes";
@@ -207,22 +212,25 @@ impl MountRoot for MacOs {
 
 impl AccountFacts for MacOs {
     fn account_home(&self) -> Result<PathBuf> {
-        account_home()
+        match std::env::var_os(crate::state::ACCOUNT_HOME_ENV) {
+            Some(raw) => fixture_account_home(Path::new(&raw)),
+            None => password_database_home(),
+        }
     }
 
     fn state_root(&self) -> Result<PathBuf> {
-        Ok(account_home()?.join(STATE_ROOT_RELATIVE))
+        Ok(password_database_home()?.join(STATE_ROOT_RELATIVE))
     }
 
     fn tool_state_dir(&self, tool: &str) -> Result<PathBuf> {
-        Ok(account_home()?
+        Ok(password_database_home()?
             .join(APPLICATION_SUPPORT_RELATIVE)
             .join(tool)
             .join("state"))
     }
 
     fn tool_cache_dir(&self, tool: &str) -> Result<PathBuf> {
-        Ok(account_home()?.join(CACHES_RELATIVE).join(tool))
+        Ok(password_database_home()?.join(CACHES_RELATIVE).join(tool))
     }
 }
 
@@ -2282,6 +2290,73 @@ impl DirOps for MacOs {
         })?;
         read_dir_identity(descriptor, Path::new("recheck"))
     }
+
+    fn create_child_symlink(&self, parent: &DirHandle, name: &str, target: &Path) -> Result<()> {
+        let directory = parent_descriptor(parent, name)?;
+        let child = name_cstring(name)?;
+        let text = path_cstring(target)?;
+        // SAFETY: `directory` is open, `child` is one NUL-terminated component
+        // inside it, and `text` is the link's own NUL-terminated text. The call
+        // creates a new directory entry and nothing else.
+        if unsafe { libc::symlinkat(text.as_ptr(), directory, child.as_ptr()) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        Err(Error::new(
+            ErrorKind::Io,
+            format!("cannot create the link `{name}`: {error}"),
+        )
+        .with_detail("name", name.into())
+        .with_detail("target", target.display().to_string().into())
+        .with_detail("os_error", error.to_string().into()))
+    }
+
+    fn read_link(&self, path: &Path) -> Result<Option<PathBuf>> {
+        let raw = path_cstring(path)?;
+        let mut buffer = vec![0u8; MAX_LINK_BYTES];
+        // SAFETY: `raw` is a NUL-terminated path and `buffer` is writable memory
+        // of the length passed, so `readlink` writes only inside it.
+        let written = unsafe {
+            libc::readlink(
+                raw.as_ptr(),
+                buffer.as_mut_ptr().cast::<libc::c_char>(),
+                buffer.len(),
+            )
+        };
+        if written < 0 {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT) => Ok(None),
+                Some(libc::EINVAL) => Err(Error::new(
+                    ErrorKind::UnknownState,
+                    format!("{} is not a symbolic link", path.display()),
+                )
+                .with_detail("path", path.display().to_string().into())),
+                _ => Err(Error::new(
+                    ErrorKind::Io,
+                    format!("cannot read the link {}: {error}", path.display()),
+                )
+                .with_detail("path", path.display().to_string().into())
+                .with_detail("os_error", error.to_string().into())),
+            };
+        }
+        let length = usize::try_from(written).unwrap_or(0);
+        if length >= buffer.len() {
+            // A link whose text fills the buffer may be truncated, so it is
+            // unknown rather than a shorter target.
+            return Err(Error::new(
+                ErrorKind::ResourceBound,
+                format!(
+                    "the link {} is at least {MAX_LINK_BYTES} bytes, over the link-text cap",
+                    path.display()
+                ),
+            )
+            .with_detail("path", path.display().to_string().into())
+            .with_detail("cap", MAX_LINK_BYTES.into()));
+        }
+        buffer.truncate(length);
+        Ok(Some(PathBuf::from(OsStr::from_bytes(&buffer))))
+    }
 }
 
 /// Open `path` as a directory, never following a symbolic link at the leaf.
@@ -2509,9 +2584,63 @@ fn unreadable_fact(path: &Path, fact: &str) -> Error {
     .with_detail("fact", fact.into())
 }
 
+/// A fixture or proof account home.
+///
+/// It is `BARGE_ACCOUNT_HOME`, the sibling of `BARGE_STATE_DIR`: a normal run
+/// leaves it unset, and when it is set the directory must be an absolute real
+/// directory of this account, so a relative or borrowed path cannot become the
+/// account's home. Nothing here is consulted unless the variable is set.
+fn fixture_account_home(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            format!(
+                "{} must be an absolute path; `{}` is relative",
+                crate::state::ACCOUNT_HOME_ENV,
+                path.display()
+            ),
+        )
+        .with_detail("account_home", path.display().to_string().into()));
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the fixture account home {} cannot be read: {error}",
+                path.display()
+            ),
+        )
+        .with_detail("account_home", path.display().to_string().into())
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the fixture account home {} is not a real directory",
+                path.display()
+            ),
+        )
+        .with_detail("account_home", path.display().to_string().into()));
+    }
+    // SAFETY: `geteuid` takes no arguments, cannot fail and has no
+    // preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        return Err(Error::new(
+            ErrorKind::ForeignOwner,
+            format!(
+                "the fixture account home {} is not this account's",
+                path.display()
+            ),
+        )
+        .with_detail("account_home", path.display().to_string().into()));
+    }
+    Ok(path.to_path_buf())
+}
+
 /// The account home from the password database for the effective uid, never
 /// from the environment (stage 1 design, "Account-wide state directory").
-fn account_home() -> Result<PathBuf> {
+fn password_database_home() -> Result<PathBuf> {
     // SAFETY: `geteuid` takes no arguments, cannot fail and has no preconditions.
     let uid = unsafe { libc::geteuid() };
     let mut buffer = vec![0u8; 1024];
@@ -2651,6 +2780,9 @@ fn entry_facts(status: &libc::stat) -> EntryFacts {
         mode: u32::from(status.st_mode) & 0o7777,
         st_mode: u32::from(status.st_mode),
         size: u64::try_from(status.st_size).unwrap_or(0),
+        allocated_bytes: u64::try_from(status.st_blocks)
+            .unwrap_or(0)
+            .saturating_mul(512),
         modified_ms: modified_ms(status),
     }
 }
@@ -2901,5 +3033,27 @@ mod tests {
             stop_when_settled(Duration::from_millis(20), SCAN_TIMEOUT, SCAN_TIMEOUT),
             Some(RetryStop::Bounded)
         );
+    }
+
+    use std::path::Path;
+
+    use super::fixture_account_home;
+    use crate::error::ErrorKind;
+    use crate::testkit::TempDir;
+
+    #[test]
+    fn a_fixture_account_home_must_be_an_absolute_real_directory() {
+        let fixture = TempDir::new("account-home");
+        let home = fixture_account_home(fixture.path()).expect("a fixture directory is accepted");
+        assert_eq!(home, fixture.path().to_path_buf());
+
+        let relative = fixture_account_home(Path::new("relative/home"))
+            .expect_err("a relative home is refused");
+        assert_eq!(relative.kind(), ErrorKind::Usage);
+
+        let file = fixture.write("a-file", b"bytes");
+        let refused = fixture_account_home(&file).expect_err("a file is not a home");
+        assert_eq!(refused.kind(), ErrorKind::UnknownState);
+        assert_eq!(refused.detail()["account_home"], file.display().to_string());
     }
 }

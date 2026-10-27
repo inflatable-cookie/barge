@@ -233,6 +233,8 @@ state/
   registry.json                 barge.registry/1   (volumes, folder overrides)
   areas/<namespace>/<area>.json barge.area/1
   placements/<id>.json          barge.placement/1
+  cache-adopt-<kind>.json       barge.cache-adopt/1 (pending cache recovery)
+  cache-undo-<kind>.json        barge.cache-undo/1 (pending undo captures)
   holds/<root-id>/<holder>.json barge.hold/1
   intents/<intent-id>.json      barge.intent/2   (barge.intent/1 still read)
   locks/                        registry.lock, volume-<uuid>.lock, root-<id>.lock,
@@ -769,11 +771,44 @@ with its own gate; nothing in this design moves consumer data.
 
 `barge cache undo --json` reverses exactly the recorded form: a `setting`
 restores the recorded bytes only if the file still has the exact after-bytes
-Barge wrote (otherwise it refuses and reports the divergence, changing nothing);
+Barge wrote (a missing after-file also refuses, even if adopt created it;
+divergence preserves the setting, any held-root marker and the placement record);
 a `link` removes the link and restores an empty directory where one was
 replaced, or removes the link where the original was absent; a `held-root` undo
 removes only the marker it wrote, and refuses if the directory's identity
 changed. Undo never reverses a relocation; that operation's own undo does.
+
+The implementation uses exclusive capture for settings, published links and
+adopted markers, following the [capture rule](#capture-verify-unlink). A bounded
+`barge.cache-undo/1` journal (at most two effects and 64 KiB per kind) records the
+parent identity, original and private random names, expected file snapshot or
+link identity, captured facts and phase before an unlink. Settings and their
+held-root marker are both captured and verified before either is removed.
+Settings adoption and failed-adoption rollback use this same capture journal
+with an explicit operation field. Existing settings are captured and verified
+against the pre-adopt snapshot before new bytes are published exclusively; an
+absent settings path and the backup path also use exclusive publication. The
+private staged file's identity is recorded before publication and copied into
+the adoption intent before the capture journal is settled. Recovery requires
+that recorded after-identity, rather than accepting newly observed matching
+bytes. Rollback captures and verifies its recorded setting/link/marker effects
+before any restoration or unlink; a raced replacement preserves pending
+intent/capture evidence and is never overwritten or deleted.
+
+Restored settings are staged under the recorded private name plus `.restore`
+and published exclusively at the original name; a concurrent replacement is
+never overwritten. An unchanged setting is put back without rewriting it.
+An empty directory is restored exclusively with its recorded mode.
+
+A mismatch is durably recorded before exclusive put-back. A taken original
+name, unreadable capture, failed put-back or interruption keeps the journal,
+placement record and any private objects; another adopt or undo refuses while
+that journal exists. Recovery requires inspection of those recorded identities;
+there is no automatic retry or inference of successful removal from absence.
+Only a completed undo removes its journal after removing the placement record.
+The residual is the capture rule's same-user discovery of a private random name
+within the capture-to-unlink window, rather than a check at the public name.
+
 
 Absent volume (Q-001): a cache placement fails clearly, naming the drive to
 attach. There is never a silent internal fallback, no re-download to the
@@ -1861,6 +1896,188 @@ Choices S5 made where this design left the mechanic to the slice:
   rows gain an optional `marker_digest`, which is the observation S4 passes to
   custody and to a delete. Both are additions inside the major version, so an
   older document still reads.
+
+- **S6** is this slice: the four cache kinds, the three placement forms
+  (`setting`, `held-root`, `link`), adopt and undo with byte-level and
+  link/root identity proofs, the refusal of a non-empty real directory, and the
+  in-place adoption of today's hand-made placements, with `barge cache adopt`,
+  `undo` and `list` as the CLI's form of them. Nothing is moved: adopt never
+  renames, copies or deletes a cache's data, and undo never deletes it either.
+  No real account's setting, link or cache was adopted by this slice; adopting
+  Tom's real npm, bun or Cargo placements stays a separate operator gate, and
+  its tests run on fixture homes, fixture settings files and fixture volumes.
+
+S6 adoption now publishes a synced `barge.cache-adopt/1` recovery record under
+its volume lock before cache effects. There is at most one pending record per
+kind (four kinds), with the placement read cap of 64 KiB. A synced private
+staging file is claimed through exclusive hard-link publication, so a competing
+volume cannot replace the same kind's journal. Replay holds the volume lock and
+reverifies that volume before restoring any path. It retains the original
+file bytes/identity or directory mode, expected setting bytes, a pre-publication
+marker root id/directory identity, observed link publication identity and the
+placement candidate before its final publication/readback. `cache undo --kind`
+replays only matching observed effects; it restores an interrupted empty-directory
+removal with the recorded mode. Divergence or an unobserved publication identity
+keeps the intent and effect for explicit operator recovery. A pending adoption
+blocks another adoption. Cache recovery records are distinct from deletion
+intents and never authorize deleting cache payload.
+
+Cache targets are walked from the verified caches descriptor, checking every
+existing component's kind, device and opened identity and refusing `..` or
+symlink ancestry. Missing suffixes are created component by component only in
+explicit adoption. Undo rechecks a settings file's exact snapshot through its
+opened parent immediately before mutation, and a link's stored device/inode
+immediately after custody and before unlink. Link records retain original
+empty-directory permission bits; restoration verifies the newly created
+identity before applying the exact mode through its descriptor. Older records
+without the required link identity or mode refuse destructive undo.
+
+Choices S6 made where this design left the mechanic to the slice:
+
+- **One record per kind.** A placement record is
+  `state/placements/<placement-id>.json` (`barge.placement/1`), at most 64 KiB
+  and one of at most 4096 rows, with exactly `schema`, `placement_id`, `kind`,
+  `original_path`, `volume_uuid`, `root_dir`, `folder`, `recorded_path`,
+  `adopted_ms`, `generation` and `form`. `deny_unknown_fields` applies at every
+  level, a stray name in `placements/` is `unknown_state`, and a record that
+  does not validate is refused rather than read as absent. One kind has one
+  record: a second adopt of the same kind refuses until that record is undone,
+  so a reader never has to choose between two claims about one tool's path.
+  `registry` still owns the volume records; the placement record lives in
+  `cache`, beside the mechanics that write it, as S3's area record lives in
+  `area`.
+- **What each form records, and what undo proves.**
+  - A `setting` record carries the settings file's identity and its exact before
+    and after bytes (hexadecimal, with their digests, sizes and modes), the key's
+    address (an optional section and the key), whether adopt changed a byte, the
+    directory the setting names, whether that directory was created, and the
+    backup copy's path. Adopt writes the backup (`...barge-backup`, hidden,
+    private) before it changes anything and preserves the file's original mode.
+    Undo restores the recorded before-bytes only when the file still digests to
+    the recorded after-bytes, and it removes the file only when adopt created it;
+    a file someone edited after adopt is `unknown_state` naming the expected and
+    actual digests, with nothing changed.
+  - A `link` record carries the link's path, its exact recorded text, the owned
+    root's id and marker digest, and what the original path was (`absent` or
+    `empty_directory`). Adopt publishes through a temporary name in the same
+    directory, so the path is never briefly missing, and proves the published
+    text. Undo requires the link to still hold that text; it removes the link,
+    re-creates the empty directory when one was replaced, and never deletes the
+    owned root or anything in it.
+  - A `held-root` record carries the adopted directory, its device and inode,
+    the marker's id, nonce and digest, the pre-adoption observation (device,
+    inode, entry count, newest entry mtime, and the directory's own allocated
+    bytes — not the tree's), and the link that already published it, when there
+    was one. Undo proves the directory is still that inode on that device and
+    that its marker is still the recorded bytes, then removes only the marker.
+    It leaves the data and any pre-existing link exactly as they were.
+- **The in-place adoption of today's layout is explicit.** `--adopt-existing-root`
+  is the flag that writes a marker into a directory that is already there;
+  without it, an unmarked link target refuses with `refused_boundary`, exit `2`,
+  a plan, and nothing recorded. With it, the existing link is recorded and the
+  marker is written; still nothing is renamed, linked, copied or moved. The
+  marker is `barge.root/1` with `kind: cache_root`,
+  `origin: adopted_existing` and `area: {namespace: "barge", area: "caches"}` —
+  `caches/` is Barge's own folder, so the marker names no consumer declaration.
+- **A directory is "on the volume" by path and device.** The design's distinction
+  between a directory that already sits on the registered volume and one on the
+  internal drive is decided by both facts: the path must be under the recorded
+  mount point and the directory's device must be the volume's. Either alone
+  would accept the other case — another directory of this machine, or a stale
+  mount-point path.
+- **Where a link's root lives, and what a setting creates.** A `link` placement's
+  owned root is created directly under the volume's `caches/` folder with a
+  fresh id, through the same containment walk and marker writer an area root
+  uses. A `setting` placement creates `<caches>/<npm|bun>` as a plain directory
+  — today's layout — so an unmarked cache directory is never prunable data, and
+  it records that it created it.
+- **Link publication is exclusive.** The temporary link reaches the original
+  path only when `rename_child` reports `Renamed`. `TargetExists` refuses,
+  removes only the temporary link and keeps the raced-in entry, even if its
+  link text matches the intended target; a matching foreign publication is
+  never accepted as Barge's own successful rename.
+- **The settings parse.** npm's `cache=` is line-scoped at the file's top level;
+  bun's `[install.cache] dir` is line-scoped inside its one section. More than
+  one candidate key, a duplicated section, a malformed section header, a
+  non-UTF-8 file, or a file over 8 KiB refuses (`unknown_state`) and is not
+  edited. A missing key is added only by the explicit adopt, and a value that
+  already names a directory under the volume's `caches/` folder is recorded with
+  no byte written — today's expected case.
+- **An empty directory's custody.** A true directory cannot be replaced by a link
+  while a symlink cannot be renamed over it, so the empty-directory case is the
+  one moment the tool's path is briefly absent. It runs only after the
+  directory's own identity is re-checked, its listing is proved empty, and the
+  bounded same-uid open-descriptor observation is complete and empty; a failure
+  after the `rmdir` puts the empty directory back. A marker cannot be the proof
+  here, because a directory being replaced has none.
+- **Command documents.** `barge.cache.adopt/1`, `barge.cache.undo/1` and
+  `barge.cache.list/1`. `--plan` is a bare flag that performs the whole
+  inspection and reports the intended changes with `placement: null`, writing
+  nothing; the same refusals carry `changed: false` and a `plan` list. A refusal
+  always precedes every effect: the registry, the volume's presence and identity,
+  the declared durability and the absence of an existing record for that kind are
+  proved first.
+- **`describe`.** `placements` rows are filled from the records: the kind, the
+  original and recorded paths, the path the current configuration resolves, the
+  observed link state, and `absent: fail` for caches (Q-001). A volume that
+  cannot be verified leaves the configured path equal to the recorded one, so
+  `describe` stays usable with the drive unplugged, and a publication that cannot
+  be inspected is `unknown`, never `missing`.
+- **Bounds as applied.** A placement record is at most 64 KiB with 4096 rows; a
+  settings file at most 8 KiB; a refused directory's plan keeps the exact entry
+  count and at most 16 names; a pre-adoption listing keeps 200 000 names. The
+  link-text cap is 4096 bytes.
+- **The OS layer's additions.** `DirOps` gains `create_child_symlink` and
+  `read_link` (both no-follow: reading a link returns its text or refuses a
+  non-link), and `EntryFacts` gains `allocated_bytes`, which is what the
+  pre-adoption observation records. `area` gains Barge's own feature-folder
+  resolution (`Feature::Caches`) and one public `write_marker`, so creation and
+  in-place adoption share one marker writer, one field set and one read-back
+  proof instead of two. The writer stages synced bytes at
+  `.barge-marker-<root-id>`, publishes by exclusive rename and syncs the opened
+  directory. An occupied marker name is refused without replacing it; the
+  staged file and in-place adoption intent are kept for inspection. Successful
+  readback proves the published inode, nonce and exact digest.
+- **Custody before a link removal.** `barge cache undo` of a `link` placement
+  reopens the volume's `caches/` folder, proves the owned root is the recorded
+  id, inode and marker bytes, and requires a `Safe` custody verdict (released or
+  stale holds, a complete and empty same-uid descriptor observation, no pending
+  intent) before it removes the link. A plan reports the removal without taking
+  custody, because a plan has no effect.
+- **An effect without its record is rolled back.** A placement record is
+  published last, after the setting write, the link or the marker. When that
+  publish fails (`ENOSPC`, `EACCES`, a changed state directory), adopt undoes the
+  effect it just made: it removes the link and restores the empty directory it
+  replaced, removes the marker it just wrote after re-proving it, or restores the
+  settings file's recorded before-bytes and removes an adopted marker. The
+  refusal's detail names every step that was rolled back, so no filesystem effect
+  is stranded without the record that proves it. The owned root a link pointed at
+  is left in place: it carries its own marker, holds no payload, and S6 removes
+  nothing on a volume.
+- **A fixture-only account home.** The native proof needs a private account home
+  (its original paths resolve from the account home, never from `$HOME`), so S6
+  adds `BARGE_ACCOUNT_HOME`, the documented fixture-only sibling of
+  `BARGE_STATE_DIR`: it is consulted only when set, it must be an absolute real
+  directory of this account, and a normal run leaves it unset. State resolution
+  is unchanged: `BARGE_STATE_DIR` still owns the state directory, and neither
+  variable is inferred from `$HOME`.
+- **The native proof's plan.** [The S6 native proof plan](s6-native-proof.md)
+  records the elevated run's fixed command, the pinned supervisor bytes, the nine
+  HIGH premises traced through the case bodies, the receipt shape, and the
+  activation order. Effigy gains `cache:native` and its uncounted
+  `cache:native:diagnostic` twin; both are owner-activated and neither is part of
+  an ordinary validation pass.
+
+The read-only S6 apparatus command `barge diagnostic descriptor-census --root
+<existing-directory> --json` uses the same binary and production observer as
+cache operations, with custody's scan bounds, self-exclusion and barge#012's
+bounded identity re-observation. It returns
+`barge.diagnostic.descriptor-census/1`, preserving counts, retry evidence and
+the complete product `os_blind_spot` record when supplied;
+complete observation is `passed`, unreadable or bounded is `infrastructure`.
+It grants no custody authority, writes nothing and never substitutes for the
+operation's own scan. The [proof contract](s6-native-proof.md#the-harness-preflight)
+owns its apparatus use, receipt interpretation and activation limits.
 
 ## Proposed validation
 

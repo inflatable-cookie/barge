@@ -10,8 +10,11 @@
 //! `barge inspect`. Slice S3 adds `area`: path containment and the descriptor
 //! walk, `barge.area/1` declarations, owned roots and their `barge.root/1`
 //! markers, cooperative holds and bounded root listing, with `barge area` verbs
-//! as the CLI's form of them. Every other module states its job and carries no
-//! placeholder logic for a later slice to undo.
+//! as the CLI's form of them. Slice S6 adds `cache`: the four cache kinds, the
+//! three placement forms, and adopt and undo with their byte-level and
+//! link/root identity proofs, with `barge cache` verbs as the CLI's form. Every
+//! other module states its job and carries no placeholder logic for a later
+//! slice to undo.
 //!
 //! `unsafe` is denied for the whole crate and allowed only in the macOS
 //! implementation of the [`os`] layer, which is the one FFI seam.
@@ -27,6 +30,7 @@ pub mod contract;
 pub mod custody;
 pub mod delete;
 pub mod describe;
+pub mod diagnostic;
 pub mod digest;
 pub mod error;
 pub mod inspect;

@@ -417,6 +417,14 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
         .collect();
     let area_total = area_rows.len();
     let roots = collect_roots(request, &paths, registry.volumes(), &declarations);
+    let placements = crate::cache::placement_rows(
+        &paths,
+        request.dirs,
+        request.facts,
+        request.mounts,
+        request.observer,
+        registry.volumes(),
+    )?;
     let observation_rows = observations.rows().to_vec();
     let observation_total = observation_rows.len();
 
@@ -429,7 +437,7 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
         state,
         volumes: RowSet::bounded(volume_rows, volume_total, VOLUME_ROWS),
         areas: RowSet::bounded(area_rows, area_total, AREA_ROWS),
-        placements: RowSet::empty(),
+        placements,
         roots,
         observations: RowSet::bounded(observation_rows, observation_total, OBSERVATION_ROWS),
         custody: crate::custody::capability_report(),
