@@ -2386,6 +2386,32 @@ pub fn read_holds(
     root_id: &str,
 ) -> Result<HoldReading> {
     state::validate_identifier("root_id", root_id)?;
+    read_hold_directory(state, observer, root_id)
+}
+
+/// Read and decide the holds recorded for one deletion unit's name.
+///
+/// It is [`read_holds`] for a name that is an ordinary area name rather than a
+/// Barge root id: S4's units include delegated and claimed names Barge never
+/// allocated, and a hold that is somehow recorded under one is decided, never
+/// skipped. A name that is not an area name at all cannot be a hold's directory
+/// name (a hold is written only by [`hold`], which refuses anything else), so the
+/// caller decides that case itself.
+pub fn read_unit_holds(
+    state: &StatePaths,
+    observer: &dyn ProcessObserver,
+    unit_name: &str,
+) -> Result<HoldReading> {
+    validate_name("unit_name", unit_name)?;
+    read_hold_directory(state, observer, unit_name)
+}
+
+/// Read one hold directory, keyed by the name the unit is recorded under.
+fn read_hold_directory(
+    state: &StatePaths,
+    observer: &dyn ProcessObserver,
+    root_id: &str,
+) -> Result<HoldReading> {
     let directory = state.holds_dir().join(root_id);
     let Some(names) = read_directory(&directory)? else {
         return Ok(HoldReading::empty());

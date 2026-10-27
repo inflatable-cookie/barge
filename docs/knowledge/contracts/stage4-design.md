@@ -16,7 +16,7 @@ bounded native design; and the implementation slices in dependency order.
 [Architecture](../architecture.md) owns the concepts, the invariants and the
 boundary with Oxide. The [stage 1 design](stage1-design.md) owns the crate and
 CLI shape, the state directory, the registry, areas, root markers, holds,
-custody, whole-root deletion and the plan/intent mechanics this contract
+custody, whole-unit deletion and the plan/intent mechanics this contract
 extends. Where they differ, they win and this file is corrected.
 
 No part of this contract authorizes a native run, a real drive, a mount or host
@@ -36,7 +36,7 @@ only.
   space policy](stage3-space-policy.md), and the code merged on `main` at
   `ce9d6ab`: slices S1, S2, [S3](stage1-design.md#implementation-status) (the
   containment walk, areas, `barge.root/1` markers, holds, root listing) and S5
-  (custody, the `barge.intent/1` journal, quarantine, whole-root delete, replay).
+  (custody, the `barge.intent/2` journal, quarantine, whole-unit delete, replay).
   S3 records no durable identity for a root, and S5's intent carries the
   within-run observation only; that gap is what this contract closes, and every
   statement below about existing behaviour is checked against that tree.
@@ -781,15 +781,18 @@ A row that is not eligible carries `eligible: false` and its first blocking
 reason, and every row carries its evidence whether or not it is eligible —
 that is what makes one plan a diagnostic as well as a permission.
 
-`barge.intent/1` gains two optional objects, `identity` and `absence`, holding
+`barge.intent/2` gains two optional objects, `identity` and `absence`, holding
 what was proved at plan time and what was re-proved at effect time, so a replay
 after a reboot has the evidence it must re-establish rather than a permission it
-must trust. S5 has landed that record with exactly the field set stage 1
-records, including `device`, `inode` and `marker_digest` as the within-run
-observation and `plan_digest` as the permission; the two objects are additions
-inside major 1, and F4 updates S5's strict reader in the same slice, so a
-document written by an older binary still reads while the new fields are
-understood by both.
+must trust. S5 has landed that record, and its barge#016 follow-up moved the
+major to `/2` when custody and deletion were generalised from a Barge-marked
+root to a deletion unit; `barge.intent/1` stays readable and maps to a
+Barge-marked directory unit. The unit object carries the within-run observation
+(`device`, `inode`, the optional marker digest) and `plan_digest` stays the
+permission; the two objects are additions inside major 2, applied to a
+directory unit's identity the same way, and F4 updates S5's strict reader in the
+same slice, so a document written by an older binary still reads while the new
+fields are understood by both.
 
 ## Formats and versions
 
@@ -800,7 +803,7 @@ understood by both.
 | `barge.absence` | `/1` | in a plan row and an intent | new |
 | `barge.prune.plan` | `/1` | `barge prune --plan` | new: the *release* plan for one area, with identity, custody, idle, reference and absence evidence. Distinct from the stage 3 space plan, `barge.space.prune/1`, which selects by measurement, participation and least-recently-used order and needs no absence proof |
 | `barge.maintain.plan` | `/1`, fields completed | `barge maintain --plan` | adds the `release` array and per-area plan digests; the space stage's own rows are the stage 3 design's |
-| `barge.intent` | `/1`, landed in S5; optional fields added | `state/intents/<intent-id>.json` | adds `identity` and `absence`; `device`, `inode` and `marker_digest` stay the within-run observation |
+| `barge.intent` | `/2`, landed in S5 (with `/1` still read); optional fields added | `state/intents/<intent-id>.json` | adds `identity` and `absence`; the unit's `device`, `inode` and optional marker digest stay the within-run observation |
 | `barge.describe` | `/1`, optional fields added | `barge describe` | adds `identity.capability` (what may be compared across a remount) and `volumes[].mounts` (how many live mounts carry each registered UUID) |
 | `barge.inspect` | `/1`, optional fields added | `barge inspect` | adds the Oxide registry observation and the per-row identity census |
 
@@ -809,9 +812,9 @@ major; removing one, changing a type or a meaning is a new major.
 `barge.prune.plan/1` has no writer yet, so its field set is completed here
 rather than extended and the reader's "exactly this field set" rule holds from
 the first write. `barge.maintain.plan/1` has no writer either (S7 is unlanded).
-`barge.intent/1` has landed in S5, so its additions are optional fields with the
-reader updated in the same slice, and an intent written before F4 stays valid
-and readable.
+`barge.intent/2` has landed in S5, so its additions are optional fields with the
+reader updated in the same slice, and an intent written before F4 (a `/2`
+record, or a `/1` record mapped on read) stays valid and readable.
 
 One naming rule, because two plans now exist: `barge.prune.plan/1` is the
 **release** plan — the evidence that a root may be given up because nothing
@@ -984,7 +987,7 @@ on its own.
 | F1 | `barge.root/2` marker, `barge.root.identity/1`, the identity record added to S3's landed `create_root` and to adoption, [verification](#verifying-a-root) with its verdicts and reason codes, `identity.capability` and the mount census in `describe` | S3 (area, markers, holds) |
 | F2 | `os::VolumeLocator` (`getfsstat` + `ATTR_VOL_UUID`), [finding the volume](#finding-the-volume-after-a-remount) with its duplicate refusal, the `barge.root/1` prefix rule, the `barge.absence/1` primitive and its ancestor volume proof | S1 and S3's containment walk (`os`), and F1 only for the shared walk helper |
 | F3 | The [release gate](#releasability-the-one-gate): the reference readers (Barge's own records, and Oxide's receipts, registry rows and markers read in place), `last_activity_ms`, the `barge prune --plan` verb, and `barge.prune.plan/1` with its digest and evidence rows | F1, F2, S5 (custody and delete) |
-| F4 | `barge.intent/1` with identity and absence evidence, S5's intent reader accepting them, replay under a changed device, and the `barge.root/1`-to-`/2` settlement for a pending intent written by an older reader | F3, S5 |
+| F4 | `barge.intent/2` with identity and absence evidence, S5's intent reader accepting them, replay under a changed device, and the `barge.root/1`-to-`/2` settlement for a pending intent written by an older reader | F3, S5 |
 | F5 | `barge inspect`'s Oxide registry census and the drift report; the read-only operation that answers the carried finding without adopting anything | F1, F2, S2 (`inspect`) |
 | F6 | Oxide declares its output areas and switches its prune to Barge's gate; the 91 legacy roots are released with an operator list | F1–F5, the [stage 3 space policy](stage3-space-policy.md)'s slices, Oxide's own project, `ff13f2ef`, operator approval |
 
