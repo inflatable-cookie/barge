@@ -488,11 +488,11 @@ impl MarkerArea {
     }
 }
 
-/// One `barge.root/1` marker: the identity and provenance of an owned root.
+/// One versioned marker: the identity and provenance of an owned root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RootMarker {
-    /// Always `barge.root/1`.
+    /// `barge.root/1` or `barge.root/2`.
     pub schema: String,
     /// The root's fresh 128-bit id, as 32 hexadecimal digits.
     pub root_id: String,
@@ -508,7 +508,14 @@ pub struct RootMarker {
     pub area: MarkerArea,
     /// The absolute path Barge resolved when it created the root. It is an
     /// observation for humans; the descriptor walk remains the authority.
-    pub resolved_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_path: Option<PathBuf>,
+    /// The root path below the recorded mount, for version 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_relative_path: Option<String>,
+    /// The mount observed when version 2 was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_at_record: Option<PathBuf>,
     /// When the marker was written.
     pub created_ms: u64,
     /// Increases on every change; a root starts at 1.
@@ -1168,6 +1175,7 @@ pub fn create_root_in_feature(
                     root_id: Some(&root_id),
                     volume_uuid: &folder.volume_uuid,
                     resolved_path: &path,
+                    mount_point: &folder.mount_point,
                     area: area.clone(),
                     kind,
                     origin: RootOrigin::Created,
@@ -1683,6 +1691,8 @@ pub struct MarkerWrite<'a> {
     pub volume_uuid: &'a VolumeUuid,
     /// The absolute path the descriptor walk actually reached for the root.
     pub resolved_path: &'a Path,
+    /// The verified mount containing the root.
+    pub mount_point: &'a Path,
     /// The area identity the root belongs to.
     pub area: MarkerArea,
     /// What the root is for.
@@ -1705,7 +1715,7 @@ pub struct MarkerIdentity {
     pub created_ms: u64,
 }
 
-/// Write one `barge.root/1` marker into an already opened root directory.
+/// Write one `barge.root/2` marker into an already opened root directory.
 ///
 /// This is the one marker writer: creation and in-place adoption both use it, so
 /// the field set, the caps, the mode and the read-back proof cannot drift apart.
@@ -1728,6 +1738,13 @@ pub fn write_marker(
     };
     let nonce = hex(16, dirs.random_bytes(16)?);
     let created_ms = state::now_ms();
+    let relative = write
+        .resolved_path
+        .strip_prefix(write.mount_point)
+        .map_err(|_| unknown_marker("root path is outside the verified mount".to_owned()))?
+        .to_str()
+        .ok_or_else(|| unknown_marker("root path is not UTF-8".to_owned()))?;
+    folder_components("mount_relative_path", relative)?;
     let marker = RootMarker {
         schema: crate::contract::ROOT_SCHEMA.to_owned(),
         root_id: root_id.clone(),
@@ -1736,7 +1753,9 @@ pub fn write_marker(
         owner: "barge".to_owned(),
         kind: write.kind,
         area: write.area.clone(),
-        resolved_path: write.resolved_path.to_path_buf(),
+        resolved_path: None,
+        mount_relative_path: Some(relative.to_owned()),
+        mount_at_record: Some(write.mount_point.to_path_buf()),
         created_ms,
         generation: 1,
         origin: write.origin,
@@ -1859,6 +1878,7 @@ fn write_root_marker(
         root_id: Some(root_id),
         volume_uuid: &resolved.volume_uuid,
         resolved_path: &path,
+        mount_point: &resolved.mount_point,
         area: MarkerArea {
             namespace: resolved.declaration.namespace.clone(),
             area: resolved.declaration.area.clone(),
@@ -1892,7 +1912,7 @@ fn describe_marker(state: &MarkerState) -> String {
 /// Read and validate one root's marker strictly.
 ///
 /// The marker must be a private regular file of this user, at most the marker
-/// cap, and must parse with exactly the fields `barge.root/1` defines. It is
+/// cap, and must parse with exactly the fields its version defines. It is
 /// owned only when its volume UUID, resolved path, id and nonce shapes and
 /// timestamps all agree with what was actually walked. Everything else is
 /// unknown, never reused and never deletable.
@@ -1964,6 +1984,22 @@ pub fn read_marker_with_digest(
             ))
         }
     };
+    // Serde's optional fields accept explicit null as well as absence. The two
+    // versions have disjoint path fields, so reject even null cross-version keys.
+    let shape: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(shape) => shape,
+        Err(error) => return unknown(format!("marker shape is unreadable: {error}")),
+    };
+    let cross_version_field = match marker.schema.as_str() {
+        "barge.root/1" => {
+            shape.get("mount_relative_path").is_some() || shape.get("mount_at_record").is_some()
+        }
+        "barge.root/2" => shape.get("resolved_path").is_some(),
+        _ => false,
+    };
+    if cross_version_field {
+        return unknown("marker carries path fields from another version".to_owned());
+    }
     // The bytes were read, so the digest is a fact even when the marker does not
     // validate where it was found: custody and replay carry the expected digest
     // themselves, and a quarantined leaf's marker necessarily fails the path
@@ -1982,7 +2018,7 @@ pub fn read_marker_with_digest(
 impl RootMarker {
     /// Validate every field of a marker against what was actually walked.
     fn validate(&self, expectation: &MarkerExpectation<'_>) -> Result<()> {
-        if self.schema != crate::contract::ROOT_SCHEMA {
+        if self.schema != crate::contract::ROOT_SCHEMA && self.schema != "barge.root/1" {
             return Err(unknown_marker(format!(
                 "`{}` is not the `{}` major this build reads",
                 self.schema,
@@ -1991,6 +2027,13 @@ impl RootMarker {
         }
         state::validate_identifier("root_id", &self.root_id)?;
         state::validate_identifier("nonce", &self.nonce)?;
+        if self.root_id.bytes().any(|byte| byte.is_ascii_uppercase())
+            || self.nonce.bytes().any(|byte| byte.is_ascii_uppercase())
+        {
+            return Err(unknown_marker(
+                "marker identifiers must be lowercase".to_owned(),
+            ));
+        }
         if &self.volume_uuid != expectation.volume_uuid {
             return Err(unknown_marker(format!(
                 "the marker records volume {}, not the verified {}",
@@ -2005,12 +2048,37 @@ impl RootMarker {
         }
         validate_name("area.namespace", &self.area.namespace)?;
         validate_name("area.area", &self.area.area)?;
-        if self.resolved_path != expectation.resolved_path {
-            return Err(unknown_marker(format!(
-                "the marker records {}, but the walk reached {}",
-                self.resolved_path.display(),
-                expectation.resolved_path.display()
-            )));
+        match self.schema.as_str() {
+            "barge.root/1" => {
+                if self.mount_relative_path.is_some()
+                    || self.mount_at_record.is_some()
+                    || self.resolved_path.as_deref() != Some(expectation.resolved_path)
+                {
+                    return Err(unknown_marker(
+                        "v1 marker path differs from the walk".to_owned(),
+                    ));
+                }
+            }
+            "barge.root/2" => {
+                let relative = self
+                    .mount_relative_path
+                    .as_deref()
+                    .ok_or_else(|| unknown_marker("v2 marker lacks relative path".to_owned()))?;
+                folder_components("mount_relative_path", relative)?;
+                let mount = self
+                    .mount_at_record
+                    .as_ref()
+                    .ok_or_else(|| unknown_marker("v2 marker lacks recorded mount".to_owned()))?;
+                if !mount.is_absolute()
+                    || self.resolved_path.is_some()
+                    || !expectation.resolved_path.ends_with(Path::new(relative))
+                {
+                    return Err(unknown_marker(
+                        "v2 marker path differs from the walk".to_owned(),
+                    ));
+                }
+            }
+            _ => return Err(unknown_marker("unknown marker version".to_owned())),
         }
         if self.created_ms > expectation.now_ms {
             return Err(unknown_marker(format!(
@@ -2018,7 +2086,10 @@ impl RootMarker {
                 self.created_ms - expectation.now_ms
             )));
         }
-        if self.generation == 0 {
+        if !matches!(
+            (self.kind, self.generation, self.conclusion.is_some()),
+            (_, 1, false) | (RootKind::ScratchRun, 2, true)
+        ) {
             return Err(unknown_marker(
                 "the marker's generation starts at 1".to_owned(),
             ));
@@ -3193,7 +3264,16 @@ fn observe_root(
             row.kind = Some(marker.kind);
             row.namespace = Some(marker.area.namespace.clone());
             row.area = Some(marker.area.area.clone());
-            row.recorded_path = Some(marker.resolved_path.clone());
+            row.recorded_path = Some(
+                marker
+                    .mount_at_record
+                    .as_ref()
+                    .zip(marker.mount_relative_path.as_ref())
+                    .map_or_else(
+                        || marker.resolved_path.clone().unwrap_or_default(),
+                        |(mount, relative)| mount.join(relative),
+                    ),
+            );
             row.created_ms = Some(marker.created_ms);
             row.last_activity_ms = Some(marker.created_ms.max(directory_modified_ms.unwrap_or(0)));
         }
@@ -4438,7 +4518,14 @@ mod tests {
         assert_eq!(marker.kind, RootKind::AreaRoot);
         assert_eq!(marker.volume_uuid, fixture.uuid);
         assert_eq!(marker.origin, super::RootOrigin::Created);
-        assert_eq!(marker.resolved_path, root.path);
+        assert_eq!(
+            marker
+                .mount_at_record
+                .as_ref()
+                .unwrap()
+                .join(marker.mount_relative_path.as_ref().unwrap()),
+            root.path
+        );
         assert!(marker.conclusion.is_none());
 
         // A second creation gets a different root, never a shared one.
@@ -4528,6 +4615,31 @@ mod tests {
     }
 
     #[test]
+    fn v1_remains_readable_at_its_exact_recorded_path() {
+        let fixture = Fixture::new("marker-v1");
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let path = marker_path(&root);
+        rewrite_marker(&path, |value| {
+            value["schema"] = "barge.root/1".into();
+            value["resolved_path"] = root.path.to_string_lossy().to_string().into();
+            value.as_object_mut().unwrap().remove("mount_relative_path");
+            value.as_object_mut().unwrap().remove("mount_at_record");
+        });
+        assert!(matches!(
+            read_owned(&fixture, &resolved, &root.root_id),
+            MarkerState::Owned(_)
+        ));
+        rewrite_marker(&path, |value| {
+            value["resolved_path"] = "/different/mount/root".into()
+        });
+        assert!(matches!(
+            read_owned(&fixture, &resolved, &root.root_id),
+            MarkerState::Unknown { .. }
+        ));
+    }
+
+    #[test]
     fn an_unknown_version_or_divergent_marker_is_not_owned() {
         let fixture = Fixture::new("marker-version");
         let declaration = fixture.declaration("example/pool");
@@ -4537,7 +4649,7 @@ mod tests {
 
         for edit in [
             (|value: &mut serde_json::Value| {
-                value["schema"] = "barge.root/2".into();
+                value["schema"] = "barge.root/3".into();
             }) as fn(&mut serde_json::Value),
             |value: &mut serde_json::Value| {
                 value["owner"] = "someone-else".into();

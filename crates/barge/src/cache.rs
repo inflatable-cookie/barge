@@ -2413,6 +2413,7 @@ fn adopt_in_place(
         root_id: Some(&root_id),
         volume_uuid: &record.volume_uuid,
         resolved_path: path,
+        mount_point: &folder.mount_point,
         area: cache_area(),
         kind: RootKind::CacheRoot,
         origin: RootOrigin::AdoptedExisting,

@@ -107,7 +107,7 @@ pub const AREA_SCHEMA: &str = "barge.area/1";
 /// One placement record's format.
 pub const PLACEMENT_SCHEMA: &str = "barge.placement/1";
 /// One owned root's marker format.
-pub const ROOT_SCHEMA: &str = "barge.root/1";
+pub const ROOT_SCHEMA: &str = "barge.root/2";
 /// One hold file's format.
 pub const HOLD_SCHEMA: &str = "barge.hold/1";
 /// One intent journal record's format.
@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(formats.registry, "barge.registry/1");
         assert_eq!(formats.area, "barge.area/1");
         assert_eq!(formats.placement, "barge.placement/1");
-        assert_eq!(formats.root, "barge.root/1");
+        assert_eq!(formats.root, "barge.root/2");
         assert_eq!(formats.hold, "barge.hold/1");
         assert_eq!(formats.intent, "barge.intent/2");
     }

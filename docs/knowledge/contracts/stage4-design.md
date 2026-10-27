@@ -19,6 +19,9 @@ CLI shape, the state directory, the registry, areas, root markers, holds,
 custody, whole-unit deletion and the plan/intent mechanics this contract
 extends. Where they differ, they win and this file is corrected.
 
+The marker writer emits `barge.root/2`; the reader also accepts `barge.root/1`
+at its exact recorded path. The v1 mount-prefix relaxation remains in F2.
+
 No part of this contract authorizes a native run, a real drive, a mount or host
 setting change, a data move, a deletion, or any change to Oxide. It is design
 only.

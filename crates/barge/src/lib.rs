@@ -8,7 +8,7 @@
 //! publish, bounded reads and fixed lock order, the `barge.registry/1` reader
 //! and its fixture-tested writer, the read-only Oxide observations and
 //! `barge inspect`. Slice S3 adds `area`: path containment and the descriptor
-//! walk, `barge.area/1` declarations, owned roots and their `barge.root/1`
+//! walk, `barge.area/1` declarations, owned roots and their versioned root
 //! markers, cooperative holds and bounded root listing, with `barge area` verbs
 //! as the CLI's form of them. Slice S6 adds `cache`: the four cache kinds, the
 //! three placement forms, and adopt and undo with their byte-level and

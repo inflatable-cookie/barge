@@ -75,6 +75,89 @@ impl RootIdentity {
     }
 }
 
+/// Facts read from the verified volume and its opened root for one observation.
+/// Callers must obtain these through the descriptor walk; no stored verdict is
+/// authority for a later use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootObservation {
+    pub matching_mounts: usize,
+    pub volume_uuid: String,
+    pub mount: PathBuf,
+    pub device: u64,
+    pub inode: u64,
+    pub root_uid: u32,
+    pub effective_uid: u32,
+    pub root_id: String,
+    pub nonce: String,
+    pub mount_relative_path: String,
+    pub kind: RootKind,
+    pub area: MarkerArea,
+}
+
+/// A durable identity comparison. Unknown keeps the root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum IdentityVerdict {
+    Verified {
+        device_at_record: u64,
+        device_live: u64,
+        device_changed: bool,
+        mount_moved: bool,
+    },
+    Unknown {
+        reason: IdentityReason,
+    },
+}
+
+/// The reason an observation cannot establish the recorded identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityReason {
+    IdentityRecordInvalid,
+    VolumeUnverified,
+    DuplicateVolumeUuid,
+    NotARealDirectory,
+    PathChanged,
+    InodeChanged,
+    MarkerIdentityMismatch,
+}
+
+/// Compare an already walked root with its immutable record. A device change
+/// across runs is diagnostic only; the live walk must itself check the device.
+pub fn compare(record: &RootIdentity, live: &RootObservation) -> IdentityVerdict {
+    let reason = if record.validate().is_err() {
+        Some(IdentityReason::IdentityRecordInvalid)
+    } else if live.matching_mounts > 1 {
+        Some(IdentityReason::DuplicateVolumeUuid)
+    } else if live.matching_mounts != 1 || record.volume_uuid != live.volume_uuid {
+        Some(IdentityReason::VolumeUnverified)
+    } else if live.root_uid != live.effective_uid || live.inode == 0 || live.device == 0 {
+        Some(IdentityReason::NotARealDirectory)
+    } else if record.mount_relative_path != live.mount_relative_path {
+        Some(IdentityReason::PathChanged)
+    } else if record.inode != live.inode {
+        Some(IdentityReason::InodeChanged)
+    } else if record.root_id != live.root_id
+        || record.nonce != live.nonce
+        || record.kind != live.kind
+        || record.area.namespace != live.area.namespace
+        || record.area.area != live.area.area
+    {
+        Some(IdentityReason::MarkerIdentityMismatch)
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => IdentityVerdict::Unknown { reason },
+        None => IdentityVerdict::Verified {
+            device_at_record: record.device_at_record,
+            device_live: live.device,
+            device_changed: record.device_at_record != live.device,
+            mount_moved: record.mount_at_record != live.mount,
+        },
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -96,6 +179,80 @@ mod tests {
             marker_generation_at_record: 1,
             recorded_ms: 0,
         }
+    }
+
+    fn observation(record: &RootIdentity) -> RootObservation {
+        RootObservation {
+            matching_mounts: 1,
+            volume_uuid: record.volume_uuid.clone(),
+            mount: record.mount_at_record.clone(),
+            device: record.device_at_record,
+            inode: record.inode,
+            root_uid: 501,
+            effective_uid: 501,
+            root_id: record.root_id.clone(),
+            nonce: record.nonce.clone(),
+            mount_relative_path: record.mount_relative_path.clone(),
+            kind: record.kind,
+            area: record.area.clone(),
+        }
+    }
+
+    #[test]
+    fn remount_changes_are_diagnostic_not_identity() {
+        let identity = record();
+        let mut live = observation(&identity);
+        live.device += 1;
+        live.mount = "/Volumes/Builds 1".into();
+        assert_ne!(identity.device_at_record, live.device); // The old comparison refused.
+        assert_eq!(
+            compare(&identity, &live),
+            IdentityVerdict::Verified {
+                device_at_record: identity.device_at_record,
+                device_live: live.device,
+                device_changed: true,
+                mount_moved: true,
+            }
+        );
+    }
+
+    #[test]
+    fn mismatches_and_duplicate_mounts_keep_the_root() {
+        let identity = record();
+        let mut live = observation(&identity);
+        live.matching_mounts = 2;
+        assert_eq!(
+            compare(&identity, &live),
+            IdentityVerdict::Unknown {
+                reason: IdentityReason::DuplicateVolumeUuid
+            }
+        );
+        live = observation(&identity);
+        live.root_uid += 1;
+        assert_eq!(
+            compare(&identity, &live),
+            IdentityVerdict::Unknown {
+                reason: IdentityReason::NotARealDirectory
+            }
+        );
+        live = observation(&identity);
+        live.inode += 1;
+        assert_eq!(
+            compare(&identity, &live),
+            IdentityVerdict::Unknown {
+                reason: IdentityReason::InodeChanged
+            }
+        );
+        live = observation(&identity);
+        live.nonce = identity.root_id.clone();
+        assert_eq!(
+            compare(&identity, &live),
+            IdentityVerdict::Unknown {
+                reason: IdentityReason::MarkerIdentityMismatch
+            }
+        );
+        // Inode reuse cannot pass when the replacement's nonce is different.
+        assert_eq!(live.inode, identity.inode);
     }
 
     #[test]

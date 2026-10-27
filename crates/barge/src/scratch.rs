@@ -5525,7 +5525,7 @@ mod tests {
                     &std::fs::read(&self.marker).expect("the racing marker"),
                 )
                 .expect("the racing marker parses");
-                value["generation"] = serde_json::json!(99);
+                value["nonce"] = serde_json::json!("0123456789abcdef0123456789abcdef");
                 write_marker(&self.marker, &serde_json::to_vec(&value).unwrap());
             }
             Ok(bytes)
