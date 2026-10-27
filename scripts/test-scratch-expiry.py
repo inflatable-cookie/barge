@@ -41,6 +41,7 @@ import os
 import plistlib
 import pwd
 import re
+import signal
 import shutil
 import stat as stat_module
 import subprocess
@@ -97,10 +98,12 @@ ENVIRONMENT = {
     "BARGE_PROOF_SUPERVISOR": "the optional path to the hash-pinned Oxide supervisor",
     "OXIDE_PROOF_EVIDENCE": "the supervisor's evidence directory for the default receipt and injection log",
     "OXIDE_TASK_SCRATCH_ROOT": "discarded by the runner so the qualified supervisor creates its own root",
-    "DYLD_INSERT_LIBRARIES": "the proof-only interposer, supplied only to the injected CLI case",
+    "DYLD_INSERT_LIBRARIES": "the proof-only interposer, supplied only to the ENOTEMPTY and pause CLI cases",
     "BARGE_PROOF_ENOTEMPTY_PATH": "the exact fixture directory whose identity is pinned before deletion",
     "BARGE_PROOF_ENOTEMPTY_LOG": "the supervisor evidence file recording each injected failure",
     "BARGE_PROOF_ENOTEMPTY_COUNT": "the bounded number of injected failures, fixed at three",
+    "BARGE_PROOF_PAUSE_PATH": "the exact fixture unit whose directory identity is pinned for the pull case",
+    "BARGE_PROOF_PAUSE_LOG": "the supervisor evidence file recording the paused unlink",
     "HOME": "a private fixture home, so no real account state is read or written",
     "CARGO_HOME": "a private fixture Cargo home; this proof builds nothing",
 }
@@ -492,6 +495,8 @@ class Proof:
         self.attached = False
         self.env = None
         self.shim_evidence = None
+        self.pull_evidence = None
+        self.pull_unsettled = False
 
     # -- fixture setup ----------------------------------------------------
 
@@ -518,6 +523,8 @@ class Proof:
         self.env.pop("BARGE_PROOF_ENOTEMPTY_PATH", None)
         self.env.pop("BARGE_PROOF_ENOTEMPTY_LOG", None)
         self.env.pop("BARGE_PROOF_ENOTEMPTY_COUNT", None)
+        self.env.pop("BARGE_PROOF_PAUSE_PATH", None)
+        self.env.pop("BARGE_PROOF_PAUSE_LOG", None)
         self.env.update(
             HOME=self.home,
             CARGO_HOME=os.path.join(self.home, "cargo"),
@@ -954,37 +961,112 @@ class Proof:
         return "three exact-target ENOTEMPTY injections left a pending intent; unshimmed replay settled it"
 
     def case_a_pull_mid_delete_leaves_a_pending_intent_then_replay(self):
+        # Same unit shape without interposition is a required control.
+        control = self.alloc("pull-control", "owner")
+        with open(os.path.join(control["path"], "payload"), "w", encoding="utf-8") as handle:
+            handle.write("payload")
+        self.conclude(control["root_id"], "owner")
+        self.release(control["root_id"], "owner")
+        self.age_conclusion(control["path"], NATIVE_AGE_DAYS + 1)
+        normal = self.expire(self.plan()["data"]["plan_digest"], expect=0)
+        if normal["data"]["deleted"]["count"] != 1 or os.path.exists(control["path"]):
+            raise Fault("case", "the unpaused control did not delete the same unit shape")
         root = self.alloc("pull", "owner")
+        with open(os.path.join(root["path"], "payload"), "w", encoding="utf-8") as handle:
+            handle.write("payload")
         self.conclude(root["root_id"], "owner")
         self.release(root["root_id"], "owner")
-        for folder_index in range(40):
-            folder = os.path.join(root["path"], f"bulk-{folder_index:02}")
-            os.makedirs(folder)
-            for index in range(50):
-                with open(os.path.join(folder, f"file-{index:03}.txt"), "w", encoding="utf-8") as handle:
-                    handle.write("payload")
         self.age_conclusion(root["path"], NATIVE_AGE_DAYS + 1)
-        document = self.plan()
-        digest = document["data"]["plan_digest"]
+        digest = self.plan()["data"]["plan_digest"]
         folder = self.project("pull")
-        command = [
-            self.binary, "scratch", "expire", "--volume", self.uuid,
-            "--plan-sha256", digest, "--json",
-        ]
-        process = subprocess.Popen(
-            command, env=self.env, cwd=self.root,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        pulled = None
+        library = os.path.join(self.root, "enotempty-shim.dylib")
+        evidence = os.environ.get("OXIDE_PROOF_EVIDENCE")
+        guard_root = os.path.dirname(os.path.realpath(os.environ.get("TMPDIR", "")))
+        if (os.path.dirname(guard_root) != os.path.realpath("/Volumes/Builds/scratch/barge")
+                or not evidence or not os.path.isdir(evidence)
+                or os.path.commonpath([guard_root, os.path.realpath(evidence)]) != guard_root):
+            raise Fault("premise", "pause evidence is outside the guard's owned root")
+        log = os.path.join(evidence, "scratch-pause-reached.log")
+        if os.path.lexists(log) or not os.path.isfile(library):
+            raise Fault("premise", "pause log already exists or the proof interposer is missing")
+        device, inode = self.identity(root["path"])
+        env = dict(self.env)
+        env.update(DYLD_INSERT_LIBRARIES=library, BARGE_PROOF_PAUSE_PATH=root["path"],
+                   BARGE_PROOF_PAUSE_LOG=log)
+        command = [self.binary, "scratch", "expire", "--volume", self.uuid,
+                   "--plan-sha256", digest, "--json"]
+        process = subprocess.Popen(command, env=env, cwd=self.root, preexec_fn=os.setpgrp,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.pull_unsettled = True
+        reached = False
         try:
-            self.wait_for_quarantine(folder, timeout=60)
-            pulled = self.pull()
+            deadline = time.monotonic() + 30
+            expected = f"{root['path']}\t{device}\t{inode}"
+            while time.monotonic() < deadline:
+                if os.path.isfile(log):
+                    with open(log, encoding="utf-8") as handle:
+                        reached = handle.read().splitlines() == [expected]
+                    if reached:
+                        break
+                if process.poll() is not None:
+                    break
+                time.sleep(0.01)
+            if reached:
+                self.wait_for_quarantine(folder, timeout=5)
         finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
             try:
-                process.wait(timeout=180)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                raise Fault("case", "the expiry did not stop after the volume was pulled")
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired as error:
+                raise Fault("infrastructure", "the paused process did not exit") from error
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    self.pull_unsettled = False
+                    break
+                except PermissionError as error:
+                    raise Fault("infrastructure", "the process-group census was unreadable") from error
+                if time.monotonic() >= deadline:
+                    raise Fault("infrastructure", "the process-group census was not empty")
+                time.sleep(0.01)
+        if not reached:
+            raise Fault("apparatus", "the exact-unit pause was not reached")
+        if process.returncode != -signal.SIGKILL:
+            raise Fault("case", f"the paused expiry was not stopped by SIGKILL: {process.returncode}")
+        self.pull_evidence = {"pause_log": log, "unit": root["path"], "device": device,
+                              "inode": inode, "process_group": process.pid,
+                              "group_census": "empty", "signal": "SIGKILL",
+                              "source_sha256": self.shim_evidence["source_sha256"],
+                              "dylib_sha256": sha256_file(library)}
+        # Positively bind the image, mount and volume to the recorded fixture.
+        images = plistlib.loads(run(["hdiutil", "info", "-plist"], self.env).stdout.encode()).get("images", [])
+        matches = [image for image in images if image.get("image-path") == self.image]
+        if len(matches) != 1 or not self.attached:
+            raise Fault("premise", "the owned image is not uniquely attached")
+        entities = matches[0].get("system-entities", [])
+        mounted = [entry for entry in entities if entry.get("mount-point") == self.mount]
+        if (len(mounted) != 1 or mounted[0].get("dev-entry") != "/dev/" + self.device
+                or not any(entry.get("dev-entry") == "/dev/" + self.whole_disk for entry in entities)):
+            raise Fault("premise", "the image device or mount changed")
+        info = plistlib.loads(run(["diskutil", "info", "-plist", self.mount], self.env).stdout.encode())
+        if (info.get("VolumeUUID") != self.uuid or info.get("DeviceIdentifier") != self.device
+                or info.get("ParentWholeDisk") != self.whole_disk):
+            raise Fault("premise", "the attached volume identity changed")
+        pulled = self.pull()
+        self.pull_evidence.update(detach=pulled, image=self.image, mount=self.mount,
+                                  volume_uuid=self.uuid, whole_disk=self.whole_disk)
+        stale_before = sorted(os.listdir(self.mount)) if os.path.isdir(self.mount) else None
+        if stale_before not in (None, []):
+            raise Fault("case", "the stale mount is not empty")
+        _, absent = self.barge("scratch", "expire", "--volume", self.uuid, "--plan", expect=2)
+        if absent.get("error", {}).get("kind") != "volume_absent":
+            raise Fault("case", f"the absent volume did not refuse: {absent}")
+        stale_after = sorted(os.listdir(self.mount)) if os.path.isdir(self.mount) else None
+        if stale_before != stale_after:
+            raise Fault("case", "the stale mount was written")
         # The pending intent is state, not the image: it must be readable while the
         # volume is away.
         pending = self.pending_intents()
@@ -1010,7 +1092,8 @@ class Proof:
         digest_after, plan = self.empty_plan_digest()
         if plan["candidates"]["count"] != 0:
             raise Fault("case", "a settled-plan run would delete something new")
-        real = self.expire(digest_after, expect=0)
+        real, removed = self.replay_observing_removed(intent["intent_id"], digest_after)
+        self.pull_evidence["removed_observation"] = removed
         replay = real["data"].get("replay") or {}
         if not replay.get("resumed") and not replay.get("settled"):
             raise Fault("case", f"the replay did not resume or settle the intent: {replay}")
@@ -1380,6 +1463,7 @@ class Proof:
             "environment": sorted(ENVIRONMENT),
             "environment_purposes": dict(ENVIRONMENT),
             "enotempty_shim": self.shim_evidence,
+            "pull": self.pull_evidence,
             "supervisor_sha256": SUPERVISOR_SHA256,
             "bin_sha256": sha256_file(self.binary) if os.path.isfile(self.binary) else None,
             "owned_scratch": self.root,
@@ -1402,6 +1486,8 @@ class Proof:
         backing of an image it could not detach. The failure is returned so the
         receipt is unqualified, never suppressed.
         """
+        if self.pull_unsettled:
+            return "the pull process-group census was not proven empty; backing kept"
         failure = self.detach()
         if failure is not None:
             return failure

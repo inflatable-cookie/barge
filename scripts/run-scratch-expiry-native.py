@@ -97,6 +97,8 @@ def main(argv):
     env.pop("BARGE_PROOF_ENOTEMPTY_PATH", None)
     env.pop("BARGE_PROOF_ENOTEMPTY_LOG", None)
     env.pop("BARGE_PROOF_ENOTEMPTY_COUNT", None)
+    env.pop("BARGE_PROOF_PAUSE_PATH", None)
+    env.pop("BARGE_PROOF_PAUSE_LOG", None)
     env["BARGE_PROOF_BIN"] = binary
     result = subprocess.run(command, env=env)
     return result.returncode

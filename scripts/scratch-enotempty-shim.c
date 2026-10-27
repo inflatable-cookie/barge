@@ -15,9 +15,22 @@ static int ready;
 static int remaining;
 static const char *target_path;
 static const char *log_path;
+static const char *pause_path;
+static const char *pause_log;
+static dev_t pause_dev;
+static ino_t pause_ino;
+static int pause_ready;
 
 __attribute__((constructor)) static void configure(void) {
     struct stat st;
+    pause_path = getenv("BARGE_PROOF_PAUSE_PATH");
+    pause_log = getenv("BARGE_PROOF_PAUSE_LOG");
+    if (pause_path && pause_path[0] == '/' && pause_log && pause_log[0] == '/'
+        && lstat(pause_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        pause_dev = st.st_dev;
+        pause_ino = st.st_ino;
+        pause_ready = 1;
+    }
     target_path = getenv("BARGE_PROOF_ENOTEMPTY_PATH");
     log_path = getenv("BARGE_PROOF_ENOTEMPTY_LOG");
     const char *count = getenv("BARGE_PROOF_ENOTEMPTY_COUNT");
@@ -32,6 +45,20 @@ __attribute__((constructor)) static void configure(void) {
 
 static int proof_unlinkat(int dirfd, const char *path, int flags) {
     struct stat st;
+    if (pause_ready && fstat(dirfd, &st) == 0 && st.st_dev == pause_dev &&
+        st.st_ino == pause_ino && S_ISDIR(st.st_mode)) {
+        int fd = open(pause_log, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0600);
+        if (fd >= 0) {
+            char line[2048];
+            int length = snprintf(line, sizeof(line), "%s\t%llu\t%llu\n", pause_path,
+                (unsigned long long)pause_dev, (unsigned long long)pause_ino);
+            if (length > 0 && (size_t)length < sizeof(line) && write(fd, line, (size_t)length) == length) {
+                (void)close(fd);
+                for (;;) (void)pause();
+            }
+            (void)close(fd);
+        }
+    }
     if (ready && remaining > 0 && flags == AT_REMOVEDIR &&
         fstatat(dirfd, path, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
         st.st_dev == target_dev && st.st_ino == target_ino && S_ISDIR(st.st_mode)) {

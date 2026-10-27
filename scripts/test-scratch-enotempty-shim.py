@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import signal
 import subprocess
 import tempfile
 import time
@@ -23,6 +24,20 @@ int main(void) {
     }
     if (unlinkat(AT_FDCWD, "captured", AT_REMOVEDIR) != 0) return 4;
     return 0;
+}
+'''
+
+PAUSE_DRIVER = r'''
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+int main(void) {
+    if (rename("pause-unit", "quarantined") != 0) return 1;
+    int other = open("pass-unit", O_RDONLY | O_DIRECTORY);
+    if (other < 0 || unlinkat(other, "other", 0) != 0 || close(other) != 0) return 2;
+    int unit = open("quarantined", O_RDONLY | O_DIRECTORY);
+    if (unit < 0) return 3;
+    return unlinkat(unit, "payload", 0) == 0 ? 0 : 4;
 }
 '''
 
@@ -51,6 +66,39 @@ def main():
             raise RuntimeError("the shim did not record exactly three firings for the pinned object")
         if (root / "captured").exists() or (root / "other").exists():
             raise RuntimeError("the shim failed to pass through a non-target or a post-bound removal")
+        # Pause only an unlink below the pinned directory after it is renamed.
+        (root / "pause-unit").mkdir()
+        (root / "pause-unit" / "payload").write_text("keep")
+        (root / "pass-unit").mkdir()
+        (root / "pass-unit" / "other").write_text("pass")
+        (root / "pause-driver.c").write_text(PAUSE_DRIVER)
+        subprocess.run(["clang", "-Wall", "-Wextra", "-Werror", str(root / "pause-driver.c"), "-o", str(root / "pause-driver")], check=True, timeout=30)
+        pause_target = root / "pause-unit"
+        pause_facts = pause_target.stat()
+        pause_log = root / "pause.log"
+        pause_env = dict(os.environ)
+        pause_env.update(DYLD_INSERT_LIBRARIES=str(library), BARGE_PROOF_PAUSE_PATH=str(pause_target),
+                         BARGE_PROOF_PAUSE_LOG=str(pause_log))
+        for key in ("BARGE_PROOF_ENOTEMPTY_PATH", "BARGE_PROOF_ENOTEMPTY_LOG", "BARGE_PROOF_ENOTEMPTY_COUNT"):
+            pause_env.pop(key, None)
+        process = subprocess.Popen([str(root / "pause-driver")], cwd=root, env=pause_env, preexec_fn=os.setpgrp)
+        try:
+            deadline = time.monotonic() + 5
+            while not pause_log.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not pause_log.exists():
+                raise RuntimeError("the exact fixture pause was not reached")
+            expected_pause = f"{pause_target}\t{pause_facts.st_dev}\t{pause_facts.st_ino}"
+            if pause_log.read_text().splitlines() != [expected_pause] or process.poll() is not None:
+                raise RuntimeError("the pause did not pin and hold the renamed unit")
+            if not (root / "quarantined" / "payload").exists() or (root / "pass-unit" / "other").exists():
+                raise RuntimeError("the pause target or unrelated pass-through was wrong")
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+        if process.returncode != -signal.SIGKILL:
+            raise RuntimeError("the paused child did not stop by SIGKILL")
         # The case must observe `removed`, never infer it from `deleted`.
         spec = importlib.util.spec_from_file_location("scratch_proof", SOURCE.with_name("test-scratch-expiry.py"))
         module = importlib.util.module_from_spec(spec)
@@ -76,7 +124,7 @@ def main():
             pass
         else:
             raise RuntimeError("the watcher inferred removed from an already deleted record")
-    print("proof-only ENOTEMPTY interposer: OK")
+    print("proof-only ENOTEMPTY and pause interposer: OK")
 
 
 if __name__ == "__main__":

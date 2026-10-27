@@ -2293,7 +2293,9 @@ Choices S4 made where this design left the mechanic to the slice:
   the image attached and its backing in place and makes the receipt unqualified.
   The proof uses no forced detach at all. The pull case is the brief's ordinary
   detach mid-delete; if that ordinary detach is refused, the case is left
-  unproved rather than satisfied by a forced detach of the same image.
+  unproved rather than satisfied by a forced detach of the same image. The pull
+  case pauses the captured unit via the proof-only interposer, kills its owned
+  process group, confirms it empty, then detaches ordinarily and replays.
 - **The native's oracles are the design's behaviours.** The allocation case
   launches both allocations before awaiting either; the pull case uses the
   ordinary detach mid-delete (a refusal leaves it unproved), and checks the
