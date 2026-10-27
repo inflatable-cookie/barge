@@ -5308,6 +5308,103 @@ mod tests {
         }
     }
     #[test]
+    fn in_place_marker_publication_preserves_a_raced_entry_and_recovery_evidence() {
+        let fixture = Fixture::new("cache-marker-exclusive-publication");
+        let target = fixture.caches().join("cargo/registry");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("payload"), b"cache data").unwrap();
+        let original = fixture.home.path().join(".cargo/registry");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &original).unwrap();
+        let marker = target.join(area::ROOT_MARKER_FILE);
+        let raced = marker.clone();
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = saved.clone();
+        let dirs = crate::testkit::Faults::new();
+        *dirs.publication_probe.borrow_mut() = Some(Box::new(move |name| {
+            if name == area::ROOT_MARKER_FILE {
+                std::fs::write(&raced, b"concurrent marker, keep exactly").unwrap();
+                *observed.borrow_mut() = Some(facts(&raced));
+            }
+        }));
+        let mut request = fixture.request(CacheKind::CargoRegistry);
+        request.adopt_existing_root = true;
+        let error = adopt(
+            &fixture.state,
+            &fixture.account,
+            &dirs,
+            fixture.facts.as_ref(),
+            &fixture.volume.mounts(),
+            &fixture.volume.observer(),
+            &request,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        assert_eq!(read(&marker), b"concurrent marker, keep exactly");
+        assert_eq!(Some(facts(&marker)), *saved.borrow());
+        assert_eq!(read(&target.join("payload")), b"cache data");
+        assert_eq!(std::fs::read_link(&original).unwrap(), target);
+        let pending = super::read_adopt_intent(&fixture.state, CacheKind::CargoRegistry)
+            .unwrap()
+            .unwrap();
+        assert!(pending.held.is_none() && pending.candidate.is_none());
+        let plan = pending.marker_plan.unwrap();
+        let staged = target.join(format!(".barge-marker-{}", plan.root_id));
+        let document: serde_json::Value = serde_json::from_slice(&read(&staged)).unwrap();
+        assert_eq!(document["root_id"], plan.root_id);
+        assert_eq!(
+            error.detail()["staged_marker"],
+            staged.display().to_string()
+        );
+        assert!(read_placements(&fixture.state).unwrap().records.is_empty());
+        assert!(fixture.adopt(&request).is_err());
+        assert!(fixture
+            .undo(&UndoRequest {
+                placement_id: None,
+                kind: Some(CacheKind::CargoRegistry),
+                plan: false
+            })
+            .is_err());
+        assert_eq!(read(&marker), b"concurrent marker, keep exactly");
+        assert_eq!(Some(facts(&marker)), *saved.borrow());
+        assert!(staged.is_file(), "pending staging evidence is kept");
+    }
+
+    #[test]
+    fn old_replacing_marker_publish_overwrites_the_same_boundary_race() {
+        let fixture = Fixture::new("cache-marker-replacing-counterfactual");
+        let target = fixture.caches().join("cargo/registry");
+        std::fs::create_dir_all(&target).unwrap();
+        let marker = target.join(area::ROOT_MARKER_FILE);
+        let parent = fixture.platform().open_path(&target).unwrap();
+        assert!(fixture
+            .platform()
+            .child_facts(&parent, area::ROOT_MARKER_FILE)
+            .unwrap()
+            .is_none());
+        let raced = marker.clone();
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = saved.clone();
+        let dirs = crate::testkit::Faults::new();
+        *dirs.replacing_publication_probe.borrow_mut() = Some(Box::new(move |name| {
+            if name == area::ROOT_MARKER_FILE {
+                std::fs::write(&raced, b"concurrent marker, keep exactly").unwrap();
+                *observed.borrow_mut() = Some(facts(&raced));
+            }
+        }));
+        // The old area::write_marker publication, after its absence observation.
+        dirs.publish_child_file(
+            &parent,
+            area::ROOT_MARKER_FILE,
+            b"old writer overwrote the marker",
+            0o600,
+        )
+        .unwrap();
+        assert_eq!(read(&marker), b"old writer overwrote the marker");
+        assert_ne!(Some(facts(&marker)), *saved.borrow());
+    }
+
+    #[test]
     fn adoption_capture_keeps_a_concurrent_settings_edit_and_pending_evidence() {
         let fixture = Fixture::new("cache-adopt-setting-capture-edit");
         let settings = fixture.write(".npmrc", "cache=/old\n");

@@ -1710,8 +1710,9 @@ pub struct MarkerIdentity {
 /// This is the one marker writer: creation and in-place adoption both use it, so
 /// the field set, the caps, the mode and the read-back proof cannot drift apart.
 /// The marker is validated against what was actually walked before it is
-/// published, and then read back so the caller records what is on disk rather
-/// than what it meant to write.
+/// published through a private synced file and an exclusive rename. A raced-in
+/// entry is kept, with the staging file available as recovery evidence. Readback
+/// proves the published inode, nonce and digest rather than just the root id.
 pub fn write_marker(
     dirs: &dyn DirOps,
     root: &DirHandle,
@@ -1767,10 +1768,66 @@ pub fn write_marker(
         .with_detail("cap", MARKER_CAP_BYTES.into()));
     }
     let digest = sha256_hex(&bytes);
-    dirs.publish_child_file(root, ROOT_MARKER_FILE, &bytes, RECORD_MODE)?;
-    match read_marker(dirs, root, &expectation) {
-        MarkerState::Owned(back) if back.root_id == root_id => {}
-        other => {
+    // The intended root id is already durable in an in-place adoption's intent.
+    // Keep this private staging name on uncertainty; never replace the marker
+    // that another writer may have created since the caller observed absence.
+    let staged = format!(".barge-marker-{root_id}");
+    if dirs.child_facts(root, &staged)?.is_some() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "marker staging name is already occupied",
+        ));
+    }
+    dirs.publish_child_file(root, &staged, &bytes, RECORD_MODE)?;
+    let staged_facts = dirs
+        .child_facts(root, &staged)?
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "staged marker disappeared"))?;
+    if staged_facts.kind != EntryKind::File
+        || staged_facts.uid != effective_uid
+        || staged_facts.device != root.identity().device
+        || dirs.recheck_dir(root)? != root.identity()
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "staged marker or parent binding changed",
+        ));
+    }
+    if dirs.rename_child(root, &staged, ROOT_MARKER_FILE)? == os::RenameOutcome::TargetExists {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "a marker appeared before publication; no existing entry was replaced",
+        )
+        .with_detail(
+            "path",
+            write
+                .resolved_path
+                .join(ROOT_MARKER_FILE)
+                .display()
+                .to_string()
+                .into(),
+        )
+        .with_detail(
+            "staged_marker",
+            write
+                .resolved_path
+                .join(&staged)
+                .display()
+                .to_string()
+                .into(),
+        ));
+    }
+    dirs.sync_dir(root)?;
+    let published = dirs.child_facts(root, ROOT_MARKER_FILE)?;
+    if published.as_ref() != Some(&staged_facts) {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "published marker identity changed",
+        ));
+    }
+    match read_marker_with_digest(dirs, root, &expectation) {
+        (MarkerState::Owned(back), Some(back_digest))
+            if back.root_id == root_id && back.nonce == nonce && back_digest == digest => {}
+        (other, _) => {
             return Err(Error::new(
                 ErrorKind::UnknownState,
                 format!(

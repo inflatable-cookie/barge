@@ -421,6 +421,21 @@ pub trait DirOps {
         mode: u32,
     ) -> Result<()>;
 
+    /// Persist directory entry changes through the opened descriptor, without
+    /// resolving its public path again. An injected handle without a descriptor
+    /// refuses rather than claiming that changes were synced.
+    fn sync_dir(&self, directory: &DirHandle) -> Result<()> {
+        let file = directory
+            .descriptor()
+            .ok_or_else(|| Error::new(ErrorKind::Io, "directory sync has no opened descriptor"))?;
+        file.sync_all().map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("cannot sync opened directory: {error}"),
+            )
+        })
+    }
+
     /// Read one child regular file without following a link, refusing one over
     /// `cap` bytes before its body is read. `Ok(None)` is "not there".
     fn read_child_file(

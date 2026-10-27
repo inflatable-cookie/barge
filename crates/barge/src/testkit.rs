@@ -460,6 +460,8 @@ pub struct Faults {
     pub capture_probe: RefCell<Option<ObserveProbe>>,
     /// Observe publication destinations just before an exclusive rename.
     pub publication_probe: RefCell<Option<ObserveProbe>>,
+    /// Counterfactual seam immediately before the old replacing file publish.
+    pub replacing_publication_probe: RefCell<Option<ObserveProbe>>,
     /// Fail one readback after publishing this settings file.
     pub fail_settings_readback: RefCell<Option<String>>,
     settings_readback_armed: Cell<bool>,
@@ -1051,6 +1053,9 @@ impl DirOps for Faults {
         bytes: &[u8],
         mode: u32,
     ) -> Result<()> {
+        if let Some(probe) = self.replacing_publication_probe.borrow().as_ref() {
+            probe(name);
+        }
         self.inner.publish_child_file(parent, name, bytes, mode)?;
         if self.fail_settings_readback.borrow().as_deref() == Some(name) {
             self.settings_readback_armed.set(true);

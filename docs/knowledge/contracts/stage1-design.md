@@ -1934,7 +1934,11 @@ Choices S6 made where this design left the mechanic to the slice:
   pre-adoption observation records. `area` gains Barge's own feature-folder
   resolution (`Feature::Caches`) and one public `write_marker`, so creation and
   in-place adoption share one marker writer, one field set and one read-back
-  proof instead of two.
+  proof instead of two. The writer stages synced bytes at
+  `.barge-marker-<root-id>`, publishes by exclusive rename and syncs the opened
+  directory. An occupied marker name is refused without replacing it; the
+  staged file and in-place adoption intent are kept for inspection. Successful
+  readback proves the published inode, nonce and exact digest.
 - **Custody before a link removal.** `barge cache undo` of a `link` placement
   reopens the volume's `caches/` folder, proves the owned root is the recorded
   id, inode and marker bytes, and requires a `Safe` custody verdict (released or
