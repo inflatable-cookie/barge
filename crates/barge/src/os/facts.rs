@@ -450,6 +450,13 @@ pub trait DirOps {
     /// mode durably before it calls this.
     fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> Result<()>;
 
+    /// One opened directory's own facts, read through its descriptor.
+    ///
+    /// The facts describe the object the handle was opened as, never whatever a
+    /// name holds now, so a caller decides about the same object it verified: a
+    /// mode recorded from these facts is the mode of the directory it will chmod.
+    fn dir_facts(&self, handle: &DirHandle) -> Result<EntryFacts>;
+
     /// Re-read one opened directory's own identity through its descriptor: the
     /// parent binding a capture or an unlink relies on.
     ///

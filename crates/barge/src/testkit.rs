@@ -425,6 +425,10 @@ pub type ObserveProbe = Box<dyn Fn(&str)>;
 /// answers one fact about the state at that moment.
 pub type PutBackProbe = Box<dyn Fn(&str) -> bool>;
 
+/// A probe the test installs at a mode change: it is handed the mode and answers
+/// one fact about the state at that moment.
+pub type ModeProbe = Box<dyn Fn(u32) -> bool>;
+
 /// The platform's directory operations with the faults a platform cannot be
 /// asked to produce: a foreign owner, an entry on another device, an
 /// `ENOTEMPTY` that keeps coming back, a racer that replaces an entry after the
@@ -494,6 +498,10 @@ pub struct Faults {
     pub mode_changes: RefCell<Vec<u32>>,
     /// Fail a mode change back to a mode without owner write: the restore fails.
     pub fail_mode_restore: Cell<bool>,
+    /// A probe run the moment a mode is set, handed the mode and answering one fact
+    /// about the state at that moment.
+    pub mode_probe: RefCell<Option<ModeProbe>>,
+    mode_probe_answers: RefCell<Vec<bool>>,
     /// Fail the listing that follows a mode change: an abort after the chmod.
     pub fail_listing_after_mode: Cell<bool>,
     /// Set once a mode change has happened and a failure is armed for it.
@@ -706,6 +714,16 @@ impl Faults {
     /// Swap the next private name for a foreign directory at its open.
     pub fn swapping_capture_on_open(&self) {
         self.swap_on_capture_open.set(true);
+    }
+
+    /// Run `probe` the moment a mode is set, and keep its answer.
+    pub fn probing_mode(&self, probe: ModeProbe) {
+        *self.mode_probe.borrow_mut() = Some(probe);
+    }
+
+    /// What the mode probe answered on each mode it saw, in order.
+    pub fn mode_probe_answers(&self) -> Vec<bool> {
+        self.mode_probe_answers.borrow().clone()
     }
 
     /// Replace the quarantine leaf with a foreign directory, once.
@@ -1067,7 +1085,15 @@ impl DirOps for Faults {
         Ok(outcome)
     }
 
+    fn dir_facts(&self, handle: &DirHandle) -> Result<EntryFacts> {
+        self.inner.dir_facts(handle)
+    }
+
     fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> Result<()> {
+        if let Some(probe) = self.mode_probe.borrow().as_ref() {
+            let answer = probe(mode);
+            self.mode_probe_answers.borrow_mut().push(answer);
+        }
         if self.fail_mode_restore.get() && mode & 0o200 == 0 {
             // The restore never reaches the platform: the mode stays changed.
             return Err(Error::new(ErrorKind::Io, "the mode restore did not happen"));

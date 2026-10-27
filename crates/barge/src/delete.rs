@@ -609,14 +609,14 @@ fn finish_deletion(
     // cannot have its contents removed. Its mode is published before the change and
     // a guard puts it back on every abort, and a replay restores it first.
     let mut base_chain: Vec<CaptureRecord> = Vec::new();
-    let leaf_facts = match dirs.child_facts(area_handle, &intent.quarantine_name) {
+    let leaf_facts = match dirs.dir_facts(&leaf).map(Some) {
         Ok(facts) => facts,
         Err(error) => {
             return pending_report(
                 &journal.intent(),
                 quarantine,
                 counts,
-                format!("the quarantine leaf cannot be read: {error}"),
+                format!("the opened quarantine leaf cannot be read: {error}"),
                 None,
             )
         }
@@ -2322,17 +2322,22 @@ fn replay_one(
                         .to_owned(),
                 ));
             }
-            let Some(leaf) = leaf_handle.as_ref() else {
+            if leaf_handle.is_none() {
                 return Ok(ReplayOutcome::Pending(
                     "the leaf and marker do not prove completion".to_owned(),
                 ));
-            };
+            }
             if !matches!(marker_digest, Some(MarkerBytes::Absent)) {
                 return Ok(ReplayOutcome::Pending(
                     "the leaf and marker do not prove completion".to_owned(),
                 ));
             }
             let journal = CaptureJournal::new(&write, state_paths, intent);
+            let leaf_mode = intent
+                .captures
+                .iter()
+                .find(|capture| capture.original == intent.quarantine_name)
+                .and_then(|capture| capture.mode);
             let mut walk = WalkState::new(
                 dirs,
                 facts,
@@ -2346,14 +2351,10 @@ fn replay_one(
             )?;
             walk.verify_volume()?;
             let mut counts = Counts::default();
-            match walk.remove_directory(
-                &area_handle,
-                leaf,
-                &intent.quarantine_name,
-                0,
-                Path::new(""),
-                &mut counts,
-            )? {
+            // The leaf is captured and verified again here too: the visible
+            // quarantine name is never removed by name, so a replacement put there
+            // cannot be deleted and recorded as a completion.
+            match walk.remove_leaf(&area_handle, intent, leaf_mode, &mut counts)? {
                 Removal::Gone => {
                     // The replay's own final unlink is the durable completion
                     // evidence, recorded before the intent settles.
@@ -3638,8 +3639,19 @@ mod tests {
             "{:?}",
             report.pending[0].reason
         );
-        assert!(private.is_file(), "the leftover is never unlinked");
-        assert!(leaf.is_dir(), "the intent stays pending with its leaf");
+        // The replay captured the leaf itself before walking it, so the leftover is
+        // now inside the leaf's own private name; it is never unlinked.
+        let area = leaf.parent().expect("the area folder").to_path_buf();
+        let kept = find_entry(
+            &area,
+            private
+                .file_name()
+                .expect("a name")
+                .to_str()
+                .expect("a name"),
+        )
+        .expect("the leftover is never unlinked");
+        assert!(kept.is_file(), "the leftover is still a file");
         assert_eq!(prepared.pending_intents().len(), 1);
     }
 
@@ -3864,6 +3876,97 @@ mod tests {
         );
         let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
         assert!(intents.records[0].phase.is_pending());
+    }
+
+    #[test]
+    fn a_mode_change_is_durable_before_the_chmod() {
+        // The ordering proof for mode custody: at the moment the owner write and
+        // search bits are applied, the intent already records the original mode, so
+        // a crash in between still lets a replay restore it.
+        let prepared = prepared("delete-mode-ordering");
+        let root = prepared.observed.path.clone();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).expect("the directory exists");
+        VolumeFixture::payload(&locked, "inside.txt", b"bytes");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+                .expect("the directory is read-only");
+        }
+        let state_paths = prepared.fixture.state.clone();
+        let faults = Faults::new();
+        faults.probing_mode(Box::new(move |mode: u32| {
+            if mode & 0o777 != 0o700 {
+                return true;
+            }
+            let intents = state::read_intents(&state_paths, 64).expect("the journal reads");
+            intents.records.iter().any(|record| {
+                record
+                    .captures
+                    .iter()
+                    .any(|capture| capture.mode == Some(0o500))
+            })
+        }));
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_deleted(), "{:?}", report.reason);
+        assert_eq!(
+            faults.mode_probe_answers().first().copied(),
+            Some(true),
+            "the recorded mode is durable before the chmod: {:?}",
+            faults.mode_probe_answers()
+        );
+    }
+
+    #[test]
+    fn a_marker_last_replay_never_removes_a_swapped_leaf() {
+        // The marker-last replay also captures and verifies the leaf before its
+        // removal: a replacement put at the visible quarantine name is kept, the
+        // intent stays pending and no completion is recorded.
+        let prepared = prepared("replay-marker-last-leaf-swap");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        publish(&prepared, &[]);
+        rename_to_quarantine(&prepared);
+        let leaf = prepared.quarantine();
+        std::fs::remove_file(leaf.join(ROOT_MARKER_FILE)).expect("the marker is removed");
+        std::fs::remove_file(leaf.join("payload.txt")).expect("the payload is removed");
+        publish(&prepared, &[IntentPhase::Renamed, IntentPhase::MarkerLast]);
+
+        let faults = Faults::new();
+        faults.swapping_leaf(&area, QUARANTINE_PREFIX);
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let replay = replay_with(
+            &prepared.fixture.state,
+            &faults,
+            &prepared.fixture.facts(),
+            &mounts,
+            &observer,
+            prepared.bounds(),
+        )
+        .expect("the replay reports");
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0]
+                .reason
+                .contains("not the recorded quarantine leaf"),
+            "{:?}",
+            replay.pending[0].reason
+        );
+        // The racer's empty directory is put back under the visible name and kept.
+        assert!(
+            std::fs::metadata(&leaf)
+                .expect("the foreign directory is put back")
+                .is_dir(),
+            "the foreign replacement is never removed"
+        );
+        let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
+        assert_eq!(intents.records[0].phase, IntentPhase::MarkerLast);
+        assert_eq!(intents.records[0].foreign_captures.len(), 1);
     }
 
     #[test]
@@ -4676,15 +4779,29 @@ mod tests {
             "{:?}",
             report.pending[0].reason
         );
-        assert!(std::fs::symlink_metadata(&private)
-            .expect("the leftover is kept")
-            .file_type()
-            .is_symlink());
+        // The replay captured the leaf itself before walking it, so the leftover is
+        // now inside the leaf's own private name.
+        let kept = find_entry(
+            &area,
+            private
+                .file_name()
+                .expect("a name")
+                .to_str()
+                .expect("a name"),
+        )
+        .expect("the leftover is kept");
+        assert!(
+            std::fs::symlink_metadata(&kept)
+                .expect("the leftover is kept")
+                .file_type()
+                .is_symlink(),
+            "the leftover is still the link it was"
+        );
         assert_eq!(
             std::fs::read(&victim).expect("the link target is untouched"),
             b"never removed"
         );
-        assert!(leaf.is_dir(), "the intent stays pending with its leaf");
+        let _ = leaf;
     }
 
     #[test]

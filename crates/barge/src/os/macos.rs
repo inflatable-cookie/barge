@@ -1873,6 +1873,16 @@ impl DirOps for MacOs {
         )
     }
 
+    fn dir_facts(&self, handle: &DirHandle) -> Result<EntryFacts> {
+        let descriptor = handle.descriptor().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Usage,
+                "the handle has no open descriptor to read".to_owned(),
+            )
+        })?;
+        Ok(entry_facts(&fstat(descriptor, Path::new("facts"))?))
+    }
+
     fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> Result<()> {
         let descriptor = handle.descriptor().ok_or_else(|| {
             Error::new(
