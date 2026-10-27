@@ -793,7 +793,12 @@ fn finish_deletion(
     // The leaf's own mode: a directory whose owner cannot write into it cannot
     // have its contents removed. Its mode is published before the change and a
     // guard puts it back on every abort, and a replay restores it first.
-    let mut base_chain: Vec<CaptureRecord> = Vec::new();
+    //
+    // The chain starts from the captures the intent already records: a stopped run
+    // may have left one under its private name, and its record is what authorises
+    // finishing it. The leaf's own mode record, when this run takes one, goes at
+    // the front, because it is the outermost private name.
+    let mut base_chain: Vec<CaptureRecord> = intent.captures.clone();
     let mut leaf_custody_mode: Option<u32> = None;
     let leaf_custody = match &leaf {
         Some(leaf) => match dirs.dir_facts(leaf) {
@@ -801,15 +806,19 @@ fn finish_deletion(
                 if leaf_facts.kind == EntryKind::Directory
                     && leaf_facts.permission_mode() & 0o300 != 0o300 =>
             {
-                base_chain.push(CaptureRecord {
-                    private: intent.capture_name().to_owned(),
-                    original: intent.capture_name().to_owned(),
-                    device: intent.unit.device,
-                    inode: intent.unit.inode,
-                    kind: "directory".to_owned(),
-                    verdict: CaptureVerdict::Observed,
-                    mode: Some(leaf_facts.st_mode),
-                });
+                base_chain.retain(|held| held.private != intent.capture_name());
+                base_chain.insert(
+                    0,
+                    CaptureRecord {
+                        private: intent.capture_name().to_owned(),
+                        original: intent.capture_name().to_owned(),
+                        device: intent.unit.device,
+                        inode: intent.unit.inode,
+                        kind: "directory".to_owned(),
+                        verdict: CaptureVerdict::Observed,
+                        mode: Some(leaf_facts.st_mode),
+                    },
+                );
                 if let Err(error) = journal.record_captures(&base_chain) {
                     return pending_report(
                         &journal.intent(),
@@ -1756,9 +1765,19 @@ impl<'a> WalkState<'a> {
         relative: &Path,
         counts: &mut Counts,
     ) -> Result<Walk> {
-        self.chain.push(record.clone());
+        // A recorded capture a stopped run left behind is already in the chain,
+        // seeded from the intent when the walk started: it keeps its position so
+        // the snapshot's outermost-first order is the one a later replay resolves
+        // private names in. A capture this run makes is appended.
+        match self
+            .chain
+            .iter()
+            .position(|held| held.private == record.private)
+        {
+            Some(index) => self.chain[index] = record.clone(),
+            None => self.chain.push(record.clone()),
+        }
         if let Err(error) = self.publish_chain() {
-            self.chain.pop();
             return Ok(Walk::Stop(format!(
                 "the capture of `{}` could not be recorded, so it is not unlinked: {error}",
                 record.original
@@ -1769,7 +1788,15 @@ impl<'a> WalkState<'a> {
         } else {
             self.remove_recorded_directory(parent, record, changed_mode, depth, relative, counts)
         };
-        self.chain.pop();
+        // The record leaves the chain only after the removal it authorised
+        // succeeded; a stop before that keeps it recorded for a replay.
+        if let Some(index) = self
+            .chain
+            .iter()
+            .position(|held| held.private == record.private)
+        {
+            self.chain.remove(index);
+        }
         outcome
     }
 
@@ -2850,8 +2877,11 @@ fn restore_recorded_modes(
         }
         if facts.kind != EntryKind::Directory {
             // A recorded file capture has no contents and is never chmod'd; there
-            // is nothing to restore under it, and no chain to descend.
-            if at_leaf {
+            // is nothing to restore under it, and no chain to descend. A file leaf
+            // is the ordinary case for a file unit, and the phase decides its
+            // absence; a directory unit's leaf that is somehow a file is not the
+            // recorded object and is reported.
+            if at_leaf && intent.unit.kind == UnitKind::Directory {
                 return Ok(Some(format!(
                     "`{}` is recorded as the captured leaf but is a {}",
                     record.private,
@@ -2985,8 +3015,13 @@ mod tests {
         }
     }
 
-    /// A registered fixture volume with one declared area folder and the recorded
-    /// grants the planted units need, ready for a unit the test plants itself.
+    /// A registered fixture volume with the volume's scratch folder as the area
+    /// and the recorded grants the planted units need, ready for a unit the test
+    /// plants itself.
+    ///
+    /// S4's claimed and delegated units live inside the volume's own scratch
+    /// folder, which is where those grants are scoped, so the fixture resolves
+    /// `scratch` directly rather than a declared consumer area.
     fn fixture_area(
         label: &str,
         grants: crate::registry::ScratchGrants,
@@ -2995,10 +3030,10 @@ mod tests {
         let mut record = fixture.record.clone();
         record.scratch_grants = grants;
         fixture.register_record(&record);
-        let declaration = fixture.declaration("example/pool");
+        let declaration = fixture.declaration("scratch");
         let resolved = fixture.resolved(&record, &declaration);
         let area = resolved.path.clone();
-        std::fs::create_dir_all(&area).expect("the area folder is created");
+        std::fs::create_dir_all(&area).expect("the scratch folder is created");
         (fixture, declaration, area)
     }
 
@@ -3106,8 +3141,8 @@ mod tests {
         }
     }
 
-    /// An unmarked claimed directory unit: one child of the `alpha` project folder,
-    /// which is one level inside the area folder (the scratch root).
+    /// An unmarked claimed directory unit: one child of the `alpha` project folder
+    /// inside the volume's scratch folder.
     fn prepared_unmarked(label: &str) -> Prepared {
         let (fixture, declaration, area) = fixture_area(
             label,
@@ -5798,6 +5833,21 @@ mod tests {
         ]
     }
 
+    /// The makers of one directory unit kind each, for the proofs that only a
+    /// directory's contents and leaf go through the walk.
+    fn directory_kind_makers() -> Vec<UnitMaker> {
+        vec![
+            ("barge", prepared as fn(&str) -> Prepared),
+            ("effigy", |label: &str| {
+                prepared_foreign(label, MarkerFamily::EffigyScratch)
+            }),
+            ("oxide", |label: &str| {
+                prepared_foreign(label, MarkerFamily::OxideScratch)
+            }),
+            ("unmarked", prepared_unmarked),
+        ]
+    }
+
     /// Plant the payloads a directory unit carries; a file unit is its own only
     /// content.
     fn plant_unit_contents(prepared: &Prepared) {
@@ -6063,36 +6113,426 @@ mod tests {
     }
 
     #[test]
-    fn an_aborted_unmarked_unit_restores_its_recorded_mode_then_replays() {
+    fn an_aborted_unit_of_every_directory_kind_restores_its_recorded_mode_then_replays() {
         use std::os::unix::fs::PermissionsExt;
-        let prepared = prepared_unmarked("mode-abort-unmarked");
+        for (label, make) in directory_kind_makers() {
+            let prepared = make(&format!("mode-abort-{label}"));
+            plant_unit_contents(&prepared);
+            std::fs::set_permissions(prepared.unit_path(), std::fs::Permissions::from_mode(0o500))
+                .expect("the unit is made read-only");
+            let faults = Faults::new();
+            faults.failing_listing_after_mode();
+            let report = prepared.delete(&faults, &prepared.fixture.facts());
+            assert!(report.is_pending(), "{label}: {report:?}");
+            assert_eq!(report.phase, IntentPhase::Renamed, "{label}");
+            assert_eq!(
+                mode_of(&report.quarantine),
+                0o500,
+                "{label}: the recorded mode is put back on the captured leaf"
+            );
+            let pending = prepared.pending_intents();
+            assert!(
+                pending[0]
+                    .captures
+                    .iter()
+                    .any(|capture| capture.mode == Some(0o040500)),
+                "{label}: the original full st_mode is recorded: {:?}",
+                pending[0].captures
+            );
+            // A replay restores the recorded mode first and then finishes the
+            // delete.
+            let replay = prepared.replay();
+            assert_eq!(replay.resumed, 1, "{label}: {replay:?}");
+            assert!(replay.is_settled(), "{label}: {replay:?}");
+            assert!(
+                !prepared.unit_path().exists(),
+                "{label}: the unit is deleted whole"
+            );
+        }
+    }
+
+    #[test]
+    fn every_successive_entry_a_racer_replaces_is_kept_for_every_directory_kind() {
+        // The Barge-root proof runs over all three depths above. Every other
+        // directory kind goes through the same walk, so the same racer must leave
+        // every foreign object it creates in place, at every position, for each of
+        // them too.
+        for (kind_label, make) in directory_kind_makers() {
+            for (position, raced) in RACED_ENTRIES.iter().enumerate() {
+                let prepared = make(&format!("racer-each-{kind_label}-{position}"));
+                plant_tree(&prepared.unit_path(), b"mine");
+                let holder = prepared.parent_path();
+                let foreign = format!("the racer's object at {kind_label} {position}").into_bytes();
+                let faults = Faults::new();
+                faults.racing(&holder, raced, 2, Replacement::File(foreign.clone()));
+                let report = prepared.delete(&faults, &prepared.fixture.facts());
+                assert!(
+                    report.is_pending(),
+                    "{kind_label} at {position}: {report:?}"
+                );
+                let leaf = report.quarantine.clone();
+                let found = find_entry(&leaf, raced_name(raced)).unwrap_or_else(|| {
+                    panic!("{kind_label} at {position}: the racer's object survives")
+                });
+                assert_eq!(
+                    std::fs::read(&found).expect("the racer's object reads"),
+                    foreign,
+                    "{kind_label} at {position}: the object it replaced is kept"
+                );
+                for other in RACED_ENTRIES.iter().filter(|other| *other != raced) {
+                    if let Some(path) = find_entry(&leaf, raced_name(other)) {
+                        assert_eq!(
+                            std::fs::read(&path).expect("the entry reads"),
+                            b"mine".to_vec(),
+                            "{kind_label} at {position}: `{other}` is never foreign"
+                        );
+                    }
+                }
+                if let Some(marker) = prepared.unit.marker_file() {
+                    assert!(
+                        leaf.join(marker).is_file(),
+                        "{kind_label} at {position}: the marker is kept"
+                    );
+                }
+                let pending = prepared.pending_intents();
+                assert_eq!(
+                    pending.len(),
+                    1,
+                    "{kind_label} at {position}: one pending intent"
+                );
+                assert_eq!(
+                    pending[0].foreign_captures.len(),
+                    1,
+                    "{kind_label} at {position}: the mismatch is recorded"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_leaf_replaced_before_its_final_capture_is_never_removed_for_every_kind() {
+        // The final capture window: a racer replaces what is at the visible private
+        // name after the deletion verified it there. A directory leaf is swapped
+        // for an empty foreign directory; a file is replaced by a new inode. In both
+        // cases the recorded identity no longer matches, so nothing is unlinked and
+        // the intent stays pending.
+        for (kind_label, make) in unit_kind_makers() {
+            let prepared = make(&format!("leaf-swap-{kind_label}"));
+            plant_unit_contents(&prepared);
+            let faults = Faults::new();
+            if prepared.unit.kind == UnitKind::File {
+                // The file is replaced after the deletion's own read of it and before
+                // the final capture, so the capture never sees the recorded object.
+                // The intent id is fresh per run, so the probe uses the name it is
+                // handed rather than a known private name.
+                let parent = prepared.parent_path();
+                let swapped = std::cell::Cell::new(false);
+                faults.observing(Box::new(move |name| {
+                    if swapped.get() || !name.starts_with(QUARANTINE_PREFIX) {
+                        return;
+                    }
+                    let leaf = parent.join(name);
+                    if !leaf.is_file() {
+                        return;
+                    }
+                    std::fs::remove_file(&leaf)
+                        .and_then(|()| std::fs::write(&leaf, b"the racer's leaf"))
+                        .expect("the racer replaces the file leaf");
+                    swapped.set(true);
+                }));
+            } else {
+                // The leaf is empty by now (contents and marker gone), so the
+                // racer can put its own empty directory at the visible name.
+                faults.swapping_leaf(&prepared.parent_path(), QUARANTINE_PREFIX);
+            }
+            let report = prepared.delete(&faults, &prepared.fixture.facts());
+            assert!(report.is_pending(), "{kind_label}: {report:?}");
+            // A file leaf's replacement is caught by the finish check before the
+            // marker-last phase; a directory leaf is swapped at its own final
+            // capture, after the phase.
+            let expected_phase = if prepared.unit.kind == UnitKind::File {
+                IntentPhase::Renamed
+            } else {
+                IntentPhase::MarkerLast
+            };
+            assert_eq!(report.phase, expected_phase, "{kind_label}");
+            let leaf = report.quarantine.clone();
+            assert!(
+                leaf.exists(),
+                "{kind_label}: the replacement is kept at the visible name"
+            );
+            if prepared.unit.kind == UnitKind::File {
+                assert_eq!(
+                    std::fs::read(&leaf).expect("the racer's file is kept"),
+                    b"the racer's leaf",
+                    "{kind_label}: the final capture never unlinks it"
+                );
+            } else {
+                assert!(leaf.is_dir(), "{kind_label}: the racer's directory is kept");
+                assert_eq!(
+                    prepared.pending_intents()[0].foreign_captures.len(),
+                    1,
+                    "{kind_label}: the mismatch is recorded"
+                );
+            }
+            // A replay keeps it too: nothing records the removed phase.
+            let replay = prepared.replay();
+            assert_eq!(replay.settled, 0, "{kind_label}: {replay:?}");
+            assert_eq!(replay.resumed, 0, "{kind_label}: {replay:?}");
+            assert_eq!(replay.pending.len(), 1, "{kind_label}: {replay:?}");
+            assert!(
+                leaf.exists(),
+                "{kind_label}: the replacement is still there"
+            );
+        }
+    }
+
+    #[test]
+    fn a_captured_leaf_that_vanishes_before_its_final_unlink_stays_pending() {
+        // The crash window #014 names: Barge captured the leaf, verified it, and
+        // then the unlink answered "already gone". That is never a completion.
+        for (kind_label, make) in [
+            ("unmarked", prepared_unmarked as fn(&str) -> Prepared),
+            ("file", prepared_file),
+        ] {
+            let prepared = make(&format!("leaf-vanish-{kind_label}"));
+            let faults = Faults::new();
+            faults.vanishing_capture();
+            let report = prepared.delete(&faults, &prepared.fixture.facts());
+            assert!(report.is_pending(), "{kind_label}: {report:?}");
+            assert_eq!(report.phase, IntentPhase::MarkerLast, "{kind_label}");
+            assert_eq!(report.entries_removed, 0, "{kind_label}");
+            assert!(
+                report
+                    .reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("vanished before Barge"),
+                "{kind_label}: {:?}",
+                report.reason
+            );
+            let pending = prepared.pending_intents();
+            assert_eq!(pending.len(), 1, "{kind_label}");
+            assert_eq!(pending[0].phase, IntentPhase::MarkerLast, "{kind_label}");
+            // An absent leaf without the durable `removed` phase is unknown, so a
+            // replay never completes it.
+            let replay = prepared.replay();
+            assert_eq!(replay.settled, 0, "{kind_label}: {replay:?}");
+            assert_eq!(replay.pending.len(), 1, "{kind_label}: {replay:?}");
+            assert!(
+                replay.pending[0]
+                    .reason
+                    .contains("removed phase was not recorded"),
+                "{kind_label}: {:?}",
+                replay.pending[0].reason
+            );
+        }
+    }
+
+    #[test]
+    fn a_resumed_delete_finishes_a_recorded_capture_for_every_directory_kind() {
+        // The mid-delete crash: one entry had been captured, verified and recorded
+        // under its private name, and the run stopped before its unlink. A replay
+        // re-verifies that record and removes only it, then finishes the unit.
+        for (kind_label, make) in directory_kind_makers() {
+            let prepared = make(&format!("replay-in-flight-{kind_label}"));
+            plant_unit_contents(&prepared);
+            publish(&prepared, &[IntentPhase::Renamed]);
+            rename_to_quarantine(&prepared);
+            let leaf = prepared.quarantine();
+            let payload = leaf.join("payload.txt");
+            let facts = prepared
+                .fixture
+                .platform()
+                .path_facts(&payload)
+                .expect("the entry reads")
+                .expect("the entry is there");
+            let private = format!("{CAPTURE_PREFIX}{}", "ab".repeat(16));
+            std::fs::rename(&payload, leaf.join(&private)).expect("the entry is captured");
+            publish_capture(
+                &prepared,
+                &state::CaptureRecord {
+                    private,
+                    original: "payload.txt".to_owned(),
+                    device: facts.device.get(),
+                    inode: facts.inode,
+                    kind: "file".to_owned(),
+                    verdict: state::CaptureVerdict::Observed,
+                    mode: None,
+                },
+            );
+
+            assert_eq!(
+                prepared.pending_intents()[0].captures.len(),
+                1,
+                "{kind_label}: the capture record is durable before the replay"
+            );
+            let replay = prepared.replay();
+            assert_eq!(replay.resumed, 1, "{kind_label}: {replay:?}");
+            assert!(replay.is_settled(), "{kind_label}: {replay:?}");
+            assert!(
+                !prepared.unit_path().exists(),
+                "{kind_label}: the unit is deleted whole"
+            );
+            assert!(
+                !prepared.quarantine().exists(),
+                "{kind_label}: the recorded capture and the leaf are gone"
+            );
+            assert!(prepared.pending_intents().is_empty(), "{kind_label}");
+        }
+    }
+
+    #[test]
+    fn a_replay_keeps_a_recorded_capture_it_has_not_reached_in_every_snapshot() {
+        // A snapshot published for another capture must keep the captures the
+        // intent already records and the replay has not reached: they are still
+        // under their private names, and their record is the only thing that
+        // authorises finishing them. The leaf's own mode record makes the first
+        // snapshot happen before the walk, so the stop is deterministic.
+        use std::os::unix::fs::PermissionsExt;
+        let prepared = prepared_unmarked("replay-keeps-unreached");
         plant_unit_contents(&prepared);
-        std::fs::set_permissions(prepared.unit_path(), std::fs::Permissions::from_mode(0o500))
-            .expect("the unit is made read-only");
+        publish(&prepared, &[IntentPhase::Renamed]);
+        rename_to_quarantine(&prepared);
+        let leaf = prepared.quarantine();
+        let payload = leaf.join("payload.txt");
+        let facts = prepared
+            .fixture
+            .platform()
+            .path_facts(&payload)
+            .expect("the entry reads")
+            .expect("the entry is there");
+        let private = format!("{CAPTURE_PREFIX}{}", "ab".repeat(16));
+        std::fs::rename(&payload, leaf.join(&private)).expect("the entry is captured");
+        publish_capture(
+            &prepared,
+            &state::CaptureRecord {
+                private: private.clone(),
+                original: "payload.txt".to_owned(),
+                device: facts.device.get(),
+                inode: facts.inode,
+                kind: "file".to_owned(),
+                verdict: state::CaptureVerdict::Observed,
+                mode: None,
+            },
+        );
+
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o500))
+            .expect("the captured leaf is made read-only");
         let faults = Faults::new();
         faults.failing_listing_after_mode();
-        let report = prepared.delete(&faults, &prepared.fixture.facts());
-        assert!(report.is_pending(), "{report:?}");
-        assert_eq!(report.phase, IntentPhase::Renamed, "{report:?}");
-        assert_eq!(
-            mode_of(&report.quarantine),
-            0o500,
-            "the recorded mode is put back on the captured leaf"
-        );
+        let replay = replay_with(
+            &prepared.fixture.state,
+            &faults,
+            &prepared.fixture.facts(),
+            &prepared.fixture.mounts(),
+            &prepared.fixture.observer(),
+            prepared.bounds(),
+        )
+        .expect("the replay reports");
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
         let pending = prepared.pending_intents();
         assert!(
             pending[0]
                 .captures
                 .iter()
-                .any(|capture| capture.mode == Some(0o040500)),
-            "the original full st_mode is recorded: {:?}",
+                .any(|capture| capture.private == private),
+            "the snapshot keeps the unreached recorded capture: {:?}",
             pending[0].captures
         );
-        // A replay restores the recorded mode first and then finishes the delete.
+        assert!(
+            pending[0]
+                .captures
+                .iter()
+                .any(|capture| capture.private == pending[0].capture_name()),
+            "the leaf's own mode record is in the same snapshot: {:?}",
+            pending[0].captures
+        );
+        assert!(
+            leaf.join(&private).is_file(),
+            "nothing unlinks the recorded capture"
+        );
+    }
+
+    #[test]
+    fn a_file_leaf_captured_before_its_unlink_stays_pending_for_a_replay() {
+        // The leaf is the one capture a replay never resumes from a private name:
+        // only the durable `removed` phase proves Barge removed it. A crash between
+        // a file leaf's capture and its unlink therefore stays pending, and the
+        // recorded private object is never unlinked.
+        let prepared = prepared_file("replay-file-leaf-captured");
+        publish(&prepared, &[IntentPhase::Renamed, IntentPhase::MarkerLast]);
+        rename_to_quarantine(&prepared);
+        let leaf = prepared.quarantine();
+        let facts = prepared
+            .fixture
+            .platform()
+            .path_facts(&leaf)
+            .expect("the leaf reads")
+            .expect("the leaf is there");
+        let parent = prepared.parent_path();
+        let private = format!("{CAPTURE_PREFIX}{}", "cd".repeat(16));
+        std::fs::rename(&leaf, parent.join(&private)).expect("the leaf is captured");
+        publish_capture(
+            &prepared,
+            &state::CaptureRecord {
+                private: private.clone(),
+                original: format!("{QUARANTINE_PREFIX}{:032x}", 1),
+                device: facts.device.get(),
+                inode: facts.inode,
+                kind: "file".to_owned(),
+                verdict: state::CaptureVerdict::Observed,
+                mode: None,
+            },
+        );
+
         let replay = prepared.replay();
-        assert_eq!(replay.resumed, 1, "{replay:?}");
-        assert!(replay.is_settled(), "{replay:?}");
-        assert!(!prepared.unit_path().exists(), "the unit is deleted whole");
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0]
+                .reason
+                .contains("removed phase was not recorded"),
+            "{:?}",
+            replay.pending[0].reason
+        );
+        assert_eq!(
+            std::fs::read(parent.join(&private)).expect("the recorded capture is kept"),
+            b"bytes",
+            "a replay never unlinks a captured leaf from its private name"
+        );
+        assert_eq!(prepared.pending_intents()[0].phase, IntentPhase::MarkerLast);
+    }
+
+    #[test]
+    fn a_leaf_absent_without_the_removed_phase_stays_unknown_for_every_kind() {
+        // The crash between Barge's own final unlink and the durable `removed`
+        // phase: an absence alone never resolves an intent, for any kind.
+        for (label, make) in unit_kind_makers() {
+            let prepared = make(&format!("crash-removed-{label}"));
+            plant_unit_contents(&prepared);
+            publish(&prepared, &[IntentPhase::Renamed, IntentPhase::MarkerLast]);
+            rename_to_quarantine(&prepared);
+            remove_leaf_whole(&prepared, &prepared.quarantine());
+            let replay = prepared.replay();
+            assert_eq!(replay.settled, 0, "{label}: {replay:?}");
+            assert_eq!(replay.resumed, 0, "{label}: {replay:?}");
+            assert_eq!(replay.pending.len(), 1, "{label}: {replay:?}");
+            assert!(
+                replay.pending[0]
+                    .reason
+                    .contains("removed phase was not recorded"),
+                "{label}: {:?}",
+                replay.pending[0].reason
+            );
+            assert_eq!(
+                prepared.pending_intents()[0].phase,
+                IntentPhase::MarkerLast,
+                "{label}: the intent is never settled on an absence"
+            );
+        }
     }
 
     #[test]

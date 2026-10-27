@@ -653,14 +653,25 @@ fn decide(
     })
 }
 
-/// Whether the grant the unit records is still recorded on the volume.
+/// Whether the grant the unit records is still recorded on the volume and covers
+/// this unit's place on it.
 ///
 /// A native root needs no entry: Barge's own marker is its grant, checked as a
-/// marker. A foreign family needs that family's delegation in the volume's
-/// `scratch_grants`, and an unmarked unit needs a claim whose scope covers it -
-/// `project:<name>` for a child of that project folder, `top_level_adhoc` for an
-/// entry directly under the scratch root - so a grant revoked between the plan and
-/// the effect keeps the unit rather than being trusted from the plan.
+/// marker, and S3 created Barge roots in declared areas too. The other two grants
+/// are **scratch** authority, so they are bound to the volume's own scratch folder
+/// (`folders.scratch`, default `scratch/`):
+///
+/// - a foreign family's delegation covers that family's marked units *inside the
+///   scratch folder* and nothing elsewhere on the volume; and
+/// - a legacy claim covers exactly the scope it declares, relative to the scratch
+///   folder: `project:<name>` is a child of `<scratch>/<name>/`, and
+///   `top_level_adhoc` is an entry directly under `<scratch>/` that is a file or
+///   whose name contains a dot. The claim's recorded unit shape must match its
+///   scope, so a `project` claim never authorizes a top-level entry and the
+///   reverse.
+///
+/// A grant revoked, or a unit moved outside the scope it was declared for, between
+/// the plan and the effect keeps the unit rather than being trusted from the plan.
 fn grant_still_recorded(
     record: &registry::VolumeRecord,
     unit: &DeletionUnit,
@@ -674,6 +685,14 @@ fn grant_still_recorded(
                     unit.grant.reference
                 ));
             };
+            if !inside_scratch(record, unit) {
+                return Err(format!(
+                    "the unit `{}` is outside volume {}'s scratch folder, so the `{}` delegation does not cover it",
+                    unit.name,
+                    record.volume_uuid,
+                    family.as_str()
+                ));
+            }
             if record
                 .scratch_grants
                 .delegations
@@ -690,27 +709,84 @@ fn grant_still_recorded(
             ))
         }
         GrantKind::Claim => {
-            let covers = record
-                .scratch_grants
-                .claims
-                .iter()
-                .any(|claim| match &claim.scope {
-                    registry::ClaimScope::TopLevelAdhoc => {
-                        unit.grant.reference == "top_level_adhoc" && unit.parent.is_empty()
+            let scope = unit_scope(unit);
+            let scratch = scratch_scope(record);
+            let covers = record.scratch_grants.claims.iter().any(|claim| {
+                match (&claim.scope, claim.unit) {
+                    (registry::ClaimScope::TopLevelAdhoc, registry::ClaimUnit::Entry) => {
+                        unit.grant.reference == "top_level_adhoc"
+                            && scope == scratch
+                            && (unit.kind == UnitKind::File || unit.name.contains('.'))
                     }
-                    registry::ClaimScope::Project { name } => {
-                        unit.grant.reference == format!("project:{name}") && unit.parent == *name
+                    (registry::ClaimScope::Project { name }, registry::ClaimUnit::Child) => {
+                        unit.grant.reference == format!("project:{name}")
+                            && scope.len() == scratch.len().saturating_add(1)
+                            && scope.starts_with(&scratch)
+                            && scope.last() == Some(&name.as_str())
                     }
-                });
+                    // A claim whose recorded shape does not match its scope covers
+                    // nothing: it was never a declaration over these units.
+                    (registry::ClaimScope::TopLevelAdhoc, registry::ClaimUnit::Child)
+                    | (registry::ClaimScope::Project { .. }, registry::ClaimUnit::Entry) => false,
+                }
+            });
             if covers {
                 return Ok(());
             }
             Err(format!(
-                "volume {} records no `{}` claim covering the unit `{}` in `{}`, so it is kept",
-                record.volume_uuid, unit.grant.reference, unit.name, unit.parent
+                "volume {} records no `{}` claim whose scope covers the unit `{}` at `{}` relative to its scratch folder, so it is kept",
+                record.volume_uuid,
+                unit.grant.reference,
+                unit.name,
+                unit.parent
             ))
         }
     }
+}
+
+/// The unit's folder inside the volume: `root_dir`, the area folder and the unit's
+/// parent, as one component path.
+fn unit_scope(unit: &DeletionUnit) -> Vec<&str> {
+    let mut components = Vec::new();
+    for part in [
+        unit.root_dir.as_str(),
+        unit.folder.as_str(),
+        unit.parent.as_str(),
+    ] {
+        components.extend(part.split('/').filter(|component| !component.is_empty()));
+    }
+    components
+}
+
+/// The volume's own scratch folder inside the volume: `root_dir` and the recorded
+/// or default scratch folder.
+fn scratch_scope(record: &registry::VolumeRecord) -> Vec<&str> {
+    let mut components: Vec<&str> = record
+        .root_dir
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    components.extend(
+        record
+            .folders
+            .scratch
+            .as_deref()
+            .unwrap_or("scratch")
+            .split('/')
+            .filter(|component| !component.is_empty()),
+    );
+    components
+}
+
+/// Whether the unit's parent directory is at or under the volume's scratch folder.
+///
+/// A family's root can be a direct child of the scratch folder itself (Effigy's
+/// runs are), so equality counts: the unit lives inside the folder even when its
+/// parent is the folder.
+fn inside_scratch(record: &registry::VolumeRecord, unit: &DeletionUnit) -> bool {
+    let scope = unit_scope(unit);
+    let scratch = scratch_scope(record);
+    scope.starts_with(&scratch)
 }
 
 /// Verify the marker a unit records, or that a markerless unit stayed unmarked.
@@ -947,29 +1023,39 @@ mod tests {
         unit: DeletionUnit,
         /// The area folder the unit lives in.
         area: PathBuf,
+        /// The area folder's path relative to the volume's `root_dir`, which is
+        /// what a unit record names.
+        folder: String,
     }
 
     fn holder(label: &str) -> Holder {
-        build(VolumeFixture::new(label))
+        build(VolumeFixture::new(label), "example/pool")
+    }
+
+    /// A holder whose area folder is the volume's own scratch folder, which is
+    /// where the claimed and delegated units of S4's sweep live.
+    fn scratch_holder(label: &str) -> Holder {
+        build(VolumeFixture::new(label), "scratch")
     }
 
     /// A holder whose fixture lives under the scratch base (AGENTS.md): the
     /// real-observer tests run there.
     fn real_holder(label: &str) -> Holder {
-        build(VolumeFixture::under_scratch(label))
+        build(VolumeFixture::under_scratch(label), "example/pool")
     }
 
-    fn build(fixture: VolumeFixture) -> Holder {
+    fn build(fixture: VolumeFixture, folder: &str) -> Holder {
         fixture.register();
-        let declaration = fixture.declaration("example/pool");
+        let declaration = fixture.declaration(folder);
         let (root, resolved) =
             fixture.create_root(&fixture.record, &declaration, RootKind::AreaRoot);
-        let unit = DeletionUnit::from_owned(&root, "", "example/pool", PLAN);
+        let unit = DeletionUnit::from_owned(&root, "", folder, PLAN);
         let area = resolved.path.clone();
         Holder {
             fixture,
             unit,
             area,
+            folder: folder.to_owned(),
         }
     }
 
@@ -1329,7 +1415,7 @@ mod tests {
             DeletionUnit {
                 volume_uuid: self.fixture.uuid.clone(),
                 root_dir: String::new(),
-                folder: "example/pool".to_owned(),
+                folder: self.folder.clone(),
                 parent: parent.to_owned(),
                 name: name.to_owned(),
                 kind,
@@ -1361,13 +1447,17 @@ mod tests {
         }
     }
 
-    /// The claim an unmarked unit's deletion rests on.
-    fn claim(scope: crate::registry::ClaimScope) -> crate::registry::ScratchGrants {
+    /// The claim an unmarked unit's deletion rests on, with its recorded unit
+    /// shape.
+    fn claim(
+        scope: crate::registry::ClaimScope,
+        shape: crate::registry::ClaimUnit,
+    ) -> crate::registry::ScratchGrants {
         crate::registry::ScratchGrants {
             delegations: Vec::new(),
             claims: vec![crate::registry::ScratchClaim {
                 scope,
-                unit: crate::registry::ClaimUnit::Child,
+                unit: shape,
                 unmarked_idle_seconds: 1_209_600,
                 families_excluded: vec![
                     crate::registry::MarkerFamily::EffigyScratch,
@@ -1381,10 +1471,13 @@ mod tests {
 
     #[test]
     fn a_claimed_unmarked_unit_with_a_complete_empty_scan_is_safe() {
-        let holder = holder("custody-unmarked");
-        holder.record_grants(claim(crate::registry::ClaimScope::Project {
-            name: "alpha".to_owned(),
-        }));
+        let holder = scratch_holder("custody-unmarked");
+        holder.record_grants(claim(
+            crate::registry::ClaimScope::Project {
+                name: "alpha".to_owned(),
+            },
+            crate::registry::ClaimUnit::Child,
+        ));
         std::fs::create_dir(holder.area.join("alpha")).expect("the project folder exists");
         std::fs::create_dir(holder.area.join("alpha").join("unmarked-run"))
             .expect("the unit is planted");
@@ -1408,8 +1501,11 @@ mod tests {
 
     #[test]
     fn a_claimed_file_unit_with_a_complete_empty_scan_is_safe() {
-        let holder = holder("custody-file");
-        holder.record_grants(claim(crate::registry::ClaimScope::TopLevelAdhoc));
+        let holder = scratch_holder("custody-file");
+        holder.record_grants(claim(
+            crate::registry::ClaimScope::TopLevelAdhoc,
+            crate::registry::ClaimUnit::Entry,
+        ));
         std::fs::write(holder.area.join("report.txt"), b"bytes").expect("the unit is planted");
         let unit = holder.planted_unit(
             "",
@@ -1427,10 +1523,13 @@ mod tests {
 
     #[test]
     fn a_claimed_unmarked_unit_that_becomes_marked_is_refused() {
-        let holder = holder("custody-became-marked");
-        holder.record_grants(claim(crate::registry::ClaimScope::Project {
-            name: "alpha".to_owned(),
-        }));
+        let holder = scratch_holder("custody-became-marked");
+        holder.record_grants(claim(
+            crate::registry::ClaimScope::Project {
+                name: "alpha".to_owned(),
+            },
+            crate::registry::ClaimUnit::Child,
+        ));
         std::fs::create_dir(holder.area.join("alpha")).expect("the project folder exists");
         std::fs::create_dir(holder.area.join("alpha").join("unmarked-run"))
             .expect("the unit is planted");
@@ -1460,7 +1559,7 @@ mod tests {
 
     #[test]
     fn a_delegated_effigy_unit_is_safe_and_its_moved_marker_bytes_are_not() {
-        let holder = holder("custody-effigy");
+        let holder = scratch_holder("custody-effigy");
         holder.record_grants(delegation(crate::unit::MarkerFamily::EffigyScratch));
         let unit_path = holder.area.join("run.effigy");
         std::fs::create_dir(&unit_path).expect("the unit is planted");
@@ -1496,7 +1595,7 @@ mod tests {
         // A delegation that the volume does not record covers nothing, so custody
         // refuses even though the unit's own record names it: a grant revoked
         // between the plan and the effect keeps the unit.
-        let holder = holder("custody-grant-revoked");
+        let holder = scratch_holder("custody-grant-revoked");
         let unit_path = holder.area.join("run.effigy");
         std::fs::create_dir(&unit_path).expect("the unit is planted");
         let marker =
@@ -1520,8 +1619,179 @@ mod tests {
     }
 
     #[test]
+    fn a_project_claim_covers_its_children_addressed_from_the_scratch_root() {
+        // The unit is a child of `<scratch>/alpha`, addressed with the scratch root
+        // as the area folder: the claim's scope is exactly that folder.
+        let holder = scratch_holder("custody-claim-from-root");
+        holder.record_grants(claim(
+            crate::registry::ClaimScope::Project {
+                name: "alpha".to_owned(),
+            },
+            crate::registry::ClaimUnit::Child,
+        ));
+        std::fs::create_dir_all(holder.area.join("alpha")).expect("the project folder exists");
+        std::fs::create_dir(holder.area.join("alpha").join("unmarked-run"))
+            .expect("the unit is planted");
+        let unit = holder.planted_unit(
+            "alpha",
+            "unmarked-run",
+            None,
+            crate::unit::UnitGrant::claim("project:alpha"),
+        );
+        let verdict = holder.take_unit(&unit);
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+    }
+
+    #[test]
+    fn a_project_claim_covers_its_children_when_the_area_is_the_project_folder() {
+        // The same unit, addressed with the project folder itself as the area
+        // folder: the scope is derived from the unit's place, not from which
+        // folder string the caller happened to pass.
+        let holder = build(
+            VolumeFixture::new("custody-claim-from-project"),
+            "scratch/alpha",
+        );
+        holder.record_grants(claim(
+            crate::registry::ClaimScope::Project {
+                name: "alpha".to_owned(),
+            },
+            crate::registry::ClaimUnit::Child,
+        ));
+        std::fs::create_dir(holder.area.join("unmarked-run")).expect("the unit is planted");
+        let unit = holder.planted_unit(
+            "",
+            "unmarked-run",
+            None,
+            crate::unit::UnitGrant::claim("project:alpha"),
+        );
+        let verdict = holder.take_unit(&unit);
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+    }
+
+    #[test]
+    fn a_claim_does_not_authorize_a_unit_outside_the_scratch_folder() {
+        // The claim names a project folder relative to the volume's scratch folder.
+        // A unit of the same name inside a consumer area is not that folder, so the
+        // claim covers nothing there.
+        let holder = holder("custody-claim-elsewhere");
+        holder.record_grants(claim(
+            crate::registry::ClaimScope::Project {
+                name: "alpha".to_owned(),
+            },
+            crate::registry::ClaimUnit::Child,
+        ));
+        std::fs::create_dir_all(holder.area.join("alpha")).expect("the project folder exists");
+        std::fs::create_dir(holder.area.join("alpha").join("unmarked-run"))
+            .expect("the unit is planted");
+        let unit = holder.planted_unit(
+            "alpha",
+            "unmarked-run",
+            None,
+            crate::unit::UnitGrant::claim("project:alpha"),
+        );
+        let verdict = holder.take_unit(&unit);
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        assert!(
+            verdict.reason().unwrap_or_default().contains("claim"),
+            "{:?}",
+            verdict.reason()
+        );
+    }
+
+    #[test]
+    fn a_delegation_does_not_authorize_a_unit_outside_the_scratch_folder() {
+        let holder = holder("custody-delegation-elsewhere");
+        holder.record_grants(delegation(crate::unit::MarkerFamily::EffigyScratch));
+        let unit_path = holder.area.join("run.effigy");
+        std::fs::create_dir(&unit_path).expect("the unit is planted");
+        std::fs::write(
+            unit_path.join(crate::unit::EFFIGY_SCRATCH_MARKER_FILE),
+            b"{\"run\": \"foreign\"}",
+        )
+        .expect("the marker is written");
+        let marker = crate::unit::UnitMarker::new(
+            crate::unit::MarkerFamily::EffigyScratch,
+            crate::digest::sha256_hex(b"{\"run\": \"foreign\"}"),
+        );
+        let unit = holder.planted_unit(
+            "",
+            "run.effigy",
+            Some(marker),
+            crate::unit::UnitGrant::delegation(crate::unit::MarkerFamily::EffigyScratch),
+        );
+        let verdict = holder.take_unit(&unit);
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        assert!(
+            verdict
+                .reason()
+                .unwrap_or_default()
+                .contains("outside volume"),
+            "{:?}",
+            verdict.reason()
+        );
+    }
+
+    #[test]
+    fn a_top_level_claim_requires_an_entry_of_the_claimed_shape() {
+        // `top_level_adhoc` covers entries directly under the scratch folder that
+        // are files or whose name contains a dot; a bare directory is not one.
+        let holder = scratch_holder("custody-claim-shape");
+        holder.record_grants(claim(
+            crate::registry::ClaimScope::TopLevelAdhoc,
+            crate::registry::ClaimUnit::Entry,
+        ));
+        std::fs::create_dir(holder.area.join("plain-dir")).expect("the unit is planted");
+        let unit = holder.planted_unit(
+            "",
+            "plain-dir",
+            None,
+            crate::unit::UnitGrant::claim("top_level_adhoc"),
+        );
+        let verdict = holder.take_unit(&unit);
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+
+        // A file directly under the scratch folder is one, and so is a dotted
+        // directory name.
+        std::fs::write(holder.area.join("report.txt"), b"bytes").expect("the file is planted");
+        let file = holder.planted_unit(
+            "",
+            "report.txt",
+            None,
+            crate::unit::UnitGrant::claim("top_level_adhoc"),
+        );
+        assert_eq!(
+            holder.take_unit(&file).name(),
+            "safe",
+            "a top-level file is an entry the claim covers"
+        );
+    }
+
+    #[test]
+    fn a_claim_whose_recorded_shape_does_not_match_its_scope_covers_nothing() {
+        let holder = scratch_holder("custody-claim-mismatch");
+        holder.record_grants(claim(
+            crate::registry::ClaimScope::Project {
+                name: "alpha".to_owned(),
+            },
+            // A project scope's units are children; an entry shape was never a
+            // declaration over them.
+            crate::registry::ClaimUnit::Entry,
+        ));
+        std::fs::create_dir_all(holder.area.join("alpha")).expect("the project folder exists");
+        std::fs::create_dir(holder.area.join("alpha").join("unmarked-run"))
+            .expect("the unit is planted");
+        let unit = holder.planted_unit(
+            "alpha",
+            "unmarked-run",
+            None,
+            crate::unit::UnitGrant::claim("project:alpha"),
+        );
+        assert_eq!(holder.take_unit(&unit).name(), "unknown");
+    }
+
+    #[test]
     fn a_unit_whose_grant_does_not_cover_its_marker_family_is_refused() {
-        let holder = holder("custody-grant-shape");
+        let holder = scratch_holder("custody-grant-shape");
         holder.record_grants(delegation(crate::unit::MarkerFamily::EffigyScratch));
         let unit_path = holder.area.join("run.effigy");
         std::fs::create_dir(&unit_path).expect("the unit is planted");

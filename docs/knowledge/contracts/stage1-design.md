@@ -839,13 +839,23 @@ Every unit needs a recorded grant, and the grant must be the form its marker
 family needs: a **native root** for Barge's own marker, that family's
 **delegation** for a foreign marker, and a legacy **claim** for an unmarked
 unit. The intent records the grant's kind and reference, and custody re-reads the
-volume's `scratch_grants` when it decides: a delegation or claim that is not
-recorded there - or a claim whose scope does not cover the unit (`project:<name>`
-for a child of that folder, `top_level_adhoc` for an entry directly under the
-scratch root) - is refused, so a grant revoked between the plan and the effect
-keeps the unit. A unit whose grant does not cover its marker family is refused
-before any effect, so a missing or mismatched grant can never become a deletion,
-and a unit that becomes marked between the plan and the effect is kept.
+volume's `scratch_grants` when it decides, so a grant revoked between the plan
+and the effect keeps the unit:
+
+- a foreign family's delegation covers that family's marked units **inside the
+  volume's scratch folder** (`folders.scratch`, default `scratch/`) and nothing
+  else on the volume; and
+- a legacy claim is bound to the volume's scratch folder and to exactly the scope
+  it declares, derived from the unit's place rather than from which folder string
+  the caller passed: `project:<name>` is a child of `<scratch>/<name>/`, and
+  `top_level_adhoc` is an entry directly under `<scratch>/` that is a file or
+  whose name contains a dot. The claim's recorded unit shape must match its
+  scope (`child` for a project, `entry` for the top level), so a claim never
+  authorizes a unit outside its declared scope or a shape it did not declare.
+
+A unit whose grant does not cover its marker family is refused before any effect,
+so a missing or mismatched grant can never become a deletion, and a unit that
+becomes marked between the plan and the effect is kept.
 
 ### Capability limits on macOS and APFS
 
@@ -1107,7 +1117,13 @@ barge#014 brief). An absent name is never proof that Barge deleted its object.
    after an ordinary entry's unlink a stop can still leave that finished capture in
    the last published snapshot, and a replay then reads it as a missing capture,
    reports it and stays pending rather than guessing. That is the conservative
-   window the phase machine closes with `removed`. Every capture whose verification
+   window the phase machine closes with `removed`. A snapshot published while a
+   replay finishes a leftover also **keeps every capture the intent already
+   records that it has not reached yet**: those objects are still under their
+   private names, and dropping their record would leave them unverifiable if the
+   replay then stopped. The chain therefore starts from the intent's recorded
+   captures, in their outermost-first order, and a capture enters or leaves it
+   only around the unlink it authorises. Every capture whose verification
    failed is durably appended to `foreign_captures` - private name, original name,
    observed device/inode/type, the identity actually found - **before** its
    put-back is attempted. A replay may **re-verify and remove a recorded, verified
