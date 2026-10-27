@@ -1654,7 +1654,11 @@ mod tests {
         // digest, and re-evaluates the root's age against its own clock before
         // the effect.
         let report = harness
-            .real_at(planned_at + 60_000, &first.plan_digest, Some(&canonical(&first)))
+            .real_at(
+                planned_at + 60_000,
+                &first.plan_digest,
+                Some(&canonical(&first)),
+            )
             .expect("the preview's digest authorizes the run");
         assert_eq!(report.volumes.rows[0].areas[0].deleted.count, 1);
         assert!(!root.path.exists(), "the planned root is gone");
@@ -1666,9 +1670,8 @@ mod tests {
         let _root = harness.create_root(RootKind::AreaRoot);
         let first = harness.preview_at(harness.now_ms);
         let second = harness.preview_at(harness.now_ms + 5_000);
-        let reason = |report: &MaintainReport| {
-            harness.area_plan(report).kept.rows[0].reason.clone()
-        };
+        let reason =
+            |report: &MaintainReport| harness.area_plan(report).kept.rows[0].reason.clone();
         assert_eq!(
             reason(&first),
             format!("idle for less than the declared {AREA_AGE_SECONDS} s")
