@@ -6288,6 +6288,103 @@ mod tests {
     }
 
     #[test]
+    fn a_file_leaf_replaced_before_its_final_capture_is_recorded_and_never_deleted() {
+        // The file unit's final-capture window: the leaf passed its finish check,
+        // and a racer replaces it after that read and before Barge captures it. The
+        // capture then holds a foreign object, so it is recorded as a foreign
+        // capture **before** its put-back, put back under the visible name, and the
+        // intent stops pending. A replay reads that record and unlinks nothing.
+        let prepared = prepared_file("file-final-capture-racer");
+        let parent = prepared.parent_path();
+        let reads = std::cell::Cell::new(0usize);
+        let swapped = std::cell::Cell::new(false);
+        let faults = Faults::new();
+        faults.observing(Box::new(move |name| {
+            if !name.starts_with(QUARANTINE_PREFIX) {
+                return;
+            }
+            reads.set(reads.get().saturating_add(1));
+            // Read one is the post-rename leaf check; read two is the finish
+            // check, so the replacement lands exactly between it and the final
+            // capture.
+            if reads.get() != 2 || swapped.get() {
+                return;
+            }
+            let leaf = parent.join(name);
+            if leaf.is_file() {
+                std::fs::remove_file(&leaf)
+                    .and_then(|()| std::fs::write(&leaf, b"the racer's file"))
+                    .expect("the racer replaces the file leaf");
+                swapped.set(true);
+            }
+        }));
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(report.phase, IntentPhase::MarkerLast, "{report:?}");
+        assert_eq!(report.entries_removed, 0, "nothing was unlinked");
+        assert!(!report.marker_removed);
+        let leaf = report.quarantine.clone();
+        assert_eq!(
+            std::fs::read(&leaf).expect("the foreign file is kept"),
+            b"the racer's file",
+            "the object the final capture found is never unlinked"
+        );
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1, "the intent stays pending");
+        assert_eq!(pending[0].phase, IntentPhase::MarkerLast);
+        let foreign = &pending[0].foreign_captures;
+        assert_eq!(
+            foreign.len(),
+            1,
+            "the final capture of a foreign object is recorded before its put-back: {foreign:?}"
+        );
+        assert_eq!(
+            foreign[0].original,
+            pending[0].capture_name(),
+            "the record names the captured leaf it came from"
+        );
+        assert_eq!(foreign[0].kind, "file");
+        assert_eq!(
+            foreign[0].put_back,
+            state::PutBackOutcome::Renamed,
+            "the foreign file went back under its own name"
+        );
+        assert_ne!(
+            foreign[0].captured.as_ref().map(|captured| captured.inode),
+            Some(pending[0].unit.inode),
+            "the record keeps the identity that did not match"
+        );
+
+        // A replay reads the foreign record, refuses to resume, and deletes
+        // nothing: the foreign file capture survives both the run and the replay.
+        let replay = prepared.replay();
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0].reason.contains("did not verify"),
+            "the replay names the unverified capture: {:?}",
+            replay.pending[0].reason
+        );
+        assert_eq!(
+            std::fs::read(&leaf).expect("the replay keeps the foreign file"),
+            b"the racer's file"
+        );
+        let after = prepared.pending_intents();
+        assert_eq!(after[0].phase, IntentPhase::MarkerLast, "never settled");
+        assert_eq!(after[0].foreign_captures.len(), 1, "the record is kept");
+
+        // A second replay is just as conservative.
+        let again = prepared.replay();
+        assert_eq!(again.pending.len(), 1, "{again:?}");
+        assert_eq!(
+            std::fs::read(&leaf).expect("the foreign file is still there"),
+            b"the racer's file"
+        );
+    }
+
+    #[test]
     fn a_captured_leaf_that_vanishes_before_its_final_unlink_stays_pending() {
         // The crash window #014 names: Barge captured the leaf, verified it, and
         // then the unlink answered "already gone". That is never a completion.
