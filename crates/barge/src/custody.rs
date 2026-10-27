@@ -996,7 +996,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        capability_report, take_custody, CustodyBounds, CustodyVerdict, PendingIntent, CAPABILITY,
+        capability_report, take_custody, CustodyBounds, CustodyEvidence, CustodyVerdict,
+        PendingIntent, CAPABILITY,
     };
     use crate::area::RootKind;
     use crate::error::{Error, ErrorKind, Result};
@@ -2274,20 +2275,72 @@ mod tests {
         // another account: it is the named blind spot, counted and reported,
         // rather than an unreadable same-uid process (barge#012, ruling
         // bcaa83d8). Nothing about it is inspected.
-        let foreign = a_foreign_identity();
-        let observer = TableObserver::new(vec![
-            self_identity(),
-            ProcessIdentity {
-                pid: foreign.pid,
-                effective_uid: Some(platform().effective_uid().expect("the account uid")),
-                start: foreign.start,
-            },
-        ]);
-        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
-        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
-        let evidence = verdict.evidence().expect("the evidence");
+        //
+        // A real process can exit between the table read and the re-observation;
+        // it then resolves as positively gone, which is a true answer about it but
+        // not the fact under test, so the next live candidate is tried. Candidates
+        // are ordered so a long-lived process (`launchd`, then a `login`) comes
+        // first, and the proof holds only when a live foreign process really was
+        // reclassified.
+        let candidates = foreign_identity_candidates();
+        assert!(
+            !candidates.is_empty(),
+            "this host reports processes of other effective uids"
+        );
+        let (pid, evidence) = reclassified_foreign_evidence(&holder, &candidates)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no live process of another effective uid was re-observed as foreign: {candidates:?}"
+                )
+            });
         assert_eq!(evidence.foreign_uid_processes, 1);
         assert_eq!(evidence.retry.retried_unreadable, 1);
+        let retried = evidence.retry.retried.first().expect("the retried pid");
+        assert_eq!(
+            retried.pid, pid,
+            "the counted process is the re-observed one"
+        );
+        assert_eq!(retried.resolution, RetryResolution::Foreign);
+    }
+
+    #[test]
+    fn a_candidate_that_exits_before_the_observation_is_passed_over() {
+        // A real process that is gone by the time the observation runs: its stated
+        // row is claimed as this account's own and the kernel reports it gone, so
+        // it proves nothing about reclassification. The proof must move on to a
+        // live candidate rather than report a false zero.
+        let holder = real_holder("custody-real-candidate-gone");
+        holder.payload();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("a child runs");
+        let pid = child.id();
+        let start = platform()
+            .process_start(pid)
+            .expect("the child's start identity")
+            .expect("the child exists");
+        child.kill().expect("the child is killed");
+        child.wait().expect("the child is reaped");
+        let gone = ProcessIdentity {
+            pid,
+            effective_uid: Some(platform().effective_uid().expect("the account uid")),
+            start,
+        };
+        assert!(
+            reclassified_foreign_evidence(&holder, std::slice::from_ref(&gone)).is_none(),
+            "the exited candidate alone proves nothing"
+        );
+        let live = foreign_identity_candidates();
+        assert!(
+            !live.is_empty(),
+            "this host reports processes of other effective uids"
+        );
+        let mut candidates = vec![gone];
+        candidates.extend(live);
+        let (_, evidence) = reclassified_foreign_evidence(&holder, &candidates)
+            .expect("a live foreign candidate is re-observed as foreign");
+        assert_eq!(evidence.foreign_uid_processes, 1);
         assert_eq!(
             evidence
                 .retry
@@ -2299,18 +2352,65 @@ mod tests {
         );
     }
 
-    /// One real process of another effective uid, read from the kernel's own
-    /// table: a read-only observation, naming nothing and changing nothing.
-    fn a_foreign_identity() -> ProcessIdentity {
+    /// Run the reclassification observation over the candidates in order, and
+    /// return the first evidence that counted exactly one re-observed foreign
+    /// process, with the pid that produced it.
+    ///
+    /// A candidate the kernel reports positively gone is skipped: it is a true
+    /// answer about that process, but not the fact the real-process proof needs.
+    fn reclassified_foreign_evidence(
+        holder: &Holder,
+        candidates: &[ProcessIdentity],
+    ) -> Option<(u32, CustodyEvidence)> {
+        let uid = platform().effective_uid().expect("the account uid");
+        for foreign in candidates {
+            let observer = TableObserver::new(vec![
+                self_identity(),
+                ProcessIdentity {
+                    pid: foreign.pid,
+                    effective_uid: Some(uid),
+                    start: foreign.start,
+                },
+            ]);
+            let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+            if let Some(evidence) = verdict.evidence() {
+                if evidence.foreign_uid_processes == 1 {
+                    return Some((foreign.pid, evidence.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// How many real foreign processes one host-dependent proof tries before it
+    /// reports that the host could not provide the fact.
+    const REAL_CANDIDATES: usize = 8;
+
+    /// Live processes of another effective uid, read from the kernel's own table,
+    /// ordered so the most stable ones are tried first: `launchd` (pid 1), then a
+    /// `login` process, then anything else. A real-process proof that needs the
+    /// process to still be there retries the next candidate, because one that
+    /// exits between the table read and the observation is positively gone.
+    fn foreign_identity_candidates() -> Vec<ProcessIdentity> {
         let uid = platform().effective_uid().expect("the account uid");
         let rows = platform()
             .observed_processes()
             .expect("the process table reads")
             .expect("the process table is within its bound");
-        rows.into_iter()
+        let mut foreign: Vec<(ProcessIdentity, String)> = rows
+            .into_iter()
+            .filter(|(identity, _)| identity.effective_uid != Some(uid))
+            .collect();
+        foreign.sort_by_key(|(identity, command)| match identity.pid {
+            1 => 0,
+            _ if command == "login" => 1,
+            _ => 2,
+        });
+        foreign
+            .into_iter()
             .map(|(identity, _)| identity)
-            .find(|identity| identity.effective_uid != Some(uid))
-            .expect("this host reports processes of other effective uids")
+            .take(REAL_CANDIDATES)
+            .collect()
     }
 
     /// The real login processes of this host, read-only from the kernel's own
@@ -2362,21 +2462,35 @@ mod tests {
     #[test]
     fn without_effective_uid_classification_the_real_login_process_refuses() {
         let uid = platform().effective_uid().expect("the account uid");
-        let candidates = real_foreign_identities();
+        let candidates = foreign_identity_candidates();
         assert!(!candidates.is_empty(), "there is a process to classify");
         // Identification through the process's own BSD facts is what the scan
-        // did before this correction, and it is refused for exactly these
-        // processes: that refusal is the counterfactual.
+        // did before this correction, and it is refused for a live foreign
+        // process: that refusal is the counterfactual. A process that exited
+        // between the table read and this read is gone, not a refusal, so the
+        // next candidate is tried; the proof holds when at least one live
+        // foreign process really was refused.
+        let mut refused = 0usize;
+        let mut gone = 0usize;
         for identity in &candidates {
-            let error = platform()
-                .process_start(identity.pid)
-                .expect_err("this account may not read that process's BSD facts");
-            assert_eq!(error.kind(), ErrorKind::UnknownState, "{}", identity.pid);
-            // The kernel's own table classified it without asking the process,
-            // which is what makes it the named blind spot instead.
-
             assert_ne!(identity.effective_uid, Some(uid));
+            match platform().process_start(identity.pid) {
+                Err(error) => {
+                    assert_eq!(error.kind(), ErrorKind::UnknownState, "{}", identity.pid);
+                    refused = refused.saturating_add(1);
+                }
+                // The kernel reports no such process: it is positively gone, so
+                // it cannot show this account's refusal.
+                Ok(None) => gone = gone.saturating_add(1),
+                // A pid the kernel now reports for this account is a reused pid,
+                // not the foreign process the table named.
+                Ok(Some(_)) => {}
+            }
         }
+        assert!(
+            refused > 0,
+            "no live process of another effective uid was refused ({gone} were gone)"
+        );
     }
 
     // ---- barge#012: a transient EPERM is settled only by positive facts ------
