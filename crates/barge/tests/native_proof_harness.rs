@@ -1156,6 +1156,7 @@ fn fabricated_receipt(
     label: &str,
     statuses: &BTreeMap<String, &str>,
     census_passed: bool,
+    detach_mode: &str,
 ) -> (Fixture, serde_json::Value) {
     let (trace_fixture, rows) = shipped_premise_rows();
     let fixture = Fixture::new(label);
@@ -1202,11 +1203,40 @@ fn fabricated_receipt(
     std::fs::write(root.join("preflight.tsv"), preflight)
         .expect("the fabricated preflight observations are written");
 
+    let ordinary = "case\tordinary\tfixture-mount\t/dev/disk42s1\t\t0\tcase.log\n";
+    let cleanup = "cleanup\tordinary\tfixture-mount\t/dev/disk42s1\t\t0\tcleanup.log\n";
+    let detach = match detach_mode {
+        "missing" => String::new(),
+        "pending" => format!(
+            "{ordinary}cleanup\tordinary\tfixture-mount\t/dev/disk42s1\t\tpending\tcleanup.log\n"
+        ),
+        "force" => format!(
+            "{ordinary}cleanup\tordinary\tfixture-mount\t/dev/disk42s1\t\t1\tcleanup.log\n\
+             cleanup\tforce\t/dev/disk42\t/dev/disk42s1\tdisk42\t0\tforce.log\n"
+        ),
+        _ => format!("{ordinary}{cleanup}"),
+    };
+    std::fs::write(root.join("detach.tsv"), detach).expect("detach evidence written");
+
     let receipt_path = root.join("receipt.json");
     let body = receipt_body();
     let program = fixture.write("receipt.py", body.as_bytes(), 0o644);
     let output = Command::new("/usr/bin/python3")
         .arg(&program)
+        .env("S6_DETACH_TSV", root.join("detach.tsv"))
+        .env(
+            "S6_CLEANUP_DISPOSITION",
+            if detach_mode == "kept" {
+                "kept"
+            } else {
+                "removed"
+            },
+        )
+        .env("S6_ATTACHED", "0")
+        .env(
+            "S6_KEEP_BACKING",
+            if detach_mode == "kept" { "1" } else { "0" },
+        )
         .env("S6_MODE", "counted")
         .env("S6_EXIT", "0")
         .env("S6_RECEIPT", &receipt_path)
@@ -1256,7 +1286,8 @@ fn fabricated_receipt(
 #[test]
 fn the_receipt_folds_the_premise_trace_against_case_results() {
     let mut statuses = BTreeMap::new();
-    let (_fixture, document) = fabricated_receipt("premise-receipt-pass", &statuses, true);
+    let (_fixture, document) =
+        fabricated_receipt("premise-receipt-pass", &statuses, true, "ordinary");
     assert_eq!(
         document["qualified"], true,
         "a clean fixture receipt qualifies"
@@ -1313,13 +1344,15 @@ fn the_receipt_folds_the_premise_trace_against_case_results() {
         );
     }
 
-    let (_fixture, document) = fabricated_receipt("census-receipt-fail", &statuses, false);
+    let (_fixture, document) =
+        fabricated_receipt("census-receipt-fail", &statuses, false, "ordinary");
     assert_eq!(
         document["qualified"], false,
         "failed censuses cannot qualify passing cases"
     );
     statuses.insert("ordinary-detach".to_string(), "fail");
-    let (_fixture, document) = fabricated_receipt("premise-receipt-fail", &statuses, true);
+    let (_fixture, document) =
+        fabricated_receipt("premise-receipt-fail", &statuses, true, "ordinary");
     assert_eq!(
         document["qualified"], false,
         "a failed case never qualifies"
@@ -1351,4 +1384,147 @@ fn the_receipt_folds_the_premise_trace_against_case_results() {
             .is_some_and(|cases| cases.iter().any(|case| case == "ordinary-detach")),
         "the premise names the case that did not pass: {premise_five}"
     );
+}
+
+#[test]
+fn a_passing_case_label_cannot_qualify_force_missing_or_retained_detach_evidence() {
+    for mode in ["force", "missing", "kept", "pending"] {
+        let (_fixture, document) =
+            fabricated_receipt("detach-receipt", &BTreeMap::new(), true, mode);
+        assert_eq!(document["summary"]["passed"], 9);
+        assert_eq!(document["qualified"], false, "{mode}: {document}");
+        if mode == "force" {
+            assert_eq!(document["detach"]["force_attempted"], true);
+            assert_eq!(
+                document["detach"]["attempts"][2]["bound_device"],
+                "/dev/disk42s1"
+            );
+            assert_eq!(document["detach"]["attempts"][2]["whole_disk"], "disk42");
+        }
+    }
+}
+
+#[test]
+fn ordinary_failure_is_not_a_case_pass_and_cleanup_never_retries_it() {
+    let detach = source_between("# >>> s6-detach", "# <<< s6-detach");
+    let cleanup = source_between("# >>> s6-cleanup", "# <<< s6-cleanup");
+    let body = r#"
+EVIDENCE="$PWD"
+RUN="$PWD/fixture-run"
+mkdir "$RUN"
+printf backing >"$RUN/backing"
+BACKING="$RUN/backing"
+MOUNT=fixture-mount
+DEVICE=/dev/disk42s1
+DETACH_TSV="$PWD/detach.tsv"
+: >"$DETACH_TSV"
+ATTACHED=1
+KEEP_BACKING=0
+ORDINARY_DETACH_FAILED=0
+LAST_DETACH=none
+DETACH_ATTEMPTS=0
+CLEANUP_DISPOSITION=pending
+REAL_STATE=fixture
+hdiutil() {
+  printf '%s\n' "$*" >>"$PWD/commands"
+  [[ "$1" == detach ]] || return 90
+  if [[ "$2" == fixture-mount ]]; then
+    if [[ "$MODE" == interrupted ]]; then
+      # Model EXIT cleanup before the ordinary attempt returns an outcome.
+      PHASE=cleanup
+      ( exit 7 )
+      cleanup
+    fi
+    [[ "$MODE" == pass || "$MODE" == remove-fail || ( "$MODE" == cleanup-fail && "$PHASE" == case ) ]]
+  else
+    [[ "$2" == /dev/disk42 && "$3" == -force && "$PHASE" == cleanup ]] || return 91
+    [[ "$MODE" != force-fail ]]
+  fi
+}
+diskutil() {
+  [[ "$1" == info && "$2" == /dev/disk42s1 ]] || return 92
+  if [[ "$MODE" == binding-fail ]]; then
+    printf 'Part of Whole: disk99\n'
+  else
+    printf 'Part of Whole: disk42\n'
+  fi
+}
+rm() { [[ "$MODE" != remove-fail ]] && command rm "$@"; }
+digest_tree() { printf unchanged; }
+write_receipt() {
+  printf '%s %s %s %s %s %s\n' "$1" "$ATTACHED" "$KEEP_BACKING" "$CLEANUP_DISPOSITION" "$CASE_RESULT" "$LAST_DETACH" >"$PWD/state"
+}
+PHASE=case
+CASE_RESULT=0
+detach_image case || CASE_RESULT=$?
+[[ "$CASE_RESULT" != 0 || "$LAST_DETACH" == ordinary ]] || exit 93
+# Only a successful ordinary case can re-attach for the rest of the proof.
+if [[ "$CASE_RESULT" == 0 ]]; then ATTACHED=1; fi
+PHASE=cleanup
+( exit "$CASE_RESULT" )
+cleanup
+"#;
+    for (mode, expected, state) in [
+        ("pass", 0, "0 0 0 removed 0 ordinary"),
+        ("force-pass", 1, "1 0 1 kept 1 force"),
+        ("force-fail", 1, "1 1 1 kept 1 none"),
+        ("binding-fail", 1, "1 1 1 kept 1 none"),
+        ("cleanup-fail", 1, "1 0 1 kept 0 force"),
+        ("remove-fail", 1, "1 0 1 remove_failed 0 ordinary"),
+        ("interrupted", 1, "1 0 1 kept 0 force"),
+    ] {
+        let fixture = Fixture::new("detach-cleanup");
+        let script = fixture.write(
+            "detach.sh",
+            format!("set -uo pipefail\n{detach}\n{cleanup}\n{body}").as_bytes(),
+            0o644,
+        );
+        let output = Command::new("/bin/bash")
+            .arg(script)
+            .current_dir(&fixture.path)
+            .env("MODE", mode)
+            .output()
+            .expect("fixture detach functions run without native commands");
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{mode}: {}",
+            stderr(&output)
+        );
+        let actual = std::fs::read_to_string(fixture.path.join("state")).expect("cleanup state");
+        assert_eq!(actual.trim(), state, "{mode}");
+        let attempts =
+            std::fs::read_to_string(fixture.path.join("detach.tsv")).expect("detach evidence");
+        let ordinary: Vec<_> = attempts
+            .lines()
+            .filter(|row| row.contains("\tordinary\t") && !row.contains("\tpending\t"))
+            .collect();
+        assert_eq!(
+            ordinary.len(),
+            if mode == "interrupted" {
+                0
+            } else if mode == "pass" || mode == "cleanup-fail" || mode == "remove-fail" {
+                2
+            } else {
+                1
+            },
+            "a spent detach is never retried: {attempts}"
+        );
+        assert_eq!(
+            fixture.path.join("fixture-run/backing").exists(),
+            expected != 0
+        );
+        assert!(attempts
+            .lines()
+            .all(|row| row.split('\t').nth(3) == Some("/dev/disk42s1")));
+        if mode == "binding-fail" {
+            assert!(
+                !attempts.contains("\tforce\t"),
+                "an unbound disk is never detached"
+            );
+        }
+        if mode != "pass" && mode != "binding-fail" && mode != "remove-fail" {
+            assert!(attempts.contains("cleanup\tforce\t/dev/disk42\t/dev/disk42s1\tdisk42\t"));
+        }
+    }
 }

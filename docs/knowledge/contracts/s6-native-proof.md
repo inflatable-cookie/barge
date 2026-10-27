@@ -93,9 +93,9 @@ mount, and the evidence directory.
 | 2 | The account home used for state resolution is the fixture's, and the real account state is untouched (before/after digest) | `BARGE_ACCOUNT_HOME` is the fixture home, so the CLI's account facts and `describe.state.home` name it; the real state directory is digested before the first case and again in cleanup | `plan-effect-free`: `describe.state.home.account` is the fixture home; `ordinary-detach`: the absent-volume refusal comes from the fixture state registry; the receipt's `real_state` holds both digests and `unchanged` |
 | 3 | Environment isolation: `BARGE_STATE_DIR`, `TMPDIR`/`TMP`/`TEMP` and every inherited scratch point inside the guard's owned scratch; no inherited real paths | the guard sets `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP` and `TEMP` inside its owned root; the script asserts `TMPDIR` is under `OXIDE_TASK_SCRATCH_ROOT` before the first fixture and refuses otherwise; `CARGO_TARGET_DIR` is unset | `absent-path`: the adopted cache target is under the case's `caches/` folder on the owned image; `plan-effect-free`: `describe.state.dir` is the case's `BARGE_STATE_DIR` inside the run root |
 | 4 | Explicit adoption only: every fixture placement is adopted with an explicit command and a recorded plan, never by an implicit default | every adopt is an explicit `barge cache adopt --kind … --volume …`; the in-place form additionally requires `--adopt-existing-root`; the plan case proves a plan writes nothing | `absent-path`, `empty-directory`, `setting-unchanged`: the link/setting is published only by the explicit adopt; `setting-written`: requires `--write-setting`; `hand-made-in-place`: requires `--adopt-existing-root`; `plan-effect-free`: `--plan` reports the effects and adopts nothing |
-| 5 | Owned image with ownership enabled (`-owners on`), ordinary detach, never a forced detach of anything but the owned image's own whole-disk device | `hdiutil attach -owners on -mountpoint <unique /Volumes/…>`; `detach_image` tries the ordinary detach first and reaches for `-force` only on the whole-disk device `diskutil` reports as the image's own; a failed detach keeps the backing | `ordinary-detach`: an ordinary `hdiutil detach` makes the cache unavailable naming the drive, and an ordinary re-attach makes it work again |
+| 5 | Owned image with ownership enabled (`-owners on`), ordinary detach, never a forced detach of anything but the owned image's own whole-disk device | `hdiutil attach -owners on -mountpoint <unique /Volumes/…>`; `detach_image case` requires an observed zero exit from ordinary detach; after failure, cleanup alone may reach for `-force` on the whole-disk device bound to the attachment device; there is no ordinary retry, the failure is latched, and the backing is retained | `ordinary-detach`: an ordinary `hdiutil detach` makes the cache unavailable naming the drive, and an ordinary re-attach makes it work again |
 | 6 | Every flag and environment hook used is listed with its purpose; no debug-only product bypass exists | the receipt's `premises[6].evidence` lists every hook and every product flag; the product has no debug or force bypass | `absent-path`: only `--kind`, `--volume` and `--json`; `setting-written`: the write needs the explicit `--write-setting`; `hand-made-in-place`: the in-place form needs `--adopt-existing-root`; `plan-effect-free`: the preview uses `--plan` |
-| 7 | Temporary storage: everything inside the guard's one owned root; no home folder, no drive root, no fixed `/tmp/<name>` | the run root is `mktemp -d "$TMPDIR/…"`; the image backing, per-case homes and state all live under it; cleanup removes it only after an ordinary detach | `absent-path`: the adopted root and link target are the case's `caches/` folder on the owned image; `empty-directory`: the restored directory is the fixture home's inside the run root; `hand-made-in-place`: the adopted root and marker are on the owned image; `plan-effect-free`: the state directory is inside the run root |
+| 7 | Temporary storage: everything inside the guard's one owned root; no home folder, no drive root, no fixed `/tmp/<name>` | the run root is `mktemp -d "$TMPDIR/…"`; the image backing, per-case homes and state all live under it; cleanup removes it only after positively observed ordinary detach | `absent-path`: the adopted root and link target are the case's `caches/` folder on the owned image; `empty-directory`: the restored directory is the fixture home's inside the run root; `hand-made-in-place`: the adopted root and marker are on the owned image; `plan-effect-free`: the state directory is inside the run root |
 | 8 | `mktemp -d` under that root for every fixture directory, never a shared name | one `mktemp -d` run root, then `cases/<case-id>/{home,state,out}` created fresh per case under it; no fixed name is used | `absent-path`, `hand-made-in-place`, `plan-effect-free`: each case's home, state, out and caches folder is case-scoped under the run root |
 | 9 | The qualified runner bytes and selector are named and hash-pinned; Barge adds no second supervisor, session or accounting harness | the supervisor path and SHA-256 are constants in the script and in this plan; the script gates it as a readable regular Python file, runs it with `/usr/bin/python3` and refuses different bytes; before every case the preflight re-checks the pin and session, then makes the two required descriptor probes in the same guarded session and aborts the run if either is unavailable | all nine cases: the per-case preflight ran before the case with both descriptor probes, and the receipt's `preflight.observations` and `premise_trace` name it |
 
@@ -136,7 +136,7 @@ the remaining cases, which are recorded `skipped` with the stopping case named.
 ## The premise trace in the receipt
 
 `write_premise_trace` writes one row per `(premise, case, assertion)` into the
-run root's `premise-trace.tsv` before any case runs, and every `run_case`
+evidence directory's `premise-trace.tsv` before any case runs, and every `run_case`
 invocation carries the premise ids its body demonstrates. At receipt time the
 script folds the two together:
 
@@ -169,6 +169,19 @@ The script always writes `$OXIDE_PROOF_EVIDENCE/s6-cache-placement-receipt.json`
   `missing`, `complete`); each `premises[i]` also carries its case
   `observations`, `covered` and `missing`, and each case row carries the
   `premises` ids it was declared for;
+- `detach` — every attempt's context (`case` or `cleanup`), method (`ordinary`,
+  `force-binding`, or `force`), target, bound attachment device, whole disk when
+  known, exit status, success and retained output log. Attempts are logged before
+  invocation; an interrupted attempt has a null exit status and cannot qualify. `ordinary_case_succeeded`
+  requires a successful ordinary case attempt; `force_attempted` is explicit.
+  Cleanup records `cleanup_disposition` (`removed`, `kept`, `remove_failed`),
+  `attached`, `retention_required` and the observed `backing_present`. Evidence
+  tables and attempt output logs remain beside the receipt after fixture removal.
+  Qualification requires ordinary success for both the case and final cleanup,
+  removal of fixture scratch, and no force, failed attempt or retention latch.
+  A failed ordinary attempt is never retried: only cleanup may bind the owned
+  whole disk and attempt force once. A binding mismatch or detach failure keeps
+  the backing; even a successful force cleanup retains it and cannot qualify.
 - `preflight` — the probe names, the descriptor primitive, the guarded session,
   the sentinel's 2 s bound, how many preflights ran, the failure (or `null`),
   `status` (`passed`, or `infrastructure` on an abort), `aborted`, and one
@@ -391,6 +404,39 @@ directory and real npm/bun/Cargo placements were unchanged. That was a census
 observation, not an activated diagnostic or counted native, and there was no
 `barge.s6.native/1` receipt at that head. It remains historical infrastructure
 evidence, without a claim about the rebased observer or future proof.
+
+### Spent diagnostic at 279cf84
+
+The owner activation in Oxide Supervisor message
+`f1aafd7c-e174-4158-bd73-9c86b43ab860` ran the uncounted selector once at
+`279cf84ed7b9a426f7f10514a3f441a5a6886525`. It exited 0 with all nine case
+labels passing, nine same-Barge census preflights passing, and the receipt's
+premise fold complete (9/9). It remained `qualified: false`. Historical evidence
+is `/Volumes/Builds/scratch/barge/run.05D5J8/scratch/supervisor-evidence.93n8xrmh`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `s6-cache-placement-receipt.json` | `2c0dd85b530521b925db7223450123ba99273a9613ebdcd5382848a798c4e667` |
+| Guard `receipt.json` | `d7a9a797ce93d9d0b734954bf30e0e1ac833c19931d3d6ccb20386e1b73789bd` |
+
+Each census recorded 67 opaque descriptors across eight verified Apple platform
+processes, including `dmd` pid 69326 and `progressd` pid 1299. The guard recorded
+closed, status 0, no fault/deadline and a certain empty census; its stop signals
+returned `EPERM` before leader reap and settlement. Reserve minimum was
+540,425,392,128 bytes over 123 samples (maximum gap 257,313,167 ns); scratch peak
+was 13,795,328 of 536,870,912 bytes. The real-state observations were both
+`absent`. Post-run observations found no matching attached image, mount, backing
+or fixture root; evidence remained.
+
+The passing `ordinary-detach` label did not establish ordinary detach: the old
+helper could silently succeed through force, both in the case and final cleanup.
+This spent receipt is not proof of ordinary detach and does not qualify this
+revision. The apparatus now records the branch and outcome, restricts force to
+cleanup, and refuses qualification after force or uncertain cleanup. Pure
+fixtures cover ordinary success, failed ordinary detach with successful or
+failed force cleanup, rejected whole-disk binding, failed final detach and failed scratch removal;
+receipt fixtures reject passing labels without complete ordinary evidence.
+No fresh native is activated by this source correction.
 
 ## Activation order
 

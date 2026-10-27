@@ -154,15 +154,15 @@ STARTED_MS="$(/usr/bin/python3 -c 'import time;print(int(time.time()*1000))')"
 readonly STARTED_MS
 RUN="$(mktemp -d "$TMPDIR/barge-s6-run.XXXXXX")" || refuse "cannot create the run root"
 readonly RUN
-readonly CASES_TSV="$RUN/cases.tsv"
+readonly CASES_TSV="$EVIDENCE/cases.tsv"
 : >"$CASES_TSV"
 # One bounded row per preflight probe, one preflight per case that runs.
-readonly PREFLIGHT_TSV="$RUN/preflight.tsv"
+readonly PREFLIGHT_TSV="$EVIDENCE/preflight.tsv"
 : >"$PREFLIGHT_TSV"
 # One row per (premise, case body, concrete assertion): the design's nine-premise
 # checklist traced through the case bodies, folded into the receipt against the
 # cases that actually ran.
-readonly PREMISE_TRACE_TSV="$RUN/premise-trace.tsv"
+readonly PREMISE_TRACE_TSV="$EVIDENCE/premise-trace.tsv"
 : >"$PREMISE_TRACE_TSV"
 
 # Premise 3: every inherited scratch/spool pointer moves inside the run root.
@@ -251,10 +251,18 @@ readonly BACKING="$RUN/backing/$VOLNAME.sparseimage"
 ATTACHED=0
 DEVICE=""
 KEEP_BACKING=0
+ORDINARY_DETACH_FAILED=0
+LAST_DETACH="none"
+DETACH_ATTEMPTS=0
+CLEANUP_DISPOSITION="pending"
+readonly DETACH_TSV="$EVIDENCE/detach-attempts.tsv"
+: >"$DETACH_TSV"
 
 attach_image() {
   local output
+  ATTACHED=1 # A failed attach may have partially attached; cleanup must establish detach.
   output="$(hdiutil attach -owners on -nobrowse -mountpoint "$MOUNT" "$BACKING" 2>&1)" || {
+    KEEP_BACKING=1
     printf '%s\n' "$output"
     return 1
   }
@@ -267,29 +275,79 @@ attach_image() {
   return 0
 }
 
-detach_image() {
-  [[ "$ATTACHED" == 1 ]] || return 0
-  if hdiutil detach "$MOUNT" >/dev/null 2>&1; then
-    ATTACHED=0
-    return 0
-  fi
-  # Premise 5: a forced detach is allowed only for this image's own whole disk.
-  local whole
-  whole="$(diskutil info "$DEVICE" 2>/dev/null | awk -F': *' '/Part of Whole/{print $2}')"
-  if [[ -n "$whole" ]] && hdiutil detach "/dev/$whole" -force >/dev/null 2>&1; then
-    ATTACHED=0
-    return 0
-  fi
-  printf 'ordinary detach failed; the backing file is kept at %s\n' "$BACKING" >&2
-  KEEP_BACKING=1
-  return 1
+# >>> s6-detach
+record_detach() {
+  # context, method, target, bound attachment device, whole disk, exit, output log.
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$1" "$2" "$3" "$DEVICE" "$4" "$5" "$6" >>"$DETACH_TSV"
 }
+
+detach_image() {
+  local context="$1" status=0 whole="" log prior_keep="$KEEP_BACKING"
+  LAST_DETACH="none"
+  [[ "$ATTACHED" == 1 ]] || return 0
+  # Do not retry a spent ordinary detach. Only cleanup may use a force fallback.
+  if [[ "$ORDINARY_DETACH_FAILED" == 0 ]]; then
+    DETACH_ATTEMPTS=$((DETACH_ATTEMPTS + 1))
+    log="$EVIDENCE/detach-$DETACH_ATTEMPTS.log"
+    ORDINARY_DETACH_FAILED=1
+    KEEP_BACKING=1
+    record_detach "$context" ordinary "$MOUNT" "" pending "$log" || { KEEP_BACKING=1; return 1; }
+    hdiutil detach "$MOUNT" >"$log" 2>&1 || status=$?
+    if ! record_detach "$context" ordinary "$MOUNT" "" "$status" "$log"; then
+      KEEP_BACKING=1
+      return 1
+    fi
+    if [[ "$status" == 0 ]]; then
+      ATTACHED=0
+      ORDINARY_DETACH_FAILED=0
+      KEEP_BACKING="$prior_keep"
+      LAST_DETACH="ordinary"
+      return 0
+    fi
+    ORDINARY_DETACH_FAILED=1
+    KEEP_BACKING=1
+  fi
+  [[ "$context" == cleanup ]] || return 1
+  # Bind the fallback to the whole disk of the device from our own attach.
+  # Failure or uncertainty keeps the backing even if later safe cleanup works.
+  DETACH_ATTEMPTS=$((DETACH_ATTEMPTS + 1))
+  log="$EVIDENCE/detach-$DETACH_ATTEMPTS.log"
+  status=0
+  record_detach "$context" force-binding "$DEVICE" "" pending "$log" || return 1
+  diskutil info "$DEVICE" >"$log" 2>&1 || status=$?
+  if [[ "$status" == 0 ]]; then
+    whole="$(awk -F': *' '/Part of Whole/{print $2}' "$log")"
+  fi
+  if [[ ! "$whole" =~ ^disk[0-9]+$ ]] ||
+      [[ ! "$DEVICE" =~ ^/dev/${whole}(s[0-9]+)*$ ]]; then
+    [[ "$status" != 0 ]] || status=125
+    record_detach "$context" force-binding "$DEVICE" "$whole" "$status" "$log" || true
+    return 1
+  fi
+  record_detach "$context" force-binding "$DEVICE" "$whole" "$status" "$log" || return 1
+  DETACH_ATTEMPTS=$((DETACH_ATTEMPTS + 1))
+  log="$EVIDENCE/detach-$DETACH_ATTEMPTS.log"
+  status=0
+  record_detach "$context" force "/dev/$whole" "$whole" pending "$log" || return 1
+  hdiutil detach "/dev/$whole" -force >"$log" 2>&1 || status=$?
+  record_detach "$context" force "/dev/$whole" "$whole" "$status" "$log" || return 1
+  [[ "$status" == 0 ]] || return 1
+  ATTACHED=0
+  LAST_DETACH="force"
+  return 0
+}
+# <<< s6-detach
 
 # ---- the receipt ------------------------------------------------------------
 
 write_receipt() {
   # >>> s6-receipt
   local exit_status="$1"
+  S6_DETACH_TSV="$DETACH_TSV" \
+  S6_CLEANUP_DISPOSITION="$CLEANUP_DISPOSITION" \
+  S6_ATTACHED="$ATTACHED" \
+  S6_KEEP_BACKING="$KEEP_BACKING" \
   S6_MODE="$MODE" \
   S6_EXIT="$exit_status" \
   S6_RECEIPT="$RECEIPT" \
@@ -547,8 +605,38 @@ summary = {
     "real_state_unchanged": unchanged,
 }
 
+detach_by_log = {}
+with open(os.environ["S6_DETACH_TSV"], encoding="utf-8") as handle:
+    for line in handle:
+        context, method, target, device, whole, status, log = line.rstrip("\n").split("\t")
+        exit_status = None if status == "pending" else int(status)
+        detach_by_log[log] = {"context": context, "method": method, "target": target,
+                              "bound_device": device, "whole_disk": whole or None,
+                              "exit_status": exit_status, "succeeded": exit_status == 0,
+                              "log": log}
+detach_attempts = list(detach_by_log.values())
+detach = {
+    "attempts": detach_attempts,
+    "ordinary_case_succeeded": any(row["context"] == "case" and row["method"] == "ordinary"
+                                   and row["succeeded"] for row in detach_attempts),
+    "force_attempted": any(row["method"] == "force" for row in detach_attempts),
+    "cleanup_disposition": os.environ["S6_CLEANUP_DISPOSITION"],
+    "attached": os.environ["S6_ATTACHED"] != "0",
+    "retention_required": os.environ["S6_KEEP_BACKING"] != "0",
+    "backing_present": os.path.lexists(os.environ["S6_BACKING"]),
+}
+detach_complete = (
+    detach["ordinary_case_succeeded"] and not detach["force_attempted"]
+    and not detach["attached"] and not detach["retention_required"]
+    and detach["cleanup_disposition"] == "removed"
+    and any(row["context"] == "cleanup" and row["method"] == "ordinary"
+            and row["succeeded"] for row in detach_attempts)
+    and all(row["method"] == "ordinary" and row["succeeded"] for row in detach_attempts)
+)
+
 qualified = (
-    mode == "counted"
+    detach_complete
+    and mode == "counted"
     and failed == 0
     and skipped == 0
     and not_run == []
@@ -579,6 +667,7 @@ receipt = {
         "size_mib": int(os.environ["S6_IMAGE_MIB"]),
         "owners": True,
     },
+    "detach": detach,
     "real_state": {
         "path": os.environ["S6_REAL_STATE"],
         "before": os.environ["S6_REAL_BEFORE"],
@@ -606,18 +695,28 @@ PY
   # <<< s6-receipt
 }
 
+# >>> s6-cleanup
 cleanup() {
   local status=$?
-  detach_image || true
+  detach_image cleanup || status=1
   REAL_STATE_AFTER="$(digest_tree "$REAL_STATE")"
-  write_receipt "$status" || printf 's6: the receipt could not be written\n' >&2
   if [[ "$KEEP_BACKING" == 0 && "$ATTACHED" == 0 ]]; then
-    rm -rf "$RUN"
+    if rm -rf "$RUN"; then
+      CLEANUP_DISPOSITION="removed"
+    else
+      CLEANUP_DISPOSITION="remove_failed"
+      KEEP_BACKING=1
+      status=1
+    fi
   else
+    CLEANUP_DISPOSITION="kept"
+    status=1
     printf 's6: kept the run root %s (image %s)\n' "$RUN" "$BACKING" >&2
   fi
+  write_receipt "$status" || { printf 's6: the receipt could not be written\n' >&2; status=1; }
   exit "$status"
 }
+# <<< s6-cleanup
 trap cleanup EXIT
 
 # ---- fixtures ---------------------------------------------------------------
@@ -1198,7 +1297,8 @@ case_plan_effect_free() {
 case_ordinary_detach() {
   mkdir -p "$HOME/.cargo"
   barge_cli "$CASE_OUT/adopt.json" cache adopt --kind cargo-registry --volume "$UUID" --json || return 1
-  detach_image || return 1
+  detach_image case || return 1
+  [[ "$LAST_DETACH" == ordinary ]] || return 1
   local status=0
   barge_cli "$CASE_OUT/undo.json" cache undo --kind cargo-registry --json || status=$?
   [[ "$status" == 2 ]] || { echo "an absent volume's undo exited $status, not 2"; return 1; }
