@@ -38,6 +38,11 @@
 //! which a same-uid racer replaces each entry after its check and the next check
 //! passes.
 //!
+//! The quarantine leaf itself is removed the same way: the visible
+//! `.barge-prune-<intent-id>` name is captured to a private name and its device and
+//! inode are checked against the intent before it is removed, so a swap at the area
+//! level can never turn the final removal into the removal of a foreign object.
+//!
 //! The durable facts that carry the rule across a stop - so an absent name is never
 //! proof that Barge deleted its object (stage 1 design, "Durable custody of
 //! captured objects") - are:
@@ -616,13 +621,14 @@ fn finish_deletion(
             )
         }
     };
+    let mut leaf_custody_mode: Option<u32> = None;
     let leaf_custody = match leaf_facts {
         Some(leaf_facts)
             if leaf_facts.kind == EntryKind::Directory && leaf_facts.mode & 0o300 != 0o300 =>
         {
             base_chain.push(CaptureRecord {
                 private: intent.quarantine_name.clone(),
-                original: intent.root_name.clone(),
+                original: intent.quarantine_name.clone(),
                 device: intent.device,
                 inode: intent.inode,
                 kind: "directory".to_owned(),
@@ -647,6 +653,7 @@ fn finish_deletion(
                     None,
                 );
             }
+            leaf_custody_mode = Some(leaf_facts.mode);
             Some(ModeCustody::new(dirs, &leaf, leaf_facts.mode))
         }
         _ => None,
@@ -756,23 +763,17 @@ fn finish_deletion(
         }
     }
 
-    // The marker is gone: only now may the quarantine leaf be removed, and only
-    // through the descriptor that was verified as the recorded root.
-    match walk.remove_directory(
-        area_handle,
-        &leaf,
-        &current.quarantine_name,
-        0,
-        Path::new(""),
-        &mut counts,
-    ) {
+    // The marker is gone: only now may the quarantine leaf be removed, and it is
+    // captured and verified again like every other entry, so the visible area-level
+    // name can never turn the final removal into the removal of a foreign object.
+    match walk.remove_leaf(area_handle, &current, leaf_custody_mode, &mut counts) {
         Ok(Removal::Gone) => {}
         Ok(Removal::Stopped(reason)) => {
             return pending_report(&journal.intent(), quarantine, counts, reason, None)
         }
         Err(error) => {
             return pending_report(
-                &current,
+                &journal.intent(),
                 quarantine,
                 counts,
                 format!("the quarantine leaf could not be removed: {error}"),
@@ -1478,6 +1479,19 @@ impl<'a> WalkState<'a> {
         record: &CaptureRecord,
         counts: &mut Counts,
     ) -> Result<Walk> {
+        // Re-verify the recorded identity immediately before the unlink: what is
+        // removed is the object the record names, never whatever a racer put at
+        // the private name since the capture.
+        let still_recorded = self
+            .dirs
+            .child_facts(parent, &record.private)?
+            .is_some_and(|facts| Self::matches_capture(record, &facts));
+        if !still_recorded {
+            return Ok(Walk::Stop(format!(
+                "`{}` is no longer the recorded capture of `{}`, so it is not unlinked and the intent stays pending",
+                record.private, record.original
+            )));
+        }
         match self
             .dirs
             .remove_child(parent, &record.private, RemoveKind::File)?
@@ -1579,6 +1593,102 @@ impl<'a> WalkState<'a> {
                 Ok(Walk::Clean)
             }
             Removal::Stopped(reason) => Ok(Walk::Stop(restore_custody(custody, reason))),
+        }
+    }
+
+    /// Remove the quarantine leaf itself, through the same rule as every entry.
+    ///
+    /// The visible quarantine name is captured again and the captured object's
+    /// identity is checked against the intent before anything is removed, so a
+    /// swap at the area level can never turn the final `rmdir` into the removal of
+    /// a foreign directory. A mismatch puts the object back and stops; the
+    /// completion phase is recorded only after Barge's own removal of the captured
+    /// object succeeded.
+    fn remove_leaf(
+        &mut self,
+        parent: &DirHandle,
+        intent: &IntentRecord,
+        leaf_mode: Option<u32>,
+        counts: &mut Counts,
+    ) -> Result<Removal> {
+        let private = match self.capture(parent, &intent.quarantine_name)? {
+            Capture::Held(private) => private,
+            Capture::Stopped(reason) => return Ok(Removal::Stopped(reason)),
+        };
+        let Some(facts) = self.dirs.child_facts(parent, &private)? else {
+            return Ok(Removal::Stopped(format!(
+                "`{private}` vanished after its capture, so the quarantine leaf is not removed and the intent stays pending"
+            )));
+        };
+        if facts.kind != EntryKind::Directory
+            || facts.device.get() != intent.device
+            || facts.inode != intent.inode
+        {
+            // It is not the recorded leaf: a foreign object at the quarantine name.
+            // It is recorded as a foreign capture before anything puts it back, and
+            // the intent stays pending.
+            let reason = format!(
+                "the quarantine name held a {} on device {} inode {}, not the recorded leaf on device {} inode {}",
+                facts.kind.as_str(),
+                facts.device,
+                facts.inode,
+                intent.device,
+                intent.inode
+            );
+            let mut foreign = ForeignCapture {
+                private: private.clone(),
+                original: intent.quarantine_name.clone(),
+                device: intent.device,
+                inode: intent.inode,
+                kind: "directory".to_owned(),
+                captured: Some(CapturedObject {
+                    device: facts.device.get(),
+                    inode: facts.inode,
+                    kind: facts.kind.as_str().to_owned(),
+                }),
+                put_back: PutBackOutcome::Pending,
+                reason: bounded_reason(&reason),
+            };
+            if let Err(error) = self.journal.record_foreign(foreign.clone()) {
+                return Ok(Removal::Stopped(format!(
+                    "`{private}` is not the recorded quarantine leaf and the mismatch could not be recorded, so it stays under its private name: {error}"
+                )));
+            }
+            let (put_back, where_it_is) =
+                match self
+                    .dirs
+                    .rename_child(parent, &private, &intent.quarantine_name)?
+                {
+                    RenameOutcome::Renamed => (
+                        PutBackOutcome::Renamed,
+                        format!("it is back under `{}`", intent.quarantine_name),
+                    ),
+                    RenameOutcome::TargetExists => (
+                        PutBackOutcome::Taken,
+                        format!("it stays under `{private}` because its name is taken"),
+                    ),
+                };
+            foreign.put_back = put_back;
+            let _ = self.journal.record_foreign(foreign);
+            return Ok(Removal::Stopped(format!(
+                "`{private}` is not the recorded quarantine leaf, so nothing is removed and {where_it_is}: {reason}"
+            )));
+        }
+        let record = CaptureRecord {
+            private,
+            original: intent.quarantine_name.clone(),
+            device: intent.device,
+            inode: intent.inode,
+            kind: "directory".to_owned(),
+            verdict: CaptureVerdict::Observed,
+            mode: leaf_mode,
+        };
+        // The leaf is the whole chain now: everything inside it is gone, and the
+        // record of the leaf replaces the earlier chain.
+        self.chain.clear();
+        match self.remove_recorded(parent, &record, leaf_mode, 0, Path::new(""), counts)? {
+            Walk::Clean => Ok(Removal::Gone),
+            Walk::Stop(reason) => Ok(Removal::Stopped(reason)),
         }
     }
 
@@ -2100,7 +2210,7 @@ fn replay_one(
     // left with a changed mode while a replay decides what to do next.
     if intent.phase != IntentPhase::Deleted {
         if let Some(leaf) = leaf_handle.as_ref() {
-            match restore_recorded_modes(dirs, leaf, intent) {
+            match restore_recorded_modes(dirs, &area_handle, leaf, intent) {
                 Ok(None) => {}
                 Ok(Some(reason)) => return Ok(ReplayOutcome::Pending(reason)),
                 Err(error) => {
@@ -2297,26 +2407,23 @@ fn marker_matches(digest: &Option<MarkerBytes>, intent: &IntentRecord) -> bool {
 /// matches is unknown, never something to chmod or delete.
 fn restore_recorded_modes(
     dirs: &dyn DirOps,
+    area: &DirHandle,
     leaf: &DirHandle,
     intent: &IntentRecord,
 ) -> Result<Option<String>> {
     let mut current: Option<DirHandle> = None;
     for record in &intent.captures {
-        if record.private == intent.quarantine_name {
-            // The quarantine leaf's own recorded mode.
-            let Some(mode) = record.mode else {
-                continue;
-            };
-            if let Err(error) = dirs.set_dir_mode(leaf, mode) {
-                return Ok(Some(format!(
-                    "the recorded mode of the quarantine leaf could not be restored: {error}"
-                )));
+        // A record of the quarantine leaf itself lives at the area level, whatever
+        // private name it is held under now; every other record lives inside the
+        // leaf or inside the capture before it.
+        let at_leaf = record.original == intent.quarantine_name;
+        let parent: &DirHandle = if at_leaf {
+            area
+        } else {
+            match &current {
+                Some(handle) => handle,
+                None => leaf,
             }
-            continue;
-        }
-        let parent: &DirHandle = match &current {
-            Some(handle) => handle,
-            None => leaf,
         };
         let Some(facts) = dirs.child_facts(parent, &record.private)? else {
             // The intent records this capture and the name is gone. Nothing proves
@@ -2335,10 +2442,26 @@ fn restore_recorded_modes(
         }
         if facts.kind != EntryKind::Directory {
             // A recorded file capture has no contents and is never chmod'd; there
-            // is nothing to restore under it.
+            // is nothing to restore under it, and no chain to descend.
+            if at_leaf {
+                return Ok(Some(format!(
+                    "`{}` is recorded as the quarantine leaf but is a {}",
+                    record.private,
+                    facts.kind.as_str()
+                )));
+            }
             continue;
         }
         let child = dirs.open_child_dir(parent, &record.private)?;
+        // The descriptor that will be chmod'd must be the recorded object: the name
+        // can be swapped between the read above and this open.
+        let opened = child.identity();
+        if opened.device.get() != record.device || opened.inode != record.inode {
+            return Ok(Some(format!(
+                "`{}` opened as device {} inode {}, not the recorded {} / {}, so its recorded mode is not restored and nothing else is done",
+                record.private, opened.device, opened.inode, record.device, record.inode
+            )));
+        }
         if let Some(mode) = record.mode {
             if let Err(error) = dirs.set_dir_mode(&child, mode) {
                 return Ok(Some(format!(
@@ -2765,13 +2888,18 @@ mod tests {
         VolumeFixture::payload(&root, "payload.txt", b"bytes");
 
         let faults = Faults::new();
-        faults.failing_remove_prefix(QUARANTINE_PREFIX, 3);
+        // The leaf itself is removed under its private capture name, so that is
+        // where the retries are refused.
+        faults.failing_remove_prefix(CAPTURE_PREFIX, 3);
         let facts = prepared.fixture.facts();
         let report = prepared.delete(&faults, &facts);
         assert!(report.is_pending(), "{report:?}");
         assert_eq!(report.phase, IntentPhase::MarkerLast, "{report:?}");
         assert!(report.marker_removed, "the marker was unlinked last");
-        assert!(report.quarantine.is_dir(), "the leaf is kept");
+        assert!(
+            !capture_names(report.quarantine.parent().expect("the area folder")).is_empty(),
+            "the captured leaf is kept"
+        );
         assert!(
             report
                 .reason
@@ -2971,7 +3099,12 @@ mod tests {
                 .contains("appeared after the classification"),
             "{report:?}"
         );
-        let planted = report.quarantine.join(".DS_Store");
+        let area = report
+            .quarantine
+            .parent()
+            .expect("the area folder")
+            .to_path_buf();
+        let planted = find_entry(&area, ".DS_Store").expect("the planted entry is still there");
         assert!(
             std::fs::symlink_metadata(&planted)
                 .expect("the planted entry is still there")
@@ -2979,7 +3112,10 @@ mod tests {
                 .is_dir(),
             "the Finder-shaped directory is never recursively deleted"
         );
-        assert!(report.quarantine.is_dir(), "the leaf is kept");
+        assert!(
+            !capture_names(&area).is_empty(),
+            "the captured leaf is kept"
+        );
     }
 
     #[test]
@@ -3569,6 +3705,59 @@ mod tests {
     }
 
     #[test]
+    fn a_leaf_swapped_before_its_final_removal_is_never_removed() {
+        // The visible quarantine name is captured and verified again before the
+        // leaf's removal. A racer that puts its own directory at that name gets its
+        // directory put back, nothing is removed, and Barge records no completion.
+        let prepared = prepared("delete-leaf-swap");
+        let root = prepared.observed.path.clone();
+        let area = root.parent().expect("the area folder").to_path_buf();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        let faults = Faults::new();
+        faults.swapping_leaf(&area, QUARANTINE_PREFIX);
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert!(
+            report
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not the recorded quarantine leaf"),
+            "{:?}",
+            report.reason
+        );
+        // The foreign directory is put back under the visible name and kept: an
+        // empty directory put there is exactly what a removal by name would have
+        // deleted and recorded as a completion.
+        assert!(
+            std::fs::metadata(&report.quarantine)
+                .expect("the foreign directory is put back")
+                .is_dir(),
+            "the foreign directory is kept"
+        );
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1);
+        assert!(
+            pending[0].phase.is_pending(),
+            "no completion is recorded for a leaf that was not the recorded one"
+        );
+        assert!(
+            pending[0].phase < IntentPhase::Removed,
+            "the removed phase is never reached"
+        );
+        assert_eq!(
+            pending[0].foreign_captures.len(),
+            1,
+            "the foreign object at the quarantine name is recorded"
+        );
+        assert_eq!(
+            pending[0].foreign_captures[0].put_back,
+            state::PutBackOutcome::Renamed
+        );
+    }
+
+    #[test]
     fn a_recorded_capture_that_vanishes_before_a_replay_keeps_it_pending() {
         // The intent records this operation's capture and the private name is gone.
         // Absence is not proof that Barge unlinked it, so the replay neither
@@ -3605,6 +3794,76 @@ mod tests {
             intents.records[0].phase.is_pending(),
             "the intent never settles on an absence"
         );
+    }
+
+    #[test]
+    fn a_capture_swapped_before_its_replay_chmod_is_not_chmodded() {
+        // The mode restoration re-verifies the descriptor it is about to chmod. A
+        // racer that swaps the private name between the read and the open gets its
+        // own directory left with its own mode, and the intent stays pending.
+        let prepared = prepared("replay-mode-swap");
+        let root = prepared.observed.path.clone();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).expect("the directory exists");
+        VolumeFixture::payload(&locked, "inside.txt", b"bytes");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+                .expect("the directory is read-only");
+        }
+        let faults = Faults::new();
+        faults.failing_mode_restore();
+        faults.failing_listing_after_mode();
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        let leaf = report.quarantine.clone();
+        assert_eq!(capture_names(&leaf).len(), 1);
+
+        let replay_faults = Faults::new();
+        replay_faults.swapping_capture_on_open();
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let replay = replay_with(
+            &prepared.fixture.state,
+            &replay_faults,
+            &prepared.fixture.facts(),
+            &mounts,
+            &observer,
+            prepared.bounds(),
+        )
+        .expect("the replay reports");
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0].reason.contains("not the recorded"),
+            "{:?}",
+            replay.pending[0].reason
+        );
+        // The racer's directory - the one at the exact private name, not the
+        // `...moved` name it displaced - keeps the mode it was created with: the
+        // restoration never chmods a descriptor it did not verify.
+        let mut foreign = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&leaf) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.len() == CAPTURE_PREFIX.len() + 32 && name.starts_with(CAPTURE_PREFIX) {
+                    foreign.push(entry.path());
+                }
+            }
+        }
+        assert_eq!(
+            foreign.len(),
+            1,
+            "the racer's directory is at the private name"
+        );
+        assert_eq!(
+            mode_of(&foreign[0]),
+            0o755,
+            "the racer's directory is not chmodded"
+        );
+        let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
+        assert!(intents.records[0].phase.is_pending());
     }
 
     #[test]

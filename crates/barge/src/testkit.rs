@@ -474,6 +474,12 @@ pub struct Faults {
     /// Vanish the Nth private-name read (counted from one), as another process
     /// moving the captured object does between a listing and its read.
     pub vanishing_facts: Cell<usize>,
+    /// The area folder and the quarantine-name prefix a racer uses to replace a
+    /// leaf with a foreign directory just before Barge captures it for removal.
+    pub leaf_swap: RefCell<Option<(PathBuf, String)>>,
+    /// Whether the next private-name open swaps the name for a foreign directory,
+    /// as another process moving the capture does between a read and its open.
+    pub swap_on_capture_open: Cell<bool>,
     /// A device the descriptor a capture is verified through reports, so the
     /// parent binding fails and the captured facts cannot be read.
     pub parent_device_shift: Cell<Option<DeviceId>>,
@@ -690,6 +696,46 @@ impl Faults {
         self.vanishing_facts.set(observation);
     }
 
+    /// Let another process put its own directory at the quarantine leaf's path just
+    /// before Barge captures the leaf for its final removal. `prefix` is the leaf's
+    /// name prefix, `.barge-prune-`, because the intent id is chosen per run.
+    pub fn swapping_leaf(&self, area: &Path, prefix: &str) {
+        *self.leaf_swap.borrow_mut() = Some((area.to_path_buf(), prefix.to_owned()));
+    }
+
+    /// Swap the next private name for a foreign directory at its open.
+    pub fn swapping_capture_on_open(&self) {
+        self.swap_on_capture_open.set(true);
+    }
+
+    /// Replace the quarantine leaf with a foreign directory, once.
+    fn maybe_swap_leaf(&self, from: &str) {
+        let mut swap = self.leaf_swap.borrow_mut();
+        let Some((area, prefix)) = swap.as_ref() else {
+            return;
+        };
+        if !from.starts_with(prefix.as_str()) {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(area) else {
+            return;
+        };
+        let Some(path) = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.file_name().and_then(|name| name.to_str()) == Some(from))
+        else {
+            return;
+        };
+        // The leaf is emptied before this step, so removing it and putting a foreign
+        // directory in its place is what a racer can do at the area level.
+        // An *empty* foreign directory is the hazardous case: a removal by the
+        // visible name would succeed and record a completion Barge never earned.
+        if std::fs::remove_dir(&path).is_ok() && std::fs::create_dir(&path).is_ok() {
+            *swap = None;
+        }
+    }
+
     /// Fail the `observation`-th entry read of `name`, aborting the walk where a
     /// real read error would. Counting from one is how a test lands the abort in
     /// the delete pass rather than in the classification.
@@ -859,6 +905,14 @@ impl DirOps for Faults {
     }
 
     fn open_child_dir(&self, parent: &DirHandle, name: &str) -> Result<DirHandle> {
+        if self.swap_on_capture_open.get() && name.starts_with(crate::state::CAPTURE_PREFIX) {
+            self.swap_on_capture_open.set(false);
+            // Another process moved the captured object away and put its own
+            // directory at the private name, between the read and this open.
+            let moved = format!("{name}.moved");
+            let _ = self.inner.rename_child(parent, name, &moved);
+            let _ = self.inner.create_child_dir(parent, name, 0o755);
+        }
         self.inner.open_child_dir(parent, name)
     }
 
@@ -988,6 +1042,9 @@ impl DirOps for Faults {
     }
 
     fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<RenameOutcome> {
+        if to.starts_with(crate::state::CAPTURE_PREFIX) {
+            self.maybe_swap_leaf(from);
+        }
         if from.starts_with(crate::state::CAPTURE_PREFIX) {
             if self.fail_put_back.get() {
                 return Err(Error::new(
