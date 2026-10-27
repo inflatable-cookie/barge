@@ -2339,24 +2339,37 @@ Choices S7 made where this design left the mechanic to the slice:
   derived from elapsed time**: a row states the declared age it was decided
   against, never how long a root has been idle, because a value that moves every
   second would make the preview's digest unusable a moment later. The real run
-  therefore accepts a preview's digest while the eligible set is unchanged, and
-  re-evaluates each root's idleness against its own clock immediately before the
-  effect; a root that crossed the age threshold in between is a plan difference,
-  and the whole run refuses rather than deleting something the preview did not
-  name.
+  therefore accepts a preview's plan as long as the plan itself is what it says,
+  and re-evaluates each root's idleness against its own clock immediately before
+  the effect: a root that crossed the age threshold in between is kept as that
+  unit only.
 - **The CLI's two forms.** A preview is the default and is effect-free:
   `barge maintain --json` prints the plan and its digest, and `--plan-out <file>`
   writes exactly the bytes the digest covers where the caller asked. A real run
-  is `barge maintain --json --plan-sha256 <hex>` and may also be given
-  `--plan <file>`, whose bytes must be exactly the plan this head computes.
-  `--plan` without its digest refuses as `usage` before any effect, so the flag
-  itself is never an effect. The host job needs only the digest; the file form
-  exists so a caller can present the preview's own bytes.
-- **The real run recomputes and refuses as a whole.** A plan that changed since
-  the preview is `unknown_state` (exit `3`) with both digests, and nothing is
-  changed. Inside the run, every effect re-verifies its own predicates: the
-  embedded scratch digest is recomputed and compared again by S4's sweep, and
-  each area root is re-read under the volume lock before its intent.
+  is `barge maintain --json --plan <file> --plan-sha256 <hex>`: the preview's
+  exact bytes and their digest, both required. `--plan` without its digest, or a
+  digest without the bytes, refuses as `usage` before any effect, so neither flag
+  is ever an effect on its own. The host job keeps the bytes with `--plan-out`
+  and passes both back.
+- **The plan is the authorization, and a change stops only its own unit.** A real
+  run applies exactly the units the preview's plan names; it never recomputes a
+  plan of its own, because a recomputation would turn any single unit's change
+  into a refusal of the whole run. The digest binds the bytes, the rows name the
+  units and their identities, and every unit is re-verified immediately before
+  its effect: the scratch stage re-reads its unit's grant, marker, identity,
+  holds and age through S4's `reassess` and the deletion's own authorization,
+  and each area root is re-read under the volume lock (declaration, policy age,
+  identity, marker digest, holds, idleness and the registry record's
+  generation). A unit that changed in between — a live hold, a withdrawn
+  delegation or claim, a marker that appeared, a changed identity or revision,
+  or a volume whose record left the registry or moved its `root_dir` — is kept
+  and reported as that unit (or that volume's units) only, and the rest of the
+  plan still runs. A plan whose own bytes do not match `--plan-sha256`, or whose
+  embedded scratch step digest does not describe that step, is a `usage` or
+  `unknown_state` refusal before any effect: that is the authorization itself
+  being unusable, not a unit changing. A volume whose record left the registry,
+  whose `root_dir` moved, or which is no longer attached is reported loudly with
+  every unit the plan named for it kept, and the other volumes still run.
 - **Exit codes.** `0` completed, including a partial completion with nothing
   pending. A `3` that still reports a plan is a completed run: the host job's
   contract keeps the `3` on record and still performs the authorized real step for

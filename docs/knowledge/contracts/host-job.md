@@ -17,7 +17,7 @@ enables it.
 
 ```text
 /usr/local/bin/barge maintain --json [--plan-out <file>]
-/usr/local/bin/barge maintain --json --plan-sha256 <hex> [--plan <file>]
+/usr/local/bin/barge maintain --json --plan <file> --plan-sha256 <hex>
 ```
 
 The first form is the preview and is effect-free: it prints one bounded canonical
@@ -25,9 +25,12 @@ The first form is the preview and is effect-free: it prints one bounded canonica
 units it would delete in `data.candidates`. `--plan-out` also writes exactly the
 bytes the digest covers to the named file, for a caller that wants to keep them.
 
-The second form is the real run and needs the preview's digest. `--plan <file>`,
-when given, must hold exactly the plan bytes this head computes; a file from any
-other state is refused before any effect.
+The second form is the real run, and it needs both of the preview's own facts:
+its exact bytes (`--plan <file>`) and their digest (`--plan-sha256 <hex>`). Either
+one alone is a usage refusal before any effect. The plan names exactly the units
+the run may act on, and every one of them is re-verified immediately before its
+effect, so a unit that changed between the preview and the real run is kept and
+reported as that unit only while the rest of the plan still runs.
 
 ## What the job does
 
@@ -36,9 +39,8 @@ other state is refused before any effect.
    and `data.plan_digest` are its report. A preview that prints a
    `barge.error/1` document refused or could not report, and nothing was planned.
 2. **Only** when the preview printed a plan document and `data.candidates` is
-   greater than zero, run the real step once, passing that preview's
-   `data.plan_digest` (and, when the job kept them, `--plan` with the exact
-   preview bytes).
+   greater than zero, run the real step once, passing that preview's exact bytes
+   (`--plan`) and its `data.plan_digest` (`--plan-sha256`).
 3. Record the real step's exit code. Never retry it, never loop, never run it
    twice, and never run it with a digest from an earlier day's preview.
 4. Exit with the worse of the two recorded codes, so a loud absence is never
@@ -61,7 +63,7 @@ a retry inside the same night.
 | `0` | plan | Completed, nothing pending. |
 | `2` | error | Refused before any effect: a usage error, a plan that is not the plan, a lock, a custody refusal. Record and stop for this schedule. |
 | `3` | plan | Completed and it needs a human: an absent **permanent** volume, a volume whose durability is undeclared, a pending intent or an unsettled replay on a volume it did not touch. The plan's candidates are still authorized, so do the real step and record the `3`. |
-| `3` | error | Unsettled or unknown state: the run's own plan changed, the wall clock, a run that stopped on an error after its first effect (reported in `data.stopped`, never as a "refused before any effect" `2`), or a refusal that could not be classified as `2`. Record and stop. |
+| `3` | error | Unsettled or unknown state: a plan whose embedded scratch step is inconsistent, the wall clock, a run that stopped on an error after its first effect (reported in `data.stopped`, never as a "refused before any effect" `2`), or a refusal that could not be classified as `2`. Record and stop. |
 
 A non-zero exit is recorded and never retried by Barge. The recording is the
 host's: launchd's `StandardOutPath`/`StandardErrorPath` append one line per run,

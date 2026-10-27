@@ -17,22 +17,20 @@ wrote.
 
 ## The fixed command
 
-Effigy owns three selectors. The two native ones are exactly two commands each —
-the CLI built from the head under proof, then the one fixed script:
+Effigy owns three selectors. The two native ones each declare `admission =
+"heavy"`, the same admission as S4's natives, and each is exactly one command —
+the one fixed script:
 
 ```text
-maintain:native              oxide build -p barge-cli --locked
-                            python3 scripts/native/s7-maintain-proof.py counted
-
-maintain:native:diagnostic   oxide build -p barge-cli --locked
-                            python3 scripts/native/s7-maintain-proof.py diagnostic
-
+maintain:native              python3 scripts/native/s7-maintain-proof.py counted
+maintain:native:diagnostic   python3 scripts/native/s7-maintain-proof.py diagnostic
 maintain:native:test         python3 scripts/native/s7-maintain-proof.py --self-check
 ```
 
 `scripts/native/s7-maintain-proof.py` is the whole command the elevated run
-supervises, in both modes, and its outer half refuses to run outside that
-supervisor: it verifies the pinned bytes, then executes them with
+supervises, in both modes; the CLI under test is named by `BARGE_PROOF_BIN`, which
+the owner builds at the head being proved. Its outer half refuses to run outside
+that supervisor: it verifies the pinned bytes, then executes them with
 `/usr/bin/python3`, and the inner half refuses without `OXIDE_PROOF_EVIDENCE` and
 a `TMPDIR` inside `OXIDE_TASK_SCRATCH_ROOT`.
 
@@ -130,22 +128,21 @@ run would replay.
    area root, one fresh one, and one concluded-then-aged native scratch run. The
    preview names exactly the two eligible units, lists the fresh root in `kept`
    with an age reason, and reports `candidates` equal to what it listed. The real
-   run, authorised by that digest, deletes exactly those two — the scratch stage
-   first, then the area stage — leaves the fresh root and its marker in place,
-   and reports nothing pending with exit `0`.
+   run, authorised by that plan's exact bytes and digest, deletes exactly those
+   two — the scratch stage first, then the area stage — leaves the fresh root and
+   its marker in place, and reports nothing pending with exit `0`.
 2. **`a_tampered_plan_refuses`.** `--plan-out` writes the exact preview bytes; the
    case proves their SHA-256 is the preview's digest, appends one byte, and
    requires exit `2` with `usage` and "do not match", with the planned root still
-   present. The same digest without a plan file then authorises a real run and
-   deletes the root, which shows the digest is the authorisation and the file is
-   the stricter reading.
+   present. The preview's authentic bytes and digest then authorise the real run,
+   which deletes the root that plan named.
 3. **`a_hold_between_preview_and_real_stops_that_unit`.** Two aged roots, one
    preview. A hold is taken through `barge area hold` with the proof's own live
-   pid, which the product reads as live. The real run authorised by the *first*
-   digest refuses as a whole (exit `3`, `unknown_state`, both roots kept) — the
-   conservative reading of a changed plan. A fresh preview then lists the held
-   root in `kept` with its hold reason and the other root as a candidate, and its
-   real run deletes only the unheld root while the held one survives.
+   pid, which the product reads as live. The real run authorised by that same
+   first plan re-verifies each unit: the held root is kept and reported in the
+   area stage's `skipped` rows with its hold reason, the other planned root is
+   still deleted, nothing is pending, and the run exits `0`. A fresh preview then
+   reports the held root in `kept`, so the next run does not plan it either.
 4. **`an_oxide_output_root_and_receipt_fixture_are_untouched`.** The case plants
    an `oxide-outputs/proof-root/` tree on the volume and a receipt file in the
    fixture state, snapshots both (names, modes, sizes, mtimes, bytes), runs a real

@@ -1687,17 +1687,97 @@ pub fn sweep(
         .with_detail("candidates", plan.candidates.count.into()));
     }
 
-    // A real run first settles what an earlier run left pending, from the
-    // recorded identity only, so the effects below are not blocked by work the
-    // sweep already knows how to finish. A preview never replays.
-    let replay = delete::replay_pending(
+    expire_plan(
         state_paths,
         dirs,
         facts,
         mounts,
         observer,
+        &record,
+        &plan,
         request.delete_bounds,
-    )?;
+        request.now_ms,
+    )
+}
+
+/// Apply one `barge.scratch.plan/1` exactly as it stands, re-verifying each unit.
+///
+/// This is `barge maintain`'s entry point: the maintain plan carries S4's own
+/// scratch plan, and a real maintain run applies those rows rather than
+/// recomputing and comparing a whole new plan. Each candidate is re-read
+/// immediately before its effect (`reassess` and the deletion's own
+/// authorization), so a unit that became ineligible — a live hold, a withdrawn
+/// delegation or claim, a marker that appeared, a changed identity or a moved
+/// configuration — is kept and reported as that unit only, and the other planned
+/// units still go. `sweep` keeps its own contract, which recomputes the plan and
+/// refuses the whole run when the digest differs.
+///
+/// The digest recorded in the report and in each intent is the digest of the
+/// plan's own bytes, so the journal can always be re-derived from the plan the
+/// caller presented.
+#[allow(clippy::too_many_arguments)]
+pub fn expire_plan(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    record: &VolumeRecord,
+    plan: &SweepPlan,
+    delete_bounds: DeleteBounds,
+    now_ms: u64,
+) -> Result<ExpireReport> {
+    if plan.volume_uuid != record.volume_uuid {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the plan is for volume {}, not the verified {}",
+                plan.volume_uuid, record.volume_uuid
+            ),
+        )
+        .with_detail("plan_volume_uuid", plan.volume_uuid.as_str().into())
+        .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
+    }
+    let digest = plan_digest(plan)?;
+    let root_dir = plan.root_dir.clone();
+
+    // A volume that went away between the plan and this run is reported: every
+    // planned unit is kept, and the run continues with the other volumes.
+    if let Err(error) = area::VolumeRoot::open(dirs, facts, mounts, record) {
+        if error.kind() != ErrorKind::VolumeAbsent {
+            return Err(error);
+        }
+        let skipped: Vec<SkippedRow> = plan
+            .candidates
+            .rows
+            .iter()
+            .map(|row| SkippedRow {
+                name: row.name.clone(),
+                scope: row.scope.clone(),
+                reason: format!(
+                    "the volume {} is not attached, so the planned unit is kept",
+                    record.volume_uuid
+                ),
+            })
+            .collect();
+        let total = skipped.len();
+        return Ok(ExpireReport {
+            volume_uuid: record.volume_uuid.as_str().to_owned(),
+            volume_present: false,
+            preview: false,
+            plan_digest: digest,
+            plan: plan.clone(),
+            deleted: RowSet::empty(),
+            pending: RowSet::empty(),
+            skipped: RowSet::bounded(skipped, total, ROOT_ROWS),
+            replay: None,
+        });
+    }
+
+    // A real run first settles what an earlier run left pending, from the
+    // recorded identity only, so the effects below are not blocked by work the
+    // run already knows how to finish. A preview never replays.
+    let replay = delete::replay_pending(state_paths, dirs, facts, mounts, observer, delete_bounds)?;
 
     let scratch = plan.folder.clone();
     let mut deleted: Vec<DeletedRow> = Vec::new();
@@ -1720,10 +1800,10 @@ pub fn sweep(
             mounts,
             observer,
             state_paths,
-            request.volume_uuid,
+            &record.volume_uuid,
             &row.scope,
             &row.name,
-            request.now_ms,
+            now_ms,
         ) {
             Ok(fresh) => fresh,
             Err(error) if is_per_unit_refusal(&error) => {
@@ -1759,7 +1839,7 @@ pub fn sweep(
             });
             continue;
         }
-        let declaration = scratch_declaration(&record, &scratch);
+        let declaration = scratch_declaration(record, &scratch);
         let (parent, claim) = match &row.scope {
             UnitScope::Project { name } => (name.clone(), format!("project:{name}")),
             UnitScope::TopLevel => (String::new(), "top_level_adhoc".to_owned()),
@@ -1790,8 +1870,8 @@ pub fn sweep(
         };
         let kind = row.kind;
         let unit = DeletionUnit {
-            volume_uuid: request.volume_uuid.clone(),
-            root_dir: record.root_dir.clone(),
+            volume_uuid: record.volume_uuid.clone(),
+            root_dir: root_dir.clone(),
             folder: scratch.clone(),
             parent,
             name: row.name.clone(),
@@ -1811,7 +1891,7 @@ pub fn sweep(
                 state_paths,
                 fresh,
                 row,
-                request.now_ms,
+                now_ms,
             )
         };
         match delete::delete_unit_authorized(
@@ -1823,7 +1903,7 @@ pub fn sweep(
             &declaration,
             None,
             &unit,
-            request.delete_bounds,
+            delete_bounds,
             Some(&authorization),
         ) {
             Ok(report) => {
@@ -1870,7 +1950,7 @@ pub fn sweep(
         volume_present: true,
         preview: false,
         plan_digest: digest,
-        plan,
+        plan: plan.clone(),
         deleted: RowSet::bounded(deleted, deleted_total, ROOT_ROWS),
         pending: RowSet::bounded(pending, pending_total, ROOT_ROWS),
         skipped: RowSet::bounded(skipped, skipped_total, ROOT_ROWS),

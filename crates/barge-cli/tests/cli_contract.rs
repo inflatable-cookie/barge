@@ -1158,6 +1158,23 @@ fn maintain_refuses_a_missing_digest_a_tampered_plan_and_an_unknown_state() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
 
+    // A digest without the preview's bytes does not name the plan's units.
+    let output = run_in(
+        &["maintain", "--json", "--plan-sha256", &"a".repeat(64)],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "usage");
+    assert!(
+        document["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("exact plan bytes"),
+        "{}",
+        document["error"]["message"]
+    );
+
     // A preview's saved plan whose bytes were changed is refused.
     let output = run_in(
         &[

@@ -46,7 +46,7 @@ use barge::state::{self, StatePaths};
 
 const USAGE: &str = "usage: barge <describe|inspect|maintain|area|cache|diagnostic|scratch> [--json]
        barge maintain [--plan-out <file>]
-       barge maintain --plan-sha256 <hex> [--plan <file>]
+       barge maintain --plan <file> --plan-sha256 <hex>
        barge diagnostic descriptor-census --root <existing-directory>
        barge area declare --namespace <ns> --area <name> --folder <folder> [--override <uuid>=<folder>]... --absent <fail:drive|wait|fallback:path> --prune <none|oldest-idle:seconds> --reserve <counts|excluded>
        barge area show --namespace <ns> --area <name>
@@ -644,9 +644,11 @@ fn area_release(mut options: Options) -> Result<Report, Error> {
 /// Run one `maintain` run: a preview, or a real run the preview authorized.
 ///
 /// The preview is effect-free and prints one bounded canonical
-/// `barge.maintain.plan/1` with its SHA-256. A real run requires that digest; a
-/// `--plan` file, when the caller kept the exact preview bytes from
-/// `--plan-out`, must be exactly the plan this head computes.
+/// `barge.maintain.plan/1` with its SHA-256. A real run requires the preview's
+/// exact bytes (`--plan <file>`) and their digest (`--plan-sha256`), so the
+/// units it acts on are exactly the ones the preview named; each unit is
+/// re-verified immediately before its effect, and a unit that changed in between
+/// is kept and reported as that unit only.
 fn maintain(args: &[String]) -> Result<Report, Error> {
     let Parsed { words, mut options } = parse_taking(args, &["plan", "plan-out"])?;
     if let Some(word) = words.first() {
@@ -663,6 +665,11 @@ fn maintain(args: &[String]) -> Result<Report, Error> {
                 path.display()
             )));
         }
+    }
+    if plan_digest.is_some() && plan_file.is_none() {
+        return Err(usage(
+            "a real run needs the preview's exact plan bytes (--plan <file>) as well as --plan-sha256; nothing was changed",
+        ));
     }
     if plan_out.is_some() && !preview {
         return Err(usage(

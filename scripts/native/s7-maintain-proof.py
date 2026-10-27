@@ -575,12 +575,16 @@ class Proof:
         code, document = self.barge(*args, expect=expect)
         return code, document
 
-    def real(self, digest, plan_file=None, expect=0):
-        args = ["maintain", "--plan-sha256", digest]
-        if plan_file:
-            args += ["--plan", plan_file]
-        code, document = self.barge(*args, expect=expect)
+    def real(self, digest, plan_file, expect=0):
+        """The real form: the preview's exact bytes and their digest."""
+        code, document = self.barge(
+            "maintain", "--plan", plan_file, "--plan-sha256", digest, expect=expect
+        )
         return code, document
+
+    def plan_path(self, case):
+        """One preview's plan file, inside this run root."""
+        return os.path.join(self.root, f"{case}-plan.json")
 
     def create_area_root(self, kind="area_root"):
         _code, document = self.barge(
@@ -729,7 +733,8 @@ class Proof:
         scratch_run = self.create_scratch_run("proof-alpha", "proof")
         self.age_native_run(scratch_run["path"])
 
-        _code, document = self.preview(expect=0)
+        plan_file = self.plan_path("case1")
+        _code, document = self.preview(expect=0, plan_out=plan_file)
         plan = document["data"]["plan"]
         assert plan["schema"] == "barge.maintain.plan/1"
         candidates = self.candidate_names(document)
@@ -743,7 +748,7 @@ class Proof:
         assert document["data"]["candidates"] == len(candidates), document["data"]["candidates"]
         digest = document["data"]["plan_digest"]
 
-        code, real = self.real(digest, expect=0)
+        code, real = self.real(digest, plan_file, expect=0)
         assert real["data"]["preview"] is False
         assert real["data"]["plan_digest"] == digest
         assert real["data"]["pending"]["count"] == 0, real["data"]["pending"]
@@ -778,9 +783,9 @@ class Proof:
         assert document["error"]["kind"] == "usage", document["error"]
         assert "do not match" in document["error"]["message"], document["error"]["message"]
         assert os.path.isdir(root["path"]), "a tampered plan changed nothing"
-        # The same digest with no plan file still authorises the run: the digest
-        # is the authorization, and the file form is the stricter reading.
-        code_ok, real = self.real(digest, expect=0)
+        # The preview's own bytes and digest then authorise the run, and it
+        # deletes the unit that plan named.
+        code_ok, real = self.real(digest, plan_file, expect=0)
         assert real["data"]["preview"] is False
         assert not os.path.exists(root["path"]), "the authorised run deleted the planned root"
         return {"tampered_exit": code, "authorised_exit": code_ok, "digest": digest}
@@ -790,35 +795,39 @@ class Proof:
         free = self.create_area_root()
         self.age_area_root(held["path"])
         self.age_area_root(free["path"])
-        _code, preview = self.preview(expect=0)
-        first_digest = preview["data"]["plan_digest"]
-        assert held["root_id"] in self.candidate_names(preview), self.candidate_names(preview)
+        plan_file = self.plan_path("case3")
+        _code, preview = self.preview(expect=0, plan_out=plan_file)
+        digest = preview["data"]["plan_digest"]
+        candidates = self.candidate_names(preview)
+        assert held["root_id"] in candidates, candidates
+        assert free["root_id"] in candidates, candidates
 
         self.hold(held["root_id"], "s7-proof-holder")
-        # A hold taken between the preview and its real run changed the plan, so
-        # the preview's digest no longer authorises anything: the conservative
-        # whole-run refusal, with both units kept.
-        code, document = self.real(first_digest, expect=3)
-        assert document["error"]["kind"] == "unknown_state", document["error"]
-        assert os.path.isdir(held["path"]) and os.path.isdir(free["path"]), "nothing was deleted"
+        # The plan still names both roots. The real run re-verifies each one, so
+        # the held root is kept and the other planned root is still deleted: the
+        # hold stops that unit only, and the run completes with exit 0.
+        code, real = self.real(digest, plan_file, expect=0)
+        stage = real["data"]["volumes"]["rows"][0]["areas"][0]
+        assert stage["deleted"]["count"] == 1, stage
+        assert stage["skipped"]["count"] == 1, stage
+        assert stage["skipped"]["rows"][0]["name"] == held["root_id"], stage
+        assert "hold" in stage["skipped"]["rows"][0]["reason"], stage["skipped"]["rows"][0]
+        assert os.path.isdir(held["path"]), "the held root is kept"
+        assert not os.path.exists(free["path"]), "the unheld planned root went"
+        assert real["data"]["pending"]["count"] == 0, real["data"]["pending"]
 
-        # A fresh preview now keeps the held unit and names the other one, and
-        # its real run deletes only that one.
+        # A fresh preview reports the held root as kept, so the next run does not
+        # plan it either.
         _code, second = self.preview(expect=0)
-        candidates = self.candidate_names(second)
-        assert free["root_id"] in candidates, candidates
-        assert held["root_id"] not in candidates, candidates
+        assert held["root_id"] not in self.candidate_names(second)
         held_rows = {row["name"]: row["reason"] for row in self.area_row(second)["kept"]["rows"]}
         assert held["root_id"] in held_rows, held_rows
         assert "hold" in held_rows[held["root_id"]], held_rows[held["root_id"]]
-        code_ok, real = self.real(second["data"]["plan_digest"], expect=0)
-        assert not os.path.exists(free["path"]), "the unheld root goes"
-        assert os.path.isdir(held["path"]), "the held root stays"
         return {
-            "stopped_exit": code,
-            "deleted_exit": code_ok,
+            "exit": code,
             "held": held["root_id"],
             "kept_reason": held_rows[held["root_id"]],
+            "skipped": stage["skipped"]["rows"][0]["reason"],
         }
 
     def case_an_absent_ephemeral_volume_is_skipped_and_a_permanent_one_is_reported(self):
@@ -836,7 +845,8 @@ class Proof:
     def absent_volume_evidence(self, root):
         # The plan is loud because a permanent volume is absent, so the preview
         # and the real run both exit 3 while the attached volume is maintained.
-        code, preview = self.preview(expect=3)
+        plan_file = self.plan_path("case5")
+        code, preview = self.preview(expect=3, plan_out=plan_file)
         assert code == 3
         ephemeral = self.volume_row(preview, self.ABSENT_EPHEMERAL_UUID)
         permanent = self.volume_row(preview, self.ABSENT_PERMANENT_UUID)
@@ -850,7 +860,7 @@ class Proof:
         assert not os.path.exists(self.absent_permanent), "an absent mount point is never created"
         assert root["root_id"] in self.candidate_names(preview), self.candidate_names(preview)
 
-        code_real, real = self.real(preview["data"]["plan_digest"], expect=3)
+        code_real, real = self.real(preview["data"]["plan_digest"], plan_file, expect=3)
         assert real["data"]["volumes"]["rows"][0]["areas"][0]["deleted"]["count"] == 1, real["data"]
         assert not os.path.exists(root["path"]), "the other volume was still maintained"
         assert not os.path.exists(self.absent_ephemeral), "an absent mount point stays absent"
@@ -881,8 +891,9 @@ class Proof:
 
         root = self.create_area_root()
         self.age_area_root(root["path"])
-        _code, preview = self.preview(expect=0)
-        _code, real = self.real(preview["data"]["plan_digest"], expect=0)
+        plan_file = self.plan_path("case4")
+        _code, preview = self.preview(expect=0, plan_out=plan_file)
+        _code, real = self.real(preview["data"]["plan_digest"], plan_file, expect=0)
         assert not os.path.exists(root["path"]), "the run did delete its planned unit"
         after_root = tree_observation(output_root)
         after_receipt = tree_observation(receipts)
@@ -902,8 +913,9 @@ class Proof:
         # An entry the deletion must never follow: a symlink inside the unit
         # stops it after its quarantine rename and leaves the intent pending.
         os.symlink("/elsewhere", os.path.join(root["path"], "link"))
-        _code, preview = self.preview(expect=0)
-        code, real = self.real(preview["data"]["plan_digest"], expect=3)
+        plan_file = self.plan_path("case6")
+        _code, preview = self.preview(expect=0, plan_out=plan_file)
+        code, real = self.real(preview["data"]["plan_digest"], plan_file, expect=3)
         assert real["data"]["pending"]["count"] == 1, real["data"]["pending"]
         assert real["data"]["volumes"]["rows"][0]["areas"][0]["pending"]["count"] == 1, real["data"]
         pending = self.pending_intents()
