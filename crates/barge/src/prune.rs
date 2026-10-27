@@ -1016,6 +1016,15 @@ fn run(
             let mut skipped = Vec::new();
             let mut stage_pending: Vec<PendingRow> = Vec::new();
             for candidate in &area_plan.candidates.rows {
+                if let Some(reason) = &stopped {
+                    // Every planned unit is accounted for: a unit the stop left
+                    // unreached is reported with counts, never dropped.
+                    skipped.push(AreaSkippedRow {
+                        name: candidate.name.clone(),
+                        reason: format!("the run stopped before this effect: {reason}"),
+                    });
+                    continue;
+                }
                 if !stage_pending.is_empty() {
                     skipped.push(AreaSkippedRow {
                         name: candidate.name.clone(),
@@ -1092,16 +1101,13 @@ fn run(
                     Err(error) => {
                         skipped.push(AreaSkippedRow {
                             name: candidate.name.clone(),
-                            reason: format!(
-                                "the run stopped on this unit's error and nothing else was attempted: {error}"
-                            ),
+                            reason: format!("the run stopped on this unit's error: {error}"),
                         });
                         outcome.detail = Some(format!(
                             "the area stage {}/{} stopped the run: {error}",
                             area_plan.namespace, area_plan.area
                         ));
                         stopped = outcome.detail.clone();
-                        break;
                     }
                 }
             }
