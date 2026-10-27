@@ -1790,6 +1790,16 @@ impl<'a> WalkState<'a> {
         )? {
             Walk::Clean => {
                 counts.marker_removed = true;
+                // The marker's capture is complete. The chain is published without
+                // it, so the durable record matches what Barge actually removed: a
+                // replay that stops at `marker_last`, before the leaf is captured,
+                // then reads no completed capture as a missing one, and resumes the
+                // leaf capture instead of reporting an unknown.
+                if let Err(error) = self.publish_chain() {
+                    return Ok(Walk::Stop(format!(
+                        "the marker was unlinked but the completed capture could not be recorded: {error}"
+                    )));
+                }
                 Ok(Walk::Clean)
             }
             stop => Ok(stop),
@@ -4260,6 +4270,44 @@ mod tests {
             "{:?}",
             replay.pending[0].reason
         );
+    }
+
+    #[test]
+    fn a_stop_after_marker_last_resumes_the_leaf_capture_on_replay() {
+        // The real post-marker-last, pre-leaf-capture boundary: the marker is
+        // unlinked and `marker_last` is durable, and the leaf capture fails. The
+        // marker's completed capture is gone from the durable chain, so a replay
+        // resumes the leaf capture instead of reading a missing capture as unknown.
+        let prepared = prepared("stop-after-marker-last");
+        let root = prepared.observed.path.clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        let faults = Faults::new();
+        faults.failing_leaf_capture();
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(report.phase, IntentPhase::MarkerLast, "{report:?}");
+        assert!(report.marker_removed, "the marker was unlinked last");
+        assert!(report.quarantine.is_dir(), "the leaf is still there");
+        assert!(
+            !report.quarantine.join(ROOT_MARKER_FILE).exists(),
+            "the marker is gone"
+        );
+        let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
+        assert_eq!(intents.records[0].phase, IntentPhase::MarkerLast);
+        assert!(
+            intents.records[0].captures.is_empty(),
+            "the completed marker capture is not left in the durable chain: {:?}",
+            intents.records[0].captures
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.settled, 1, "{replay:?}");
+        assert_eq!(replay.pending.len(), 0, "{replay:?}");
+        assert!(replay.is_settled());
+        assert!(!report.quarantine.exists(), "the leaf is gone");
+        let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
+        assert_eq!(intents.records[0].phase, IntentPhase::Deleted);
     }
 
     #[test]

@@ -475,6 +475,9 @@ pub struct Faults {
     /// Whether the next private-name removal answers "already gone", as it does
     /// when another process moves the captured object mid-run.
     pub vanishing: Cell<bool>,
+    /// Whether the next leaf capture fails, stopping the deletion between
+    /// `marker_last` and the leaf's own capture.
+    pub fail_leaf_capture: Cell<bool>,
     /// Vanish the Nth private-name read (counted from one), as another process
     /// moving the captured object does between a listing and its read.
     pub vanishing_facts: Cell<usize>,
@@ -705,6 +708,12 @@ impl Faults {
     /// listing and its read, so the read answers "not there".
     pub fn vanishing_capture_at(&self, observation: usize) {
         self.vanishing_facts.set(observation);
+    }
+
+    /// Fail the next leaf capture, stopping the deletion exactly between
+    /// `marker_last` and the leaf's own capture.
+    pub fn failing_leaf_capture(&self) {
+        self.fail_leaf_capture.set(true);
     }
 
     /// Let another process put its own directory at the quarantine leaf's path just
@@ -1077,6 +1086,13 @@ impl DirOps for Faults {
     }
 
     fn rename_child(&self, parent: &DirHandle, from: &str, to: &str) -> Result<RenameOutcome> {
+        if self.fail_leaf_capture.get()
+            && from.starts_with(crate::state::QUARANTINE_PREFIX)
+            && to.starts_with(crate::state::CAPTURE_PREFIX)
+        {
+            self.fail_leaf_capture.set(false);
+            return Err(Error::new(ErrorKind::Io, "the leaf capture did not happen"));
+        }
         if to.starts_with(crate::state::CAPTURE_PREFIX) {
             self.maybe_swap_leaf(from);
         }

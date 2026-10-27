@@ -1016,7 +1016,11 @@ barge#014 brief). An absent name is never proof that Barge deleted its object.
    while the intent durably records that capture and its post-capture
    verification - device, inode, kind and verdict (`observed`, or the
    Finder-metadata class verdict) - and a replay re-verifies the same identity
-   before it deletes anything. The record is published before the unlink (and
+   before it deletes anything. A completed capture is dropped from that record as
+   soon as its unlink succeeds, so the durable chain never names a finish Barge
+   itself made, and a replay that stops right after an unlink - the `marker_last`
+   boundary before the leaf is captured, for instance - resumes instead of
+   reading a finished capture as a missing one. The record is published before the unlink (and
    before any chmod), one atomic publish per entry, so the deletion's practical
    size inside its 120 s deadline is smaller than the name bound alone suggests; a
    root that reaches the deadline stops pending. Every capture whose verification
