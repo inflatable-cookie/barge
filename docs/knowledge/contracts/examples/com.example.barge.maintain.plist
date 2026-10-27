@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  An EXAMPLE of the host job that calls `barge maintain`
+  (docs/knowledge/contracts/host-job.md). It is documentation only: nothing in
+  this repository installs, loads or enables it, and its label, schedule, binary
+  path and log paths all change when an operator installs one.
+
+  The protocol is the contract's: preview (effect-free), then a single real run
+  that passes the preview's own digest and only when the preview named at least
+  one candidate. A non-zero exit is written to launchd's log and never retried.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.barge.maintain</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>set -u
+BARGE=/usr/local/bin/barge
+RUN_ROOT=${TMPDIR:-/var/tmp}
+WORK=$(/usr/bin/mktemp -d "$RUN_ROOT/barge-maintain.XXXXXX") || {
+  echo "barge maintain: no temporary directory under $RUN_ROOT; nothing was run"
+  exit 2
+}
+cleanup() {
+  if [ -n "$WORK" ] && [ -d "$WORK" ]; then
+    /bin/rm -f "$WORK/preview.json" "$WORK/real.json" "$WORK/plan.json"
+    /bin/rmdir "$WORK" 2>/dev/null
+  fi
+}
+trap cleanup EXIT
+
+# 1. Preview. Effect-free; it writes only the plan file this script asked for.
+"$BARGE" maintain --json --plan-out "$WORK/plan.json" >"$WORK/preview.json"
+preview_exit=$?
+if [ "$preview_exit" -ne 0 ]; then
+  echo "barge maintain: preview exit=$preview_exit; recorded, not retried"
+  exit "$preview_exit"
+fi
+
+# 2. Read the digest and the candidate count from the preview document.
+read_key() {
+  /usr/bin/python3 - "$WORK/preview.json" "$1" <<'PY'
+import json, sys
+document = json.load(open(sys.argv[1]))
+print(document["data"][sys.argv[2]])
+PY
+}
+DIGEST=$(read_key plan_digest) || {
+  echo "barge maintain: the preview is not one readable document; recorded, not retried"
+  exit 3
+}
+CANDIDATES=$(read_key candidates) || {
+  echo "barge maintain: the preview reports no candidate count; recorded, not retried"
+  exit 3
+}
+if [ "$CANDIDATES" -eq 0 ]; then
+  # The preview ran and there is nothing to do. This is not a real run.
+  exit 0
+fi
+
+# 3. Exactly one real run, with this preview's digest and its exact bytes. No
+#    retry, and never a digest from an earlier preview.
+"$BARGE" maintain --json --plan "$WORK/plan.json" --plan-sha256 "$DIGEST" >"$WORK/real.json"
+real_exit=$?
+echo "barge maintain: real exit=$real_exit digest=$DIGEST candidates=$CANDIDATES; recorded, not retried"
+exit "$real_exit"</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>4</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/example/Library/Logs/barge-maintain.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/example/Library/Logs/barge-maintain.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>LowPriorityIO</key>
+  <true/>
+</dict>
+</plist>

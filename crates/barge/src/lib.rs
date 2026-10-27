@@ -12,9 +12,12 @@
 //! markers, cooperative holds and bounded root listing, with `barge area` verbs
 //! as the CLI's form of them. Slice S6 adds `cache`: the four cache kinds, the
 //! three placement forms, and adopt and undo with their byte-level and
-//! link/root identity proofs, with `barge cache` verbs as the CLI's form. Every
-//! other module states its job and carries no placeholder logic for a later
-//! slice to undo.
+//! link/root identity proofs, with `barge cache` verbs as the CLI's form. Slice
+//! S7 adds `prune`: `barge maintain` in preview and real form, which sweeps every
+//! registered, present volume's scratch folder through S4's sweep and then
+//! applies each declared area's prune policy, with one canonical plan and digest
+//! and the 0/2/3 exit contract. Every other module states its job and carries no
+//! placeholder logic for a later slice to undo.
 //!
 //! `unsafe` is denied for the whole crate and allowed only in the macOS
 //! implementation of the [`os`] layer, which is the one FFI seam.

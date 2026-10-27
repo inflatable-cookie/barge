@@ -1878,8 +1878,9 @@ pub fn sweep(
     })
 }
 
-/// A refusal that concerns one unit and must not abort the sweep.
-fn is_per_unit_refusal(error: &Error) -> bool {
+/// A refusal that concerns one unit and must not abort the sweep or a maintain
+/// stage. Slice S7's area prune reuses the same set, so there is one list.
+pub(crate) fn is_per_unit_refusal(error: &Error) -> bool {
     matches!(
         error.kind(),
         ErrorKind::CustodyNotProven

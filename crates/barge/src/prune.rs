@@ -1,4 +1,2224 @@
-//! Area prune policy evaluation, plan and preview with a digest, and the intent
-//! journal (stage 1 design, "Scheduling without a daemon").
+//! Area prune policy evaluation and `maintain`, preview and real (stage 1
+//! design, "Scheduling without a daemon").
 //!
-//! Slice S7, with the deletion mechanics in S5.
+//! Slice S7 owns the one command a host job calls. The rules it carries:
+//!
+//! - **One fixed order.** `maintain` sweeps every registered, present volume's
+//!   scratch folder (S4) and then each declared area's prune policy, in registry
+//!   order and then declaration order, and does nothing else. It never runs
+//!   Oxide's outputs prune, reads an Oxide receipt or deletes an Oxide root.
+//! - **Preview then real.** One bounded canonical `barge.maintain.plan/1` and its
+//!   SHA-256. A preview changes nothing; a real run requires exactly that digest
+//!   (and, when the caller kept it, those exact plan bytes), then re-verifies
+//!   every predicate immediately before each effect: the embedded scratch plan
+//!   digest, the root's identity and marker digest, the registry record, the
+//!   declaration's current prune policy and the root's holds.
+//! - **Absence is a report, never an effect.** An absent `ephemeral` volume is
+//!   skipped and reported; an absent `permanent` volume is reported loudly while
+//!   the other volumes continue. A mount point is never recreated, and an
+//!   undeclared or `kept` volume's data is never pruned.
+//! - **A bound leaves the rest for later.** The run's wall clock is the design's
+//!   600 s with a 30 s stop window; reaching it reports `timed_out` and the work
+//!   it did not reach, and it is never reported as success.
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::area::{self, AreaDocument, MarkerStateName, PrunePolicy};
+use crate::contract::{
+    RowSet, AREA_ROWS, DOCUMENT_SIZE_CAP_BYTES, MAINTAIN_PLAN_SCHEMA, ROOT_ROWS, VOLUME_ROWS,
+};
+use crate::delete::{self, DeleteBounds, PendingRow};
+use crate::digest::sha256_hex;
+use crate::error::{Error, ErrorKind, Result};
+use crate::os::{DeviceId, DirOps, MountRoot, ProcessObserver, VolumeFacts};
+use crate::registry::{self, Availability, Durability, VolumeRecord};
+use crate::scratch::{self, SweepBounds, SweepPlan, SweepPolicy, SweepRequest};
+use crate::state::{self, StatePaths};
+use crate::unit::{self, DeletionUnit, MarkerFamily, UnitGrant, UnitKind, UnitMarker};
+
+/// How long one `maintain` run may take (design, "Bounded resources").
+pub const MAINTAIN_WALL: Duration = Duration::from_secs(600);
+
+/// How much of that wall clock is reserved for stopping: no new effect starts
+/// inside it, so the run reports instead of being killed mid-effect.
+pub const MAINTAIN_STOP_MARGIN: Duration = Duration::from_secs(30);
+
+/// One run's bounds. The design's are 600 s and 30 s; a test shortens them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintainBounds {
+    /// The whole run's wall clock.
+    pub wall: Duration,
+    /// The window at the end in which no new effect starts.
+    pub stop_margin: Duration,
+}
+
+impl MaintainBounds {
+    /// The design's bounds.
+    pub const fn design() -> Self {
+        Self {
+            wall: MAINTAIN_WALL,
+            stop_margin: MAINTAIN_STOP_MARGIN,
+        }
+    }
+
+    /// The moment no new effect may start.
+    fn deadline(self, started: Instant) -> Instant {
+        started + self.wall.saturating_sub(self.stop_margin)
+    }
+}
+
+impl Default for MaintainBounds {
+    fn default() -> Self {
+        Self::design()
+    }
+}
+
+/// Whether a volume was attached when the plan was built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeState {
+    /// Attached and verified.
+    Present,
+    /// Not attached. Its recorded mount point is never written to or recreated.
+    Absent,
+}
+
+/// One volume's step in the maintain plan: its scratch sweep and its areas.
+///
+/// Everything here is stable across a preview and its real run, so the plan's
+/// digest is reproducible; the time the plan was built and every effect it
+/// caused are reported outside the plan, in `barge.maintain/1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumePlan {
+    /// The registered volume.
+    pub volume_uuid: String,
+    /// When the volume is attached.
+    pub availability: Availability,
+    /// What the data on it is.
+    pub durability: Durability,
+    /// The last observed mount point.
+    pub mount_hint: Option<PathBuf>,
+    /// The volume's recorded `root_dir`.
+    pub root_dir: String,
+    /// The registry record's generation when the plan was built. The effect
+    /// step compares it under the volume lock, so a record changed in the run's
+    /// own window stops the affected units instead of being trusted.
+    pub record_generation: u64,
+    /// Whether it was attached.
+    pub state: VolumeState,
+    /// Why the volume has no work, when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Whether the report needs a human: a permanent volume's absence, or a
+    /// volume whose durability an operator has not declared.
+    pub loud: bool,
+    /// The volume's scratch sweep, when the volume is present and prunable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<ScratchStep>,
+    /// Each declared area's prune step, in declaration order.
+    pub areas: RowSet<AreaPrunePlan>,
+}
+
+impl VolumePlan {
+    /// Whether any work was planned for this volume.
+    pub fn has_work(&self) -> bool {
+        self.scratch.is_some() || !self.areas.rows.is_empty()
+    }
+}
+
+/// The scratch stage of one volume: its plan and the digest that authorizes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScratchStep {
+    /// The SHA-256 of the scratch plan's own canonical bytes.
+    pub plan_digest: String,
+    /// The stable scratch plan (S4's `barge.scratch.plan/1`).
+    pub plan: SweepPlan,
+}
+
+/// One declared area's prune step on one volume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AreaPrunePlan {
+    /// The area's namespace.
+    pub namespace: String,
+    /// The area's name.
+    pub area: String,
+    /// The folder this volume resolves the area to.
+    pub folder: String,
+    /// The declared policy the step applied.
+    pub policy: PrunePolicy,
+    /// The owned roots whose idleness is past the declared age.
+    pub candidates: RowSet<PruneRootRow>,
+    /// The roots this step keeps, with the reason.
+    pub kept: RowSet<PruneKeptRow>,
+    /// How many folder entries the listing examined.
+    pub examined: usize,
+    /// Whether a listing bound stopped the walk before the folder was exhausted.
+    pub truncated: bool,
+}
+
+/// One owned root the plan would prune.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PruneRootRow {
+    /// The root's id, which is its name inside the area folder.
+    pub name: String,
+    /// The path the current configuration resolves.
+    pub path: PathBuf,
+    /// The root directory's device.
+    pub device: u64,
+    /// The root directory's inode on that device.
+    pub inode: u64,
+    /// The SHA-256 of the root's exact marker bytes.
+    pub marker_digest: String,
+    /// What the root is for.
+    pub kind: area::RootKind,
+    /// When the root was created, as its marker records it.
+    pub created_ms: Option<u64>,
+    /// The newest activity Barge observed for the root.
+    pub last_activity_ms: u64,
+    /// Why it is eligible, in one line.
+    pub reason: String,
+}
+
+/// One root the plan keeps, with the reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PruneKeptRow {
+    /// The entry's name inside the area folder.
+    pub name: String,
+    /// The observed path, when one was resolved.
+    pub path: Option<PathBuf>,
+    /// What it is: `owned`, `absent`, `unknown` or an entry kind.
+    pub state: String,
+    /// Why it is kept.
+    pub reason: String,
+}
+
+/// The `barge.maintain.plan/1` body: one bounded canonical plan and nothing
+/// volatile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintainPlan {
+    /// Always `barge.maintain.plan/1`.
+    pub schema: String,
+    /// The scratch ages the plan applied.
+    pub policy: SweepPolicy,
+    /// The registered volumes, in registry order.
+    pub volumes: RowSet<VolumePlan>,
+}
+
+impl MaintainPlan {
+    /// How many units the plan would delete, across every volume.
+    pub fn candidate_count(&self) -> usize {
+        self.volumes
+            .rows
+            .iter()
+            .map(|volume| {
+                volume
+                    .scratch
+                    .as_ref()
+                    .map_or(0, |step| step.plan.candidates.count)
+                    + volume
+                        .areas
+                        .rows
+                        .iter()
+                        .map(|area| area.candidates.count)
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+}
+
+/// One unit a real run deleted from a declared area.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AreaDeletedRow {
+    /// The root's name.
+    pub name: String,
+    /// Its path before the deletion.
+    pub path: PathBuf,
+    /// The intent that recorded it.
+    pub intent_id: String,
+    /// How many entries the deletion removed.
+    pub entries_removed: usize,
+    /// How many directories it removed, the quarantine leaf included.
+    pub directories_removed: usize,
+    /// Whether the marker was unlinked last.
+    pub marker_removed: bool,
+}
+
+/// One planned root a real run kept, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AreaSkippedRow {
+    /// The root's name.
+    pub name: String,
+    /// Why it was kept this run.
+    pub reason: String,
+}
+
+/// What one volume's scratch stage did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScratchOutcome {
+    /// The digest the stage was authorized by.
+    pub plan_digest: String,
+    /// The units deleted.
+    pub deleted: RowSet<scratch::DeletedRow>,
+    /// The intents left pending.
+    pub pending: RowSet<PendingRow>,
+    /// The candidates not deleted.
+    pub skipped: RowSet<scratch::SkippedRow>,
+    /// What the stage's replay of earlier pending intents did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<delete::ReplayReport>,
+}
+
+impl ScratchOutcome {
+    /// Whether the stage left no work unsettled.
+    fn is_settled(&self) -> bool {
+        self.pending.count == 0
+            && self
+                .replay
+                .as_ref()
+                .is_none_or(delete::ReplayReport::is_settled)
+    }
+}
+
+/// What one declared area's prune stage did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AreaPruneOutcome {
+    /// The area's namespace.
+    pub namespace: String,
+    /// The area's name.
+    pub area: String,
+    /// The roots deleted.
+    pub deleted: RowSet<AreaDeletedRow>,
+    /// The planned roots kept this run.
+    pub skipped: RowSet<AreaSkippedRow>,
+    /// The intents left pending.
+    pub pending: RowSet<PendingRow>,
+}
+
+impl AreaPruneOutcome {
+    /// A stage that did nothing yet, which is what a preview reports.
+    fn empty(namespace: &str, area: &str) -> Self {
+        Self {
+            namespace: namespace.to_owned(),
+            area: area.to_owned(),
+            deleted: RowSet::empty(),
+            skipped: RowSet::empty(),
+            pending: RowSet::empty(),
+        }
+    }
+}
+
+/// What one volume's real run did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeOutcome {
+    /// The volume's UUID.
+    pub volume_uuid: String,
+    /// Whether it was attached.
+    pub state: VolumeState,
+    /// Whether the report needs a human for this volume.
+    pub loud: bool,
+    /// Why the volume had no work, or why the run stopped before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The scratch stage's outcome, when it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<ScratchOutcome>,
+    /// Each area stage's outcome, in plan order.
+    pub areas: Vec<AreaPruneOutcome>,
+}
+
+/// What was not reached because the run's wall clock ran out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnreachedRow {
+    /// The volume the run stopped on.
+    pub volume_uuid: String,
+    /// The stage it stopped before: `scratch`, or `area:<namespace>/<area>`.
+    pub stage: String,
+    /// How many planned candidates of that stage were not attempted.
+    pub candidates: usize,
+}
+
+/// The `barge.maintain/1` data: the plan, its digest, and what the run did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintainReport {
+    /// Whether this run only previewed.
+    pub preview: bool,
+    /// The SHA-256 of the plan's canonical bytes.
+    pub plan_digest: String,
+    /// When the plan was built. It is outside the plan, so the digest is stable.
+    pub planned_ms: u64,
+    /// Whether the run's wall clock stopped it before all its work was done.
+    pub timed_out: bool,
+    /// Why a real run stopped before the rest of its plan, when one did. A
+    /// failure after the first effect is never exit `2` ("refused before any
+    /// effect"), so it is reported here and the command exits `3`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<String>,
+    /// How many units the plan would delete.
+    pub candidates: usize,
+    /// The stable plan.
+    pub plan: MaintainPlan,
+    /// What each volume's real run did. A preview reports none.
+    pub volumes: RowSet<VolumeOutcome>,
+    /// Every intent the run left pending, across all stages.
+    pub pending: RowSet<PendingRow>,
+    /// The stages the wall clock stopped before.
+    pub unreached: RowSet<UnreachedRow>,
+}
+
+impl MaintainReport {
+    /// The exit code the finished document forces.
+    ///
+    /// `3` is the design's "a pending intent or unknown state that needs a
+    /// human": a pending intent, a replay that did not settle, a permanent
+    /// volume that is not attached, a volume whose durability is undeclared, or
+    /// a run its wall clock stopped. `0` is everything else, including a partial
+    /// completion with nothing pending.
+    pub fn needs_human(&self) -> bool {
+        self.timed_out
+            || self.stopped.is_some()
+            || self.pending.count > 0
+            || self.plan.volumes.rows.iter().any(|volume| volume.loud)
+            || self.volumes.rows.iter().any(|volume| {
+                volume.loud
+                    || volume
+                        .scratch
+                        .as_ref()
+                        .is_some_and(|stage| !stage.is_settled())
+            })
+    }
+}
+
+/// What one caller asks `barge maintain` for.
+#[derive(Debug, Clone)]
+pub struct MaintainRequest<'a> {
+    /// Whether to preview only. A preview changes nothing.
+    pub preview: bool,
+    /// The digest a real run is authorized by. A real run without it refuses.
+    pub plan_digest: Option<&'a str>,
+    /// The exact preview bytes, when the caller kept them. A real run refuses
+    /// bytes that are not the plan this head computes.
+    pub plan_bytes: Option<&'a [u8]>,
+    /// The scratch sweep's bounds.
+    pub sweep_bounds: SweepBounds,
+    /// The deletion's bounds.
+    pub delete_bounds: DeleteBounds,
+    /// The run's wall clock.
+    pub maintain_bounds: MaintainBounds,
+    /// The current time, so a test can age a root or a conclusion.
+    pub now_ms: u64,
+}
+
+/// Preview or run `maintain` across every registered volume.
+///
+/// A preview builds the plan and its digest and changes nothing. A real run
+/// requires that digest (and, when one is given, exactly those plan bytes),
+/// recomputes the plan and refuses when it differs, and then re-verifies every
+/// predicate immediately before each effect. Scratch goes through S4's sweep and
+/// area roots through S5's custody and delete path; nothing else is touched.
+#[allow(clippy::too_many_arguments)]
+pub fn maintain(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    request: &MaintainRequest<'_>,
+) -> Result<MaintainReport> {
+    if !request.preview {
+        let Some(digest) = request.plan_digest else {
+            return Err(Error::new(
+                ErrorKind::Usage,
+                "a real maintain run needs --plan-sha256 from a preview; nothing was changed",
+            ));
+        };
+        if !unit::is_sha256(digest) {
+            return Err(Error::new(
+                ErrorKind::Usage,
+                "the plan digest is not a SHA-256 hex string; nothing was changed",
+            )
+            .with_detail("plan_digest", digest.into()));
+        }
+        if let Some(bytes) = request.plan_bytes {
+            if sha256_hex(bytes) != digest {
+                return Err(Error::new(
+                    ErrorKind::Usage,
+                    "the plan file's bytes do not match --plan-sha256; nothing was changed",
+                ));
+            }
+        }
+    }
+
+    let started = Instant::now();
+    let records = read_registry(state_paths)?;
+    let declarations = area::read_declarations(state_paths)?;
+    let plan = build_plan(
+        state_paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        &records,
+        &declarations,
+        request,
+    )?;
+    let canonical = canonical_plan_bytes(&plan)?;
+    let digest = sha256_hex(&canonical);
+    let candidates = plan.candidate_count();
+
+    if request.preview {
+        return Ok(MaintainReport {
+            preview: true,
+            plan_digest: digest,
+            planned_ms: request.now_ms,
+            timed_out: false,
+            stopped: None,
+            candidates,
+            plan,
+            volumes: RowSet::empty(),
+            pending: RowSet::empty(),
+            unreached: RowSet::empty(),
+        });
+    }
+
+    if let Some(bytes) = request.plan_bytes {
+        if bytes != canonical.as_slice() {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "the plan file is not the plan this head computes from the current state; preview again before changing anything",
+            )
+            .with_detail("file_digest", sha256_hex(bytes).into())
+            .with_detail("plan_digest", digest.clone().into()));
+        }
+    }
+    if request.plan_digest != Some(digest.as_str()) {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the maintain plan changed since the preview; preview again before changing anything",
+        )
+        .with_detail(
+            "expected_plan_digest",
+            request.plan_digest.unwrap_or("").into(),
+        )
+        .with_detail("actual_plan_digest", digest.clone().into())
+        .with_detail("candidates", candidates.into()));
+    }
+
+    run(
+        state_paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        &records,
+        &declarations,
+        plan,
+        digest,
+        request.maintain_bounds.deadline(started),
+        request,
+    )
+}
+
+/// Read the registry under the shared observation lock. Nothing is created.
+fn read_registry(state_paths: &StatePaths) -> Result<Vec<VolumeRecord>> {
+    let mut locks = state::LockSet::new(state_paths.clone());
+    let _lock = locks.observe_registry()?;
+    Ok(registry::read(state_paths)?.volumes().to_vec())
+}
+
+/// The plan's canonical bytes: one compact JSON document, exactly the bytes the
+/// plan digest covers and a real run must present.
+pub fn canonical_plan_bytes(plan: &MaintainPlan) -> Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(plan).map_err(|error| {
+        Error::new(
+            ErrorKind::Io,
+            format!(
+                "could not encode the {} plan: {error}",
+                MAINTAIN_PLAN_SCHEMA
+            ),
+        )
+    })?;
+    if bytes.len() > DOCUMENT_SIZE_CAP_BYTES {
+        return Err(Error::new(
+            ErrorKind::ResourceBound,
+            format!(
+                "the {} plan is {} bytes, over the {DOCUMENT_SIZE_CAP_BYTES}-byte document cap",
+                MAINTAIN_PLAN_SCHEMA,
+                bytes.len()
+            ),
+        )
+        .with_detail("bytes", bytes.len().into())
+        .with_detail("cap", DOCUMENT_SIZE_CAP_BYTES.into()));
+    }
+    Ok(bytes)
+}
+
+/// Build the whole plan, in registry order and then declaration order.
+#[allow(clippy::too_many_arguments)]
+fn build_plan(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    records: &[VolumeRecord],
+    declarations: &area::DeclarationSet,
+    request: &MaintainRequest<'_>,
+) -> Result<MaintainPlan> {
+    let builder = Builder {
+        state_paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        declarations,
+        sweep_bounds: request.sweep_bounds,
+        delete_bounds: request.delete_bounds,
+        now_ms: request.now_ms,
+    };
+    let mut rows = Vec::new();
+    for record in records {
+        rows.push(builder.volume_plan(record)?);
+    }
+    let total = rows.len();
+    Ok(MaintainPlan {
+        schema: MAINTAIN_PLAN_SCHEMA.to_owned(),
+        policy: SweepPolicy::design(),
+        volumes: RowSet::bounded(rows, total, VOLUME_ROWS),
+    })
+}
+
+/// The read-only half of a maintain run: everything the plan can say.
+struct Builder<'a> {
+    state_paths: &'a StatePaths,
+    dirs: &'a dyn DirOps,
+    facts: &'a dyn VolumeFacts,
+    mounts: &'a dyn MountRoot,
+    observer: &'a dyn ProcessObserver,
+    declarations: &'a area::DeclarationSet,
+    sweep_bounds: SweepBounds,
+    delete_bounds: DeleteBounds,
+    now_ms: u64,
+}
+
+impl Builder<'_> {
+    /// One volume's step, or the reason it has none.
+    fn volume_plan(&self, record: &VolumeRecord) -> Result<VolumePlan> {
+        let mut row = VolumePlan {
+            volume_uuid: record.volume_uuid.as_str().to_owned(),
+            availability: record.availability,
+            durability: record.durability,
+            mount_hint: record.mount_hint.clone(),
+            root_dir: record.root_dir.clone(),
+            record_generation: record.generation,
+            state: VolumeState::Present,
+            detail: None,
+            loud: false,
+            scratch: None,
+            areas: RowSet::empty(),
+        };
+        if let Err(error) = area::VolumeRoot::open(self.dirs, self.facts, self.mounts, record) {
+            if error.kind() != ErrorKind::VolumeAbsent {
+                return Err(error);
+            }
+            // An absent volume is a report. Its recorded mount point stays
+            // untouched: a stale mount-point directory is never written to, and
+            // nothing is recreated.
+            row.state = VolumeState::Absent;
+            row.loud = record.availability == Availability::Permanent;
+            row.detail = Some(if row.loud {
+                format!(
+                    "permanent volume {} is not attached; its scratch and areas were left alone and its mount point was not recreated",
+                    record.volume_uuid
+                )
+            } else {
+                format!(
+                    "ephemeral volume {} is not attached; it was skipped",
+                    record.volume_uuid
+                )
+            });
+            return Ok(row);
+        }
+        let durability = match record.declared_durability() {
+            Ok(durability) => durability,
+            Err(error) => {
+                row.loud = true;
+                row.detail = Some(format!(
+                    "volume {} has no declared durability, so nothing on it is pruned: {error}",
+                    record.volume_uuid
+                ));
+                return Ok(row);
+            }
+        };
+        if !durability.permits_pruning() {
+            row.detail = Some(format!(
+                "volume {} is declared `{}`, so nothing on it is pruned",
+                record.volume_uuid,
+                durability_name(durability)
+            ));
+            return Ok(row);
+        }
+
+        let sweep = scratch::sweep(
+            self.state_paths,
+            self.dirs,
+            self.facts,
+            self.mounts,
+            self.observer,
+            &SweepRequest {
+                volume_uuid: &record.volume_uuid,
+                preview: true,
+                plan_digest: None,
+                bounds: self.sweep_bounds,
+                delete_bounds: self.delete_bounds,
+                now_ms: self.now_ms,
+            },
+        )?;
+        row.scratch = Some(ScratchStep {
+            plan_digest: sweep.plan_digest,
+            plan: sweep.plan,
+        });
+
+        let mut area_rows = Vec::new();
+        for document in &self.declarations.documents {
+            if let Some(step) = self.area_plan(record, document)? {
+                area_rows.push(step);
+            }
+        }
+        let area_total = area_rows.len();
+        row.areas = RowSet::bounded(area_rows, area_total, AREA_ROWS);
+        Ok(row)
+    }
+
+    /// One declared area's prune step on one volume, or `None` when the area
+    /// declares no prune policy (it is then not a maintain step at all).
+    fn area_plan(
+        &self,
+        record: &VolumeRecord,
+        document: &AreaDocument,
+    ) -> Result<Option<AreaPrunePlan>> {
+        let declaration = document.declaration();
+        let Some(age_seconds) = prune_age_seconds(&declaration.prune) else {
+            return Ok(None);
+        };
+        let resolved = area::resolve(
+            self.dirs,
+            self.facts,
+            self.mounts,
+            self.observer,
+            record,
+            &declaration,
+            Some(document),
+        )?;
+        let listing = area::list_roots(
+            self.dirs,
+            self.observer,
+            self.state_paths,
+            &resolved,
+            ROOT_ROWS,
+        )?;
+        let age_ms = age_seconds.saturating_mul(1000);
+        let mut candidates = Vec::new();
+        let mut kept = Vec::new();
+        for root in &listing.roots {
+            let path = Some(root.configured_path.clone());
+            if root.state != MarkerStateName::Owned {
+                kept.push(PruneKeptRow {
+                    name: root.name.clone(),
+                    path,
+                    state: marker_state_name(root.state).to_owned(),
+                    reason: "the entry's marker is not an owned root, so no prune policy covers it"
+                        .to_owned(),
+                });
+                continue;
+            }
+            let (Some(device), Some(inode), Some(digest), Some(kind), Some(last)) = (
+                root.device,
+                root.inode,
+                root.marker_digest.clone(),
+                root.kind,
+                root.last_activity_ms,
+            ) else {
+                kept.push(PruneKeptRow {
+                    name: root.name.clone(),
+                    path,
+                    state: marker_state_name(root.state).to_owned(),
+                    reason: "the root's identity or last activity is unreadable".to_owned(),
+                });
+                continue;
+            };
+            if !root.idle {
+                kept.push(PruneKeptRow {
+                    name: root.name.clone(),
+                    path,
+                    state: marker_state_name(root.state).to_owned(),
+                    reason: "a live or undecidable hold covers the root".to_owned(),
+                });
+                continue;
+            }
+            let idle_ms = self.now_ms.saturating_sub(last);
+            if idle_ms < age_ms {
+                kept.push(PruneKeptRow {
+                    name: root.name.clone(),
+                    path,
+                    state: marker_state_name(root.state).to_owned(),
+                    reason: format!(
+                        "idle for {} s, less than the declared {age_seconds} s",
+                        idle_ms / 1000
+                    ),
+                });
+                continue;
+            }
+            candidates.push(PruneRootRow {
+                name: root.name.clone(),
+                path: root.configured_path.clone(),
+                device,
+                inode,
+                marker_digest: digest,
+                kind,
+                created_ms: root.created_ms,
+                last_activity_ms: last,
+                reason: format!(
+                    "owned, idle for {} s past the declared {age_seconds} s",
+                    idle_ms / 1000
+                ),
+            });
+        }
+        let candidate_total = candidates.len();
+        let kept_total = kept.len();
+        Ok(Some(AreaPrunePlan {
+            namespace: document.namespace.clone(),
+            area: document.area.clone(),
+            folder: resolved.folder.clone(),
+            policy: declaration.prune.clone(),
+            candidates: RowSet::bounded(candidates, candidate_total, ROOT_ROWS),
+            kept: RowSet::bounded(kept, kept_total, ROOT_ROWS),
+            examined: listing.examined,
+            truncated: listing.truncated,
+        }))
+    }
+}
+
+/// The declared prune age, when the policy has one.
+fn prune_age_seconds(policy: &PrunePolicy) -> Option<u64> {
+    match policy {
+        PrunePolicy::None => None,
+        PrunePolicy::OldestIdleAfter { age_seconds } => Some(*age_seconds),
+    }
+}
+
+/// A durability's name, as a report spells it.
+const fn durability_name(durability: Durability) -> &'static str {
+    match durability {
+        Durability::Expendable => "expendable",
+        Durability::Kept => "kept",
+        Durability::Undeclared => "undeclared",
+    }
+}
+
+/// A marker state's name, as a report spells it.
+const fn marker_state_name(state: MarkerStateName) -> &'static str {
+    match state {
+        MarkerStateName::Owned => "owned",
+        MarkerStateName::Absent => "absent",
+        MarkerStateName::Unknown => "unknown",
+    }
+}
+
+/// Read one `barge.maintain.plan/1` document from its own bytes.
+///
+/// A reader refuses an unknown major, a document over the size cap, a body that
+/// does not carry exactly this major's field set, and a list whose counts
+/// disagree with its rows. An extra field is refused, because the plan is the
+/// authorization a real run presents and a document whose meaning a reader would
+/// have to guess at is not one.
+pub fn read_maintain_plan(bytes: &[u8]) -> Result<MaintainPlan> {
+    let document = crate::contract::parse_document(bytes)?;
+    let found = document
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the plan has no schema string, so it is not a maintain plan",
+            )
+        })?;
+    if found != MAINTAIN_PLAN_SCHEMA {
+        let prefix = "barge.maintain.plan/";
+        let message = if found.starts_with(prefix) {
+            format!("`{found}` is an unknown major; this reader knows {MAINTAIN_PLAN_SCHEMA}")
+        } else {
+            format!("`{found}` is not a {prefix} document")
+        };
+        return Err(Error::new(ErrorKind::UnknownState, message)
+            .with_detail("schema", found.into())
+            .with_detail("supported", MAINTAIN_PLAN_SCHEMA.into()));
+    }
+    let plan: MaintainPlan = serde_json::from_value(document).map_err(|error| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the plan does not provide the field set {MAINTAIN_PLAN_SCHEMA} requires: {error}"
+            ),
+        )
+    })?;
+    plan.volumes.validate()?;
+    for volume in &plan.volumes.rows {
+        volume.areas.validate()?;
+        if let Some(step) = &volume.scratch {
+            step.plan.candidates.validate()?;
+            step.plan.kept.validate()?;
+        }
+        for area_plan in &volume.areas.rows {
+            area_plan.candidates.validate()?;
+            area_plan.kept.validate()?;
+        }
+    }
+    Ok(plan)
+}
+
+/// The real half: apply the plan stage by stage, re-verifying before each effect.
+#[allow(clippy::too_many_arguments)]
+fn run(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    records: &[VolumeRecord],
+    declarations: &area::DeclarationSet,
+    plan: MaintainPlan,
+    digest: String,
+    deadline: Instant,
+    request: &MaintainRequest<'_>,
+) -> Result<MaintainReport> {
+    let mut volumes = Vec::new();
+    let mut pending: Vec<PendingRow> = Vec::new();
+    let mut unreached: Vec<UnreachedRow> = Vec::new();
+    let mut timed_out = false;
+    let mut stopped: Option<String> = None;
+    let candidates = plan.candidate_count();
+
+    'volumes: for volume_plan in &plan.volumes.rows {
+        let Some(record) = records
+            .iter()
+            .find(|record| record.volume_uuid.as_str() == volume_plan.volume_uuid)
+        else {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "volume {} left the registry between the plan and the effect",
+                    volume_plan.volume_uuid
+                ),
+            ));
+        };
+        let mut outcome = VolumeOutcome {
+            volume_uuid: volume_plan.volume_uuid.clone(),
+            state: volume_plan.state,
+            loud: volume_plan.loud,
+            detail: volume_plan.detail.clone(),
+            scratch: None,
+            areas: Vec::new(),
+        };
+        if !volume_plan.has_work() {
+            volumes.push(outcome);
+            continue;
+        }
+
+        if let Some(step) = &volume_plan.scratch {
+            if Instant::now() >= deadline {
+                timed_out = true;
+                unreached.push(UnreachedRow {
+                    volume_uuid: volume_plan.volume_uuid.clone(),
+                    stage: "scratch".to_owned(),
+                    candidates: step.plan.candidates.count,
+                });
+                volumes.push(outcome);
+                break 'volumes;
+            }
+            let report = match scratch::sweep(
+                state_paths,
+                dirs,
+                facts,
+                mounts,
+                observer,
+                &SweepRequest {
+                    volume_uuid: &record.volume_uuid,
+                    preview: false,
+                    plan_digest: Some(&step.plan_digest),
+                    bounds: request.sweep_bounds,
+                    delete_bounds: request.delete_bounds,
+                    now_ms: request.now_ms,
+                },
+            ) {
+                Ok(report) => report,
+                Err(error) => {
+                    // Work may already have been done on an earlier volume, so
+                    // this is never a "refused before any effect" refusal.
+                    outcome.detail = Some(format!(
+                        "the scratch stage of volume {} stopped the run: {error}",
+                        record.volume_uuid
+                    ));
+                    stopped = outcome.detail.clone();
+                    volumes.push(outcome);
+                    break 'volumes;
+                }
+            };
+            pending.extend(report.pending.rows.iter().cloned());
+            outcome.scratch = Some(ScratchOutcome {
+                plan_digest: report.plan_digest,
+                deleted: report.deleted,
+                pending: report.pending,
+                skipped: report.skipped,
+                replay: report.replay,
+            });
+        }
+
+        for area_plan in &volume_plan.areas.rows {
+            let mut stage = AreaPruneOutcome::empty(&area_plan.namespace, &area_plan.area);
+            if area_plan.candidates.count == 0 {
+                outcome.areas.push(stage);
+                continue;
+            }
+            let Some(document) = declarations.find(&area_plan.namespace, &area_plan.area) else {
+                stage.skipped = all_skipped(
+                    area_plan,
+                    "the declaration was withdrawn between the plan and the effect",
+                );
+                outcome.areas.push(stage);
+                continue;
+            };
+            let declaration = document.declaration();
+            let Some(age_seconds) = prune_age_seconds(&declaration.prune) else {
+                stage.skipped = all_skipped(
+                    area_plan,
+                    "the declaration no longer declares a prune policy",
+                );
+                outcome.areas.push(stage);
+                continue;
+            };
+            let mut deleted = Vec::new();
+            let mut skipped = Vec::new();
+            let mut stage_pending: Vec<PendingRow> = Vec::new();
+            for candidate in &area_plan.candidates.rows {
+                if !stage_pending.is_empty() {
+                    skipped.push(AreaSkippedRow {
+                        name: candidate.name.clone(),
+                        reason:
+                            "a pending intent stopped this area's prune; a later run replays it"
+                                .to_owned(),
+                    });
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    skipped.push(AreaSkippedRow {
+                        name: candidate.name.clone(),
+                        reason: "the run's wall clock was reached before this effect".to_owned(),
+                    });
+                    continue;
+                }
+                let unit = area_unit(record, area_plan, candidate, &digest);
+                let authorize = |fresh: &VolumeRecord| {
+                    reverify_area_root(
+                        state_paths,
+                        dirs,
+                        facts,
+                        mounts,
+                        observer,
+                        fresh,
+                        volume_plan.record_generation,
+                        document,
+                        candidate,
+                        age_seconds,
+                        request.now_ms,
+                    )
+                };
+                match delete::delete_unit_authorized(
+                    state_paths,
+                    dirs,
+                    facts,
+                    mounts,
+                    observer,
+                    &declaration,
+                    Some(document),
+                    &unit,
+                    request.delete_bounds,
+                    Some(&authorize),
+                ) {
+                    Ok(report) => {
+                        if report.is_deleted() {
+                            deleted.push(AreaDeletedRow {
+                                name: candidate.name.clone(),
+                                path: candidate.path.clone(),
+                                intent_id: report.intent_id,
+                                entries_removed: report.entries_removed,
+                                directories_removed: report.directories_removed,
+                                marker_removed: report.marker_removed,
+                            });
+                        } else {
+                            stage_pending.push(PendingRow {
+                                intent_id: report.intent_id,
+                                unit_name: report.unit_name,
+                                unit_kind: report.unit_kind,
+                                phase: report.phase,
+                                reason: report
+                                    .reason
+                                    .unwrap_or_else(|| "the deletion stopped short".to_owned()),
+                            });
+                        }
+                    }
+                    Err(error) if scratch::is_per_unit_refusal(&error) => {
+                        skipped.push(AreaSkippedRow {
+                            name: candidate.name.clone(),
+                            reason: error.to_string(),
+                        });
+                    }
+                    Err(error) => {
+                        skipped.push(AreaSkippedRow {
+                            name: candidate.name.clone(),
+                            reason: format!(
+                                "the run stopped on this unit's error and nothing else was attempted: {error}"
+                            ),
+                        });
+                        outcome.detail = Some(format!(
+                            "the area stage {}/{} stopped the run: {error}",
+                            area_plan.namespace, area_plan.area
+                        ));
+                        stopped = outcome.detail.clone();
+                        break;
+                    }
+                }
+            }
+            pending.extend(stage_pending.iter().cloned());
+            let deleted_total = deleted.len();
+            let skipped_total = skipped.len();
+            let stage_pending_total = stage_pending.len();
+            stage.deleted = RowSet::bounded(deleted, deleted_total, ROOT_ROWS);
+            stage.skipped = RowSet::bounded(skipped, skipped_total, ROOT_ROWS);
+            stage.pending = RowSet::bounded(stage_pending, stage_pending_total, ROOT_ROWS);
+            outcome.areas.push(stage);
+            if stopped.is_some() {
+                volumes.push(outcome);
+                break 'volumes;
+            }
+        }
+        volumes.push(outcome);
+    }
+    if timed_out {
+        // Report what the wall clock stopped before, with counts, so the
+        // unfinished part is never reported as done.
+        for volume_plan in &plan.volumes.rows {
+            if volumes
+                .iter()
+                .any(|outcome| outcome.volume_uuid == volume_plan.volume_uuid)
+            {
+                continue;
+            }
+            for stage in unreached_stages(volume_plan) {
+                unreached.push(UnreachedRow {
+                    volume_uuid: volume_plan.volume_uuid.clone(),
+                    stage,
+                    candidates: 0,
+                });
+            }
+        }
+    }
+
+    let pending_total = pending.len();
+    let unreached_total = unreached.len();
+    let volume_total = volumes.len();
+    Ok(MaintainReport {
+        preview: false,
+        plan_digest: digest,
+        planned_ms: request.now_ms,
+        timed_out,
+        stopped,
+        candidates,
+        plan,
+        volumes: RowSet::bounded(volumes, volume_total, VOLUME_ROWS),
+        pending: RowSet::bounded(pending, pending_total, ROOT_ROWS),
+        unreached: RowSet::bounded(unreached, unreached_total, ROOT_ROWS),
+    })
+}
+
+/// The stages of one volume plan, as an `unreached` row names them.
+fn unreached_stages(volume_plan: &VolumePlan) -> Vec<String> {
+    let mut stages = Vec::new();
+    if volume_plan.scratch.is_some() {
+        stages.push("scratch".to_owned());
+    }
+    for area_plan in &volume_plan.areas.rows {
+        stages.push(format!("area:{}/{}", area_plan.namespace, area_plan.area));
+    }
+    stages
+}
+
+/// Every planned candidate of one area, kept with one reason.
+fn all_skipped(area_plan: &AreaPrunePlan, reason: &str) -> RowSet<AreaSkippedRow> {
+    let rows: Vec<AreaSkippedRow> = area_plan
+        .candidates
+        .rows
+        .iter()
+        .map(|candidate| AreaSkippedRow {
+            name: candidate.name.clone(),
+            reason: reason.to_owned(),
+        })
+        .collect();
+    let total = rows.len();
+    RowSet::bounded(rows, total, ROOT_ROWS)
+}
+
+/// The deletion unit one planned area root is.
+fn area_unit(
+    record: &VolumeRecord,
+    area_plan: &AreaPrunePlan,
+    candidate: &PruneRootRow,
+    digest: &str,
+) -> DeletionUnit {
+    DeletionUnit {
+        volume_uuid: record.volume_uuid.clone(),
+        root_dir: record.root_dir.clone(),
+        folder: area_plan.folder.clone(),
+        parent: String::new(),
+        name: candidate.name.clone(),
+        kind: UnitKind::Directory,
+        device: DeviceId::new(candidate.device),
+        inode: candidate.inode,
+        marker: Some(UnitMarker::new(
+            MarkerFamily::Barge,
+            candidate.marker_digest.clone(),
+        )),
+        grant: UnitGrant::native_root(candidate.name.clone()),
+        plan_digest: digest.to_owned(),
+    }
+}
+
+/// Re-verify one planned area root inside the deletion's own window.
+///
+/// This runs under the volume lock, after the registry record was re-read and
+/// before the intent is written: the declaration must still declare the same
+/// prune age, the root must still be that identity with that marker bytes
+/// digest, it must still be idle, and its idleness must still be past the
+/// declared age. Every refusal here is per-unit, so a changed root or a
+/// withdrawn policy stops only that root.
+#[allow(clippy::too_many_arguments)]
+fn reverify_area_root(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    record: &VolumeRecord,
+    planned_generation: u64,
+    document: &AreaDocument,
+    candidate: &PruneRootRow,
+    age_seconds: u64,
+    now_ms: u64,
+) -> Result<()> {
+    if record.generation != planned_generation {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "the registry record of volume {} changed between the plan and the effect (generation {} to {}); the root is kept",
+                record.volume_uuid, planned_generation, record.generation
+            ),
+        ));
+    }
+    let Some(stored) = area::show(state_paths, &document.namespace, &document.area)? else {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "the declaration {}/{} was withdrawn between the plan and the effect; the root is kept",
+                document.namespace, document.area
+            ),
+        ));
+    };
+    let declaration = stored.declaration();
+    if prune_age_seconds(&declaration.prune) != Some(age_seconds) {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "the prune policy of {}/{} changed between the plan and the effect; the root is kept",
+                stored.namespace, stored.area
+            ),
+        ));
+    }
+    let resolved = area::resolve(
+        dirs,
+        facts,
+        mounts,
+        observer,
+        record,
+        &declaration,
+        Some(&stored),
+    )?;
+    let listing = area::list_roots(dirs, observer, state_paths, &resolved, ROOT_ROWS)?;
+    let Some(observed) = listing
+        .roots
+        .iter()
+        .find(|root| root.root_id.as_deref() == Some(candidate.name.as_str()))
+    else {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "the root {} is no longer an owned root of {}/{}; it is kept",
+                candidate.name, stored.namespace, stored.area
+            ),
+        ));
+    };
+    if observed.state != MarkerStateName::Owned
+        || observed.device != Some(candidate.device)
+        || observed.inode != Some(candidate.inode)
+        || observed.marker_digest.as_deref() != Some(candidate.marker_digest.as_str())
+    {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "the root {}'s identity or marker changed between the plan and the effect; it is kept",
+                candidate.name
+            ),
+        ));
+    }
+    if !observed.idle {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "a live or undecidable hold now covers the root {}; it is kept",
+                candidate.name
+            ),
+        ));
+    }
+    let last = observed.last_activity_ms.unwrap_or(now_ms);
+    if now_ms.saturating_sub(last) < age_seconds.saturating_mul(1000) {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "the root {} is no longer idle past the declared {age_seconds} s; it is kept",
+                candidate.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use super::{
+        canonical_plan_bytes, maintain, MaintainBounds, MaintainReport, MaintainRequest,
+        VolumeState,
+    };
+    use crate::area::{
+        self, ConclusionClosure, ConclusionOutcome, KeptReason, NestedScope, OwnedRoot,
+        PrunePolicy, RootKind, RootSpec,
+    };
+    use crate::delete::DeleteBounds;
+    use crate::digest::sha256_hex;
+    use crate::error::ErrorKind;
+    use crate::registry::{self, Availability, ClaimScope, ClaimUnit, Durability, ScratchClaim};
+    use crate::scratch::{self, AllocRequest, ConcludeRequest, SweepBounds};
+    use crate::state;
+    use crate::testkit::{Faults, VolumeFixture, FIXTURE_BOOT};
+
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    const AREA_AGE_SECONDS: u64 = 60;
+
+    /// A fixture volume with one declared area whose prune age is `60` seconds.
+    struct Harness {
+        fixture: VolumeFixture,
+        now_ms: u64,
+    }
+
+    impl Harness {
+        fn new(label: &str) -> Self {
+            let fixture = VolumeFixture::new(label);
+            fixture.register();
+            let now_ms = state::now_ms();
+            let harness = Self { fixture, now_ms };
+            harness.declare();
+            harness
+        }
+
+        fn declare(&self) {
+            area::declare(&self.fixture.state, &self.declaration(), self.now_ms)
+                .expect("the area is declared");
+        }
+
+        fn declaration(&self) -> area::AreaDeclaration {
+            let mut declaration = self.fixture.declaration("pool");
+            declaration.prune = PrunePolicy::OldestIdleAfter {
+                age_seconds: AREA_AGE_SECONDS,
+            };
+            declaration
+        }
+
+        /// A "now" far enough past the roots' activity for the declared age.
+        fn aged(&self) -> u64 {
+            self.fixture.state_biased_now()
+        }
+
+        fn create_root(&self, kind: RootKind) -> OwnedRoot {
+            let resolved = self
+                .fixture
+                .resolved(&self.fixture.record, &self.declaration());
+            area::create_root(
+                &self.fixture.platform(),
+                &self.fixture.observer(),
+                &resolved,
+                RootSpec { kind },
+            )
+            .expect("the root is created")
+        }
+
+        fn request<'a>(
+            &self,
+            preview: bool,
+            plan_digest: Option<&'a str>,
+            plan_bytes: Option<&'a [u8]>,
+            now_ms: u64,
+        ) -> MaintainRequest<'a> {
+            MaintainRequest {
+                preview,
+                plan_digest,
+                plan_bytes,
+                sweep_bounds: SweepBounds::default(),
+                delete_bounds: DeleteBounds {
+                    retry_pause: Duration::ZERO,
+                    ..DeleteBounds::default()
+                },
+                maintain_bounds: MaintainBounds::design(),
+                now_ms,
+            }
+        }
+
+        fn preview(&self) -> MaintainReport {
+            self.preview_at(self.aged())
+        }
+
+        fn preview_at(&self, now_ms: u64) -> MaintainReport {
+            let facts = self.fixture.facts();
+            self.preview_with(&facts, now_ms)
+        }
+
+        fn preview_with(&self, facts: &crate::testkit::FakeVolume, now_ms: u64) -> MaintainReport {
+            let platform = self.fixture.platform();
+            maintain(
+                &self.fixture.state,
+                &platform,
+                facts,
+                &self.fixture.mounts(),
+                &self.fixture.observer(),
+                &self.request(true, None, None, now_ms),
+            )
+            .expect("the plan is computed")
+        }
+
+        fn real(&self, digest: &str) -> crate::error::Result<MaintainReport> {
+            self.real_at(self.aged(), digest, None)
+        }
+
+        fn real_with_facts(
+            &self,
+            facts: &crate::testkit::FakeVolume,
+            digest: &str,
+        ) -> crate::error::Result<MaintainReport> {
+            let platform = self.fixture.platform();
+            maintain(
+                &self.fixture.state,
+                &platform,
+                facts,
+                &self.fixture.mounts(),
+                &self.fixture.observer(),
+                &self.request(false, Some(digest), None, self.aged()),
+            )
+        }
+
+        fn real_at(
+            &self,
+            now_ms: u64,
+            digest: &str,
+            plan_bytes: Option<&[u8]>,
+        ) -> crate::error::Result<MaintainReport> {
+            self.real_with(&self.fixture.platform(), now_ms, digest, plan_bytes)
+        }
+
+        fn real_with(
+            &self,
+            dirs: &dyn crate::os::DirOps,
+            now_ms: u64,
+            digest: &str,
+            plan_bytes: Option<&[u8]>,
+        ) -> crate::error::Result<MaintainReport> {
+            maintain(
+                &self.fixture.state,
+                dirs,
+                &self.fixture.facts(),
+                &self.fixture.mounts(),
+                &self.fixture.observer(),
+                &self.request(false, Some(digest), plan_bytes, now_ms),
+            )
+        }
+
+        fn area_plan<'a>(&self, report: &'a MaintainReport) -> &'a super::AreaPrunePlan {
+            &report.plan.volumes.rows[0].areas.rows[0]
+        }
+
+        fn scratch_root(&self, project: &str, consumer: &str) -> PathBuf {
+            let platform = self.fixture.platform();
+            let report = scratch::alloc(
+                &self.fixture.state,
+                &platform,
+                &self.fixture.facts(),
+                &self.fixture.mounts(),
+                &self.fixture.observer(),
+                &AllocRequest {
+                    volume_uuid: self.fixture.uuid.clone(),
+                    project: project.to_owned(),
+                    consumer: consumer.to_owned(),
+                    pid: std::process::id(),
+                },
+            )
+            .expect("the scratch root is allocated");
+            report.root.path
+        }
+
+        fn conclude_and_release(&self, path: &Path, holder: &str) {
+            let platform = self.fixture.platform();
+            let root_id = path
+                .file_name()
+                .expect("a root name")
+                .to_string_lossy()
+                .to_string();
+            scratch::conclude(
+                &self.fixture.state,
+                &platform,
+                &self.fixture.facts(),
+                &self.fixture.mounts(),
+                &self.fixture.observer(),
+                &ConcludeRequest {
+                    volume_uuid: &self.fixture.uuid,
+                    root_id: &root_id,
+                    holder,
+                    project: None,
+                    outcome: ConclusionOutcome::Closed,
+                    closure: ConclusionClosure::Positive,
+                    kept_reason: KeptReason::Evidence,
+                    nested_scope: NestedScope::Exclusive,
+                },
+            )
+            .expect("the run concludes");
+            area::release(&self.fixture.state, &root_id, holder).expect("the hold is released");
+        }
+
+        fn scratch_folder(&self) -> PathBuf {
+            self.fixture
+                .root
+                .join(scratch::scratch_folder(&self.fixture.record))
+        }
+
+        /// Write one live hold record under a unit name, as another process does
+        /// between a preview and its real run.
+        fn write_live_hold(&self, unit_name: &str, holder: &str) {
+            let directory = self.fixture.state.holds_dir().join(unit_name);
+            std::fs::create_dir_all(&directory).expect("the holds directory");
+            let path = directory.join(format!("{holder}.json"));
+            std::fs::write(
+                &path,
+                VolumeFixture::hold_record(
+                    unit_name,
+                    holder,
+                    std::process::id(),
+                    7_000_000,
+                    FIXTURE_BOOT,
+                ),
+            )
+            .expect("the hold is written");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("the hold is private");
+        }
+    }
+
+    impl VolumeFixture {
+        /// A "now" that makes this fixture's roots idle past the declared area
+        /// age.
+        fn state_biased_now(&self) -> u64 {
+            state::now_ms() + 7 * DAY_MS + AREA_AGE_SECONDS * 1000
+        }
+    }
+
+    fn canonical(report: &MaintainReport) -> Vec<u8> {
+        canonical_plan_bytes(&report.plan).expect("the plan encodes")
+    }
+
+    #[test]
+    fn a_preview_plans_scratch_then_each_areas_policy_and_changes_nothing() {
+        let harness = Harness::new("maintain-preview");
+        // One concluded, released scratch run: eligible through S4's policy.
+        let scratch_root = harness.scratch_root("alpha", "owner");
+        harness.conclude_and_release(&scratch_root, "owner");
+        // Two owned area roots: one idle past the declared age, one held live.
+        let idle = harness.create_root(RootKind::AreaRoot);
+        let held = harness.create_root(RootKind::AreaRoot);
+        harness.write_live_hold(&held.root_id, "someone");
+
+        let report = harness.preview();
+        assert!(report.preview);
+        assert_eq!(report.plan.volumes.count, 1);
+        let volume = &report.plan.volumes.rows[0];
+        assert_eq!(volume.state, VolumeState::Present);
+        assert!(!volume.loud);
+        let scratch_step = volume.scratch.as_ref().expect("a scratch stage");
+        assert_eq!(scratch_step.plan.candidates.count, 1);
+        let area_plan = harness.area_plan(&report);
+        assert_eq!(area_plan.candidates.count, 1);
+        assert_eq!(area_plan.candidates.rows[0].name, idle.root_id);
+        assert_eq!(area_plan.kept.count, 1);
+        assert_eq!(area_plan.kept.rows[0].name, held.root_id);
+        assert!(area_plan.kept.rows[0].reason.contains("hold"));
+        assert_eq!(report.candidates, 2);
+        assert!(!report.needs_human());
+        // A preview changes nothing: both roots and the scratch run are there,
+        // and no intent was written.
+        assert!(idle.path.is_dir());
+        assert!(held.path.is_dir());
+        assert!(scratch_root.is_dir());
+        assert!(
+            !harness.fixture.state.intents_dir().exists()
+                || std::fs::read_dir(harness.fixture.state.intents_dir())
+                    .expect("the intents directory")
+                    .next()
+                    .is_none()
+        );
+    }
+
+    #[test]
+    fn the_plan_digest_is_the_sha256_of_the_canonical_plan_and_is_stable() {
+        let harness = Harness::new("maintain-digest");
+        let _root = harness.create_root(RootKind::AreaRoot);
+        let first = harness.preview();
+        let second = harness.preview();
+        assert_eq!(first.plan_digest, second.plan_digest, "a preview is stable");
+        assert_eq!(first.plan, second.plan);
+        assert_eq!(first.plan_digest, sha256_hex(&canonical(&first)));
+        let document: serde_json::Value =
+            serde_json::from_slice(&canonical(&first)).expect("the plan parses");
+        assert_eq!(document["schema"], "barge.maintain.plan/1");
+    }
+
+    #[test]
+    fn a_real_run_deletes_exactly_the_planned_roots() {
+        let harness = Harness::new("maintain-real");
+        let scratch_root = harness.scratch_root("alpha", "owner");
+        harness.conclude_and_release(&scratch_root, "owner");
+        let idle = harness.create_root(RootKind::AreaRoot);
+        let held = harness.create_root(RootKind::AreaRoot);
+        harness.write_live_hold(&held.root_id, "someone");
+
+        let preview = harness.preview();
+        let report = harness.real(&preview.plan_digest).expect("the run reports");
+        assert!(!report.preview);
+        assert_eq!(report.plan_digest, preview.plan_digest);
+        assert!(!report.needs_human(), "{report:?}");
+        let volume = &report.volumes.rows[0];
+        let scratch_stage = volume.scratch.as_ref().expect("a scratch stage");
+        assert_eq!(scratch_stage.deleted.count, 1);
+        assert_eq!(scratch_stage.pending.count, 0);
+        let area_stage = &volume.areas[0];
+        assert_eq!(area_stage.deleted.count, 1);
+        assert_eq!(area_stage.deleted.rows[0].name, idle.root_id);
+        assert!(area_stage.deleted.rows[0].marker_removed);
+        assert!(!idle.path.exists(), "the planned root is gone");
+        assert!(held.path.is_dir(), "the held root is kept");
+        assert!(!scratch_root.exists(), "the planned scratch run is gone");
+        assert_eq!(report.pending.count, 0);
+    }
+
+    #[test]
+    fn a_changed_plan_digest_refuses_before_any_effect() {
+        let harness = Harness::new("maintain-digest-mismatch");
+        let idle = harness.create_root(RootKind::AreaRoot);
+        let error = harness
+            .real(&"0".repeat(64))
+            .expect_err("a digest that is not the plan refuses");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(error.message().contains("changed since the preview"));
+        assert!(idle.path.is_dir(), "nothing was deleted");
+    }
+
+    #[test]
+    fn a_real_run_without_a_digest_is_a_usage_refusal() {
+        let harness = Harness::new("maintain-no-digest");
+        let platform = harness.fixture.platform();
+        let error = maintain(
+            &harness.fixture.state,
+            &platform,
+            &harness.fixture.facts(),
+            &harness.fixture.mounts(),
+            &harness.fixture.observer(),
+            &harness.request(false, None, None, harness.aged()),
+        )
+        .expect_err("a real run needs the preview's digest");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+    }
+
+    #[test]
+    fn plan_bytes_that_do_not_match_the_digest_refuse() {
+        let harness = Harness::new("maintain-tampered-bytes");
+        let idle = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        let mut tampered = canonical(&preview);
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        let error = harness
+            .real_at(harness.aged(), &preview.plan_digest, Some(&tampered))
+            .expect_err("a tampered plan refuses");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert!(error.message().contains("do not match"));
+        assert!(idle.path.is_dir());
+    }
+
+    #[test]
+    fn a_plan_file_from_another_state_refuses_even_with_a_matching_digest() {
+        let harness = Harness::new("maintain-stale-plan-file");
+        let first = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        // A second root changes the plan, so the saved bytes are no longer the
+        // plan this head computes.
+        let _second = harness.create_root(RootKind::AreaRoot);
+        let saved = canonical(&preview);
+        let error = harness
+            .real_at(harness.aged(), &preview.plan_digest, Some(&saved))
+            .expect_err("a stale plan file refuses");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(first.path.is_dir() && _second.path.is_dir());
+    }
+
+    #[test]
+    fn a_root_that_became_marked_differently_between_the_plan_and_the_effect_is_kept() {
+        let harness = Harness::new("maintain-changed-root");
+        let first = harness.create_root(RootKind::AreaRoot);
+        let second = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        assert_eq!(harness.area_plan(&preview).candidates.count, 2);
+
+        // The probe rewrites the first root's marker the moment the deletion's
+        // own window lists it, which is the plan-to-effect gap a racer lands in.
+        let marker = first.path.join(area::ROOT_MARKER_FILE);
+        let target = first.root_id.clone();
+        let target_path = first.path.clone();
+        let faults = Faults::new();
+        let seen = std::cell::Cell::new(0usize);
+        let marker_for_probe = marker.clone();
+        faults.observing(Box::new(move |name: &str| {
+            if name != target {
+                return;
+            }
+            let count = seen.get() + 1;
+            seen.set(count);
+            // The first observation of the unit's own name is the deletion's
+            // present check: after the plan, before its re-verification.
+            if count != 1 {
+                return;
+            }
+            let bytes = std::fs::read(&marker_for_probe).expect("the marker");
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("the marker parses");
+            let created = document["created_ms"].as_u64().expect("created_ms");
+            document["created_ms"] = serde_json::Value::from(created + 1);
+            let mut rewritten = serde_json::to_vec(&document).expect("the marker encodes");
+            rewritten.push(b'\n');
+            let staged = target_path.join(".barge-marker-rewrite");
+            std::fs::write(&staged, &rewritten).expect("the staged marker");
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))
+                .expect("the staged marker is private");
+            std::fs::rename(&staged, &marker_for_probe).expect("the marker is replaced");
+        }));
+
+        let report = harness
+            .real_with(&faults, harness.aged(), &preview.plan_digest, None)
+            .expect("the run reports");
+        let area_stage = &report.volumes.rows[0].areas[0];
+        assert_eq!(area_stage.deleted.count, 1, "{area_stage:?}");
+        assert_eq!(area_stage.skipped.count, 1);
+        assert_eq!(area_stage.skipped.rows[0].name, first.root_id);
+        assert!(
+            area_stage.skipped.rows[0]
+                .reason
+                .contains("identity or marker changed"),
+            "{}",
+            area_stage.skipped.rows[0].reason
+        );
+        assert!(first.path.is_dir(), "the changed root is kept");
+        assert!(!second.path.exists(), "the unchanged root still goes");
+    }
+
+    #[test]
+    fn a_live_hold_taken_between_the_plan_and_the_effect_stops_only_that_root() {
+        let harness = Harness::new("maintain-live-hold");
+        let held = harness.create_root(RootKind::AreaRoot);
+        let free = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        assert_eq!(harness.area_plan(&preview).candidates.count, 2);
+
+        let target = held.root_id.clone();
+        let target_path = held.path.clone();
+        let seen = std::cell::Cell::new(0usize);
+        let faults = Faults::new();
+        let holds = harness.fixture.state.clone();
+        faults.observing(Box::new(move |name: &str| {
+            if name != target {
+                return;
+            }
+            let count = seen.get() + 1;
+            seen.set(count);
+            if count != 1 {
+                return;
+            }
+            let directory = holds.holds_dir().join(&target);
+            std::fs::create_dir_all(&directory).expect("the holds directory");
+            let path = directory.join("racer.json");
+            std::fs::write(
+                &path,
+                VolumeFixture::hold_record(
+                    &target,
+                    "racer",
+                    std::process::id(),
+                    7_000_000,
+                    FIXTURE_BOOT,
+                ),
+            )
+            .expect("the racer's hold");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("the hold is private");
+        }));
+
+        let report = harness
+            .real_with(&faults, harness.aged(), &preview.plan_digest, None)
+            .expect("the run reports");
+        let area_stage = &report.volumes.rows[0].areas[0];
+        assert_eq!(area_stage.deleted.count, 1, "{area_stage:?}");
+        assert_eq!(area_stage.skipped.count, 1);
+        assert_eq!(area_stage.skipped.rows[0].name, held.root_id);
+        assert!(area_stage.skipped.rows[0].reason.contains("hold"));
+        assert!(target_path.is_dir(), "a held root is kept");
+        assert!(!free.path.exists());
+    }
+
+    #[test]
+    fn a_registry_revision_change_stops_the_affected_volume_s_roots() {
+        let harness = Harness::new("maintain-registry-revision");
+        let first = harness.create_root(RootKind::AreaRoot);
+        let second = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        assert_eq!(harness.area_plan(&preview).candidates.count, 2);
+
+        let target = first.root_id.clone();
+        let record = harness.fixture.record.clone();
+        let state = harness.fixture.state.clone();
+        let seen = std::cell::Cell::new(0usize);
+        let faults = Faults::new();
+        faults.observing(Box::new(move |name: &str| {
+            if name != target {
+                return;
+            }
+            let count = seen.get() + 1;
+            seen.set(count);
+            if count != 1 {
+                return;
+            }
+            // A changed record: its content differs, so the writer advances its
+            // generation, which is the revision a real run re-checks.
+            let mut bumped = record.clone();
+            bumped.registered_ms = bumped.registered_ms.saturating_add(1);
+            let mut locks = state::LockSet::with_deadline(
+                state.clone(),
+                state::Deadline::after(Duration::from_secs(5)),
+            );
+            let lock = locks.lock_registry().expect("the registry lock");
+            registry::RegistryWriter::new(&state)
+                .publish(&lock, &registry::RegistryDocument::new(vec![bumped]))
+                .expect("the registry is republished");
+        }));
+
+        let report = harness
+            .real_with(&faults, harness.aged(), &preview.plan_digest, None)
+            .expect("the run reports");
+        let area_stage = &report.volumes.rows[0].areas[0];
+        // The record belongs to the volume, so every root re-verified after the
+        // change is stopped; a root whose deletion was already decided under the
+        // planned record may have gone first, and that is the plan's own order.
+        assert_eq!(
+            area_stage.deleted.count + area_stage.skipped.count,
+            2,
+            "{area_stage:?}"
+        );
+        assert!(
+            area_stage
+                .skipped
+                .rows
+                .iter()
+                .all(|row| row.reason.contains("registry record of volume")),
+            "{:?}",
+            area_stage.skipped.rows
+        );
+        for row in &area_stage.skipped.rows {
+            let path = if row.name == first.root_id {
+                &first.path
+            } else {
+                &second.path
+            };
+            assert!(path.is_dir(), "a stopped root is kept");
+        }
+        assert_eq!(report.pending.count, 0);
+    }
+
+    #[test]
+    fn a_pending_intent_makes_the_run_need_a_human() {
+        let harness = Harness::new("maintain-pending");
+        let root = harness.create_root(RootKind::AreaRoot);
+        std::os::unix::fs::symlink("/elsewhere", root.path.join("link")).expect("the link");
+        let preview = harness.preview();
+        let report = harness.real(&preview.plan_digest).expect("the run reports");
+        assert!(report.needs_human());
+        assert_eq!(report.pending.count, 1);
+        assert_eq!(report.volumes.rows[0].areas[0].pending.count, 1);
+        assert!(
+            !root.path.exists(),
+            "the unit was renamed into its quarantine leaf"
+        );
+        let leaves = std::fs::read_dir(harness.fixture.root.join("pool"))
+            .expect("the area folder")
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".barge-prune-")
+            })
+            .count();
+        assert_eq!(leaves, 1, "a stopped deletion keeps its quarantine leaf");
+    }
+
+    #[test]
+    fn an_ephemeral_volume_that_is_absent_is_skipped_quietly() {
+        let harness = Harness::new("maintain-ephemeral-absent");
+        let mut record = harness.fixture.record.clone();
+        record.availability = Availability::Ephemeral;
+        harness.fixture.register_record(&record);
+        let root = harness.create_root(RootKind::AreaRoot);
+        let facts = harness.fixture.facts();
+        facts.present.set(false);
+
+        let report = harness.preview_with(&facts, harness.aged());
+        let volume = &report.plan.volumes.rows[0];
+        assert_eq!(volume.state, VolumeState::Absent);
+        assert!(!volume.loud);
+        assert!(!volume.has_work());
+        assert!(volume
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("skipped"));
+        assert!(!report.needs_human());
+        assert!(root.path.is_dir());
+        assert!(
+            !harness.fixture.root.join("scratch").exists(),
+            "an absent volume's mount point is never written"
+        );
+    }
+
+    #[test]
+    fn a_permanent_volume_that_is_absent_is_reported_loudly_and_needs_a_human() {
+        let harness = Harness::new("maintain-permanent-absent");
+        let root = harness.create_root(RootKind::AreaRoot);
+        let facts = harness.fixture.facts();
+        facts.present.set(false);
+
+        let report = harness.preview_with(&facts, harness.aged());
+        let volume = &report.plan.volumes.rows[0];
+        assert_eq!(volume.state, VolumeState::Absent);
+        assert!(volume.loud);
+        assert!(volume
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("permanent volume"));
+        assert!(report.needs_human(), "a permanent absence needs a human");
+        assert!(root.path.is_dir());
+
+        // The real run refuses nothing and deletes nothing: it reports the same
+        // absence and keeps everything.
+        let digest = report.plan_digest.clone();
+        let real = harness
+            .real_with_facts(&facts, &digest)
+            .expect("the run reports");
+        assert!(real.needs_human());
+        assert_eq!(real.volumes.rows[0].state, VolumeState::Absent);
+        assert!(real.pending.count == 0);
+        assert!(root.path.is_dir());
+    }
+
+    #[test]
+    fn a_kept_volume_is_never_pruned() {
+        let harness = Harness::new("maintain-kept-volume");
+        let mut record = harness.fixture.record.clone();
+        record.durability = Durability::Kept;
+        harness.fixture.register_record(&record);
+        let root = harness.create_root(RootKind::AreaRoot);
+
+        let report = harness.preview();
+        let volume = &report.plan.volumes.rows[0];
+        assert!(!volume.has_work());
+        assert!(
+            volume
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("kept"),
+            "{:?}",
+            volume.detail
+        );
+        assert!(root.path.is_dir());
+    }
+
+    #[test]
+    fn a_volume_without_a_declared_durability_is_loud_and_prunes_nothing() {
+        let harness = Harness::new("maintain-undeclared-volume");
+        let mut record = harness.fixture.record.clone();
+        record.durability = Durability::Undeclared;
+        harness.fixture.register_record(&record);
+        let root = harness.create_root(RootKind::AreaRoot);
+
+        let report = harness.preview();
+        let volume = &report.plan.volumes.rows[0];
+        assert!(volume.loud);
+        assert!(!volume.has_work());
+        assert!(report.needs_human());
+        assert!(root.path.is_dir());
+    }
+
+    #[test]
+    fn a_revoked_claim_changes_the_whole_plan_and_refuses_the_real_run() {
+        let harness = Harness::new("maintain-revoked-claim");
+        let claimed = harness.scratch_folder().join("alpha").join("old-run");
+        std::fs::create_dir_all(&claimed).expect("the unmarked unit");
+        std::fs::write(claimed.join("payload"), b"bytes").expect("the payload");
+        let claim = ScratchClaim {
+            scope: ClaimScope::Project {
+                name: "alpha".to_owned(),
+            },
+            unit: ClaimUnit::Child,
+            unmarked_idle_seconds: 1,
+            families_excluded: Vec::new(),
+            declared_by: "operator".to_owned(),
+            declared_ms: state::now_ms(),
+        };
+        scratch::declare_claim(&harness.fixture.state, &harness.fixture.uuid, &claim, false)
+            .expect("the claim is declared");
+        let preview = harness.preview();
+        assert_eq!(
+            preview.plan.volumes.rows[0]
+                .scratch
+                .as_ref()
+                .expect("a scratch stage")
+                .plan
+                .candidates
+                .count,
+            1
+        );
+        scratch::declare_claim(&harness.fixture.state, &harness.fixture.uuid, &claim, true)
+            .expect("the claim is withdrawn");
+        let error = harness
+            .real(&preview.plan_digest)
+            .expect_err("a plan whose claim was withdrawn refuses");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(claimed.is_dir(), "nothing was deleted");
+    }
+
+    #[test]
+    fn maintain_reads_no_oxide_receipt_and_deletes_no_oxide_root() {
+        let harness = Harness::new("maintain-oxide-untouched");
+        // An Oxide outputs root and a receipt fixture, both outside every area
+        // and every Barge folder.
+        let output_root = harness.fixture.root.join("oxide-outputs").join("main");
+        std::fs::create_dir_all(&output_root).expect("the oxide output root");
+        std::fs::write(output_root.join("artifact"), b"bytes").expect("the artifact");
+        let receipt = harness
+            .fixture
+            .state
+            .root()
+            .join("oxide-receipts")
+            .join("prune.json");
+        std::fs::create_dir_all(receipt.parent().expect("the receipt parent"))
+            .expect("the receipts directory");
+        std::fs::write(&receipt, b"{\"version\":1}\n").expect("the receipt");
+        let before_receipt = std::fs::read(&receipt).expect("the receipt bytes");
+        let before_entries = std::fs::read_dir(&output_root)
+            .expect("the output root listing")
+            .count();
+
+        let idle = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        let report = harness.real(&preview.plan_digest).expect("the run reports");
+        assert!(report.volumes.rows[0].areas[0].deleted.count == 1);
+        assert!(!idle.path.exists());
+        assert_eq!(
+            std::fs::read(&receipt).expect("the receipt is unchanged"),
+            before_receipt
+        );
+        assert_eq!(
+            std::fs::read_dir(&output_root)
+                .expect("the output root listing")
+                .count(),
+            before_entries
+        );
+        assert!(output_root.is_dir());
+    }
+
+    #[test]
+    fn an_error_inside_a_real_run_is_reported_as_a_stop_never_as_a_refusal() {
+        let harness = Harness::new("maintain-mid-run-stop");
+        let first = harness.create_root(RootKind::AreaRoot);
+        let second = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        assert_eq!(harness.area_plan(&preview).candidates.count, 2);
+
+        // One unit's own entry read fails inside its deletion window. Work may
+        // already have happened, so the run must report the stop and need a
+        // human rather than refuse with the exit code that says "nothing was
+        // changed".
+        let mut faults = Faults::new();
+        faults.failing_facts_at(&second.root_id, 1);
+        let report = harness
+            .real_with(&faults, harness.aged(), &preview.plan_digest, None)
+            .expect("the run reports instead of refusing");
+        let stopped = report.stopped.as_deref().expect("the stop is reported");
+        assert!(stopped.contains("stopped the run"), "{stopped}");
+        assert!(report.needs_human());
+        let area_stage = &report.volumes.rows[0].areas[0];
+        assert_eq!(
+            area_stage.deleted.count + area_stage.skipped.count,
+            2,
+            "every planned unit is accounted for"
+        );
+        assert!(
+            area_stage
+                .skipped
+                .rows
+                .iter()
+                .any(|row| row.name == second.root_id
+                    && row.reason.contains("the run stopped on this unit's error")),
+            "{:?}",
+            area_stage.skipped.rows
+        );
+        let _ = (first, second);
+    }
+
+    #[test]
+    fn a_declaration_without_a_prune_policy_is_not_a_maintain_step() {
+        let harness = Harness::new("maintain-no-policy");
+        let mut declaration = harness.declaration();
+        declaration.prune = PrunePolicy::None;
+        area::declare(&harness.fixture.state, &declaration, harness.now_ms)
+            .expect("the area is redeclared");
+        let root = harness.create_root(RootKind::AreaRoot);
+        let report = harness.preview();
+        assert!(report.plan.volumes.rows[0].areas.rows.is_empty());
+        assert!(root.path.is_dir());
+    }
+
+    #[test]
+    fn the_scratch_stage_runs_before_the_areas_of_every_volume() {
+        let harness = Harness::new("maintain-order");
+        let scratch_root = harness.scratch_root("alpha", "owner");
+        harness.conclude_and_release(&scratch_root, "owner");
+        let root = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        let volume = &preview.plan.volumes.rows[0];
+        assert!(volume.scratch.is_some(), "the scratch stage is first");
+        assert_eq!(volume.areas.count, 1);
+        // The registry order is the fixed volume order, and it is the same in
+        // the preview and the real run.
+        let report = harness.real(&preview.plan_digest).expect("the run reports");
+        assert_eq!(report.plan.volumes, preview.plan.volumes);
+        assert!(!root.path.exists());
+        assert!(!scratch_root.exists());
+    }
+
+    #[test]
+    fn a_record_whose_volume_is_not_the_attached_one_refuses_rather_than_reading_as_absent() {
+        // The fixture mounts one volume. A record naming another UUID is a
+        // mismatch, never an absence: absence is the one case a report may skip.
+        let harness = Harness::new("maintain-mismatched-volume");
+        let mut record = harness.fixture.record.clone();
+        record.volume_uuid =
+            crate::os::VolumeUuid::parse(crate::testkit::OTHER_UUID).expect("a second UUID");
+        harness.fixture.register_record(&record);
+        let platform = harness.fixture.platform();
+        let error = maintain(
+            &harness.fixture.state,
+            &platform,
+            &harness.fixture.facts(),
+            &harness.fixture.mounts(),
+            &harness.fixture.observer(),
+            &harness.request(true, None, None, harness.aged()),
+        )
+        .expect_err("a record whose volume is not the attached one refuses");
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::VolumeMismatch | ErrorKind::VolumeAbsent
+        ));
+    }
+
+    #[test]
+    fn the_plan_reader_accepts_this_head_s_plan_and_refuses_other_documents() {
+        let harness = Harness::new("maintain-plan-reader");
+        let _root = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        let bytes = canonical(&preview);
+        let plan = super::read_maintain_plan(&bytes).expect("the plan reads");
+        assert_eq!(plan, preview.plan);
+
+        // An unknown major is refused, naming what this reader knows.
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("the plan parses");
+        document["schema"] = serde_json::Value::String("barge.maintain.plan/2".to_owned());
+        let other = serde_json::to_vec(&document).expect("the document encodes");
+        let error = super::read_maintain_plan(&other).expect_err("another major refuses");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(error.message().contains("unknown major"));
+
+        // A field this major does not define is refused rather than ignored.
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("the plan parses");
+        document["extra"] = serde_json::Value::Bool(true);
+        let extra = serde_json::to_vec(&document).expect("the document encodes");
+        assert_eq!(
+            super::read_maintain_plan(&extra)
+                .expect_err("an unknown field refuses")
+                .kind(),
+            ErrorKind::UnknownState
+        );
+    }
+}

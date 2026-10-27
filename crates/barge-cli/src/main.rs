@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use barge::area::{
@@ -28,21 +28,25 @@ use barge::cache::{self, AdoptRequest, CacheKind, FormRequest, UndoRequest};
 use barge::contract::{
     self, AREA_DECLARE_SCHEMA, AREA_HOLD_SCHEMA, AREA_LIST_SCHEMA, AREA_RELEASE_SCHEMA,
     AREA_ROOT_CREATE_SCHEMA, AREA_ROOT_LIST_SCHEMA, AREA_SHOW_SCHEMA, CACHE_ADOPT_SCHEMA,
-    CACHE_LIST_SCHEMA, CACHE_UNDO_SCHEMA, DESCRIBE_SCHEMA, INSPECT_SCHEMA, ROOT_ROWS,
-    SCRATCH_ALLOC_SCHEMA, SCRATCH_CLAIM_SCHEMA, SCRATCH_CONCLUDE_SCHEMA, SCRATCH_DELEGATE_SCHEMA,
-    SCRATCH_EXPIRE_SCHEMA, SCRATCH_GRANTS_SCHEMA, SCRATCH_REVOKE_SCHEMA,
+    CACHE_LIST_SCHEMA, CACHE_UNDO_SCHEMA, DESCRIBE_SCHEMA, DOCUMENT_SIZE_CAP_BYTES, INSPECT_SCHEMA,
+    MAINTAIN_SCHEMA, ROOT_ROWS, SCRATCH_ALLOC_SCHEMA, SCRATCH_CLAIM_SCHEMA,
+    SCRATCH_CONCLUDE_SCHEMA, SCRATCH_DELEGATE_SCHEMA, SCRATCH_EXPIRE_SCHEMA, SCRATCH_GRANTS_SCHEMA,
+    SCRATCH_REVOKE_SCHEMA,
 };
 use barge::describe::{
     self, DescribeData, DescribeRequest, InspectData, InspectRequest, StateDirSource,
 };
 use barge::error::{Error, ErrorKind};
 use barge::os::{self, VolumeUuid};
+use barge::prune::{self, MaintainBounds, MaintainReport, MaintainRequest};
 use barge::scratch::{
     self, AllocRequest, ConcludeRequest, ExpireReport, SweepBounds, SweepRequest,
 };
 use barge::state::{self, StatePaths};
 
-const USAGE: &str = "usage: barge <describe|inspect|area|cache|diagnostic|scratch> [--json]
+const USAGE: &str = "usage: barge <describe|inspect|maintain|area|cache|diagnostic|scratch> [--json]
+       barge maintain [--plan-out <file>]
+       barge maintain --plan-sha256 <hex> [--plan <file>]
        barge diagnostic descriptor-census --root <existing-directory>
        barge area declare --namespace <ns> --area <name> --folder <folder> [--override <uuid>=<folder>]... --absent <fail:drive|wait|fallback:path> --prune <none|oldest-idle:seconds> --reserve <counts|excluded>
        barge area show --namespace <ns> --area <name>
@@ -116,11 +120,12 @@ enum Report {
     /// One `area` or `cache` command document, already serialised by its library
     /// type.
     Verb(Box<VerbReport>),
-    /// A scratch command with its outcome exit code.
-    Scratch(Box<ScratchReport>),
+    /// A command whose finished document carries its own exit code: a `scratch`
+    /// verb, or `maintain`.
+    Outcome(Box<OutcomeReport>),
 }
 
-struct ScratchReport {
+struct OutcomeReport {
     schema: &'static str,
     command: &'static str,
     data: serde_json::Value,
@@ -141,7 +146,7 @@ impl Report {
             Self::Describe(_) => describe::DESCRIBE_COMMAND.to_owned(),
             Self::Inspect(_) => describe::INSPECT_COMMAND.to_owned(),
             Self::Verb(report) => report.command.to_owned(),
-            Self::Scratch(report) => report.command.to_owned(),
+            Self::Outcome(report) => report.command.to_owned(),
         }
     }
 
@@ -149,12 +154,12 @@ impl Report {
     /// an intent that needs replay, `0` otherwise.
     fn exit(&self) -> u8 {
         match self {
-            Self::Scratch(report) => report.exit,
+            Self::Outcome(report) => report.exit,
             _ => 0,
         }
     }
 
-    fn scratch<T: serde::Serialize>(
+    fn outcome<T: serde::Serialize>(
         schema: &'static str,
         command: &'static str,
         data: &T,
@@ -167,7 +172,7 @@ impl Report {
                 format!("could not encode the {schema} document: {error}"),
             )
         })?;
-        Ok(Self::Scratch(Box::new(ScratchReport {
+        Ok(Self::Outcome(Box::new(OutcomeReport {
             schema,
             command,
             data,
@@ -224,6 +229,7 @@ fn dispatch(args: &[String]) -> Result<Report, Error> {
             no_extra_arguments(rest)?;
             inspect().map(Box::new).map(Report::Inspect)
         }
+        "maintain" => maintain(rest),
         "area" => area(rest),
         "cache" => cache(rest),
         "diagnostic" => descriptor_census(rest),
@@ -279,6 +285,13 @@ struct Parsed {
 
 /// Parse one command line's positional words and `--key value` options.
 fn parse(args: &[String]) -> Result<Parsed, Error> {
+    parse_taking(args, &[])
+}
+
+/// [`parse`] with option names that take a value for this command even though
+/// they are a flag elsewhere: `maintain`'s `--plan` names the preview bytes,
+/// while `scratch expire` and `cache adopt` take it as a bare flag.
+fn parse_taking(args: &[String], value_options: &[&str]) -> Result<Parsed, Error> {
     let mut words = Vec::new();
     let mut options: Options = BTreeMap::new();
     let mut rest_positional = false;
@@ -300,7 +313,7 @@ fn parse(args: &[String]) -> Result<Parsed, Error> {
                 return Err(usage("an empty option name"));
             }
             // A flag carries no value; every other option takes exactly one.
-            if FLAGS.contains(&key.as_str()) {
+            if FLAGS.contains(&key.as_str()) && !value_options.contains(&key.as_str()) {
                 options.entry(key).or_default().push("true".to_owned());
                 index += 1;
                 continue;
@@ -319,6 +332,15 @@ fn parse(args: &[String]) -> Result<Parsed, Error> {
         index += 1;
     }
     Ok(Parsed { words, options })
+}
+
+/// Read one optional single-valued option, refusing a repeated one.
+fn one_option(options: &mut Options, key: &str) -> Result<Option<String>, Error> {
+    match options.remove(key) {
+        None => Ok(None),
+        Some(mut values) if values.len() == 1 => Ok(values.pop()),
+        Some(_) => Err(usage(format!("--{key} was given more than once"))),
+    }
 }
 
 fn required(options: &mut BTreeMap<String, Vec<String>>, key: &str) -> Result<String, Error> {
@@ -619,6 +641,168 @@ fn area_release(mut options: Options) -> Result<Report, Error> {
     )
 }
 
+/// Run one `maintain` run: a preview, or a real run the preview authorized.
+///
+/// The preview is effect-free and prints one bounded canonical
+/// `barge.maintain.plan/1` with its SHA-256. A real run requires that digest; a
+/// `--plan` file, when the caller kept the exact preview bytes from
+/// `--plan-out`, must be exactly the plan this head computes.
+fn maintain(args: &[String]) -> Result<Report, Error> {
+    let Parsed { words, mut options } = parse_taking(args, &["plan", "plan-out"])?;
+    if let Some(word) = words.first() {
+        return Err(usage(format!("unexpected argument: {word}")));
+    }
+    let plan_file = one_option(&mut options, "plan")?.map(PathBuf::from);
+    let plan_out = one_option(&mut options, "plan-out")?.map(PathBuf::from);
+    let plan_digest = one_option(&mut options, "plan-sha256")?;
+    let preview = plan_digest.is_none();
+    if let Some(path) = &plan_file {
+        if preview {
+            return Err(usage(format!(
+                "--plan {} is the preview's exact bytes for a real run, so it needs --plan-sha256; nothing was changed",
+                path.display()
+            )));
+        }
+    }
+    if plan_out.is_some() && !preview {
+        return Err(usage(
+            "--plan-out writes a preview's plan and has no meaning on a real run; nothing was changed",
+        ));
+    }
+    if plan_file.is_some() && plan_out.is_some() {
+        return Err(usage(
+            "--plan and --plan-out name different files; give one",
+        ));
+    }
+    refuse_unknown(options)?;
+    let plan_bytes = match &plan_file {
+        Some(path) => Some(read_plan_file(path)?),
+        None => None,
+    };
+    let state = state_paths()?;
+    let platform = os::platform();
+    let report = prune::maintain(
+        &state,
+        &platform,
+        &platform,
+        &platform,
+        &platform,
+        &MaintainRequest {
+            preview,
+            plan_digest: plan_digest.as_deref(),
+            plan_bytes: plan_bytes.as_deref(),
+            sweep_bounds: SweepBounds::default(),
+            delete_bounds: barge::delete::DeleteBounds::default(),
+            maintain_bounds: MaintainBounds::design(),
+            now_ms: state::now_ms(),
+        },
+    )?;
+    if preview {
+        if let Some(path) = &plan_out {
+            let bytes = prune::canonical_plan_bytes(&report.plan)?;
+            write_plan_file(path, &bytes)?;
+        }
+    }
+    let human = maintain_summary(&report);
+    let exit = if report.needs_human() { 3 } else { 0 };
+    Report::outcome(MAINTAIN_SCHEMA, "maintain", &report, human, exit)
+}
+
+/// Read the caller's plan file, bounded before it is parsed.
+fn read_plan_file(path: &Path) -> Result<Vec<u8>, Error> {
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        Error::new(
+            ErrorKind::Io,
+            format!("could not read the plan file {}: {error}", path.display()),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            format!("the plan file {} is not a regular file", path.display()),
+        ));
+    }
+    if metadata.len() > DOCUMENT_SIZE_CAP_BYTES as u64 {
+        return Err(Error::new(
+            ErrorKind::ResourceBound,
+            format!(
+                "the plan file {} is {} bytes, over the {DOCUMENT_SIZE_CAP_BYTES}-byte cap",
+                path.display(),
+                metadata.len()
+            ),
+        ));
+    }
+    std::fs::read(path).map_err(|error| {
+        Error::new(
+            ErrorKind::Io,
+            format!("could not read the plan file {}: {error}", path.display()),
+        )
+    })
+}
+
+/// Write a preview's exact plan bytes where the caller asked for them.
+fn write_plan_file(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    std::fs::write(path, bytes).map_err(|error| {
+        Error::new(
+            ErrorKind::Io,
+            format!("could not write the plan file {}: {error}", path.display()),
+        )
+    })
+}
+
+/// The human summary of `barge.maintain/1`.
+fn maintain_summary(report: &MaintainReport) -> String {
+    let mut lines = Vec::new();
+    for volume in &report.volumes.rows {
+        if volume.loud {
+            if let Some(detail) = &volume.detail {
+                lines.push(format!("warning: {detail}"));
+            }
+        }
+        if let Some(stage) = &volume.scratch {
+            lines.push(format!(
+                "{}: scratch {} deleted, {} pending, {} skipped",
+                volume.volume_uuid, stage.deleted.count, stage.pending.count, stage.skipped.count
+            ));
+        }
+        for area in &volume.areas {
+            lines.push(format!(
+                "{}: {}/{} {} deleted, {} pending, {} skipped",
+                volume.volume_uuid,
+                area.namespace,
+                area.area,
+                area.deleted.count,
+                area.pending.count,
+                area.skipped.count
+            ));
+        }
+    }
+    if report.timed_out {
+        lines.push(format!(
+            "the run's wall clock stopped it before {} stage(s)",
+            report.unreached.count
+        ));
+    }
+    if let Some(stopped) = &report.stopped {
+        lines.push(format!("stopped: {stopped}"));
+    }
+    let head = if report.preview {
+        format!(
+            "previewed maintain plan {}: {} candidate(s) on {} volume(s); nothing was changed",
+            report.plan_digest, report.candidates, report.plan.volumes.count
+        )
+    } else {
+        format!(
+            "maintained {} volume(s) under plan {}: {} candidate(s), {} pending",
+            report.volumes.count, report.plan_digest, report.candidates, report.pending.count
+        )
+    };
+    lines.push(head);
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text
+}
+
 /// Run one `scratch` verb.
 fn scratch(args: &[String]) -> Result<Report, Error> {
     let Parsed { words, options } = parse(args)?;
@@ -676,7 +860,7 @@ fn scratch_alloc(mut options: Options) -> Result<Report, Error> {
         report.root.path.display(),
         report.consumer
     );
-    Report::scratch(SCRATCH_ALLOC_SCHEMA, "scratch.alloc", &report, human, 0)
+    Report::outcome(SCRATCH_ALLOC_SCHEMA, "scratch.alloc", &report, human, 0)
 }
 
 fn scratch_conclude(mut options: Options) -> Result<Report, Error> {
@@ -733,7 +917,7 @@ fn scratch_conclude(mut options: Options) -> Result<Report, Error> {
         report.root_id,
         report.path.display()
     );
-    Report::scratch(
+    Report::outcome(
         SCRATCH_CONCLUDE_SCHEMA,
         "scratch.conclude",
         &report,
@@ -770,7 +954,7 @@ fn scratch_expire(mut options: Options) -> Result<Report, Error> {
     )?;
     let human = expire_summary(&report);
     let exit = if report.has_pending() { 3 } else { 0 };
-    Report::scratch(
+    Report::outcome(
         SCRATCH_EXPIRE_SCHEMA,
         "scratch.expire",
         &report,
@@ -790,7 +974,7 @@ fn scratch_grants(mut options: Options) -> Result<Report, Error> {
         report.grants.claims.len(),
         report.volume_uuid
     );
-    Report::scratch(SCRATCH_GRANTS_SCHEMA, "scratch.grants", &report, human, 0)
+    Report::outcome(SCRATCH_GRANTS_SCHEMA, "scratch.grants", &report, human, 0)
 }
 
 fn scratch_delegate(mut options: Options) -> Result<Report, Error> {
@@ -819,7 +1003,7 @@ fn scratch_delegate(mut options: Options) -> Result<Report, Error> {
     } else {
         SCRATCH_DELEGATE_SCHEMA
     };
-    Report::scratch(
+    Report::outcome(
         schema,
         if revoke {
             "scratch.revoke"
@@ -901,7 +1085,7 @@ fn scratch_claim(mut options: Options) -> Result<Report, Error> {
     } else {
         SCRATCH_CLAIM_SCHEMA
     };
-    Report::scratch(
+    Report::outcome(
         schema,
         if revoke {
             "scratch.revoke"
@@ -1233,7 +1417,7 @@ fn emit(report: &Report, json: bool) -> Result<(), Error> {
                 write_stdout(data.human.as_bytes())
             }
         }
-        Report::Scratch(data) => {
+        Report::Outcome(data) => {
             if json {
                 let bytes = contract::success_bytes(data.schema, data.command, &data.data)?;
                 write_stdout(&bytes)

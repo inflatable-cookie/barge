@@ -55,6 +55,14 @@ lists the commands. Each covers what it names:
   owner activation: the declarations activate nothing, `BARGE_PROOF_BIN` names
   the binary, and each run is separately activated (diagnostic first, then the
   counted pass at the exact head). A missing receipt is a missing proof.
+- `effigy maintain:native:test` — the `barge maintain` native proof's own
+  apparatus self-check: its case map and dispatch, the hash-pinned supervisor,
+  the nine-premise trace and the environment inventory. No image, no scratch and
+  no child process.
+- `effigy maintain:native` and `effigy maintain:native:diagnostic` — S7's one
+  bounded native for `barge maintain`, on one owned 64 MiB image under the same
+  qualified supervisor. HELD for owner activation on the same terms: the
+  declarations activate nothing, and each run is separately activated.
 
 RustQuality strict is active for the Rust source, manifests, tests and their
 documentation: `docs/knowledge/contracts/language-quality-activation.json` opts

@@ -1222,7 +1222,9 @@ Barge owns no timer, daemon or hook. A host launchd job calls one command:
   and continues with the other volumes; it never recreates a mount point.
 - The job's own file (`~/Library/LaunchAgents/<label>.plist`), its schedule and
   its replacement of `com.tom.scratch-reaper` are host changes with their own
-  operator gate. This design defines the command and its contract only.
+  operator gate. This design defines the command and its contract only; [the
+  host-job contract](host-job.md) owns the hand-off, the example plist and the
+  recording rule.
 - Oxide's outputs prune entry stays in the existing host job until stage 4;
   `maintain` never runs it, never reads a receipt, and never deletes an Oxide
   root.
@@ -2313,6 +2315,78 @@ Choices S4 made where this design left the mechanic to the slice:
   change, no Oxide or Effigy adoption, and no native receipt until the owner
   activates the runs. `scratch:expiry:native` and its `:diagnostic` twin are
   declared and held.
+
+- **S7** is this slice: `barge maintain` in preview and real form, its exit
+  codes, the completion of `describe`, and the host-job hand-off. `maintain`
+  sweeps every registered, present volume's scratch folder through S4's sweep and
+  then applies each declared area's prune policy, in registry order and then
+  declaration order, and does nothing else. It reads no Oxide receipt, runs no
+  Oxide prune and deletes no Oxide root: every effect goes through S4's
+  grant-checked sweep or S5's custody and delete path on a root whose
+  `barge.root/1` marker Barge wrote. The job file itself, its schedule and the
+  retirement of `com.tom.scratch-reaper` stay an operator gate; [the host-job
+  contract](host-job.md) owns that hand-off and ships one example plist under
+  `docs/`, uninstalled.
+
+Choices S7 made where this design left the mechanic to the slice:
+
+- **Command documents.** `barge.maintain/1` is the command's document: the
+  bounded canonical `barge.maintain.plan/1`, its SHA-256, when the plan was built,
+  and what the run did. The plan holds only stable facts (the volume rows, each
+  scratch step's own `barge.scratch.plan/1` and digest, each area step's policy,
+  candidates and kept rows), so its digest is reproducible across a preview and
+  its real run; the clock and every effect live outside it.
+- **The CLI's two forms.** A preview is the default and is effect-free:
+  `barge maintain --json` prints the plan and its digest, and `--plan-out <file>`
+  writes exactly the bytes the digest covers where the caller asked. A real run
+  is `barge maintain --json --plan-sha256 <hex>` and may also be given
+  `--plan <file>`, whose bytes must be exactly the plan this head computes.
+  `--plan` without its digest refuses as `usage` before any effect, so the flag
+  itself is never an effect. The host job needs only the digest; the file form
+  exists so a caller can present the preview's own bytes.
+- **The real run recomputes and refuses as a whole.** A plan that changed since
+  the preview is `unknown_state` (exit `3`) with both digests, and nothing is
+  changed. Inside the run, every effect re-verifies its own predicates: the
+  embedded scratch digest is recomputed and compared again by S4's sweep, and
+  each area root is re-read under the volume lock before its intent.
+- **Exit codes.** `0` completed, including a partial completion with nothing
+  pending. `2` refused before any effect, from the closed error kinds. `3` a
+  pending intent, a replay that stopped short, a wall-clock stop, **or an absent
+  permanent volume**: absence is a fact, but a drive that should be attached and
+  is not needs a human, and the exit code is the only channel the host contract
+  gives that report. An absent ephemeral volume is `0` and quiet. A volume whose
+  durability is `undeclared` is reported loudly (exit `3`) because expending data
+  is never inferred; a volume declared `kept` is never pruned and is not loud.
+- **A mid-run error is a stop, not a refusal.** `2` means "refused before any
+  effect", which cannot be true once an earlier volume was maintained, so a
+  failure inside a real run is reported in `data.stopped`, forces exit `3`, and
+  names the unit or stage it stopped on. The affected unit is recorded in that
+  stage's `skipped` rows with the error, and nothing after it is attempted.
+- **The wall clock.** 600 s, with no new effect starting inside the last 30 s.
+  Reaching it sets `timed_out`, reports every stage and candidate the run did not
+  reach with counts, and forces exit `3`. A timeout is never success.
+- **Area prune mechanics.** A step exists only for a declaration whose policy is
+  `oldest-idle:<seconds>`; a candidate is an owned root (`barge.root/1`, any kind)
+  with no live or undecidable hold and last activity — its own directory mtime or
+  its marker's creation time, whichever is newer — older than the declared age.
+  An unmarked, unknown or foreign-marker entry is never a candidate: S5's
+  containment rule already refuses to delete one. The deletion is S5's, with the
+  native-root grant the marker itself is, and the re-verification re-reads the
+  declaration (`area::show`), the root's identity, marker digest, holds and age,
+  and the registry record's generation, which must still be the one the plan
+  named. Each of those is a `refused_boundary` for that root only, so the other
+  roots of the same area still go; a pending intent stops the rest of that area's
+  stage and is reported.
+- **`describe` completion.** An area row now carries the declaration's `absent`,
+  `prune` and `reserve` policies, which is the last part of the design's
+  `describe` list that was still empty. They are optional on read and always
+  written, so a document from before them still reads and a reader never guesses
+  a policy.
+- **What S7 does not claim.** No real-drive maintain run, no LaunchAgent, no
+  reaper replacement, no Oxide or Effigy adoption, and no native receipt until
+  the owner activates the runs. `maintain:native` and its `:diagnostic` twin are
+  declared and held; [the S7 native proof plan](s7-maintain-proof.md) is the
+  premise record and the case bodies.
 
 ## Proposed validation
 

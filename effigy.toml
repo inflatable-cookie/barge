@@ -36,6 +36,32 @@ alias = "barge"
   "scripts/native/s6-cache-placement-proof.sh diagnostic",
 ]
 
+# S7's elevated native proof (docs/knowledge/contracts/s7-maintain-proof.md): the
+# one bounded native for `barge maintain`, on one owned APFS image of at most
+# 64 MiB attached `-owners on`, under Oxide's qualified shared supervisor whose
+# bytes this script hash-pins itself. `--plan` is effect-free, so the proof's
+# previews change nothing; only the authorised real runs delete, and only inside
+# the guard's image. Each selector builds the CLI from the same head and then
+# runs the one fixed script.
+#
+# HELD for owner activation: the declarations activate nothing, `BARGE_PROOF_BIN`
+# names the binary, and each run is separately activated (diagnostic first, then
+# the counted pass at the exact head). A missing receipt is a missing proof.
+"maintain:native" = [
+  "oxide build -p barge-cli --locked",
+  "python3 scripts/native/s7-maintain-proof.py counted",
+]
+# The uncounted twin: keep-going, latched first fault, dependent-skip, and a
+# `qualified: false` receipt. It proves nothing on its own.
+"maintain:native:diagnostic" = [
+  "oxide build -p barge-cli --locked",
+  "python3 scripts/native/s7-maintain-proof.py diagnostic",
+]
+# The proof's own apparatus self-check: the case map and its dispatch, the pinned
+# supervisor digest, the nine-premise trace and the environment inventory. No
+# image, no scratch, no child process.
+"maintain:native:test" = "python3 scripts/native/s7-maintain-proof.py --self-check"
+
 [test.suites.rust]
 # The library and CLI suites. The budgets are the test route's timeout and
 # forced exit: an expired admission window starts no child, and an expired
