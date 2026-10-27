@@ -5482,6 +5482,19 @@ mod tests {
             self.inner.create_child_dir(parent, name, mode)
         }
 
+        fn create_child_symlink(
+            &self,
+            parent: &DirHandle,
+            name: &str,
+            target: &Path,
+        ) -> crate::error::Result<()> {
+            self.inner.create_child_symlink(parent, name, target)
+        }
+
+        fn read_link(&self, path: &Path) -> crate::error::Result<Option<std::path::PathBuf>> {
+            self.inner.read_link(path)
+        }
+
         fn publish_child_file(
             &self,
             parent: &DirHandle,
