@@ -49,14 +49,20 @@
 //! captured objects") - are:
 //!
 //! - a `.barge-del-*` name is unlinked only while the intent records its capture,
-//!   its verdict and its device, inode and kind, and a replay re-verifies the same
-//!   identity before it deletes anything; an unrecorded, collided or unverifiable
-//!   private name is never unlinked and keeps the intent pending;
+//!   its verdict and its device, inode and kind. A replay may re-verify a
+//!   **recorded, verified** capture - the same device, inode and kind, through the
+//!   descriptor it verified - and then remove it, which is how a nested capture a
+//!   stop left behind is finished. A name recorded in `foreign_captures`, an
+//!   unrecorded name, a name whose identity no longer matches and an unverifiable
+//!   name are never unlinked: they stay reported and keep the intent pending;
 //! - a capture whose verification failed is recorded in `foreign_captures` before
 //!   its put-back, so a replay never mistakes the object for content of the root;
 //! - a capture the intent records whose private name is gone is `Unknown`: the
 //!   record proves the capture happened, not that Barge unlinked it, so a replay
-//!   reports it and keeps the intent pending instead of completing past it;
+//!   reports it and keeps the intent pending instead of completing past it. The
+//!   quarantine leaf is the one exception: its own record's absence is decided by
+//!   the phase, because only the durable `removed` phase proves Barge removed the
+//!   leaf;
 //! - a captured directory whose owner cannot write or search it has its original
 //!   permission mode recorded before the mode is changed, a scope guard restores it
 //!   on every return, `?` error and panic, and a replay restores recorded modes
@@ -2093,10 +2099,17 @@ fn is_finder_metadata(name: &str) -> bool {
 
 /// Replay every pending intent, settling only what its recorded identity proves.
 ///
-/// A pending intent is resolved only from its recorded device, inode and marker
-/// digest: the quarantine leaf exists with them, or both the leaf and the marker
-/// are positively absent and the `marker_last` phase was recorded. Anything else
-/// stays pending, is reported, and blocks reuse of that leaf.
+/// A pending intent is resolved only from its recorded identity and its durable
+/// journal. It resumes when the quarantine leaf is at its visible
+/// `.barge-prune-<intent-id>` name with the recorded device and inode and the marker
+/// digest matches (`renamed`), or, at `marker_last`, when the leaf is still at that
+/// visible name and the marker is positively absent; a resumed walk re-verifies each
+/// **recorded, verified** capture and removes only those. It settles only when the
+/// leaf is positively absent **and the durable `removed` phase was recorded**, which
+/// is the evidence of Barge's own final unlink. Absence alone never resolves an
+/// intent. A foreign capture (one in `foreign_captures`), an unrecorded name, a name
+/// whose identity no longer matches and an unverifiable name are never unlinked:
+/// they stay reported and keep the intent pending.
 pub fn replay_pending(
     state_paths: &StatePaths,
     dirs: &dyn DirOps,
