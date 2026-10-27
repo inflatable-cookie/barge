@@ -45,7 +45,7 @@ impl RootIdentity {
     /// Validate the complete record before using it as authority.
     pub fn validate(&self) -> Result<()> {
         let invalid = || Error::new(ErrorKind::UnknownState, "invalid root identity record");
-        if self.schema != "barge.root.identity/1" {
+        if self.schema != crate::contract::ROOT_IDENTITY_SCHEMA {
             return Err(invalid());
         }
         validate_identifier("root_id", &self.root_id)?;
@@ -88,7 +88,7 @@ pub fn from_owned(
         .to_str()
         .ok_or_else(|| Error::new(ErrorKind::UnknownState, "root path is not UTF-8"))?;
     let record = RootIdentity {
-        schema: "barge.root.identity/1".to_owned(),
+        schema: crate::contract::ROOT_IDENTITY_SCHEMA.to_owned(),
         root_id: root.root_id.clone(),
         nonce: root.nonce.clone(),
         volume_uuid: root.volume_uuid.as_str().to_owned(),
@@ -314,6 +314,215 @@ pub fn write_once(
     Ok(())
 }
 
+/// Evidence produced by the explicit identity repair.
+#[derive(Debug, Clone, Serialize)]
+pub struct IdentifyReport {
+    pub record: RootIdentity,
+    pub custody_verdict: &'static str,
+    pub custody: crate::custody::CustodyEvidence,
+}
+
+struct RepairObservation {
+    root: crate::area::OwnedRoot,
+    generation: u64,
+}
+
+fn observe_repair(
+    dirs: &dyn DirOps,
+    facts: &dyn crate::os::VolumeFacts,
+    mounts: &dyn crate::os::MountRoot,
+    observer: &dyn crate::os::ProcessObserver,
+    record: &crate::registry::VolumeRecord,
+    relative: &str,
+) -> Result<RepairObservation> {
+    let components = folder_components("mount_relative_path", relative)?;
+    let volume = crate::area::VolumeRoot::open(dirs, facts, mounts, record)?;
+    let mount = volume.mount_point().to_path_buf();
+    let device = volume.identity().device;
+    let uid = observer.effective_uid()?;
+    let mut handle = dirs.open_path(&mount)?;
+    if handle.identity().device != device {
+        return Err(Error::new(ErrorKind::UnknownState, "mount binding changed"));
+    }
+    for component in components {
+        let entry = dirs
+            .child_facts(&handle, &component)?
+            .ok_or_else(|| Error::new(ErrorKind::UnknownState, "root path is missing"))?;
+        if entry.kind != EntryKind::Directory || entry.uid != uid || entry.device != device {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "root path is not an owned directory on the volume",
+            ));
+        }
+        let next = dirs.open_child_dir(&handle, &component)?;
+        if next.identity()
+            != (DirId {
+                device: entry.device,
+                inode: entry.inode,
+            })
+        {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "root path changed while opened",
+            ));
+        }
+        handle = next;
+    }
+    let path = mount.join(relative);
+    let expectation = crate::area::MarkerExpectation {
+        volume_uuid: &record.volume_uuid,
+        resolved_path: &path,
+        mount_point: Some(&mount),
+        effective_uid: uid,
+        now_ms: crate::state::now_ms(),
+    };
+    let (marker, digest) = crate::area::read_marker_with_digest(dirs, &handle, &expectation);
+    let crate::area::MarkerState::Owned(marker) = marker else {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "root marker is not owned",
+        ));
+    };
+    if marker.schema == "barge.root/2" && marker.mount_relative_path.as_deref() != Some(relative) {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "marker relative path differs",
+        ));
+    }
+    let digest =
+        digest.ok_or_else(|| Error::new(ErrorKind::UnknownState, "marker digest missing"))?;
+    if dirs.recheck_dir(&handle)? != handle.identity() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "root changed while read",
+        ));
+    }
+    volume.reverify(facts)?;
+    Ok(RepairObservation {
+        root: crate::area::OwnedRoot {
+            root_id: marker.root_id.clone(),
+            nonce: marker.nonce.clone(),
+            kind: marker.kind,
+            area: marker.area.clone(),
+            volume_uuid: marker.volume_uuid.clone(),
+            path,
+            identity: handle.identity(),
+            marker_digest: digest,
+            created_ms: marker.created_ms,
+        },
+        generation: marker.generation,
+    })
+}
+
+/// Explicitly identify a root without a record. It never overwrites a record and
+/// requires a complete census, marker and volume verification, and safe custody.
+#[allow(clippy::too_many_arguments)]
+pub fn identify(
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn crate::os::VolumeFacts,
+    mounts: &dyn crate::os::MountRoot,
+    observer: &dyn crate::os::ProcessObserver,
+    uuid: &VolumeUuid,
+    relative: &str,
+) -> Result<IdentifyReport> {
+    let record = crate::area::registered_volume(state, uuid)?;
+    let candidates = facts.mount_census(uuid)?;
+    if candidates.len() != 1 || record.mount_hint.as_ref() != candidates.first() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "volume census is absent, duplicated, or differs from its registered mount",
+        ));
+    }
+    let mut locks = crate::state::LockSet::new(state.clone());
+    let _volume_lock = locks.lock_volume(uuid)?;
+    let first = observe_repair(dirs, facts, mounts, observer, &record, relative)?;
+    let lock = locks.lock_root(&first.root.root_id)?;
+    let uid = observer.effective_uid()?;
+    if read(state, dirs, &first.root.root_id, uid)?.is_some() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "identity record already exists",
+        ));
+    }
+    let observed = observe_repair(dirs, facts, mounts, observer, &record, relative)?;
+    if observed.root != first.root || observed.generation != first.generation {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "root or marker changed before custody",
+        ));
+    }
+    let intents = crate::state::read_intents(state, crate::contract::INTENT_ROWS)?;
+    if intents.truncated {
+        return Err(Error::new(
+            ErrorKind::CustodyNotProven,
+            "intent census is truncated",
+        ));
+    }
+    let relative_path = std::path::Path::new(relative);
+    let folder = relative_path
+        .parent()
+        .and_then(std::path::Path::to_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "root has no containing area folder",
+            )
+        })?;
+    let name = relative_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "root name is not UTF-8"))?;
+    let unit = crate::unit::DeletionUnit {
+        volume_uuid: uuid.clone(),
+        root_dir: String::new(),
+        folder: folder.to_owned(),
+        parent: String::new(),
+        name: name.to_owned(),
+        kind: crate::unit::UnitKind::Directory,
+        device: observed.root.identity.device,
+        inode: observed.root.identity.inode,
+        marker: Some(crate::unit::UnitMarker::new(
+            crate::unit::MarkerFamily::Barge,
+            observed.root.marker_digest.clone(),
+        )),
+        grant: crate::unit::UnitGrant::native_root(name),
+        plan_digest: "0".repeat(64),
+    };
+    let pending = crate::custody::PendingIntent::pending(&intents.records);
+    let custody = crate::custody::take_identity_custody(
+        dirs,
+        facts,
+        mounts,
+        observer,
+        state,
+        &unit,
+        &pending,
+        crate::custody::CustodyBounds::default(),
+        &observed.root.root_id,
+    )
+    .into_evidence()?;
+    let after = observe_repair(dirs, facts, mounts, observer, &record, relative)?;
+    if after.root != observed.root
+        || after.generation != observed.generation
+        || facts.mount_census(uuid)? != candidates
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "root, marker, or mount census changed during custody",
+        ));
+    }
+    let mut identity = from_owned(&after.root, &candidates[0], IdentityOrigin::Identified)?;
+    identity.marker_generation_at_record = after.generation;
+    write_once(state, dirs, &lock, uid, &identity)?;
+    Ok(IdentifyReport {
+        record: identity,
+        custody_verdict: "safe",
+        custody,
+    })
+}
+
 /// Facts read from the verified volume and its opened root for one observation.
 /// Callers must obtain these through the descriptor walk; no stored verdict is
 /// authority for a later use.
@@ -333,14 +542,20 @@ pub struct RootObservation {
     pub area: MarkerArea,
 }
 
+/// Device observations from the recorded and live mount instances.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemountEvidence {
+    pub device_at_record: u64,
+    pub device_live: u64,
+    pub changed: bool,
+}
+
 /// A durable identity comparison. Unknown keeps the root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "verdict", rename_all = "snake_case")]
 pub enum IdentityVerdict {
     Verified {
-        device_at_record: u64,
-        device_live: u64,
-        device_changed: bool,
+        remount: RemountEvidence,
         mount_moved: bool,
     },
     Unknown {
@@ -369,9 +584,8 @@ pub enum IdentityReason {
     MarkerGenerationUnexpected,
 }
 
-/// Verify against a complete, freshly observed set of mounts for the UUID.
-/// The caller supplies that census; an unavailable census must never be passed
-/// as an empty or complete set. All filesystem facts are read again here.
+/// Verify against a freshly observed complete mount census and descriptor walk.
+/// An unavailable census is unknown, never an empty set.
 pub fn verify(
     state: &StatePaths,
     dirs: &dyn DirOps,
@@ -379,7 +593,6 @@ pub fn verify(
     mounts: &dyn crate::os::MountRoot,
     uid: u32,
     root_id: &str,
-    candidates: &[PathBuf],
 ) -> IdentityVerdict {
     let unknown = |reason| IdentityVerdict::Unknown { reason };
     let record = match read(state, dirs, root_id, uid) {
@@ -387,18 +600,22 @@ pub fn verify(
         Ok(None) => return unknown(IdentityReason::IdentityRecordMissing),
         Err(_) => return unknown(IdentityReason::IdentityRecordInvalid),
     };
+    let Ok(uuid) = VolumeUuid::parse(&record.volume_uuid) else {
+        return unknown(IdentityReason::IdentityRecordInvalid);
+    };
+    let candidates = match facts.mount_census(&uuid) {
+        Ok(value) => value,
+        Err(_) => return unknown(IdentityReason::VolumeUnverified),
+    };
     if candidates.len() > 1 {
         return unknown(IdentityReason::DuplicateVolumeUuid);
     }
     let Some(mount) = candidates.first() else {
         return unknown(IdentityReason::VolumeUnverified);
     };
-    let Ok(uuid) = VolumeUuid::parse(&record.volume_uuid) else {
-        return unknown(IdentityReason::IdentityRecordInvalid);
-    };
     let expected = crate::os::ExpectedVolume {
         volume_uuid: &uuid,
-        mount_hint: None,
+        mount_hint: Some(mount),
     };
     let Ok(volume) = crate::os::verify_volume(facts, mounts, mount, &expected) else {
         return unknown(IdentityReason::VolumeUnverified);
@@ -420,7 +637,10 @@ pub fn verify(
                 return unknown(IdentityReason::PathChanged)
             }
             Ok(None) => {
-                return if volume.reverify(facts).is_ok() {
+                return if volume.reverify(facts).is_ok()
+                    && facts.mount_census(&uuid).ok().as_ref() == Some(&candidates)
+                    && dirs.recheck_dir(&current).ok() == Some(current.identity())
+                {
                     IdentityVerdict::Gone
                 } else {
                     unknown(IdentityReason::VolumeUnverified)
@@ -483,30 +703,42 @@ pub fn verify(
         Err(_) => return unknown(IdentityReason::MarkerSchemaDivergent),
     };
     if marker.schema == "barge.root/2"
-        && (marker.mount_relative_path.as_deref() != Some(record.mount_relative_path.as_str())
-            || marker.mount_at_record.as_ref() != Some(&record.mount_at_record))
+        && marker.mount_relative_path.as_deref() != Some(record.mount_relative_path.as_str())
     {
         return unknown(IdentityReason::PathChanged);
     }
     if marker.owner != "barge" {
         return unknown(IdentityReason::MarkerForeignOwner);
     }
-    if !matches!(
-        (marker.kind, marker.generation, marker.conclusion.is_some()),
-        (_, 1, false) | (RootKind::ScratchRun, 2, true)
-    ) {
+    if marker.root_id != record.root_id
+        || marker.nonce != record.nonce
+        || marker.volume_uuid != uuid
+        || marker.kind != record.kind
+        || marker.area.namespace != record.area.namespace
+        || marker.area.area != record.area.area
+    {
+        return unknown(IdentityReason::MarkerIdentityMismatch);
+    }
+    if marker.generation < record.marker_generation_at_record
+        || !matches!(
+            (marker.kind, marker.generation, marker.conclusion.is_some()),
+            (_, 1, false) | (RootKind::ScratchRun, 2, true)
+        )
+    {
         return unknown(IdentityReason::MarkerGenerationUnexpected);
     }
     let expectation = crate::area::MarkerExpectation {
         volume_uuid: &uuid,
         resolved_path: &mount.join(&record.mount_relative_path),
+        mount_point: Some(mount),
         effective_uid: uid,
         now_ms: crate::state::now_ms(),
     };
-    if !matches!(
-        crate::area::read_marker(dirs, &current, &expectation),
-        crate::area::MarkerState::Owned(_)
-    ) {
+    let (checked_marker, checked_digest) =
+        crate::area::read_marker_with_digest(dirs, &current, &expectation);
+    if !matches!(checked_marker, crate::area::MarkerState::Owned(_))
+        || checked_digest.as_deref() != Some(crate::digest::sha256_hex(&bytes).as_str())
+    {
         return unknown(IdentityReason::MarkerSchemaDivergent);
     }
     if dirs
@@ -517,6 +749,7 @@ pub fn verify(
         != Some(&marker_facts)
         || dirs.recheck_dir(&current).ok() != Some(current.identity())
         || volume.reverify(facts).is_err()
+        || facts.mount_census(&uuid).ok().as_ref() != Some(&candidates)
     {
         return unknown(IdentityReason::PathChanged);
     }
@@ -567,9 +800,11 @@ pub fn compare(record: &RootIdentity, live: &RootObservation) -> IdentityVerdict
     match reason {
         Some(reason) => IdentityVerdict::Unknown { reason },
         None => IdentityVerdict::Verified {
-            device_at_record: record.device_at_record,
-            device_live: live.device,
-            device_changed: record.device_at_record != live.device,
+            remount: RemountEvidence {
+                device_at_record: record.device_at_record,
+                device_live: live.device,
+                changed: record.device_at_record != live.device,
+            },
             mount_moved: record.mount_at_record != live.mount,
         },
     }
@@ -625,9 +860,11 @@ mod tests {
         assert_eq!(
             compare(&identity, &live),
             IdentityVerdict::Verified {
-                device_at_record: identity.device_at_record,
-                device_live: live.device,
-                device_changed: true,
+                remount: RemountEvidence {
+                    device_at_record: identity.device_at_record,
+                    device_live: live.device,
+                    changed: true
+                },
                 mount_moved: true,
             }
         );
@@ -670,6 +907,70 @@ mod tests {
         );
         // Inode reuse cannot pass when the replacement's nonce is different.
         assert_eq!(live.inode, identity.inode);
+    }
+
+    #[test]
+    fn explicit_repair_refuses_unsafe_custody_and_never_rewrites() {
+        let fixture = crate::testkit::VolumeFixture::new("identity-repair");
+        fixture.register();
+        let declaration = fixture.declaration("example/pool");
+        let (root, _) = fixture.create_root(&fixture.record, &declaration, RootKind::AreaRoot);
+        let identity_path = fixture
+            .state
+            .root()
+            .join("roots")
+            .join(&root.root_id)
+            .join("identity.json");
+        std::fs::remove_file(&identity_path).unwrap();
+        let relative = root
+            .path
+            .strip_prefix(&fixture.root)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let mut observer = fixture.observer();
+        observer.scan = crate::testkit::ScanMode::Open(vec![crate::os::OpenDescriptor {
+            pid: 42,
+            descriptor: 9,
+            path: root.path.clone(),
+        }]);
+        let error = identify(
+            &fixture.state,
+            &fixture.platform(),
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &fixture.uuid,
+            relative,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::CustodyNotProven);
+        assert!(!identity_path.exists());
+        observer.scan = crate::testkit::ScanMode::Complete;
+        let report = identify(
+            &fixture.state,
+            &fixture.platform(),
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &fixture.uuid,
+            relative,
+        )
+        .unwrap();
+        assert_eq!(report.record.origin, IdentityOrigin::Identified);
+        assert_eq!(report.custody_verdict, "safe");
+        let bytes = std::fs::read(&identity_path).unwrap();
+        assert!(identify(
+            &fixture.state,
+            &fixture.platform(),
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &fixture.uuid,
+            relative
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&identity_path).unwrap(), bytes);
     }
 
     #[test]

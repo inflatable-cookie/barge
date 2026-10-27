@@ -573,6 +573,8 @@ pub struct MarkerExpectation<'a> {
     pub volume_uuid: &'a VolumeUuid,
     /// The absolute path the descriptor walk actually reached.
     pub resolved_path: &'a Path,
+    /// The verified live mount, when path validation is required.
+    pub mount_point: Option<&'a Path>,
     /// The account's effective uid.
     pub effective_uid: u32,
     /// The current time, so a future-dated marker is refused.
@@ -1787,6 +1789,7 @@ pub fn write_marker(
     let expectation = MarkerExpectation {
         volume_uuid: write.volume_uuid,
         resolved_path: write.resolved_path,
+        mount_point: Some(write.mount_point),
         effective_uid,
         now_ms: created_ms,
     };
@@ -2094,7 +2097,10 @@ impl RootMarker {
                     .ok_or_else(|| unknown_marker("v2 marker lacks recorded mount".to_owned()))?;
                 if !mount.is_absolute()
                     || self.resolved_path.is_some()
-                    || !expectation.resolved_path.ends_with(Path::new(relative))
+                    || expectation
+                        .mount_point
+                        .and_then(|mount| expectation.resolved_path.strip_prefix(mount).ok())
+                        != Some(Path::new(relative))
                 {
                     return Err(unknown_marker(
                         "v2 marker path differs from the walk".to_owned(),
@@ -3216,6 +3222,7 @@ pub fn list_roots(
         let expectation = MarkerExpectation {
             volume_uuid: &resolved.volume_uuid,
             resolved_path: &configured_path,
+            mount_point: Some(&resolved.mount_point),
             effective_uid,
             now_ms,
         };
@@ -3504,6 +3511,13 @@ mod tests {
     }
 
     impl VolumeFacts for FakeVolume {
+        fn mount_census(&self, uuid: &VolumeUuid) -> Result<Vec<PathBuf>> {
+            Ok(if self.present && &self.uuid == uuid {
+                vec![self.root.clone()]
+            } else {
+                Vec::new()
+            })
+        }
         fn identify(&self, _path: &Path) -> Result<VolumeIdentity> {
             if !self.present {
                 return Err(Error::new(
@@ -3992,6 +4006,7 @@ mod tests {
             &MarkerExpectation {
                 volume_uuid: &fixture.uuid,
                 resolved_path: &path,
+                mount_point: Some(&resolved.mount_point),
                 effective_uid: observer.effective_uid().expect("the uid"),
                 now_ms: crate::state::now_ms(),
             },
@@ -4588,8 +4603,7 @@ mod tests {
         let platform = fixture.platform();
         let observer = fixture.observer();
         let uid = observer.effective_uid().unwrap();
-        let candidates = vec![fixture.root.clone()];
-        let verify = |candidates: &[PathBuf]| {
+        let verify = || {
             crate::identity::verify(
                 &fixture.state,
                 &platform,
@@ -4597,17 +4611,76 @@ mod tests {
                 &fixture.mounts(),
                 uid,
                 &root.root_id,
-                candidates,
             )
         };
         assert!(matches!(
-            verify(&candidates),
+            verify(),
             crate::identity::IdentityVerdict::Verified { .. }
         ));
+        struct Duplicate(FakeVolume);
+        impl VolumeFacts for Duplicate {
+            fn identify(&self, path: &Path) -> Result<VolumeIdentity> {
+                self.0.identify(path)
+            }
+            fn mount_census(&self, _: &VolumeUuid) -> Result<Vec<PathBuf>> {
+                Ok(vec![self.0.root.clone(), self.0.root.clone()])
+            }
+        }
         assert_eq!(
-            verify(&[fixture.root.clone(), fixture.root.clone()]),
+            crate::identity::verify(
+                &fixture.state,
+                &platform,
+                &Duplicate(fixture.facts()),
+                &fixture.mounts(),
+                uid,
+                &root.root_id
+            ),
             crate::identity::IdentityVerdict::Unknown {
                 reason: crate::identity::IdentityReason::DuplicateVolumeUuid
+            }
+        );
+        let identity_path = fixture
+            .state
+            .root()
+            .join("roots")
+            .join(&root.root_id)
+            .join("identity.json");
+        let identity_bytes = std::fs::read(&identity_path).unwrap();
+        let mut identity: serde_json::Value = serde_json::from_slice(&identity_bytes).unwrap();
+        identity["device_at_record"] = (root.identity.device.get() + 1).into();
+        std::fs::write(&identity_path, serde_json::to_vec(&identity).unwrap()).unwrap();
+        assert!(matches!(
+            verify(),
+            crate::identity::IdentityVerdict::Verified {
+                remount: crate::identity::RemountEvidence { changed: true, .. },
+                ..
+            }
+        ));
+        assert_ne!(
+            identity["device_at_record"].as_u64().unwrap(),
+            root.identity.device.get()
+        );
+        identity["inode"] = (root.identity.inode + 1).into();
+        std::fs::write(&identity_path, serde_json::to_vec(&identity).unwrap()).unwrap();
+        assert_eq!(
+            verify(),
+            crate::identity::IdentityVerdict::Unknown {
+                reason: crate::identity::IdentityReason::InodeChanged
+            }
+        );
+        std::fs::write(&identity_path, identity_bytes).unwrap();
+        let foreign = Adjust::new().with_foreign_owner(ROOT_MARKER_FILE);
+        assert_eq!(
+            crate::identity::verify(
+                &fixture.state,
+                &foreign,
+                &fixture.facts(),
+                &fixture.mounts(),
+                uid,
+                &root.root_id
+            ),
+            crate::identity::IdentityVerdict::Unknown {
+                reason: crate::identity::IdentityReason::MarkerForeignOwner
             }
         );
         let marker_path = marker_path(&root);
@@ -4616,14 +4689,14 @@ mod tests {
             value["nonce"] = "0123456789abcdef0123456789abcdef".into()
         });
         assert_eq!(
-            verify(&candidates),
+            verify(),
             crate::identity::IdentityVerdict::Unknown {
                 reason: crate::identity::IdentityReason::MarkerIdentityMismatch
             }
         );
         std::fs::write(&marker_path, bytes).unwrap();
         std::fs::remove_dir_all(&root.path).unwrap();
-        assert_eq!(verify(&candidates), crate::identity::IdentityVerdict::Gone);
+        assert_eq!(verify(), crate::identity::IdentityVerdict::Gone);
     }
 
     #[test]
@@ -4671,6 +4744,7 @@ mod tests {
             &MarkerExpectation {
                 volume_uuid: &fixture.uuid,
                 resolved_path: &root.path,
+                mount_point: Some(&resolved.mount_point),
                 effective_uid: observer.effective_uid().expect("the uid"),
                 now_ms: crate::state::now_ms(),
             },
@@ -4776,6 +4850,17 @@ mod tests {
                 "a divergent marker is never owned: {state:?}"
             );
         }
+        std::fs::write(&path, &valid).expect("the marker is restored");
+        rewrite_marker(&path, |value| {
+            value["mount_relative_path"] = root.root_id.clone().into()
+        });
+        assert!(
+            matches!(
+                read_owned(&fixture, &resolved, &root.root_id),
+                MarkerState::Unknown { .. }
+            ),
+            "a matching suffix is not the whole path"
+        );
         std::fs::write(&path, &valid).expect("the marker is restored");
         assert!(matches!(
             read_owned(&fixture, &resolved, &root.root_id),

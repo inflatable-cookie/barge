@@ -1046,6 +1046,7 @@ fn recover_marker_observation(
     let expectation = MarkerExpectation {
         volume_uuid: &intent.volume.volume_uuid,
         resolved_path: &plan.path,
+        mount_point: Some(&folder.mount_point),
         effective_uid: observer.effective_uid()?,
         now_ms: state::now_ms(),
     };
@@ -2364,6 +2365,7 @@ fn adopt_in_place(
     let expectation = MarkerExpectation {
         volume_uuid: &record.volume_uuid,
         resolved_path: path,
+        mount_point: Some(&folder.mount_point),
         effective_uid,
         now_ms: state::now_ms(),
     };
@@ -3650,6 +3652,7 @@ fn observed_link_root(
     let expectation = MarkerExpectation {
         volume_uuid: &record.volume_uuid,
         resolved_path: &root_path,
+        mount_point: volume.mount_hint.as_deref(),
         effective_uid,
         now_ms: state::now_ms(),
     };
@@ -3770,6 +3773,7 @@ fn observe_adopted_marker(
     let expectation = MarkerExpectation {
         volume_uuid: &record.volume_uuid,
         resolved_path: &held.path,
+        mount_point: volume.mount_hint.as_deref(),
         effective_uid,
         now_ms: state::now_ms(),
     };
@@ -4840,6 +4844,48 @@ mod tests {
             })
             .collect();
         assert_eq!(after_tree, before_tree, "the cache data is untouched");
+    }
+
+    #[test]
+    fn adopted_directory_with_a_non_id_name_can_be_explicitly_identified() {
+        let fixture = Fixture::new("cache-identify-held");
+        let npm = fixture.caches().join("npm");
+        std::fs::create_dir_all(&npm).unwrap();
+        fixture.write(".npmrc", &format!("cache={}\n", npm.display()));
+        let mut request = fixture.request(CacheKind::NpmCache);
+        request.adopt_existing_root = true;
+        let placement = fixture.adopt(&request).unwrap().placement.unwrap();
+        let PlacementForm::Setting(form) = placement.form else {
+            panic!("setting expected")
+        };
+        let held = form.held_root.unwrap();
+        let identity_path = fixture
+            .state
+            .root()
+            .join("roots")
+            .join(&held.root_id)
+            .join("identity.json");
+        std::fs::remove_file(&identity_path).unwrap();
+        let relative = npm
+            .strip_prefix(&fixture.volume.root)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let report = crate::identity::identify(
+            &fixture.state,
+            &fixture.platform(),
+            fixture.facts.as_ref(),
+            &fixture.volume.mounts(),
+            &fixture.volume.observer(),
+            &fixture.volume.uuid,
+            relative,
+        )
+        .unwrap();
+        assert_eq!(report.record.root_id, held.root_id);
+        assert_eq!(
+            report.record.origin,
+            crate::identity::IdentityOrigin::Identified
+        );
     }
 
     #[test]

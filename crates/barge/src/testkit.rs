@@ -279,6 +279,13 @@ impl FakeVolume {
 }
 
 impl VolumeFacts for FakeVolume {
+    fn mount_census(&self, uuid: &VolumeUuid) -> Result<Vec<PathBuf>> {
+        Ok(if self.present.get() && &self.uuid == uuid {
+            vec![self.root.clone()]
+        } else {
+            Vec::new()
+        })
+    }
     fn identify(&self, _path: &Path) -> Result<VolumeIdentity> {
         if !self.present.get() {
             return Err(Error::new(

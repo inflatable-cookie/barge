@@ -1112,6 +1112,7 @@ fn leaf_marker_digest(
     let expectation = MarkerExpectation {
         volume_uuid: &intent.volume_uuid,
         resolved_path: Path::new(""),
+        mount_point: None,
         effective_uid: observer.effective_uid()?,
         now_ms: state::now_ms(),
     };

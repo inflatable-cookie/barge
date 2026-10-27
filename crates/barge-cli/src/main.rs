@@ -49,6 +49,7 @@ const USAGE: &str = "usage: barge <describe|inspect|area|cache|diagnostic|scratc
        barge area list
        barge area root create --namespace <ns> --area <name> --volume <uuid> --kind <area_root|cache_root|scratch_run>
        barge area root list --namespace <ns> --area <name> --volume <uuid>
+       barge area root identify --volume <uuid> --path <mount-relative-path>
        barge area hold --root <root-id> --holder <id> --pid <pid> --scope <read|write> --purpose <text>
        barge area release --root <root-id> --holder <id>
        barge cache adopt --kind <npm-cache|bun-cache|cargo-registry|cargo-git> --volume <uuid> [--form <setting|held-root|link>] [--write-setting] [--adopt-existing-root] [--plan]
@@ -485,6 +486,26 @@ fn area_root(
                     effective: volume.resolved.declaration.clone(),
                     root,
                 },
+                human,
+            )
+        }
+        Some("identify") if words.len() == 1 => {
+            let uuid = VolumeUuid::parse(&required(&mut options, "volume")?)?;
+            let relative = required(&mut options, "path")?;
+            refuse_unknown(options)?;
+            let state = state_paths()?;
+            let platform = os::platform();
+            let report = barge::identity::identify(
+                &state, &platform, &platform, &platform, &platform, &uuid, &relative,
+            )?;
+            let human = format!(
+                "identified root {} at {}; custody safe; identity recorded\n",
+                report.record.root_id, relative
+            );
+            Report::verb(
+                "barge.root.identify/1",
+                "area.root.identify",
+                &report,
                 human,
             )
         }

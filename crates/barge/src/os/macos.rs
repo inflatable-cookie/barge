@@ -163,6 +163,69 @@ impl VolumeFacts for MacOs {
         let descriptor = open_directory(path)?;
         read_identity(&descriptor, path)
     }
+
+    fn mount_census(&self, uuid: &VolumeUuid) -> Result<Vec<PathBuf>> {
+        const LIMIT: usize = 256;
+        // SAFETY: statfs is plain data and zero is a valid initial buffer; the
+        // kernel fills at most the byte count supplied below.
+        let mut table: Vec<libc::statfs> =
+            (0..=LIMIT).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let bytes = table
+            .len()
+            .checked_mul(std::mem::size_of::<libc::statfs>())
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(|| Error::new(ErrorKind::ResourceBound, "mount census buffer overflow"))?;
+        // SAFETY: table points to writable storage for bytes bytes, and remains
+        // allocated for the duration of the call.
+        let count = unsafe { libc::getfsstat(table.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
+        if count < 0 {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("mount census failed: {}", io::Error::last_os_error()),
+            ));
+        }
+        let count = usize::try_from(count)
+            .map_err(|_| Error::new(ErrorKind::UnknownState, "invalid mount count"))?;
+        if count > LIMIT {
+            return Err(Error::new(
+                ErrorKind::ResourceBound,
+                "mount census exceeded its bound",
+            ));
+        }
+        let mut found = Vec::new();
+        for entry in table.iter().take(count) {
+            let candidate = read_mount_point(entry, Path::new(VOLUMES_PARENT))?;
+            if candidate.parent() != Some(Path::new(VOLUMES_PARENT))
+                || read_filesystem(entry, &candidate)? != FileSystem::Apfs
+            {
+                continue;
+            }
+            let identity = self.identify(&candidate)?;
+            if identity.filesystem != FileSystem::Apfs || identity.volume_uuid.is_none() {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "APFS mount identity is incomplete or changed",
+                ));
+            }
+            if identity.mount_point != candidate {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "mount changed during census",
+                ));
+            }
+            if identity.volume_uuid.as_ref() == Some(uuid) {
+                self.mount_root(&candidate)?;
+                found.push(candidate);
+                if found.len() > 64 {
+                    return Err(Error::new(
+                        ErrorKind::ResourceBound,
+                        "too many mounts for UUID",
+                    ));
+                }
+            }
+        }
+        Ok(found)
+    }
 }
 
 impl MountRoot for MacOs {
@@ -2037,6 +2100,9 @@ impl DirOps for MacOs {
         name: &str,
         cap: usize,
     ) -> Result<Option<Vec<u8>>> {
+        let Some(before) = self.child_facts(parent, name)? else {
+            return Ok(None);
+        };
         let directory = parent_descriptor(parent, name)?;
         let raw = name_cstring(name)?;
         // SAFETY: `directory` is open, `raw` is one NUL-terminated component and
@@ -2056,6 +2122,12 @@ impl DirOps for MacOs {
         // and no other owner exists, so `File` may take ownership of it.
         let mut file = unsafe { File::from_raw_fd(descriptor) };
         let facts = entry_facts(&fstat(&file, Path::new(name))?);
+        if facts != before {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("`{name}` changed while it was opened"),
+            ));
+        }
         if facts.kind != EntryKind::File {
             return Err(Error::new(
                 ErrorKind::UnknownState,
@@ -2073,6 +2145,13 @@ impl DirOps for MacOs {
                 .read(&mut chunk)
                 .map_err(|error| child_error(name, "cannot read the file", error))?;
             if read == 0 {
+                let after = entry_facts(&fstat(&file, Path::new(name))?);
+                if after != facts || self.child_facts(parent, name)?.as_ref() != Some(&facts) {
+                    return Err(Error::new(
+                        ErrorKind::UnknownState,
+                        format!("`{name}` changed while it was read"),
+                    ));
+                }
                 return Ok(Some(buffer));
             }
             if buffer.len() + read > cap {

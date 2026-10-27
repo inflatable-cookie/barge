@@ -108,6 +108,8 @@ pub const AREA_SCHEMA: &str = "barge.area/1";
 pub const PLACEMENT_SCHEMA: &str = "barge.placement/1";
 /// One owned root's marker format.
 pub const ROOT_SCHEMA: &str = "barge.root/2";
+/// One durable owned-root identity record's format.
+pub const ROOT_IDENTITY_SCHEMA: &str = "barge.root.identity/1";
 /// One hold file's format.
 pub const HOLD_SCHEMA: &str = "barge.hold/1";
 /// One intent journal record's format.
@@ -137,6 +139,9 @@ pub struct FormatVersions {
     pub placement: String,
     /// `barge.root/<major>`.
     pub root: String,
+    /// `barge.root.identity/<major>`.
+    #[serde(default)]
+    pub root_identity: String,
     /// `barge.hold/<major>`.
     pub hold: String,
     /// `barge.intent/<major>`.
@@ -153,6 +158,7 @@ impl FormatVersions {
             area: AREA_SCHEMA.to_owned(),
             placement: PLACEMENT_SCHEMA.to_owned(),
             root: ROOT_SCHEMA.to_owned(),
+            root_identity: ROOT_IDENTITY_SCHEMA.to_owned(),
             hold: HOLD_SCHEMA.to_owned(),
             intent: INTENT_SCHEMA.to_owned(),
         }
