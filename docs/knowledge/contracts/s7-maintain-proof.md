@@ -171,6 +171,22 @@ run would replay.
    unit's visible name is gone. Nothing replays it: the image is discarded after
    the receipt.
 
+### The ownership oracle
+
+The brief requires the owned image to be attached with `-owners on`, and the attach
+argv is asserted as part of the command the proof runs. This platform's plist form
+does **not** report the result: on macOS 26.6.2 `diskutil info -plist <volume>`
+carries no `Owners` key for any volume, so a plist read can never establish it. The
+proof therefore binds the attached image's UUID, device, whole disk and mount from
+the plist (as it always has) and then reads that **same volume's text form**,
+`diskutil info <volume>`, for exactly one `Owners:` line whose value is `Enabled`.
+A missing line, `Disabled`, two lines, or any other value is refused as a premise
+failure — ownership is never inferred from the attach command alone. The answer is
+recorded in the receipt as `image.ownership` (`attach_argv`,
+`plist_keys_with_owner`, `text_state`), and `maintain:native:test` states the
+oracle's counterfactuals for Enabled, Disabled, missing, ambiguous and unrecognised
+text without spawning a process or touching a volume.
+
 ## The receipt
 
 `s7-maintain-receipt.json` in the supervisor's evidence directory. It records
@@ -202,6 +218,33 @@ host capability result, not a case result, and it never qualifies a head.
 None of these qualify a head. A diagnostic that fails is recorded here rather
 than promoted, and every one needs a fresh, separately owner-activated run at the
 head it is meant to describe.
+
+### 2026-10-27 — head `620ab6f`, second owner-activated diagnostic: setup premise refused, no case
+
+- **Selector and mode:** `effigy maintain:native:diagnostic` (heavy admission) at
+  `620ab6fb3205aaa70be05c5d446366751db65561`; one invocation, no retry.
+- **Outcome:** exit `3`, `unqualified`, receipt present but no case evidence. The
+  argv fix held: the guard ran `--inner diagnostic --binary <path>`, attached a
+  64 MiB image with `-owners on` and detached it ordinarily
+  (`detach: [{mount, exit: 0, forced: false}]`).
+- **Cause (apparatus, not product):** `setup` refused with
+  `kind: premise, detail: "the owned image did not enable ownership: None"` — the
+  proof read `Owners` from `diskutil info -plist`, which this platform never
+  reports. Second, smaller defect in the same receipt: `supervisor.path` recorded
+  `…/scripts/scripts/bounded-test.py`, a doubled segment.
+- **Fix in this change:** the ownership oracle now reads the volume's text form for
+  an explicit `Owners: Enabled` (above), keeping the attach argv assertion and
+  refusing everything else; the receipt records the verified supervisor path and no
+  longer reconstructs it. No product rule changed.
+- **Preserved packet (unchanged):** guard evidence
+  `/Volumes/Builds/scratch/barge/oxide-proof.rn3q7pf_/evidence/` — guard receipt
+  `1bd476fced2dab21341dbabe3bc1f9f308d3f15989942a2bd8a3d0610068f75c`,
+  proof receipt
+  `4acd4bee4ded5f09196aa417542c6da03f695cf9bf460087d6f94af1a6574855`,
+  stdout `5bf50bdd68fb17c46746fb485ee1165c8161a22746ce197c6636253a48eb9305`,
+  stderr (empty) `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`;
+  selector log `/Volumes/Builds/scratch/barge/run.uNDYiG/diagnostic.log`
+  `9de46d7a48cf1e7246384de654c321b977e9c701aa0268569b9a665401070589`.
 
 ### 2026-10-27 — head `24c5018`, first owner-activated diagnostic: failed before any case
 

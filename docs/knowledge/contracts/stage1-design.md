@@ -2408,8 +2408,10 @@ Choices S7 made where this design left the mechanic to the slice:
   checks it **before it can do anything at all** — its first possible durable act
   is the settle that follows an absent folder or parent at the `removed` phase — and
   **again immediately after each of those observations**, because reading a folder
-  or a parent can itself consume the clock, and **again after its own preflight and
-  locks**, so an overrun never records a completion.
+  or a parent can itself consume the clock, **again after its own preflight and
+  locks**, and **again inside `settle` with the volume, unit and intent-write locks
+  held and immediately before the `deleted` phase is advanced**, so an overrun
+  never records a completion.
   Slow locks, a slow registry re-read or a slow custody scan therefore cannot carry
   an effect past the stop window, however much preflight they consume. So neither a stage with many units nor a long journal
   of earlier intents can outlive the run's bound and then be reported as a success. Reaching it sets `timed_out`,

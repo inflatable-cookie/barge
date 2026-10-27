@@ -64,6 +64,7 @@ import traceback
 SCHEMA = "barge.maintain.native/1"
 SELF_CHECK_SCHEMA = "barge.maintain.native.self-check/1"
 SUPERVISOR_NAME = "scripts/bounded-test.py"
+DEFAULT_SUPERVISOR = os.path.expanduser("~/Dev/projects/oxide/scripts/bounded-test.py")
 # The qualified supervisor's bytes at this proof's authoring head (S4's and S6's
 # pin, unchanged: Barge writes no second supervisor).
 SUPERVISOR_SHA256 = "bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924"
@@ -427,6 +428,7 @@ class Proof:
         self.real_state = None
         self.attached = False
         self.detach_evidence = []
+        self.ownership = None
 
     # -- fixture setup ----------------------------------------------------
 
@@ -483,12 +485,23 @@ class Proof:
         self.whole_disk = info.get("ParentWholeDisk")
         if not self.uuid or not self.device or not self.whole_disk:
             raise Fault("premise", "the owned image did not report its UUID, device and whole disk")
-        if not str(info.get("Owners", "")).lower() in ("yes", "true", "1"):
-            # Ownership is what the brief requires; `diskutil` reports it as a
-            # boolean on some releases and as a string on others.
-            owners = info.get("Owners")
-            if owners not in (True, "Yes", "yes", "1"):
-                raise Fault("premise", f"the owned image did not enable ownership: {owners!r}")
+        # The attach argv above carries `-owners on`; this platform's plist form
+        # does not report the result, so the same volume's text form is read for an
+        # explicit `Owners: Enabled`. A missing, disabled, ambiguous or
+        # unrecognised line refuses the run: ownership is never inferred.
+        text = run(["diskutil", "info", self.mount], self.env).stdout
+        self.ownership = {
+            "attach_argv": list(ATTACH_OPTIONS),
+            "plist_keys_with_owner": sorted(key for key in info if "wner" in key),
+            "text_state": ownership_state(text),
+        }
+        if self.ownership["text_state"] != "enabled":
+            raise Fault(
+                "premise",
+                "the owned image does not state `Owners: Enabled` "
+                f"(device {self.device}, mount {self.mount}); the text form reads "
+                f"{self.ownership['text_state']!r}",
+            )
         self.register()
         self.declare_area()
 
@@ -1018,9 +1031,8 @@ class Proof:
             "started_ms": now_ms(),
             "activated_by": "the owner, separately for each run",
             "supervisor": {
-                "path": os.path.join(
-                    os.path.dirname(os.path.dirname(SCRIPT_PATH)), SUPERVISOR_NAME
-                ),
+                "path": supervisor_path(),
+                "name_segment": SUPERVISOR_NAME,
                 "sha256": SUPERVISOR_SHA256,
                 "name": SUPERVISOR_NAME,
                 "limit_seconds": LIMIT_SECONDS,
@@ -1028,6 +1040,7 @@ class Proof:
             },
             "binary": {"path": self.binary, "sha256": sha256_file(self.binary)},
             "image": {
+                "ownership": self.ownership,
                 "backing": self.image,
                 "mount": self.mount,
                 "volume_uuid": self.uuid,
@@ -1127,6 +1140,29 @@ def preflight_problems():
     problems = []
     if len(PREMISE_TRACE) != 9 or len(PREMISES) != 9:
         problems.append("the premise record does not name nine premises")
+    # The ownership oracle is pure: state each answer setup must accept or refuse.
+    for text, expected in (
+        ("Owners: Enabled", "enabled"),
+        ("   Owners:   Enabled   ", "enabled"),
+        ("Owners: Disabled", "disabled"),
+        ("Owners: Unknown", None),
+        ("owners: enabled", "enabled"),
+        ("", None),
+        ("Owners: Enabled\nOwners: Enabled", None),
+        ("owner: Enabled", None),
+        ("Owners:", None),
+    ):
+        answer = ownership_state(text)
+        if answer != expected:
+            problems.append(
+                f"the ownership oracle reads {text!r} as {answer!r}, not {expected!r}"
+            )
+    if "-owners" not in ATTACH_OPTIONS or ATTACH_OPTIONS[ATTACH_OPTIONS.index("-owners") + 1 :][:1] != ["on"]:
+        problems.append("the attach no longer carries `-owners on`")
+    # The receipt's supervisor path is the verified one, never a reconstruction.
+    recorded = supervisor_path()
+    if not recorded.endswith("/scripts/bounded-test.py") or "/scripts/scripts/" in recorded:
+        problems.append(f"the recorded supervisor path is not the verified one: {recorded}")
     if len(SUPERVISOR_SHA256) != 64:
         problems.append("the supervisor digest is not a SHA-256")
     if IMAGE_MIB > 64:
@@ -1267,12 +1303,39 @@ def self_check():
     return problems
 
 
+def supervisor_path():
+    """The supervisor this run verifies and executes, as an absolute path.
+
+    The receipt records exactly this path — never a path reconstructed from this
+    script's own location — and the self-check refuses a doubled `scripts/`
+    segment, which is how the field once recorded a file that does not exist.
+    """
+    return os.environ.get("BARGE_PROOF_SUPERVISOR", DEFAULT_SUPERVISOR)
+
+
+def ownership_state(info_text):
+    """What `diskutil info <volume>`'s text says about ownership, explicitly.
+
+    `diskutil info -plist` does not report ownership on this platform (macOS
+    26.6.2 omits the key for every volume), so the volume's text form is the
+    oracle: exactly one `Owners:` line whose value is `Enabled` or `Disabled`.
+    No line, two lines or any other value is unknown — never read as enabled.
+    """
+    values = []
+    for line in info_text.splitlines():
+        stripped = line.strip()
+        if not stripped.lower().startswith("owners:"):
+            continue
+        _, _, value = stripped.partition(":")
+        values.append(value.strip().lower())
+    if len(values) != 1:
+        return None
+    return {"enabled": "enabled", "disabled": "disabled"}.get(values[0])
+
+
 def outer_half(mode, binary):
     """Verify the pinned supervisor and hand this script to it as the command."""
-    supervisor = os.environ.get(
-        "BARGE_PROOF_SUPERVISOR",
-        os.path.expanduser("~/Dev/projects/oxide/scripts/bounded-test.py"),
-    )
+    supervisor = supervisor_path()
     if not os.path.isfile(supervisor) or not os.access(supervisor, os.R_OK):
         print(json.dumps({
             "schema": SCHEMA,
@@ -1306,6 +1369,8 @@ def outer_half(mode, binary):
     env.pop("OXIDE_TASK_SCRATCH_ROOT", None)
     env.pop("DYLD_INSERT_LIBRARIES", None)
     env["BARGE_PROOF_BIN"] = binary
+    # The guarded child records the exact supervisor this run verified.
+    env["BARGE_PROOF_SUPERVISOR"] = supervisor
     result = subprocess.run(supervisor_command(supervisor, mode, binary), env=env)
     return result.returncode
 
@@ -1523,6 +1588,13 @@ def main(argv):
                 "mib": IMAGE_MIB,
             },
             "supervisor": {"name": SUPERVISOR_NAME, "sha256": SUPERVISOR_SHA256},
+            "ownership_oracle": {
+                "source": "diskutil info <volume> text form",
+                "accepts": "exactly one `Owners: Enabled` line",
+                "refuses": ["missing", "disabled", "ambiguous", "unrecognised"],
+                "attach_argv": list(ATTACH_OPTIONS),
+            },
+            "supervisor_path": supervisor_path(),
             "argv_guard": {
                 "modes": ["counted", "diagnostic"],
                 "inner": inner_command("diagnostic", "<binary>"),

@@ -2653,8 +2653,11 @@ fn replay_one(
             if expired(bounds.deadline) {
                 return Ok(ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned()));
             }
-            settle(state_paths, intent)?;
-            return Ok(ReplayOutcome::Settled);
+            return Ok(if settle(state_paths, intent, bounds.deadline)? {
+                ReplayOutcome::Settled
+            } else {
+                ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned())
+            });
         }
         return Ok(ReplayOutcome::Pending(
             "the area folder is gone but the removed phase was not recorded, so completion is unknown"
@@ -2675,8 +2678,11 @@ fn replay_one(
             if expired(bounds.deadline) {
                 return Ok(ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned()));
             }
-            settle(state_paths, intent)?;
-            return Ok(ReplayOutcome::Settled);
+            return Ok(if settle(state_paths, intent, bounds.deadline)? {
+                ReplayOutcome::Settled
+            } else {
+                ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned())
+            });
         }
         return Ok(ReplayOutcome::Pending(
             "the unit's parent is gone but the removed phase was not recorded, so completion is unknown"
@@ -3079,14 +3085,26 @@ fn recorded_mismatch(leftovers: &[ForeignCapture]) -> Option<String> {
 
 /// Settle an intent whose area folder or unit parent is positively gone and whose
 /// durable `removed` phase was recorded.
-fn settle(state_paths: &StatePaths, intent: &IntentRecord) -> Result<()> {
+fn settle(
+    state_paths: &StatePaths,
+    intent: &IntentRecord,
+    deadline: Option<Instant>,
+) -> Result<bool> {
     let unit = intent.deletion_unit();
     let mut locks = LockSet::new(state_paths.clone());
     let _volume_lock = locks.lock_volume(&intent.volume_uuid)?;
     let _unit_lock = lock_deletion_unit(&mut locks, &unit)?;
     let write = locks.begin_intent_write()?;
+    // Settling is itself a durable effect, and the lock waits above can consume
+    // the caller's stop window after the caller's own check. The clock is
+    // therefore checked here, with the locks held and immediately before the
+    // phase advance: `false` means nothing was recorded and the intent stays
+    // pending for a later run.
+    if expired(deadline) {
+        return Ok(false);
+    }
     state::advance_intent(&write, state_paths, intent, IntentPhase::Deleted)?;
-    Ok(())
+    Ok(true)
 }
 
 /// A lowercase hexadecimal rendering of fresh bytes.
@@ -4119,6 +4137,43 @@ mod tests {
             intents[0].phase,
             IntentPhase::Removed,
             "no settle was recorded"
+        );
+    }
+
+    #[test]
+    fn a_settle_with_a_spent_clock_records_nothing_and_leaves_the_intent_pending() {
+        let prepared = prepared("settle-deadline");
+        let root = prepared.unit_path().clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        let intent = publish(
+            &prepared,
+            &[
+                IntentPhase::Renamed,
+                IntentPhase::MarkerLast,
+                IntentPhase::Removed,
+            ],
+        );
+
+        // The lock waits inside the settle can consume the caller's stop window,
+        // so the clock is re-checked with those locks held: a spent clock records
+        // no completion and the intent stays at `removed` for a later run.
+        assert!(
+            !super::settle(&prepared.fixture.state, &intent, Some(Instant::now()))
+                .expect("the settle reports"),
+            "a spent clock does not settle"
+        );
+        let intents = prepared.pending_intents();
+        assert_eq!(intents.len(), 1, "the intent stays pending");
+        assert_eq!(intents[0].phase, IntentPhase::Removed, "no settled phase");
+
+        // The counterfactual: with no caller clock the same intent settles.
+        assert!(
+            super::settle(&prepared.fixture.state, &intent, None).expect("the settle reports"),
+            "an unclocked settle records the completion"
+        );
+        assert!(
+            prepared.pending_intents().is_empty(),
+            "the intent is settled"
         );
     }
 
