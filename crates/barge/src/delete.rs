@@ -7,15 +7,16 @@
 //! deletion is whole-root only, of owned roots only, descriptor-relative and
 //! bounded.
 //!
-//! Every phase is durable before the effect it authorises:
+//! Each phase is durable at its own step, before the effect it authorises and
+//! after the effect it records:
 //!
 //! 1. `intent` before the quarantine rename, recording the root id, marker
 //!    digest, device, inode, volume UUID, plan digest and time;
 //! 2. `renamed` before the first unlink;
 //! 3. `marker_last` after the marker is unlinked last and before the quarantine
 //!    leaf is removed;
-//! 4. `removed` once Barge's own final unlink of the leaf succeeded, which is the
-//!    durable completion evidence;
+//! 4. `removed` after Barge's own final unlink of the verified captured leaf
+//!    succeeded, which is the durable completion evidence;
 //! 5. `deleted` once the leaf is gone, which settles the intent.
 //!
 //! A stop after the first effect leaves the intent pending and the quarantine
@@ -624,7 +625,8 @@ fn finish_deletion(
     let mut leaf_custody_mode: Option<u32> = None;
     let leaf_custody = match leaf_facts {
         Some(leaf_facts)
-            if leaf_facts.kind == EntryKind::Directory && leaf_facts.mode & 0o300 != 0o300 =>
+            if leaf_facts.kind == EntryKind::Directory
+                && leaf_facts.permission_mode() & 0o300 != 0o300 =>
         {
             base_chain.push(CaptureRecord {
                 private: intent.quarantine_name.clone(),
@@ -633,7 +635,7 @@ fn finish_deletion(
                 inode: intent.inode,
                 kind: "directory".to_owned(),
                 verdict: CaptureVerdict::Observed,
-                mode: Some(leaf_facts.mode),
+                mode: Some(leaf_facts.st_mode),
             });
             if let Err(error) = journal.record_captures(&base_chain) {
                 return pending_report(
@@ -644,7 +646,7 @@ fn finish_deletion(
                     None,
                 );
             }
-            if let Err(error) = dirs.set_dir_mode(&leaf, leaf_facts.mode | 0o300) {
+            if let Err(error) = dirs.set_dir_mode(&leaf, leaf_facts.permission_mode() | 0o300) {
                 return pending_report(
                     &journal.intent(),
                     quarantine,
@@ -653,8 +655,8 @@ fn finish_deletion(
                     None,
                 );
             }
-            leaf_custody_mode = Some(leaf_facts.mode);
-            Some(ModeCustody::new(dirs, &leaf, leaf_facts.mode))
+            leaf_custody_mode = Some(leaf_facts.st_mode);
+            Some(ModeCustody::new(dirs, &leaf, leaf_facts.st_mode))
         }
         _ => None,
     };
@@ -1367,13 +1369,14 @@ impl<'a> WalkState<'a> {
         // A directory this account cannot write or search cannot have its contents
         // removed. Its mode is recorded before it is changed, so an abort and a
         // replay put back exactly what was there.
-        let changed_mode =
-            if captured.kind == EntryKind::Directory && captured.mode & 0o300 != 0o300 {
-                record.mode = Some(captured.mode);
-                Some(captured.mode)
-            } else {
-                None
-            };
+        let changed_mode = if captured.kind == EntryKind::Directory
+            && captured.permission_mode() & 0o300 != 0o300
+        {
+            record.mode = Some(captured.st_mode);
+            Some(captured.st_mode)
+        } else {
+            None
+        };
         self.remove_recorded(handle, &record, changed_mode, depth, relative, counts)
     }
 
@@ -1542,7 +1545,7 @@ impl<'a> WalkState<'a> {
         // The recorded mode was published before this change; the guard puts it
         // back on every return, `?` error and panic that aborts or puts back.
         let custody = match changed_mode {
-            Some(mode) => match self.dirs.set_dir_mode(&child, mode | 0o300) {
+            Some(mode) => match self.dirs.set_dir_mode(&child, (mode & 0o7777) | 0o300) {
                 Ok(()) => Some(ModeCustody::new(self.dirs, &child, mode)),
                 Err(error) => {
                     return Ok(Walk::Stop(format!(
@@ -1955,7 +1958,7 @@ impl<'a> ModeCustody<'a> {
         if self.settled.replace(true) {
             return Ok(());
         }
-        self.dirs.set_dir_mode(self.handle, self.mode)
+        self.dirs.set_dir_mode(self.handle, self.mode & 0o7777)
     }
 }
 
@@ -1965,7 +1968,7 @@ impl Drop for ModeCustody<'_> {
             // Every return, `?` error and panic restores the recorded mode. A
             // failure here keeps the intent pending, and the intent keeps the mode
             // recorded, so a replay restores it first.
-            let _ = self.dirs.set_dir_mode(self.handle, self.mode);
+            let _ = self.dirs.set_dir_mode(self.handle, self.mode & 0o7777);
         }
     }
 }
@@ -2464,7 +2467,7 @@ fn restore_recorded_modes(
             )));
         }
         if let Some(mode) = record.mode {
-            if let Err(error) = dirs.set_dir_mode(&child, mode) {
+            if let Err(error) = dirs.set_dir_mode(&child, mode & 0o7777) {
                 return Ok(Some(format!(
                     "the recorded mode of `{}` could not be restored: {error}",
                     record.private
@@ -3904,7 +3907,7 @@ mod tests {
                 record
                     .captures
                     .iter()
-                    .any(|capture| capture.mode == Some(0o500))
+                    .any(|capture| capture.mode == Some(0o040500))
             })
         }));
         let facts = prepared.fixture.facts();
@@ -4088,6 +4091,71 @@ mod tests {
     }
 
     #[test]
+    fn a_crash_between_the_actual_final_unlink_and_removed_stays_pending() {
+        // The real transition: the final unlink happens, the `removed` publish does
+        // not. The leaf is gone, and an absence without `removed` is Unknown, so a
+        // replay keeps the intent pending.
+        let prepared = prepared("crash-unlink-before-removed");
+        let root = prepared.observed.path.clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        state::fail_next_phase_publish(IntentPhase::Removed);
+        let faults = Faults::new();
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(report.phase, IntentPhase::MarkerLast, "{report:?}");
+        assert!(
+            !report.quarantine.exists(),
+            "the final unlink actually happened"
+        );
+        let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
+        assert_eq!(intents.records[0].phase, IntentPhase::MarkerLast);
+        assert!(
+            intents.records[0]
+                .captures
+                .iter()
+                .any(|capture| capture.original == intents.records[0].quarantine_name),
+            "the leaf's own capture was recorded before it was removed"
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0]
+                .reason
+                .contains("removed phase was not recorded"),
+            "{:?}",
+            replay.pending[0].reason
+        );
+    }
+
+    #[test]
+    fn a_crash_after_the_durable_removed_phase_settles_on_replay() {
+        // The other side of the window: the final unlink happened and `removed` is
+        // durable, so a replay completes when the leaf is positively absent.
+        let prepared = prepared("crash-after-removed");
+        let root = prepared.observed.path.clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        state::fail_next_phase_publish(IntentPhase::Deleted);
+        let faults = Faults::new();
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(report.phase, IntentPhase::Removed, "{report:?}");
+        assert!(!report.quarantine.exists(), "the leaf is gone");
+        let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
+        assert_eq!(intents.records[0].phase, IntentPhase::Removed);
+
+        let replay = prepared.replay();
+        assert_eq!(replay.settled, 1, "{replay:?}");
+        assert!(replay.is_settled());
+        let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
+        assert_eq!(intents.records[0].phase, IntentPhase::Deleted);
+    }
+
+    #[test]
     fn a_delete_records_the_removed_phase_before_it_settles() {
         // The durable completion evidence is written after Barge's own final unlink
         // and before the intent settles.
@@ -4144,7 +4212,11 @@ mod tests {
         );
         let pending = prepared.pending_intents();
         assert_eq!(pending.len(), 1, "the abort is recorded");
-        assert_eq!(pending[0].captures[0].mode, Some(0o500));
+        assert_eq!(
+            pending[0].captures[0].mode,
+            Some(0o040500),
+            "the record keeps the object's full st_mode"
+        );
         let _ = area;
     }
 
@@ -4241,7 +4313,11 @@ mod tests {
         );
         let pending = prepared.pending_intents();
         assert_eq!(pending.len(), 1, "the abort is recorded");
-        assert_eq!(pending[0].captures[0].mode, Some(0o500));
+        assert_eq!(
+            pending[0].captures[0].mode,
+            Some(0o040500),
+            "the record keeps the object's full st_mode"
+        );
     }
 
     #[test]
@@ -4276,8 +4352,8 @@ mod tests {
         assert_eq!(pending.len(), 1, "the failed restore stays pending");
         assert_eq!(
             pending[0].captures[0].mode,
-            Some(0o500),
-            "the mode is recorded"
+            Some(0o040500),
+            "the object's full st_mode is recorded"
         );
 
         // A replay restores the recorded mode first. The marker is removed here so

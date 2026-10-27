@@ -886,7 +886,8 @@ bounded:
    cross-device or changed-inode result stops before deletion.
 3. Walk and delete through descriptors opened from the area's descriptor:
    `openat` with `O_NOFOLLOW` per directory, and every entry removed through
-   **capture, verify, unlink** (below), never following a symlink, with a depth
+   **capture, verify, record, unlink** (below): the capture and its verdict are
+   durable before the unlink, never following a symlink, with a depth
    bound (12) and per-directory name bound (200 000) and a per-root deadline
    (120 s).
 4. Finder tolerance is exactly Oxide's two forms and nothing broader:
@@ -1021,8 +1022,8 @@ barge#014 brief). An absent name is never proof that Barge deleted its object.
    private name, inside the captured parent's private name.
 3. **Mode custody.** A captured directory this account cannot write or search
    cannot have its contents removed, so Barge adds the owner write and search bits
-   - and only after the object's original full permission mode is recorded
-   durably, in the same capture record. A scope guard restores the recorded mode on
+   - and only after the object's original **full `st_mode`**, the file-type bits
+   included, is recorded durably, in the same capture record. A scope guard restores the recorded mode on
    every return, `?` error and panic that aborts or puts back, so a changed mode is
    never left behind without the intent recording the original. A restore that
    fails leaves the intent pending with the mode recorded. **A replay restores the
@@ -1521,7 +1522,9 @@ Choices S5 made where this design left the mechanic to the slice:
   headroom, and never more than the record's 4 KiB cap allows - and
   each entry carries the private name, the original name, the device, inode and
   kind of the verified object, its verdict (`observed` or `finder`) and, when
-  Barge changed it, the original permission mode. It is a snapshot: a later publish
+  Barge changed it, the original full `st_mode`; a restore applies its permission
+  bits, and the recorded type bits must agree with the recorded kind. It is a
+  snapshot: a later publish
   replaces it, so it never grows with the tree, and it is published before each
   unlink. `foreign_captures` is empty in the common case and absent from the
   document then: at most four failed captures, each with the private name, the
@@ -1545,9 +1548,11 @@ Choices S5 made where this design left the mechanic to the slice:
   intent.
 - **Deletion order.** The intent is durable, custody is re-decided, the root is
   renamed, `renamed` is durable, the volume and the leaf's identity are
-  re-verified, the tree is classified once without mutation, then deleted,
-  then the marker is unlinked last, `marker_last` is durable, the leaf is
-  removed, and `deleted` settles the intent. The two-pass walk is what makes "an
+  re-verified, the tree is classified once without mutation, then deleted, then
+  the marker is unlinked last, `marker_last` is durable, the leaf is captured and
+  verified again under a private name and that capture is durable, the captured
+  leaf is removed, `removed` is durable, and `deleted` settles the intent. The
+  two-pass walk is what makes "an
   unknown entry stops the delete and keeps the root" literal: nothing is
   unlinked until every entry is classified, and the delete pass removes only what
   was classified plus Finder metadata that appeared again. Finder metadata is the
@@ -1594,7 +1599,7 @@ Choices S5 made where this design left the mechanic to the slice:
   the capture rule across a stop: the `removed` phase after Barge's own final
   unlink, with an absence without it staying `Unknown`; the `captures` chain,
   published before each unlink and each chmod, with the verdict and the original
-  permission mode, so only this operation's recorded and verified private objects
+  full `st_mode`, so only this operation's recorded and verified private objects
   are ever unlinked and a replay re-verifies the same identity; and
   `foreign_captures`, published before each put-back, so a failed capture is never
   relabelled as ordinary content by an abort or a replay. A captured directory

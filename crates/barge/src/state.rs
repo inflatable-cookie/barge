@@ -1187,8 +1187,9 @@ pub struct CaptureRecord {
     pub kind: String,
     /// The verification verdict the capture reached.
     pub verdict: CaptureVerdict,
-    /// The object's original full permission mode, recorded before Barge changed
-    /// it so an abort and a replay can restore it.
+    /// The object's original full `st_mode` - the file-type bits included -
+    /// recorded before Barge changed it, so an abort and a replay restore exactly
+    /// what `stat` reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<u32>,
 }
@@ -1220,12 +1221,23 @@ impl CaptureRecord {
             )
             .with_detail("private", self.private.clone().into()));
         }
-        if self.mode.is_some_and(|mode| mode > 0o7777) {
-            return Err(Error::new(
-                ErrorKind::UnknownState,
-                "a recorded mode is not a permission mode".to_owned(),
-            )
-            .with_detail("private", self.private.clone().into()));
+        if let Some(mode) = self.mode {
+            // A full `st_mode` is a 16-bit `mode_t`; its file-type bits must agree
+            // with the recorded kind, so a record cannot claim a directory mode for
+            // a file.
+            let type_bits = mode & 0o170000;
+            let expected = if self.kind == "directory" {
+                0o040000
+            } else {
+                0o100000
+            };
+            if mode > u32::from(u16::MAX) || (mode != 0 && type_bits != expected) {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "a recorded mode is not the object's full st_mode".to_owned(),
+                )
+                .with_detail("private", self.private.clone().into()));
+            }
         }
         Ok(())
     }
@@ -1455,6 +1467,35 @@ pub fn publish_intent(
     publish_atomic(&intent_path(state, &record.intent_id)?, &bytes)
 }
 
+// A test seam: fail the next publish of one phase on this thread, so a test can
+// stop the deletion exactly between an effect and the durable step that follows
+// it - the real unlink and the `removed` phase, for instance.
+#[cfg(test)]
+thread_local! {
+    static FAIL_PHASE_PUBLISH: std::cell::RefCell<Option<IntentPhase>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Fail the next publish that advances an intent to `phase`, on this thread only.
+#[cfg(test)]
+pub(crate) fn fail_next_phase_publish(phase: IntentPhase) {
+    FAIL_PHASE_PUBLISH.with(|cell| *cell.borrow_mut() = Some(phase));
+}
+
+/// Whether this publish is the one a test asked to fail, consuming the request.
+#[cfg(test)]
+fn take_phase_failure(phase: IntentPhase) -> bool {
+    FAIL_PHASE_PUBLISH.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if *cell == Some(phase) {
+            *cell = None;
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// Advance one intent to `phase`, publishing the new generation durably before
 /// its effect. A phase may only move forward, so a stale writer cannot rewind an
 /// intent it raced.
@@ -1474,6 +1515,18 @@ pub fn advance_intent(
             ),
         )
         .with_detail("intent_id", record.intent_id.clone().into()));
+    }
+    #[cfg(test)]
+    {
+        if take_phase_failure(phase) {
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!(
+                    "the `{}` phase publish did not happen: the test stopped the process there",
+                    phase.as_str()
+                ),
+            ));
+        }
     }
     let mut next = record.clone();
     next.phase = phase;
@@ -2338,11 +2391,11 @@ mod intent_tests {
         publish_intent(&write, &state, &intent).expect("the intent publishes");
 
         let mut held = capture("sub", 1);
-        held.mode = Some(0o500);
+        held.mode = Some(0o040500);
         let recorded = super::record_captures(&write, &state, &intent, &[held.clone()])
             .expect("the capture is recorded");
         assert_eq!(recorded.captures.len(), 1);
-        assert_eq!(recorded.captures[0].mode, Some(0o500));
+        assert_eq!(recorded.captures[0].mode, Some(0o040500));
         let read = read_intent(&state, &intent.intent_id).expect("the intent reads back");
         assert_eq!(read.captures[0].private, held.private);
         assert_eq!(read.captures[0].verdict, super::CaptureVerdict::Observed);

@@ -282,6 +282,9 @@ pub struct EntryFacts {
     pub uid: u32,
     /// The permission bits, so a marker or hold file's privacy is checkable.
     pub mode: u32,
+    /// The platform's full `st_mode`, including the file-type bits, so a record
+    /// that has to restore the mode keeps everything `stat` reported.
+    pub st_mode: u32,
     /// The size in bytes; a marker is refused over its cap before it is read.
     pub size: u64,
     /// The modification time, when the platform reports one.
@@ -293,6 +296,11 @@ impl EntryFacts {
     /// authoritative record is written with.
     pub const fn is_private(&self) -> bool {
         self.mode & 0o077 == 0
+    }
+
+    /// The bits `chmod` takes, which are the full mode's permission part.
+    pub const fn permission_mode(&self) -> u32 {
+        self.st_mode & 0o7777
     }
 }
 

@@ -2280,6 +2280,7 @@ fn entry_facts(status: &libc::stat) -> EntryFacts {
         inode: status.st_ino,
         uid: status.st_uid,
         mode: u32::from(status.st_mode) & 0o7777,
+        st_mode: u32::from(status.st_mode),
         size: u64::try_from(status.st_size).unwrap_or(0),
         modified_ms: modified_ms(status),
     }
