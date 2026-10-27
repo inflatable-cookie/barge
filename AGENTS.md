@@ -28,6 +28,8 @@ follow the first consumer's manifests and are pinned in `rust-toolchain.toml`;
 Rust selectors run through `oxide`, never `cargo`; the `oxide:begin` block below
 lists the commands. Each covers what it names:
 
+- `effigy barge:install:test` — synthetic installer refusal and receipt fixtures; no real build or install.
+- `effigy barge:install` / `effigy barge:reinstall` — planner only, after a reviewed merge; Tom's go-ahead is required for the first host install. Set `BARGE_INSTALL_PIN` and `BARGE_INSTALL_SCRATCH` as documented in the [consumer contract](docs/knowledge/contracts/consumption.md).
 - `effigy rust:compile` — `oxide check --workspace --all-targets --locked`.
 - `effigy rust:format` — `oxide fmt --all -- --check`; run it when formatted
   Rust changed.
