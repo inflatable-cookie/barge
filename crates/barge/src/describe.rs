@@ -75,6 +75,8 @@ pub struct DescribeRequest<'a> {
     pub facts: &'a dyn VolumeFacts,
     /// The platform's mount-root proof.
     pub mounts: &'a dyn MountRoot,
+    /// Space measurement provider, when the caller requests space rows.
+    pub space: Option<&'a dyn crate::os::SpaceFacts>,
     /// The platform's process observations, for a root's holds.
     pub observer: &'a dyn ProcessObserver,
 }
@@ -135,6 +137,9 @@ pub struct DescribeData {
     /// `root_dir` change is visible without anything having moved.
     #[serde(default)]
     pub roots: RowSet<RootObservation>,
+    /// Per-volume space measurements and declared policies.
+    #[serde(default)]
+    pub space: RowSet<crate::space::SpaceRow>,
     /// Foreign observations, bounded to the observation row cap.
     pub observations: RowSet<ObservationRow>,
     /// Identity facts used across a remount.
@@ -482,6 +487,13 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
     let observation_rows = observations.rows().to_vec();
     let observation_total = observation_rows.len();
 
+    let space = match request.space {
+        Some(provider) => {
+            crate::space::report(&paths, request.facts, request.mounts, provider)?.volumes
+        }
+        None => RowSet::empty(),
+    };
+
     Ok(DescribeData {
         tool: ToolVersions {
             name: TOOL_NAME.to_owned(),
@@ -493,6 +505,7 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
         areas: RowSet::bounded(area_rows, area_total, AREA_ROWS),
         placements,
         roots,
+        space,
         observations: RowSet::bounded(observation_rows, observation_total, OBSERVATION_ROWS),
         custody: crate::custody::capability_report(),
         identity: IdentityCapability::default(),
@@ -713,6 +726,7 @@ pub fn read_describe_document(bytes: &[u8]) -> Result<DescribeData> {
     data.areas.validate()?;
     data.placements.validate()?;
     data.roots.validate()?;
+    data.space.validate()?;
     data.observations.validate()?;
     Ok(data)
 }
@@ -867,6 +881,7 @@ mod tests {
                 dirs: &self.platform,
                 facts: &self.platform,
                 mounts: &self.platform,
+                space: None,
                 observer: &self.platform,
             }
         }
@@ -900,6 +915,7 @@ mod tests {
                 folders: FolderOverrides::none(),
                 origin: RecordOrigin::Declared,
                 scratch_grants: ScratchGrants::none(),
+                space: None,
                 generation: 1,
                 registered_ms: 1_792_525_019_847,
             }]);
@@ -957,6 +973,7 @@ mod tests {
             dirs: &fixture.platform,
             facts: &fixture.platform,
             mounts: &fixture.platform,
+            space: None,
             observer: &fixture.platform,
         })
         .expect("describe reads");
@@ -984,6 +1001,7 @@ mod tests {
             dirs: &fixture.platform,
             facts: &fixture.platform,
             mounts: &fixture.platform,
+            space: None,
             observer: &fixture.platform,
         })
         .expect("describe reads");
@@ -1006,6 +1024,7 @@ mod tests {
             dirs: &fixture.platform,
             facts: &fixture.platform,
             mounts: &fixture.platform,
+            space: None,
             observer: &fixture.platform,
         })
         .expect("describe reads");
@@ -1417,6 +1436,7 @@ mod tests {
             dirs: &platform,
             facts: &platform,
             mounts: &platform,
+            space: None,
             observer: &platform,
         })
         .expect_err("an unreadable account home refuses");
@@ -1460,6 +1480,7 @@ mod tests {
             },
             origin: RecordOrigin::ObservedOxide,
             scratch_grants: ScratchGrants::none(),
+            space: None,
             generation: 1,
             registered_ms: 0,
         };
@@ -1492,6 +1513,7 @@ mod tests {
             dirs: &fixture.platform,
             facts: &fixture.platform,
             mounts: &fixture.platform,
+            space: None,
             observer: &fixture.platform,
         })
         .expect_err("a relative override is refused");
@@ -1606,6 +1628,7 @@ mod tests {
             folders: FolderOverrides::none(),
             origin: RecordOrigin::Declared,
             scratch_grants: ScratchGrants::none(),
+            space: None,
             generation: 1,
             registered_ms: 1_792_525_019_847,
         };
@@ -1665,6 +1688,7 @@ mod tests {
             dirs: platform,
             facts: &volume,
             mounts: &volume,
+            space: None,
             observer: &volume,
         };
         let data = describe(&request).expect("describe reads");
