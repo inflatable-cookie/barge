@@ -2,11 +2,17 @@
 //!
 //! Every fixture lives inside a directory this process creates and removes, and
 //! never at a fixed path, so two tests — or two tasks on one machine — cannot
-//! share a name. Tests that need the state directory use
+//! share a name. A fixture that needs the real OS layer lives inside one run
+//! root as well ([`RunRoot`]): the caller's fresh
+//! `/Volumes/Builds/scratch/barge/run.*` directory when it names one, and
+//! otherwise a `run.*` directory this process creates and removes for the
+//! fixture, so no fixture is ever created directly in the shared scratch parent.
+//! Tests that need the state directory use
 //! [`crate::state::StatePaths`] over a directory here.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,8 +21,19 @@ static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The scratch directory AGENTS.md names for scratch writes when the Builds
 /// drive is present. Nothing is ever written to a fixed name inside it: every
-/// fixture is a fresh directory this process creates and removes.
+/// fixture is a fresh directory this process creates and removes, inside a run
+/// root of its own.
 pub const SCRATCH_BASE: &str = "/Volumes/Builds/scratch/barge";
+
+/// The variable that names the run root one invocation's real-OS fixtures live
+/// in.
+///
+/// A caller that wants every fixture of a run inside one directory it owns — a
+/// task that must not write in the shared scratch parent, for instance — creates
+/// a fresh `mktemp -d /Volumes/Builds/scratch/barge/run.XXXXXX`, names it here
+/// and removes it when the run is over. Unset, each fixture gets a `run.*` root
+/// of its own under [`scratch_base`], which it removes itself.
+pub const SCRATCH_ROOT_ENV: &str = "BARGE_TEST_SCRATCH_ROOT";
 
 /// The base a fixture that needs the real OS layer is created under.
 ///
@@ -32,10 +49,61 @@ pub fn scratch_base() -> PathBuf {
     }
 }
 
+/// The run root one real-OS fixture lives in.
+///
+/// A supplied root belongs to its caller and is never removed here; one this
+/// process creates is removed with the fixture that created it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRoot {
+    /// The directory fixtures are created inside.
+    pub path: PathBuf,
+    /// Whether this process created the root and must remove it when empty.
+    pub owned: bool,
+}
+
+/// Resolve the run root for one invocation: the supplied directory when there is
+/// one, and otherwise a fresh root under `parent` that this process owns.
+pub fn run_root_in(parent: &Path, supplied: Option<&OsStr>) -> RunRoot {
+    match supplied {
+        Some(path) if !path.is_empty() => RunRoot {
+            path: PathBuf::from(path),
+            owned: false,
+        },
+        _ => RunRoot {
+            path: fresh_run_root(parent),
+            owned: true,
+        },
+    }
+}
+
+/// The run root this test invocation was given, or a fresh one per fixture.
+pub fn scratch_root() -> RunRoot {
+    run_root_in(
+        &scratch_base(),
+        std::env::var_os(SCRATCH_ROOT_ENV).as_deref(),
+    )
+}
+
+/// A fresh, unused `run.*` name under `parent`. The directory is created by the
+/// fixture that moves into it, so a name that is somehow taken is retried there.
+fn fresh_run_root(parent: &Path) -> PathBuf {
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    parent.join(format!(
+        "run.barge-test-{}-{sequence}-{nanos}",
+        std::process::id()
+    ))
+}
+
 /// A temporary directory that removes itself when the test ends.
 #[derive(Debug)]
 pub struct TempDir {
     path: PathBuf,
+    /// The run root this process created for the fixture, removed once the
+    /// fixture is gone and the root is empty. `None` for a root a caller owns.
+    owned_root: Option<PathBuf>,
 }
 
 impl TempDir {
@@ -47,6 +115,33 @@ impl TempDir {
     /// Create a fresh directory named after `label` and this process under
     /// `base`, creating `base` when it is not there.
     pub fn under(base: &Path, label: &str) -> Self {
+        Self {
+            path: Self::create_under(base, label),
+            owned_root: None,
+        }
+    }
+
+    /// Create a fresh directory inside this invocation's run root: the fresh
+    /// `/Volumes/Builds/scratch/barge/run.*` directory [`SCRATCH_ROOT_ENV`]
+    /// names when the caller supplied one, and otherwise a fresh `run.*` root
+    /// this process creates and removes. Nothing is created in the shared scratch
+    /// parent itself.
+    pub fn under_scratch(label: &str) -> Self {
+        Self::within_run_root(&scratch_root(), label)
+    }
+
+    /// Create a fresh directory inside `root`, and remove the root itself after
+    /// this fixture when this process created it.
+    pub fn within_run_root(root: &RunRoot, label: &str) -> Self {
+        Self {
+            path: Self::create_under(&root.path, label),
+            owned_root: root.owned.then(|| root.path.clone()),
+        }
+    }
+
+    /// The path one fresh directory under `base` got, creating `base` when it is
+    /// not there.
+    fn create_under(base: &Path, label: &str) -> PathBuf {
         if !base.is_dir() {
             std::fs::create_dir_all(base).expect("the fixture base is created");
         }
@@ -60,7 +155,7 @@ impl TempDir {
                 std::process::id()
             ));
             match std::fs::create_dir(&path) {
-                Ok(()) => return Self { path },
+                Ok(()) => return path,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => panic!("cannot create the fixture directory: {error}"),
             }
@@ -95,6 +190,12 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+        if let Some(root) = self.owned_root.take() {
+            // Removing the root succeeds only when this fixture was the last
+            // thing in it, so a fixture something else still holds is never
+            // deleted. A root the caller supplied is never removed here.
+            let _ = std::fs::remove_dir(&root);
+        }
     }
 }
 
@@ -286,6 +387,17 @@ impl ProcessObserver for FakeObserver {
         Ok(self.processes.get(&pid).copied().flatten())
     }
 
+    fn verify_platform_binary(
+        &self,
+        _classified: crate::os::ProcessIdentity,
+    ) -> Result<crate::os::PlatformStatus> {
+        // The fixture scan reports no opaque descriptor, so this is never asked;
+        // it answers honestly rather than pretending to a platform binary.
+        Ok(crate::os::PlatformStatus::NotVerified {
+            reason: "this observer reports no platform binary".to_owned(),
+        })
+    }
+
     fn scan_open_descriptors(
         &self,
         _request: &DescriptorScanRequest<'_>,
@@ -296,6 +408,7 @@ impl ProcessObserver for FakeObserver {
                 descriptors: 12,
                 foreign: 0,
                 retry: crate::os::RetryEvidence::default(),
+                os_blind_spot: crate::os::BlindSpotEvidence::default(),
                 open: Vec::new(),
             }),
             ScanMode::Open(open) => Ok(DescriptorScan::Complete {
@@ -303,6 +416,7 @@ impl ProcessObserver for FakeObserver {
                 descriptors: 12,
                 foreign: 0,
                 retry: crate::os::RetryEvidence::default(),
+                os_blind_spot: crate::os::BlindSpotEvidence::default(),
                 open: open.clone(),
             }),
             ScanMode::Bounded => Ok(DescriptorScan::Bounded {
@@ -565,10 +679,10 @@ impl VolumeFixture {
         Self::within(TempDir::new(label))
     }
 
-    /// A fresh fixture volume under the scratch base (AGENTS.md), for a test
-    /// that exercises the real OS layer instead of injected facts.
+    /// A fresh fixture volume inside this invocation's run root (AGENTS.md), for
+    /// a test that exercises the real OS layer instead of injected facts.
     pub fn under_scratch(label: &str) -> Self {
-        Self::within(TempDir::under(&scratch_base(), label))
+        Self::within(TempDir::under_scratch(label))
     }
 
     fn within(dir: TempDir) -> Self {
@@ -754,5 +868,112 @@ impl VolumeFixture {
         let mut bytes = serde_json::to_vec_pretty(&value).expect("the hold encodes");
         bytes.push(b'\n');
         bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::path::Path;
+
+    use super::{run_root_in, scratch_base, scratch_root, RunRoot, TempDir, SCRATCH_ROOT_ENV};
+
+    /// How many entries a fresh fixture parent holds.
+    fn entries(directory: &Path) -> usize {
+        std::fs::read_dir(directory)
+            .expect("the directory is listed")
+            .count()
+    }
+
+    #[test]
+    fn a_real_os_fixture_stays_inside_the_run_root_it_is_given() {
+        // The parent stands in for the run scratch area, and `run.supplied` for
+        // the fresh `run.*` directory a test invocation names in
+        // `SCRATCH_ROOT_ENV`. The fixture must land inside that root, nothing may
+        // appear beside it, and the root must survive the fixture: the caller
+        // owns it.
+        let parent = TempDir::new("run-root-supplied");
+        let supplied = parent.join("run.supplied");
+        let root = run_root_in(parent.path(), Some(supplied.as_os_str()));
+        assert_eq!(
+            root,
+            RunRoot {
+                path: supplied.clone(),
+                owned: false,
+            }
+        );
+        let fixture = TempDir::within_run_root(&root, "contained");
+        assert!(
+            fixture.path().starts_with(&supplied),
+            "the fixture is inside the supplied run root: {}",
+            fixture.path().display()
+        );
+        assert_eq!(fixture.path().parent(), Some(supplied.as_path()));
+        assert_eq!(
+            entries(parent.path()),
+            1,
+            "the run root is the only entry in the scratch area"
+        );
+        let path = fixture.path().to_path_buf();
+        drop(fixture);
+        assert!(!path.exists(), "the fixture removes itself");
+        assert!(
+            supplied.is_dir(),
+            "a supplied run root is left for its owner"
+        );
+        assert_eq!(entries(&supplied), 0, "the run root is left empty");
+        assert_eq!(entries(parent.path()), 1);
+    }
+
+    #[test]
+    fn a_fixture_that_creates_its_own_run_root_removes_it() {
+        // Without a supplied root, the fixture gets a fresh `run.*` root of its
+        // own under the scratch base, and removes that root with itself: nothing
+        // is created beside it and nothing is left behind.
+        let parent = TempDir::new("run-root-owned");
+        let root = run_root_in(parent.path(), None);
+        assert!(root.owned);
+        assert_eq!(root.path.parent(), Some(parent.path()));
+        assert!(
+            root.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("run.")),
+            "the root is a fresh `run.*` name: {}",
+            root.path.display()
+        );
+        let fixture = TempDir::within_run_root(&root, "owned");
+        assert!(fixture.path().starts_with(&root.path));
+        assert_eq!(entries(parent.path()), 1);
+        drop(fixture);
+        assert!(!root.path.exists(), "the owned run root is removed");
+        assert_eq!(entries(parent.path()), 0, "nothing is left beside it");
+    }
+
+    #[test]
+    fn the_invocations_run_root_is_what_a_real_os_fixture_lives_in() {
+        // The wiring, read-only: a supplied root is used as it is and belongs to
+        // the caller; without one, the fixture base is a fresh `run.*` directory
+        // under the scratch base rather than the shared parent itself.
+        let root = scratch_root();
+        match std::env::var_os(SCRATCH_ROOT_ENV) {
+            Some(supplied) => {
+                assert_eq!(root.path, std::path::PathBuf::from(supplied));
+                assert!(!root.owned, "a supplied run root is never removed here");
+            }
+            None => {
+                assert!(root.owned);
+                assert_eq!(root.path.parent(), Some(scratch_base().as_path()));
+                assert!(
+                    root.path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("run.")),
+                    "the fixture base is a run root, not the shared parent: {}",
+                    root.path.display()
+                );
+            }
+        }
     }
 }

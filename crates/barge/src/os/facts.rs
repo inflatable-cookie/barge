@@ -473,6 +473,23 @@ pub trait ProcessObserver {
     /// and never stale.
     fn process_start(&self, pid: u32) -> Result<Option<u64>>;
 
+    /// Verify that one classified process is a platform binary, so the vnode
+    /// descriptors whose paths the platform hides are an OS blind spot rather
+    /// than an unreadable fact (Tom, 2026-10-26, decision e528a712).
+    ///
+    /// The scan asks this only about a process it classified as this account's
+    /// own, and only when the platform hid the path of at least one of its vnode
+    /// descriptors. `classified` is the identity the scan classified the process
+    /// with, and the answer is [`PlatformStatus::PlatformBinary`] only when the
+    /// platform's own code-signing status reports the platform binary flag
+    /// **and** the process's start identity is still the classified one after
+    /// that read: an identity that changed around it is a different process, so
+    /// nothing the read says is evidence about the descriptors just listed. An
+    /// unreadable status is an error, never a `NotVerified` that could be read as
+    /// a fact about the process. Every answer except `PlatformBinary` leaves the
+    /// opaque descriptors unreadable, which is unknown and never safe.
+    fn verify_platform_binary(&self, classified: ProcessIdentity) -> Result<PlatformStatus>;
+
     /// Observe, within a bound, whether any process of this account holds an
     /// open descriptor at or under `request.root`.
     ///
@@ -494,11 +511,17 @@ pub trait ProcessObserver {
     /// on a later listing, a gone process, a changed start identity or a changed
     /// effective uid, and never on elapsed time. The same identity still
     /// answering `EPERM` is
-    /// unreadable, which is unknown and never safe. A scan that reaches its
+    /// unreadable, which is unknown and never safe. A vnode descriptor whose
+    /// path the platform hides is an unreadable descriptor too, unless
+    /// [`Self::verify_platform_binary`] verifies the process it belongs to: then
+    /// the descriptors are counted in [`DescriptorScan::Complete`]'s
+    /// [`BlindSpotEvidence`] and do not block, and every readable descriptor of
+    /// that same process is still evaluated. A scan that reaches its
     /// process, descriptor or time bound answers [`DescriptorScan::Bounded`],
     /// which is unknown and never safe. An unreadable effective uid, and an
     /// unreadable descriptor entry of this account's process that is not a
-    /// retried `EPERM`, answers [`DescriptorScan::Unreadable`], which is also
+    /// retried `EPERM` or a verified platform binary's opaque descriptor, answers
+    /// [`DescriptorScan::Unreadable`], which is also
     /// unknown and never safe and carries the bounded retry record with it. A
     /// returned error is a fact the scan could not begin with: this account's own
     /// effective uid or the kernel's process table.
@@ -560,6 +583,106 @@ pub struct DescriptorScanRequest<'a> {
     /// counterfactual the tests use to show what the exclusion prevents, and a
     /// request without it can only make a verdict stricter.
     pub self_exclusion: Option<SelfExclusion>,
+}
+
+/// What one process's code-signing status says about the vnode descriptors
+/// whose paths the platform hides.
+///
+/// Only [`PlatformBinary`](Self::PlatformBinary) makes those descriptors an OS
+/// blind spot. It is an answer rather than a verdict: the scan records it in the
+/// evidence, and every other answer leaves the opaque descriptors unreadable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlatformStatus {
+    /// The platform's code-signing status reports the platform binary flag for
+    /// this process, and its start identity was unchanged before and after that
+    /// read. `command` is the command the platform's own table reports for it,
+    /// recorded with the blind spot.
+    PlatformBinary {
+        /// The command name the kernel's own table reports for the process.
+        command: String,
+    },
+    /// Everything else: the flag is not set, the process is not there any more,
+    /// or its start identity changed around the read. The reason is reported for
+    /// a human and never exempts a descriptor.
+    NotVerified {
+        /// Why the process is not a verified platform binary.
+        reason: String,
+    },
+}
+
+/// The most blind-spot processes one scan records.
+///
+/// Every one of them is recorded, and a scan that meets more than this bound
+/// refuses instead of dropping the surplus: a bounded record that silently
+/// narrows is worse than a refusal, because the `Safe` evidence would count
+/// processes it no longer names. The measured hosts need far fewer (Q-008: eight
+/// processes of this account on macOS 26.6.2).
+pub const BLIND_SPOT_RECORDS: usize = 32;
+
+/// One process the platform verified as a platform binary, whose vnode
+/// descriptor paths it therefore hides.
+///
+/// It is the **OS blind spot**, not the named blind spot of a process of another
+/// effective uid: the process is one custody may inspect, and it is recorded
+/// rather than silently skipped. Its descriptors could point inside the root and
+/// nothing Barge can read says whether they do, which is why `describe` names
+/// the residual (Tom, 2026-10-26, decision e528a712).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformBlindSpot {
+    /// The process's pid.
+    pub pid: u32,
+    /// The start identity the scan classified it with and re-verified after the
+    /// code-signing read.
+    pub start: u64,
+    /// The command name the platform's own table reports for it.
+    pub command: String,
+    /// How many of its vnode descriptors the platform hid: both the path and the
+    /// vnode facts answered `EPERM` for each of them.
+    pub opaque_descriptors: usize,
+}
+
+/// The OS blind spots one scan found: platform-verified processes whose vnode
+/// descriptor paths the platform hides.
+///
+/// The platform flag was verified for every process recorded here, which is what
+/// makes the count evidence rather than a claim. `records` holds **every**
+/// process `processes` counts — the record is never truncated — but it is
+/// bounded: a scan that meets more than [`BLIND_SPOT_RECORDS`] of them cannot
+/// report them all, so it answers unknown instead of dropping one and claiming
+/// the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlindSpotEvidence {
+    /// How many same-uid processes the scan verified as platform binaries with at
+    /// least one opaque vnode descriptor. Always `records.len()`.
+    pub processes: usize,
+    /// How many vnode descriptors the platform hid on them, in total.
+    pub opaque_descriptors: usize,
+    /// The record of those processes, in scan order: one entry per counted
+    /// process, and never more than [`BLIND_SPOT_RECORDS`].
+    pub records: Vec<PlatformBlindSpot>,
+}
+
+impl BlindSpotEvidence {
+    /// Record one verified platform binary.
+    ///
+    /// `false` means the record is full: this process could not be kept, so the
+    /// evidence would be incomplete and the scan must answer unknown rather than
+    /// report a partial record as complete. A dropped blind-spot process is
+    /// exactly the silently narrowing evidence custody must never produce.
+    #[must_use = "an unrecorded blind spot makes the evidence incomplete, so the scan must refuse"]
+    pub fn record(&mut self, record: PlatformBlindSpot) -> bool {
+        if self.records.len() >= BLIND_SPOT_RECORDS {
+            return false;
+        }
+        self.opaque_descriptors = self
+            .opaque_descriptors
+            .saturating_add(record.opaque_descriptors);
+        self.records.push(record);
+        self.processes = self.processes.saturating_add(1);
+        true
+    }
 }
 
 /// The most retried pids one scan records in its evidence.
@@ -676,6 +799,11 @@ pub enum DescriptorScan {
         foreign: usize,
         /// The bounded record of every same-uid `EPERM` the scan re-observed.
         retry: RetryEvidence,
+        /// The platform-verified processes whose vnode descriptor paths the
+        /// platform hides: counted and reported, and not a refusal, because the
+        /// platform's own code-signing status explains them (Tom, 2026-10-26,
+        /// decision e528a712).
+        os_blind_spot: BlindSpotEvidence,
         /// The open descriptors at or under the root.
         open: Vec<OpenDescriptor>,
     },

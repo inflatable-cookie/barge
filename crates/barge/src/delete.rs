@@ -1349,8 +1349,8 @@ mod tests {
     use crate::custody::ObservedRoot;
     use crate::error::ErrorKind;
     use crate::os::{
-        DescriptorScan, DescriptorScanRequest, DeviceId, ProcessObserver, RetriedUnreadable,
-        RetryEvidence, RetryResolution,
+        DescriptorScan, DescriptorScanRequest, DeviceId, PlatformStatus, ProcessIdentity,
+        ProcessObserver, RetriedUnreadable, RetryEvidence, RetryResolution,
     };
     use crate::state::{self, IntentPhase, IntentRecord, LockSet, QUARANTINE_PREFIX};
     use crate::testkit::{FakeObserver, Faults, VolumeFixture};
@@ -1465,6 +1465,13 @@ mod tests {
 
         fn process_start(&self, pid: u32) -> crate::error::Result<Option<u64>> {
             self.inner.process_start(pid)
+        }
+
+        fn verify_platform_binary(
+            &self,
+            classified: ProcessIdentity,
+        ) -> crate::error::Result<PlatformStatus> {
+            self.inner.verify_platform_binary(classified)
         }
 
         fn scan_open_descriptors(

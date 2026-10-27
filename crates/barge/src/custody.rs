@@ -17,6 +17,11 @@
 //!   later listing, a gone process, a changed start identity or a changed
 //!   effective uid — never on elapsed time (barge#012), with that bounded record
 //!   carried on every verdict, refusals included;
+//! - a vnode descriptor whose path the platform hides counts as an OS blind spot,
+//!   counted and reported, only when the process's own code-signing status
+//!   verifies it as a platform binary and its start identity is unchanged around
+//!   that read (barge#013, Tom's decision e528a712); every other hidden
+//!   descriptor is unreadable and refuses;
 //! - the root's device, inode and marker digest equal to the observation the
 //!   caller was given;
 //! - the volume still verified; and
@@ -24,9 +29,11 @@
 //!
 //! Two residuals are named in [`capability_report`] rather than implied: a
 //! process of another effective uid, which the kernel's own process table
-//! classifies and the evidence counts but nothing inspects, and a process that
-//! dropped its hold and kept writing. A wrong delete stays recoverable through
-//! the intent journal and quarantine rename. The scan excludes the calling
+//! classifies and the evidence counts but nothing inspects, and a descriptor
+//! whose path a verified platform binary's process hides, which is counted and
+//! reported as the OS blind spot because nothing can read where it points. A
+//! process that dropped its hold and kept writing is named there too. A wrong
+//! delete stays recoverable through the intent sequence and quarantine rename. The scan excludes the calling
 //! `barge` process and nothing else: another Barge process, its child or its
 //! parent holds a descriptor like any other writer. `lsof` is never custody: it
 //! is external, unbounded and its silence is not a kernel guarantee, so nothing
@@ -44,8 +51,8 @@ use crate::area::{self, HoldState, MarkerExpectation, MarkerState};
 use crate::contract::HOLD_ROWS;
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
-    DescriptorScan, DescriptorScanRequest, DeviceId, DirOps, MountRoot, ProcessObserver,
-    RetryEvidence, SelfExclusion, VolumeFacts, VolumeUuid,
+    BlindSpotEvidence, DescriptorScan, DescriptorScanRequest, DeviceId, DirOps, MountRoot,
+    ProcessObserver, RetryEvidence, SelfExclusion, VolumeFacts, VolumeUuid,
 };
 use crate::registry;
 use crate::state::{self, IntentRecord, StatePaths};
@@ -211,6 +218,18 @@ pub struct CustodyEvidence {
     /// the command, start identity, errno sequence and resolution, so a native
     /// diagnostic can tell an intermittent answer from a persistent one.
     pub retry: RetryEvidence,
+    /// The OS blind spot the scan counted: how many same-uid processes the
+    /// platform's own code-signing status verified as platform binaries with
+    /// vnode descriptors whose path and vnode facts it hides
+    /// (`processes`), how many such descriptors there were in total, and the
+    /// record of **each** of those processes — pid, start identity, command and
+    /// how many of its descriptors were hidden (barge#013, Tom's decision
+    /// e528a712). Nothing can read where those descriptors point, so this is
+    /// reported rather than implied, and it never blocks `Safe`. The record is
+    /// bounded but never truncated: a scan that meets more than
+    /// [`crate::os::BLIND_SPOT_RECORDS`] such processes refuses rather than
+    /// count one it cannot name.
+    pub os_blind_spot: BlindSpotEvidence,
     /// When the verdict was decided.
     pub checked_ms: u64,
 }
@@ -544,7 +563,7 @@ fn decide(
             start: self_start,
         }),
     });
-    let (processes, descriptors, foreign, retry) = match scan {
+    let (processes, descriptors, foreign, retry, os_blind_spot) = match scan {
         Err(error) => {
             return Err(Refusal::refuse_unknown(format!(
                 "the open-descriptor scan is unreadable: {error}"
@@ -576,6 +595,7 @@ fn decide(
             descriptors,
             foreign,
             retry,
+            os_blind_spot,
             open,
         }) => {
             if let Some(first) = open.first() {
@@ -587,7 +607,7 @@ fn decide(
                 ))
                 .with_retry(retry));
             }
-            (processes, descriptors, foreign, retry)
+            (processes, descriptors, foreign, retry, os_blind_spot)
         }
     };
 
@@ -604,6 +624,7 @@ fn decide(
         self_excluded: self_pid,
         foreign_uid_processes: foreign,
         retry,
+        os_blind_spot,
         checked_ms: state::now_ms(),
     })
 }
@@ -641,6 +662,8 @@ pub fn capability_report() -> CustodyReport {
             "that scan classifies each process by the effective uid the kernel's own process table reports, before it inspects any descriptor, and reports how many processes of another effective uid it classified".to_owned(),
             "that scan excludes the calling barge process's own descriptors, by its pid and the start identity read once and verified, and no other process: another barge process, its child or its parent is observed like any other same-uid writer".to_owned(),
             "that scan re-observes a same-uid process whose descriptor listing the kernel answers EPERM for, by re-reading the kernel's pid, start identity and effective uid and listing again at most three times inside a 250 ms settle window, with both that window and the scan's own deadline rechecked after every backoff, and settles it only on a positive fact: a later listing, a process the kernel reports gone, a changed start identity re-evaluated as the different process it now names, or a changed effective uid counted as the named blind spot; the same identity still answering EPERM is unknown and refuses, and elapsed time is never taken as proof".to_owned(),
+            "that scan treats a vnode descriptor whose path and vnode facts the platform both answer EPERM for as an OS blind spot, counted and reported in the evidence and never a refusal, only when the process's own code-signing status carries the platform binary flag and its kernel start identity is unchanged before and after that read; a process that is not a verified platform binary, a status read that fails, and an identity that changes around it leave those descriptors unknown".to_owned(),
+            "that evidence names every blind-spot process it counts — pid, kernel start identity, command and hidden-descriptor count — up to 32 of them, and a scan that meets more refuses rather than report a count it cannot show".to_owned(),
             "the bounded record of that re-observation — how many processes it re-observed, and for up to eight of them the command, kernel start identity, errno sequence, identity changes and resolution — is reported on every verdict and in every refusal's failure detail, so a diagnostic of a refusal sees it too".to_owned(),
             "the root's device, inode and marker digest equal the observation the caller was given".to_owned(),
             "the volume still verifies as the registered one".to_owned(),
@@ -648,6 +671,7 @@ pub fn capability_report() -> CustodyReport {
         ],
         excludes: vec![
             "a process of another effective uid: classified from the kernel's process table and reported in the evidence as not observed, never inspected".to_owned(),
+            "a vnode descriptor whose path the platform hides on a process it verifies as a platform binary: counted and reported as the OS blind spot, and not observed, because nothing Barge can read says where it points".to_owned(),
             "a process created after the scan".to_owned(),
             "a writer that never took a hold and stopped being observable".to_owned(),
         ],
@@ -671,7 +695,8 @@ mod tests {
     use crate::error::{Error, ErrorKind, Result};
     use crate::os::{
         platform, retry_schedule, DescriptorScan, DescriptorScanRequest, OpenDescriptor,
-        ProcessIdentity, ProcessObserver, RetryResolution, StatedListing, VolumeUuid,
+        PlatformStatus, ProcessIdentity, ProcessObserver, RetryResolution, StatedListing,
+        StatedPlatform, VolumeUuid,
     };
     use crate::testkit::{Faults, ScanMode, VolumeFixture, FIXTURE_BOOT, OTHER_UUID};
 
@@ -733,6 +758,21 @@ mod tests {
                 .stdin(std::process::Stdio::null())
                 .spawn()
                 .expect("a same-uid child runs");
+            Self { process }
+        }
+
+        /// Spawn `/bin/sleep` holding two files under the root open, on stdin and
+        /// stdout, so one of its descriptors can be stated opaque while another
+        /// stays readable.
+        fn holding_two(first: &std::path::Path, second: &std::path::Path) -> Self {
+            let first = std::fs::File::open(first).expect("the first held file opens");
+            let second = std::fs::File::open(second).expect("the second held file opens");
+            let process = std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .stdin(std::process::Stdio::from(first))
+                .stdout(std::process::Stdio::from(second))
+                .spawn()
+                .expect("a same-uid child holds both files open");
             Self { process }
         }
 
@@ -833,6 +873,12 @@ mod tests {
             self.inner.process_start(pid)
         }
 
+        fn verify_platform_binary(&self, classified: ProcessIdentity) -> Result<PlatformStatus> {
+            // The stated answers reach the scan itself, which is where the
+            // exemption is decided; this is the production read.
+            self.inner.verify_platform_binary(classified)
+        }
+
         fn scan_open_descriptors(
             &self,
             request: &DescriptorScanRequest<'_>,
@@ -863,6 +909,10 @@ mod tests {
 
         fn process_start(&self, pid: u32) -> Result<Option<u64>> {
             self.inner.process_start(pid)
+        }
+
+        fn verify_platform_binary(&self, classified: ProcessIdentity) -> Result<PlatformStatus> {
+            self.inner.verify_platform_binary(classified)
         }
 
         fn scan_open_descriptors(
@@ -908,6 +958,10 @@ mod tests {
                     });
             }
             Ok(start)
+        }
+
+        fn verify_platform_binary(&self, classified: ProcessIdentity) -> Result<PlatformStatus> {
+            self.inner.verify_platform_binary(classified)
         }
 
         fn scan_open_descriptors(
@@ -1228,6 +1282,30 @@ mod tests {
                 .any(|fact| fact.contains("errno sequence")),
             "the capability names the bounded record each retried pid leaves: {:?}",
             report.establishes
+        );
+        assert!(
+            report
+                .establishes
+                .iter()
+                .any(|fact| fact.contains("platform binary flag") && fact.contains("OS blind spot")),
+            "the capability names the verified platform binary exemption and its condition: {:?}",
+            report.establishes
+        );
+        assert!(
+            report
+                .establishes
+                .iter()
+                .any(|fact| fact.contains("names every blind-spot process")),
+            "the capability says the evidence names each blind-spot process rather than a count it cannot show: {:?}",
+            report.establishes
+        );
+        assert!(
+            report
+                .excludes
+                .iter()
+                .any(|fact| fact.contains("platform binary") && fact.contains("OS blind spot")),
+            "the capability names the blind spot as not observed: {:?}",
+            report.excludes
         );
     }
 
@@ -1618,6 +1696,7 @@ mod tests {
                 errnos: vec![EPERM],
                 start: Some(identity.start.saturating_add(1)),
                 uid: None,
+                ..StatedListing::default()
             }],
         );
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
@@ -1821,6 +1900,7 @@ mod tests {
                 errnos: vec![EPERM],
                 start: None,
                 uid: Some(foreign),
+                ..StatedListing::default()
             }],
         );
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
@@ -1897,5 +1977,255 @@ mod tests {
         assert_eq!(record.errnos, vec![EPERM]);
         assert_eq!(record.resolution, RetryResolution::Unreadable);
         assert!(verdict.into_evidence().is_err(), "unknown refuses");
+    }
+
+    // ---- barge#013: a verified platform binary's hidden descriptors ----------
+
+    /// The stated platform answer for one child: this account owns no
+    /// Apple-signed platform binary, so the flag that makes hidden descriptors an
+    /// OS blind spot is stated instead of read.
+    fn stated_platform(identity: ProcessIdentity, platform: StatedPlatform) -> TableObserver {
+        TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                opaque: 1,
+                platform: Some(platform),
+                ..StatedListing::default()
+            }],
+        )
+    }
+
+    #[test]
+    fn a_verified_platform_binarys_hidden_descriptors_are_an_os_blind_spot() {
+        let holder = real_holder("custody-013-platform");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let identity = child.identity();
+        // The kernel hides this child's only vnode descriptor, and the stated
+        // code-signing status verifies the process as a platform binary: the
+        // descriptor is an OS blind spot, counted and recorded, not a refusal.
+        let observer = stated_platform(
+            identity,
+            StatedPlatform::PlatformBinary {
+                command: "sleep".to_owned(),
+            },
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+        let evidence = verdict.evidence().expect("the evidence");
+        assert_eq!(evidence.os_blind_spot.processes, 1);
+        assert_eq!(evidence.os_blind_spot.opaque_descriptors, 1);
+        let record = evidence
+            .os_blind_spot
+            .records
+            .first()
+            .expect("the blind-spot process is recorded");
+        assert_eq!(record.pid, identity.pid);
+        assert_eq!(record.start, identity.start);
+        assert_eq!(record.command, "sleep");
+        assert_eq!(record.opaque_descriptors, 1);
+        assert_eq!(evidence.retry.retried_unreadable, 0);
+    }
+
+    #[test]
+    fn a_non_platform_process_with_hidden_descriptors_is_unknown() {
+        let holder = real_holder("custody-013-not-platform");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let identity = child.identity();
+        // The same hidden descriptor, on a process whose code-signing status does
+        // not carry the platform flag: nothing is exempt and nothing is recorded.
+        let observer = stated_platform(
+            identity,
+            StatedPlatform::NotPlatformBinary {
+                command: "sleep".to_owned(),
+            },
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        let reason = verdict.reason().unwrap_or_default();
+        assert!(
+            reason.contains("not a verified platform binary"),
+            "{reason}"
+        );
+        assert!(reason.contains("platform binary flag"), "{reason}");
+        assert_eq!(
+            verdict.retry().retried_unreadable,
+            0,
+            "the listing was readable, so there is no `EPERM` retry record"
+        );
+        assert!(verdict.into_evidence().is_err(), "unknown refuses");
+    }
+
+    #[test]
+    fn a_failed_code_signing_read_is_unknown() {
+        let holder = real_holder("custody-013-csops-failed");
+        holder.payload();
+        let child = Child::idle();
+        let identity = child.identity();
+        let observer = stated_platform(identity, StatedPlatform::Failed { errno: EPERM });
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        let reason = verdict.reason().unwrap_or_default();
+        assert!(
+            reason.contains("code-signing status is unreadable"),
+            "{reason}"
+        );
+        assert!(verdict.clone().into_evidence().is_err(), "unknown refuses");
+    }
+
+    #[test]
+    fn a_start_identity_that_changes_around_the_code_signing_read_is_unknown() {
+        let holder = real_holder("custody-013-identity-changed");
+        holder.payload();
+        let child = Child::idle();
+        let identity = child.identity();
+        // The pid names a different process after the status read, so nothing
+        // that read says is evidence about the descriptors just listed, even
+        // though the flag was reported.
+        let observer = stated_platform(
+            identity,
+            StatedPlatform::IdentityChanged {
+                command: "sleep".to_owned(),
+                start: identity.start.saturating_add(1),
+            },
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        let reason = verdict.reason().unwrap_or_default();
+        assert!(reason.contains("start identity"), "{reason}");
+        assert!(verdict.clone().into_evidence().is_err(), "unknown refuses");
+    }
+
+    #[test]
+    fn a_platform_binary_with_a_readable_descriptor_inside_the_root_is_unsafe() {
+        let holder = real_holder("custody-013-platform-open");
+        let first = holder.payload();
+        let second = holder.root_path().join("second.bin");
+        std::fs::write(&second, b"second").expect("the second payload is written");
+        let child = Child::holding_two(&first, &second);
+        let identity = child.identity();
+        // One of the child's vnode descriptors is hidden and the process is a
+        // verified platform binary, but the other is readable and inside the
+        // root: the exemption never covers a descriptor the scan can place.
+        let observer = stated_platform(
+            identity,
+            StatedPlatform::PlatformBinary {
+                command: "sleep".to_owned(),
+            },
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unsafe", "{:?}", verdict.reason());
+        assert!(
+            verdict
+                .reason()
+                .unwrap_or_default()
+                .contains(&identity.pid.to_string()),
+            "the readable descriptor of the platform process refuses it: {:?}",
+            verdict.reason()
+        );
+    }
+
+    #[test]
+    fn without_the_platform_flag_the_same_fixture_refuses() {
+        // The counterfactual to the blind-spot case: the same process, the same
+        // hidden descriptor and the same scan, with only the code-signing answer
+        // different. The flag is what buys the exemption, and without it the
+        // hidden descriptor refuses instead of being recorded.
+        let holder = real_holder("custody-013-counterfactual");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let identity = child.identity();
+        let verified = holder.take_with(
+            &[],
+            &stated_platform(
+                identity,
+                StatedPlatform::PlatformBinary {
+                    command: "sleep".to_owned(),
+                },
+            ),
+            CustodyBounds::default(),
+        );
+        assert_eq!(verified.name(), "safe", "{:?}", verified.reason());
+        let refused = holder.take_with(
+            &[],
+            &stated_platform(
+                identity,
+                StatedPlatform::NotPlatformBinary {
+                    command: "sleep".to_owned(),
+                },
+            ),
+            CustodyBounds::default(),
+        );
+        assert_eq!(refused.name(), "unknown", "{:?}", refused.reason());
+        assert!(refused.into_evidence().is_err(), "unknown refuses");
+    }
+
+    #[test]
+    fn more_blind_spot_processes_than_the_record_bound_refuses() {
+        // The evidence never drops a blind-spot process. A scan that meets more of
+        // them than its record holds refuses, rather than report a `Safe` verdict
+        // that counts processes it no longer names.
+        let holder = real_holder("custody-013-blind-spot-bound");
+        holder.payload();
+        let children: Vec<Child> = (0..crate::os::BLIND_SPOT_RECORDS.saturating_add(1))
+            .map(|_| Child::idle())
+            .collect();
+        let mut table = vec![self_identity()];
+        let mut faults = Vec::new();
+        for child in &children {
+            let identity = child.identity();
+            table.push(identity);
+            faults.push(StatedListing {
+                pid: identity.pid,
+                opaque: 1,
+                platform: Some(StatedPlatform::PlatformBinary {
+                    command: "sleep".to_owned(),
+                }),
+                ..StatedListing::default()
+            });
+        }
+        let observer = TableObserver::stated(table, faults);
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        let reason = verdict.reason().unwrap_or_default();
+        assert!(
+            reason.contains("more than 32 platform-verified processes"),
+            "the refusal names the record bound: {reason}"
+        );
+        assert!(reason.contains("did not fit"), "{reason}");
+        assert!(verdict.into_evidence().is_err(), "unknown refuses");
+    }
+
+    #[test]
+    fn a_real_platform_binary_is_verified_and_this_test_binary_is_not() {
+        // A read-only observation of this host: at least one same-uid process is
+        // an Apple platform binary according to its own code-signing status, and
+        // a locally built binary is not.
+        let uid = platform().effective_uid().expect("the account uid");
+        let rows = platform()
+            .observed_processes()
+            .expect("the process table reads")
+            .expect("the process table is within its bound");
+        let verified = rows
+            .iter()
+            .filter(|(identity, _)| identity.effective_uid == Some(uid))
+            .find_map(
+                |(identity, _)| match platform().verify_platform_binary(*identity) {
+                    Ok(PlatformStatus::PlatformBinary { command }) => Some((*identity, command)),
+                    _ => None,
+                },
+            );
+        let (identity, command) = verified.expect("this host runs a same-uid platform binary");
+        assert_eq!(Some(uid), identity.effective_uid);
+        assert!(!command.is_empty(), "the kernel reports its command");
+        let own = platform()
+            .verify_platform_binary(self_identity())
+            .expect("this test binary's code-signing status reads");
+        assert!(
+            matches!(own, PlatformStatus::NotVerified { .. }),
+            "a locally built test binary is not a platform binary: {own:?}"
+        );
     }
 }
