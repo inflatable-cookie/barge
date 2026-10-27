@@ -34,6 +34,70 @@ pub struct SpaceRow {
     pub policy: Option<serde_json::Value>,
     /// `policy_undeclared` or `volume_absent`.
     pub state: String,
+    /// Area accounting, unavailable until a later slice.
+    pub areas: Option<RowSet<AreaSpace>>,
+    /// Scratch accounting, unavailable until a later slice.
+    pub scratch: Option<ScratchSpace>,
+    /// Cache accounting, unavailable until a later slice.
+    pub caches: Option<CacheSpace>,
+    /// Attribution, unavailable until a later slice.
+    pub attribution: Option<Attribution>,
+}
+
+/// Space attributed to one area.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AreaSpace {
+    /// Owning namespace.
+    pub namespace: String,
+    /// Area name.
+    pub area: String,
+    /// Reserve participation.
+    pub reserve: String,
+    /// Owned bytes.
+    pub bytes: u64,
+    /// Idle roots.
+    pub idle_roots: u64,
+    /// Held roots.
+    pub held_roots: u64,
+    /// Roots with unknown activity.
+    pub unknown_roots: u64,
+}
+
+/// Space attributed to scratch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchSpace {
+    /// Owned bytes.
+    pub bytes: u64,
+    /// Idle eligible roots.
+    pub idle_eligible_roots: u64,
+    /// Held roots.
+    pub held_roots: u64,
+    /// Unconcluded roots.
+    pub unconcluded_roots: u64,
+}
+
+/// Space attributed to caches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheSpace {
+    /// Owned bytes.
+    pub bytes: u64,
+    /// Reserve participation.
+    pub reserve: String,
+}
+
+/// Attribution of volume use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attribution {
+    /// Owned bytes.
+    pub owned_bytes: u64,
+    /// Excluded bytes.
+    pub excluded_bytes: u64,
+    /// Held or unknown bytes.
+    pub held_or_unknown_bytes: u64,
+    /// Estimated remaining bytes.
+    pub other_estimate_bytes: u64,
+    /// Described cause.
+    pub cause: String,
 }
 
 /// Read the registry and measure present volumes without creating state or locks.
@@ -69,6 +133,10 @@ pub fn report(
                     measurement: None,
                     policy: None,
                     state: "volume_absent".to_owned(),
+                    areas: None,
+                    scratch: None,
+                    caches: None,
+                    attribution: None,
                 });
                 continue;
             }
@@ -81,6 +149,10 @@ pub fn report(
             measurement: Some(measurement),
             policy: None,
             state: "policy_undeclared".to_owned(),
+            areas: None,
+            scratch: None,
+            caches: None,
+            attribution: None,
         });
     }
     let total = rows.len();
@@ -113,6 +185,10 @@ pub fn read_document(bytes: &[u8]) -> Result<SpaceReport> {
             "measurement",
             "policy",
             "state",
+            "areas",
+            "scratch",
+            "caches",
+            "attribution",
         ] {
             if row.get(field).is_none() {
                 return Err(invalid());
@@ -122,6 +198,9 @@ pub fn read_document(bytes: &[u8]) -> Result<SpaceReport> {
     let report: SpaceReport = serde_json::from_value(data.clone()).map_err(|_| invalid())?;
     report.volumes.validate()?;
     for row in &report.volumes.rows {
+        if let Some(areas) = &row.areas {
+            areas.validate()?;
+        }
         if !matches!(
             row.state.as_str(),
             "above_reserve"
@@ -213,6 +292,28 @@ mod tests {
         let envelope = serde_json::json!({"schema": SPACE_SCHEMA, "command": "space", "ok": true, "data": result});
         let encoded = serde_json::to_vec(&envelope).expect("encode");
         read_document(&encoded).expect("valid report");
+        for field in ["areas", "scratch", "caches", "attribution"] {
+            assert_eq!(
+                envelope["data"]["volumes"]["rows"][0][field],
+                serde_json::Value::Null
+            );
+            let mut missing = envelope.clone();
+            missing["data"]["volumes"]["rows"][0]
+                .as_object_mut()
+                .expect("row")
+                .remove(field);
+            assert!(read_document(&serde_json::to_vec(&missing).expect("encode")).is_err());
+        }
+        let mut populated = envelope.clone();
+        let row = &mut populated["data"]["volumes"]["rows"][0];
+        row["areas"] = serde_json::json!({"rows": [{"namespace":"oxide", "area":"pool", "reserve":"counts", "bytes":1, "idle_roots":2, "held_roots":3, "unknown_roots":4}], "count":1, "total":1, "truncated":false});
+        row["scratch"] = serde_json::json!({"bytes":1, "idle_eligible_roots":2, "held_roots":3, "unconcluded_roots":4});
+        row["caches"] = serde_json::json!({"bytes":1, "reserve":"excluded"});
+        row["attribution"] = serde_json::json!({"owned_bytes":1, "excluded_bytes":2, "held_or_unknown_bytes":3, "other_estimate_bytes":4, "cause":"none"});
+        read_document(&serde_json::to_vec(&populated).expect("encode")).expect("populated report");
+        populated["data"]["volumes"]["rows"][0]["scratch"]["bytes"] = serde_json::json!("invalid");
+        assert!(read_document(&serde_json::to_vec(&populated).expect("encode")).is_err());
+
         let mut broken = envelope;
         broken["data"]["volumes"]["rows"][0]
             .as_object_mut()

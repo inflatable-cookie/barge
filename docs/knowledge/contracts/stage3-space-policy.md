@@ -864,6 +864,12 @@ rows, `unknown` never read as absent or default.
 }
 ```
 
+For T1, `areas`, `scratch`, `caches` and `attribution` are required keys
+whose value is `null` while the later slices have not computed them. Null means
+unavailable, not zero or an empty set. Readers require these keys and accept the
+populated shapes above as later slices provide them (Tom, 2026-10-27, decision
+`ceaa90b1`). A missing policy remains undeclared.
+
 `state` is one of `above_reserve`, `below_reserve`, `below_floor`,
 `policy_undeclared`, `volume_absent`, `space_unknown`, `durability_forbids`.
 A report never prunes and never writes, and it takes only the shared volume lock,
