@@ -341,6 +341,16 @@ def create_pool():
 def remove_released_pool(pool, expected):
     """Only a successful Oxide build and the same private directory permit cleanup."""
     verify_pool(pool, os.stat("/").st_dev, expected)
+    try:
+        ledger = json.loads((pool / "p/ledger.json").read_text())
+        slots = ledger["slots"]
+        if (ledger["version"] != 1 or not isinstance(slots, list) or not slots
+                or any(slot.get("state") != "idle" or slot.get("lease_id") is not None
+                       for slot in slots)):
+            raise ValueError("slots are not all released")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise Refusal(f"pool custody uncertain; retained at {pool}: {error}") from error
+    verify_pool(pool, os.stat("/").st_dev, expected)
     shutil.rmtree(pool)
 
 

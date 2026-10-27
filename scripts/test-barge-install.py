@@ -117,6 +117,26 @@ class InstallerFixtures(unittest.TestCase):
                 installer.verify_pool(pool, device)
         self.assertTrue(pool.exists())
 
+    def test_pool_cleanup_requires_released_ledger(self):
+        pool = Path(self.temp.name) / "pool"
+        (pool / "p").mkdir(parents=True, mode=0o700)
+        pool.chmod(0o700)
+        info = pool.stat()
+        expected = (info.st_dev, info.st_ino)
+        ledger = pool / "p/ledger.json"
+        ledger.write_text(json.dumps({"version": 1, "slots": [{"state": "held", "lease_id": "x"}]}))
+        real_stat = os.stat
+        with patch.object(installer.os, "fsencode", return_value=b"short"), \
+             patch.object(installer.os, "stat") as stat_mock:
+            root_info = Mock(st_dev=info.st_dev)
+            stat_mock.side_effect = lambda path, *a, **kw: root_info if path == "/" else real_stat(path, *a, **kw)
+            with self.assertRaises(installer.Refusal):
+                installer.remove_released_pool(pool, expected)
+            self.assertTrue(pool.exists())
+            ledger.write_text(json.dumps({"version": 1, "slots": [{"state": "idle", "lease_id": None}]}))
+            installer.remove_released_pool(pool, expected)
+            self.assertFalse(pool.exists())
+
     def test_unsafe_receipt_and_missing_receipt_refuse(self):
         with self.assertRaises(installer.Refusal):
             installer.preflight(True)
