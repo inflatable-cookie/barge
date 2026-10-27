@@ -41,6 +41,7 @@ pub mod scratch;
 pub mod space;
 pub mod state;
 pub mod unit;
+pub mod volume;
 
 #[cfg(test)]
 #[allow(dead_code)]

@@ -30,9 +30,12 @@ pub struct SpaceRow {
     pub mount_point: Option<PathBuf>,
     /// Kernel measurement, absent only when the volume is absent.
     pub measurement: Option<SpaceMeasurement>,
-    /// No policy can be declared until the registration slice.
-    pub policy: Option<serde_json::Value>,
-    /// `policy_undeclared` or `volume_absent`.
+    /// The declared policy, or none when undeclared.
+    pub policy: Option<registry::SpacePolicy>,
+    /// Whether the declared floor is below the default.
+    #[serde(default)]
+    pub floor_below_default: bool,
+    /// Current state of the volume and its policy.
     pub state: String,
     /// Area accounting, unavailable until a later slice.
     pub areas: Option<RowSet<AreaSpace>>,
@@ -131,7 +134,11 @@ pub fn report(
                     volume_uuid: record.volume_uuid.clone(),
                     mount_point: None,
                     measurement: None,
-                    policy: None,
+                    policy: record.space.clone(),
+                    floor_below_default: record
+                        .space
+                        .as_ref()
+                        .is_some_and(|p| p.floor_bytes < registry::DEFAULT_FLOOR_BYTES),
                     state: "volume_absent".to_owned(),
                     areas: None,
                     scratch: None,
@@ -143,12 +150,23 @@ pub fn report(
             Err(error) => return Err(error),
         };
         let measurement = space.measure_space(&verified)?;
+        let state = match &record.space {
+            None => "policy_undeclared",
+            Some(_) if !record.durability.permits_pruning() => "durability_forbids",
+            Some(policy) if measurement.free_bytes <= policy.floor_bytes => "below_floor",
+            Some(policy) if measurement.free_bytes <= policy.reserve_bytes => "below_reserve",
+            Some(_) => "above_reserve",
+        };
         rows.push(SpaceRow {
             volume_uuid: record.volume_uuid.clone(),
             mount_point: Some(verified.identity().mount_point.clone()),
             measurement: Some(measurement),
-            policy: None,
-            state: "policy_undeclared".to_owned(),
+            policy: record.space.clone(),
+            floor_below_default: record
+                .space
+                .as_ref()
+                .is_some_and(|p| p.floor_bytes < registry::DEFAULT_FLOOR_BYTES),
+            state: state.to_owned(),
             areas: None,
             scratch: None,
             caches: None,

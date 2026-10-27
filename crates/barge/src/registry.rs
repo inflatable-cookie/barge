@@ -243,12 +243,22 @@ pub struct VolumeRecord {
     /// The recorded scratch-deletion authority for this volume.
     pub scratch_grants: ScratchGrants,
     /// An absent policy is undeclared, never unlimited.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "read_space"
+    )]
     pub space: Option<SpacePolicy>,
     /// Increases on every change, so a stale reader is detectable.
     pub generation: u64,
     /// When this record was written.
     pub registered_ms: u64,
+}
+
+fn read_space<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<SpacePolicy>, D::Error> {
+    SpacePolicy::deserialize(deserializer).map(Some)
 }
 
 impl VolumeRecord {

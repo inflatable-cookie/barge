@@ -141,6 +141,18 @@ pub struct FormatVersions {
     pub hold: String,
     /// `barge.intent/<major>`.
     pub intent: String,
+    /// `barge.space/<major>`.
+    #[serde(default)]
+    pub space: String,
+    /// Volume registration and report formats.
+    #[serde(default)]
+    pub volume_register: String,
+    /// Volume update format.
+    #[serde(default)]
+    pub volume_update: String,
+    /// Volume describe format.
+    #[serde(default)]
+    pub volume_describe: String,
 }
 
 impl FormatVersions {
@@ -155,6 +167,10 @@ impl FormatVersions {
             root: ROOT_SCHEMA.to_owned(),
             hold: HOLD_SCHEMA.to_owned(),
             intent: INTENT_SCHEMA.to_owned(),
+            space: crate::space::SPACE_SCHEMA.to_owned(),
+            volume_register: "barge.volume.register/1".to_owned(),
+            volume_update: "barge.volume.update/1".to_owned(),
+            volume_describe: "barge.volume.describe/1".to_owned(),
         }
     }
 }

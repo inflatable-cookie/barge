@@ -8,9 +8,9 @@ rules that let pruning run while consumers work, and the formats, locks, bounds,
 failure matrix, test plan, bounded native design and implementation slices
 those need.
 
-It is design only. No part of it authorizes a Rust change, a crate, a state
-file, a native run, a real drive, a mount or host setting, a data move, or an
-Oxide change. [Architecture](../architecture.md) owns the concepts and the
+The measurement and registration slices are implemented. This contract alone
+does not authorize a native run, a real drive registration, a mount or host
+setting, a data move, or an Oxide change. [Architecture](../architecture.md) owns the concepts and the
 boundary; the [stage 1 design](stage1-design.md) owns the crate and CLI shape
 this stage extends. Where this file and architecture differ, architecture wins
 and this file is corrected.

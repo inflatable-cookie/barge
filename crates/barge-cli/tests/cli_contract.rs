@@ -75,7 +75,8 @@ fn stdout_document(output: &Output) -> Value {
 }
 
 /// The usage's first line; the full text names every area verb too.
-const USAGE: &str = "usage: barge <describe|inspect|space|area|cache|diagnostic|scratch> [--json]";
+const USAGE: &str =
+    "usage: barge <describe|inspect|space|volume|area|cache|diagnostic|scratch> [--json]";
 
 #[test]
 fn descriptor_census_refuses_bad_arguments_and_missing_roots_without_scanning() {
@@ -1092,4 +1093,35 @@ fn space_json_does_not_create_state() {
     assert_eq!(document["schema"], "barge.space/1");
     assert_eq!(document["data"]["volumes"]["count"], 0);
     assert!(!state_dir.exists());
+}
+
+#[test]
+fn volume_registration_requires_explicit_modes() {
+    let (_fixture, state_dir) = absent_state_dir("volume-modes");
+    for missing in ["availability", "durability"] {
+        let mut args = vec![
+            "volume",
+            "register",
+            "--mount",
+            "/unused",
+            "--root-dir",
+            "",
+            "--reserve",
+            "1",
+            "--declared-by",
+            "operator",
+            "--plan",
+            "--json",
+        ];
+        if missing != "availability" {
+            args.extend(["--availability", "permanent"]);
+        }
+        if missing != "durability" {
+            args.extend(["--durability", "expendable"]);
+        }
+        let output = run_in(&args, &state_dir);
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+        assert!(!state_dir.exists());
+    }
 }
