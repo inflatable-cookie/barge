@@ -90,12 +90,32 @@ class InstallerFixtures(unittest.TestCase):
         staging.mkdir()
         with patch.dict(os.environ, {"CARGO_TARGET_DIR": "/foreign", "OXIDE_POOL": "/foreign",
                                       "CARGO_BUILD_BUILD_DIR": "/foreign"}):
-            environment = installer.build_environment(staging, "a" * 40, "b" * 32)
+            environment = installer.build_environment(staging, self.home, "a" * 40, "b" * 32)
         self.assertNotIn("CARGO_TARGET_DIR", environment)
         self.assertNotIn("CARGO_BUILD_BUILD_DIR", environment)
-        self.assertEqual(environment["OXIDE_POOL"], str(staging / "p"))
+        self.assertEqual(environment["OXIDE_POOL"], str(self.home))
         self.assertEqual(environment["TMPDIR"], str(staging))
         self.assertEqual(environment["BARGE_BUILD_PIN"], "a" * 40)
+
+    def test_pool_verification_and_identity(self):
+        pool = Path(self.temp.name) / "pool"
+        pool.mkdir(mode=0o700)
+        device = pool.stat().st_dev
+        # Fixture paths can be longer than the actual short boot pool.
+        with patch.object(installer.os, "fsencode", return_value=b"short"):
+            identity = installer.verify_pool(pool, device)
+            with self.assertRaises(installer.Refusal):
+                installer.verify_pool(pool, device + 1)
+            with self.assertRaises(installer.Refusal):
+                installer.verify_pool(pool, device, (identity[0], identity[1] + 1))
+            pool.chmod(0o755)
+            with self.assertRaises(installer.Refusal):
+                installer.verify_pool(pool, device)
+        pool.chmod(0o700)
+        with patch.object(installer.os, "fsencode", return_value=b"x" * 92):
+            with self.assertRaises(installer.Refusal):
+                installer.verify_pool(pool, device)
+        self.assertTrue(pool.exists())
 
     def test_unsafe_receipt_and_missing_receipt_refuse(self):
         with self.assertRaises(installer.Refusal):

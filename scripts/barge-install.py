@@ -21,6 +21,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 HOME = Path(os.environ["HOME"])
@@ -187,7 +188,7 @@ def new_instance():
     return secrets.token_hex(16)
 
 
-def build_environment(staging, pin, instance):
+def build_environment(staging, pool, pin, instance):
     """The build's environment: private target, authenticated pin, fresh instance.
 
     Inherited `CARGO_TARGET_*` names are dropped so the build cannot write to
@@ -199,7 +200,7 @@ def build_environment(staging, pin, instance):
                    and not k.startswith("OXIDE_")}
     for name in ("TMPDIR", "TMP", "TEMP"):
         environment[name] = str(staging)
-    environment["OXIDE_POOL"] = str(staging / "p")
+    environment["OXIDE_POOL"] = str(pool)
     environment["OXIDE_CONFIG"] = str(staging / "o.toml")
     (staging / "o.toml").write_text("")
     environment[BUILD_PIN_VARIABLE] = pin
@@ -207,7 +208,7 @@ def build_environment(staging, pin, instance):
     return environment
 
 
-def build(pin, instance, staging):
+def build(pin, instance, staging, pool):
     source = staging / "s"
     source.mkdir()
     (source / "target").mkdir()
@@ -217,7 +218,7 @@ def build(pin, instance, staging):
     subprocess.run(["tar", "-x", "-C", str(source)], stdin=archive.stdout, check=True)
     if archive.wait() != 0:
         raise Refusal("git archive failed")
-    environment = build_environment(staging, pin, instance)
+    environment = build_environment(staging, pool, pin, instance)
     versions = {
         tool: subprocess.run(
             [tool, "-vV" if tool == "rustc" else "-V"],
@@ -319,9 +320,33 @@ def install(built, expected):
     return built_hash, installed
 
 
+def verify_pool(pool, boot_device, expected=None):
+    info = os.lstat(pool)
+    identity = (info.st_dev, info.st_ino)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700 or info.st_dev != boot_device
+            or (expected is not None and identity != expected)):
+        raise Refusal(f"unverified pool retained at {pool}")
+    if len(os.fsencode(pool / "payload/slots/s-12345678/quick-1/scratch")) > 91:
+        raise Refusal(f"socket path too long; pool retained at {pool}")
+    return identity
+
+
+def create_pool():
+    """Create a short private boot-volume pool and capture its identity."""
+    pool = Path(tempfile.mkdtemp(prefix="bgi.", dir="/private/tmp"))
+    return pool, verify_pool(pool, os.stat("/").st_dev)
+
+
+def remove_released_pool(pool, expected):
+    """Only a successful Oxide build and the same private directory permit cleanup."""
+    verify_pool(pool, os.stat("/").st_dev, expected)
+    shutil.rmtree(pool)
+
+
 def cleanup_staging(staging):
     """Remove only the installer-owned entries, never the caller's directory."""
-    for name in ("s", "p"):
+    for name in ("s",):
         item = staging / name
         if item.exists():
             shutil.rmtree(item)
@@ -342,6 +367,8 @@ def main():
     arguments = parser.parse_args()
     started = datetime.datetime.now(datetime.timezone.utc)
     staging = None
+    pool = None
+    released = False
     try:
         pin, tree, tip = authenticate_pin(arguments.pin)
         previous, expected = preflight(arguments.replace)
@@ -360,14 +387,14 @@ def main():
             raise Refusal("BARGE_INSTALL_SCRATCH must be an absolute, private, owned real directory")
         if any(scratch.iterdir()):
             raise Refusal("BARGE_INSTALL_SCRATCH must be empty and exclusively owned")
-        socket_bound = scratch / "p/payload/slots/s-12345678/quick-1/scratch"
-        if len(os.fsencode(socket_bound)) > 91:
-            raise Refusal("BARGE_INSTALL_SCRATCH is too long for Oxide's socket bound")
         staging = scratch
-        (staging / "p").mkdir()
+        pool, pool_identity = create_pool()
         print(f"staging {staging}")
         instance = new_instance()
-        built, versions = build(pin, instance, staging)
+        built, versions = build(pin, instance, staging, pool)
+        released = True
+        remove_released_pool(pool, pool_identity)
+        pool = None
         build_identity(built, pin, instance)
         current, current_identity = preflight(arguments.replace)
         if current != previous or current_identity != expected:
@@ -375,8 +402,12 @@ def main():
         built_hash, installed = install(built, expected)
     except (Refusal, subprocess.CalledProcessError, OSError, KeyError, ValueError) as error:
         print(f"barge:install refused: {error}", file=sys.stderr)
-        if staging is not None:
+        if pool is not None:
+            print(f"pool retained pending custody check: {pool}", file=sys.stderr)
+        if staging is not None and (pool is None or released):
             cleanup_staging(staging)
+        elif staging is not None:
+            print(f"staging retained pending custody check: {staging}", file=sys.stderr)
         return 1
     receipt = {
         "mode": "initial" if previous is None else "replace",
