@@ -1358,12 +1358,19 @@ a reviewer may prefer. None blocks the design from being reviewed as a whole.
    rewrite the root marker, which the frozen marker contract forbids, or rely on
    hold-file mtimes, which are not durable and disappear on release.
 
-### Implemented measurement surface
+### Implemented measurement and registration surface
 
 The library's `os::SpaceFacts` reports checked `fstatfs` block counts with
 source, completion time and device provenance; `os::Flush` exposes the macOS
-whole-volume flush. `barge space` reads the registry and measures present
-registered volumes without creating files. Until registration gains space
-policy, its rows identify that policy as undeclared; an absent registered volume
-is reported as absent. Area attribution and policy decisions belong to their
-later slices.
+whole-volume flush. `barge volume register` and `update` preview a record in a
+plan with its SHA-256; publication requires the saved plan and its exact digest,
+rechecks the registry generation and volume, and writes the registry atomically.
+`barge volume describe` reads the registered record. Their document formats are
+`barge.volume.register/1`, `barge.volume.update/1`, and
+`barge.volume.describe/1`.
+
+`barge space` reads the registry and measures present registered volumes without
+creating files. Its rows and the space rows in `barge describe` report the
+declared policy, or `policy_undeclared` when absent, and identify a floor below
+the default with `floor_below_default`. An absent registered volume is reported
+as absent. Area attribution and policy decisions belong to their later slices.
