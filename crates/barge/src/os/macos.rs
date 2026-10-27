@@ -188,7 +188,7 @@ impl VolumeLocator for MacOs {
                 .collect();
             let name = OsStr::from_bytes(&name_bytes);
             let path = PathBuf::from(name);
-            if !is_under_volumes_parent(&path) {
+            if !recorded_mount_path(&path) {
                 continue;
             }
             let descriptor = open_directory(&path).map_err(|_| {
@@ -252,18 +252,71 @@ fn mount_table() -> Result<Vec<libc::statfs>> {
         .collect();
     let bytes = i32::try_from(CAPACITY * std::mem::size_of::<libc::statfs>())
         .map_err(|_| Error::new(ErrorKind::UnknownState, "mount table buffer is too large"))?;
+    // SAFETY: a null buffer and zero size request the number of mounts only.
+    let before = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
     // SAFETY: entries owns a writable buffer of exactly `bytes` bytes.
     let count = unsafe { libc::getfsstat(entries.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
     let count = usize::try_from(count)
         .map_err(|_| Error::new(ErrorKind::UnknownState, "mount table is unreadable"))?;
-    if count > 256 {
+    // SAFETY: a null buffer and zero size request the number of mounts only.
+    let after = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    check_mount_count(before, count, after)?;
+    entries.truncate(count);
+    Ok(entries)
+}
+
+fn check_mount_count(before: i32, count: usize, after: i32) -> Result<()> {
+    if count > 256
+        || usize::try_from(before).ok() != Some(count)
+        || usize::try_from(after).ok() != Some(count)
+    {
         return Err(Error::new(
             ErrorKind::UnknownState,
             "mount table is truncated or exceeds its bound",
         ));
     }
-    entries.truncate(count);
-    Ok(entries)
+    Ok(())
+}
+
+impl super::AbsenceVolume for MacOs {
+    fn volume_prefix(&self, path: &Path) -> Option<PathBuf> {
+        let rest = path.strip_prefix(VOLUMES_PARENT).ok()?;
+        let name = rest.components().next()?;
+        Some(Path::new(VOLUMES_PARENT).join(name.as_os_str()))
+    }
+
+    fn identify_directory(&self, handle: &DirHandle) -> Result<VolumeIdentity> {
+        let file = handle.descriptor().ok_or_else(|| {
+            Error::new(ErrorKind::UnknownState, "directory descriptor unavailable")
+        })?;
+        let path = Path::new("opened ancestor");
+        let stat = read_statfs(file.as_raw_fd(), path)?;
+        if stat.f_flags & (libc::MNT_LOCAL as u32) == 0 {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "ancestor volume is not local",
+            ));
+        }
+        read_identity(file, path)
+    }
+
+    fn boot_data(&self) -> Result<VolumeIdentity> {
+        let path = Path::new("/System/Volumes/Data");
+        let descriptor = open_directory(path)?;
+        let identity = read_identity(&descriptor, path)?;
+        let stat = read_statfs(descriptor.as_raw_fd(), path)?;
+        if stat.f_flags & (libc::MNT_LOCAL as u32) == 0
+            || identity.mount_point != path
+            || identity.filesystem != FileSystem::Apfs
+            || identity.volume_uuid.is_none()
+        {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "boot Data volume is unverified",
+            ));
+        }
+        Ok(identity)
+    }
 }
 
 impl MountRoot for MacOs {
@@ -2655,6 +2708,10 @@ fn is_boot_volume(mount_point: &Path) -> bool {
 
 /// Whether the mount point is a mount root directly under the mount parent, and
 /// that parent is a real directory rather than a link.
+pub(super) fn recorded_mount_path(path: &Path) -> bool {
+    path.parent() == Some(Path::new(VOLUMES_PARENT))
+}
+
 fn is_under_volumes_parent(mount_point: &Path) -> bool {
     if mount_point.parent() != Some(Path::new(VOLUMES_PARENT)) {
         return false;
@@ -3156,5 +3213,24 @@ mod tests {
         let refused = fixture_account_home(&file).expect_err("a file is not a home");
         assert_eq!(refused.kind(), ErrorKind::UnknownState);
         assert_eq!(refused.detail()["account_home"], file.display().to_string());
+    }
+}
+
+#[cfg(test)]
+mod locator_bounds_tests {
+    #![allow(clippy::expect_used)]
+    use super::check_mount_count;
+    use crate::error::ErrorKind;
+    #[test]
+    fn partial_or_truncated_tables_are_unknown() {
+        assert!(check_mount_count(256, 256, 256).is_ok());
+        for (before, count, after) in [(257, 257, 257), (4, 3, 4), (3, 3, 4), (-1, 0, 0)] {
+            assert_eq!(
+                check_mount_count(before, count, after)
+                    .expect_err("incomplete")
+                    .kind(),
+                ErrorKind::UnknownState
+            );
+        }
     }
 }

@@ -9,7 +9,9 @@
 
 use std::path::Path;
 
+mod absence;
 mod facts;
+pub use absence::{prove_absence, AbsenceProof, AbsenceVolume, AncestorExpected};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -142,13 +144,36 @@ pub fn verify_volume(
     Ok(VerifiedVolume::new(path.to_path_buf(), identity))
 }
 
+/// A mount verified after a complete census found exactly one matching UUID.
+#[derive(Debug, Clone)]
+pub struct LocatedVolume(VerifiedVolume);
+
+impl LocatedVolume {
+    /// The live mount root.
+    pub fn path(&self) -> &Path {
+        self.0.path()
+    }
+    /// Facts observed at the verified mount.
+    pub fn identity(&self) -> &VolumeIdentity {
+        self.0.identity()
+    }
+    /// Re-read the live facts before relying on them again.
+    pub fn reverify(&self, facts: &dyn VolumeFacts) -> Result<()> {
+        self.0.reverify(facts)
+    }
+    #[cfg(test)]
+    pub(crate) fn injected(volume: VerifiedVolume) -> Self {
+        Self(volume)
+    }
+}
+
 /// Find and verify the unique current mount of a registered UUID.
 pub fn locate_volume(
     locator: &dyn VolumeLocator,
     facts: &dyn VolumeFacts,
     mounts: &dyn MountRoot,
     uuid: &VolumeUuid,
-) -> Result<VerifiedVolume> {
+) -> Result<LocatedVolume> {
     let candidates = locator.mounts_for_uuid(uuid)?;
     match candidates.as_slice() {
         [] => Err(Error::new(
@@ -163,13 +188,20 @@ pub fn locate_volume(
                 volume_uuid: uuid,
                 mount_hint: Some(mount.as_path()),
             },
-        ),
+        )
+        .map(LocatedVolume),
         _ => Err(Error::new(
             ErrorKind::UnknownState,
             "multiple mounts have the registered volume UUID",
         )
         .with_detail("reason", "duplicate_volume_uuid".into())),
     }
+}
+
+/// Whether a recorded path has the platform's managed mount-root shape.
+#[cfg(target_os = "macos")]
+pub(crate) fn recorded_mount_path(path: &Path) -> bool {
+    macos::recorded_mount_path(path)
 }
 
 /// The refusal for a volume that is not where the record says it is.

@@ -1915,6 +1915,34 @@ pub fn read_marker_with_digest(
     root: &DirHandle,
     expectation: &MarkerExpectation<'_>,
 ) -> (MarkerState, Option<String>) {
+    read_marker_inner(dirs, root, expectation, None)
+}
+
+/// Read a v1 marker after locating and verifying the recorded volume's live mount.
+pub fn read_remounted_marker(
+    dirs: &dyn DirOps,
+    root: &DirHandle,
+    expectation: &MarkerExpectation<'_>,
+    verified: &os::LocatedVolume,
+    recorded_mount: &Path,
+) -> (MarkerState, Option<String>) {
+    if root.identity().device != verified.identity().device {
+        return (
+            MarkerState::Unknown {
+                reason: "root is not on the located volume".to_owned(),
+            },
+            None,
+        );
+    }
+    read_marker_inner(dirs, root, expectation, Some((verified, recorded_mount)))
+}
+
+fn read_marker_inner(
+    dirs: &dyn DirOps,
+    root: &DirHandle,
+    expectation: &MarkerExpectation<'_>,
+    remounted: Option<(&os::LocatedVolume, &Path)>,
+) -> (MarkerState, Option<String>) {
     let facts = match dirs.child_facts(root, ROOT_MARKER_FILE) {
         Ok(Some(facts)) => facts,
         Ok(None) => return (MarkerState::Absent, None),
@@ -1968,7 +1996,13 @@ pub fn read_marker_with_digest(
     // validate where it was found: custody and replay carry the expected digest
     // themselves, and a quarantined leaf's marker necessarily fails the path
     // check after the rename.
-    match marker.validate(expectation) {
+    let verdict = match remounted {
+        Some((verified, recorded_mount)) => {
+            marker.validate_remounted(verified, recorded_mount, expectation)
+        }
+        None => marker.validate(expectation),
+    };
+    match verdict {
         Ok(()) => (MarkerState::Owned(Box::new(marker)), Some(digest)),
         Err(error) => (
             MarkerState::Unknown {
@@ -1980,6 +2014,59 @@ pub fn read_marker_with_digest(
 }
 
 impl RootMarker {
+    /// Validate a v1 marker after a verified UUID has moved to a new mount.
+    /// The caller supplies the recorded mount and the path reached by its walk.
+    pub fn validate_remounted(
+        &self,
+        verified: &os::LocatedVolume,
+        recorded_mount: &Path,
+        expectation: &MarkerExpectation<'_>,
+    ) -> Result<()> {
+        let canonical = |path: &Path| {
+            path.to_str().is_some_and(|value| {
+                value.starts_with('/')
+                    && value
+                        .split('/')
+                        .skip(1)
+                        .all(|part| !part.is_empty() && part != "." && part != "..")
+            })
+        };
+        if !os::recorded_mount_path(recorded_mount)
+            || !canonical(recorded_mount)
+            || !canonical(&self.resolved_path)
+            || !canonical(expectation.resolved_path)
+            || verified.identity().volume_uuid.as_ref() != Some(expectation.volume_uuid)
+            || verified.path() != verified.identity().mount_point
+        {
+            return Err(unknown_marker(
+                "the live mount does not verify the recorded UUID".to_owned(),
+            ));
+        }
+        let old = self
+            .resolved_path
+            .strip_prefix(recorded_mount)
+            .map_err(|_| unknown_marker("marker is outside the recorded mount".to_owned()))?;
+        let live = expectation
+            .resolved_path
+            .strip_prefix(verified.path())
+            .map_err(|_| unknown_marker("walk is outside the verified mount".to_owned()))?;
+        if old.as_os_str().is_empty()
+            || old != live
+            || old
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(unknown_marker(
+                "the path below the mount changed".to_owned(),
+            ));
+        }
+        let original = MarkerExpectation {
+            resolved_path: &self.resolved_path,
+            ..*expectation
+        };
+        self.validate(&original)
+    }
+
     /// Validate every field of a marker against what was actually walked.
     fn validate(&self, expectation: &MarkerExpectation<'_>) -> Result<()> {
         if self.schema != crate::contract::ROOT_SCHEMA {
@@ -4499,6 +4586,57 @@ mod tests {
             MarkerState::Unknown { reason } => assert!(reason.contains("uid"), "{reason}"),
             other => panic!("a foreign-owned marker is unknown: {other:?}"),
         }
+    }
+
+    #[test]
+    fn v1_remount_replaces_only_the_mount_prefix() {
+        let fixture = Fixture::new("marker-remount");
+        let declaration = fixture.declaration("example/pool");
+        let (root, _) = fixture.create_root(&fixture.record, &declaration);
+        let marker: super::RootMarker =
+            serde_json::from_slice(&std::fs::read(marker_path(&root)).unwrap()).unwrap();
+        let mut marker = marker;
+        marker.resolved_path = PathBuf::from("/Volumes/Old/area/root");
+        let identity = crate::os::VolumeIdentity {
+            mount_point: PathBuf::from("/Volumes/New"),
+            filesystem: crate::os::FileSystem::Apfs,
+            device: crate::os::DeviceId::new(5),
+            volume_uuid: Some(fixture.uuid.clone()),
+            boot_volume: false,
+        };
+        let verified = crate::os::LocatedVolume::injected(crate::os::VerifiedVolume::new(
+            PathBuf::from("/Volumes/New"),
+            identity,
+        ));
+        let live = Path::new("/Volumes/New/area/root");
+        let expectation = MarkerExpectation {
+            volume_uuid: &fixture.uuid,
+            resolved_path: live,
+            effective_uid: 0,
+            now_ms: crate::state::now_ms(),
+        };
+        marker
+            .validate_remounted(&verified, Path::new("/Volumes/Old"), &expectation)
+            .unwrap();
+        let changed = MarkerExpectation {
+            resolved_path: Path::new("/Volumes/New/other/root"),
+            ..expectation
+        };
+        assert!(marker
+            .validate_remounted(&verified, Path::new("/Volumes/Old"), &changed)
+            .is_err());
+        assert!(marker
+            .validate_remounted(&verified, Path::new("/"), &expectation)
+            .is_err());
+        let other_uuid =
+            crate::os::VolumeUuid::parse("0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0").unwrap();
+        let foreign = MarkerExpectation {
+            volume_uuid: &other_uuid,
+            ..expectation
+        };
+        assert!(marker
+            .validate_remounted(&verified, Path::new("/Volumes/Old"), &foreign)
+            .is_err());
     }
 
     #[test]
