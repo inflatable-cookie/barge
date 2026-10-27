@@ -165,11 +165,16 @@ run would replay.
    real run both exit `3`; the real run still deletes the attached volume's
    planned root, so the other volumes are maintained. The one-volume registry is
    restored in a `finally` block, so the last case's plan is quiet again.
-6. **`exit_3_with_a_pending_intent`.** An aged owned root holding a symlink. The
-   real run exits `3` with exactly one pending intent, the intent record is not
-   `deleted`, the area folder holds exactly one `.barge-prune-` leaf, and the
-   unit's visible name is gone. Nothing replays it: the image is discarded after
-   the receipt.
+6. **`exit_3_with_a_pending_intent`.** An owned root holding a symlink, with the
+   entry created **before** the root is aged (adding an entry refreshes the
+   directory mtime, so aging first would plan nothing — the arrangement defect the
+   first `9a573a9` diagnostic exposed), and the symlink pointing at a fixture file
+   inside the run root. The case asserts the preview names exactly that unit before
+   the real run; the real run then exits `3` with exactly one pending intent, the
+   intent record is not `deleted`, the area folder holds exactly one
+   `.barge-prune-` leaf, the unit's visible name is gone, and the symlink's
+   referent still holds its exact bytes. Nothing replays it: the image is discarded
+   after the receipt.
 
 ### The ownership oracle
 
@@ -218,6 +223,44 @@ host capability result, not a case result, and it never qualifies a head.
 None of these qualify a head. A diagnostic that fails is recorded here rather
 than promoted, and every one needs a fresh, separately owner-activated run at the
 head it is meant to describe.
+
+### 2026-10-27 — head `9a573a9`, third owner-activated diagnostic: 5 of 6 cases passed, case 6 arrangement defect
+
+- **Selector and mode:** `effigy maintain:native:diagnostic` (heavy admission) at
+  `9a573a9d6595e4eabf3179fcc7b39de0fcc55fdf`; one invocation, no retry, exit `3`,
+  `qualified: false` (an uncounted diagnostic is never counted PASS).
+- **What executed:** the preflight census **passed** (16 451 descriptors, 335
+  foreign-uid processes classified, 0 open under the root, OS blind spot: 8
+  verified platform binaries with 67 opaque descriptors); the ownership oracle read
+  the volume text form as `Enabled` with no plist `Owners` key; the image was
+  attached `-owners on`, detached ordinarily (`exit 0, forced false`); the nine
+  premises were traced with `premise_failure: null`; the real account state was
+  observed absent and unchanged; the guard closed with `census.certain`, 0 members,
+  8.0 MiB peak scratch of 512 MiB.
+- **Passed:** `preview_then_real_deletes_exactly_the_planned_units`,
+  `a_tampered_plan_refuses`, `a_hold_between_preview_and_real_stops_that_unit`,
+  `an_oxide_output_root_and_receipt_fixture_are_untouched`,
+  `an_absent_ephemeral_volume_is_skipped_and_a_permanent_one_is_reported`.
+- **Failed (apparatus arrangement, not product):** `exit_3_with_a_pending_intent`
+  exited `0` instead of `3` because the plan it was handed named **0 candidates**:
+  the case created its symlink *after* aging the root, and adding an entry refreshes
+  the directory mtime, which is an owned root's last activity. Nothing was planned,
+  so nothing stopped.
+- **Fix in this change:** the case creates the entry before aging the root, points
+  the symlink at a fixture referent and requires it unchanged, and asserts the
+  preview names exactly its unit before the real run. `maintain:native:test` gained
+  a pure fixture-order guard (the symlink call must precede the aging call in that
+  case, and the case must assert its planned candidate), verified to fail when the
+  order is reversed.
+- **Preserved packet (unchanged):** guard evidence
+  `/Volumes/Builds/scratch/barge/oxide-proof.umacocyb/evidence/` — guard receipt
+  `a763b17146da80ff754b67ef3b94619fb85897c4b856f9c1bc75fab69d867cba`,
+  proof receipt
+  `233cf71cc245c9d868dd05ce1b3f0597b4829f1a9e0fbe9eaac9d72f3944bcec`,
+  stdout `b2963c97140820d224ec82b08d5f74f4ce49668f261390d7a71fefd29977c7e8`,
+  stderr (empty) `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`;
+  selector log `/Volumes/Builds/scratch/barge/run.JPI74V/diagnostic.log`
+  `8b9765156e7a30c12c473305d32012fcea740a17469ec24cae048b150222a110`.
 
 ### 2026-10-27 — head `620ab6f`, second owner-activated diagnostic: setup premise refused, no case
 

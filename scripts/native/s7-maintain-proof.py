@@ -96,6 +96,9 @@ AGED_DAYS = 30
 # The native scratch run's age past S4's seven-day native policy.
 NATIVE_AGE_DAYS = 8
 EXIT_INFRASTRUCTURE = 4
+# The bytes the pending-intent case's symlink points at: the oracle for "the walk
+# never followed the link".
+REFERENT_BYTES = b"the referent the maintain deletion must never follow\n"
 
 ENVIRONMENT = {
     "TMPDIR": "the guard's owned scratch; every fixture directory is created here",
@@ -929,12 +932,26 @@ class Proof:
 
     def case_exit_3_with_a_pending_intent(self):
         root = self.create_area_root()
+        # The referent is a fixture file inside this run root, so "the deletion
+        # never followed the link" is a byte comparison rather than a claim.
+        referent = os.path.join(self.root, "case6-referent.txt")
+        with open(referent, "wb") as handle:
+            handle.write(REFERENT_BYTES)
+        # The entry is created *before* the root is aged. Adding an entry refreshes
+        # the directory's mtime, and an owned root's last activity is its newest
+        # entry time, so aging first would make the root "idle for 0 s" and the
+        # preview would plan nothing at all — the arrangement defect the first
+        # 9a573a9 diagnostic exposed.
+        os.symlink(referent, os.path.join(root["path"], "link"))
         self.age_area_root(root["path"])
-        # An entry the deletion must never follow: a symlink inside the unit
-        # stops it after its quarantine rename and leaves the intent pending.
-        os.symlink("/elsewhere", os.path.join(root["path"], "link"))
         plan_file = self.plan_path("case6")
         _code, preview = self.preview(expect=0, plan_out=plan_file)
+        # The plan this run is authorised by must name exactly this unit: the case
+        # is about a planned deletion that stops mid-way, so a plan that named
+        # nothing would test nothing.
+        candidates = self.candidate_names(preview)
+        assert root["root_id"] in candidates, (root["root_id"], candidates)
+        assert preview["data"]["candidates"] == 1, preview["data"]["candidates"]
         code, real = self.real(preview["data"]["plan_digest"], plan_file, expect=3)
         assert real["data"]["pending"]["count"] == 1, real["data"]["pending"]
         assert real["data"]["volumes"]["rows"][0]["areas"][0]["pending"]["count"] == 1, real["data"]
@@ -945,6 +962,8 @@ class Proof:
         leaves = self.quarantine_leaves(self.area_folder())
         assert len(leaves) == 1, leaves
         assert not os.path.exists(root["path"]), "the unit was renamed into its quarantine leaf"
+        with open(referent, "rb") as handle:
+            assert handle.read() == REFERENT_BYTES, "the symlink's referent is untouched"
         return {
             "exit": code,
             "pending": real["data"]["pending"],
@@ -1237,6 +1256,37 @@ def preflight_problems():
             problems.append(
                 "the absent-volume case does not restore the one-volume registry in a "
                 "finally block"
+            )
+    # The pending-intent case creates its symlink before it ages the root: adding an
+    # entry refreshes the directory mtime, so aging first makes the root ineligible
+    # and the case would plan nothing. It must also assert its planned candidate.
+    pending_case = methods.get("case_exit_3_with_a_pending_intent")
+    if pending_case is None:
+        problems.append("`case_exit_3_with_a_pending_intent` is missing")
+    else:
+        def call_lines(attribute):
+            return [
+                node.lineno
+                for node in ast.walk(pending_case)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == attribute
+            ]
+
+        symlink_lines = call_lines("symlink")
+        age_lines = call_lines("age_area_root")
+        if not symlink_lines or not age_lines:
+            problems.append(
+                "the pending-intent case no longer creates an entry and ages its root"
+            )
+        elif min(symlink_lines) > min(age_lines):
+            problems.append(
+                "the pending-intent case ages its root before creating the symlink entry, "
+                "so the root would not be idle"
+            )
+        if not call_lines("candidate_names"):
+            problems.append(
+                "the pending-intent case does not assert the unit its preview planned"
             )
     adders = sorted(
         name

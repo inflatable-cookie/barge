@@ -1500,6 +1500,13 @@ impl<'a> WalkState<'a> {
 
     /// Account for `added` examined entries: the deadline, the periodic volume
     /// re-verification, and nothing else.
+    /// The walk's effect boundary: a spent caller clock stops it before it
+    /// captures, journals or unlinks anything else. `Ok(Some(reason))` means the
+    /// caller must stop the walk with that reason and change nothing further.
+    fn effect_stop(&mut self) -> Result<Option<String>> {
+        self.budget(0)
+    }
+
     fn budget(&mut self, added: usize) -> Result<Option<String>> {
         self.examined = self.examined.saturating_add(added);
         if Instant::now() >= self.deadline {
@@ -1665,6 +1672,9 @@ impl<'a> WalkState<'a> {
     /// replaces an entry. A taken private name is retried with fresh random
     /// bytes, so a collision can never be mistaken for a capture.
     fn capture(&mut self, handle: &DirHandle, name: &str) -> Result<Capture> {
+        if let Some(reason) = self.effect_stop()? {
+            return Ok(Capture::Stopped(reason));
+        }
         for _ in 0..CAPTURE_ATTEMPTS {
             let private = format!("{CAPTURE_PREFIX}{}", hex(&self.dirs.random_bytes(16)?));
             match self.dirs.rename_child(handle, name, &private)? {
@@ -1898,6 +1908,9 @@ impl<'a> WalkState<'a> {
             Some(index) => self.chain[index] = record.clone(),
             None => self.chain.push(record.clone()),
         }
+        if let Some(reason) = self.effect_stop()? {
+            return Ok(Walk::Stop(reason));
+        }
         if let Err(error) = self.publish_chain() {
             return Ok(Walk::Stop(format!(
                 "the capture of `{}` could not be recorded, so it is not unlinked: {error}",
@@ -1940,6 +1953,9 @@ impl<'a> WalkState<'a> {
                 "`{}` is no longer the recorded capture of `{}`, so it is not unlinked and the intent stays pending",
                 record.private, record.original
             )));
+        }
+        if let Some(reason) = self.effect_stop()? {
+            return Ok(Walk::Stop(reason));
         }
         match self
             .dirs
@@ -2024,6 +2040,9 @@ impl<'a> WalkState<'a> {
         }
         // The recursion refreshed the chain; make this directory the last recorded
         // entry before its own removal.
+        if let Some(reason) = self.effect_stop()? {
+            return Ok(Walk::Stop(reason));
+        }
         if let Err(error) = self.publish_chain() {
             return Ok(Walk::Stop(restore_custody(
                 custody,
@@ -2228,6 +2247,9 @@ impl<'a> WalkState<'a> {
                 // replay that stops at `marker_last`, before the leaf is captured,
                 // then reads no completed capture as a missing one, and resumes the
                 // leaf capture instead of reporting an unknown.
+                if let Some(reason) = self.effect_stop()? {
+                    return Ok(Walk::Stop(reason));
+                }
                 if let Err(error) = self.publish_chain() {
                     return Ok(Walk::Stop(format!(
                         "the marker was unlinked but the completed capture could not be recorded: {error}"
@@ -2367,6 +2389,9 @@ impl<'a> WalkState<'a> {
     ) -> Result<Removal> {
         let attempts = self.bounds.retry_attempts.max(1);
         for attempt in 0..attempts {
+            if let Some(reason) = self.effect_stop()? {
+                return Ok(Removal::Stopped(reason));
+            }
             match self
                 .dirs
                 .remove_child(parent, name, RemoveKind::Directory)?
@@ -4385,14 +4410,72 @@ mod tests {
         );
         let intents = prepared.pending_intents();
         assert_eq!(intents.len(), 1, "the intent stays pending");
-        // The marker really was unlinked last before the clock ran out, so the
-        // bookkeeping phase that records it is honest; the durable completion
-        // phases (`removed`, `deleted`) are what the clock refuses.
+        // The walk's own effect gates stop it before the marker-last bookkeeping
+        // and before any completion phase, so the intent is still at `renamed`.
         assert_eq!(
             intents[0].phase,
-            IntentPhase::MarkerLast,
+            IntentPhase::Renamed,
             "no completion phase"
         );
+    }
+
+    #[test]
+    fn a_walk_stops_starting_effects_once_the_run_clock_is_spent() {
+        let prepared = prepared("replay-walk-effects");
+        let root = prepared.unit_path().clone();
+        VolumeFixture::payload(&root, "a.txt", b"first");
+        VolumeFixture::payload(&root, "b.txt", b"second");
+        publish(&prepared, &[]);
+        rename_to_quarantine(&prepared);
+        publish(&prepared, &[IntentPhase::Renamed]);
+
+        // The walk's first capture-and-unlink outlives the two-second run clock.
+        // The walk must not start another capture, journal write or unlink after
+        // it: exactly one entry is removed, the second stays behind, and the intent
+        // is left pending without a completion phase.
+        let faults = Faults::new();
+        faults.sleeping_remove_prefix(CAPTURE_PREFIX, Duration::from_millis(2_300));
+        let facts = prepared.fixture.facts();
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let mut bounds = prepared.bounds();
+        bounds.deadline = Some(Instant::now() + Duration::from_secs(2));
+        let report = replay_with(
+            &prepared.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            bounds,
+            bounds.deadline,
+        )
+        .expect("the replay reports");
+        assert_eq!(report.settled, 0, "{report:?}");
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(
+            report.pending[0].reason.contains("wall clock"),
+            "{}",
+            report.pending[0].reason
+        );
+        // A pending report deliberately does not count its removals as a resumed
+        // completion, so the filesystem is the oracle: exactly one of the two
+        // payloads was removed before the clock was spent.
+        let intents = prepared.pending_intents();
+        assert_eq!(intents.len(), 1, "the intent stays pending");
+        assert_ne!(
+            intents[0].phase,
+            IntentPhase::Removed,
+            "no completion phase"
+        );
+        // One of the two payloads is still somewhere under the leaf: the walk did
+        // not start its removal after the clock was spent.
+        let payloads: Vec<String> = std::fs::read_dir(prepared.quarantine())
+            .expect("the quarantine leaf")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name == "a.txt" || name == "b.txt")
+            .collect();
+        assert_eq!(payloads.len(), 1, "one payload remains: {payloads:?}");
     }
 
     #[test]
