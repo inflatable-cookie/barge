@@ -10,6 +10,7 @@
 use std::path::Path;
 
 mod facts;
+mod space;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -22,6 +23,8 @@ pub use facts::{
     RetryEvidence, RetryResolution, SelfExclusion, VerifiedVolume, VolumeFacts, VolumeIdentity,
     VolumeUuid, BLIND_SPOT_RECORDS, RETRY_RECORDS,
 };
+
+pub use space::{Flush, SpaceFacts, SpaceMeasurement};
 
 #[cfg(target_os = "macos")]
 pub use macos::MacOs;

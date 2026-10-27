@@ -75,7 +75,7 @@ fn stdout_document(output: &Output) -> Value {
 }
 
 /// The usage's first line; the full text names every area verb too.
-const USAGE: &str = "usage: barge <describe|inspect|area|cache|diagnostic|scratch> [--json]";
+const USAGE: &str = "usage: barge <describe|inspect|space|area|cache|diagnostic|scratch> [--json]";
 
 #[test]
 fn descriptor_census_refuses_bad_arguments_and_missing_roots_without_scanning() {
@@ -1081,4 +1081,15 @@ fn a_scratch_conclude_without_its_five_facts_is_a_usage_refusal() {
     assert!(document["error"]["detail"]["usage"]
         .as_str()
         .is_some_and(|usage| usage.contains("scratch conclude")));
+}
+
+#[test]
+fn space_json_does_not_create_state() {
+    let (_fixture, state_dir) = absent_state_dir("space");
+    let output = run_in(&["space", "--json"], &state_dir);
+    assert_eq!(output.status.code(), Some(0));
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.space/1");
+    assert_eq!(document["data"]["volumes"]["count"], 0);
+    assert!(!state_dir.exists());
 }
