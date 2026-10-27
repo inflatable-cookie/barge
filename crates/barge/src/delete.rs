@@ -48,10 +48,13 @@
 //!   private name is never unlinked and keeps the intent pending;
 //! - a capture whose verification failed is recorded in `foreign_captures` before
 //!   its put-back, so a replay never mistakes the object for content of the root;
+//! - a capture the intent records whose private name is gone is `Unknown`: the
+//!   record proves the capture happened, not that Barge unlinked it, so a replay
+//!   reports it and keeps the intent pending instead of completing past it;
 //! - a captured directory whose owner cannot write or search it has its original
 //!   permission mode recorded before the mode is changed, a scope guard restores it
 //!   on every return, `?` error and panic, and a replay restores recorded modes
-//!   first;
+//!   first - before it reads the marker or decides the phase;
 //! - the `removed` phase is published after Barge's own final unlink and before the
 //!   intent settles, and an absent leaf without it stays unknown and pending.
 
@@ -1173,7 +1176,13 @@ impl<'a> WalkState<'a> {
             if depth == 0 && entry.name == ROOT_MARKER_FILE {
                 continue;
             }
-            let Some(facts) = self.dirs.child_facts(handle, &entry.name)? else {
+            let facts = self.dirs.child_facts(handle, &entry.name)?;
+            if is_capture_name(&entry.name) && facts.is_none() {
+                // A recorded capture that answered "not there" is unknown: neither
+                // the walk nor a replay may treat it as already removed.
+                return Ok(Walk::Stop(self.unrecorded_stop(&entry.name, None)));
+            }
+            let Some(facts) = facts else {
                 // It vanished between the listing and the read.
                 continue;
             };
@@ -1691,7 +1700,13 @@ impl<'a> WalkState<'a> {
                 continue;
             }
             // This read is the observation the capture is verified against.
-            let Some(facts) = self.dirs.child_facts(handle, &entry.name)? else {
+            let facts = self.dirs.child_facts(handle, &entry.name)?;
+            if is_capture_name(&entry.name) && facts.is_none() {
+                // The recorded capture's name answered "not there" after the
+                // listing: an absence is unknown, never a step that completed.
+                return Ok(Walk::Stop(self.unrecorded_stop(&entry.name, None)));
+            }
+            let Some(facts) = facts else {
                 continue;
             };
             if let Walk::Stop(reason) = self.classify_entry(&entry.name, &facts) {
@@ -2080,14 +2095,9 @@ fn replay_one(
     } else {
         None
     };
-    let marker_digest = match &leaf_handle {
-        Some(leaf) => Some(leaf_marker_digest(dirs, observer, intent, leaf)?),
-        None => None,
-    };
-
     // The modes this deletion recorded come back first, before any other deletion
-    // or reconciliation action, so no object is left with a changed mode while a
-    // replay decides what to do next.
+    // or reconciliation action - before the marker is even read - so no object is
+    // left with a changed mode while a replay decides what to do next.
     if intent.phase != IntentPhase::Deleted {
         if let Some(leaf) = leaf_handle.as_ref() {
             match restore_recorded_modes(dirs, leaf, intent) {
@@ -2101,6 +2111,11 @@ fn replay_one(
             }
         }
     }
+
+    let marker_digest = match &leaf_handle {
+        Some(leaf) => Some(leaf_marker_digest(dirs, observer, intent, leaf)?),
+        None => None,
+    };
 
     match intent.phase {
         IntentPhase::Intent => {
@@ -2304,8 +2319,13 @@ fn restore_recorded_modes(
             None => leaf,
         };
         let Some(facts) = dirs.child_facts(parent, &record.private)? else {
-            // The recorded object is gone, so nothing it held is reachable either.
-            break;
+            // The intent records this capture and the name is gone. Nothing proves
+            // Barge unlinked it - the durable `removed` phase is the only such
+            // proof - so an absence is unknown and the intent stays pending.
+            return Ok(Some(format!(
+                "`{}`, the recorded capture of `{}`, is gone without the removed phase, so completion is unknown and its recorded mode is not restored",
+                record.private, record.original
+            )));
         };
         if !WalkState::matches_capture(record, &facts) {
             return Ok(Some(format!(
@@ -2314,7 +2334,9 @@ fn restore_recorded_modes(
             )));
         }
         if facts.kind != EntryKind::Directory {
-            break;
+            // A recorded file capture has no contents and is never chmod'd; there
+            // is nothing to restore under it.
+            continue;
         }
         let child = dirs.open_child_dir(parent, &record.private)?;
         if let Some(mode) = record.mode {
@@ -2616,6 +2638,19 @@ mod tests {
                 .expect("the phase advances");
         }
         intent
+    }
+
+    /// Replay pending intents through explicit seams, for a test that needs its own
+    /// dirs or facts.
+    fn replay_with(
+        state_paths: &crate::state::StatePaths,
+        dirs: &Faults,
+        facts: &crate::testkit::FakeVolume,
+        mounts: &crate::testkit::FakeMounts,
+        observer: &dyn ProcessObserver,
+        bounds: DeleteBounds,
+    ) -> crate::error::Result<ReplayReport> {
+        replay_pending(state_paths, dirs, facts, mounts, observer, bounds)
     }
 
     fn rename_to_quarantine(prepared: &Prepared) {
@@ -3517,6 +3552,148 @@ mod tests {
         let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
         assert_eq!(intents.records[0].captures[0].original, "sub");
         assert!(intents.records[0].captures[0].kind == "directory");
+
+        // A replay may not treat the gone capture as a completed step: the durable
+        // `removed` phase is the only proof, so it stays pending.
+        let replay = prepared.replay();
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0]
+                .reason
+                .contains("gone without the removed phase"),
+            "{:?}",
+            replay.pending[0].reason
+        );
+    }
+
+    #[test]
+    fn a_recorded_capture_that_vanishes_before_a_replay_keeps_it_pending() {
+        // The intent records this operation's capture and the private name is gone.
+        // Absence is not proof that Barge unlinked it, so the replay neither
+        // completes the intent nor restores a mode it cannot reach.
+        let prepared = prepared("replay-recorded-capture-gone");
+        let root = prepared.observed.path.clone();
+        VolumeFixture::payload(&root, "sub/nested/deep.txt", b"bytes");
+        VolumeFixture::payload(&root, "sub/other.txt", b"bytes");
+        let mut faults = Faults::new();
+        faults.failing_facts_at("nested", 2);
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        let leaf = report.quarantine.clone();
+        for private in capture_names(&leaf) {
+            std::fs::remove_dir_all(&private).expect("another process moved the capture away");
+        }
+        assert!(capture_names(&leaf).is_empty());
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0]
+                .reason
+                .contains("gone without the removed phase"),
+            "{:?}",
+            replay.pending[0].reason
+        );
+        assert!(leaf.join(ROOT_MARKER_FILE).is_file(), "the root is kept");
+        let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
+        assert!(
+            intents.records[0].phase.is_pending(),
+            "the intent never settles on an absence"
+        );
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_read_still_restores_the_recorded_mode_first() {
+        // Rule 3 puts the mode restoration ahead of every other reconciliation
+        // action, the marker read included: an unreadable marker must not skip it.
+        let prepared = prepared("replay-marker-unreadable-mode");
+        let root = prepared.observed.path.clone();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).expect("the directory exists");
+        VolumeFixture::payload(&locked, "inside.txt", b"bytes");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+                .expect("the directory is read-only");
+        }
+        let faults = Faults::new();
+        faults.failing_mode_restore();
+        faults.failing_listing_after_mode();
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+
+        // Make the marker unreadable, so a replay that read it before restoring
+        // would stop with the mode still changed.
+        let leaf = report.quarantine.clone();
+        let marker = leaf.join(ROOT_MARKER_FILE);
+        let bytes = std::fs::read(&marker).expect("the marker reads");
+        let mut truncated = bytes.clone();
+        truncated.truncate(bytes.len() / 2);
+        std::fs::write(&marker, &truncated).expect("the marker is spoiled");
+        let private = capture_names(&leaf);
+        assert_eq!(private.len(), 1);
+
+        let replay = prepared.replay();
+        assert_eq!(
+            mode_of(&private[0]),
+            0o500,
+            "the replay restored the recorded mode before it read the marker"
+        );
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+    }
+
+    #[test]
+    fn a_recorded_capture_that_vanishes_between_its_listing_and_its_read_stays_pending() {
+        // The walk lists the recorded capture, and another process moves it before
+        // the read. The read answering "not there" is unknown, never a step that
+        // completed, so the replay keeps the intent pending.
+        let prepared = prepared("replay-capture-vanishes-mid-walk");
+        let root = prepared.observed.path.clone();
+        VolumeFixture::payload(&root, "sub/nested/deep.txt", b"bytes");
+        let mut faults = Faults::new();
+        faults.failing_facts_at("nested", 2);
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        let leaf = report.quarantine.clone();
+        assert_eq!(capture_names(&leaf).len(), 1);
+
+        let replay_faults = Faults::new();
+        // The private-name reads in order: the mode-restoration walk, the
+        // classification, then the delete pass's own read - which vanishes.
+        replay_faults.vanishing_capture_at(3);
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let replay = replay_with(
+            &prepared.fixture.state,
+            &replay_faults,
+            &prepared.fixture.facts(),
+            &mounts,
+            &observer,
+            prepared.bounds(),
+        )
+        .expect("the replay reports");
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.settled, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0].reason.contains("not there")
+                || replay.pending[0]
+                    .reason
+                    .contains("recorded as this operation's capture"),
+            "{:?}",
+            replay.pending[0].reason
+        );
+        let intents = state::read_intents(&prepared.fixture.state, 64).expect("the journal reads");
+        assert!(intents.records[0].phase.is_pending());
+        let _ = leaf;
     }
 
     #[test]
@@ -3664,6 +3841,45 @@ mod tests {
             "the leaf's owner write and search bits were applied: {:?}",
             faults.modes_set()
         );
+    }
+
+    #[test]
+    fn an_entry_read_error_after_the_chmod_restores_the_mode_and_records_the_abort() {
+        // The second post-chmod failure seam: the abort lands on an entry read
+        // inside the captured directory rather than on its listing, and the mode
+        // custody is the same.
+        let prepared = prepared("delete-mode-abort-entry-read");
+        let root = prepared.observed.path.clone();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).expect("the directory exists");
+        VolumeFixture::payload(&locked, "inside.txt", b"bytes");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+                .expect("the directory is read-only");
+        }
+        let faults = Faults::new();
+        faults.failing_facts_after_mode();
+        let facts = prepared.fixture.facts();
+        let report = prepared.delete(&faults, &facts);
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(
+            faults.modes_set().first().map(|mode| mode & 0o777),
+            Some(0o700),
+            "the owner write and search bits were applied: {:?}",
+            faults.modes_set()
+        );
+        let leaf = report.quarantine.clone();
+        let private = capture_names(&leaf);
+        assert_eq!(private.len(), 1, "the captured directory is still there");
+        assert_eq!(
+            mode_of(&private[0]),
+            0o500,
+            "the guard put the recorded mode back"
+        );
+        let pending = prepared.pending_intents();
+        assert_eq!(pending.len(), 1, "the abort is recorded");
+        assert_eq!(pending[0].captures[0].mode, Some(0o500));
     }
 
     #[test]

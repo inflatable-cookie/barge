@@ -471,6 +471,9 @@ pub struct Faults {
     /// Whether the next private-name removal answers "already gone", as it does
     /// when another process moves the captured object mid-run.
     pub vanishing: Cell<bool>,
+    /// Vanish the Nth private-name read (counted from one), as another process
+    /// moving the captured object does between a listing and its read.
+    pub vanishing_facts: Cell<usize>,
     /// A device the descriptor a capture is verified through reports, so the
     /// parent binding fails and the captured facts cannot be read.
     pub parent_device_shift: Cell<Option<DeviceId>>,
@@ -681,6 +684,12 @@ impl Faults {
         self.vanishing.set(true);
     }
 
+    /// Let another process move the `observation`-th private name away between its
+    /// listing and its read, so the read answers "not there".
+    pub fn vanishing_capture_at(&self, observation: usize) {
+        self.vanishing_facts.set(observation);
+    }
+
     /// Fail the `observation`-th entry read of `name`, aborting the walk where a
     /// real read error would. Counting from one is how a test lands the abort in
     /// the delete pass rather than in the classification.
@@ -858,6 +867,17 @@ impl DirOps for Faults {
     }
 
     fn child_facts(&self, parent: &DirHandle, name: &str) -> Result<Option<EntryFacts>> {
+        if name.starts_with(crate::state::CAPTURE_PREFIX) && self.vanishing_facts.get() > 0 {
+            let remaining = self.vanishing_facts.get().saturating_sub(1);
+            self.vanishing_facts.set(remaining);
+            if remaining == 0 {
+                // Another process moved the captured object away: the entry is
+                // listed, and by the time it is read it is not there.
+                let _ = self.inner.remove_child(parent, name, RemoveKind::File);
+                let _ = self.inner.remove_child(parent, name, RemoveKind::Directory);
+                return Ok(None);
+            }
+        }
         if self.failing_facts_name.as_deref() == Some(name) {
             let seen = self.facts_seen.get().saturating_add(1);
             self.facts_seen.set(seen);
@@ -997,7 +1017,7 @@ impl DirOps for Faults {
         }
         self.inner.set_dir_mode(handle, mode)?;
         self.mode_changes.borrow_mut().push(mode);
-        if self.fail_listing_after_mode.get() {
+        if self.fail_listing_after_mode.get() || self.fail_facts_after_mode.get() {
             self.arm_after_mode.set(true);
         }
         Ok(())
