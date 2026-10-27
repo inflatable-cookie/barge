@@ -31,25 +31,37 @@ other state is refused before any effect.
 
 ## What the job does
 
-1. Run the preview. Record its exit code.
-2. **Only** when the preview exited `0` and `data.candidates` is greater than
-   zero, run the real step once, passing that preview's `data.plan_digest`.
+1. Run the preview and record its exit code. A preview that prints a
+   `barge.maintain/1` document with `ok: true` **completed**: `data.candidates`
+   and `data.plan_digest` are its report. A preview that prints a
+   `barge.error/1` document refused or could not report, and nothing was planned.
+2. **Only** when the preview printed a plan document and `data.candidates` is
+   greater than zero, run the real step once, passing that preview's
+   `data.plan_digest` (and, when the job kept them, `--plan` with the exact
+   preview bytes).
 3. Record the real step's exit code. Never retry it, never loop, never run it
    twice, and never run it with a digest from an earlier day's preview.
-4. Do nothing else. The job sweeps scratch and applies each declared area's prune
+4. Exit with the worse of the two recorded codes, so a loud absence is never
+   lost and a later success never hides an earlier refusal.
+5. Do nothing else. The job sweeps scratch and applies each declared area's prune
    policy; it never runs Oxide's outputs prune, never reads an Oxide receipt or
    journal, and never deletes an Oxide root.
 
+The distinction in step 1 is what lets one volume's absence be loud without
+stopping the other volumes' work: an absent **permanent** volume makes the
+preview exit `3` while it still reports an authorized plan for the volumes that
+are attached, so the job performs that authorized real step and records the `3`.
 A pending intent is finished by the next scheduled real run's own replay, not by
 a retry inside the same night.
 
 ## Exit codes and what the job records
 
-| Exit | Meaning for the job |
-| --- | --- |
-| `0` | Completed. Nothing else to do. |
-| `2` | Refused before any effect: a usage error, a plan that is not the plan, an absent volume it named, a lock, a custody refusal. Record and stop for this schedule. |
-| `3` | Unsettled or unknown state that needs a human: a pending intent, a replay that stopped short, the run's wall clock, a run that stopped on an error after its first effect (reported in `data.stopped`, never as a "refused before any effect" `2`), an absent **permanent** volume, or a volume whose durability is undeclared. Record and stop. |
+| Exit | Document | Meaning for the job |
+| --- | --- | --- |
+| `0` | plan | Completed, nothing pending. |
+| `2` | error | Refused before any effect: a usage error, a plan that is not the plan, a lock, a custody refusal. Record and stop for this schedule. |
+| `3` | plan | Completed and it needs a human: an absent **permanent** volume, a volume whose durability is undeclared, a pending intent or an unsettled replay on a volume it did not touch. The plan's candidates are still authorized, so do the real step and record the `3`. |
+| `3` | error | Unsettled or unknown state: the run's own plan changed, the wall clock, a run that stopped on an error after its first effect (reported in `data.stopped`, never as a "refused before any effect" `2`), or a refusal that could not be classified as `2`. Record and stop. |
 
 A non-zero exit is recorded and never retried by Barge. The recording is the
 host's: launchd's `StandardOutPath`/`StandardErrorPath` append one line per run,
@@ -58,8 +70,9 @@ and Barge writes nothing about the job into its own state.
 An absent `ephemeral` volume is not a failure: it is reported in the plan with
 `loud: false`, and the run exits `0`. An absent `permanent` volume is reported
 with `loud: true` and forces exit `3`, because a drive that should be attached and
-is not needs a human. In both cases the other volumes are still maintained and no
-mount point is ever recreated.
+is not needs a human. In both cases the other volumes are still maintained, the
+run's own `candidates` are still authorized, and no mount point is ever
+recreated.
 
 ## What the job must not do
 

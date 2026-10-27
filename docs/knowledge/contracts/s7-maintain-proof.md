@@ -52,8 +52,13 @@ verifies and then executes Oxide's qualified shared supervisor:
 `maintain:native:test` proves the same pins without an image: the case map
 resolves every case name to a `case_<name>` method, no case method is
 undispatched, each dependency is evaluated first, the nine premises are recorded
-and traced, the environment inventory covers every hook the source reads or
-sets, and the script contains no force detach.
+and traced, the environment inventory covers every hook the source reads or sets,
+and the script contains no force detach. It also holds the ordering the case
+bodies need — the planned-deletion cases before the absent-volume case, the
+pending-intent case last — that the absent-volume records are registered by that
+one case, and that it restores the one-volume registry in a `finally` block, so a
+future edit cannot quietly make the earlier cases observe a loud plan or leave a
+pending intent for a later case's real run to replay.
 
 ## Resources
 
@@ -79,9 +84,13 @@ directly than a second attached image would.
   a unique `/Volumes/BargeMaintainProof<pid>-<tick>`.
 - A private `HOME`, `CARGO_HOME` and state directory inside the run root, so no
   real account state is read or written.
-- One fixture `barge.registry/1` with three explicit records: the owned image's
-  volume (permanent, expendable), a second permanent record and an ephemeral
-  record whose `mount_hint` paths are *inside the run root and never created*.
+- One fixture `barge.registry/1` that starts with the owned image's volume only
+  (permanent, expendable). The absent-volume case adds two further explicit
+  records — a permanent and an ephemeral one whose `mount_hint` paths are *inside
+  the run root and never created* — and restores the one-volume registry
+  afterwards. A record for a volume that is not attached makes every plan loud
+  (exit `3`), so registering those two first would stop every planned-deletion
+  case from observing the quiet exit its behaviour is stated against.
 - One area declaration, `example/pool`, with `--absent wait`,
   `--prune oldest-idle:60` and `--reserve counts`, written by the area verb.
 - Owned roots through `barge area root create`, one native scratch run through
@@ -111,6 +120,12 @@ Each case asserts the design's observable and fails on a missing fact. The
 counted mode stops at the first fault; the diagnostic keeps going, latches the
 first fault, and skips only the cases that depend on a failed one.
 
+The order is the one the case bodies need, not the order the brief lists them in:
+the four cases that plan deletions run first against the quiet one-volume
+registry, the absent-volume case then adds its two records and restores them, and
+the pending-intent case runs last because it leaves an intent that any later real
+run would replay.
+
 1. **`preview_then_real_deletes_exactly_the_planned_units`.** One aged owned
    area root, one fresh one, and one concluded-then-aged native scratch run. The
    preview names exactly the two eligible units, lists the fresh root in `kept`
@@ -131,18 +146,19 @@ first fault, and skips only the cases that depend on a failed one.
    conservative reading of a changed plan. A fresh preview then lists the held
    root in `kept` with its hold reason and the other root as a candidate, and its
    real run deletes only the unheld root while the held one survives.
-4. **`an_absent_ephemeral_volume_is_skipped_and_a_permanent_one_is_reported`.**
-   The plan reports the ephemeral record `absent` with `loud: false`, the
-   permanent record `absent` with `loud: true`, and neither mount point exists
-   afterwards. The preview and the real run both exit `3`; the real run still
-   deletes the attached volume's planned root, so the other volumes are
-   maintained.
-5. **`an_oxide_output_root_and_receipt_fixture_are_untouched`.** The case plants
+4. **`an_oxide_output_root_and_receipt_fixture_are_untouched`.** The case plants
    an `oxide-outputs/proof-root/` tree on the volume and a receipt file in the
    fixture state, snapshots both (names, modes, sizes, mtimes, bytes), runs a real
    maintain that deletes its own planned unit, and requires both snapshots
    byte-identical. `maintain` never runs Oxide's outputs prune, never reads a
    receipt and never deletes an Oxide root.
+5. **`an_absent_ephemeral_volume_is_skipped_and_a_permanent_one_is_reported`.**
+   The case writes the two absent records itself. The plan reports the ephemeral
+   record `absent` with `loud: false`, the permanent record `absent` with
+   `loud: true`, and neither mount point exists afterwards. The preview and the
+   real run both exit `3`; the real run still deletes the attached volume's
+   planned root, so the other volumes are maintained. The one-volume registry is
+   restored in a `finally` block, so the last case's plan is quiet again.
 6. **`exit_3_with_a_pending_intent`.** An aged owned root holding a symlink. The
    real run exits `3` with exactly one pending intent, the intent record is not
    `deleted`, the area folder holds exactly one `.barge-prune-` leaf, and the

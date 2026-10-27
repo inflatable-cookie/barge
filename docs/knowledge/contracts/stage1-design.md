@@ -2335,7 +2335,15 @@ Choices S7 made where this design left the mechanic to the slice:
   and what the run did. The plan holds only stable facts (the volume rows, each
   scratch step's own `barge.scratch.plan/1` and digest, each area step's policy,
   candidates and kept rows), so its digest is reproducible across a preview and
-  its real run; the clock and every effect live outside it.
+  its real run; the clock and every effect live outside it. **No plan byte is
+  derived from elapsed time**: a row states the declared age it was decided
+  against, never how long a root has been idle, because a value that moves every
+  second would make the preview's digest unusable a moment later. The real run
+  therefore accepts a preview's digest while the eligible set is unchanged, and
+  re-evaluates each root's idleness against its own clock immediately before the
+  effect; a root that crossed the age threshold in between is a plan difference,
+  and the whole run refuses rather than deleting something the preview did not
+  name.
 - **The CLI's two forms.** A preview is the default and is effect-free:
   `barge maintain --json` prints the plan and its digest, and `--plan-out <file>`
   writes exactly the bytes the digest covers where the caller asked. A real run
@@ -2350,7 +2358,10 @@ Choices S7 made where this design left the mechanic to the slice:
   embedded scratch digest is recomputed and compared again by S4's sweep, and
   each area root is re-read under the volume lock before its intent.
 - **Exit codes.** `0` completed, including a partial completion with nothing
-  pending. `2` refused before any effect, from the closed error kinds. `3` a
+  pending. A `3` that still reports a plan is a completed run: the host job's
+  contract keeps the `3` on record and still performs the authorized real step for
+  the candidates it named, so one absent permanent volume does not stop the other
+  volumes' work. `2` refused before any effect, from the closed error kinds. `3` a
   pending intent, a replay that stopped short, a wall-clock stop, **or an absent
   permanent volume**: absence is a fact, but a drive that should be attached and
   is not needs a human, and the exit code is the only channel the host contract

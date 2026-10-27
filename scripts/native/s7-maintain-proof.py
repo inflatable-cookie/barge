@@ -116,12 +116,18 @@ CASES = [
     ("a_tampered_plan_refuses", ["preview_then_real_deletes_exactly_the_planned_units"]),
     ("a_hold_between_preview_and_real_stops_that_unit",
      ["a_tampered_plan_refuses"]),
-    ("an_absent_ephemeral_volume_is_skipped_and_a_permanent_one_is_reported",
-     ["a_hold_between_preview_and_real_stops_that_unit"]),
+    # The absent-volume case rewrites this proof's registry, so it runs only after
+    # the planned-deletion cases: a record for a volume that is not attached makes
+    # every plan loud (exit 3), which would confuse a case that expects a quiet
+    # exit 0. It restores the one-volume registry in a finally block, and the
+    # pending-intent case stays last because its intent is replayed by any later
+    # real run.
     ("an_oxide_output_root_and_receipt_fixture_are_untouched",
-     ["an_absent_ephemeral_volume_is_skipped_and_a_permanent_one_is_reported"]),
-    ("exit_3_with_a_pending_intent",
+     ["a_hold_between_preview_and_real_stops_that_unit"]),
+    ("an_absent_ephemeral_volume_is_skipped_and_a_permanent_one_is_reported",
      ["an_oxide_output_root_and_receipt_fixture_are_untouched"]),
+    ("exit_3_with_a_pending_intent",
+     ["an_absent_ephemeral_volume_is_skipped_and_a_permanent_one_is_reported"]),
 ]
 
 PREMISES = [
@@ -484,49 +490,54 @@ class Proof:
         self.register()
         self.declare_area()
 
-    def register(self):
-        """Register the fixture's three volume records: this proof's own write."""
-        volumes = [
-            {
-                "volume_uuid": self.uuid,
-                "mount_hint": self.mount,
-                "availability": "permanent",
-                "durability": "expendable",
-                "root_dir": "",
-                "folders": {"scratch": None, "caches": None},
-                "origin": "declared",
-                "scratch_grants": {"delegations": [], "claims": []},
-                "generation": 1,
-                "registered_ms": now_ms(),
-            },
-            {
-                "volume_uuid": "B1B2C3D4-1111-4222-8333-944455556666",
-                "mount_hint": self.absent_ephemeral,
-                "availability": "ephemeral",
-                "durability": "expendable",
-                "root_dir": "",
-                "folders": {"scratch": None, "caches": None},
-                "origin": "declared",
-                "scratch_grants": {"delegations": [], "claims": []},
-                "generation": 1,
-                "registered_ms": now_ms(),
-            },
-            {
-                "volume_uuid": "C1C2C3D4-1111-4222-8333-944455556666",
-                "mount_hint": self.absent_permanent,
-                "availability": "permanent",
-                "durability": "expendable",
-                "root_dir": "",
-                "folders": {"scratch": None, "caches": None},
-                "origin": "declared",
-                "scratch_grants": {"delegations": [], "claims": []},
-                "generation": 1,
-                "registered_ms": now_ms(),
-            },
-        ]
+    ABSENT_EPHEMERAL_UUID = "B1B2C3D4-1111-4222-8333-944455556666"
+    ABSENT_PERMANENT_UUID = "C1C2C3D4-1111-4222-8333-944455556666"
+
+    def volume_record(self, uuid, mount, availability):
+        return {
+            "volume_uuid": uuid,
+            "mount_hint": mount,
+            "availability": availability,
+            "durability": "expendable",
+            "root_dir": "",
+            "folders": {"scratch": None, "caches": None},
+            "origin": "declared",
+            "scratch_grants": {"delegations": [], "claims": []},
+            "generation": 1,
+            "registered_ms": now_ms(),
+        }
+
+    def write_registry(self, volumes):
+        """Publish the fixture registry: this proof's own explicit write."""
         with open(os.path.join(self.state, "registry.json"), "w", encoding="utf-8") as handle:
             json.dump({"schema": "barge.registry/1", "volumes": volumes}, handle, indent=1)
             handle.write("\n")
+
+    def register(self):
+        """Register the attached volume only, so quiet runs stay quiet.
+
+        The two absent volumes are records the absent-volume case adds and then
+        removes: a record for a volume that is not attached makes every plan loud
+        (exit `3`), so registering them here would stop every planned-deletion
+        case from observing the quiet exit its behaviour is stated against.
+        """
+        self.write_registry([self.volume_record(self.uuid, self.mount, "permanent")])
+
+    def add_absent_volumes(self):
+        """Register the two volumes whose mount points are never created."""
+        self.write_registry([
+            self.volume_record(self.uuid, self.mount, "permanent"),
+            self.volume_record(
+                self.ABSENT_EPHEMERAL_UUID, self.absent_ephemeral, "ephemeral"
+            ),
+            self.volume_record(
+                self.ABSENT_PERMANENT_UUID, self.absent_permanent, "permanent"
+            ),
+        ])
+
+    def restore_attached_only(self):
+        """Drop the absent records again, so a later case sees a quiet plan."""
+        self.register()
 
     def declare_area(self):
         self.barge(
@@ -813,12 +824,22 @@ class Proof:
     def case_an_absent_ephemeral_volume_is_skipped_and_a_permanent_one_is_reported(self):
         root = self.create_area_root()
         self.age_area_root(root["path"])
+        # The two absent records are this case's own explicit write, and the
+        # one-volume registry is restored afterwards so the next case's plan is
+        # quiet again.
+        self.add_absent_volumes()
+        try:
+            return self.absent_volume_evidence(root)
+        finally:
+            self.restore_attached_only()
+
+    def absent_volume_evidence(self, root):
         # The plan is loud because a permanent volume is absent, so the preview
         # and the real run both exit 3 while the attached volume is maintained.
         code, preview = self.preview(expect=3)
         assert code == 3
-        ephemeral = self.volume_row(preview, "B1B2C3D4-1111-4222-8333-944455556666")
-        permanent = self.volume_row(preview, "C1C2C3D4-1111-4222-8333-944455556666")
+        ephemeral = self.volume_row(preview, self.ABSENT_EPHEMERAL_UUID)
+        permanent = self.volume_row(preview, self.ABSENT_PERMANENT_UUID)
         assert ephemeral["state"] == "absent", ephemeral
         assert ephemeral["loud"] is False, ephemeral
         assert "skipped" in ephemeral["detail"], ephemeral["detail"]
@@ -1115,7 +1136,64 @@ def preflight_problems():
     if not environment_inventory_problems(['os.environ.get(variable)'], {}):
         problems.append("a dynamic environment hook is not detected")
     with open(SCRIPT_PATH, encoding="utf-8") as handle:
-        tree = ast.parse(handle.read())
+        source = handle.read()
+    tree = ast.parse(source)
+    # The absent-volume case must run after the planned-deletion cases, and the
+    # pending-intent case last: a record for a volume that is not attached makes
+    # every plan loud, and a pending intent is replayed by any later real run.
+    # A self-check reports problems and never raises: a renamed or missing case
+    # is a problem to state, not an exception to escape from.
+    positions = {name: index for index, (name, _) in enumerate(CASES)}
+    absent_name = "an_absent_ephemeral_volume_is_skipped_and_a_permanent_one_is_reported"
+    oxide_name = "an_oxide_output_root_and_receipt_fixture_are_untouched"
+    hold_name = "a_hold_between_preview_and_real_stops_that_unit"
+    pending_name = "exit_3_with_a_pending_intent"
+    required = (absent_name, oxide_name, hold_name, pending_name)
+    missing = [name for name in required if name not in positions]
+    if missing:
+        problems.append(f"the case map is missing a case the ordering rule names: {missing}")
+    else:
+        if positions[oxide_name] > positions[absent_name]:
+            problems.append("the absent-volume case runs before a planned-deletion case")
+        if positions[hold_name] > positions[absent_name]:
+            problems.append("the absent-volume case runs before the hold case")
+        if positions[pending_name] != max(positions.values()):
+            problems.append("the pending-intent case is not last")
+    methods = {
+        node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+    }
+    absent_case = methods.get(f"case_{absent_name}")
+    if absent_case is None:
+        problems.append(f"`case_{absent_name}` is missing")
+    else:
+        restores = any(
+            isinstance(handler, ast.Try)
+            and any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "restore_attached_only"
+                for statement in handler.finalbody
+                for call in ast.walk(statement)
+            )
+            for handler in ast.walk(absent_case)
+        )
+        if not restores:
+            problems.append(
+                "the absent-volume case does not restore the one-volume registry in a "
+                "finally block"
+            )
+    adders = sorted(
+        name
+        for name, method in methods.items()
+        if any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "add_absent_volumes"
+            for call in ast.walk(method)
+        )
+    )
+    if adders != [f"case_{absent_name}"]:
+        problems.append(f"the absent volumes are registered outside their case: {adders}")
     for node in ast.walk(tree):
         if isinstance(node, (ast.List, ast.Tuple)):
             values = [

@@ -771,16 +771,17 @@ impl Builder<'_> {
                 });
                 continue;
             }
-            let idle_ms = self.now_ms.saturating_sub(last);
-            if idle_ms < age_ms {
+            // The comparison is evaluated against the plan's own clock, and the
+            // row's reason never states the elapsed time: that value moves every
+            // second, and a plan whose bytes move cannot be the authorization a
+            // real run presents. The decision is re-evaluated against the effect's
+            // clock immediately before the deletion instead.
+            if self.now_ms.saturating_sub(last) < age_ms {
                 kept.push(PruneKeptRow {
                     name: root.name.clone(),
                     path,
                     state: marker_state_name(root.state).to_owned(),
-                    reason: format!(
-                        "idle for {} s, less than the declared {age_seconds} s",
-                        idle_ms / 1000
-                    ),
+                    reason: format!("idle for less than the declared {age_seconds} s"),
                 });
                 continue;
             }
@@ -793,10 +794,7 @@ impl Builder<'_> {
                 kind,
                 created_ms: root.created_ms,
                 last_activity_ms: last,
-                reason: format!(
-                    "owned, idle for {} s past the declared {age_seconds} s",
-                    idle_ms / 1000
-                ),
+                reason: format!("owned and idle past the declared {age_seconds} s"),
             });
         }
         let candidate_total = candidates.len();
@@ -1630,6 +1628,54 @@ mod tests {
         let document: serde_json::Value =
             serde_json::from_slice(&canonical(&first)).expect("the plan parses");
         assert_eq!(document["schema"], "barge.maintain.plan/1");
+    }
+
+    #[test]
+    fn the_plan_bytes_are_stable_across_elapsed_seconds_and_authorize_the_real_run() {
+        let harness = Harness::new("maintain-plan-stable");
+        let root = harness.create_root(RootKind::AreaRoot);
+        let planned_at = harness.aged();
+        let first = harness.preview_at(planned_at);
+        let first_candidate = &harness.area_plan(&first).candidates.rows[0];
+        // The candidate states the declared policy, never how long it has been
+        // idle: that number moves every second, and a plan whose bytes move can
+        // never be the authorization a real run presents.
+        assert_eq!(
+            first_candidate.reason,
+            format!("owned and idle past the declared {AREA_AGE_SECONDS} s")
+        );
+
+        // Five seconds later the same state produces the same bytes and digest.
+        let second = harness.preview_at(planned_at + 5_000);
+        assert_eq!(second.plan_digest, first.plan_digest);
+        assert_eq!(second.plan, first.plan);
+
+        // A real run a minute after the preview still accepts that preview's
+        // digest, and re-evaluates the root's age against its own clock before
+        // the effect.
+        let report = harness
+            .real_at(planned_at + 60_000, &first.plan_digest, Some(&canonical(&first)))
+            .expect("the preview's digest authorizes the run");
+        assert_eq!(report.volumes.rows[0].areas[0].deleted.count, 1);
+        assert!(!root.path.exists(), "the planned root is gone");
+    }
+
+    #[test]
+    fn a_fresh_root_s_reason_states_the_policy_and_never_the_elapsed_time() {
+        let harness = Harness::new("maintain-kept-reason-stable");
+        let _root = harness.create_root(RootKind::AreaRoot);
+        let first = harness.preview_at(harness.now_ms);
+        let second = harness.preview_at(harness.now_ms + 5_000);
+        let reason = |report: &MaintainReport| {
+            harness.area_plan(report).kept.rows[0].reason.clone()
+        };
+        assert_eq!(
+            reason(&first),
+            format!("idle for less than the declared {AREA_AGE_SECONDS} s")
+        );
+        assert_eq!(reason(&first), reason(&second));
+        assert_eq!(first.plan_digest, second.plan_digest);
+        assert_eq!(harness.area_plan(&first).candidates.count, 0);
     }
 
     #[test]
