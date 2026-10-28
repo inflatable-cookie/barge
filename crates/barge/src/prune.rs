@@ -970,7 +970,23 @@ fn run(
         // landed after the run started must not authorise a stale record. A record
         // that left the registry or moved its `root_dir` keeps every unit the plan
         // named for it, as that volume only, and the other volumes still run.
-        let fresh = read_registry(state_paths)?;
+        // A registry that cannot be read again is a mid-run failure: earlier
+        // volumes may already have been maintained, so it is reported as a stop
+        // (exit `3`) with this volume's units kept, never an error document that
+        // would drop the work already done.
+        let fresh = match read_registry(state_paths) {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                let reason = format!(
+                    "the registry could not be read again before volume {}'s stage: {error}",
+                    volume_plan.volume_uuid
+                );
+                fill_kept(&mut outcome, volume_plan, &reason, &mut unreached, true);
+                stopped = Some(reason);
+                volumes.push(outcome);
+                break 'volumes;
+            }
+        };
         let Some(record) = fresh
             .iter()
             .find(|record| record.volume_uuid.as_str() == volume_plan.volume_uuid)
@@ -3552,6 +3568,54 @@ mod tests {
             true,
         );
         assert_eq!(outcome.areas.len(), volume_plan.areas.rows.len());
+    }
+
+    #[test]
+    fn an_unreadable_registry_mid_run_is_a_stop_that_keeps_the_rows() {
+        let harness = Harness::new("maintain-registry-unreadable");
+        let area_root = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        assert_eq!(preview.candidates, 1);
+
+        // The registry becomes unreadable before the run reaches its volume. That
+        // is a mid-run failure — earlier volumes may already have been maintained —
+        // so the run must report a stop with this volume's units kept, not refuse
+        // with an error document that drops the accounting.
+        std::fs::write(
+            harness.fixture.state.registry_path(),
+            b"{ this is not a registry",
+        )
+        .expect("the registry is damaged");
+        let declarations =
+            crate::area::read_declarations(&harness.fixture.state).expect("the declarations");
+        let bytes = canonical(&preview);
+        let request = harness.request(
+            false,
+            Some(&preview.plan_digest),
+            Some(&bytes),
+            harness.aged(),
+        );
+        let report = super::run(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.fixture.facts(),
+            &harness.fixture.mounts(),
+            &harness.fixture.observer(),
+            &declarations,
+            preview.plan.clone(),
+            preview.plan_digest.clone(),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            &request,
+        )
+        .expect("the run reports instead of refusing");
+        let stopped = report.stopped.as_deref().expect("the stop is reported");
+        assert!(stopped.contains("could not be read again"), "{stopped}");
+        assert!(report.needs_human());
+        let volume = &report.volumes.rows[0];
+        assert!(volume.loud, "an unreadable registry needs a human");
+        assert_eq!(volume.areas[0].deleted.count, 0);
+        assert_eq!(volume.areas[0].skipped.count, 1, "the planned unit is kept");
+        assert!(area_root.path.is_dir(), "nothing was deleted");
     }
 
     #[test]

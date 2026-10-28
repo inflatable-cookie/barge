@@ -2400,7 +2400,9 @@ Choices S7 made where this design left the mechanic to the slice:
   with the unreached stage counted — and the run stops there. The registry record
   is read again immediately before each volume's stage, never trusted from the
   run's opening read, so a revision that landed after the run started keeps that
-  volume's units instead of authorising the stale record. A preview names every
+  volume's units instead of authorising the stale record; a registry that cannot be
+  read again at that point is another mid-run failure, so it is a `data.stopped`
+  stop (exit `3`) with that volume's units kept and the earlier rows intact. A preview names every
   intent an earlier run left pending, so the document forces exit `3` and the host
   job runs the real step to replay it even when the plan names no candidate.
 - **Exit codes.** `0` completed, including a partial completion with nothing
