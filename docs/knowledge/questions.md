@@ -77,3 +77,32 @@ declared folder (for example `scratch/`) and never the whole volume, report the
 change exactly and undo it. It would also need a rule for an absent volume at VM
 start. This is not in stage 1. Until it is designed, mount changes stay manual
 operator changes to the Colima profile.
+
+## Q-010 — What about a vnode descriptor that is dead (revoked or reclaimed)?
+
+Status: answered 2026-10-28
+Answer: both of a vnode descriptor's per-fd reads are evaluated, and only a
+readable path with readable vnode facts, `ENOENT` from both and `EPERM` from both
+are an answer; every mixed pair refuses as `Unknown`, including a readable path
+whose vnode facts answer `ENOENT` and a path read that answers `ENOENT` beside a
+closed vnode-facts read. A descriptor the platform reports closed is never an
+answer at all: `ESRCH` and `EBADF` are other errnos, so even two closed answers
+are `Unknown`, as is one closed answer beside any other answer — whichever
+read saw the close — because no read's answer is carried by the other's and the fd
+may already have been closed and reused. When both reads answer `ENOENT` after a
+successful `PROC_PIDLISTFDS`, the scan re-observes that descriptor under
+barge#012's bounded rule, re-reading the pid's kernel identity and rechecking both
+deadlines after the observation and the final identity read, and reports a **dead
+handle** — pid, start identity, descriptor and command — in the `Safe` evidence
+as `dead_handles` and in `describe.custody`, where it does not block: a revoked or
+reclaimed vnode cannot do I/O. `ENOENT` on the listing itself, a changed or
+unreadable identity, a bound reached and a second observation that fails — which
+is never discarded, not even when the pid is then reported gone — stay `Unknown`,
+and no path or name is listed for a dead handle (Tom, decision e33115d3, implemented by barge#023); see
+the [stage 1
+design](contracts/stage1-design.md#writer-custody-and-safe-deletion).
+Measured before the decision (barge#008, macOS 26.6.2): a live same-uid
+terminal pty-host held descriptor 33, whose `PROC_PIDFDVNODEPATHINFO` and
+`PROC_PIDFDVNODEINFO` both answered `ENOENT` persistently and from every context
+while its descriptor listing succeeded, which made the product-custody census of
+a full-scan proof unreachable.

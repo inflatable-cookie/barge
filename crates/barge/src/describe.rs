@@ -1620,6 +1620,7 @@ mod tests {
                 foreign: 0,
                 retry: crate::os::RetryEvidence::default(),
                 os_blind_spot: crate::os::BlindSpotEvidence::default(),
+                dead_handles: crate::os::DeadHandleEvidence::default(),
                 open: Vec::new(),
             })
         }

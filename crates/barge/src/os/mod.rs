@@ -18,12 +18,13 @@ pub use absence::{prove_absence, AbsenceProof, AbsenceVolume, AncestorExpected};
 mod macos;
 
 pub use facts::{
-    AccountFacts, BlindSpotEvidence, ChildEntry, ChildListing, ChildRemoval, DescriptorScan,
-    DescriptorScanRequest, DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind,
-    ExpectedVolume, FileSystem, MountPoint, MountRoot, OpenDescriptor, PlatformBlindSpot,
-    PlatformStatus, ProcessIdentity, ProcessObserver, RemoveKind, RenameOutcome, RetriedUnreadable,
-    RetryEvidence, RetryResolution, SelfExclusion, VerifiedVolume, VolumeFacts, VolumeIdentity,
-    VolumeLocator, VolumeUuid, BLIND_SPOT_RECORDS, RETRY_RECORDS,
+    AccountFacts, BlindSpotEvidence, ChildEntry, ChildListing, ChildRemoval, DeadHandle,
+    DeadHandleEvidence, DescriptorScan, DescriptorScanRequest, DeviceId, DirHandle, DirId, DirOps,
+    EntryFacts, EntryKind, ExpectedVolume, FileSystem, MountPoint, MountRoot, OpenDescriptor,
+    PlatformBlindSpot, PlatformStatus, ProcessIdentity, ProcessObserver, RemoveKind, RenameOutcome,
+    RetriedUnreadable, RetryEvidence, RetryResolution, SelfExclusion, VerifiedVolume, VolumeFacts,
+    VolumeIdentity, VolumeLocator, VolumeUuid, BLIND_SPOT_RECORDS, DEAD_HANDLE_RECORDS,
+    RETRY_RECORDS,
 };
 
 pub use space::{Flush, SpaceFacts, SpaceMeasurement};
@@ -32,10 +33,13 @@ pub use space::{Flush, SpaceFacts, SpaceMeasurement};
 pub use macos::MacOs;
 
 /// The parts of the macOS scan the crate's own tests state for themselves: an
-/// `EPERM` answer sequence and the backoff schedule it is settled on. Nothing
-/// outside a test build can reach them.
+/// `EPERM` answer sequence, the per-fd answers of one vnode descriptor, and the
+/// backoff schedule they are settled on. Nothing outside a test build can reach
+/// them.
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) use macos::{retry_schedule, StatedListing, StatedPlatform};
+pub(crate) use macos::{
+    retry_schedule, StatedCall, StatedListing, StatedPlatform, StatedVnodeRead,
+};
 
 #[cfg(not(target_os = "macos"))]
 compile_error!(
