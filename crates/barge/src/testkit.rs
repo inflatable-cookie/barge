@@ -279,6 +279,13 @@ impl FakeVolume {
 }
 
 impl VolumeFacts for FakeVolume {
+    fn mount_census(&self, uuid: &VolumeUuid) -> Result<Vec<PathBuf>> {
+        Ok(if self.present.get() && &self.uuid == uuid {
+            vec![self.root.clone()]
+        } else {
+            Vec::new()
+        })
+    }
     fn identify(&self, _path: &Path) -> Result<VolumeIdentity> {
         if !self.present.get() {
             return Err(Error::new(
@@ -1324,6 +1331,7 @@ impl VolumeFixture {
             folders: FolderOverrides::none(),
             origin: RecordOrigin::Declared,
             scratch_grants: ScratchGrants::none(),
+            space: None,
             generation: 1,
             registered_ms: 1_792_525_019_847,
         };
@@ -1444,8 +1452,14 @@ impl VolumeFixture {
         let platform = self.platform();
         let observer = self.observer();
         let resolved = self.resolved(record, declaration);
-        let root = area::create_root(&platform, &observer, &resolved, RootSpec { kind })
-            .expect("the root is created");
+        let root = area::create_root(
+            &self.state,
+            &platform,
+            &observer,
+            &resolved,
+            RootSpec { kind },
+        )
+        .expect("the root is created");
         let resolved = self.resolved(record, declaration);
         (root, resolved)
     }

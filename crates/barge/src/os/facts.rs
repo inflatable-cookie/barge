@@ -197,6 +197,21 @@ pub trait VolumeFacts {
     /// platform cannot read is refused, never defaulted. A path whose volume
     /// has vanished is an error, never "absent and safe".
     fn identify(&self, path: &Path) -> Result<VolumeIdentity>;
+
+    /// A complete bounded census of currently mounted instances of this UUID.
+    /// Unavailable or incomplete enumeration is an error, never an empty census.
+    fn mount_census(&self, _uuid: &VolumeUuid) -> Result<Vec<PathBuf>> {
+        Err(Error::new(
+            ErrorKind::UnknownState,
+            "mount census is unavailable",
+        ))
+    }
+}
+
+/// Bounded, current mount enumeration by kernel volume UUID.
+pub trait VolumeLocator {
+    /// Return every matching live mount, or refuse an incomplete observation.
+    fn mounts_for_uuid(&self, uuid: &VolumeUuid) -> Result<Vec<MountPoint>>;
 }
 
 /// Whether a path is the mount root of a volume Barge may manage.

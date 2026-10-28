@@ -76,7 +76,7 @@ fn stdout_document(output: &Output) -> Value {
 
 /// The usage's first line; the full text names every area verb too.
 const USAGE: &str =
-    "usage: barge <describe|inspect|maintain|area|cache|diagnostic|scratch> [--json]";
+    "usage: barge <describe|inspect|space|volume|maintain|area|cache|diagnostic|scratch> [--json]";
 
 #[test]
 fn descriptor_census_refuses_bad_arguments_and_missing_roots_without_scanning() {
@@ -1218,4 +1218,46 @@ fn maintain_refuses_a_missing_digest_a_tampered_plan_and_an_unknown_state() {
         document["error"]["detail"]["path"],
         state_dir.join("registry.json").display().to_string()
     );
+}
+
+#[test]
+fn space_json_does_not_create_state() {
+    let (_fixture, state_dir) = absent_state_dir("space");
+    let output = run_in(&["space", "--json"], &state_dir);
+    assert_eq!(output.status.code(), Some(0));
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.space/1");
+    assert_eq!(document["data"]["volumes"]["count"], 0);
+    assert!(!state_dir.exists());
+}
+
+#[test]
+fn volume_registration_requires_explicit_modes() {
+    let (_fixture, state_dir) = absent_state_dir("volume-modes");
+    for missing in ["availability", "durability"] {
+        let mut args = vec![
+            "volume",
+            "register",
+            "--mount",
+            "/unused",
+            "--root-dir",
+            "",
+            "--reserve",
+            "1",
+            "--declared-by",
+            "operator",
+            "--plan",
+            "--json",
+        ];
+        if missing != "availability" {
+            args.extend(["--availability", "permanent"]);
+        }
+        if missing != "durability" {
+            args.extend(["--durability", "expendable"]);
+        }
+        let output = run_in(&args, &state_dir);
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+        assert!(!state_dir.exists());
+    }
 }

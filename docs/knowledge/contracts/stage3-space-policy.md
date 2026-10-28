@@ -8,9 +8,9 @@ rules that let pruning run while consumers work, and the formats, locks, bounds,
 failure matrix, test plan, bounded native design and implementation slices
 those need.
 
-It is design only. No part of it authorizes a Rust change, a crate, a state
-file, a native run, a real drive, a mount or host setting, a data move, or an
-Oxide change. [Architecture](../architecture.md) owns the concepts and the
+The measurement and registration slices are implemented. This contract alone
+does not authorize a native run, a real drive registration, a mount or host
+setting, a data move, or an Oxide change. [Architecture](../architecture.md) owns the concepts and the
 boundary; the [stage 1 design](stage1-design.md) owns the crate and CLI shape
 this stage extends. Where this file and architecture differ, architecture wins
 and this file is corrected.
@@ -864,6 +864,12 @@ rows, `unknown` never read as absent or default.
 }
 ```
 
+For T1, `areas`, `scratch`, `caches` and `attribution` are required keys
+whose value is `null` while the later slices have not computed them. Null means
+unavailable, not zero or an empty set. Readers require these keys and accept the
+populated shapes above as later slices provide them (Tom, 2026-10-27, decision
+`ceaa90b1`). A missing policy remains undeclared.
+
 `state` is one of `above_reserve`, `below_reserve`, `below_floor`,
 `policy_undeclared`, `volume_absent`, `space_unknown`, `durability_forbids`.
 A report never prunes and never writes, and it takes only the shared volume lock,
@@ -954,9 +960,16 @@ locks are held for which step.
 | Rank | Lock | Held by stage 3 for | Never held across |
 | --- | --- | --- | --- |
 | 1 | `registry.lock` | the policy snapshot read (shared), and a registration write (exclusive) | a measurement, a volume walk, a deletion |
-| 2 | `volume-<uuid>.lock` | a prune pass (exclusive, held from its first authoritative measurement to its final decision); a report (shared, only if the file exists); an operator prune's real run; a registration write | a registry lock write |
+| 2 | `volume-<uuid>.lock` | a prune pass (exclusive, held from its first authoritative measurement to its final decision); a report (shared, only if the file exists); an operator prune's real run; a registration write | a registry lock write, except the ordered registration publication described below |
 | 3 | `root-<id>.lock` | `hold`, `release` and the activity write; one candidate's plan → intent → rename → delete | another root's effect |
 | 4 | intent write (no lock file) | the intent publish before an effect | — |
+
+For a registration write, measure capacity before either lock; then take the
+exclusive registry lock followed by the exclusive volume lock. Revalidate the
+plan, registry generation and bound volume identity under both, and retain both
+through atomic publication. No measurement, volume walk or deletion occurs under
+the registry lock. This registration exception follows the stage 1 ordered
+dual-lock grant-write rule; prune and report locking are unchanged.
 
 Rules a reviewer can check:
 
@@ -1351,3 +1364,20 @@ a reviewer may prefer. None blocks the design from being reviewed as a whole.
 7. **Is the `activity` record the right place for last-use?** Alternative:
    rewrite the root marker, which the frozen marker contract forbids, or rely on
    hold-file mtimes, which are not durable and disappear on release.
+
+### Implemented measurement and registration surface
+
+The library's `os::SpaceFacts` reports checked `fstatfs` block counts with
+source, completion time and device provenance; `os::Flush` exposes the macOS
+whole-volume flush. `barge volume register` and `update` preview a record in a
+plan with its SHA-256; publication requires the saved plan and its exact digest,
+rechecks the registry generation and volume, and writes the registry atomically.
+`barge volume describe` reads the registered record. Their document formats are
+`barge.volume.register/1`, `barge.volume.update/1`, and
+`barge.volume.describe/1`.
+
+`barge space` reads the registry and measures present registered volumes without
+creating files. Its rows and the space rows in `barge describe` report the
+declared policy, or `policy_undeclared` when absent, and identify a floor below
+the default with `floor_below_default`. An absent registered volume is reported
+as absent. Area attribution and policy decisions belong to their later slices.

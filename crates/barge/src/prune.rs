@@ -1612,6 +1612,7 @@ mod tests {
                 .fixture
                 .resolved(&self.fixture.record, &self.declaration());
             area::create_root(
+                &self.fixture.state,
                 &self.fixture.platform(),
                 &self.fixture.observer(),
                 &resolved,

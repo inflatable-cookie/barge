@@ -19,9 +19,18 @@ CLI shape, the state directory, the registry, areas, root markers, holds,
 custody, whole-unit deletion and the plan/intent mechanics this contract
 extends. Where they differ, they win and this file is corrected.
 
+The marker writer emits `barge.root/2`; the reader also accepts `barge.root/1`
+at its exact recorded path. The v1 mount-prefix relaxation remains in F2.
+Creation and in-place cache adoption record the immutable identity under a root
+lock; verification reads a fresh bounded mount census. `barge describe` reports
+the identity capability and each registered UUID's census, with unavailable
+censuses reported as unknown. `barge area root identify --volume <uuid> --path
+<mount-relative-path>` explicitly identifies a root without a record only after
+verifying its volume and marker and obtaining safe custody. It never overwrites
+a record.
+
 No part of this contract authorizes a native run, a real drive, a mount or host
-setting change, a data move, a deletion, or any change to Oxide. It is design
-only.
+setting change, a data move, a deletion, or any change to Oxide.
 
 ## Scope and authority
 
@@ -1001,6 +1010,21 @@ identity, custody and policy conditions a space prune already supplies. Nothing
 depends on a real drive; `F6` needs its own operator gate because it changes what
 happens to data on a real volume.
 
+### F2 library primitives
+
+The OS layer exposes a bounded UUID mount locator and a unique-mount verifier.
+A mount census that exceeds its table bound or changes during observation is
+unknown; duplicate UUID mounts are unknown with `duplicate_volume_uuid`.
+The v1 marker reader can compare paths after replacing the recorded mount prefix
+with a verified live mount, retaining exact comparison of every lower component.
+
+`os::prove_absence` walks held directory descriptors without following links,
+checks each opened identity against the no-follow observation, and accepts only
+an absent leaf whose parent is on the verified boot Data or registered volume.
+Its `barge.absence/1` document is evidence for one observation; it must be
+established again at effect time. The primitive does not itself authorize a
+prune or change any consumer's state.
+
 ## Proposed validation
 
 Design-only validation for this contract is `effigy docs:check` once per changed
@@ -1132,17 +1156,11 @@ qualification claim, and none contradicts a frozen ruling.
   (for example a per-volume registration receipt written at registration time)
   is worth the coupling. If the operator wants clones treated as unknown, that
   is a scope decision, not a design detail.
-- **O4-002 — Repairing a root that has no identity record.** S3 has landed and
-  records no durable identity, so roots it created, a root adopted before F1, and
-  a root whose creation crashes between the marker and the identity write all
-  have a valid marker and no identity record. Proposed: never automatic; one
-  explicit operator command that takes the root lock, verifies the marker and
-  the volume, requires custody `Safe`, writes a record with
-  `origin: identified`, and reports exactly what it decided. The alternative is
-  that such a root can only ever be kept and released by hand — a space prune can
-  still reclaim it, which is part of what makes the alternative tolerable. The
-  operator's choice is needed before F1 lands, because it decides whether a
-  repair verb exists at all.
+- **O4-002 — Repairing a root that has no identity record.** Tom's ruling
+  `d9a9cd37` chooses one explicit operator command, never automatic. It takes
+  the root lock, verifies the marker and volume, requires custody `Safe`, writes
+  `origin: identified` once, and reports the decision and custody evidence.
+  A missing record is otherwise unknown and never establishes release authority.
 - **O4-003 — The `barge.root/1` prefix relaxation.** Stage 1's v1 marker records
   an absolute `resolved_path`, and S3 writes it and validates it against the path
   it walked, so the relaxation is live from the first day rather than a

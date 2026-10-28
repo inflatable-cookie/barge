@@ -9,7 +9,10 @@
 
 use std::path::Path;
 
+mod absence;
 mod facts;
+mod space;
+pub use absence::{prove_absence, AbsenceProof, AbsenceVolume, AncestorExpected};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -20,8 +23,10 @@ pub use facts::{
     ExpectedVolume, FileSystem, MountPoint, MountRoot, OpenDescriptor, PlatformBlindSpot,
     PlatformStatus, ProcessIdentity, ProcessObserver, RemoveKind, RenameOutcome, RetriedUnreadable,
     RetryEvidence, RetryResolution, SelfExclusion, VerifiedVolume, VolumeFacts, VolumeIdentity,
-    VolumeUuid, BLIND_SPOT_RECORDS, RETRY_RECORDS,
+    VolumeLocator, VolumeUuid, BLIND_SPOT_RECORDS, RETRY_RECORDS,
 };
+
+pub use space::{Flush, SpaceFacts, SpaceMeasurement};
 
 #[cfg(target_os = "macos")]
 pub use macos::MacOs;
@@ -142,6 +147,66 @@ pub fn verify_volume(
     Ok(VerifiedVolume::new(path.to_path_buf(), identity))
 }
 
+/// A mount verified after a complete census found exactly one matching UUID.
+#[derive(Debug, Clone)]
+pub struct LocatedVolume(VerifiedVolume);
+
+impl LocatedVolume {
+    /// The live mount root.
+    pub fn path(&self) -> &Path {
+        self.0.path()
+    }
+    /// Facts observed at the verified mount.
+    pub fn identity(&self) -> &VolumeIdentity {
+        self.0.identity()
+    }
+    /// Re-read the live facts before relying on them again.
+    pub fn reverify(&self, facts: &dyn VolumeFacts) -> Result<()> {
+        self.0.reverify(facts)
+    }
+    #[cfg(test)]
+    pub(crate) fn injected(volume: VerifiedVolume) -> Self {
+        Self(volume)
+    }
+}
+
+/// Find and verify the unique current mount of a registered UUID.
+pub fn locate_volume(
+    locator: &dyn VolumeLocator,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    uuid: &VolumeUuid,
+) -> Result<LocatedVolume> {
+    let candidates = locator.mounts_for_uuid(uuid)?;
+    match candidates.as_slice() {
+        [] => Err(Error::new(
+            ErrorKind::VolumeAbsent,
+            "registered volume is not mounted",
+        )),
+        [mount] => verify_volume(
+            facts,
+            mounts,
+            mount.as_path(),
+            &ExpectedVolume {
+                volume_uuid: uuid,
+                mount_hint: Some(mount.as_path()),
+            },
+        )
+        .map(LocatedVolume),
+        _ => Err(Error::new(
+            ErrorKind::UnknownState,
+            "multiple mounts have the registered volume UUID",
+        )
+        .with_detail("reason", "duplicate_volume_uuid".into())),
+    }
+}
+
+/// Whether a recorded path has the platform's managed mount-root shape.
+#[cfg(target_os = "macos")]
+pub(crate) fn recorded_mount_path(path: &Path) -> bool {
+    macos::recorded_mount_path(path)
+}
+
 /// The refusal for a volume that is not where the record says it is.
 fn mount_mismatch(path: &Path, expected: &Path, actual: &Path, reason: &str) -> Error {
     Error::new(
@@ -238,6 +303,42 @@ mod tests {
             volume_uuid,
             mount_hint,
         }
+    }
+
+    struct Locator(Result<Vec<MountPoint>>);
+
+    impl super::VolumeLocator for Locator {
+        fn mounts_for_uuid(&self, _uuid: &VolumeUuid) -> Result<Vec<MountPoint>> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn locator_finds_a_remount_and_refuses_duplicates_or_incomplete_tables() {
+        let uuid = VolumeUuid::parse(UUID).expect("UUID");
+        let facts = FakeFacts(Ok(identity(Some(UUID), "/Volumes/Builds 1")));
+        let mounts = FakeMounts::new("/Volumes/Builds 1");
+        let candidate = || MountPoint::new(PathBuf::from("/Volumes/Builds 1"));
+        let found = super::locate_volume(&Locator(Ok(vec![candidate()])), &facts, &mounts, &uuid)
+            .expect("remounted volume verifies");
+        assert_eq!(found.path(), Path::new("/Volumes/Builds 1"));
+        let duplicate = super::locate_volume(
+            &Locator(Ok(vec![candidate(), candidate()])),
+            &facts,
+            &mounts,
+            &uuid,
+        )
+        .expect_err("duplicate UUID refuses");
+        assert_eq!(duplicate.kind(), ErrorKind::UnknownState);
+        assert_eq!(duplicate.detail()["reason"], "duplicate_volume_uuid");
+        let incomplete = super::locate_volume(
+            &Locator(Err(Error::new(ErrorKind::UnknownState, "truncated table"))),
+            &facts,
+            &mounts,
+            &uuid,
+        )
+        .expect_err("incomplete table is not absence");
+        assert_eq!(incomplete.kind(), ErrorKind::UnknownState);
     }
 
     #[test]

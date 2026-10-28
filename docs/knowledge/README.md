@@ -4,6 +4,8 @@
 
 Contracts own durable interfaces and formats:
 
+- [Consumption](contracts/consumption.md) owns the install and exact-revision dependency paths.
+
 - [Stage 1 design](contracts/stage1-design.md) owns the crate and CLI shape,
   versioned JSON, account state and volume records, area declarations, root
   markers, scratch and cache placement, writer custody and safe deletion, the

@@ -75,6 +75,8 @@ pub struct DescribeRequest<'a> {
     pub facts: &'a dyn VolumeFacts,
     /// The platform's mount-root proof.
     pub mounts: &'a dyn MountRoot,
+    /// Space measurement provider, when the caller requests space rows.
+    pub space: Option<&'a dyn crate::os::SpaceFacts>,
     /// The platform's process observations, for a root's holds.
     pub observer: &'a dyn ProcessObserver,
 }
@@ -135,13 +137,54 @@ pub struct DescribeData {
     /// `root_dir` change is visible without anything having moved.
     #[serde(default)]
     pub roots: RowSet<RootObservation>,
+    /// Per-volume space measurements and declared policies.
+    #[serde(default)]
+    pub space: RowSet<crate::space::SpaceRow>,
     /// Foreign observations, bounded to the observation row cap.
     pub observations: RowSet<ObservationRow>,
+    /// Identity facts used across a remount.
+    #[serde(default)]
+    pub identity: IdentityCapability,
     /// The writer-custody capability this build offers, its named limits, and
     /// the fact that no kernel proof is claimed (slice S5). An older document
     /// without this field still reads.
     #[serde(default)]
     pub custody: crate::custody::CustodyReport,
+}
+
+/// Which root identity facts survive a remount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityCapability {
+    pub capability: String,
+    pub stable_facts: Vec<String>,
+    pub device_role: String,
+}
+
+impl Default for IdentityCapability {
+    fn default() -> Self {
+        Self {
+            capability: "volume_uuid_root_id_nonce_inode_relative_path".into(),
+            stable_facts: [
+                "volume_uuid",
+                "root_id",
+                "nonce",
+                "inode",
+                "mount_relative_path",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            device_role: "within_run_only".into(),
+        }
+    }
+}
+
+/// A complete live census, or a reason the count is unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MountCensus {
+    Complete { count: usize, paths: Vec<PathBuf> },
+    Unknown { reason: String },
 }
 
 /// The `data` of `barge.inspect/1`.
@@ -206,6 +249,9 @@ pub struct VolumeRow {
     /// The last observed mount point; used to find the volume, never as
     /// identity.
     pub mount_hint: Option<PathBuf>,
+    /// The current census; unknown is never reported as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mounts: Option<MountCensus>,
     /// When the volume is attached.
     pub availability: Availability,
     /// What the data on it is.
@@ -240,6 +286,7 @@ impl VolumeRow {
         Self {
             volume_uuid: record.volume_uuid.as_str().to_owned(),
             mount_hint: record.mount_hint.clone(),
+            mounts: None,
             availability: record.availability,
             durability: record.durability,
             root_dir: record.root_dir.clone(),
@@ -425,7 +472,19 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
     let volume_rows: Vec<VolumeRow> = registry
         .volumes()
         .iter()
-        .map(VolumeRow::from_record)
+        .map(|record| {
+            let mut row = VolumeRow::from_record(record);
+            row.mounts = Some(match request.facts.mount_census(&record.volume_uuid) {
+                Ok(paths) => MountCensus::Complete {
+                    count: paths.len(),
+                    paths,
+                },
+                Err(error) => MountCensus::Unknown {
+                    reason: error.to_string(),
+                },
+            });
+            row
+        })
         .collect();
     let volume_total = volume_rows.len();
     let area_rows: Vec<AreaRow> = declarations
@@ -446,6 +505,13 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
     let observation_rows = observations.rows().to_vec();
     let observation_total = observation_rows.len();
 
+    let space = match request.space {
+        Some(provider) => {
+            crate::space::report(&paths, request.facts, request.mounts, provider)?.volumes
+        }
+        None => RowSet::empty(),
+    };
+
     Ok(DescribeData {
         tool: ToolVersions {
             name: TOOL_NAME.to_owned(),
@@ -457,8 +523,10 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
         areas: RowSet::bounded(area_rows, area_total, AREA_ROWS),
         placements,
         roots,
+        space,
         observations: RowSet::bounded(observation_rows, observation_total, OBSERVATION_ROWS),
         custody: crate::custody::capability_report(),
+        identity: IdentityCapability::default(),
     })
 }
 
@@ -676,6 +744,7 @@ pub fn read_describe_document(bytes: &[u8]) -> Result<DescribeData> {
     data.areas.validate()?;
     data.placements.validate()?;
     data.roots.validate()?;
+    data.space.validate()?;
     data.observations.validate()?;
     Ok(data)
 }
@@ -830,6 +899,7 @@ mod tests {
                 dirs: &self.platform,
                 facts: &self.platform,
                 mounts: &self.platform,
+                space: None,
                 observer: &self.platform,
             }
         }
@@ -863,6 +933,7 @@ mod tests {
                 folders: FolderOverrides::none(),
                 origin: RecordOrigin::Declared,
                 scratch_grants: ScratchGrants::none(),
+                space: None,
                 generation: 1,
                 registered_ms: 1_792_525_019_847,
             }]);
@@ -920,6 +991,7 @@ mod tests {
             dirs: &fixture.platform,
             facts: &fixture.platform,
             mounts: &fixture.platform,
+            space: None,
             observer: &fixture.platform,
         })
         .expect("describe reads");
@@ -947,6 +1019,7 @@ mod tests {
             dirs: &fixture.platform,
             facts: &fixture.platform,
             mounts: &fixture.platform,
+            space: None,
             observer: &fixture.platform,
         })
         .expect("describe reads");
@@ -969,6 +1042,7 @@ mod tests {
             dirs: &fixture.platform,
             facts: &fixture.platform,
             mounts: &fixture.platform,
+            space: None,
             observer: &fixture.platform,
         })
         .expect("describe reads");
@@ -1380,6 +1454,7 @@ mod tests {
             dirs: &platform,
             facts: &platform,
             mounts: &platform,
+            space: None,
             observer: &platform,
         })
         .expect_err("an unreadable account home refuses");
@@ -1423,6 +1498,7 @@ mod tests {
             },
             origin: RecordOrigin::ObservedOxide,
             scratch_grants: ScratchGrants::none(),
+            space: None,
             generation: 1,
             registered_ms: 0,
         };
@@ -1455,6 +1531,7 @@ mod tests {
             dirs: &fixture.platform,
             facts: &fixture.platform,
             mounts: &fixture.platform,
+            space: None,
             observer: &fixture.platform,
         })
         .expect_err("a relative override is refused");
@@ -1481,6 +1558,13 @@ mod tests {
     }
 
     impl crate::os::VolumeFacts for FixtureVolume {
+        fn mount_census(&self, uuid: &crate::os::VolumeUuid) -> Result<Vec<PathBuf>> {
+            Ok(if uuid == &self.uuid {
+                vec![self.root.clone()]
+            } else {
+                Vec::new()
+            })
+        }
         fn identify(&self, _path: &Path) -> Result<crate::os::VolumeIdentity> {
             Ok(crate::os::VolumeIdentity {
                 mount_point: self.root.clone(),
@@ -1562,6 +1646,7 @@ mod tests {
             folders: FolderOverrides::none(),
             origin: RecordOrigin::Declared,
             scratch_grants: ScratchGrants::none(),
+            space: None,
             generation: 1,
             registered_ms: 1_792_525_019_847,
         };
@@ -1603,6 +1688,7 @@ mod tests {
         )
         .expect("the area resolves");
         let root = crate::area::create_root(
+            &state,
             platform,
             &volume,
             &resolved,
@@ -1620,9 +1706,21 @@ mod tests {
             dirs: platform,
             facts: &volume,
             mounts: &volume,
+            space: None,
             observer: &volume,
         };
         let data = describe(&request).expect("describe reads");
+        assert_eq!(
+            data.identity.capability,
+            "volume_uuid_root_id_nonce_inode_relative_path"
+        );
+        assert_eq!(
+            data.volumes.rows[0].mounts,
+            Some(super::MountCensus::Complete {
+                count: 1,
+                paths: vec![volume_dir.clone()]
+            })
+        );
         assert_eq!(data.areas.count, 1, "the declared area is reported");
         assert_eq!(data.roots.count, 1, "the owned root is reported");
         let row = &data.roots.rows[0];

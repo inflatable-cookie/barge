@@ -313,6 +313,38 @@ pub fn take_custody(
         unit,
         pending,
         bounds,
+        None,
+    ) {
+        Ok(evidence) => CustodyVerdict::Safe(Box::new(evidence)),
+        Err(Refusal::Unsafe { reason, retry }) => CustodyVerdict::Unsafe { reason, retry },
+        Err(Refusal::Unknown { reason, retry }) => CustodyVerdict::Unknown { reason, retry },
+    }
+}
+
+/// Decide identity-repair custody for an adopted root whose directory name can
+/// differ from the marker's root ID. The deletion-unit gate remains unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn take_identity_custody(
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    state: &StatePaths,
+    unit: &DeletionUnit,
+    pending: &[PendingIntent],
+    bounds: CustodyBounds,
+    root_id: &str,
+) -> CustodyVerdict {
+    match decide(
+        dirs,
+        facts,
+        mounts,
+        observer,
+        state,
+        unit,
+        pending,
+        bounds,
+        Some(root_id),
     ) {
         Ok(evidence) => CustodyVerdict::Safe(Box::new(evidence)),
         Err(Refusal::Unsafe { reason, retry }) => CustodyVerdict::Unsafe { reason, retry },
@@ -372,7 +404,11 @@ fn read_unit_holds(
     state_paths: &StatePaths,
     observer: &dyn ProcessObserver,
     unit: &DeletionUnit,
+    root_id: Option<&str>,
 ) -> Result<area::HoldReading> {
+    if let Some(root_id) = root_id {
+        return area::read_holds(state_paths, observer, root_id);
+    }
     if state::is_identifier(&unit.name) {
         return area::read_holds(state_paths, observer, &unit.name);
     }
@@ -392,6 +428,7 @@ fn decide(
     unit: &DeletionUnit,
     pending: &[PendingIntent],
     bounds: CustodyBounds,
+    root_id: Option<&str>,
 ) -> std::result::Result<CustodyEvidence, Refusal> {
     // 0. The unit's own record: its plan digest, parent, name, kind, marker and
     //    grant must each have one well-formed shape, and the grant must be the
@@ -401,7 +438,7 @@ fn decide(
         .map_err(|error| Refusal::refuse_unknown(format!("the unit record is invalid: {error}")))?;
 
     // 1. Holds: released, or positively stale. Anything else is a refusal.
-    let holds = read_unit_holds(state_paths, observer, unit).map_err(|error| {
+    let holds = read_unit_holds(state_paths, observer, unit, root_id).map_err(|error| {
         Refusal::refuse_unknown(format!("the unit's holds are unreadable: {error}"))
     })?;
     if holds.total > bounds.holds || holds.truncated {
@@ -521,6 +558,7 @@ fn decide(
     let expectation = MarkerExpectation {
         volume_uuid: &unit.volume_uuid,
         resolved_path: &unit_path,
+        mount_point: record.mount_hint.as_deref(),
         effective_uid: observer.effective_uid().map_err(|error| {
             Refusal::refuse_unknown(format!("the account uid is unreadable: {error}"))
         })?,
@@ -549,7 +587,14 @@ fn decide(
     } else {
         None
     };
-    let marker = verify_marker(dirs, unit, unit_handle.as_ref(), &expectation, &unit_path)?;
+    let marker = verify_marker(
+        dirs,
+        unit,
+        unit_handle.as_ref(),
+        &expectation,
+        &unit_path,
+        root_id,
+    )?;
 
     // 4. The same-uid descriptor observation, complete within its bound.
     //
@@ -807,6 +852,7 @@ fn verify_marker(
     handle: Option<&crate::os::DirHandle>,
     expectation: &MarkerExpectation<'_>,
     unit_path: &Path,
+    root_id: Option<&str>,
 ) -> std::result::Result<Option<UnitMarker>, Refusal> {
     let Some(observed) = &unit.marker else {
         // A file unit never carries a marker (validated on the unit), so there
@@ -847,7 +893,7 @@ fn verify_marker(
         MarkerFamily::Barge => {
             let (marker, digest) = area::read_marker_with_digest(dirs, handle, expectation);
             match marker {
-                MarkerState::Owned(owned) if owned.root_id == unit.name => {}
+                MarkerState::Owned(owned) if owned.root_id == root_id.unwrap_or(&unit.name) => {}
                 MarkerState::Owned(other) => {
                     return Err(Refusal::refuse_unknown(format!(
                         "the marker names root {}, not the observed `{}`",

@@ -24,7 +24,7 @@ use crate::os::facts::{
     DescriptorScanRequest, DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, FileSystem,
     MountPoint, MountRoot, OpenDescriptor, PlatformBlindSpot, PlatformStatus, ProcessIdentity,
     ProcessObserver, RemoveKind, RenameOutcome, RetriedUnreadable, RetryEvidence, RetryResolution,
-    VolumeFacts, VolumeIdentity, VolumeUuid, BLIND_SPOT_RECORDS,
+    VerifiedVolume, VolumeFacts, VolumeIdentity, VolumeLocator, VolumeUuid, BLIND_SPOT_RECORDS,
 };
 
 /// The largest symbolic-link text Barge reads, so a link cannot make a record
@@ -162,6 +162,298 @@ impl VolumeFacts for MacOs {
     fn identify(&self, path: &Path) -> Result<VolumeIdentity> {
         let descriptor = open_directory(path)?;
         read_identity(&descriptor, path)
+    }
+
+    fn mount_census(&self, uuid: &VolumeUuid) -> Result<Vec<PathBuf>> {
+        const LIMIT: usize = 256;
+        // SAFETY: statfs is plain data and zero is a valid initial buffer; the
+        // kernel fills at most the byte count supplied below.
+        let mut table: Vec<libc::statfs> =
+            (0..=LIMIT).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let bytes = table
+            .len()
+            .checked_mul(std::mem::size_of::<libc::statfs>())
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(|| Error::new(ErrorKind::ResourceBound, "mount census buffer overflow"))?;
+        // SAFETY: table points to writable storage for bytes bytes, and remains
+        // allocated for the duration of the call.
+        let count = unsafe { libc::getfsstat(table.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
+        if count < 0 {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("mount census failed: {}", io::Error::last_os_error()),
+            ));
+        }
+        let count = usize::try_from(count)
+            .map_err(|_| Error::new(ErrorKind::UnknownState, "invalid mount count"))?;
+        if count > LIMIT {
+            return Err(Error::new(
+                ErrorKind::ResourceBound,
+                "mount census exceeded its bound",
+            ));
+        }
+        let mut found = Vec::new();
+        for entry in table.iter().take(count) {
+            let candidate = read_mount_point(entry, Path::new(VOLUMES_PARENT))?;
+            if candidate.parent() != Some(Path::new(VOLUMES_PARENT))
+                || read_filesystem(entry, &candidate)? != FileSystem::Apfs
+            {
+                continue;
+            }
+            let identity = self.identify(&candidate)?;
+            if identity.filesystem != FileSystem::Apfs || identity.volume_uuid.is_none() {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "APFS mount identity is incomplete or changed",
+                ));
+            }
+            if identity.mount_point != candidate {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "mount changed during census",
+                ));
+            }
+            if identity.volume_uuid.as_ref() == Some(uuid) {
+                self.mount_root(&candidate)?;
+                found.push(candidate);
+                if found.len() > 64 {
+                    return Err(Error::new(
+                        ErrorKind::ResourceBound,
+                        "too many mounts for UUID",
+                    ));
+                }
+            }
+        }
+        Ok(found)
+    }
+}
+
+impl VolumeLocator for MacOs {
+    fn mounts_for_uuid(&self, uuid: &VolumeUuid) -> Result<Vec<MountPoint>> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let table = mount_table()?;
+        let mut matches = Vec::new();
+        for entry in &table {
+            if Instant::now() >= deadline {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "mount enumeration deadline reached",
+                ));
+            }
+            let end = entry
+                .f_mntonname
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or_else(|| Error::new(ErrorKind::UnknownState, "unterminated mount name"))?;
+            let name_bytes: Vec<u8> = entry.f_mntonname[..end]
+                .iter()
+                .map(|byte| *byte as u8)
+                .collect();
+            let name = OsStr::from_bytes(&name_bytes);
+            let path = PathBuf::from(name);
+            if !recorded_mount_path(&path) {
+                continue;
+            }
+            let descriptor = open_directory(&path).map_err(|_| {
+                Error::new(
+                    ErrorKind::UnknownState,
+                    "mount candidate could not be opened",
+                )
+            })?;
+            let identity = read_identity(&descriptor, &path).map_err(|_| {
+                Error::new(
+                    ErrorKind::UnknownState,
+                    "mount candidate could not be identified",
+                )
+            })?;
+            if identity.mount_point != path {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "mount candidate changed during enumeration",
+                ));
+            }
+            let candidate_uuid = identity.volume_uuid.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::UnknownState,
+                    "mount candidate UUID is unreadable",
+                )
+            })?;
+            if &candidate_uuid == uuid {
+                matches.push(MountPoint::new(path));
+                if matches.len() > 64 {
+                    return Err(Error::new(
+                        ErrorKind::UnknownState,
+                        "mount candidate bound reached",
+                    ));
+                }
+            }
+        }
+        let after = mount_table()?;
+        if Instant::now() >= deadline
+            || table.len() != after.len()
+            || table.iter().zip(&after).any(|(a, b)| {
+                a.f_mntonname != b.f_mntonname
+                    || a.f_mntfromname != b.f_mntfromname
+                    || a.f_flags != b.f_flags
+            })
+        {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "mount table changed during enumeration",
+            ));
+        }
+        Ok(matches)
+    }
+}
+
+/// Read the complete bounded mount table. One extra slot detects truncation.
+fn mount_table() -> Result<Vec<libc::statfs>> {
+    const CAPACITY: usize = 257;
+    // SAFETY: statfs is a plain C structure and zero is a valid initial buffer.
+    let mut entries: Vec<libc::statfs> = (0..CAPACITY)
+        .map(|_| unsafe { std::mem::zeroed() })
+        .collect();
+    let bytes = i32::try_from(CAPACITY * std::mem::size_of::<libc::statfs>())
+        .map_err(|_| Error::new(ErrorKind::UnknownState, "mount table buffer is too large"))?;
+    // SAFETY: a null buffer and zero size request the number of mounts only.
+    let before = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    // SAFETY: entries owns a writable buffer of exactly `bytes` bytes.
+    let count = unsafe { libc::getfsstat(entries.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
+    let count = usize::try_from(count)
+        .map_err(|_| Error::new(ErrorKind::UnknownState, "mount table is unreadable"))?;
+    // SAFETY: a null buffer and zero size request the number of mounts only.
+    let after = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    check_mount_count(before, count, after)?;
+    entries.truncate(count);
+    Ok(entries)
+}
+
+fn check_mount_count(before: i32, count: usize, after: i32) -> Result<()> {
+    if count > 256
+        || usize::try_from(before).ok() != Some(count)
+        || usize::try_from(after).ok() != Some(count)
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "mount table is truncated or exceeds its bound",
+        ));
+    }
+    Ok(())
+}
+
+impl super::AbsenceVolume for MacOs {
+    fn volume_prefix(&self, path: &Path) -> Option<PathBuf> {
+        let rest = path.strip_prefix(VOLUMES_PARENT).ok()?;
+        let name = rest.components().next()?;
+        Some(Path::new(VOLUMES_PARENT).join(name.as_os_str()))
+    }
+
+    fn identify_directory(&self, handle: &DirHandle) -> Result<VolumeIdentity> {
+        let file = handle.descriptor().ok_or_else(|| {
+            Error::new(ErrorKind::UnknownState, "directory descriptor unavailable")
+        })?;
+        let path = Path::new("opened ancestor");
+        let stat = read_statfs(file.as_raw_fd(), path)?;
+        if stat.f_flags & (libc::MNT_LOCAL as u32) == 0 {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "ancestor volume is not local",
+            ));
+        }
+        read_identity(file, path)
+    }
+
+    fn boot_data(&self) -> Result<VolumeIdentity> {
+        let path = Path::new("/System/Volumes/Data");
+        let descriptor = open_directory(path)?;
+        let identity = read_identity(&descriptor, path)?;
+        let stat = read_statfs(descriptor.as_raw_fd(), path)?;
+        if stat.f_flags & (libc::MNT_LOCAL as u32) == 0
+            || identity.mount_point != path
+            || identity.filesystem != FileSystem::Apfs
+            || identity.volume_uuid.is_none()
+        {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "boot Data volume is unverified",
+            ));
+        }
+        Ok(identity)
+    }
+}
+
+impl MacOs {
+    // Open the mount root and compare the identity read on that very descriptor.
+    fn space_descriptor(&self, volume: &VerifiedVolume) -> Result<File> {
+        volume.reverify(self)?;
+        let path = &volume.identity().mount_point;
+        self.mount_root(path)?;
+        let descriptor = open_directory(path)?;
+        if read_identity(&descriptor, path)? != *volume.identity() {
+            return Err(Error::new(
+                ErrorKind::VolumeMismatch,
+                "volume changed before space operation",
+            ));
+        }
+        Ok(descriptor)
+    }
+}
+
+impl super::SpaceFacts for MacOs {
+    fn measure_space(&self, volume: &VerifiedVolume) -> Result<super::SpaceMeasurement> {
+        let descriptor = self.space_descriptor(volume)?;
+        let path = &volume.identity().mount_point;
+        let status = read_statfs(descriptor.as_raw_fd(), path)?;
+        if read_identity(&descriptor, path)? != *volume.identity() {
+            return Err(Error::new(
+                ErrorKind::VolumeMismatch,
+                "volume changed during space measurement",
+            ));
+        }
+        volume.reverify(self)?;
+        super::SpaceMeasurement::from_blocks(
+            Some(u64::from(status.f_bsize)),
+            Some(status.f_bavail),
+            Some(status.f_bfree),
+            Some(status.f_blocks),
+            crate::state::now_ms(),
+            volume.identity().device,
+        )
+    }
+}
+
+impl super::Flush for MacOs {
+    fn flush_volume(&self, volume: &VerifiedVolume) -> Result<()> {
+        const SYNC_VOLUME_FULLSYNC: libc::c_int = 0x01;
+        const SYNC_VOLUME_WAIT: libc::c_int = 0x02;
+        extern "C" {
+            fn fsync_volume_np(fd: libc::c_int, flags: libc::c_int) -> libc::c_int;
+        }
+        let descriptor = self.space_descriptor(volume)?;
+        // SAFETY: the descriptor stays open for the call and both flags are documented.
+        let result = unsafe {
+            fsync_volume_np(
+                descriptor.as_raw_fd(),
+                SYNC_VOLUME_FULLSYNC | SYNC_VOLUME_WAIT,
+            )
+        };
+        if result != 0 {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "volume flush failed: {}",
+                    io::Error::from_raw_os_error(result)
+                ),
+            ));
+        }
+        let path = &volume.identity().mount_point;
+        if read_identity(&descriptor, path)? != *volume.identity() {
+            return Err(Error::new(
+                ErrorKind::VolumeMismatch,
+                "volume changed during flush",
+            ));
+        }
+        volume.reverify(self)
     }
 }
 
@@ -2037,6 +2329,9 @@ impl DirOps for MacOs {
         name: &str,
         cap: usize,
     ) -> Result<Option<Vec<u8>>> {
+        let Some(before) = self.child_facts(parent, name)? else {
+            return Ok(None);
+        };
         let directory = parent_descriptor(parent, name)?;
         let raw = name_cstring(name)?;
         // SAFETY: `directory` is open, `raw` is one NUL-terminated component and
@@ -2056,6 +2351,12 @@ impl DirOps for MacOs {
         // and no other owner exists, so `File` may take ownership of it.
         let mut file = unsafe { File::from_raw_fd(descriptor) };
         let facts = entry_facts(&fstat(&file, Path::new(name))?);
+        if facts != before {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("`{name}` changed while it was opened"),
+            ));
+        }
         if facts.kind != EntryKind::File {
             return Err(Error::new(
                 ErrorKind::UnknownState,
@@ -2073,6 +2374,13 @@ impl DirOps for MacOs {
                 .read(&mut chunk)
                 .map_err(|error| child_error(name, "cannot read the file", error))?;
             if read == 0 {
+                let after = entry_facts(&fstat(&file, Path::new(name))?);
+                if after != facts || self.child_facts(parent, name)?.as_ref() != Some(&facts) {
+                    return Err(Error::new(
+                        ErrorKind::UnknownState,
+                        format!("`{name}` changed while it was read"),
+                    ));
+                }
                 return Ok(Some(buffer));
             }
             if buffer.len() + read > cap {
@@ -2552,8 +2860,12 @@ fn is_boot_volume(mount_point: &Path) -> bool {
     mount_point == Path::new("/") || mount_point.starts_with("/System/Volumes")
 }
 
-/// Whether the mount point is a mount root directly under the mount parent, and
-/// that parent is a real directory rather than a link.
+/// Whether the recorded path has the mount parent's direct-child shape.
+pub(super) fn recorded_mount_path(path: &Path) -> bool {
+    path.parent() == Some(Path::new(VOLUMES_PARENT))
+}
+
+/// Whether the mount point is directly under the real, non-link mount parent.
 fn is_under_volumes_parent(mount_point: &Path) -> bool {
     if mount_point.parent() != Some(Path::new(VOLUMES_PARENT)) {
         return false;
@@ -3055,5 +3367,24 @@ mod tests {
         let refused = fixture_account_home(&file).expect_err("a file is not a home");
         assert_eq!(refused.kind(), ErrorKind::UnknownState);
         assert_eq!(refused.detail()["account_home"], file.display().to_string());
+    }
+}
+
+#[cfg(test)]
+mod locator_bounds_tests {
+    #![allow(clippy::expect_used)]
+    use super::check_mount_count;
+    use crate::error::ErrorKind;
+    #[test]
+    fn partial_or_truncated_tables_are_unknown() {
+        assert!(check_mount_count(256, 256, 256).is_ok());
+        for (before, count, after) in [(257, 257, 257), (4, 3, 4), (3, 3, 4), (-1, 0, 0)] {
+            assert_eq!(
+                check_mount_count(before, count, after)
+                    .expect_err("incomplete")
+                    .kind(),
+                ErrorKind::UnknownState
+            );
+        }
     }
 }

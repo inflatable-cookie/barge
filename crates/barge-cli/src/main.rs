@@ -44,7 +44,11 @@ use barge::scratch::{
 };
 use barge::state::{self, StatePaths};
 
-const USAGE: &str = "usage: barge <describe|inspect|maintain|area|cache|diagnostic|scratch> [--json]
+const USAGE: &str = "usage: barge <describe|inspect|space|volume|maintain|area|cache|diagnostic|scratch> [--json]
+       barge volume register --mount <root> --availability <permanent|ephemeral> --durability <expendable|kept> --root-dir <folder> --reserve <bytes> [--floor <bytes>] --declared-by <name> --plan
+       barge volume update <uuid> [--reserve <bytes>] [--floor <bytes>] --declared-by <name> --plan
+       barge volume <register|update> --plan-file <file> --plan-sha256 <digest>
+       barge volume describe <uuid>
        barge maintain [--plan-out <file>]
        barge maintain --plan <file> --plan-sha256 <hex>
        barge diagnostic descriptor-census --root <existing-directory>
@@ -53,6 +57,7 @@ const USAGE: &str = "usage: barge <describe|inspect|maintain|area|cache|diagnost
        barge area list
        barge area root create --namespace <ns> --area <name> --volume <uuid> --kind <area_root|cache_root|scratch_run>
        barge area root list --namespace <ns> --area <name> --volume <uuid>
+       barge area root identify --volume <uuid> --path <mount-relative-path>
        barge area hold --root <root-id> --holder <id> --pid <pid> --scope <read|write> --purpose <text>
        barge area release --root <root-id> --holder <id>
        barge cache adopt --kind <npm-cache|bun-cache|cargo-registry|cargo-git> --volume <uuid> [--form <setting|held-root|link>] [--write-setting] [--adopt-existing-root] [--plan]
@@ -67,6 +72,16 @@ const USAGE: &str = "usage: barge <describe|inspect|maintain|area|cache|diagnost
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() == 1 && args[0] == "__barge-build-identity" {
+        let identity = serde_json::json!({
+            "build_pin": option_env!("BARGE_BUILD_PIN"),
+            "build_instance": option_env!("BARGE_BUILD_INSTANCE"),
+        });
+        return match write_stdout(format!("{identity}\n").as_bytes()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
     let json = args.iter().any(|argument| argument == "--json");
     let command = command_name(&args);
 
@@ -97,7 +112,7 @@ fn command_name(args: &[String]) -> String {
         .take(2);
     let first = words.next().map(String::as_str);
     match first {
-        Some(command @ ("area" | "scratch")) => match words.next() {
+        Some(command @ ("area" | "scratch" | "volume")) => match words.next() {
             Some(verb) => format!("{command}.{verb}"),
             None => command.to_owned(),
         },
@@ -229,6 +244,14 @@ fn dispatch(args: &[String]) -> Result<Report, Error> {
             no_extra_arguments(rest)?;
             inspect().map(Box::new).map(Report::Inspect)
         }
+        "space" => {
+            no_extra_arguments(rest)?;
+            let platform = os::platform();
+            let report = barge::space::report(&state_paths()?, &platform, &platform, &platform)?;
+            let human = format!("space: {} registered volumes\n", report.volumes.count);
+            Report::verb(barge::space::SPACE_SCHEMA, "space", &report, human)
+        }
+        "volume" => volume(rest),
         "maintain" => maintain(rest),
         "area" => area(rest),
         "cache" => cache(rest),
@@ -362,6 +385,148 @@ fn refuse_unknown(options: Options) -> Result<(), Error> {
         Some(key) => Err(usage(format!("unknown option for this command: --{key}"))),
         None => Ok(()),
     }
+}
+
+fn optional(options: &mut Options, key: &str) -> Result<Option<String>, Error> {
+    match options.remove(key) {
+        None => Ok(None),
+        Some(mut values) if values.len() == 1 => Ok(values.pop()),
+        Some(_) => Err(usage(format!("--{key} was given more than once"))),
+    }
+}
+
+fn volume(args: &[String]) -> Result<Report, Error> {
+    use barge::registry::{Availability, Durability};
+    use barge::volume::{self, Operation, RegisterRequest, UpdateRequest};
+    let Parsed { words, mut options } = parse(args)?;
+    let verb = words
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| usage("volume verb is required"))?;
+    let paths = state_paths()?;
+    let platform = os::platform();
+    if verb == "describe" {
+        if words.len() != 2 {
+            return Err(usage("volume describe requires a UUID"));
+        }
+        refuse_unknown(options)?;
+        let uuid = VolumeUuid::parse(&words[1])?;
+        let row = volume::describe(&paths, &uuid)?;
+        return Report::verb(
+            "barge.volume.describe/1",
+            "volume.describe",
+            &row,
+            format!("volume {}\n", row.volume_uuid),
+        );
+    }
+    let operation = match verb {
+        "register" => Operation::Register,
+        "update" => Operation::Update,
+        _ => return Err(usage("unknown volume verb")),
+    };
+    let is_plan = flag(&mut options, "plan")?;
+    let command = if operation == Operation::Register {
+        "volume.register"
+    } else {
+        "volume.update"
+    };
+    let schema = if operation == Operation::Register {
+        "barge.volume.register/1"
+    } else {
+        "barge.volume.update/1"
+    };
+    if !is_plan {
+        if words.len() != 1 {
+            return Err(usage(
+                "apply takes the saved plan, not additional arguments",
+            ));
+        }
+        let file = PathBuf::from(required(&mut options, "plan-file")?);
+        let digest = required(&mut options, "plan-sha256")?;
+        refuse_unknown(options)?;
+        let bounds = state::Bounds::new(
+            barge::volume::REGISTRATION_SIZE_CAP_BYTES,
+            1,
+            state::Deadline::after(state::READ_DEADLINE),
+        );
+        let bytes = match state::read_bounded(&file, &bounds) {
+            state::ReadOutcome::Present(bytes) => bytes,
+            state::ReadOutcome::Absent => return Err(usage("plan file is absent")),
+            state::ReadOutcome::Refused(error) => return Err(error),
+        };
+        let plan: volume::Plan =
+            serde_json::from_slice(&bytes).map_err(|e| usage(format!("invalid plan: {e}")))?;
+        if plan.operation != operation {
+            return Err(usage("plan operation does not match the command"));
+        }
+        let result = volume::apply(&paths, &bytes, &digest, &platform, &platform, &platform)?;
+        return Report::verb(
+            schema,
+            command,
+            &result,
+            format!("{command}: {}\n", result.volume_uuid),
+        );
+    }
+    let by = required(&mut options, "declared-by")?;
+    let reserve = optional(&mut options, "reserve")?
+        .map(|v| volume::parse_bytes(&v))
+        .transpose()?;
+    let floor = optional(&mut options, "floor")?
+        .map(|v| volume::parse_bytes(&v))
+        .transpose()?;
+    let availability = optional(&mut options, "availability")?
+        .map(|v| match v.as_str() {
+            "permanent" => Ok(Availability::Permanent),
+            "ephemeral" => Ok(Availability::Ephemeral),
+            _ => Err(usage("invalid availability")),
+        })
+        .transpose()?;
+    let durability = optional(&mut options, "durability")?
+        .map(|v| match v.as_str() {
+            "expendable" => Ok(Durability::Expendable),
+            "kept" => Ok(Durability::Kept),
+            _ => Err(usage("invalid durability")),
+        })
+        .transpose()?;
+    let root_dir = optional(&mut options, "root-dir")?;
+    let result = if operation == Operation::Register {
+        if words.len() != 1 {
+            return Err(usage("volume register takes no positional argument"));
+        }
+        let mount = PathBuf::from(required(&mut options, "mount")?);
+        refuse_unknown(options)?;
+        let request = RegisterRequest {
+            mount,
+            availability: availability.ok_or_else(|| usage("--availability is required"))?,
+            durability: durability.ok_or_else(|| usage("--durability is required"))?,
+            root_dir: root_dir.ok_or_else(|| usage("--root-dir is required"))?,
+            reserve_bytes: reserve.ok_or_else(|| usage("--reserve is required"))?,
+            floor_bytes: floor,
+            declared_by: by,
+        };
+        volume::register_plan(&paths, &request, &platform, &platform, &platform)?
+    } else {
+        if words.len() != 2 {
+            return Err(usage("volume update requires a UUID"));
+        }
+        refuse_unknown(options)?;
+        let request = UpdateRequest {
+            volume_uuid: VolumeUuid::parse(&words[1])?,
+            reserve_bytes: reserve,
+            floor_bytes: floor,
+            availability,
+            durability,
+            root_dir,
+            declared_by: by,
+        };
+        volume::update_plan(&paths, &request, &platform, &platform, &platform)?
+    };
+    Report::verb(
+        schema,
+        command,
+        &result,
+        format!("{}\nsha256: {}\n", result.plan, result.plan_sha256),
+    )
 }
 
 /// Run one `area` verb.
@@ -507,6 +672,26 @@ fn area_root(
                     effective: volume.resolved.declaration.clone(),
                     root,
                 },
+                human,
+            )
+        }
+        Some("identify") if words.len() == 1 => {
+            let uuid = VolumeUuid::parse(&required(&mut options, "volume")?)?;
+            let relative = required(&mut options, "path")?;
+            refuse_unknown(options)?;
+            let state = state_paths()?;
+            let platform = os::platform();
+            let report = barge::identity::identify(
+                &state, &platform, &platform, &platform, &platform, &uuid, &relative,
+            )?;
+            let human = format!(
+                "identified root {} at {}; custody safe; identity recorded\n",
+                report.record.root_id, relative
+            );
+            Report::verb(
+                "barge.root.identify/1",
+                "area.root.identify",
+                &report,
                 human,
             )
         }
@@ -1383,6 +1568,7 @@ fn describe() -> Result<DescribeData, Error> {
         facts: &platform,
         mounts: &platform,
         observer: &platform,
+        space: Some(&platform),
     })
 }
 

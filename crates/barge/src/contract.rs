@@ -112,7 +112,9 @@ pub const AREA_SCHEMA: &str = "barge.area/1";
 /// One placement record's format.
 pub const PLACEMENT_SCHEMA: &str = "barge.placement/1";
 /// One owned root's marker format.
-pub const ROOT_SCHEMA: &str = "barge.root/1";
+pub const ROOT_SCHEMA: &str = "barge.root/2";
+/// One durable owned-root identity record's format.
+pub const ROOT_IDENTITY_SCHEMA: &str = "barge.root.identity/1";
 /// One hold file's format.
 pub const HOLD_SCHEMA: &str = "barge.hold/1";
 /// One intent journal record's format.
@@ -142,10 +144,25 @@ pub struct FormatVersions {
     pub placement: String,
     /// `barge.root/<major>`.
     pub root: String,
+    /// `barge.root.identity/<major>`.
+    #[serde(default)]
+    pub root_identity: String,
     /// `barge.hold/<major>`.
     pub hold: String,
     /// `barge.intent/<major>`.
     pub intent: String,
+    /// `barge.space/<major>`.
+    #[serde(default)]
+    pub space: String,
+    /// Volume registration and report formats.
+    #[serde(default)]
+    pub volume_register: String,
+    /// Volume update format.
+    #[serde(default)]
+    pub volume_update: String,
+    /// Volume describe format.
+    #[serde(default)]
+    pub volume_describe: String,
 }
 
 impl FormatVersions {
@@ -158,8 +175,13 @@ impl FormatVersions {
             area: AREA_SCHEMA.to_owned(),
             placement: PLACEMENT_SCHEMA.to_owned(),
             root: ROOT_SCHEMA.to_owned(),
+            root_identity: ROOT_IDENTITY_SCHEMA.to_owned(),
             hold: HOLD_SCHEMA.to_owned(),
             intent: INTENT_SCHEMA.to_owned(),
+            space: crate::space::SPACE_SCHEMA.to_owned(),
+            volume_register: "barge.volume.register/1".to_owned(),
+            volume_update: "barge.volume.update/1".to_owned(),
+            volume_describe: "barge.volume.describe/1".to_owned(),
         }
     }
 }
@@ -354,7 +376,7 @@ mod tests {
         assert_eq!(formats.registry, "barge.registry/1");
         assert_eq!(formats.area, "barge.area/1");
         assert_eq!(formats.placement, "barge.placement/1");
-        assert_eq!(formats.root, "barge.root/1");
+        assert_eq!(formats.root, "barge.root/2");
         assert_eq!(formats.hold, "barge.hold/1");
         assert_eq!(formats.intent, "barge.intent/2");
     }
