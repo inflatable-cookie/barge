@@ -123,6 +123,10 @@ pub fn descriptor_census(
             retry,
             open,
             os_blind_spot,
+            // The census reports the same-uid observation counts, the retry
+            // record and the OS blind spot. A dead handle is a custody residual,
+            // and this census grants no custody verdict, so it is not reported.
+            dead_handles: _,
         } => {
             report.status = CensusStatus::Passed;
             report.processes = Some(processes);
@@ -236,6 +240,7 @@ mod tests {
                         opaque_descriptors: 2,
                     }],
                 },
+                dead_handles: crate::os::DeadHandleEvidence::default(),
                 open: vec![],
             }),
             fixture.path(),
