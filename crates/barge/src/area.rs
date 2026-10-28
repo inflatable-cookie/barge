@@ -2084,6 +2084,13 @@ impl RootMarker {
         recorded_mount: &Path,
         expectation: &MarkerExpectation<'_>,
     ) -> Result<()> {
+        // A v1 marker must carry its absolute path. A missing path is unknown,
+        // never defaulted, so the prefix rule has nothing to compare.
+        let Some(recorded_path) = self.resolved_path.as_deref() else {
+            return Err(unknown_marker(
+                "the v1 marker records no resolved path".to_owned(),
+            ));
+        };
         let canonical = |path: &Path| {
             path.to_str().is_some_and(|value| {
                 value.starts_with('/')
@@ -2095,7 +2102,7 @@ impl RootMarker {
         };
         if !os::recorded_mount_path(recorded_mount)
             || !canonical(recorded_mount)
-            || !canonical(&self.resolved_path)
+            || !canonical(recorded_path)
             || !canonical(expectation.resolved_path)
             || verified.identity().volume_uuid.as_ref() != Some(expectation.volume_uuid)
             || verified.path() != verified.identity().mount_point
@@ -2104,8 +2111,7 @@ impl RootMarker {
                 "the live mount does not verify the recorded UUID".to_owned(),
             ));
         }
-        let old = self
-            .resolved_path
+        let old = recorded_path
             .strip_prefix(recorded_mount)
             .map_err(|_| unknown_marker("marker is outside the recorded mount".to_owned()))?;
         let live = expectation
@@ -2123,7 +2129,7 @@ impl RootMarker {
             ));
         }
         let original = MarkerExpectation {
-            resolved_path: &self.resolved_path,
+            resolved_path: recorded_path,
             ..*expectation
         };
         self.validate(&original)
@@ -4850,7 +4856,12 @@ mod tests {
         let marker: super::RootMarker =
             serde_json::from_slice(&std::fs::read(marker_path(&root)).unwrap()).unwrap();
         let mut marker = marker;
-        marker.resolved_path = PathBuf::from("/Volumes/Old/area/root");
+        // The fixture writes v2; this test exercises the v1 prefix rule, so it
+        // rebuilds the marker as the v1 shape that carries the absolute path.
+        marker.schema = "barge.root/1".to_owned();
+        marker.mount_relative_path = None;
+        marker.mount_at_record = None;
+        marker.resolved_path = Some(PathBuf::from("/Volumes/Old/area/root"));
         let identity = crate::os::VolumeIdentity {
             mount_point: PathBuf::from("/Volumes/New"),
             filesystem: crate::os::FileSystem::Apfs,
@@ -4866,6 +4877,7 @@ mod tests {
         let expectation = MarkerExpectation {
             volume_uuid: &fixture.uuid,
             resolved_path: live,
+            mount_point: Some(Path::new("/Volumes/New")),
             effective_uid: 0,
             now_ms: crate::state::now_ms(),
         };
