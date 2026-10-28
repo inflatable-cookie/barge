@@ -1157,43 +1157,67 @@ mod tests {
     }
 
     impl Child {
-        /// Spawn `/bin/sleep` with the file at `path` as its stdin, so the child
-        /// holds one descriptor at that vnode for as long as it runs.
+        /// Spawn one child that announces it finished starting and then waits, so a
+        /// scan never reads a descriptor the loader is about to close. A freshly
+        /// exec'd binary opens and closes its own image and libraries immediately,
+        /// and a scan that paired a readable path with the closed answer of such a
+        /// descriptor would be unknown by the pairing rule instead of observing the
+        /// fact under test.
+        fn spawn(configure: impl FnOnce(&mut std::process::Command)) -> Self {
+            use std::io::Read;
+            use std::os::fd::OwnedFd;
+
+            let (mut ready, announced) =
+                std::os::unix::net::UnixStream::pair().expect("a socket pair is created");
+            let mut command = std::process::Command::new("/bin/sh");
+            // The child announces it started and then stops itself: one process,
+            // holding exactly the descriptors under test, with a descriptor table
+            // that cannot change while the scan reads it and no grandchild to leak
+            // when it is killed. The announcement writes to stderr only, so no
+            // redirection ever replaces the descriptor a test states an answer for.
+            command
+                .arg("-c")
+                .arg("printf ready >&2; kill -STOP $$")
+                .stderr(std::process::Stdio::from(OwnedFd::from(announced)));
+            configure(&mut command);
+            let process = command.spawn().expect("a same-uid child runs");
+            let mut banner = [0u8; 5];
+            ready
+                .read_exact(&mut banner)
+                .expect("the child announces it finished starting");
+            assert_eq!(&banner, b"ready", "the child is ready to be scanned");
+            Self { process }
+        }
+
+        /// Spawn a child holding the file at `path` as its stdin, so it holds one
+        /// descriptor at that vnode for as long as it runs.
         fn holding(path: &std::path::Path) -> Self {
             let held = std::fs::File::open(path).expect("the held payload opens");
-            let process = std::process::Command::new("/bin/sleep")
-                .arg("60")
-                .stdin(std::process::Stdio::from(held))
-                .spawn()
-                .expect("a same-uid child holds the payload open");
-            Self { process }
+            Self::spawn(|command| {
+                command.stdin(std::process::Stdio::from(held));
+            })
         }
 
-        /// Spawn `/bin/sleep` holding nothing under the root: a live same-uid
-        /// process whose listing can be stated unreadable, and whose own handles
-        /// are not a writer's claim on the root.
+        /// Spawn a child holding nothing under the root: a live same-uid process
+        /// whose listing can be stated unreadable, and whose own handles are not a
+        /// writer's claim on the root.
         fn idle() -> Self {
-            let process = std::process::Command::new("/bin/sleep")
-                .arg("60")
-                .stdin(std::process::Stdio::null())
-                .spawn()
-                .expect("a same-uid child runs");
-            Self { process }
+            Self::spawn(|command| {
+                command.stdin(std::process::Stdio::null());
+            })
         }
 
-        /// Spawn `/bin/sleep` holding two files under the root open, on stdin and
+        /// Spawn a child holding two files under the root open, on stdin and
         /// stdout, so one of its descriptors can be stated opaque while another
         /// stays readable.
         fn holding_two(first: &std::path::Path, second: &std::path::Path) -> Self {
             let first = std::fs::File::open(first).expect("the first held file opens");
             let second = std::fs::File::open(second).expect("the second held file opens");
-            let process = std::process::Command::new("/bin/sleep")
-                .arg("60")
-                .stdin(std::process::Stdio::from(first))
-                .stdout(std::process::Stdio::from(second))
-                .spawn()
-                .expect("a same-uid child holds both files open");
-            Self { process }
+            Self::spawn(|command| {
+                command
+                    .stdin(std::process::Stdio::from(first))
+                    .stdout(std::process::Stdio::from(second));
+            })
         }
 
         /// The child's own identity, as the kernel's table reports it.
@@ -2281,7 +2305,13 @@ mod tests {
             table: vec![self_identity()],
         };
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
-        assert_eq!(verdict.name(), "unsafe", "{:?}", verdict.reason());
+        // Without the exclusion the caller's own descriptor is observed, so the
+        // verdict is never `Safe`: it is `Unsafe` when that descriptor is placed,
+        // and `Unknown` when this process closed a descriptor between the two
+        // reads while other tests ran in parallel — which the pairing rule refuses
+        // rather than carrying one read's answer. Either is a refusal, and neither
+        // is a skip.
+        assert_ne!(verdict.name(), "safe", "{:?}", verdict.reason());
         assert!(
             verdict
                 .reason()
@@ -2653,7 +2683,8 @@ mod tests {
         assert_eq!(record.errnos, vec![EPERM]);
         assert_eq!(record.identity_changes, 0);
         assert_eq!(record.resolution, RetryResolution::Listed);
-        assert_eq!(record.command.as_deref(), Some("sleep"));
+        // `/bin/sh` is bash on this platform, and the kernel's own table says so.
+        assert_eq!(record.command.as_deref(), Some("bash"));
     }
 
     #[test]
@@ -3298,7 +3329,8 @@ mod tests {
             .expect("the dead handle is recorded");
         assert_eq!(record.pid, identity.pid);
         assert_eq!(record.start, identity.start);
-        assert_eq!(record.command, "sleep");
+        // `/bin/sh` is bash on this platform, and the kernel's own table says so.
+        assert_eq!(record.command, "bash");
         assert_eq!(
             record.descriptor, 0,
             "the payload is the child's stdin, its first vnode descriptor"
@@ -3549,25 +3581,19 @@ mod tests {
     }
 
     #[test]
-    fn a_descriptor_that_closes_between_the_two_reads_is_gone_not_dead() {
-        let holder = real_holder("custody-023-closed-between-reads");
+    fn a_readable_path_beside_closed_vnode_facts_is_unknown() {
+        let holder = real_holder("custody-023-path-closed-facts");
         let payload = holder.payload();
         let child = Child::holding(&payload);
-        let identity = child.identity();
         // The path reads fine and the vnode facts then report the descriptor
-        // closed: it closed between the two reads, so it holds nothing. That is
-        // neither a dead handle nor a refusal — descriptors close all the time
-        // while a scan reads them.
-        let observer = stated_vnode(
-            identity,
+        // closed. The pair disagrees, and a closed answer never carries the other
+        // read's result: the fd may already have been closed and reused, so this
+        // is unknown — never a closed descriptor and never a dead handle.
+        assert_mixed_pair_refuses(
+            &holder,
+            &child,
             StatedVnodeRead::new(StatedCall::Real, StatedCall::Closed),
-        );
-        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
-        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
-        let evidence = verdict.evidence().expect("the evidence");
-        assert_eq!(
-            evidence.dead_handles.handles, 0,
-            "a closed descriptor is not a dead handle"
+            "the path read a path while the vnode facts report the descriptor closed",
         );
     }
 

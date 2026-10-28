@@ -2407,14 +2407,13 @@ enum DescriptorReading {
 /// that closed between the two reads is positively gone — it holds nothing — and
 /// is reported closed whichever read saw it, unless the path read answered
 /// `ENOENT`, which is a disagreement and refuses. Every other pairing is
-/// unreadable and refuses: a readable path with vnode facts that report the vnode
-/// gone, a readable path with facts the platform hides, a path read that reports
-/// the descriptor closed beside anything but a closed vnode-facts read (a closed
-/// answer is never carried by whatever the second read then reports, and that
-/// second read can still find the vnode gone or fail), `ENOENT` from one read
-/// with `EPERM` or a closed answer from the other, a hidden path beside a closed
-/// answer, and a path read that failed for any reason but the hidden answer —
-/// which a closed vnode-facts answer never carries.
+/// unreadable and refuses: a readable path beside vnode facts that report the
+/// vnode gone, report it hidden or report the descriptor closed, a path read that
+/// reports the descriptor closed beside anything but a closed vnode-facts read,
+/// `ENOENT` from one read with `EPERM` or a closed answer from the other, a hidden
+/// path beside a closed answer, and a path read that failed for any reason but the
+/// hidden answer. Only a pair that agrees is an answer, so no read's result is
+/// ever carried by the other's.
 fn read_descriptor(
     pid: u32,
     descriptor: i32,
@@ -2468,15 +2467,11 @@ fn read_descriptor(
             Err(mixed_reads(pid, descriptor, &path, &facts))
         }
         // Both reads agree the descriptor closed between them: it holds nothing,
-        // so it is positively gone. One closed answer beside any other answer is
-        // a disagreement below — a closed path read is never carried by whatever
-        // the second read then reports.
+        // so it is positively gone. Only that agreement is an answer — one closed
+        // answer beside any other answer, a readable path included, is a
+        // disagreement below, because the fd may already have been closed and
+        // reused and no read's answer is carried by the other's.
         (DescriptorPath::Closed, VnodeFacts::Closed) => Ok(DescriptorReading::Closed),
-        // The vnode facts reporting the descriptor closed means it closed between
-        // the two reads: it holds nothing, so it is positively gone. A path read
-        // that answered `ENOENT` is not carried by that — one read reporting the
-        // vnode gone beside a closed answer stays a disagreement below.
-        (DescriptorPath::Path(_), VnodeFacts::Closed) => Ok(DescriptorReading::Closed),
         // The pair disagrees. Nothing about the descriptor is established, so it
         // is unknown and never a dead handle.
         (path, facts) => Err(mixed_reads(pid, descriptor, &path, &facts)),

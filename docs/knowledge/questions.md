@@ -87,8 +87,9 @@ are an answer; every mixed pair refuses as `Unknown`, including a readable path
 whose vnode facts answer `ENOENT` and a path read that answers `ENOENT` beside a
 closed vnode-facts read. A descriptor that closes between the two reads holds
 nothing, so it is reported closed when both reads report it closed; one closed
-answer beside any other answer is a disagreement, because no read's answer is
-carried by the other's. When both reads answer `ENOENT` after a
+answer beside any other answer is a disagreement — whichever read saw the close —
+because no read's answer is carried by the other's and the fd may already have
+been closed and reused. When both reads answer `ENOENT` after a
 successful `PROC_PIDLISTFDS`, the scan re-observes that descriptor under
 barge#012's bounded rule, re-reading the pid's kernel identity and rechecking both
 deadlines after the observation and the final identity read, and reports a **dead
