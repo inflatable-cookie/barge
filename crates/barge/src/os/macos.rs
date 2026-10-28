@@ -1241,12 +1241,15 @@ impl MacOs {
     /// takes one bounded backoff, inside the same settle window and the scan's
     /// own deadline, and re-reads the pid's kernel identity before and after the
     /// second observation. It reports a dead handle only when that identity is
-    /// the classified one and the second observation still answers `ENOENT` to
-    /// both flavors. A descriptor that reads on the second observation is
-    /// evaluated like any other; a changed or unreadable identity, a second
-    /// observation that answers `ENOENT` to only one flavor, any other errno or a
-    /// bound reached is unknown, never a dead handle (Tom, 2026-10-28, decision
-    /// e33115d3, barge#023).
+    /// the classified one, the second observation still answers `ENOENT` to both
+    /// flavors, and both deadlines still hold when that observation and the final
+    /// identity read complete — the reads themselves can be slow, so they are
+    /// checked when the answer arrives and not only around the backoff. A
+    /// descriptor that reads on the second observation is evaluated like any
+    /// other; a changed or unreadable identity, a second observation that pairs
+    /// its two answers differently, any other errno or a bound reached is
+    /// unknown, never a dead handle (Tom, 2026-10-28, decision e33115d3,
+    /// barge#023).
     #[allow(clippy::too_many_arguments)]
     fn settle_dead_handle(
         &self,
@@ -1260,6 +1263,24 @@ impl MacOs {
     ) -> Observed {
         let pid = classified.pid;
         let settle_started = Instant::now();
+        // Whether a settled answer may be accepted. Every read below can be slow,
+        // so both deadlines are checked when the answer arrives and not only
+        // around the backoff: an answer read after the process's settle window
+        // closed is not evidence, and one read after the scan's own deadline makes
+        // the scan bounded. This is the same rule the listing re-observation
+        // applies, and it is what keeps the last descriptor of the last process
+        // from being recorded past either bound.
+        let accept = |observed: Observed| match stop_when_settled(
+            settle_started.elapsed(),
+            started.elapsed(),
+            timeout,
+        ) {
+            Some(RetryStop::Unreadable) => {
+                Observed::Unreadable(dead_window_closed(pid, descriptor, classified.start))
+            }
+            Some(RetryStop::Bounded) => Observed::Bounded,
+            None => observed,
+        };
         // No backoff left is both the exhausted schedule and the counterfactual:
         // nothing was re-observed, so persistence is not established.
         let Some(backoff) = backoffs.first().copied() else {
@@ -1306,7 +1327,7 @@ impl MacOs {
         let before = match self.reobserve_identity(pid, faults) {
             Ok(Some(now)) => now,
             // Positively gone: nothing it held is open any more.
-            Ok(None) => return Observed::Closed,
+            Ok(None) => return accept(Observed::Closed),
             Err(error) => {
                 return Observed::Unreadable(dead_identity_unreadable(pid, descriptor, &error))
             }
@@ -1323,7 +1344,7 @@ impl MacOs {
             ));
         }
         let stated = stated_vnode_read(faults, pid, vnode_index);
-        match read_descriptor(pid, descriptor, stated) {
+        let observed = match read_descriptor(pid, descriptor, stated) {
             Ok(DescriptorReading::Path(path)) => Observed::Path(path),
             Ok(DescriptorReading::Closed) => Observed::Closed,
             Ok(DescriptorReading::Opaque) => Observed::Opaque,
@@ -1346,7 +1367,7 @@ impl MacOs {
                         ))
                     }
                     // Gone after the second observation: nothing it held is open.
-                    Ok(None) => return Observed::Closed,
+                    Ok(None) => return accept(Observed::Closed),
                     Err(error) => {
                         return Observed::Unreadable(dead_identity_unreadable(
                             pid, descriptor, &error,
@@ -1360,7 +1381,10 @@ impl MacOs {
                     command: before.command,
                 })
             }
-        }
+        };
+        // The second observation and the final identity read are done, so the
+        // answer is accepted only if both deadlines still hold after them.
+        accept(observed)
     }
 
     /// The kernel's own identity for one pid, with any identity a test states.
@@ -1526,46 +1550,118 @@ pub(crate) struct StatedListing {
     pub(crate) platform: Option<StatedPlatform>,
 }
 
-/// One stated answer for a vnode descriptor's pair of per-fd reads.
+/// One per-fd answer a test states instead of reading it.
 ///
-/// The production scan states nothing; this account cannot create a revoked or
-/// reclaimed vnode on demand (an unlinked file and a pty slave whose master
-/// closed both keep a readable path), so the dead-handle rule is exercised with
-/// the per-fd answers stated and every identity, bound and re-observation real.
+/// A stated answer replaces exactly one of the two reads, so every mixed pair is
+/// decided by the production pairing in [`read_descriptor`] rather than by a
+/// fabricated result.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StatedVnodeRead {
-    /// Both per-fd reads answer `EPERM`: the descriptor is opaque.
-    Opaque,
-    /// Both per-fd reads answer `ENOENT` on every observation.
-    Dead,
-    /// Both per-fd reads answer `ENOENT` on the first observation and are read
-    /// for real afterwards.
-    DeadOnce,
-    /// The path read answers `ENOENT` while the vnode facts are readable.
-    PathAbsent,
-    /// The vnode facts answer `ENOENT` while the path is readable.
-    FactsAbsent,
+pub(crate) enum StatedCall {
+    /// Read this call for real.
+    Real,
+    /// The call answers `ENOENT`.
+    Absent,
+    /// The call answers `EPERM`.
+    Hidden,
+    /// The call answers `ESRCH`, as the read of a descriptor that closed between
+    /// the two calls does.
+    Closed,
 }
 
+/// The pair of per-fd answers a test states for one vnode descriptor.
+///
+/// The production scan states nothing and reads both; this account cannot create
+/// a revoked or reclaimed vnode on demand (an unlinked file and a pty slave whose
+/// master closed both keep a readable path), so the dead-handle rule is exercised
+/// with the per-fd answers stated and every identity, bound and re-observation
+/// real.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StatedVnodeRead {
+    /// The stated answer of the path read, or [`StatedCall::Real`] to read it.
+    pub(crate) path: StatedCall,
+    /// The stated answer of the vnode-facts read, or [`StatedCall::Real`] to
+    /// read it.
+    pub(crate) facts: StatedCall,
+    /// Whether this pair answers this way once and is read for real afterwards.
+    pub(crate) once: bool,
+}
+
+/// The answers the scan itself reads from a stated pair. They exist in every
+/// build, because the production pairing reads them; the test-facing
+/// constructors below do not.
 impl StatedVnodeRead {
-    /// The reading this stated answer stands for, exactly as the per-fd reads
-    /// would answer it.
-    fn reading(self, pid: u32, descriptor: i32) -> Result<DescriptorReading> {
-        match self {
-            Self::Opaque => Ok(DescriptorReading::Opaque),
-            Self::Dead | Self::DeadOnce => Ok(DescriptorReading::Dead),
-            Self::PathAbsent => Err(one_call_absent(
-                pid,
-                descriptor,
-                "the path read answered `ENOENT` while the vnode facts were readable",
-            )),
-            Self::FactsAbsent => Err(one_call_absent(
-                pid,
-                descriptor,
-                "the path read was readable while the vnode facts answered `ENOENT`",
-            )),
+    /// The stated answer of the path read.
+    pub(crate) const fn path_call(self) -> StatedCall {
+        self.path
+    }
+
+    /// The stated answer of the vnode-facts read.
+    pub(crate) const fn facts_call(self) -> StatedCall {
+        self.facts
+    }
+
+    /// Whether the pair keeps answering this way, which is what a persistent dead
+    /// handle does; every other stated pair is consumed by its first use so the
+    /// re-observation reads the descriptor for real.
+    pub(crate) const fn persists(self) -> bool {
+        !self.once
+            && matches!(self.path, StatedCall::Absent)
+            && matches!(self.facts, StatedCall::Absent)
+    }
+}
+
+/// The pairs the crate's own tests state, each one chosen so the production
+/// pairing decides the case rather than a fabricated reading.
+#[cfg(test)]
+impl StatedVnodeRead {
+    /// The pair, stated for every observation unless `once` is set.
+    pub(crate) const fn new(path: StatedCall, facts: StatedCall) -> Self {
+        Self {
+            path,
+            facts,
+            once: false,
         }
+    }
+
+    /// Both per-fd reads answer `EPERM`: an OS blind spot.
+    pub(crate) const fn opaque() -> Self {
+        Self::new(StatedCall::Hidden, StatedCall::Hidden)
+    }
+
+    /// Both per-fd reads answer `ENOENT` on every observation: a dead handle.
+    pub(crate) const fn dead() -> Self {
+        Self::new(StatedCall::Absent, StatedCall::Absent)
+    }
+
+    /// Both per-fd reads answer `ENOENT` once, then the descriptor is read for
+    /// real: a transient answer, not a dead handle.
+    pub(crate) const fn dead_once() -> Self {
+        Self {
+            once: true,
+            ..Self::dead()
+        }
+    }
+
+    /// The path read answers `ENOENT`; the vnode facts are read for real.
+    pub(crate) const fn path_absent() -> Self {
+        Self::new(StatedCall::Absent, StatedCall::Real)
+    }
+
+    /// The path is read for real and the vnode facts answer `ENOENT`.
+    pub(crate) const fn facts_absent() -> Self {
+        Self::new(StatedCall::Real, StatedCall::Absent)
+    }
+
+    /// The path read answers `ENOENT` and the vnode facts report the descriptor
+    /// closed.
+    pub(crate) const fn path_absent_facts_closed() -> Self {
+        Self::new(StatedCall::Absent, StatedCall::Closed)
+    }
+
+    /// The path read answers `EPERM` and the vnode facts answer `ENOENT`.
+    pub(crate) const fn path_hidden_facts_absent() -> Self {
+        Self::new(StatedCall::Hidden, StatedCall::Absent)
     }
 }
 
@@ -1651,7 +1747,7 @@ fn stated_vnode_read(
     let stated = faults.iter_mut().find(|stated| stated.pid == pid)?;
     let position = stated.vnode_reads.iter().position(|(at, _)| *at == index)?;
     let answer = stated.vnode_reads[position].1;
-    if answer != StatedVnodeRead::Dead {
+    if !answer.persists() {
         stated.vnode_reads.remove(position);
     }
     Some(answer)
@@ -2283,89 +2379,113 @@ enum DescriptorReading {
 
 /// One vnode descriptor, read as far as the platform allows.
 ///
-/// A path the platform hides as `EPERM` is confirmed against the vnode facts:
-/// only when both flavors answer `EPERM` is the descriptor opaque. A path this
-/// account may not read while its vnode facts are readable is not opaque — the
-/// exemption is about exactly the descriptors the platform hides twice — so it
-/// stays an unreadable fact and refuses. A path the kernel reports gone as
-/// `ENOENT` is confirmed the same way: only when both flavors answer `ENOENT` is
-/// the descriptor a dead-handle candidate, because one call answering it alone is
-/// a fact the scan cannot place and therefore unreadable. Any other failure
-/// refuses at once.
+/// Both of the platform's per-fd reads are evaluated, because every answer is a
+/// statement about the *pair*. Only three pairings are an answer: a readable path
+/// with readable vnode facts, `ENOENT` from both flavors (a dead-handle
+/// candidate), and `EPERM` from both flavors (the OS blind spot). A descriptor
+/// that closed between the two reads is positively gone — it holds nothing — and
+/// is reported closed whichever read saw it, unless the path read answered
+/// `ENOENT`, which is a disagreement and refuses. Every other pairing is
+/// unreadable and refuses: a readable path with vnode facts that report the vnode
+/// gone, a readable path with facts the platform hides, `ENOENT` from one read
+/// with `EPERM` or a closed answer from the other, and any path failure that is
+/// not the hidden answer. A path read that reports the descriptor closed is
+/// positively gone too, so the facts are not read: there is no second answer to
+/// pair.
 fn read_descriptor(
     pid: u32,
     descriptor: i32,
     stated: Option<StatedVnodeRead>,
 ) -> Result<DescriptorReading> {
-    // A test states the per-fd answers a host cannot be asked to produce. The
-    // production scan states nothing and reads both of them.
-    if let Some(stated) = stated {
-        return stated.reading(pid, descriptor);
-    }
-    let hidden = match descriptor_path(pid, descriptor) {
-        DescriptorPath::Path(path) => return Ok(DescriptorReading::Path(path)),
-        DescriptorPath::Closed => return Ok(DescriptorReading::Closed),
-        DescriptorPath::Hidden(error) => error,
+    let path = match stated.map(StatedVnodeRead::path_call) {
+        Some(StatedCall::Absent) => DescriptorPath::Absent,
+        Some(StatedCall::Hidden) => {
+            DescriptorPath::Failed(io::Error::from_raw_os_error(libc::EPERM))
+        }
+        Some(StatedCall::Closed) => DescriptorPath::Closed,
+        Some(StatedCall::Real) | None => descriptor_path(pid, descriptor),
     };
-    match hidden.raw_os_error() {
-        Some(libc::EPERM) => match descriptor_vnode_facts(pid, descriptor) {
-            VnodeFacts::Hidden => Ok(DescriptorReading::Opaque),
-            VnodeFacts::Closed => Ok(DescriptorReading::Closed),
-            VnodeFacts::Readable => Err(path_hidden_facts_readable(pid, descriptor)),
-            // Only one of the two reads reports the vnode gone: unreadable.
-            VnodeFacts::Absent => Err(one_call_absent(
-                pid,
-                descriptor,
-                "the path read answered `EPERM` while the vnode facts answered `ENOENT`",
-            )),
-            VnodeFacts::Unreadable(error) => Err(unreadable_descriptors(pid, &error)),
-        },
-        Some(libc::ENOENT) => match descriptor_vnode_facts(pid, descriptor) {
-            // Both per-fd reads agree, so this is a dead-handle candidate.
-            VnodeFacts::Absent => Ok(DescriptorReading::Dead),
-            VnodeFacts::Closed => Ok(DescriptorReading::Closed),
-            VnodeFacts::Readable => Err(one_call_absent(
-                pid,
-                descriptor,
-                "the path read answered `ENOENT` while the vnode facts were readable",
-            )),
-            VnodeFacts::Hidden => Err(one_call_absent(
-                pid,
-                descriptor,
-                "the path read answered `ENOENT` while the vnode facts answered `EPERM`",
-            )),
-            VnodeFacts::Unreadable(error) => Err(unreadable_descriptors(pid, &error)),
-        },
-        _ => Err(unreadable_descriptors(pid, &hidden)),
+    if matches!(path, DescriptorPath::Closed) {
+        return Ok(DescriptorReading::Closed);
+    }
+    let facts = match stated.map(StatedVnodeRead::facts_call) {
+        Some(StatedCall::Absent) => VnodeFacts::Absent,
+        Some(StatedCall::Hidden) => VnodeFacts::Hidden,
+        Some(StatedCall::Closed) => VnodeFacts::Closed,
+        Some(StatedCall::Real) | None => descriptor_vnode_facts(pid, descriptor),
+    };
+    let facts = match facts {
+        VnodeFacts::Unreadable(error) => return Err(unreadable_descriptors(pid, &error)),
+        other => other,
+    };
+    // The vnode facts reporting the descriptor closed means it closed between the
+    // two reads: it holds nothing, so it is positively gone rather than a
+    // disagreement. A path read that answered `ENOENT` is not carried by that —
+    // one read reporting the vnode gone beside a closed answer stays a
+    // disagreement — so it is decided by the pairing below.
+    if matches!(facts, VnodeFacts::Closed) && !matches!(path, DescriptorPath::Absent) {
+        return Ok(DescriptorReading::Closed);
+    }
+    match (path, facts) {
+        // Both reads agree: the descriptor is placeable.
+        (DescriptorPath::Path(path), VnodeFacts::Readable) => Ok(DescriptorReading::Path(path)),
+        // Both reads agree: a revoked or reclaimed vnode, which is a dead-handle
+        // candidate until a bounded re-observation proves it.
+        (DescriptorPath::Absent, VnodeFacts::Absent) => Ok(DescriptorReading::Dead),
+        // Both reads agree: the platform hides the descriptor twice.
+        (DescriptorPath::Failed(error), VnodeFacts::Hidden)
+            if error.raw_os_error() == Some(libc::EPERM) =>
+        {
+            Ok(DescriptorReading::Opaque)
+        }
+        // A path failure that is not the hidden answer is unknown at once: the
+        // vnode facts cannot explain it.
+        (DescriptorPath::Failed(error), _) if error.raw_os_error() != Some(libc::EPERM) => {
+            Err(unreadable_descriptors(pid, &error))
+        }
+        // A closed path was returned above; the arm keeps the pair total.
+        (DescriptorPath::Closed, _) => Ok(DescriptorReading::Closed),
+        // The pair disagrees. Nothing about the descriptor is established, so it
+        // is unknown and never a dead handle.
+        (path, facts) => Err(mixed_reads(pid, descriptor, &path, &facts)),
     }
 }
 
-/// The refusal for a descriptor whose path the platform hides while its vnode
-/// facts are readable: the OS blind spot is about exactly the descriptors both
-/// flavors hide, so this one stays an unreadable fact.
-fn path_hidden_facts_readable(pid: u32, descriptor: i32) -> Error {
+/// The refusal for a descriptor whose two per-fd reads do not agree: only a
+/// readable path with readable facts, `ENOENT` from both and `EPERM` from both are
+/// an answer, so a mixed pair establishes nothing and is never a dead handle.
+fn mixed_reads(pid: u32, descriptor: i32, path: &DescriptorPath, facts: &VnodeFacts) -> Error {
     Error::new(
         ErrorKind::UnknownState,
         format!(
-            "the vnode facts of descriptor {descriptor} of pid {pid} are readable while its path is not, so it cannot be placed"
+            "the two reads of descriptor {descriptor} of pid {pid} do not agree ({}; {}), so the descriptor cannot be placed and a dead handle is not established",
+            path_answer(path),
+            facts_answer(facts)
         ),
     )
     .with_detail("pid", u64::from(pid).into())
     .with_detail("descriptor", i64::from(descriptor).into())
 }
 
-/// The refusal for a descriptor exactly one of whose two per-fd reads reports
-/// the vnode gone: the pair disagrees, so nothing about the descriptor is
-/// established and it is never a dead handle.
-fn one_call_absent(pid: u32, descriptor: i32, reads: &str) -> Error {
-    Error::new(
-        ErrorKind::UnknownState,
-        format!(
-            "only one of the two reads of descriptor {descriptor} of pid {pid} reports its vnode gone ({reads}), so a dead handle is not established"
-        ),
-    )
-    .with_detail("pid", u64::from(pid).into())
-    .with_detail("descriptor", i64::from(descriptor).into())
+/// What one per-fd path read reported, for a refusal that a human reads.
+fn path_answer(path: &DescriptorPath) -> String {
+    match path {
+        DescriptorPath::Path(_) => "the path read a path".to_owned(),
+        DescriptorPath::Closed => "the path read reports the descriptor closed".to_owned(),
+        DescriptorPath::Absent => "the path read answered `ENOENT`".to_owned(),
+        DescriptorPath::Failed(error) => format!("the path read failed with `{error}`"),
+    }
+}
+
+/// What one per-fd vnode-facts read reported, for the same refusal.
+fn facts_answer(facts: &VnodeFacts) -> String {
+    match facts {
+        VnodeFacts::Readable => "the vnode facts are readable".to_owned(),
+        VnodeFacts::Hidden => "the vnode facts answered `EPERM`".to_owned(),
+        VnodeFacts::Closed => "the vnode facts report the descriptor closed".to_owned(),
+        VnodeFacts::Absent => "the vnode facts answered `ENOENT`".to_owned(),
+        VnodeFacts::Unreadable(error) => format!("the vnode facts failed with `{error}`"),
+    }
 }
 
 /// What one vnode descriptor was observed to be, after any bounded
@@ -2387,6 +2507,16 @@ enum Observed {
     Unreadable(String),
     /// The scan's own time bound would be crossed: bounded, never a dead handle.
     Bounded,
+}
+
+/// The refusal for a dead-handle re-observation that produced its answer after
+/// its settle window had closed: the answer is not evidence, because the bounded
+/// re-observation did not finish inside its bound.
+fn dead_window_closed(pid: u32, descriptor: i32, start: u64) -> String {
+    format!(
+        "the dead-handle re-observation of descriptor {descriptor} of pid {pid} (start {start}) produced its answer after its {} ms settle window closed, so it is not evidence",
+        SETTLE_WINDOW.as_millis()
+    )
 }
 
 /// The refusal for a dead-handle candidate that could not be re-observed inside
@@ -2428,9 +2558,12 @@ enum DescriptorPath {
     Path(PathBuf),
     /// The descriptor closed while it was observed, or reports no path.
     Closed,
+    /// The kernel reports the vnode gone: `ENOENT`, one half of a dead-handle
+    /// candidate.
+    Absent,
     /// The read failed, with the kernel's own reason. `EPERM` is the hidden
-    /// answer the vnode facts are confirmed against.
-    Hidden(io::Error),
+    /// answer the vnode facts are confirmed against; every other reason refuses.
+    Failed(io::Error),
 }
 
 /// One descriptor's vnode facts, as `PROC_PIDFDVNODEINFO` answers them. The
@@ -2470,7 +2603,8 @@ fn descriptor_path(pid: u32, descriptor: i32) -> DescriptorPath {
         let error = io::Error::last_os_error();
         return match error.raw_os_error() {
             Some(libc::ESRCH | libc::EBADF) => DescriptorPath::Closed,
-            _ => DescriptorPath::Hidden(error),
+            Some(libc::ENOENT) => DescriptorPath::Absent,
+            _ => DescriptorPath::Failed(error),
         };
     }
     // SAFETY: `vip_path` is a fixed array of `c_char` inside `info`, which is
@@ -2482,7 +2616,7 @@ fn descriptor_path(pid: u32, descriptor: i32) -> DescriptorPath {
         )
     };
     let Ok(path) = CStr::from_bytes_until_nul(bytes) else {
-        return DescriptorPath::Hidden(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+        return DescriptorPath::Failed(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
     };
     if path.to_bytes().is_empty() {
         return DescriptorPath::Closed;

@@ -27,12 +27,20 @@
 //!   verifies it as a platform binary and its start identity is unchanged around
 //!   that read (barge#013, Tom's decision e528a712); every other hidden
 //!   descriptor is unreadable and refuses;
+//! - both of a vnode descriptor's per-fd reads are evaluated, and only a readable
+//!   path with readable facts, `ENOENT` from both and `EPERM` from both are an
+//!   answer: a descriptor whose path read a path while its facts answered
+//!   `ENOENT`, or whose two reads disagree in any other way, is unreadable. A
+//!   descriptor that closed between the two reads holds nothing, so it is reported
+//!   closed whichever read saw it — unless the path read answered `ENOENT`, which
+//!   is a disagreement;
 //! - a vnode descriptor whose path and vnode facts both answer `ENOENT`, and
-//!   still do for the same process identity on a bounded re-observation, is a
-//!   reported dead handle: a revoked or reclaimed vnode cannot do I/O, so it is
-//!   recorded with its pid, start identity, descriptor and command and does not
-//!   block (barge#023, Tom's decision e33115d3); `ENOENT` on the listing itself,
-//!   on only one of the two reads, a changed identity and a bound reached are
+//!   still do for the same process identity on a bounded re-observation whose
+//!   deadlines are rechecked after that observation and the final identity read,
+//!   is a reported dead handle: a revoked or reclaimed vnode cannot do I/O, so it
+//!   is recorded with its pid, start identity, descriptor and command and does
+//!   not block (barge#023, Tom's decision e33115d3); `ENOENT` on the listing
+//!   itself, a changed or unreadable identity and a bound reached are
 //!   unreadable;
 //! - the unit's device, inode and kind equal to the observation the caller was
 //!   given;
@@ -1046,7 +1054,8 @@ pub fn capability_report() -> CustodyReport {
             "that scan excludes the calling barge process's own descriptors, by its pid and the start identity read once and verified, and no other process: another barge process, its child or its parent is observed like any other same-uid writer".to_owned(),
             "that scan re-observes a same-uid process whose descriptor listing the kernel answers EPERM for, by re-reading the kernel's pid, start identity and effective uid and listing again at most three times inside a 250 ms settle window, with both that window and the scan's own deadline rechecked after every backoff, and settles it only on a positive fact: a later listing, a process the kernel reports gone, a changed start identity re-evaluated as the different process it now names, or a changed effective uid counted as the named blind spot; the same identity still answering EPERM is unknown and refuses, and elapsed time is never taken as proof".to_owned(),
             "that scan treats a vnode descriptor whose path and vnode facts the platform both answer EPERM for as an OS blind spot, counted and reported in the evidence and never a refusal, only when the process's own code-signing status carries the platform binary flag and its kernel start identity is unchanged before and after that read; a process that is not a verified platform binary, a status read that fails, and an identity that changes around it leave those descriptors unknown".to_owned(),
-            "that scan re-observes a vnode descriptor whose path and vnode facts both answer ENOENT under the same bounded rule, re-reading the kernel's pid, start identity and effective uid before and after the second observation, and reports it as a dead handle — a revoked or reclaimed vnode that cannot do I/O — only when the second observation still answers ENOENT to both reads for the classified identity; ENOENT on the descriptor listing itself, on only one of the two reads, a changed or unreadable identity and a bound reached are all unknown, and no path or name is listed for a dead handle".to_owned(),
+            "that scan evaluates both of a vnode descriptor's per-fd reads, and treats only three pairings as an answer: a readable path with readable vnode facts, ENOENT from both, and EPERM from both (the OS blind spot); a descriptor that closed between the two reads holds nothing and is reported closed whichever read saw it, unless the path read answered ENOENT; every other pairing, including a readable path whose vnode facts answer ENOENT and a path read that answers ENOENT beside a closed vnode-facts read, is unknown and refuses".to_owned(),
+            "that scan re-observes a vnode descriptor whose path and vnode facts both answer ENOENT under the same bounded rule, re-reading the kernel's pid, start identity and effective uid before and after the second observation, rechecking both deadlines when that observation and the final identity read complete, and reports it as a dead handle — a revoked or reclaimed vnode that cannot do I/O — only when the second observation still answers ENOENT to both reads for the classified identity inside both bounds; ENOENT on the descriptor listing itself, a changed or unreadable identity and a bound reached are all unknown, and no path or name is listed for a dead handle".to_owned(),
             "that evidence names every dead handle it counts — pid, kernel start identity, descriptor and command — up to 32 of them, and a scan that meets more refuses rather than report a count it cannot show".to_owned(),
             "that evidence names every blind-spot process it counts — pid, kernel start identity, command and hidden-descriptor count — up to 32 of them, and a scan that meets more refuses rather than report a count it cannot show".to_owned(),
             "the bounded record of that re-observation — how many processes it re-observed, and for up to eight of them the command, kernel start identity, errno sequence, identity changes and resolution — is reported on every verdict and in every refusal's failure detail, so a diagnostic of a refusal sees it too".to_owned(),
@@ -1083,8 +1092,8 @@ mod tests {
     use crate::error::{Error, ErrorKind, Result};
     use crate::os::{
         platform, retry_schedule, DescriptorScan, DescriptorScanRequest, OpenDescriptor,
-        PlatformStatus, ProcessIdentity, ProcessObserver, RetryResolution, StatedListing,
-        StatedPlatform, StatedVnodeRead, VolumeUuid,
+        PlatformStatus, ProcessIdentity, ProcessObserver, RetryResolution, StatedCall,
+        StatedListing, StatedPlatform, StatedVnodeRead, VolumeUuid,
     };
     use crate::testkit::{Faults, ScanMode, VolumeFixture, FIXTURE_BOOT, OTHER_UUID};
     use crate::unit::DeletionUnit;
@@ -2993,7 +3002,7 @@ mod tests {
             vec![self_identity(), identity],
             vec![StatedListing {
                 pid: identity.pid,
-                vnode_reads: vec![(0, StatedVnodeRead::Opaque)],
+                vnode_reads: vec![(0, StatedVnodeRead::opaque())],
                 platform: Some(platform),
                 ..StatedListing::default()
             }],
@@ -3183,7 +3192,7 @@ mod tests {
             table.push(identity);
             faults.push(StatedListing {
                 pid: identity.pid,
-                vnode_reads: vec![(0, StatedVnodeRead::Opaque)],
+                vnode_reads: vec![(0, StatedVnodeRead::opaque())],
                 platform: Some(StatedPlatform::PlatformBinary {
                     command: "sleep".to_owned(),
                 }),
@@ -3275,7 +3284,7 @@ mod tests {
         // a revoked or reclaimed vnode does. It is re-observed by identity, the
         // same answer persists, and it is recorded as a dead handle instead of
         // refusing the deletion.
-        let observer = stated_vnode(identity, StatedVnodeRead::Dead);
+        let observer = stated_vnode(identity, StatedVnodeRead::dead());
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
         assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
         let evidence = verdict.evidence().expect("the evidence");
@@ -3304,7 +3313,7 @@ mod tests {
         let identity = child.identity();
         // One descriptor is dead and one is readable inside the root: the dead
         // one never hides the readable one, which still makes the verdict unsafe.
-        let observer = stated_vnode(identity, StatedVnodeRead::Dead);
+        let observer = stated_vnode(identity, StatedVnodeRead::dead());
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
         assert_eq!(verdict.name(), "unsafe", "{:?}", verdict.reason());
         assert!(
@@ -3326,7 +3335,7 @@ mod tests {
         // `ENOENT` on both reads once, then the real answer: a single observation
         // never decides a dead handle, and the readable descriptor inside the root
         // refuses exactly as it would have without the first answer.
-        let observer = stated_vnode(identity, StatedVnodeRead::DeadOnce);
+        let observer = stated_vnode(identity, StatedVnodeRead::dead_once());
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
         assert_eq!(verdict.name(), "unsafe", "{:?}", verdict.reason());
         assert!(
@@ -3339,38 +3348,87 @@ mod tests {
         );
     }
 
-    #[test]
-    fn enoent_on_only_the_path_read_is_unknown() {
-        let holder = real_holder("custody-023-path-absent");
-        let payload = holder.payload();
-        let child = Child::holding(&payload);
+    /// One mixed pair of per-fd answers, exercised through the production
+    /// pairing: only the read the test names is stated, so the other is the real
+    /// kernel read and [`crate::os`]'s own branching decides the case.
+    fn assert_mixed_pair_refuses(
+        holder: &Holder,
+        child: &Child,
+        stated: StatedVnodeRead,
+        label: &str,
+    ) {
         let identity = child.identity();
-        // The two per-fd reads disagree, so nothing about the descriptor is
-        // established: it is never a dead handle.
-        let observer = stated_vnode(identity, StatedVnodeRead::PathAbsent);
+        let observer = stated_vnode(identity, stated);
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
-        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        assert_eq!(verdict.name(), "unknown", "{label}: {:?}", verdict.reason());
         let reason = verdict.reason().unwrap_or_default();
-        assert!(reason.contains("only one of the two reads"), "{reason}");
+        assert!(reason.contains("do not agree"), "{label}: {reason}");
         assert!(
             reason.contains("dead handle is not established"),
-            "{reason}"
+            "{label}: {reason}"
         );
         assert!(verdict.into_evidence().is_err(), "unknown refuses");
     }
 
     #[test]
-    fn enoent_on_only_the_vnode_facts_is_unknown() {
-        let holder = real_holder("custody-023-facts-absent");
+    fn a_mixed_pair_of_per_fd_answers_is_unknown() {
+        let holder = real_holder("custody-023-mixed");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        // The descriptor's real path is readable and its real vnode facts are
+        // readable, so each case below states exactly one half and leaves the
+        // other for the production read.
+        for (stated, label) in [
+            (
+                StatedVnodeRead::path_absent(),
+                "the path read answers ENOENT while the vnode facts are readable",
+            ),
+            (
+                StatedVnodeRead::facts_absent(),
+                "the vnode facts answer ENOENT while the path is readable",
+            ),
+            (
+                StatedVnodeRead::path_absent_facts_closed(),
+                "the path read answers ENOENT while the vnode facts report the descriptor closed",
+            ),
+            (
+                StatedVnodeRead::path_hidden_facts_absent(),
+                "the path read answers EPERM while the vnode facts answer ENOENT",
+            ),
+            (
+                StatedVnodeRead::new(StatedCall::Absent, StatedCall::Hidden),
+                "the path read answers ENOENT while the vnode facts answer EPERM",
+            ),
+            (
+                StatedVnodeRead::new(StatedCall::Hidden, StatedCall::Real),
+                "the path read answers EPERM while the vnode facts are readable",
+            ),
+        ] {
+            assert_mixed_pair_refuses(&holder, &child, stated, label);
+        }
+    }
+
+    #[test]
+    fn a_descriptor_that_closes_between_the_two_reads_is_gone_not_dead() {
+        let holder = real_holder("custody-023-closed-between-reads");
         let payload = holder.payload();
         let child = Child::holding(&payload);
         let identity = child.identity();
-        let observer = stated_vnode(identity, StatedVnodeRead::FactsAbsent);
+        // The path reads fine and the vnode facts then report the descriptor
+        // closed: it closed between the two reads, so it holds nothing. That is
+        // neither a dead handle nor a refusal — descriptors close all the time
+        // while a scan reads them.
+        let observer = stated_vnode(
+            identity,
+            StatedVnodeRead::new(StatedCall::Real, StatedCall::Closed),
+        );
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
-        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
-        let reason = verdict.reason().unwrap_or_default();
-        assert!(reason.contains("only one of the two reads"), "{reason}");
-        assert!(verdict.into_evidence().is_err(), "unknown refuses");
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+        let evidence = verdict.evidence().expect("the evidence");
+        assert_eq!(
+            evidence.dead_handles.handles, 0,
+            "a closed descriptor is not a dead handle"
+        );
     }
 
     #[test]
@@ -3381,7 +3439,7 @@ mod tests {
         let identity = child.identity();
         // `ENOENT` on the listing itself is not a dead handle: the scan never saw
         // a descriptor, so nothing about the process is established.
-        let observer = stated_vnode_with(identity, StatedVnodeRead::Dead, None, vec![ENOENT]);
+        let observer = stated_vnode_with(identity, StatedVnodeRead::dead(), None, vec![ENOENT]);
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
         assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
         assert!(
@@ -3411,7 +3469,7 @@ mod tests {
         // no dead handle is recorded.
         let observer = stated_vnode_with(
             identity,
-            StatedVnodeRead::Dead,
+            StatedVnodeRead::dead(),
             Some(identity.start.saturating_add(1)),
             Vec::new(),
         );
@@ -3435,7 +3493,7 @@ mod tests {
             vec![self_identity(), identity],
             vec![StatedListing {
                 pid: identity.pid,
-                vnode_reads: vec![(0, StatedVnodeRead::Dead)],
+                vnode_reads: vec![(0, StatedVnodeRead::dead())],
                 ..StatedListing::default()
             }],
         );
@@ -3463,7 +3521,7 @@ mod tests {
             table.push(identity);
             faults.push(StatedListing {
                 pid: identity.pid,
-                vnode_reads: vec![(0, StatedVnodeRead::Dead)],
+                vnode_reads: vec![(0, StatedVnodeRead::dead())],
                 ..StatedListing::default()
             });
         }
@@ -3493,7 +3551,7 @@ mod tests {
             let payload = holder.payload();
             let child = Child::holding(&payload);
             let identity = child.identity();
-            let observer = stated_vnode(identity, StatedVnodeRead::Dead);
+            let observer = stated_vnode(identity, StatedVnodeRead::dead());
             let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
             assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
             let evidence = verdict.evidence().expect("the evidence");

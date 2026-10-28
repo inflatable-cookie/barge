@@ -907,7 +907,7 @@ design states the limit and builds only on facts it can establish:
 | Fact Barge needs | Available evidence | Limit |
 | --- | --- | --- |
 | A cooperative holder is done | its hold file was released, or its recorded process is positively gone | a process that never took a hold, or escaped its group, is outside this |
-| No same-uid process has an open descriptor under the root | each process's effective uid and start identity from the kernel's own process table (`sysctl`/`KERN_PROC_ALL`), then `proc_pidinfo`/`PROC_PIDLISTFDS`, `PROC_PIDFDVNODEPATHINFO` and `PROC_PIDFDVNODEINFO` for this account's processes only, matching vnode paths; a descriptor whose path the kernel hides is checked against the process's own code-signing status (`csops`/`CS_OPS_STATUS`) | a process of another effective uid is classified and reported, never inspected; a process created after the scan is not observed; a hidden vnode descriptor is an OS blind spot, counted and reported rather than refused, only for a process that status verifies as a platform binary with an unchanged start identity, and nothing can read where such a descriptor points; a vnode descriptor both of whose per-fd reads answer `ENOENT` is a dead handle, recorded by pid, start identity, descriptor and command rather than refused, and its path is never read |
+| No same-uid process has an open descriptor under the root | each process's effective uid and start identity from the kernel's own process table (`sysctl`/`KERN_PROC_ALL`), then `proc_pidinfo`/`PROC_PIDLISTFDS`, `PROC_PIDFDVNODEPATHINFO` and `PROC_PIDFDVNODEINFO` for this account's processes only, pairing both per-fd reads of every vnode descriptor and matching vnode paths; a descriptor both of whose reads answer `EPERM` is checked against the process's own code-signing status (`csops`/`CS_OPS_STATUS`) | a process of another effective uid is classified and reported, never inspected; a process created after the scan is not observed; a hidden vnode descriptor is an OS blind spot, counted and reported rather than refused, only for a process that status verifies as a platform binary with an unchanged start identity, and nothing can read where such a descriptor points; a vnode descriptor both of whose per-fd reads answer `ENOENT` is a dead handle, recorded by pid, start identity, descriptor and command rather than refused, and its path is never read |
 | The root is the inode that was verified | `fstat` device + inode through the opened descriptor before and after each step | a rename by another user between steps stops the operation |
 | The volume is still the registered one | descriptor `fstatfs` + `ATTR_VOL_UUID`, re-verified | a vanished volume fails the call, it does not answer "absent and safe" |
 
@@ -972,11 +972,14 @@ every other hidden descriptor — a process that is not a verified platform bina
 a status read that fails, an identity that moves around it — stays unreadable. A
 vnode descriptor both of whose per-fd reads answer `ENOENT` is a **dead handle**
 when barge#012's bounded re-observation finds the same answer for the same kernel
-identity: it is recorded (pid, start identity, descriptor and command) and does
-not block `Safe`, because a revoked or reclaimed vnode cannot do I/O, and its path
-is never read (Tom, 2026-10-28, decision e33115d3, barge#023). `ENOENT` on the
-descriptor listing itself, on only one of the two per-fd reads, with a changed or
-unreadable identity, or with a bound reached stays unreadable.
+identity inside both deadlines, rechecked after the observation and the final
+identity read: it is recorded (pid, start identity, descriptor and command) and
+does not block `Safe`, because a revoked or reclaimed vnode cannot do I/O, and its
+path is never read (Tom, 2026-10-28, decision e33115d3, barge#023). Only a
+readable path with readable facts, `ENOENT` from both reads and `EPERM` from both
+are an answer, so a mixed pair — including a readable path whose vnode facts
+answer `ENOENT` — is unreadable, and `ENOENT` on the descriptor listing itself,
+with a changed or unreadable identity, or with a bound reached stays unreadable.
 Any unreadable
 hold, an unreadable effective uid, a same-uid descriptor that stays unreadable
 after its retries or that no verified platform binary explains and no
@@ -1670,23 +1673,31 @@ Choices S5 made where this design left the mechanic to the slice:
   every context. A revoked or reclaimed vnode cannot do I/O, so such a descriptor
   cannot be a writer's claim on the root, and refusing it made a full-scan `Safe`
   verdict unreachable on a real session for the second time. The rule is narrow
-  and proved: a vnode descriptor whose path answered `ENOENT` is confirmed
-  against the same descriptor's vnode facts, and only when **both** flavors say
-  `ENOENT` is it a dead-handle candidate. The candidate is then re-observed under
-  barge#012's bounded rule — the first backoff of the same schedule, inside the
-  same settle window and the scan's own deadline — with the pid's kernel identity
-  re-read before and after the second observation. It is recorded as a dead
-  handle only when that identity is the classified start identity and effective
-  uid both times and the second observation still answers `ENOENT` to both
-  flavors: the scan records pid, start identity, descriptor and command, and does
-  not block. Every other descriptor of the same process is evaluated normally, so
-  a readable one inside the root still makes the verdict `Unsafe`. Everything
-  else is unchanged and refuses with `Unknown`: `ENOENT` on the
-  `PROC_PIDLISTFDS` listing itself, `ENOENT` on only one of the two per-fd reads
-  (either one), any other errno, a changed or unreadable identity, and a bound
-  reached. There are no path or name lists, because a dead handle's path is not
-  read either. The record names every dead handle, bounded at 32 descriptors:
-  meeting more is `Unknown`, not a shorter list.
+  and proved: both of a vnode descriptor's per-fd reads are evaluated, and only
+  three pairings are an answer — a readable path with readable vnode facts,
+  `ENOENT` from both flavors, and `EPERM` from both. A descriptor that closed
+  between the two reads holds nothing, so it is reported closed whichever read saw
+  it, unless the path read answered `ENOENT` — descriptors close while a scan
+  reads them, and refusing that would make an ordinary close a refusal. Every
+  other pairing is unreadable and refuses, including a path that is readable while
+  the vnode facts answer `ENOENT`, `ENOENT` from one read with `EPERM` from the
+  other, and `ENOENT` from the path read beside a closed vnode-facts read. Only `ENOENT` from **both** flavors makes a dead-handle candidate. The
+  candidate is then re-observed under barge#012's bounded rule — the first
+  backoff of the same schedule, inside the same settle window and the scan's own
+  deadline — with the pid's kernel identity re-read before and after the second
+  observation, and both deadlines rechecked when that observation and the final
+  identity read complete, so a slow kernel read cannot carry a settled answer
+  past either bound. It is recorded as a dead handle only when that identity is
+  the classified start identity and effective uid both times, both bounds still
+  hold, and the second observation still answers `ENOENT` to both flavors: the
+  scan records pid, start identity, descriptor and command, and does not block.
+  Every other descriptor of the same process is evaluated normally, so a readable
+  one inside the root still makes the verdict `Unsafe`. Everything else is
+  unchanged and refuses with `Unknown`: `ENOENT` on the
+  `PROC_PIDLISTFDS` listing itself, any other errno, a changed or unreadable
+  identity, and a bound reached. There are no path or name lists, because a dead
+  handle's path is not read either. The record names every dead handle, bounded
+  at 32 descriptors: meeting more is `Unknown`, not a shorter list.
 - **What the evidence says.** The evidence records `self_excluded: <pid>` (the one
   process the scan excluded), `foreign_uid_processes` (how many processes of
   another effective uid it classified and did not inspect) and `retry`: how many
@@ -1742,17 +1753,24 @@ Choices S5 made where this design left the mechanic to the slice:
   record bound refuses rather than drop one, and a real-observer test reads the kernel's
   own table to verify one live same-uid platform binary and to show that this
   locally built test binary is not one. The dead-handle rule's cases are stated
-  the same way, with the per-fd answers injected because this account cannot
-  create a revoked vnode on demand (an unlinked file and a pty slave whose master
-  closed both keep a readable path): a persistent `ENOENT` from both reads is
-  `safe` with the dead handle recorded and does not block, the same dead handle
+  the same way, with one or both per-fd answers injected because this account
+  cannot create a revoked vnode on demand (an unlinked file and a pty slave whose
+  master closed both keep a readable path): a persistent `ENOENT` from both reads
+  is `safe` with the dead handle recorded and does not block, the same dead handle
   beside a readable descriptor inside the root is `unsafe`, a descriptor that
   reads on the re-observation is evaluated normally instead of recorded, `ENOENT`
-  from only one of the two reads (either one) is `unknown`, `ENOENT` on the
-  listing itself is `unknown` with no dead handle, a changed identity during the
-  re-observation is `unknown`, a scan that meets more than the 32-descriptor
-  record bound refuses rather than drop one, and the counterfactual refuses at
-  once with the bounded re-observation removed. A read-only real-observer case
+  on the listing itself is `unknown` with no dead handle, a changed identity
+  during the re-observation is `unknown`, a scan that meets more than the
+  32-descriptor record bound refuses rather than drop one, and the counterfactual
+  refuses at once with the bounded re-observation removed. The mixed pairs are
+  exercised through the production pairing, with only the stated half replaced by
+  an injected answer and the other half a real kernel read: a path that answers
+  `ENOENT` while the vnode facts are readable, readable vnode facts beside a
+  hidden path (`EPERM`), `ENOENT` from the path read while the vnode facts answer
+  `EPERM`, `EPERM` from the path read while the vnode facts answer `ENOENT`, and
+  `ENOENT` from the path read while the vnode facts report the descriptor closed
+  are all `unknown`; a descriptor that closes between the two reads is `safe` and
+  not recorded, because it holds nothing. A read-only real-observer case
   classifies a live same-uid process of this host that really holds a dead vnode,
   and states the same fact when the host has none at test time. The deadline
   checks are also unit-tested on their own: a projection

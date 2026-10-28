@@ -37,7 +37,9 @@ pub use macos::MacOs;
 /// backoff schedule they are settled on. Nothing outside a test build can reach
 /// them.
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) use macos::{retry_schedule, StatedListing, StatedPlatform, StatedVnodeRead};
+pub(crate) use macos::{
+    retry_schedule, StatedCall, StatedListing, StatedPlatform, StatedVnodeRead,
+};
 
 #[cfg(not(target_os = "macos"))]
 compile_error!(
