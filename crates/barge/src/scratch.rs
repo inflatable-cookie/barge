@@ -3700,6 +3700,20 @@ fn reassess(
     now_ms: u64,
 ) -> Result<Option<Assessment>> {
     let record = area::registered_volume(state_paths, volume_uuid)?;
+    // A record that no longer permits pruning keeps this unit, as a per-unit
+    // refusal: an `undeclared` record is loud at the volume level, and a `kept`
+    // one is quiet, but neither is a reason to stop the whole stage.
+    if !record.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "volume {} does not permit pruning now (`{}`), so the unit is kept",
+                record.volume_uuid,
+                durability_name(record.durability)
+            ),
+        )
+        .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
+    }
     record.declared_durability()?;
     reassess_under(
         dirs,

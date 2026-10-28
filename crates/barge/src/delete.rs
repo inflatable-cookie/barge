@@ -369,17 +369,25 @@ pub(crate) fn delete_unit_authorized(
     // not contain its folder, and a unit that is not in the folder the
     // configuration resolves all refuse before a directory or lock exists.
     let record = area::registered_volume(state_paths, &volume_uuid)?;
-    record.declared_durability()?;
+    // Only an expendable record authorizes a deletion, and this is a per-unit
+    // refusal so the caller keeps the unit and reports it rather than stopping the
+    // stage: an `undeclared` record is loud at the volume level.
     if !record.durability.permits_pruning() {
         return Err(Error::new(
             ErrorKind::RefusedBoundary,
             format!(
-                "volume {} is declared `{:?}`, which never permits pruning, so nothing is deleted",
-                record.volume_uuid, record.durability
+                "volume {} does not permit pruning now (`{}`), so the unit is kept",
+                record.volume_uuid,
+                match record.durability {
+                    crate::registry::Durability::Expendable => "expendable",
+                    crate::registry::Durability::Kept => "kept",
+                    crate::registry::Durability::Undeclared => "undeclared",
+                }
             ),
         )
         .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
     }
+    record.declared_durability()?;
     let volume = area::prepare(
         state_paths,
         dirs,
@@ -447,17 +455,22 @@ pub(crate) fn delete_unit_authorized(
     // The registry is re-read under the locks before the intent is written, so a
     // record that changed while the plan ran is refused rather than trusted.
     let record = area::registered_volume(state_paths, &volume_uuid)?;
-    record.declared_durability()?;
     if !record.durability.permits_pruning() {
         return Err(Error::new(
             ErrorKind::RefusedBoundary,
             format!(
-                "volume {} is declared `{:?}`, which never permits pruning, so nothing is deleted",
-                record.volume_uuid, record.durability
+                "volume {} does not permit pruning now (`{}`), so the unit is kept",
+                record.volume_uuid,
+                match record.durability {
+                    crate::registry::Durability::Expendable => "expendable",
+                    crate::registry::Durability::Kept => "kept",
+                    crate::registry::Durability::Undeclared => "undeclared",
+                }
             ),
         )
         .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
     }
+    record.declared_durability()?;
     if let Some(authorize) = authorize {
         authorize(&record)?;
     }

@@ -973,23 +973,10 @@ fn run(
             continue;
         }
         // The plan is the authorization, so the record it was made under must still
-        // be the record this run acts under: a changed generation (any registry
-        // write) or a durability that no longer permits pruning keeps every unit
-        // the plan named for this volume.
-        if record.generation != volume_plan.record_generation {
-            fill_kept(
-                &mut outcome,
-                volume_plan,
-                &format!(
-                    "the volume record changed since the plan (generation {} to {}); every planned unit it names is kept",
-                    volume_plan.record_generation, record.generation
-                ),
-                &mut unreached,
-                false,
-            );
-            volumes.push(outcome);
-            continue;
-        }
+        // be the record this run acts under. Durability is decided first, because a
+        // volume that became `undeclared` needs a human (exit `3`) while one
+        // declared `kept` does not; any such change also advances the generation,
+        // so the generation branch below would otherwise report both quietly.
         if !record.durability.permits_pruning() {
             fill_kept(
                 &mut outcome,
@@ -1000,6 +987,20 @@ fn run(
                 ),
                 &mut unreached,
                 record.durability == Durability::Undeclared,
+            );
+            volumes.push(outcome);
+            continue;
+        }
+        if record.generation != volume_plan.record_generation {
+            fill_kept(
+                &mut outcome,
+                volume_plan,
+                &format!(
+                    "the volume record changed since the plan (generation {} to {}); every planned unit it names is kept",
+                    volume_plan.record_generation, record.generation
+                ),
+                &mut unreached,
+                false,
             );
             volumes.push(outcome);
             continue;
@@ -1308,6 +1309,21 @@ fn run(
                 );
                 volumes.push(outcome);
                 break 'volumes;
+            }
+        }
+        // A record that became `undeclared` while the run was deleting is only
+        // visible to the per-unit refusals; the volume's own report is loud for it,
+        // because expending data is never inferred. An `undeclared` record keeps
+        // its units, and that needs a human rather than a quiet partial run.
+        if area::registered_volume(state_paths, &record.volume_uuid)
+            .is_ok_and(|current| current.durability == Durability::Undeclared)
+        {
+            outcome.loud = true;
+            if outcome.detail.is_none() {
+                outcome.detail = Some(
+                    "the volume's durability is now undeclared, so the units the plan named are kept"
+                        .to_owned(),
+                );
             }
         }
         volumes.push(outcome);
@@ -2902,10 +2918,12 @@ mod tests {
         let stage = volume.scratch.as_ref().expect("the scratch stage reports");
         assert_eq!(stage.deleted.count, 0, "{stage:?}");
         assert_eq!(stage.skipped.count, 1);
+        // A durability that no longer permits pruning is decided before the
+        // generation, so the reason names the `kept` declaration.
         assert!(
             stage.skipped.rows[0]
                 .reason
-                .contains("volume record changed since the plan"),
+                .contains("never permits pruning"),
             "{}",
             stage.skipped.rows[0].reason
         );
@@ -3052,7 +3070,8 @@ mod tests {
                 .skipped
                 .rows
                 .iter()
-                .all(|row| row.reason.contains("never permits pruning")
+                .all(|row| row.reason.contains("does not permit pruning now")
+                    || row.reason.contains("never permits pruning")
                     || row.reason.contains("record changed since the plan")),
             "{:?}",
             stage.skipped.rows
@@ -3102,6 +3121,110 @@ mod tests {
         assert_eq!(volume.areas[0].skipped.count, 1);
         assert!(report.needs_human());
         assert!(root.path.is_dir(), "the planned unit is kept");
+    }
+
+    #[test]
+    fn a_volume_declared_undeclared_between_the_plan_and_the_effect_is_loud() {
+        let harness = Harness::new("maintain-undeclared-after-plan");
+        let scratch_root = harness.scratch_root("alpha", "owner");
+        harness.conclude_and_release(&scratch_root, "owner");
+        let area_root = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        assert_eq!(preview.candidates, 2);
+
+        // The record loses its declared durability after the preview. Expending data
+        // is never inferred, so the units are kept and the volume needs a human —
+        // even though the same change also advances the generation.
+        let mut record = harness.fixture.record.clone();
+        record.durability = Durability::Undeclared;
+        harness.fixture.register_record(&record);
+        let report = harness.real(&preview).expect("the run reports");
+        let volume = &report.volumes.rows[0];
+        assert!(volume.loud, "{volume:?}");
+        assert!(
+            volume
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("undeclared"),
+            "{:?}",
+            volume.detail
+        );
+        let stage = volume.scratch.as_ref().expect("the scratch stage reports");
+        assert_eq!(stage.deleted.count, 0, "{stage:?}");
+        assert_eq!(stage.skipped.count, 1);
+        assert_eq!(volume.areas[0].deleted.count, 0);
+        assert!(
+            scratch_root.is_dir() && area_root.path.is_dir(),
+            "nothing pruned"
+        );
+        assert!(report.needs_human(), "{report:?}");
+        assert_eq!(report.pending.count, 0);
+    }
+
+    #[test]
+    fn a_mid_run_undeclared_record_is_loud() {
+        let harness = Harness::new("maintain-undeclared-mid-run");
+        let first = harness.scratch_root("alpha", "owner");
+        harness.conclude_and_release(&first, "owner");
+        let second = harness.scratch_root("beta", "owner");
+        harness.conclude_and_release(&second, "owner");
+        let preview = harness.preview();
+        assert_eq!(preview.candidates, 2);
+
+        // The record loses its durability while the run is deleting: the per-unit
+        // refusal keeps the remaining units, and the volume still needs a human.
+        let record = harness.fixture.record.clone();
+        let state = harness.fixture.state.clone();
+        let mutated = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = mutated.clone();
+        let names = [first.clone(), second.clone()];
+        let faults = Faults::new();
+        faults.observing(Box::new(move |name: &str| {
+            if flag.get() {
+                return;
+            }
+            if !names
+                .iter()
+                .any(|path| path.file_name().and_then(|part| part.to_str()) == Some(name))
+            {
+                return;
+            }
+            flag.set(true);
+            let mut lost = record.clone();
+            lost.durability = Durability::Undeclared;
+            let mut locks = state::LockSet::with_deadline(
+                state.clone(),
+                state::Deadline::after(Duration::from_secs(5)),
+            );
+            let lock = locks.lock_registry().expect("the registry lock");
+            registry::RegistryWriter::new(&state)
+                .publish(&lock, &registry::RegistryDocument::new(vec![lost]))
+                .expect("the registry is republished");
+        }));
+        let report = harness
+            .real_with(&faults, harness.aged(), &preview)
+            .expect("the run reports");
+        assert!(mutated.get(), "the record changed inside the run");
+        let volume = &report.volumes.rows[0];
+        assert!(volume.loud, "{volume:?}");
+        assert!(
+            report.needs_human(),
+            "an undeclared durability needs a human"
+        );
+        let stage = volume.scratch.as_ref().expect("a scratch stage");
+        assert!(
+            stage
+                .skipped
+                .rows
+                .iter()
+                .all(|row| row.reason.contains("does not permit pruning now")
+                    || row.reason.contains("never permits pruning")
+                    || row.reason.contains("record changed since the plan")),
+            "{:?}",
+            stage.skipped.rows
+        );
+        assert_eq!(report.pending.count, 0);
     }
 
     #[test]

@@ -61,9 +61,9 @@ a retry inside the same night.
 | Exit | Document | Meaning for the job |
 | --- | --- | --- |
 | `0` | plan | Completed, nothing pending. |
-| `2` | error | Refused before any effect: a usage error, a plan that is not the plan, a lock, a custody refusal. Record and stop for this schedule. |
+| `2` | error | Refused before any effect: a usage error, a plan that is not the plan or whose embedded scratch step is not self-consistent, a lock, a custody refusal. Record and stop for this schedule. |
 | `3` | plan | Completed and it needs a human: an absent **permanent** volume, a volume whose durability is undeclared, a pending intent or an unsettled replay on a volume it did not touch. The plan's candidates are still authorized, so do the real step and record the `3`. |
-| `3` | error | Unsettled or unknown state: a plan whose embedded scratch step is inconsistent, the wall clock, a run that stopped on an error after its first effect (reported in `data.stopped`, never as a "refused before any effect" `2`), or a refusal that could not be classified as `2`. Record and stop. |
+| `3` | error | Unsettled or unknown state: the wall clock, a run that stopped on an error after its first effect (reported in `data.stopped`, never as a "refused before any effect" `2`), or a refusal that could not be classified as `2`. Record and stop. |
 
 A non-zero exit is recorded and never retried by Barge. The recording is the
 host's: launchd's `StandardOutPath`/`StandardErrorPath` append one line per run,
