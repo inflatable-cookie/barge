@@ -1344,6 +1344,14 @@ impl MacOs {
         }
         let stated = stated_vnode_read(faults, pid, vnode_index);
         let reading = read_descriptor(pid, descriptor, stated);
+        // A failed observation is never discarded, and never settled by a process
+        // that disappears afterwards: it refuses here, before the identity is
+        // consulted, so another errno the second read answered can never be
+        // skipped.
+        let reading = match reading {
+            Ok(reading) => reading,
+            Err(error) => return Observed::Unreadable(error.message().to_owned()),
+        };
         // The identity is re-read after the second observation whatever it
         // answered, so the two reads bracket the observation: a descriptor
         // observed around an identity change is not evidence about the classified
@@ -1362,19 +1370,20 @@ impl MacOs {
                     "around the dead descriptor's re-observation",
                 ))
             }
-            // Gone after the second observation: nothing it held is open.
+            // Gone after the second observation, which answered: nothing it held
+            // is open, so the answer to the observation is that the descriptor is
+            // gone with it.
             Ok(None) => return accept(Observed::Closed),
             Err(error) => {
                 return Observed::Unreadable(dead_identity_unreadable(pid, descriptor, &error))
             }
         }
         let observed = match reading {
-            Ok(DescriptorReading::Path(path)) => Observed::Path(path),
-            Ok(DescriptorReading::Opaque) => Observed::Opaque,
-            Err(error) => Observed::Unreadable(error.message().to_owned()),
+            DescriptorReading::Path(path) => Observed::Path(path),
+            DescriptorReading::Opaque => Observed::Opaque,
             // Still dead for the classified identity, which was just re-read: it
             // is a dead handle, never a skip.
-            Ok(DescriptorReading::Dead) => Observed::Dead(DeadHandle {
+            DescriptorReading::Dead => Observed::Dead(DeadHandle {
                 pid,
                 start: classified.start,
                 descriptor,
@@ -1400,6 +1409,12 @@ impl MacOs {
         };
         if let Some(stated) = faults.iter_mut().find(|stated| stated.pid == pid) {
             stated.identity_reads = stated.identity_reads.saturating_add(1);
+            if stated
+                .gone_after
+                .is_some_and(|after| stated.identity_reads > after)
+            {
+                return Ok(None);
+            }
             // A stated identity applies to every read unless a test says how many
             // reads report the classified identity first, which is how an identity
             // that changes *between* the two reads bracketing one observation is
@@ -1557,6 +1572,10 @@ pub(crate) struct StatedListing {
     pub(crate) start_after: Option<usize>,
     /// How many identity reads this pid has had, counted by the scan itself.
     pub(crate) identity_reads: usize,
+    /// How many identity reads of this pid report the kernel's own answer before
+    /// the pid is reported gone: the process disappearing between the two reads
+    /// that bracket one observation. `None` never reports it gone.
+    pub(crate) gone_after: Option<usize>,
     /// The answer a test states for one of this process's vnode descriptors, by
     /// its index among them, instead of reading the descriptor for real. They
     /// stand for the per-fd answers that make a descriptor opaque or dead; every

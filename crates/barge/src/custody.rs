@@ -42,7 +42,8 @@
 //!   is recorded with its pid, start identity, descriptor and command and does
 //!   not block (barge#023, Tom's decision e33115d3); `ENOENT` on the listing
 //!   itself, a changed or unreadable identity and a bound reached are
-//!   unreadable;
+//!   unreadable, and a second observation that fails refuses before the identity
+//!   is consulted, so a process that disappears afterwards never settles it;
 //! - the unit's device, inode and kind equal to the observation the caller was
 //!   given;
 //! - its marker (when it records one) still holds exactly the bytes the caller
@@ -1056,7 +1057,7 @@ pub fn capability_report() -> CustodyReport {
             "that scan re-observes a same-uid process whose descriptor listing the kernel answers EPERM for, by re-reading the kernel's pid, start identity and effective uid and listing again at most three times inside a 250 ms settle window, with both that window and the scan's own deadline rechecked after every backoff, and settles it only on a positive fact: a later listing, a process the kernel reports gone, a changed start identity re-evaluated as the different process it now names, or a changed effective uid counted as the named blind spot; the same identity still answering EPERM is unknown and refuses, and elapsed time is never taken as proof".to_owned(),
             "that scan treats a vnode descriptor whose path and vnode facts the platform both answer EPERM for as an OS blind spot, counted and reported in the evidence and never a refusal, only when the process's own code-signing status carries the platform binary flag and its kernel start identity is unchanged before and after that read; a process that is not a verified platform binary, a status read that fails, and an identity that changes around it leave those descriptors unknown".to_owned(),
             "that scan evaluates both of a vnode descriptor's per-fd reads, and treats only three pairings as an answer: a readable path with readable vnode facts, ENOENT from both, and EPERM from both (the OS blind spot); every other pairing is unknown and refuses, and a descriptor the platform reports closed is never carried — ESRCH and EBADF are other errnos, the fd may already have been closed and reused, and no read's result is carried by the other's, so even two closed answers refuse, as do a readable path whose vnode facts answer ENOENT and a path read that answers ENOENT, fails or reports a close beside any other answer".to_owned(),
-            "that scan re-observes a vnode descriptor whose path and vnode facts both answer ENOENT under the same bounded rule, re-reading the kernel's pid, start identity and effective uid before and after the second observation, rechecking both deadlines when that observation and the final identity read complete, and reports it as a dead handle — a revoked or reclaimed vnode that cannot do I/O — only when the second observation still answers ENOENT to both reads for the classified identity inside both bounds; ENOENT on the descriptor listing itself, a changed or unreadable identity and a bound reached are all unknown, and no path or name is listed for a dead handle".to_owned(),
+            "that scan re-observes a vnode descriptor whose path and vnode facts both answer ENOENT under the same bounded rule, re-reading the kernel's pid, start identity and effective uid before and after the second observation, rechecking both deadlines when that observation and the final identity read complete, and reports it as a dead handle — a revoked or reclaimed vnode that cannot do I/O — only when the second observation still answers ENOENT to both reads for the classified identity inside both bounds; a second observation that fails for any reason is never discarded, not even when the pid is then reported gone, ENOENT on the descriptor listing itself, a changed or unreadable identity and a bound reached are all unknown, and no path or name is listed for a dead handle".to_owned(),
             "that evidence names every dead handle it counts — pid, kernel start identity, descriptor and command — up to 32 of them, and a scan that meets more refuses rather than report a count it cannot show".to_owned(),
             "that evidence names every blind-spot process it counts — pid, kernel start identity, command and hidden-descriptor count — up to 32 of them, and a scan that meets more refuses rather than report a count it cannot show".to_owned(),
             "the bounded record of that re-observation — how many processes it re-observed, and for up to eight of them the command, kernel start identity, errno sequence, identity changes and resolution — is reported on every verdict and in every refusal's failure detail, so a diagnostic of a refusal sees it too".to_owned(),
@@ -3526,6 +3527,70 @@ mod tests {
         ] {
             assert_mixed_pair_refuses(&holder, &child, stated, label);
         }
+    }
+
+    #[test]
+    fn a_failed_second_observation_is_not_discarded_when_the_process_disappears() {
+        let holder = real_holder("custody-023-failed-second-observation");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let identity = child.identity();
+        // The first observation answers paired `ENOENT` and the second fails with
+        // another errno, and the pid is reported gone by the time that observation
+        // is checked. The failure refuses: a disappearing process never settles a
+        // failed read, and the second observation is not discarded.
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                gone_after: Some(1),
+                vnode_reads: vec![
+                    (0, StatedVnodeRead::dead_once()),
+                    (
+                        0,
+                        StatedVnodeRead::new(StatedCall::Failed(EIO), StatedCall::Real),
+                    ),
+                ],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        let reason = verdict.reason().unwrap_or_default();
+        assert!(reason.contains("unreadable"), "{reason}");
+        assert!(reason.contains(&identity.pid.to_string()), "{reason}");
+        assert!(verdict.into_evidence().is_err(), "unknown refuses");
+    }
+
+    #[test]
+    fn a_dead_observation_of_a_process_that_then_disappeared_is_gone() {
+        let holder = real_holder("custody-023-gone-after-dead");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let identity = child.identity();
+        // The second observation answered paired `ENOENT` and the pid is gone by
+        // the time it is checked: a gone process holds nothing, so the answer is
+        // that the descriptor went with it, and no dead handle is recorded for a
+        // process that no longer exists.
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                gone_after: Some(1),
+                vnode_reads: vec![(0, StatedVnodeRead::dead())],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+        assert_eq!(
+            verdict
+                .evidence()
+                .expect("the evidence")
+                .dead_handles
+                .handles,
+            0
+        );
     }
 
     #[test]

@@ -1693,7 +1693,10 @@ Choices S5 made where this design left the mechanic to the slice:
   observation whatever that observation answers, so a process that changed
   underneath it never has any settled answer accepted, and both deadlines
   rechecked when that observation and the final identity read complete, so a slow
-  kernel read cannot carry a settled answer past either bound. It is recorded as a dead handle only when that identity is
+  kernel read cannot carry a settled answer past either bound. A second
+  observation that fails for any reason refuses before the identity is consulted,
+  so a pid the kernel then reports gone never discards the errno that observation
+  answered — only an observation that answered may be settled by a gone process. It is recorded as a dead handle only when that identity is
   the classified start identity and effective uid both times, both bounds still
   hold, and the second observation still answers `ENOENT` to both flavors: the
   scan records pid, start identity, descriptor and command, and does not block.
@@ -1780,7 +1783,10 @@ Choices S5 made where this design left the mechanic to the slice:
   facts read, a closed path read beside `ENOENT`, `EPERM` or readable facts, a
   readable path beside closed vnode facts, and **both** reads reporting the
   descriptor closed are all `unknown`, because `ESRCH` and `EBADF` are other
-  errnos. An identity that changes after a
+  errnos. A second observation that fails with `EIO` while the pid is then
+  reported gone is `unknown` too — a disappearing process never settles a failed
+  read — and the same disappearance after an answered paired `ENOENT` is `safe`
+  with no dead handle recorded, because the descriptor went with the process. An identity that changes after a
   second observation which answered a real path — not a dead one — is `unknown`,
   which is the bracket every settled answer is now held to. A read-only real-observer case
   classifies a live same-uid process of this host that really holds a dead vnode,

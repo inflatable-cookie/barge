@@ -96,8 +96,9 @@ deadlines after the observation and the final identity read, and reports a **dea
 handle** — pid, start identity, descriptor and command — in the `Safe` evidence
 as `dead_handles` and in `describe.custody`, where it does not block: a revoked or
 reclaimed vnode cannot do I/O. `ENOENT` on the listing itself, a changed or
-unreadable identity and a bound reached stay `Unknown`, and no path or name is
-listed for a dead handle (Tom, decision e33115d3, implemented by barge#023); see
+unreadable identity, a bound reached and a second observation that fails — which
+is never discarded, not even when the pid is then reported gone — stay `Unknown`,
+and no path or name is listed for a dead handle (Tom, decision e33115d3, implemented by barge#023); see
 the [stage 1
 design](contracts/stage1-design.md#writer-custody-and-safe-deletion).
 Measured before the decision (barge#008, macOS 26.6.2): a live same-uid
