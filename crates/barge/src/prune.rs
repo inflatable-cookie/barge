@@ -941,6 +941,36 @@ fn run(
             volumes.push(outcome);
             continue;
         }
+        // The plan is the authorization, so the record it was made under must still
+        // be the record this run acts under: a changed generation (any registry
+        // write) or a durability that no longer permits pruning keeps every unit
+        // the plan named for this volume.
+        if record.generation != volume_plan.record_generation {
+            fill_kept(
+                &mut outcome,
+                volume_plan,
+                &format!(
+                    "the volume record changed since the plan (generation {} to {}); every planned unit it names is kept",
+                    volume_plan.record_generation, record.generation
+                ),
+                &mut unreached,
+            );
+            volumes.push(outcome);
+            continue;
+        }
+        if !record.durability.permits_pruning() {
+            fill_kept(
+                &mut outcome,
+                volume_plan,
+                &format!(
+                    "the volume is now declared `{}`, which never permits pruning; every planned unit it names is kept",
+                    durability_name(record.durability)
+                ),
+                &mut unreached,
+            );
+            volumes.push(outcome);
+            continue;
+        }
 
         if let Some(step) = &volume_plan.scratch {
             if Instant::now() >= deadline {
@@ -961,13 +991,29 @@ fn run(
                 break 'volumes;
             }
             // The step's own digest must describe the step's own bytes, so the
-            // plan is self-consistent before any of its units is attempted.
-            if scratch::plan_digest(&step.plan)? != step.plan_digest {
-                return Err(Error::new(
-                    ErrorKind::UnknownState,
-                    "the plan's scratch step digest does not match that step's own bytes; nothing was changed",
-                )
-                .with_detail("volume_uuid", volume_plan.volume_uuid.clone().into()));
+            // plan is self-consistent before any of its units is attempted. An
+            // inconsistent step is a mid-run stop: earlier volumes may already have
+            // been maintained, so it is reported in `data.stopped` (exit 3) rather
+            // than as a refusal document that would claim nothing changed.
+            match scratch::plan_digest(&step.plan) {
+                Ok(digest) if digest == step.plan_digest => {}
+                other => {
+                    let reason = format!(
+                        "the plan's scratch step for volume {} is not self-consistent ({}); its units are kept and the run stopped",
+                        volume_plan.volume_uuid,
+                        match other {
+                            Ok(digest) => format!(
+                                "recorded {} but described by {}",
+                                step.plan_digest, digest
+                            ),
+                            Err(error) => error.to_string(),
+                        }
+                    );
+                    fill_kept(&mut outcome, volume_plan, &reason, &mut unreached);
+                    stopped = Some(reason);
+                    volumes.push(outcome);
+                    break 'volumes;
+                }
             }
             // The run's deadline is passed into the stage, so every candidate's
             // effect is gated by it: a stage with many units cannot outlive the
@@ -1350,7 +1396,8 @@ fn fill_unreached_areas(
 /// for it, and the other volumes still run.
 fn fill_unmaintainable(outcome: &mut VolumeOutcome, volume_plan: &VolumePlan, reason: &str) {
     outcome.detail = Some(reason.to_owned());
-    outcome.loud = true;
+    outcome.loud = is_loud(volume_plan);
+
     if let Some(step) = &volume_plan.scratch {
         let skipped: Vec<scratch::SkippedRow> = step
             .plan
@@ -1384,6 +1431,68 @@ fn fill_unmaintainable(outcome: &mut VolumeOutcome, volume_plan: &VolumePlan, re
             pending: RowSet::empty(),
         })
         .collect();
+}
+
+/// Every planned unit of one volume, kept with one reason and never loud: a record
+/// that changed or a durability that no longer permits pruning is an operator
+/// change, so the units are kept and reported, not escalated.
+fn fill_kept(
+    outcome: &mut VolumeOutcome,
+    volume_plan: &VolumePlan,
+    reason: &str,
+    unreached: &mut Vec<UnreachedRow>,
+) {
+    outcome.detail = Some(reason.to_owned());
+    // A record that changed or a durability that no longer permits pruning is an
+    // operator change reported as kept units, not an absence that needs a human.
+    outcome.loud = false;
+    if let Some(step) = &volume_plan.scratch {
+        let skipped: Vec<scratch::SkippedRow> = step
+            .plan
+            .candidates
+            .rows
+            .iter()
+            .map(|row| scratch::SkippedRow {
+                name: row.name.clone(),
+                scope: row.scope.clone(),
+                reason: reason.to_owned(),
+            })
+            .collect();
+        let total = skipped.len();
+        if total > 0 {
+            unreached.push(UnreachedRow {
+                volume_uuid: volume_plan.volume_uuid.clone(),
+                stage: "scratch".to_owned(),
+                candidates: total,
+            });
+        }
+        outcome.scratch = Some(ScratchOutcome {
+            plan_digest: step.plan_digest.clone(),
+            deleted: RowSet::empty(),
+            pending: RowSet::empty(),
+            skipped: RowSet::bounded(skipped, total, ROOT_ROWS),
+            replay: None,
+        });
+    }
+    outcome.areas = volume_plan
+        .areas
+        .rows
+        .iter()
+        .map(|area_plan| AreaPruneOutcome {
+            namespace: area_plan.namespace.clone(),
+            area: area_plan.area.clone(),
+            deleted: RowSet::empty(),
+            skipped: all_skipped(area_plan, reason),
+            pending: RowSet::empty(),
+        })
+        .collect();
+}
+
+/// Whether a report about one volume needs a human: only a permanent volume's
+/// absence is loud, because a drive that should be attached and is not needs one.
+/// An ephemeral volume that is away — at preview or mid-run — is reported quietly.
+const fn is_loud(volume_plan: &VolumePlan) -> bool {
+    volume_plan.loud || matches!(volume_plan.availability, Availability::Permanent)
 }
 
 /// Every planned candidate of one area, kept with one reason.
@@ -2174,7 +2283,7 @@ mod tests {
     }
 
     #[test]
-    fn a_registry_revision_change_stops_that_volume_s_planned_roots() {
+    fn a_registry_revision_change_keeps_that_volume_s_planned_units() {
         let harness = Harness::new("maintain-registry-revision");
         let first = harness.create_root(RootKind::AreaRoot);
         let second = harness.create_root(RootKind::AreaRoot);
@@ -2189,7 +2298,20 @@ mod tests {
         bumped.registered_ms = bumped.registered_ms.saturating_add(1);
         harness.fixture.register_record(&bumped);
         let report = harness.real(&preview).expect("the run reports");
-        let area_stage = &report.volumes.rows[0].areas[0];
+        let volume = &report.volumes.rows[0];
+        // A generation bump is any registry write, and the plan was made under the
+        // old record: every unit it named for this volume is kept, and the reason
+        // names the record rather than a per-unit identity.
+        assert!(
+            volume
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("volume record changed since the plan"),
+            "{:?}",
+            volume.detail
+        );
+        let area_stage = &volume.areas[0];
         assert_eq!(area_stage.deleted.count, 0, "{area_stage:?}");
         assert_eq!(area_stage.skipped.count, 2);
         assert!(
@@ -2197,7 +2319,7 @@ mod tests {
                 .skipped
                 .rows
                 .iter()
-                .all(|row| row.reason.contains("registry record of volume")),
+                .all(|row| row.reason.contains("volume record changed since the plan")),
             "{:?}",
             area_stage.skipped.rows
         );
@@ -2747,6 +2869,113 @@ mod tests {
     }
 
     #[test]
+    fn a_volume_changed_to_kept_between_the_plan_and_the_effect_prunes_nothing() {
+        let harness = Harness::new("maintain-kept-after-plan");
+        let scratch_root = harness.scratch_root("alpha", "owner");
+        harness.conclude_and_release(&scratch_root, "owner");
+        let area_root = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        assert_eq!(preview.candidates, 2);
+
+        // The operator declares the volume kept after the preview. The plan names
+        // units for an expendable volume, so none of them may be pruned: the
+        // registry revision and the durability are re-checked before the effects.
+        let mut record = harness.fixture.record.clone();
+        record.durability = Durability::Kept;
+        harness.fixture.register_record(&record);
+        let report = harness.real(&preview).expect("the run reports");
+        let volume = &report.volumes.rows[0];
+        let stage = volume.scratch.as_ref().expect("the scratch stage reports");
+        assert_eq!(stage.deleted.count, 0, "{stage:?}");
+        assert_eq!(stage.skipped.count, 1);
+        assert!(
+            stage.skipped.rows[0]
+                .reason
+                .contains("volume record changed since the plan"),
+            "{}",
+            stage.skipped.rows[0].reason
+        );
+        assert_eq!(volume.areas[0].deleted.count, 0);
+        assert_eq!(volume.areas[0].skipped.count, 1);
+        assert!(
+            scratch_root.is_dir() && area_root.path.is_dir(),
+            "nothing was pruned"
+        );
+        assert_eq!(report.pending.count, 0);
+        assert!(!report.needs_human(), "{report:?}");
+    }
+
+    #[test]
+    fn an_ephemeral_volume_that_vanishes_mid_run_stays_quiet() {
+        let harness = Harness::new("maintain-ephemeral-mid-run");
+        let root = harness.create_root(RootKind::AreaRoot);
+        let mut record = harness.fixture.record.clone();
+        record.availability = Availability::Ephemeral;
+        harness.fixture.register_record(&record);
+        let facts = harness.fixture.facts();
+        let preview = harness.preview_with(&facts, harness.aged());
+        assert_eq!(preview.candidates, 1);
+
+        // The volume goes away between the preview and the effect. The design says
+        // an absent ephemeral volume is quiet: the unit is kept and reported, and
+        // the run does not need a human.
+        facts.present.set(false);
+        let report = harness
+            .real_with_facts(&facts, &preview)
+            .expect("the run reports");
+        let volume = &report.volumes.rows[0];
+        assert!(!volume.loud, "{volume:?}");
+        assert!(
+            volume
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not attached any more"),
+            "{:?}",
+            volume.detail
+        );
+        assert_eq!(volume.areas[0].deleted.count, 0);
+        assert_eq!(volume.areas[0].skipped.count, 1);
+        assert!(!report.needs_human(), "{report:?}");
+        assert!(root.path.is_dir(), "the planned unit is kept");
+    }
+
+    #[test]
+    fn an_inconsistent_scratch_step_stops_the_run_without_a_refusal_document() {
+        let harness = Harness::new("maintain-inconsistent-step");
+        let root = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&canonical(&preview)).expect("the plan parses");
+        document["volumes"]["rows"][0]["scratch"]["plan_digest"] =
+            serde_json::Value::String("0".repeat(64));
+        let mut bytes = serde_json::to_vec(&document).expect("the plan encodes");
+        bytes.push(b'\n');
+        let digest = sha256_hex(&bytes);
+
+        // A step whose own digest does not describe its own bytes is a mid-run stop:
+        // the run reports `data.stopped` with its units kept instead of an error
+        // document that would claim nothing was changed.
+        let platform = harness.fixture.platform();
+        let report = maintain(
+            &harness.fixture.state,
+            &platform,
+            &harness.fixture.facts(),
+            &harness.fixture.mounts(),
+            &harness.fixture.observer(),
+            &harness.request(false, Some(&digest), Some(&bytes), harness.aged()),
+        )
+        .expect("the run reports instead of refusing");
+        let stopped = report.stopped.as_deref().expect("the stop is reported");
+        assert!(stopped.contains("not self-consistent"), "{stopped}");
+        assert!(report.needs_human());
+        let volume = &report.volumes.rows[0];
+        assert_eq!(volume.areas[0].deleted.count, 0);
+        assert_eq!(volume.areas[0].skipped.count, 1);
+        assert!(root.path.is_dir(), "nothing was pruned");
+    }
+
+    #[test]
     fn a_pending_intent_makes_the_run_need_a_human() {
         let harness = Harness::new("maintain-pending");
         let root = harness.create_root(RootKind::AreaRoot);
@@ -2899,11 +3128,28 @@ mod tests {
             .expect("a scratch stage");
         assert_eq!(scratch_step.plan.candidates.count, 2);
 
-        scratch::declare_claim(&harness.fixture.state, &harness.fixture.uuid, &claim, true)
-            .expect("the claim is withdrawn");
-        // The withdrawn claim stops its own unit only: the native run the same
-        // plan named is still deleted.
-        let report = harness.real(&preview).expect("the run reports");
+        // The claim is withdrawn inside the run's own window, at the claimed unit's
+        // re-verification: the deletion's own authorization re-reads the record and
+        // keeps that unit, while the native run the same plan named still goes. A
+        // withdrawal *between* the preview and the real run is a registry revision
+        // change instead, and the volume guard then keeps every planned unit (its
+        // own test covers that).
+        let state = harness.fixture.state.clone();
+        let uuid = harness.fixture.uuid.clone();
+        let withdrew = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = withdrew.clone();
+        let faults = Faults::new();
+        faults.observing(Box::new(move |name: &str| {
+            if flag.get() || name != "old-run" {
+                return;
+            }
+            flag.set(true);
+            scratch::declare_claim(&state, &uuid, &claim, true).expect("the claim is withdrawn");
+        }));
+        let report = harness
+            .real_with(&faults, harness.aged(), &preview)
+            .expect("the run reports");
+        assert!(withdrew.get(), "the claim was withdrawn inside the window");
         let stage = report.volumes.rows[0]
             .scratch
             .as_ref()
@@ -2911,8 +3157,8 @@ mod tests {
         assert_eq!(stage.deleted.count, 1, "{stage:?}");
         assert_eq!(stage.skipped.count, 1);
         assert_eq!(stage.skipped.rows[0].name, "old-run");
-        // The re-assessment records that the unit is no longer eligible; the
-        // withdrawn claim is why, and only this unit is affected.
+        // The deletion's own authorization names the withdrawn grant as the reason,
+        // and only this unit is affected.
         assert!(
             stage.skipped.rows[0].reason.contains("no longer eligible"),
             "{}",

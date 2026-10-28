@@ -1757,6 +1757,41 @@ pub fn expire_plan(
         .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
     }
     let digest = plan_digest(plan)?;
+
+    // Only an expendable volume may be pruned. A record that now says `kept` (or
+    // that declares nothing) keeps every planned unit: applying a plan made under
+    // another durability would delete data the volume says is never pruned.
+    if !record.durability.permits_pruning() {
+        let skipped: Vec<SkippedRow> = plan
+            .candidates
+            .rows
+            .iter()
+            .map(|row| SkippedRow {
+                name: row.name.clone(),
+                scope: row.scope.clone(),
+                reason: format!(
+                    "the volume now declares `{}`, which never permits pruning, so the planned unit is kept",
+                    durability_name(record.durability)
+                ),
+            })
+            .collect();
+        let total = skipped.len();
+        return Ok(ExpireRun {
+            report: ExpireReport {
+                volume_uuid: record.volume_uuid.as_str().to_owned(),
+                volume_present: true,
+                preview: false,
+                plan_digest: digest,
+                plan: plan.clone(),
+                deleted: RowSet::empty(),
+                pending: RowSet::empty(),
+                skipped: RowSet::bounded(skipped, total, ROOT_ROWS),
+                replay: None,
+            },
+            timed_out: false,
+            unreached: 0,
+        });
+    }
     let root_dir = plan.root_dir.clone();
 
     // A volume that went away between the plan and this run is reported: every
@@ -2041,6 +2076,15 @@ pub fn expire_plan(
         timed_out,
         unreached,
     })
+}
+
+/// A durability's name, as a report spells it.
+const fn durability_name(durability: registry::Durability) -> &'static str {
+    match durability {
+        registry::Durability::Expendable => "expendable",
+        registry::Durability::Kept => "kept",
+        registry::Durability::Undeclared => "undeclared",
+    }
 }
 
 /// The reason one planned scratch unit was not attempted: the caller's wall
@@ -5067,6 +5111,62 @@ mod tests {
             run.report.replay.is_none(),
             "no replay starts on a spent clock"
         );
+    }
+
+    #[test]
+    fn an_expire_plan_stage_on_a_kept_volume_keeps_every_planned_unit() {
+        let harness = Harness::new("scratch-stage-kept");
+        let root = harness.alloc("kept", "owner");
+        harness.conclude(
+            &root,
+            "owner",
+            ConclusionOutcome::Closed,
+            ConclusionClosure::Positive,
+            KeptReason::Evidence,
+            NestedScope::Exclusive,
+        );
+        let days = NATIVE_AGE_SECONDS / (24 * 60 * 60) + 1;
+        let preview = harness.plan(days);
+        assert_eq!(preview.plan.candidates.count, 1);
+
+        // The record now declares the volume kept, at the same generation: a plan
+        // made for an expendable volume may never prune a volume that says its data
+        // is kept.
+        let mut kept_record = harness.fixture.record.clone();
+        kept_record.durability = crate::registry::Durability::Kept;
+        assert_eq!(kept_record.generation, harness.fixture.record.generation);
+        let observer = harness.fixture.observer();
+        let facts = harness.fixture.facts();
+        let mounts = harness.fixture.mounts();
+        let platform = harness.fixture.platform();
+        let run = expire_plan(
+            &harness.fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &kept_record,
+            &preview.plan,
+            DeleteBounds {
+                retry_pause: std::time::Duration::ZERO,
+                ..DeleteBounds::default()
+            },
+            sweep_now(days, 0),
+            None,
+        )
+        .expect("the stage reports");
+        assert_eq!(run.report.deleted.count, 0);
+        assert_eq!(run.report.pending.count, 0);
+        assert_eq!(run.report.skipped.count, 1);
+        assert!(
+            run.report.skipped.rows[0]
+                .reason
+                .contains("never permits pruning"),
+            "{}",
+            run.report.skipped.rows[0].reason
+        );
+        assert!(!run.timed_out);
+        assert!(root.is_dir(), "the planned unit is kept");
     }
 
     #[test]
