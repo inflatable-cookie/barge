@@ -3290,7 +3290,9 @@ mod tests {
         // authorization names the changed record: the unit is kept and only this
         // unit is affected, which is the design's per-unit rule.
         assert!(
-            stage.skipped.rows[0].reason.contains("record changed since the plan"),
+            stage.skipped.rows[0]
+                .reason
+                .contains("record changed since the plan"),
             "{}",
             stage.skipped.rows[0].reason
         );
