@@ -1094,15 +1094,18 @@ class Proof:
             handle.write("\n")
 
     def cleanup(self):
-        """Ordinary detach, then remove only this run's own root."""
+        """Ordinary detach, then remove only this run's own root.
+
+        The detach is gated on re-reading the mounted volume's identity: a read
+        that fails, or a volume whose UUID or device is not the one this run
+        attached, cancels the detach and keeps the image (premise 5).
+        """
         cancelled = None
         if self.attached and self.mount:
             before = diskutil_info(self.mount, self.env)
-            if before is not None and (
-                before.get("VolumeUUID") != self.uuid
-                or before.get("DeviceIdentifier") != self.device
-            ):
-                cancelled = "the mounted volume is no longer the owned image; detach refused"
+            problem = owned_detach_problem(before, self.uuid, self.device)
+            if problem is not None:
+                cancelled = problem
             else:
                 result = run(
                     ["hdiutil", "detach", self.mount], self.env, check=False, timeout=120
@@ -1125,6 +1128,32 @@ class Proof:
         return cancelled
 
 
+def owned_detach_problem(info, uuid, device):
+    """Why this mount must not be detached, or `None` when it is the owned image.
+
+    Pure, so `maintain:native:test` can state every answer: the proof's only
+    detach runs only when the re-read identity is the one the run attached.
+    """
+    if not uuid or not device:
+        return "the run recorded no owned identity, so no detach is authorized; the image is kept"
+    if info is None:
+        return (
+            "the mounted volume's identity could not be read again, so the detach is "
+            "refused and the image is kept"
+        )
+    if info.get("VolumeUUID") != uuid:
+        return (
+            "the mounted volume's UUID is not the owned image, so the detach is refused "
+            "and the image is kept"
+        )
+    if info.get("DeviceIdentifier") != device:
+        return (
+            "the mounted volume's device is not the owned image, so the detach is "
+            "refused and the image is kept"
+        )
+    return None
+
+
 def diskutil_info(mount, env):
     result = run(["diskutil", "info", "-plist", mount], env, check=False, timeout=60)
     if result.returncode != 0:
@@ -1140,7 +1169,7 @@ PREMISE_TRACE = [
     ("the fixture account home and an unchanged real state", "setup + inner_half", "real_state_observation before in Proof.setup and after in inner_half, and child_environment_problems"),
     ("environment isolation", "setup", "TMPDIR, TMP and TEMP are the run root; BARGE_STATE_DIR is the fixture state"),
     ("explicit adoption only", "setup", "register() writes the three records and declare_area() declares the area by command"),
-    ("the owned image", "create_image", "-owners on at attach, one ordinary detach in cleanup, no force path in this script"),
+    ("the owned image", "create_image + cleanup", "-owners on at attach, and the only detach is gated on re-reading the owned UUID and device (owned_detach_problem); no force path in this script"),
     ("every environment hook is listed", "self_check", "environment_inventory_problems over this script's sources"),
     ("temporary storage inside the owned root", "setup", "tempfile.mkdtemp with dir=the run root, which is inside TMPDIR"),
     ("mktemp -d for every fixture directory", "setup + create_image", "root creation uses tempfile.mkdtemp under TMPDIR; no fixed path"),
@@ -1188,6 +1217,26 @@ def preflight_problems():
     if len(PREMISE_TRACE) != 9 or len(PREMISES) != 9:
         problems.append("the premise record does not name nine premises")
     problems.extend(premise_body_problems())
+    # The detach gate is pure: state each answer cleanup must accept or refuse, so
+    # "the only detach is gated on the owned identity" cannot rot into a claim.
+    owned = "11111111-2222-3333-4444-555555555555"
+    for info, device, expected in (
+        ({"VolumeUUID": owned, "DeviceIdentifier": "disk9s1"}, "disk9s1", None),
+        (None, "disk9s1", "refused"),
+        ({"VolumeUUID": "99999999-2222-3333-4444-555555555555", "DeviceIdentifier": "disk9s1"}, "disk9s1", "refused"),
+        ({"VolumeUUID": owned, "DeviceIdentifier": "disk8s1"}, "disk9s1", "refused"),
+        ({"VolumeUUID": owned}, "disk9s1", "refused"),
+        ({"DeviceIdentifier": "disk9s1"}, "disk9s1", "refused"),
+    ):
+        answer = owned_detach_problem(info, owned, device)
+        if (answer is None) != (expected is None):
+            problems.append(f"the detach gate answered {answer!r} for {info!r}")
+    for verdict in (
+        owned_detach_problem({"VolumeUUID": owned, "DeviceIdentifier": "disk9s1"}, "", "disk9s1"),
+        owned_detach_problem({"VolumeUUID": owned, "DeviceIdentifier": "disk9s1"}, owned, ""),
+    ):
+        if verdict is None:
+            problems.append("the detach gate accepted a run with no recorded identity")
     # The ownership oracle is pure: state each answer setup must accept or refuse.
     for text, expected in (
         ("Owners: Enabled", "enabled"),
