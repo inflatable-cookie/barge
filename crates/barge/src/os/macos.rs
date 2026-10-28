@@ -1218,7 +1218,6 @@ impl MacOs {
         let stated = stated_vnode_read(faults, identity.pid, vnode_index);
         match read_descriptor(identity.pid, descriptor, stated) {
             Ok(DescriptorReading::Path(path)) => Observed::Path(path),
-            Ok(DescriptorReading::Closed) => Observed::Closed,
             Ok(DescriptorReading::Opaque) => Observed::Opaque,
             Ok(DescriptorReading::Dead) => self.settle_dead_handle(
                 identity,
@@ -1371,7 +1370,6 @@ impl MacOs {
         }
         let observed = match reading {
             Ok(DescriptorReading::Path(path)) => Observed::Path(path),
-            Ok(DescriptorReading::Closed) => Observed::Closed,
             Ok(DescriptorReading::Opaque) => Observed::Opaque,
             Err(error) => Observed::Unreadable(error.message().to_owned()),
             // Still dead for the classified identity, which was just re-read: it
@@ -2385,8 +2383,6 @@ fn bsd_info(pid: u32) -> Result<Option<libc::proc_bsdinfo>> {
 enum DescriptorReading {
     /// The path the platform reports for the descriptor.
     Path(PathBuf),
-    /// The descriptor closed while it was observed.
-    Closed,
     /// Both the path and the vnode facts answered `EPERM`, so where the
     /// descriptor points cannot be read at all.
     Opaque,
@@ -2403,17 +2399,14 @@ enum DescriptorReading {
 /// Both of the platform's per-fd reads are evaluated, because every answer is a
 /// statement about the *pair*. Only three pairings are an answer: a readable path
 /// with readable vnode facts, `ENOENT` from both flavors (a dead-handle
-/// candidate), and `EPERM` from both flavors (the OS blind spot). A descriptor
-/// that closed between the two reads is positively gone — it holds nothing — and
-/// is reported closed whichever read saw it, unless the path read answered
-/// `ENOENT`, which is a disagreement and refuses. Every other pairing is
-/// unreadable and refuses: a readable path beside vnode facts that report the
-/// vnode gone, report it hidden or report the descriptor closed, a path read that
-/// reports the descriptor closed beside anything but a closed vnode-facts read,
-/// `ENOENT` from one read with `EPERM` or a closed answer from the other, a hidden
-/// path beside a closed answer, and a path read that failed for any reason but the
-/// hidden answer. Only a pair that agrees is an answer, so no read's result is
-/// ever carried by the other's.
+/// candidate), and `EPERM` from both flavors (the OS blind spot). Every other
+/// pairing is unknown and refuses, and a descriptor the platform reports closed is
+/// never carried: `ESRCH` and `EBADF` are other errnos, the fd may already have
+/// been closed and reused, and no read's result is ever carried by the other's. So
+/// a paired closed answer refuses like one closed answer beside `ENOENT`, `EPERM`,
+/// a readable path or a failure, a readable path beside vnode facts that report
+/// the vnode gone or hidden, a hidden path beside a readable or absent answer, and
+/// a path read that failed for any reason but the hidden answer.
 fn read_descriptor(
     pid: u32,
     descriptor: i32,
@@ -2466,16 +2459,32 @@ fn read_descriptor(
         (path @ DescriptorPath::Failed(_), facts @ VnodeFacts::Closed) => {
             Err(mixed_reads(pid, descriptor, &path, &facts))
         }
-        // Both reads agree the descriptor closed between them: it holds nothing,
-        // so it is positively gone. Only that agreement is an answer — one closed
-        // answer beside any other answer, a readable path included, is a
-        // disagreement below, because the fd may already have been closed and
-        // reused and no read's answer is carried by the other's.
-        (DescriptorPath::Closed, VnodeFacts::Closed) => Ok(DescriptorReading::Closed),
+        // A descriptor the platform reports closed is not an answer custody can
+        // build on: `ESRCH` and `EBADF` are other errnos, the fd may already have
+        // been closed and reused, and no read's result is ever carried by the
+        // other's. Even two closed answers refuse, so nothing a closing descriptor
+        // reports can make a scan safe.
+        (DescriptorPath::Closed, VnodeFacts::Closed) => Err(closed_descriptor(pid, descriptor)),
         // The pair disagrees. Nothing about the descriptor is established, so it
         // is unknown and never a dead handle.
         (path, facts) => Err(mixed_reads(pid, descriptor, &path, &facts)),
     }
+}
+
+/// The refusal for a descriptor both of whose per-fd reads report it closed.
+///
+/// `ESRCH` and `EBADF` are other errnos, so a closed descriptor is never a `Safe`
+/// fact: the fd may already have been closed and reused, and custody refuses
+/// rather than skip it (Tom, 2026-10-28, decision e33115d3, barge#023).
+fn closed_descriptor(pid: u32, descriptor: i32) -> Error {
+    Error::new(
+        ErrorKind::UnknownState,
+        format!(
+            "both reads of descriptor {descriptor} of pid {pid} report it closed, and a closed descriptor is not an answer custody can build on: the descriptor is unknown and is never skipped"
+        ),
+    )
+    .with_detail("pid", u64::from(pid).into())
+    .with_detail("descriptor", i64::from(descriptor).into())
 }
 
 /// The refusal for a descriptor whose two per-fd reads do not agree: only a
@@ -2521,7 +2530,7 @@ fn facts_answer(facts: &VnodeFacts) -> String {
 enum Observed {
     /// The path the platform reports for it.
     Path(PathBuf),
-    /// The descriptor closed while it was observed, or its process is gone.
+    /// The process holding it is positively gone, so nothing it held is open.
     Closed,
     /// Both the path and the vnode facts answered `EPERM`.
     Opaque,

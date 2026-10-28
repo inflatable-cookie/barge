@@ -1676,14 +1676,13 @@ Choices S5 made where this design left the mechanic to the slice:
   and proved: both of a vnode descriptor's per-fd reads are evaluated, and only
   three pairings are an answer — a readable path with readable vnode facts,
   `ENOENT` from both flavors, and `EPERM` from both. A descriptor that closed
-  between the two reads holds nothing, so it is reported closed when **both** reads
-  report it closed, and no other pairing that mentions a close is an answer: one
-  closed answer beside any other answer is a disagreement, whichever read saw the
-  close. A closed path read is never carried by whatever the second read then
-  reports — that second read can still find the vnode gone, find it hidden, read
-  it, or fail — and a readable path is never carried by closed vnode facts,
-  because the fd may already have been closed and reused. Both reads are
-  therefore always made, even when the first reports the descriptor closed. Every other pairing is unreadable
+  closed, `ESRCH` or `EBADF`, is never an answer at all: those are other errnos,
+  the fd may already have been closed and reused, and no read's result is carried
+  by the other's. So even **both** reads reporting the descriptor closed is
+  `Unknown`, and so is one closed answer beside `ENOENT`, `EPERM`, a readable path
+  or a failure, whichever read saw the close. Both reads are therefore always
+  made, even when the first reports the descriptor closed, and nothing a closing
+  descriptor reports can make a scan `Safe`. Every other pairing is unreadable
   and refuses, including a path that is readable while the vnode facts answer
   `ENOENT`, `ENOENT` from one read with `EPERM` from the other, and a path read
   that failed for any reason but the hidden answer, which a closed vnode-facts
@@ -1778,10 +1777,10 @@ Choices S5 made where this design left the mechanic to the slice:
   `ENOENT` from the path read while the vnode facts report the descriptor closed,
   `EIO` from the path read while the vnode facts report it closed, `EPERM` from
   the path read while the vnode facts report it closed, `EIO` from the vnode
-  facts read, a closed path read beside `ENOENT`, `EPERM` or readable facts, and
-  a readable path beside closed vnode facts are all `unknown`; a descriptor whose
-  two reads both report it closed is `safe` and not recorded, because it holds
-  nothing. An identity that changes after a
+  facts read, a closed path read beside `ENOENT`, `EPERM` or readable facts, a
+  readable path beside closed vnode facts, and **both** reads reporting the
+  descriptor closed are all `unknown`, because `ESRCH` and `EBADF` are other
+  errnos. An identity that changes after a
   second observation which answered a real path — not a dead one — is `unknown`,
   which is the bracket every settled answer is now held to. A read-only real-observer case
   classifies a live same-uid process of this host that really holds a dead vnode,
