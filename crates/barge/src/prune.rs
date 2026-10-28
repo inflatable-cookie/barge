@@ -730,8 +730,8 @@ impl Builder<'_> {
             },
         )?;
         row.scratch = Some(ScratchStep {
-            plan_digest: sweep.plan_digest,
-            plan: sweep.plan,
+            plan_digest: sweep.report.plan_digest,
+            plan: sweep.report.plan,
         });
 
         let mut area_rows = Vec::new();

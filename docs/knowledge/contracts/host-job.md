@@ -38,12 +38,11 @@ reported as that unit only while the rest of the plan still runs.
    `barge.maintain/1` document with `ok: true` **completed**: `data.candidates`
    and `data.plan_digest` are its report. A preview that prints a
    `barge.error/1` document refused or could not report, and nothing was planned.
-2. **Only** when the preview printed a plan document, run the real step once when
-   it names work: `data.candidates` is greater than zero, or `data.pending.count`
-   is greater than zero, because a real run of that plan replays what an earlier
-   run left pending and does nothing else. Pass that preview's exact bytes
-   (`--plan`) and its `data.plan_digest` (`--plan-sha256`). A preview with neither
-   candidates nor a pending intent changes nothing, so the job runs no real step.
+2. **Only** when the preview printed a plan document and `data.candidates` is
+   greater than zero, run the real step once, passing that preview's exact bytes
+   (`--plan`) and its `data.plan_digest` (`--plan-sha256`). Candidates are the
+   only trigger: a preview that names none has nothing for a real run to settle
+   from this plan, and the job runs no real step.
 3. Record the real step's exit code. Never retry it, never loop, never run it
    twice, and never run it with a digest from an earlier day's preview.
 4. Exit with the worse of the two recorded codes, so a loud absence is never
@@ -58,7 +57,10 @@ preview exit `3` while it still reports an authorized plan for the volumes that
 are attached, so the job performs that authorized real step and records the `3`.
 A pending intent is reported by the preview — never silently: the document names
 it in `data.pending` and forces exit `3` even when the plan names no candidate —
-and it is finished by that same night's real run's own replay, not by a retry.
+and it is finished by the next real run's own replay, not by a retry. A
+pending-only preview therefore records its `3` and runs no real step: the next
+night the same report appears until a run with a candidate replays the intent, or
+the operator settles it deliberately.
 
 ## Exit codes and what the job records
 

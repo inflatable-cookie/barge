@@ -1602,7 +1602,7 @@ pub fn sweep(
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
     request: &SweepRequest<'_>,
-) -> Result<ExpireReport> {
+) -> Result<ExpireRun> {
     if !request.preview {
         let Some(digest) = request.plan_digest else {
             return Err(Error::new(
@@ -1644,16 +1644,21 @@ pub fn sweep(
         }
         let plan = empty_plan(&record);
         let digest = plan_digest(&plan)?;
-        return Ok(ExpireReport {
-            volume_uuid: record.volume_uuid.as_str().to_owned(),
-            volume_present: false,
-            preview: request.preview,
-            plan_digest: digest,
-            plan,
-            deleted: RowSet::empty(),
-            pending: RowSet::empty(),
-            skipped: RowSet::empty(),
-            replay: None,
+        return Ok(ExpireRun {
+            report: ExpireReport {
+                volume_uuid: record.volume_uuid.as_str().to_owned(),
+                volume_present: false,
+                preview: request.preview,
+                plan_digest: digest,
+                plan,
+                deleted: RowSet::empty(),
+                pending: RowSet::empty(),
+                skipped: RowSet::empty(),
+                replay: None,
+            },
+            timed_out: false,
+            unreached: 0,
+            stopped: None,
         });
     }
 
@@ -1669,16 +1674,21 @@ pub fn sweep(
     )?;
     let digest = plan_digest(&plan)?;
     if request.preview {
-        return Ok(ExpireReport {
-            volume_uuid: record.volume_uuid.as_str().to_owned(),
-            volume_present: true,
-            preview: true,
-            plan_digest: digest,
-            plan,
-            deleted: RowSet::empty(),
-            pending: RowSet::empty(),
-            skipped: RowSet::empty(),
-            replay: None,
+        return Ok(ExpireRun {
+            report: ExpireReport {
+                volume_uuid: record.volume_uuid.as_str().to_owned(),
+                volume_present: true,
+                preview: true,
+                plan_digest: digest,
+                plan,
+                deleted: RowSet::empty(),
+                pending: RowSet::empty(),
+                skipped: RowSet::empty(),
+                replay: None,
+            },
+            timed_out: false,
+            unreached: 0,
+            stopped: None,
         });
     }
     if request.plan_digest != Some(digest.as_str()) {
@@ -1694,7 +1704,7 @@ pub fn sweep(
         .with_detail("candidates", plan.candidates.count.into()));
     }
 
-    Ok(expire_plan(
+    expire_plan(
         state_paths,
         dirs,
         facts,
@@ -1706,8 +1716,7 @@ pub fn sweep(
         request.delete_bounds,
         request.now_ms,
         None,
-    )?
-    .report)
+    )
 }
 
 /// Apply one `barge.scratch.plan/1` exactly as it stands, re-verifying each unit.
@@ -3986,6 +3995,7 @@ mod tests {
                 &request,
             )
             .expect("the plan is computed")
+            .report
         }
 
         fn plan_at(&self, now_ms: u64) -> super::ExpireReport {
@@ -4014,6 +4024,7 @@ mod tests {
                 &request,
             )
             .expect("the plan is computed")
+            .report
         }
 
         fn expire_at(&self, now_ms: u64, digest: &str) -> super::ExpireReport {
@@ -4042,6 +4053,7 @@ mod tests {
                 &request,
             )
             .expect("the real sweep reports")
+            .report
         }
 
         fn expire(&self, days: u64, digest: &str) -> super::ExpireReport {
@@ -4070,6 +4082,7 @@ mod tests {
                 &request,
             )
             .expect("the real sweep reports")
+            .report
         }
 
         fn expire_with(&self, dirs: &dyn DirOps, days: u64, digest: &str) -> super::ExpireReport {
@@ -4097,6 +4110,7 @@ mod tests {
                 &request,
             )
             .expect("the real sweep reports")
+            .report
         }
 
         fn claim(&self, project: &str, idle: u64) {
@@ -5091,6 +5105,75 @@ mod tests {
     }
 
     #[test]
+    fn a_sweep_that_stops_keeps_its_rows_and_is_never_a_success() {
+        let harness = Harness::new("scratch-sweep-stop");
+        let first = harness.alloc("alpha", "owner");
+        harness.conclude(
+            &first,
+            "owner",
+            ConclusionOutcome::Closed,
+            ConclusionClosure::Positive,
+            KeptReason::Evidence,
+            NestedScope::Exclusive,
+        );
+        let second = harness.alloc("beta", "owner");
+        harness.conclude(
+            &second,
+            "owner",
+            ConclusionOutcome::Closed,
+            ConclusionClosure::Positive,
+            KeptReason::Evidence,
+            NestedScope::Exclusive,
+        );
+        let days = NATIVE_AGE_SECONDS / (24 * 60 * 60) + 1;
+        let plan = harness.plan(days);
+        assert_eq!(plan.plan.candidates.count, 2, "{:?}", plan.plan.candidates);
+        let failing = plan.plan.candidates.rows[1].name.clone();
+
+        // The second unit's effect fails in a way that is not that unit's refusal.
+        // The sweep stops, and the run it returns carries that stop: the CLI reads
+        // `stopped` for its exit code, so a partial sweep can never look like 0.
+        // Observation one is the plan's own classification; two is the re-read
+        // immediately before the effect.
+        let mut faults = Faults::new();
+        faults.failing_facts_at(&failing, 2);
+        let observer = harness.fixture.observer();
+        let facts = harness.fixture.facts();
+        let mounts = harness.fixture.mounts();
+        let uuid = harness.fixture.uuid.clone();
+        let request = SweepRequest {
+            volume_uuid: &uuid,
+            preview: false,
+            plan_digest: Some(&plan.plan_digest),
+            bounds: SweepBounds::default(),
+            delete_bounds: DeleteBounds {
+                retry_pause: std::time::Duration::ZERO,
+                ..DeleteBounds::default()
+            },
+            now_ms: sweep_now(days, 0),
+        };
+        let run = sweep(
+            &harness.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            &request,
+        )
+        .expect("the sweep reports instead of refusing");
+        let stopped = run.stopped.as_deref().expect("the stop is reported");
+        assert!(stopped.contains("the stage stopped"), "{stopped}");
+        assert!(!run.timed_out);
+        assert_eq!(run.report.deleted.count, 1, "the first deletion is kept");
+        assert_eq!(
+            run.report.deleted.rows[0].name,
+            plan.plan.candidates.rows[0].name
+        );
+        assert_eq!(run.report.skipped.count, 1, "the failing unit is reported");
+        assert_eq!(run.report.skipped.rows[0].name, failing);
+    }
+
+    #[test]
     fn enotempty_leaves_a_pending_intent_and_the_quarantine_leaf() {
         let harness = Harness::new("scratch-delete-enotempty");
         let path = harness.alloc("project-a", "owner");
@@ -5327,7 +5410,8 @@ mod tests {
             &observer,
             &request,
         )
-        .expect("an ephemeral volume's absence is a report");
+        .expect("an ephemeral volume's absence is a report")
+        .report;
         assert!(!report.volume_present);
         assert_eq!(report.plan.candidates.count, 0);
         assert!(!harness.fixture.root.join("scratch").exists());
@@ -5432,7 +5516,8 @@ mod tests {
             &harness.fixture.observer(),
             &request,
         )
-        .expect("preview");
+        .expect("preview")
+        .report;
         assert!(report.plan.truncated);
         assert_eq!(report.plan.candidates.count, 0);
         assert!(harness
@@ -6234,7 +6319,8 @@ mod tests {
             &observer,
             &request,
         )
-        .expect("the bounded preview reports");
+        .expect("the bounded preview reports")
+        .report;
         assert!(report.plan.truncated, "the bound is reported");
         assert!(report.plan.examined <= 2);
     }
@@ -6966,7 +7052,8 @@ mod tests {
             &observer,
             &request,
         )
-        .expect("the bounded preview reports");
+        .expect("the bounded preview reports")
+        .report;
         assert!(report.plan.truncated, "the bound is reported");
         assert!(
             report.plan.examined <= 6,

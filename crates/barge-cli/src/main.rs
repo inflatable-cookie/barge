@@ -1137,7 +1137,7 @@ fn scratch_expire(mut options: Options) -> Result<Report, Error> {
     refuse_unknown(options)?;
     let state = state_paths()?;
     let platform = os::platform();
-    let report = scratch::sweep(
+    let run = scratch::sweep(
         &state,
         &platform,
         &platform,
@@ -1152,15 +1152,17 @@ fn scratch_expire(mut options: Options) -> Result<Report, Error> {
             now_ms: state::now_ms(),
         },
     )?;
-    let human = expire_summary(&report);
-    let exit = if report.has_pending() { 3 } else { 0 };
-    Report::outcome(
-        SCRATCH_EXPIRE_SCHEMA,
-        "scratch.expire",
-        &report,
-        human,
-        exit,
-    )
+    let report = &run.report;
+    let human = expire_summary(report);
+    // A stage that stopped on a failure that is not one unit's refusal, or a run
+    // that was cut short by its clock, is never a success: it forces exit `3` even
+    // when nothing it did left an intent pending.
+    let exit = if run.stopped.is_some() || run.timed_out || report.has_pending() {
+        3
+    } else {
+        0
+    };
+    Report::outcome(SCRATCH_EXPIRE_SCHEMA, "scratch.expire", report, human, exit)
 }
 
 fn scratch_grants(mut options: Options) -> Result<Report, Error> {

@@ -2182,6 +2182,12 @@ Choices S4 made where this design left the mechanic to the slice:
   `volume_absent` loudly and writes nothing; on an ephemeral volume it reports
   `volume_present: false`, an empty plan and no effect. Neither recreates or
   writes a stale mount point.
+- **A stopped sweep is never a success.** `barge.scratch.expire/1` is printed
+  from the same `ExpireRun` the maintain stage uses, so a stage that stopped on a
+  failure that is not one unit's refusal — its own report rows, the unit that
+  failed and every later unit kept — or a run cut short by its clock forces exit
+  `3`, exactly as the maintain stage does. No stop is dropped between the library
+  and the exit code.
 - **Command documents.** `barge.scratch.alloc/1`, `barge.scratch.conclude/1`,
   `barge.scratch.expire/1` (with `barge.scratch.plan/1` inside it),
   `barge.scratch.grants/1`, `barge.scratch.delegate/1`, `barge.scratch.claim/1`
@@ -2402,9 +2408,11 @@ Choices S7 made where this design left the mechanic to the slice:
   run's opening read, so a revision that landed after the run started keeps that
   volume's units instead of authorising the stale record; a registry that cannot be
   read again at that point is another mid-run failure, so it is a `data.stopped`
-  stop (exit `3`) with that volume's units kept and the earlier rows intact. A preview names every
-  intent an earlier run left pending, so the document forces exit `3` and the host
-  job runs the real step to replay it even when the plan names no candidate.
+  stop (exit `3`) with that volume's units kept and the earlier rows intact. A
+  preview names every intent an earlier run left pending, so the document forces
+  exit `3` even when the plan names no candidate; the host job still runs its real
+  step only when the preview names a candidate, per the rule above, and the
+  pending intent is settled by a later real run's replay.
 - **Exit codes.** `0` completed, including a partial completion with nothing
   pending. A `3` that still reports a plan is a completed run: the host job's
   contract keeps the `3` on record and still performs the authorized real step for
