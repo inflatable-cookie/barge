@@ -2393,8 +2393,11 @@ Choices S7 made where this design left the mechanic to the slice:
   failure and therefore a `data.stopped` stop (exit `3`), never a refusal document.
   A stage that stops on a failure that is not one unit's refusal keeps the rows it
   earned: the units it deleted, the intents it left pending, and the unit whose
-  effect failed as that stage's skipped row. Its rows are never dropped with the
-  error, and the stages it did not reach are reported as kept.
+  effect failed as that stage's skipped row, and every later candidate of that
+  stage as a skipped row carrying the stop reason. Its rows are never dropped with
+  the error, and the stages it did not reach are reported as kept. A volume whose
+  scratch stage cannot even open is reported in full — every planned unit kept,
+  with the unreached stage counted — and the run stops there.
 - **Exit codes.** `0` completed, including a partial completion with nothing
   pending. A `3` that still reports a plan is a completed run: the host job's
   contract keeps the `3` on record and still performs the authorized real step for

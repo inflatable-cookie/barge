@@ -1046,12 +1046,21 @@ fn run(
                 Ok(run) => run,
                 Err(error) => {
                     // Work may already have been done on an earlier volume, so
-                    // this is never a "refused before any effect" refusal.
-                    outcome.detail = Some(format!(
+                    // this is never a "refused before any effect" refusal. The
+                    // volume that stopped is reported in full: every unit the plan
+                    // named for it is kept with the reason and counted as unreached.
+                    let reason = format!(
                         "the scratch stage of volume {} stopped the run: {error}",
                         record.volume_uuid
-                    ));
-                    stopped = outcome.detail.clone();
+                    );
+                    fill_kept(
+                        &mut outcome,
+                        volume_plan,
+                        &reason,
+                        &mut unreached,
+                        is_loud(volume_plan),
+                    );
+                    stopped = Some(reason);
                     volumes.push(outcome);
                     break 'volumes;
                 }
@@ -1179,7 +1188,35 @@ fn run(
             // A folder override that moved the area between the plan and the
             // effect keeps this area's units: the plan named paths the current
             // configuration no longer resolves.
-            if area::effective_folder(record, &declaration)? != area_plan.folder {
+            let folder = match area::effective_folder(record, &declaration) {
+                Ok(folder) => folder,
+                Err(error) => {
+                    // A stored declaration is validated when the run loads it, so a
+                    // refusal here means the record changed underneath this run. It
+                    // is still after earlier effects, so it is a stop (exit 3), not a
+                    // refusal document: this area and every stage after it are kept.
+                    stage.skipped = all_skipped(
+                        area_plan,
+                        &format!("the area's folder could not be resolved: {error}"),
+                    );
+                    outcome.areas.push(stage);
+                    let reason = format!(
+                        "the area {namespace}.{area} stopped the run: {error}",
+                        namespace = area_plan.namespace,
+                        area = area_plan.area,
+                    );
+                    outcome.detail = Some(reason.clone());
+                    stopped = Some(reason);
+                    fill_remaining_areas(
+                        &mut outcome,
+                        volume_plan,
+                        "the run stopped before this area, so the planned unit is kept",
+                    );
+                    volumes.push(outcome);
+                    break 'volumes;
+                }
+            };
+            if folder != area_plan.folder {
                 stage.skipped = all_skipped(
                     area_plan,
                     "the area's folder changed since the plan; the planned units are kept",
@@ -3293,6 +3330,49 @@ mod tests {
             stage.skipped.rows
         );
         assert_eq!(report.pending.count, 0);
+    }
+
+    #[test]
+    fn a_scratch_stage_that_cannot_open_reports_the_volume_s_units() {
+        let harness = Harness::new("maintain-scratch-open-stops");
+        let scratch_root = harness.scratch_root("alpha", "owner");
+        harness.conclude_and_release(&scratch_root, "owner");
+        let area_root = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        assert_eq!(preview.candidates, 2);
+
+        // The device changes between the plan and the run, so the scratch stage
+        // cannot open the volume at all. That is a mid-run failure: the volume's
+        // planned units are reported as kept, with counts, and the run stops with
+        // `data.stopped` (exit 3) instead of dropping the volume's accounting.
+        let facts = harness.fixture.facts();
+        facts.shift_device();
+        let report = harness
+            .real_with_facts(&facts, &preview)
+            .expect("the run reports instead of refusing");
+        let stopped = report.stopped.as_deref().expect("the stop is reported");
+        assert!(stopped.contains("the scratch stage"), "{stopped}");
+        assert!(report.needs_human());
+        let volume = &report.volumes.rows[0];
+        let stage = volume.scratch.as_ref().expect("the stage is reported");
+        assert_eq!(stage.deleted.count, 0);
+        assert_eq!(stage.skipped.count, 1, "the planned scratch unit is kept");
+        assert_eq!(volume.areas[0].deleted.count, 0);
+        assert_eq!(
+            volume.areas[0].skipped.count, 1,
+            "the planned area unit is kept"
+        );
+        assert!(
+            report
+                .unreached
+                .rows
+                .iter()
+                .any(|row| row.stage == "scratch" && row.candidates == 1),
+            "the unreached stage is counted: {:?}",
+            report.unreached
+        );
+        assert!(scratch_root.exists(), "the kept unit is not deleted");
+        assert!(area_root.path.is_dir(), "the planned root is kept");
     }
 
     #[test]

@@ -1851,6 +1851,14 @@ pub fn expire_plan(
     }
     let mut intent_seen = false;
     for row in plan.candidates.rows.iter() {
+        if let Some(reason) = &stopped {
+            skipped.push(SkippedRow {
+                name: row.name.clone(),
+                scope: row.scope.clone(),
+                reason: format!("the stage stopped before this unit: {reason}"),
+            });
+            continue;
+        }
         if intent_seen {
             skipped.push(SkippedRow {
                 name: row.name.clone(),
@@ -1902,7 +1910,7 @@ pub fn expire_plan(
                     "the stage stopped while re-verifying {}: {error}",
                     row.name
                 ));
-                break;
+                continue;
             }
         };
         let Some(fresh) = fresh else {
@@ -2053,7 +2061,7 @@ pub fn expire_plan(
                     "the stage stopped while deleting {}: {error}",
                     row.name
                 ));
-                break;
+                continue;
             }
         }
         // An effect that finished past the caller's clock is still this run's
