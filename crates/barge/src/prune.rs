@@ -28,7 +28,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::area::{self, AreaDocument, MarkerStateName, PrunePolicy};
 use crate::contract::{
-    RowSet, AREA_ROWS, DOCUMENT_SIZE_CAP_BYTES, MAINTAIN_PLAN_SCHEMA, ROOT_ROWS, VOLUME_ROWS,
+    RowSet, AREA_ROWS, DOCUMENT_SIZE_CAP_BYTES, INTENT_ROWS, MAINTAIN_PLAN_SCHEMA, ROOT_ROWS,
+    VOLUME_ROWS,
 };
 use crate::delete::{self, DeleteBounds, PendingRow};
 use crate::digest::sha256_hex;
@@ -404,6 +405,28 @@ impl MaintainReport {
     }
 }
 
+/// The intents an earlier run left pending, as a preview reports them.
+///
+/// A preview changes nothing, so it does not replay them; it names them, which is
+/// what makes the document force exit `3` and tells the host-job operator that a
+/// real run of this plan has work to settle.
+fn preview_pending(state_paths: &StatePaths) -> Result<RowSet<PendingRow>> {
+    let intents = state::read_intents(state_paths, INTENT_ROWS)?;
+    let rows: Vec<PendingRow> = intents
+        .pending()
+        .map(|intent| PendingRow {
+            intent_id: intent.intent_id.clone(),
+            unit_name: intent.unit.name.clone(),
+            unit_kind: intent.unit.kind.as_str().to_owned(),
+            phase: intent.phase,
+            reason: "an earlier run left this intent pending; a real run of this plan replays it"
+                .to_owned(),
+        })
+        .collect();
+    let total = rows.len();
+    Ok(RowSet::bounded(rows, total, ROOT_ROWS))
+}
+
 /// What one caller asks `barge maintain` for.
 #[derive(Debug, Clone)]
 pub struct MaintainRequest<'a> {
@@ -471,7 +494,11 @@ pub fn maintain(
             candidates,
             plan,
             volumes: RowSet::empty(),
-            pending: RowSet::empty(),
+            // A pending intent is a fact about the state, not about this run's
+            // candidates: a scheduled preview must report it — and so exit `3` —
+            // even when the plan names nothing, because a real run of this plan
+            // replays it.
+            pending: preview_pending(state_paths)?,
             unreached: RowSet::empty(),
         });
     }
@@ -539,7 +566,6 @@ pub fn maintain(
         facts,
         mounts,
         observer,
-        &records,
         &declarations,
         plan,
         digest.to_owned(),
@@ -912,7 +938,6 @@ fn run(
     facts: &dyn VolumeFacts,
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
-    records: &[VolumeRecord],
     declarations: &area::DeclarationSet,
     plan: MaintainPlan,
     digest: String,
@@ -940,10 +965,13 @@ fn run(
             continue;
         }
         // The plan's volume must still be the registered one, with the folder it
-        // planned against. A record that left the registry or moved its
-        // `root_dir` keeps every unit the plan named for it, as that volume
-        // only, and the other volumes still run.
-        let Some(record) = records
+        // planned against. The registry is re-read here, before this volume's
+        // stage, rather than trusted from the run's opening read: a revision that
+        // landed after the run started must not authorise a stale record. A record
+        // that left the registry or moved its `root_dir` keeps every unit the plan
+        // named for it, as that volume only, and the other volumes still run.
+        let fresh = read_registry(state_paths)?;
+        let Some(record) = fresh
             .iter()
             .find(|record| record.volume_uuid.as_str() == volume_plan.volume_uuid)
         else {
@@ -1805,7 +1833,7 @@ mod tests {
         self, ConclusionClosure, ConclusionOutcome, KeptReason, NestedScope, OwnedRoot,
         PrunePolicy, RootKind, RootSpec,
     };
-    use crate::contract::{RowSet, ROOT_ROWS};
+    use crate::contract::{RowSet, INTENT_ROWS, ROOT_ROWS};
     use crate::delete::DeleteBounds;
     use crate::digest::sha256_hex;
     use crate::error::ErrorKind;
@@ -3524,6 +3552,36 @@ mod tests {
             true,
         );
         assert_eq!(outcome.areas.len(), volume_plan.areas.rows.len());
+    }
+
+    #[test]
+    fn a_preview_reports_a_pending_intent_it_will_not_replay() {
+        let harness = Harness::new("maintain-preview-pending");
+        let root = harness.create_root(RootKind::AreaRoot);
+        std::os::unix::fs::symlink("/elsewhere", root.path.join("link")).expect("the link");
+        let preview = harness.preview();
+        let first = harness.real(&preview).expect("the run reports");
+        assert_eq!(first.pending.count, 1);
+
+        // A scheduled run previews and nothing else. The intent an earlier run left
+        // pending is a fact about the state, so the preview names it and the
+        // document forces exit 3 — even though this preview changes nothing and
+        // replays nothing.
+        let second = harness.preview();
+        assert!(second.preview);
+        assert_eq!(second.pending.count, 1, "{second:?}");
+        assert_eq!(
+            second.pending.rows[0].intent_id,
+            first.pending.rows[0].intent_id
+        );
+        assert!(second.needs_human(), "{second:?}");
+        // The plan still names no effect: the pending intent is settled by a real
+        // run, not by the preview's document.
+        assert_eq!(second.candidates, 0, "{second:?}");
+        let intents = state::read_intents(&harness.fixture.state, INTENT_ROWS)
+            .expect("the intents are readable");
+        assert_eq!(intents.records.len(), 1, "the preview journalled nothing");
+        assert_eq!(intents.records[0].phase, first.pending.rows[0].phase);
     }
 
     #[test]

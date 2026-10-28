@@ -2397,7 +2397,12 @@ Choices S7 made where this design left the mechanic to the slice:
   stage as a skipped row carrying the stop reason. Its rows are never dropped with
   the error, and the stages it did not reach are reported as kept. A volume whose
   scratch stage cannot even open is reported in full — every planned unit kept,
-  with the unreached stage counted — and the run stops there.
+  with the unreached stage counted — and the run stops there. The registry record
+  is read again immediately before each volume's stage, never trusted from the
+  run's opening read, so a revision that landed after the run started keeps that
+  volume's units instead of authorising the stale record. A preview names every
+  intent an earlier run left pending, so the document forces exit `3` and the host
+  job runs the real step to replay it even when the plan names no candidate.
 - **Exit codes.** `0` completed, including a partial completion with nothing
   pending. A `3` that still reports a plan is a completed run: the host job's
   contract keeps the `3` on record and still performs the authorized real step for

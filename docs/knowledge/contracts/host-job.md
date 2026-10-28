@@ -38,9 +38,12 @@ reported as that unit only while the rest of the plan still runs.
    `barge.maintain/1` document with `ok: true` **completed**: `data.candidates`
    and `data.plan_digest` are its report. A preview that prints a
    `barge.error/1` document refused or could not report, and nothing was planned.
-2. **Only** when the preview printed a plan document and `data.candidates` is
-   greater than zero, run the real step once, passing that preview's exact bytes
-   (`--plan`) and its `data.plan_digest` (`--plan-sha256`).
+2. **Only** when the preview printed a plan document, run the real step once when
+   it names work: `data.candidates` is greater than zero, or `data.pending.count`
+   is greater than zero, because a real run of that plan replays what an earlier
+   run left pending and does nothing else. Pass that preview's exact bytes
+   (`--plan`) and its `data.plan_digest` (`--plan-sha256`). A preview with neither
+   candidates nor a pending intent changes nothing, so the job runs no real step.
 3. Record the real step's exit code. Never retry it, never loop, never run it
    twice, and never run it with a digest from an earlier day's preview.
 4. Exit with the worse of the two recorded codes, so a loud absence is never
@@ -53,8 +56,9 @@ The distinction in step 1 is what lets one volume's absence be loud without
 stopping the other volumes' work: an absent **permanent** volume makes the
 preview exit `3` while it still reports an authorized plan for the volumes that
 are attached, so the job performs that authorized real step and records the `3`.
-A pending intent is finished by the next scheduled real run's own replay, not by
-a retry inside the same night.
+A pending intent is reported by the preview — never silently: the document names
+it in `data.pending` and forces exit `3` even when the plan names no candidate —
+and it is finished by that same night's real run's own replay, not by a retry.
 
 ## Exit codes and what the job records
 
