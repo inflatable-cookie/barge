@@ -1567,6 +1567,9 @@ pub(crate) enum StatedCall {
     /// The call answers `ESRCH`, as the read of a descriptor that closed between
     /// the two calls does.
     Closed,
+    /// The call fails with this errno, as a read the platform cannot explain
+    /// does. `EPERM` is stated as [`Hidden`](Self::Hidden).
+    Failed(i32),
 }
 
 /// The pair of per-fd answers a test states for one vnode descriptor.
@@ -2388,10 +2391,11 @@ enum DescriptorReading {
 /// `ENOENT`, which is a disagreement and refuses. Every other pairing is
 /// unreadable and refuses: a readable path with vnode facts that report the vnode
 /// gone, a readable path with facts the platform hides, `ENOENT` from one read
-/// with `EPERM` or a closed answer from the other, and any path failure that is
-/// not the hidden answer. A path read that reports the descriptor closed is
-/// positively gone too, so the facts are not read: there is no second answer to
-/// pair.
+/// with `EPERM` or a closed answer from the other, a hidden path beside a closed
+/// answer, and a path read that failed for any reason but the hidden answer —
+/// which a closed vnode-facts answer never carries. A path read that reports the
+/// descriptor closed is positively gone too, so the facts are not read: there is
+/// no second answer to pair.
 fn read_descriptor(
     pid: u32,
     descriptor: i32,
@@ -2402,6 +2406,9 @@ fn read_descriptor(
         Some(StatedCall::Hidden) => {
             DescriptorPath::Failed(io::Error::from_raw_os_error(libc::EPERM))
         }
+        Some(StatedCall::Failed(errno)) => {
+            DescriptorPath::Failed(io::Error::from_raw_os_error(errno))
+        }
         Some(StatedCall::Closed) => DescriptorPath::Closed,
         Some(StatedCall::Real) | None => descriptor_path(pid, descriptor),
     };
@@ -2411,6 +2418,9 @@ fn read_descriptor(
     let facts = match stated.map(StatedVnodeRead::facts_call) {
         Some(StatedCall::Absent) => VnodeFacts::Absent,
         Some(StatedCall::Hidden) => VnodeFacts::Hidden,
+        Some(StatedCall::Failed(errno)) => {
+            VnodeFacts::Unreadable(io::Error::from_raw_os_error(errno))
+        }
         Some(StatedCall::Closed) => VnodeFacts::Closed,
         Some(StatedCall::Real) | None => descriptor_vnode_facts(pid, descriptor),
     };
@@ -2418,14 +2428,6 @@ fn read_descriptor(
         VnodeFacts::Unreadable(error) => return Err(unreadable_descriptors(pid, &error)),
         other => other,
     };
-    // The vnode facts reporting the descriptor closed means it closed between the
-    // two reads: it holds nothing, so it is positively gone rather than a
-    // disagreement. A path read that answered `ENOENT` is not carried by that —
-    // one read reporting the vnode gone beside a closed answer stays a
-    // disagreement — so it is decided by the pairing below.
-    if matches!(facts, VnodeFacts::Closed) && !matches!(path, DescriptorPath::Absent) {
-        return Ok(DescriptorReading::Closed);
-    }
     match (path, facts) {
         // Both reads agree: the descriptor is placeable.
         (DescriptorPath::Path(path), VnodeFacts::Readable) => Ok(DescriptorReading::Path(path)),
@@ -2438,11 +2440,22 @@ fn read_descriptor(
         {
             Ok(DescriptorReading::Opaque)
         }
-        // A path failure that is not the hidden answer is unknown at once: the
-        // vnode facts cannot explain it.
+        // A path read that failed for any reason but the hidden answer is unknown
+        // at once, and the vnode facts never explain it: not even a closed answer
+        // carries it, because the two reads disagree about the descriptor.
         (DescriptorPath::Failed(error), _) if error.raw_os_error() != Some(libc::EPERM) => {
             Err(unreadable_descriptors(pid, &error))
         }
+        // A hidden path beside a closed answer disagrees in the same way: the
+        // hidden answer is only placeable when the vnode facts hide it too.
+        (path @ DescriptorPath::Failed(_), facts @ VnodeFacts::Closed) => {
+            Err(mixed_reads(pid, descriptor, &path, &facts))
+        }
+        // The vnode facts reporting the descriptor closed means it closed between
+        // the two reads: it holds nothing, so it is positively gone. A path read
+        // that answered `ENOENT` is not carried by that — one read reporting the
+        // vnode gone beside a closed answer stays a disagreement below.
+        (DescriptorPath::Path(_), VnodeFacts::Closed) => Ok(DescriptorReading::Closed),
         // A closed path was returned above; the arm keeps the pair total.
         (DescriptorPath::Closed, _) => Ok(DescriptorReading::Closed),
         // The pair disagrees. Nothing about the descriptor is established, so it

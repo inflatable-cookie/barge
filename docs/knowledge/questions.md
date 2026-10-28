@@ -86,8 +86,8 @@ readable path with readable vnode facts, `ENOENT` from both and `EPERM` from bot
 are an answer; every mixed pair refuses as `Unknown`, including a readable path
 whose vnode facts answer `ENOENT` and a path read that answers `ENOENT` beside a
 closed vnode-facts read. A descriptor that closes between the two reads holds
-nothing, so it is reported closed rather than refused, unless the path read
-answered `ENOENT`. When both reads answer `ENOENT` after a
+nothing, so it is reported closed rather than refused — unless the path read
+answered `ENOENT` or failed, because a closed answer explains neither. When both reads answer `ENOENT` after a
 successful `PROC_PIDLISTFDS`, the scan re-observes that descriptor under
 barge#012's bounded rule, re-reading the pid's kernel identity and rechecking both
 deadlines after the observation and the final identity read, and reports a **dead
