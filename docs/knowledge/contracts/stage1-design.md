@@ -2364,25 +2364,29 @@ Choices S7 made where this design left the mechanic to the slice:
   derived from the current declaration, both before the stage and again under the
   effect lock, so a declaration edited in either window cannot decide the age the
   plan's units are judged by. The volume's **registry generation and durability
-  are re-read before the scratch stage as well as inside every area root's
-  re-verification**: a record that changed (any registry write) or a durability
-  that no longer permits pruning — `kept`, or `undeclared` — keeps every unit the
-  plan named, and `scratch::expire_plan` refuses of its own accord to act on a
-  non-expendable record, so a plan made for an expendable volume can never prune a
-  volume that afterwards says its data is kept. A unit that changed in between — a
+  are re-read before the scratch stage, again inside every scratch unit's own
+  effect window, and inside every area root's re-verification**: a record that
+  changed (any registry write) or a durability that no longer permits pruning —
+  `kept`, or `undeclared` — keeps the units the plan named. The scratch stage's
+  per-unit authorization re-reads the record under the volume lock and compares its
+  generation with the plan's, so a `kept` declaration or a registry write made
+  after the real run started stops the remaining units instead of deleting them;
+  `scratch::expire_plan`, `delete::delete_unit_authorized` and every area root's
+  re-verification refuse a non-expendable record of their own accord, so a plan
+  made for an expendable volume can never prune a volume that afterwards says its
+  data is kept. A unit that changed in between — a
   live hold, a withdrawn delegation or claim, a marker that appeared, a changed
   identity or revision, or a volume whose record left the registry or moved its
   `root_dir` — is kept and reported as that unit (or that volume's units) only,
   and the rest of the plan still runs. A plan whose own bytes do not match
   `--plan-sha256` is a `usage` refusal before any effect: that is the authorization
   itself being unusable, not a unit changing. A plan whose *embedded scratch step*
-  is not self-consistent is caught when that stage is reached; because earlier
-  volumes may already have been maintained, it is a stop reported in
-  `data.stopped` (exit `3`) with that stage's units kept, never an error document
-  that would claim nothing changed. A volume whose record left the registry, whose
-  `root_dir` moved, or which is no longer attached is reported with every unit the
-  plan named for it kept, and the other volumes still run: a permanent volume's
-  absence is loud, an ephemeral volume's is quiet.
+  is not self-consistent is the same kind of refusal: every step is checked before
+  the run applies anything, so it is a `usage` refusal before any effect with
+  nothing changed. A volume whose record left the registry or whose `root_dir`
+  moved is reported **loudly** with every unit the plan named for it kept, and the
+  other volumes still run. An absent volume is reported per its availability: a
+  permanent volume's absence is loud, an ephemeral volume's is quiet.
 - **Exit codes.** `0` completed, including a partial completion with nothing
   pending. A `3` that still reports a plan is a completed run: the host job's
   contract keeps the `3` on record and still performs the authorized real step for
@@ -2395,15 +2399,16 @@ Choices S7 made where this design left the mechanic to the slice:
   goes away between the preview and the effect**: its planned units are kept and
   reported with `loud: false`, while only a permanent volume's absence is loud. A
   volume whose durability is `undeclared` is reported loudly (exit `3`) because
-  expending data is never inferred; a volume declared `kept` is never pruned and is
-  not loud.
+  expending data is never inferred; a volume declared `kept` keeps its units
+  quietly, because an operator's decision to keep data is not a failure. A record
+  that left the registry or moved its `root_dir` between the preview and the effect
+  is loud whatever the volume's availability: that is unknown authority, not a
+  drive that is merely away.
 - **A mid-run error is a stop, not a refusal.** `2` means "refused before any
   effect", which cannot be true once an earlier volume was maintained, so a
   failure inside a real run is reported in `data.stopped`, forces exit `3`, and
   names the unit or stage it stopped on. The affected unit is recorded in that
-  stage's `skipped` rows with the error, and nothing after it is attempted. That
-  includes an inconsistent embedded scratch step, whose units are kept and whose
-  stop is reported in `data.stopped` rather than as an error document.
+  stage's `skipped` rows with the error, and nothing after it is attempted.
 - **The wall clock.** 600 s, with no new effect starting inside the last 30 s.
   The deadline is carried into every stage the run performs, including S4's
   scratch stage and every replay path inside it: `scratch::expire_plan` checks it

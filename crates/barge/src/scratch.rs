@@ -1702,6 +1702,7 @@ pub fn sweep(
         observer,
         &record,
         &plan,
+        record.generation,
         request.delete_bounds,
         request.now_ms,
         None,
@@ -1741,6 +1742,7 @@ pub fn expire_plan(
     observer: &dyn ProcessObserver,
     record: &VolumeRecord,
     plan: &SweepPlan,
+    expected_generation: u64,
     delete_bounds: DeleteBounds,
     now_ms: u64,
     deadline: Option<Instant>,
@@ -1758,39 +1760,23 @@ pub fn expire_plan(
     }
     let digest = plan_digest(plan)?;
 
-    // Only an expendable volume may be pruned. A record that now says `kept` (or
-    // that declares nothing) keeps every planned unit: applying a plan made under
-    // another durability would delete data the volume says is never pruned.
+    // Only an expendable volume may be pruned, and only under the record the plan
+    // was made for. A record that now says `kept` (or declares nothing), or that
+    // has been written since the plan, keeps every planned unit: applying a plan
+    // made under another record would delete data the volume no longer authorizes.
+    if record.generation != expected_generation {
+        let reason = format!(
+            "the volume record changed since the plan (generation {expected_generation} to {}), so the planned unit is kept",
+            record.generation
+        );
+        return Ok(kept_plan_run(record, plan, &digest, &reason));
+    }
     if !record.durability.permits_pruning() {
-        let skipped: Vec<SkippedRow> = plan
-            .candidates
-            .rows
-            .iter()
-            .map(|row| SkippedRow {
-                name: row.name.clone(),
-                scope: row.scope.clone(),
-                reason: format!(
-                    "the volume now declares `{}`, which never permits pruning, so the planned unit is kept",
-                    durability_name(record.durability)
-                ),
-            })
-            .collect();
-        let total = skipped.len();
-        return Ok(ExpireRun {
-            report: ExpireReport {
-                volume_uuid: record.volume_uuid.as_str().to_owned(),
-                volume_present: true,
-                preview: false,
-                plan_digest: digest,
-                plan: plan.clone(),
-                deleted: RowSet::empty(),
-                pending: RowSet::empty(),
-                skipped: RowSet::bounded(skipped, total, ROOT_ROWS),
-                replay: None,
-            },
-            timed_out: false,
-            unreached: 0,
-        });
+        let reason = format!(
+            "the volume now declares `{}`, which never permits pruning, so the planned unit is kept",
+            durability_name(record.durability)
+        );
+        return Ok(kept_plan_run(record, plan, &digest, &reason));
     }
     let root_dir = plan.root_dir.clone();
 
@@ -1994,6 +1980,7 @@ pub fn expire_plan(
                 observer,
                 state_paths,
                 fresh,
+                expected_generation,
                 row,
                 now_ms,
             )
@@ -2143,6 +2130,37 @@ pub fn plan_digest(plan: &SweepPlan) -> Result<String> {
     Ok(sha256_hex(&bytes))
 }
 
+/// Every planned unit kept, with one reason: the record no longer authorizes
+/// pruning this plan.
+fn kept_plan_run(record: &VolumeRecord, plan: &SweepPlan, digest: &str, reason: &str) -> ExpireRun {
+    let skipped: Vec<SkippedRow> = plan
+        .candidates
+        .rows
+        .iter()
+        .map(|row| SkippedRow {
+            name: row.name.clone(),
+            scope: row.scope.clone(),
+            reason: reason.to_owned(),
+        })
+        .collect();
+    let total = skipped.len();
+    ExpireRun {
+        report: ExpireReport {
+            volume_uuid: record.volume_uuid.as_str().to_owned(),
+            volume_present: true,
+            preview: false,
+            plan_digest: digest.to_owned(),
+            plan: plan.clone(),
+            deleted: RowSet::empty(),
+            pending: RowSet::empty(),
+            skipped: RowSet::bounded(skipped, total, ROOT_ROWS),
+            replay: None,
+        },
+        timed_out: false,
+        unreached: 0,
+    }
+}
+
 fn empty_plan(record: &VolumeRecord) -> SweepPlan {
     SweepPlan {
         schema: PLAN_SCHEMA.to_owned(),
@@ -2239,9 +2257,34 @@ fn authorize_under(
     observer: &dyn ProcessObserver,
     state_paths: &StatePaths,
     record: &VolumeRecord,
+    expected_generation: u64,
     row: &PlanRow,
     now_ms: u64,
 ) -> Result<()> {
+    // The record is re-read under the volume lock and the plan was made under one
+    // record: a durability that no longer permits pruning, or any registry write
+    // since the plan, keeps this unit. The snapshot the run started with is not
+    // enough, because either can change while earlier units are deleted.
+    if !record.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "the volume now declares `{}`, which never permits pruning, so the unit is kept",
+                durability_name(record.durability)
+            ),
+        )
+        .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
+    }
+    if record.generation != expected_generation {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "the volume record changed since the plan (generation {expected_generation} to {}), so the unit is kept",
+                record.generation
+            ),
+        )
+        .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
+    }
     let Some(current) = reassess_under(
         dirs,
         facts,
@@ -5052,6 +5095,7 @@ mod tests {
             &observer,
             &harness.fixture.record,
             &preview.plan,
+            harness.fixture.record.generation,
             DeleteBounds {
                 retry_pause: std::time::Duration::ZERO,
                 ..DeleteBounds::default()
@@ -5095,6 +5139,7 @@ mod tests {
             &observer,
             &harness.fixture.record,
             &preview.plan,
+            harness.fixture.record.generation,
             DeleteBounds {
                 retry_pause: std::time::Duration::ZERO,
                 ..DeleteBounds::default()
@@ -5147,6 +5192,7 @@ mod tests {
             &observer,
             &kept_record,
             &preview.plan,
+            harness.fixture.record.generation,
             DeleteBounds {
                 retry_pause: std::time::Duration::ZERO,
                 ..DeleteBounds::default()
@@ -5415,6 +5461,7 @@ mod tests {
             &harness.fixture.observer(),
             &harness.fixture.state,
             &record,
+            record.generation,
             row,
             now,
         )
@@ -6225,6 +6272,7 @@ mod tests {
                 &observer,
                 &harness.fixture.state,
                 &claimed,
+                claimed.generation,
                 &unmarked,
                 now,
             )
@@ -6244,6 +6292,7 @@ mod tests {
             &observer,
             &harness.fixture.state,
             &stricter,
+            stricter.generation,
             &unmarked,
             now,
         )
@@ -6262,6 +6311,7 @@ mod tests {
                 &observer,
                 &harness.fixture.state,
                 &withdrawn,
+                withdrawn.generation,
                 &unmarked,
                 now,
             )
@@ -6291,6 +6341,7 @@ mod tests {
             &observer,
             &harness.fixture.state,
             &claimed,
+            claimed.generation,
             &marked_row,
             now,
         )
@@ -6304,6 +6355,7 @@ mod tests {
                 &observer,
                 &harness.fixture.state,
                 &delegated,
+                delegated.generation,
                 &marked_row,
                 now,
             )
@@ -6321,6 +6373,7 @@ mod tests {
                 &observer,
                 &harness.fixture.state,
                 &claimed,
+                claimed.generation,
                 &wrong_kind,
                 now
             )
@@ -6340,6 +6393,7 @@ mod tests {
                 &observer,
                 &harness.fixture.state,
                 &claimed,
+                claimed.generation,
                 &moved,
                 now,
             )

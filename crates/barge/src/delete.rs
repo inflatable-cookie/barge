@@ -370,6 +370,16 @@ pub(crate) fn delete_unit_authorized(
     // configuration resolves all refuse before a directory or lock exists.
     let record = area::registered_volume(state_paths, &volume_uuid)?;
     record.declared_durability()?;
+    if !record.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "volume {} is declared `{:?}`, which never permits pruning, so nothing is deleted",
+                record.volume_uuid, record.durability
+            ),
+        )
+        .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
+    }
     let volume = area::prepare(
         state_paths,
         dirs,
@@ -438,6 +448,16 @@ pub(crate) fn delete_unit_authorized(
     // record that changed while the plan ran is refused rather than trusted.
     let record = area::registered_volume(state_paths, &volume_uuid)?;
     record.declared_durability()?;
+    if !record.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "volume {} is declared `{:?}`, which never permits pruning, so nothing is deleted",
+                record.volume_uuid, record.durability
+            ),
+        )
+        .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
+    }
     if let Some(authorize) = authorize {
         authorize(&record)?;
     }
