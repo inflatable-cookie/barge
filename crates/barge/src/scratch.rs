@@ -1814,6 +1814,7 @@ pub fn expire_plan(
             },
             timed_out: false,
             unreached: 0,
+            stopped: None,
         });
     }
 
@@ -1823,6 +1824,7 @@ pub fn expire_plan(
     let mut skipped: Vec<SkippedRow> = Vec::new();
     let mut timed_out = false;
     let mut unreached = 0usize;
+    let mut stopped: Option<String> = None;
     // A real run first settles what an earlier run left pending, from the
     // recorded identity only, so the effects below are not blocked by work the
     // run already knows how to finish. A preview never replays, and a run whose
@@ -1890,7 +1892,18 @@ pub fn expire_plan(
                 });
                 continue;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                skipped.push(SkippedRow {
+                    name: row.name.clone(),
+                    scope: row.scope.clone(),
+                    reason: format!("the unit could not be verified again: {error}"),
+                });
+                stopped = Some(format!(
+                    "the stage stopped while re-verifying {}: {error}",
+                    row.name
+                ));
+                break;
+            }
         };
         let Some(fresh) = fresh else {
             skipped.push(SkippedRow {
@@ -2030,7 +2043,18 @@ pub fn expire_plan(
                     reason: error.to_string(),
                 });
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                skipped.push(SkippedRow {
+                    name: row.name.clone(),
+                    scope: row.scope.clone(),
+                    reason: format!("the unit's effect failed: {error}"),
+                });
+                stopped = Some(format!(
+                    "the stage stopped while deleting {}: {error}",
+                    row.name
+                ));
+                break;
+            }
         }
         // An effect that finished past the caller's clock is still this run's
         // work — it is in `deleted` or `pending` — but the run did not finish
@@ -2062,6 +2086,7 @@ pub fn expire_plan(
         },
         timed_out,
         unreached,
+        stopped,
     })
 }
 
@@ -2097,6 +2122,9 @@ pub struct ExpireRun {
     pub timed_out: bool,
     /// How many planned candidates were never attempted because of it.
     pub unreached: usize,
+    /// Why the stage stopped before its last candidate, if it did: a failure that
+    /// is not one unit's refusal. The rows above are the work already done.
+    pub stopped: Option<String>,
 }
 
 /// A refusal that concerns one unit and must not abort the sweep or a maintain
@@ -2158,6 +2186,7 @@ fn kept_plan_run(record: &VolumeRecord, plan: &SweepPlan, digest: &str, reason: 
         },
         timed_out: false,
         unreached: 0,
+        stopped: None,
     }
 }
 

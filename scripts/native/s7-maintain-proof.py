@@ -53,6 +53,7 @@ import hashlib
 import json
 import os
 import plistlib
+import re
 import pwd
 import shutil
 import subprocess
@@ -1136,13 +1137,13 @@ def diskutil_info(mount, env):
 
 PREMISE_TRACE = [
     ("a private HOME, CARGO_HOME and state directory", "setup", "self.env sets HOME, CARGO_HOME and BARGE_STATE_DIR under the run root"),
-    ("the fixture account home and an unchanged real state", "premise_2", "real_state_observation before and after, and child_environment_problems"),
+    ("the fixture account home and an unchanged real state", "setup + inner_half", "real_state_observation before in Proof.setup and after in inner_half, and child_environment_problems"),
     ("environment isolation", "setup", "TMPDIR, TMP and TEMP are the run root; BARGE_STATE_DIR is the fixture state"),
     ("explicit adoption only", "setup", "register() writes the three records and declare_area() declares the area by command"),
     ("the owned image", "create_image", "-owners on at attach, one ordinary detach in cleanup, no force path in this script"),
     ("every environment hook is listed", "self_check", "environment_inventory_problems over this script's sources"),
     ("temporary storage inside the owned root", "setup", "tempfile.mkdtemp with dir=the run root, which is inside TMPDIR"),
-    ("mktemp -d for every fixture directory", "all cases", "root creation uses tempfile.mkdtemp; no fixed path"),
+    ("mktemp -d for every fixture directory", "setup + create_image", "root creation uses tempfile.mkdtemp under TMPDIR; no fixed path"),
     ("the pinned supervisor, and no second harness", "main", "the outer half verifies the pinned digest and execs it"),
 ]
 
@@ -1155,10 +1156,38 @@ def premise_trace():
     ]
 
 
+def premise_body_problems():
+    """Every premise names a body that exists, so a trace cannot drift.
+
+    A body is a module function, a `Proof` method, or a ` + `-joined list of
+    either. `all cases` is the one alias, and it must resolve to every dispatched
+    case method.
+    """
+    problems = []
+    for premise, body, _assertion in PREMISE_TRACE:
+        for token in re.split(r"\s*\+\s*", body):
+            token = token.strip()
+            if not token:
+                problems.append(f"the premise {premise!r} names an empty body")
+            elif token == "all cases":
+                missing = [
+                    name for name, _ in CASES if not callable(getattr(Proof, f"case_{name}", None))
+                ]
+                if missing:
+                    problems.append(f"the premise {premise!r} names all cases, missing {missing}")
+            elif token.startswith("Proof."):
+                if not callable(getattr(Proof, token[len("Proof."):], None)):
+                    problems.append(f"the premise {premise!r} names `{token}`, which does not exist")
+            elif not (callable(globals().get(token)) or callable(getattr(Proof, token, None))):
+                problems.append(f"the premise {premise!r} names `{token}`, which does not exist")
+    return problems
+
+
 def preflight_problems():
     problems = []
     if len(PREMISE_TRACE) != 9 or len(PREMISES) != 9:
         problems.append("the premise record does not name nine premises")
+    problems.extend(premise_body_problems())
     # The ownership oracle is pure: state each answer setup must accept or refuse.
     for text, expected in (
         ("Owners: Enabled", "enabled"),

@@ -1059,6 +1059,9 @@ fn run(
             if run.timed_out {
                 timed_out = true;
             }
+            // A stage that stopped mid-way keeps the rows it earned: the units it
+            // deleted, the intents it left pending and the unit that failed.
+            let stage_stopped = run.stopped.clone();
             if run.unreached > 0 {
                 unreached.push(UnreachedRow {
                     volume_uuid: volume_plan.volume_uuid.clone(),
@@ -1074,6 +1077,20 @@ fn run(
                 skipped: run.report.skipped,
                 replay: run.report.replay,
             });
+            if let Some(reason) = stage_stopped {
+                // The stage stopped on a failure that is not one unit's refusal.
+                // Its own rows stay in the report; the areas it never reached are
+                // kept, and the run stops here with exit 3.
+                outcome.detail = Some(reason.clone());
+                stopped = Some(reason);
+                fill_remaining_areas(
+                    &mut outcome,
+                    volume_plan,
+                    "the run stopped before this area, so the planned unit is kept",
+                );
+                volumes.push(outcome);
+                break 'volumes;
+            }
             if timed_out {
                 // No further effect may start. The areas of this volume the run
                 // did not reach are reported, with counts, and the other volumes
@@ -3276,6 +3293,51 @@ mod tests {
             stage.skipped.rows
         );
         assert_eq!(report.pending.count, 0);
+    }
+
+    #[test]
+    fn a_scratch_stage_that_stops_keeps_the_rows_it_earned() {
+        let harness = Harness::new("maintain-scratch-stage-stops");
+        let first = harness.scratch_root("alpha", "owner");
+        harness.conclude_and_release(&first, "owner");
+        let second = harness.scratch_root("beta", "owner");
+        harness.conclude_and_release(&second, "owner");
+        let preview = harness.preview();
+        let rows = &preview.plan.volumes.rows[0]
+            .scratch
+            .as_ref()
+            .expect("a scratch step")
+            .plan
+            .candidates
+            .rows;
+        assert_eq!(rows.len(), 2, "two candidates are planned");
+        let failing = rows[1].name.clone();
+
+        // The second unit's effect fails in a way that is not that unit's refusal:
+        // the stage stops there. The first unit's deletion is already this run's
+        // work, so it stays in the report instead of being dropped with the error.
+        let mut faults = Faults::new();
+        faults.failing_facts_at(&failing, 1);
+        let report = harness
+            .real_with(&faults, harness.aged(), &preview)
+            .expect("the run reports instead of refusing");
+        let stopped = report.stopped.as_deref().expect("the stop is reported");
+        assert!(stopped.contains("the stage stopped"), "{stopped}");
+        assert!(report.needs_human());
+        let stage = report.volumes.rows[0]
+            .scratch
+            .as_ref()
+            .expect("the stage is reported");
+        assert_eq!(stage.deleted.count, 1, "the first deletion is kept");
+        assert_eq!(stage.deleted.rows[0].name, rows[0].name);
+        assert_eq!(stage.skipped.count, 1, "the failing unit is reported");
+        assert_eq!(stage.skipped.rows[0].name, failing);
+        assert!(!Path::new(&stage.deleted.rows[0].path).exists());
+        // The area stage, which the stop never reached, is kept.
+        assert!(report.volumes.rows[0]
+            .areas
+            .iter()
+            .all(|area| area.deleted.count == 0));
     }
 
     #[test]
