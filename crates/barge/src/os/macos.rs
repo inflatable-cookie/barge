@@ -1344,43 +1344,44 @@ impl MacOs {
             ));
         }
         let stated = stated_vnode_read(faults, pid, vnode_index);
-        let observed = match read_descriptor(pid, descriptor, stated) {
+        let reading = read_descriptor(pid, descriptor, stated);
+        // The identity is re-read after the second observation whatever it
+        // answered, so the two reads bracket the observation: a descriptor
+        // observed around an identity change is not evidence about the classified
+        // process, whether its answer is dead or not, and the answer is never
+        // accepted from a pid that now names another process.
+        match self.reobserve_identity(pid, faults) {
+            Ok(Some(after))
+                if after.identity.start == classified.start
+                    && after.identity.effective_uid == classified.effective_uid => {}
+            Ok(Some(after)) => {
+                return Observed::Unreadable(dead_identity_changed(
+                    pid,
+                    descriptor,
+                    classified,
+                    after.identity,
+                    "around the dead descriptor's re-observation",
+                ))
+            }
+            // Gone after the second observation: nothing it held is open.
+            Ok(None) => return accept(Observed::Closed),
+            Err(error) => {
+                return Observed::Unreadable(dead_identity_unreadable(pid, descriptor, &error))
+            }
+        }
+        let observed = match reading {
             Ok(DescriptorReading::Path(path)) => Observed::Path(path),
             Ok(DescriptorReading::Closed) => Observed::Closed,
             Ok(DescriptorReading::Opaque) => Observed::Opaque,
             Err(error) => Observed::Unreadable(error.message().to_owned()),
-            // Still dead for the classified identity: the persisted answer is a
-            // dead handle, and the identity is re-read after that observation so
-            // a process that changed underneath it is never recorded.
-            Ok(DescriptorReading::Dead) => {
-                match self.reobserve_identity(pid, faults) {
-                    Ok(Some(after))
-                        if after.identity.start == classified.start
-                            && after.identity.effective_uid == classified.effective_uid => {}
-                    Ok(Some(after)) => {
-                        return Observed::Unreadable(dead_identity_changed(
-                            pid,
-                            descriptor,
-                            classified,
-                            after.identity,
-                            "around the dead descriptor's re-observation",
-                        ))
-                    }
-                    // Gone after the second observation: nothing it held is open.
-                    Ok(None) => return accept(Observed::Closed),
-                    Err(error) => {
-                        return Observed::Unreadable(dead_identity_unreadable(
-                            pid, descriptor, &error,
-                        ))
-                    }
-                }
-                Observed::Dead(DeadHandle {
-                    pid,
-                    start: classified.start,
-                    descriptor,
-                    command: before.command,
-                })
-            }
+            // Still dead for the classified identity, which was just re-read: it
+            // is a dead handle, never a skip.
+            Ok(DescriptorReading::Dead) => Observed::Dead(DeadHandle {
+                pid,
+                start: classified.start,
+                descriptor,
+                command: before.command,
+            }),
         };
         // The second observation and the final identity read are done, so the
         // answer is accepted only if both deadlines still hold after them.
@@ -1394,17 +1395,27 @@ impl MacOs {
     fn reobserve_identity(
         &self,
         pid: u32,
-        faults: &[StatedListing],
+        faults: &mut [StatedListing],
     ) -> Result<Option<KinfoProcess>> {
         let Some(mut now) = kinfo_process(pid)? else {
             return Ok(None);
         };
-        if let Some(stated) = faults.iter().find(|stated| stated.pid == pid) {
-            if let Some(start) = stated.start {
-                now.identity.start = start;
-            }
-            if let Some(uid) = stated.uid {
-                now.identity.effective_uid = Some(uid);
+        if let Some(stated) = faults.iter_mut().find(|stated| stated.pid == pid) {
+            stated.identity_reads = stated.identity_reads.saturating_add(1);
+            // A stated identity applies to every read unless a test says how many
+            // reads report the classified identity first, which is how an identity
+            // that changes *between* the two reads bracketing one observation is
+            // exercised.
+            let applies = stated
+                .start_after
+                .is_none_or(|after| stated.identity_reads > after);
+            if applies {
+                if let Some(start) = stated.start {
+                    now.identity.start = start;
+                }
+                if let Some(uid) = stated.uid {
+                    now.identity.effective_uid = Some(uid);
+                }
             }
         }
         Ok(Some(now))
@@ -1541,6 +1552,13 @@ pub(crate) struct StatedListing {
     pub(crate) start: Option<u64>,
     /// An effective uid the re-observation reports instead of the kernel's.
     pub(crate) uid: Option<u32>,
+    /// How many identity reads of this pid report the kernel's own answer before
+    /// `start` and `uid` apply. `None` applies them to every read, which is how
+    /// the reused-pid and foreign-uid cases are stated; a count is how an identity
+    /// that changes between the two reads of one re-observation is stated.
+    pub(crate) start_after: Option<usize>,
+    /// How many identity reads this pid has had, counted by the scan itself.
+    pub(crate) identity_reads: usize,
     /// The answer a test states for one of this process's vnode descriptors, by
     /// its index among them, instead of reading the descriptor for real. They
     /// stand for the per-fd answers that make a descriptor opaque or dead; every
@@ -2390,12 +2408,13 @@ enum DescriptorReading {
 /// is reported closed whichever read saw it, unless the path read answered
 /// `ENOENT`, which is a disagreement and refuses. Every other pairing is
 /// unreadable and refuses: a readable path with vnode facts that report the vnode
-/// gone, a readable path with facts the platform hides, `ENOENT` from one read
+/// gone, a readable path with facts the platform hides, a path read that reports
+/// the descriptor closed beside anything but a closed vnode-facts read (a closed
+/// answer is never carried by whatever the second read then reports, and that
+/// second read can still find the vnode gone or fail), `ENOENT` from one read
 /// with `EPERM` or a closed answer from the other, a hidden path beside a closed
 /// answer, and a path read that failed for any reason but the hidden answer —
-/// which a closed vnode-facts answer never carries. A path read that reports the
-/// descriptor closed is positively gone too, so the facts are not read: there is
-/// no second answer to pair.
+/// which a closed vnode-facts answer never carries.
 fn read_descriptor(
     pid: u32,
     descriptor: i32,
@@ -2412,9 +2431,6 @@ fn read_descriptor(
         Some(StatedCall::Closed) => DescriptorPath::Closed,
         Some(StatedCall::Real) | None => descriptor_path(pid, descriptor),
     };
-    if matches!(path, DescriptorPath::Closed) {
-        return Ok(DescriptorReading::Closed);
-    }
     let facts = match stated.map(StatedVnodeRead::facts_call) {
         Some(StatedCall::Absent) => VnodeFacts::Absent,
         Some(StatedCall::Hidden) => VnodeFacts::Hidden,
@@ -2451,13 +2467,16 @@ fn read_descriptor(
         (path @ DescriptorPath::Failed(_), facts @ VnodeFacts::Closed) => {
             Err(mixed_reads(pid, descriptor, &path, &facts))
         }
+        // Both reads agree the descriptor closed between them: it holds nothing,
+        // so it is positively gone. One closed answer beside any other answer is
+        // a disagreement below — a closed path read is never carried by whatever
+        // the second read then reports.
+        (DescriptorPath::Closed, VnodeFacts::Closed) => Ok(DescriptorReading::Closed),
         // The vnode facts reporting the descriptor closed means it closed between
         // the two reads: it holds nothing, so it is positively gone. A path read
         // that answered `ENOENT` is not carried by that — one read reporting the
         // vnode gone beside a closed answer stays a disagreement below.
         (DescriptorPath::Path(_), VnodeFacts::Closed) => Ok(DescriptorReading::Closed),
-        // A closed path was returned above; the arm keeps the pair total.
-        (DescriptorPath::Closed, _) => Ok(DescriptorReading::Closed),
         // The pair disagrees. Nothing about the descriptor is established, so it
         // is unknown and never a dead handle.
         (path, facts) => Err(mixed_reads(pid, descriptor, &path, &facts)),

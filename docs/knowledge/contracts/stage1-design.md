@@ -1676,21 +1676,24 @@ Choices S5 made where this design left the mechanic to the slice:
   and proved: both of a vnode descriptor's per-fd reads are evaluated, and only
   three pairings are an answer — a readable path with readable vnode facts,
   `ENOENT` from both flavors, and `EPERM` from both. A descriptor that closed
-  between the two reads holds nothing, so it is reported closed whichever read saw
-  it — descriptors close while a scan reads them, and refusing that would make an
-  ordinary close a refusal — but a closed answer explains nothing else: a path
-  read that answered `ENOENT`, or failed for any reason including the hidden
-  answer, beside a closed vnode-facts read is still a disagreement and refuses.
-  Every other pairing is unreadable and refuses, including a path that is
-  readable while the vnode facts answer `ENOENT`, `ENOENT` from one read with
-  `EPERM` from the other, and a path read that failed for any reason but the
-  hidden answer, which no closed vnode-facts answer carries. Only `ENOENT` from **both** flavors makes a dead-handle candidate. The
+  between the two reads holds nothing, so it is reported closed when **both** reads
+  report it closed — descriptors close while a scan reads them, and refusing that
+  would make an ordinary close a refusal — and one closed answer beside any other
+  answer is a disagreement: a closed path read is never carried by whatever the
+  second read then reports, and that second read can still find the vnode gone,
+  find it hidden, read it, or fail. Both reads are therefore always made, even
+  when the first reports the descriptor closed. Every other pairing is unreadable
+  and refuses, including a path that is readable while the vnode facts answer
+  `ENOENT`, `ENOENT` from one read with `EPERM` from the other, and a path read
+  that failed for any reason but the hidden answer, which a closed vnode-facts
+  answer never carries. Only `ENOENT` from **both** flavors makes a dead-handle candidate. The
   candidate is then re-observed under barge#012's bounded rule — the first
   backoff of the same schedule, inside the same settle window and the scan's own
   deadline — with the pid's kernel identity re-read before and after the second
-  observation, and both deadlines rechecked when that observation and the final
-  identity read complete, so a slow kernel read cannot carry a settled answer
-  past either bound. It is recorded as a dead handle only when that identity is
+  observation whatever that observation answers, so a process that changed
+  underneath it never has any settled answer accepted, and both deadlines
+  rechecked when that observation and the final identity read complete, so a slow
+  kernel read cannot carry a settled answer past either bound. It is recorded as a dead handle only when that identity is
   the classified start identity and effective uid both times, both bounds still
   hold, and the second observation still answers `ENOENT` to both flavors: the
   scan records pid, start identity, descriptor and command, and does not block.
@@ -1773,9 +1776,12 @@ Choices S5 made where this design left the mechanic to the slice:
   `EPERM`, `EPERM` from the path read while the vnode facts answer `ENOENT`,
   `ENOENT` from the path read while the vnode facts report the descriptor closed,
   `EIO` from the path read while the vnode facts report it closed, `EPERM` from
-  the path read while the vnode facts report it closed, and `EIO` from the vnode
-  facts read are all `unknown`; a descriptor that closes between the two reads is
-  `safe` and not recorded, because it holds nothing. A read-only real-observer case
+  the path read while the vnode facts report it closed, `EIO` from the vnode
+  facts read, and a closed path read beside `ENOENT`, `EPERM` or readable facts
+  are all `unknown`; a descriptor whose two reads both report it closed is `safe`
+  and not recorded, because it holds nothing. An identity that changes after a
+  second observation which answered a real path — not a dead one — is `unknown`,
+  which is the bracket every settled answer is now held to. A read-only real-observer case
   classifies a live same-uid process of this host that really holds a dead vnode,
   and states the same fact when the host has none at test time. The deadline
   checks are also unit-tested on their own: a projection
