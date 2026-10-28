@@ -1092,9 +1092,24 @@ fn run(
 
         // A volume that went away between the plan and this run keeps every unit
         // the plan named for it, reports why, and leaves the other volumes alone.
+        // Any other failure here is mid-run: earlier volumes — and this volume's
+        // scratch stage — may already have been maintained, so it is a stop
+        // reported in `data.stopped` (exit `3`), never a refusal document.
         if let Err(error) = area::VolumeRoot::open(dirs, facts, mounts, record) {
             if error.kind() != ErrorKind::VolumeAbsent {
-                return Err(error);
+                fill_kept(
+                    &mut outcome,
+                    volume_plan,
+                    &format!(
+                        "volume {} could not be verified again before its areas; every unit the plan named for it that was not already handled is kept ({error})",
+                        record.volume_uuid
+                    ),
+                    &mut unreached,
+                    is_loud(volume_plan),
+                );
+                stopped = outcome.detail.clone();
+                volumes.push(outcome);
+                break 'volumes;
             }
             fill_unmaintainable(
                 &mut outcome,
@@ -1429,6 +1444,12 @@ fn fill_unmaintainable(
     outcome.detail = Some(reason.to_owned());
     outcome.loud = loud;
 
+    // A stage that already ran keeps its own rows: a mid-run absence must never
+    // restate units it deleted as kept.
+    if outcome.scratch.is_some() {
+        fill_remaining_areas(outcome, volume_plan, reason);
+        return;
+    }
     if let Some(step) = &volume_plan.scratch {
         let skipped: Vec<scratch::SkippedRow> = step
             .plan
@@ -1476,6 +1497,10 @@ fn fill_kept(
 ) {
     outcome.detail = Some(reason.to_owned());
     outcome.loud = loud;
+    if outcome.scratch.is_some() {
+        fill_remaining_areas(outcome, volume_plan, reason);
+        return;
+    }
     if let Some(step) = &volume_plan.scratch {
         let skipped: Vec<scratch::SkippedRow> = step
             .plan
@@ -1523,6 +1548,31 @@ fn fill_kept(
 /// An ephemeral volume that is away — at preview or mid-run — is reported quietly.
 const fn is_loud(volume_plan: &VolumePlan) -> bool {
     volume_plan.loud || matches!(volume_plan.availability, Availability::Permanent)
+}
+
+/// Append kept rows for the area stages this volume has not reported yet, so a
+/// mid-run stop never duplicates or rewrites a stage that already ran.
+fn fill_remaining_areas(outcome: &mut VolumeOutcome, volume_plan: &VolumePlan, reason: &str) {
+    let reported: Vec<(String, String)> = outcome
+        .areas
+        .iter()
+        .map(|stage| (stage.namespace.clone(), stage.area.clone()))
+        .collect();
+    for area_plan in &volume_plan.areas.rows {
+        if reported
+            .iter()
+            .any(|(namespace, area)| namespace == &area_plan.namespace && area == &area_plan.area)
+        {
+            continue;
+        }
+        outcome.areas.push(AreaPruneOutcome {
+            namespace: area_plan.namespace.clone(),
+            area: area_plan.area.clone(),
+            deleted: RowSet::empty(),
+            skipped: all_skipped(area_plan, reason),
+            pending: RowSet::empty(),
+        });
+    }
 }
 
 /// Every planned candidate of one area, kept with one reason.
@@ -1694,13 +1744,14 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        canonical_plan_bytes, maintain, MaintainBounds, MaintainReport, MaintainRequest,
-        VolumeState,
+        canonical_plan_bytes, fill_unmaintainable, maintain, MaintainBounds, MaintainReport,
+        MaintainRequest, ScratchOutcome, VolumeOutcome, VolumeState,
     };
     use crate::area::{
         self, ConclusionClosure, ConclusionOutcome, KeptReason, NestedScope, OwnedRoot,
         PrunePolicy, RootKind, RootSpec,
     };
+    use crate::contract::{RowSet, ROOT_ROWS};
     use crate::delete::DeleteBounds;
     use crate::digest::sha256_hex;
     use crate::error::ErrorKind;
@@ -3225,6 +3276,112 @@ mod tests {
             stage.skipped.rows
         );
         assert_eq!(report.pending.count, 0);
+    }
+
+    #[test]
+    fn a_mid_run_volume_change_is_a_stop_not_a_refusal() {
+        let harness = Harness::new("maintain-volume-change-mid-run");
+        let scratch_root = harness.scratch_root("alpha", "owner");
+        harness.conclude_and_release(&scratch_root, "owner");
+        let area_root = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        assert_eq!(preview.candidates, 2);
+
+        // The volume changes identity as the scratch deletion renames its unit, so
+        // the scratch stage stops with a pending intent and the *area* stage's
+        // re-verification then fails. That is mid-run: the run must report a stop in
+        // `data.stopped` (exit 3), never a refusal document.
+        let facts = harness.fixture.facts_shared();
+        let faults = Faults::new().shifting_volume(facts.clone());
+        let report = maintain(
+            &harness.fixture.state,
+            &faults,
+            &*facts,
+            &harness.fixture.mounts(),
+            &harness.fixture.observer(),
+            &harness.request(
+                false,
+                Some(&preview.plan_digest),
+                Some(&canonical(&preview)),
+                harness.aged(),
+            ),
+        )
+        .expect("the run reports instead of refusing");
+        let stopped = report.stopped.as_deref().expect("the stop is reported");
+        assert!(stopped.contains("could not be verified again"), "{stopped}");
+        assert!(report.needs_human());
+        assert_eq!(report.volumes.count, 1);
+        // The area stage never ran, so its planned unit is kept.
+        let areas = &report.volumes.rows[0].areas;
+        assert!(
+            areas.iter().all(|area| area.deleted.count == 0),
+            "{areas:?}"
+        );
+        assert!(area_root.path.is_dir(), "the planned root is kept");
+    }
+
+    #[test]
+    fn a_mid_run_absence_never_restates_a_scratch_stage_that_already_ran() {
+        // The helper is the fix's boundary: a stage that already deleted a unit must
+        // keep its own rows when absence is reported afterwards.
+        let harness = Harness::new("maintain-absence-preserves-stage");
+        let preview = harness.preview();
+        let volume_plan = &preview.plan.volumes.rows[0];
+        let mut outcome = VolumeOutcome {
+            volume_uuid: volume_plan.volume_uuid.clone(),
+            state: VolumeState::Present,
+            loud: false,
+            detail: None,
+            scratch: Some(ScratchOutcome {
+                plan_digest: "a".repeat(64),
+                deleted: RowSet::bounded(
+                    vec![scratch::DeletedRow {
+                        name: "deleted-unit".to_owned(),
+                        scope: scratch::UnitScope::TopLevel,
+                        family: scratch::UnitFamily::Native,
+                        path: PathBuf::from("/deleted-unit"),
+                        intent_id: "1".repeat(32),
+                        entries_removed: 1,
+                        directories_removed: 2,
+                        marker_removed: true,
+                    }],
+                    1,
+                    ROOT_ROWS,
+                ),
+                pending: RowSet::empty(),
+                skipped: RowSet::empty(),
+                replay: None,
+            }),
+            areas: Vec::new(),
+        };
+        fill_unmaintainable(
+            &mut outcome,
+            volume_plan,
+            "volume is not attached any more",
+            true,
+        );
+        let stage = outcome.scratch.as_ref().expect("the stage is kept");
+        assert_eq!(stage.deleted.count, 1, "the deletion is still reported");
+        assert_eq!(stage.deleted.rows[0].name, "deleted-unit");
+        assert!(outcome.loud);
+        assert_eq!(
+            outcome.detail.as_deref(),
+            Some("volume is not attached any more")
+        );
+        // The area stage, which never ran, is reported as kept.
+        assert_eq!(outcome.areas.len(), volume_plan.areas.rows.len());
+        assert!(outcome
+            .areas
+            .iter()
+            .all(|area| area.deleted.count == 0 && area.skipped.count <= 1));
+        // Calling it again never duplicates a stage.
+        fill_unmaintainable(
+            &mut outcome,
+            volume_plan,
+            "volume is not attached any more",
+            true,
+        );
+        assert_eq!(outcome.areas.len(), volume_plan.areas.rows.len());
     }
 
     #[test]

@@ -2386,7 +2386,11 @@ Choices S7 made where this design left the mechanic to the slice:
   nothing changed. A volume whose record left the registry or whose `root_dir`
   moved is reported **loudly** with every unit the plan named for it kept, and the
   other volumes still run. An absent volume is reported per its availability: a
-  permanent volume's absence is loud, an ephemeral volume's is quiet.
+  permanent volume's absence is loud, an ephemeral volume's is quiet. A stage that
+  already ran keeps its own rows: a volume that goes away before its areas are
+  reached reports those areas as kept and never restates units it already deleted
+  as kept. A volume that cannot be verified again before its areas is a mid-run
+  failure and therefore a `data.stopped` stop (exit `3`), never a refusal document.
 - **Exit codes.** `0` completed, including a partial completion with nothing
   pending. A `3` that still reports a plan is a completed run: the host job's
   contract keeps the `3` on record and still performs the authorized real step for
