@@ -20,11 +20,12 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::facts::{
-    AccountFacts, BlindSpotEvidence, ChildEntry, ChildListing, ChildRemoval, DescriptorScan,
-    DescriptorScanRequest, DeviceId, DirHandle, DirId, DirOps, EntryFacts, EntryKind, FileSystem,
-    MountPoint, MountRoot, OpenDescriptor, PlatformBlindSpot, PlatformStatus, ProcessIdentity,
-    ProcessObserver, RemoveKind, RenameOutcome, RetriedUnreadable, RetryEvidence, RetryResolution,
-    VerifiedVolume, VolumeFacts, VolumeIdentity, VolumeLocator, VolumeUuid, BLIND_SPOT_RECORDS,
+    AccountFacts, BlindSpotEvidence, ChildEntry, ChildListing, ChildRemoval, DeadHandle,
+    DeadHandleEvidence, DescriptorScan, DescriptorScanRequest, DeviceId, DirHandle, DirId, DirOps,
+    EntryFacts, EntryKind, FileSystem, MountPoint, MountRoot, OpenDescriptor, PlatformBlindSpot,
+    PlatformStatus, ProcessIdentity, ProcessObserver, RemoveKind, RenameOutcome, RetriedUnreadable,
+    RetryEvidence, RetryResolution, VerifiedVolume, VolumeFacts, VolumeIdentity, VolumeLocator,
+    VolumeUuid, BLIND_SPOT_RECORDS, DEAD_HANDLE_RECORDS,
 };
 
 /// The largest symbolic-link text Barge reads, so a link cannot make a record
@@ -79,26 +80,28 @@ const CS_PLATFORM_BINARY: u32 = 0x0400_0000;
 /// observation cannot be complete.
 const SCAN_DESCRIPTORS_PER_PROCESS: usize = 4096;
 
-/// The backoff before each re-observation of one process whose descriptor
-/// listing answered `EPERM`. The settle is short on purpose: the answers it
-/// settles are intermittent, and a real refusal must still refuse quickly.
-const EPERM_BACKOFFS: [Duration; 3] = [
+/// The backoff before each re-observation: of one process whose descriptor
+/// listing answered `EPERM`, and of one dead-handle candidate. The settle is
+/// short on purpose: the answers it settles are intermittent, and a real refusal
+/// must still refuse quickly.
+const RETRY_BACKOFFS: [Duration; 3] = [
     Duration::from_millis(25),
     Duration::from_millis(75),
     Duration::from_millis(100),
 ];
 
-/// The most time one process's `EPERM` may be re-observed for, always inside the
-/// scan's own overall time bound. It is larger than the backoffs above, so the
-/// retry count is what normally stops a persistent answer.
-const EPERM_SETTLE_WINDOW: Duration = Duration::from_millis(250);
+/// The most time one re-observation may take, always inside the scan's own
+/// overall time bound. It is larger than the backoffs above, so the retry count
+/// is what normally stops a persistent answer.
+const SETTLE_WINDOW: Duration = Duration::from_millis(250);
 
-/// The backoff schedule this build retries a same-uid `EPERM` on. A test that
-/// states an empty schedule is the counterfactual: the same answer that the
-/// retry settles then refuses at once.
+/// The backoff schedule this build retries a same-uid `EPERM` on, and the one
+/// backoff a dead-handle candidate's re-observation takes. A test that states an
+/// empty schedule is the counterfactual: the same answer that the retry settles
+/// then refuses at once.
 #[cfg(test)]
 pub(crate) fn retry_schedule() -> &'static [Duration] {
-    &EPERM_BACKOFFS
+    &RETRY_BACKOFFS
 }
 
 // `proc_pidfdinfo` is the one libproc call the descriptor scan needs, and
@@ -597,7 +600,7 @@ impl ProcessObserver for MacOs {
             });
         };
         let table: Vec<ProcessIdentity> = table.into_iter().map(|row| row.identity).collect();
-        self.scan_processes(request, &table, &EPERM_BACKOFFS, &mut [])
+        self.scan_processes(request, &table, &RETRY_BACKOFFS, &mut [])
     }
 }
 
@@ -617,7 +620,7 @@ impl MacOs {
         request: &DescriptorScanRequest<'_>,
         table: &[ProcessIdentity],
     ) -> Result<DescriptorScan> {
-        self.scan_processes(request, table, &EPERM_BACKOFFS, &mut [])
+        self.scan_processes(request, table, &RETRY_BACKOFFS, &mut [])
     }
 
     /// Scan one known process table with the real descriptor enumeration, the
@@ -681,6 +684,7 @@ impl MacOs {
         let mut descriptors = 0usize;
         let mut foreign = 0usize;
         let mut os_blind_spot = BlindSpotEvidence::default();
+        let mut dead_handles = DeadHandleEvidence::default();
         let mut open = Vec::new();
         // Whether the process the request names as the calling one was found and
         // skipped. An exclusion that never matched proves nothing about what it
@@ -820,34 +824,56 @@ impl MacOs {
                 if libc::c_int::try_from(fd.proc_fdtype).ok() != Some(libc::PROX_FDTYPE_VNODE) {
                     continue;
                 }
-                // A test may state that this descriptor's path read answers
-                // `EPERM`; the production scan states nothing and reads it.
-                let stated_opaque = stated_opaque(faults, pid, vnodes);
+                let descriptor = fd.proc_fd;
+                let vnode_index = vnodes;
                 vnodes = vnodes.saturating_add(1);
-                if stated_opaque {
-                    opaque = opaque.saturating_add(1);
-                    continue;
-                }
-                let path = match read_descriptor(pid, fd.proc_fd) {
-                    Ok(DescriptorReading::Path(path)) => path,
-                    Ok(DescriptorReading::Closed) => continue,
-                    Ok(DescriptorReading::Opaque) => {
-                        opaque = opaque.saturating_add(1);
-                        continue;
+                match self.observe_descriptor(
+                    identity,
+                    descriptor,
+                    vnode_index,
+                    started,
+                    request.timeout,
+                    backoffs,
+                    faults,
+                ) {
+                    Observed::Path(path) => {
+                        if roots.iter().any(|root| path_is_at_or_under(&path, root)) {
+                            open.push(OpenDescriptor {
+                                pid,
+                                descriptor,
+                                path,
+                            });
+                        }
                     }
-                    Err(error) => {
+                    Observed::Closed => {}
+                    Observed::Opaque => opaque = opaque.saturating_add(1),
+                    // The evidence names every dead handle or none: a descriptor
+                    // that did not fit would make a `Safe` verdict count evidence
+                    // it cannot show, so the scan refuses instead.
+                    Observed::Dead(handle) => {
+                        if !dead_handles.record(handle) {
+                            return Ok(DescriptorScan::Unreadable {
+                                reason: format!(
+                                    "the scan met more than {DEAD_HANDLE_RECORDS} dead vnode descriptors, and its record holds every one of them or none: descriptor {descriptor} of pid {pid} did not fit, so the evidence would be incomplete"
+                                ),
+                                retry: retry.clone(),
+                            });
+                        }
+                    }
+                    Observed::Unreadable(reason) => {
                         return Ok(DescriptorScan::Unreadable {
-                            reason: error.message().to_owned(),
+                            reason,
                             retry: retry.clone(),
                         })
                     }
-                };
-                if roots.iter().any(|root| path_is_at_or_under(&path, root)) {
-                    open.push(OpenDescriptor {
-                        pid,
-                        descriptor: fd.proc_fd,
-                        path,
-                    });
+                    Observed::Bounded => {
+                        return Ok(DescriptorScan::Bounded {
+                            processes,
+                            descriptors,
+                            bound: "time",
+                            retry: retry.clone(),
+                        })
+                    }
                 }
             }
             if opaque == 0 {
@@ -913,6 +939,7 @@ impl MacOs {
             foreign,
             retry: retry.clone(),
             os_blind_spot,
+            dead_handles,
             open,
         })
     }
@@ -987,7 +1014,7 @@ impl MacOs {
     /// found by barge#007's owner-context diagnostic: the cause of a same-uid
     /// `EPERM` is not established). The scan re-reads the process's kernel
     /// identity — pid, start time and effective uid — and lists again after a
-    /// short backoff, once per entry in `backoffs`, inside [`EPERM_SETTLE_WINDOW`]
+    /// short backoff, once per entry in `backoffs`, inside [`SETTLE_WINDOW`]
     /// and inside the scan's own time bound. It settles
     /// only on a positive fact: a later listing, the kernel reporting no such
     /// pid, a changed start identity (a different process, re-evaluated under
@@ -1168,6 +1195,174 @@ impl MacOs {
         }
     }
 
+    /// One vnode descriptor observed as far as the platform allows, including the
+    /// bounded re-observation a dead-handle candidate needs.
+    ///
+    /// Both of the descriptor's per-fd reads answering `ENOENT` is a question,
+    /// not an answer: a revoked or reclaimed vnode cannot do I/O and is reported
+    /// as a dead handle, but only after a bounded re-observation finds the same
+    /// answer for the same process identity (Tom, 2026-10-28, decision e33115d3,
+    /// barge#023). A descriptor that reads on the second observation is
+    /// evaluated like any other.
+    #[allow(clippy::too_many_arguments)]
+    fn observe_descriptor(
+        &self,
+        identity: ProcessIdentity,
+        descriptor: i32,
+        vnode_index: usize,
+        started: Instant,
+        timeout: Duration,
+        backoffs: &[Duration],
+        faults: &mut [StatedListing],
+    ) -> Observed {
+        let stated = stated_vnode_read(faults, identity.pid, vnode_index);
+        match read_descriptor(identity.pid, descriptor, stated) {
+            Ok(DescriptorReading::Path(path)) => Observed::Path(path),
+            Ok(DescriptorReading::Closed) => Observed::Closed,
+            Ok(DescriptorReading::Opaque) => Observed::Opaque,
+            Ok(DescriptorReading::Dead) => self.settle_dead_handle(
+                identity,
+                descriptor,
+                vnode_index,
+                started,
+                timeout,
+                backoffs,
+                faults,
+            ),
+            Err(error) => Observed::Unreadable(error.message().to_owned()),
+        }
+    }
+
+    /// Re-observe one dead-handle candidate under barge#012's bounded rule.
+    ///
+    /// Both per-fd reads answered `ENOENT`, which is either a revoked or
+    /// reclaimed vnode — which cannot do I/O — or a transient answer. The scan
+    /// never decides that from one observation and never from elapsed time: it
+    /// takes one bounded backoff, inside the same settle window and the scan's
+    /// own deadline, and re-reads the pid's kernel identity before and after the
+    /// second observation. It reports a dead handle only when that identity is
+    /// the classified one and the second observation still answers `ENOENT` to
+    /// both flavors. A descriptor that reads on the second observation is
+    /// evaluated like any other; a changed or unreadable identity, a second
+    /// observation that answers `ENOENT` to only one flavor, any other errno or a
+    /// bound reached is unknown, never a dead handle (Tom, 2026-10-28, decision
+    /// e33115d3, barge#023).
+    #[allow(clippy::too_many_arguments)]
+    fn settle_dead_handle(
+        &self,
+        classified: ProcessIdentity,
+        descriptor: i32,
+        vnode_index: usize,
+        started: Instant,
+        timeout: Duration,
+        backoffs: &[Duration],
+        faults: &mut [StatedListing],
+    ) -> Observed {
+        let pid = classified.pid;
+        let settle_started = Instant::now();
+        // No backoff left is both the exhausted schedule and the counterfactual:
+        // nothing was re-observed, so persistence is not established.
+        let Some(backoff) = backoffs.first().copied() else {
+            return Observed::Unreadable(dead_unsettled(
+                pid,
+                descriptor,
+                classified.start,
+                "no re-observation was available inside the bound",
+            ));
+        };
+        match stop_before_backoff(
+            settle_started.elapsed(),
+            started.elapsed(),
+            backoff,
+            timeout,
+        ) {
+            Some(RetryStop::Unreadable) => {
+                return Observed::Unreadable(dead_unsettled(
+                    pid,
+                    descriptor,
+                    classified.start,
+                    "the settle window would close before the re-observation",
+                ))
+            }
+            Some(RetryStop::Bounded) => return Observed::Bounded,
+            None => {}
+        }
+        std::thread::sleep(backoff);
+        match stop_after_backoff(settle_started.elapsed(), started.elapsed(), timeout) {
+            Some(RetryStop::Unreadable) => {
+                return Observed::Unreadable(dead_unsettled(
+                    pid,
+                    descriptor,
+                    classified.start,
+                    "the settle window closed before the re-observation",
+                ))
+            }
+            Some(RetryStop::Bounded) => return Observed::Bounded,
+            None => {}
+        }
+        // The kernel's own identity for the pid, read before the second
+        // observation: the descriptor and that identity are one fact, and a
+        // different identity is not the process that listed it.
+        let before = match self.reobserve_identity(pid, faults) {
+            Ok(Some(now)) => now,
+            // Positively gone: nothing it held is open any more.
+            Ok(None) => return Observed::Closed,
+            Err(error) => {
+                return Observed::Unreadable(dead_identity_unreadable(pid, descriptor, &error))
+            }
+        };
+        if before.identity.start != classified.start
+            || before.identity.effective_uid != classified.effective_uid
+        {
+            return Observed::Unreadable(dead_identity_changed(
+                pid,
+                descriptor,
+                classified,
+                before.identity,
+                "when the dead descriptor was re-observed",
+            ));
+        }
+        let stated = stated_vnode_read(faults, pid, vnode_index);
+        match read_descriptor(pid, descriptor, stated) {
+            Ok(DescriptorReading::Path(path)) => Observed::Path(path),
+            Ok(DescriptorReading::Closed) => Observed::Closed,
+            Ok(DescriptorReading::Opaque) => Observed::Opaque,
+            Err(error) => Observed::Unreadable(error.message().to_owned()),
+            // Still dead for the classified identity: the persisted answer is a
+            // dead handle, and the identity is re-read after that observation so
+            // a process that changed underneath it is never recorded.
+            Ok(DescriptorReading::Dead) => {
+                match self.reobserve_identity(pid, faults) {
+                    Ok(Some(after))
+                        if after.identity.start == classified.start
+                            && after.identity.effective_uid == classified.effective_uid => {}
+                    Ok(Some(after)) => {
+                        return Observed::Unreadable(dead_identity_changed(
+                            pid,
+                            descriptor,
+                            classified,
+                            after.identity,
+                            "around the dead descriptor's re-observation",
+                        ))
+                    }
+                    // Gone after the second observation: nothing it held is open.
+                    Ok(None) => return Observed::Closed,
+                    Err(error) => {
+                        return Observed::Unreadable(dead_identity_unreadable(
+                            pid, descriptor, &error,
+                        ))
+                    }
+                }
+                Observed::Dead(DeadHandle {
+                    pid,
+                    start: classified.start,
+                    descriptor,
+                    command: before.command,
+                })
+            }
+        }
+    }
+
     /// The kernel's own identity for one pid, with any identity a test states.
     ///
     /// `Ok(None)` is the kernel reporting no such process, which is the positive
@@ -1322,13 +1517,56 @@ pub(crate) struct StatedListing {
     pub(crate) start: Option<u64>,
     /// An effective uid the re-observation reports instead of the kernel's.
     pub(crate) uid: Option<u32>,
-    /// How many of this process's vnode descriptors' path reads the test states
-    /// as `EPERM`, counting from the first vnode descriptor of the listing. They
-    /// stand for the descriptors the platform hides; every later vnode descriptor
-    /// is read for real.
-    pub(crate) opaque: usize,
+    /// The answer a test states for one of this process's vnode descriptors, by
+    /// its index among them, instead of reading the descriptor for real. They
+    /// stand for the per-fd answers that make a descriptor opaque or dead; every
+    /// descriptor without a stated answer is read for real.
+    pub(crate) vnode_reads: Vec<(usize, StatedVnodeRead)>,
     /// The code-signing answer the test states instead of the kernel's.
     pub(crate) platform: Option<StatedPlatform>,
+}
+
+/// One stated answer for a vnode descriptor's pair of per-fd reads.
+///
+/// The production scan states nothing; this account cannot create a revoked or
+/// reclaimed vnode on demand (an unlinked file and a pty slave whose master
+/// closed both keep a readable path), so the dead-handle rule is exercised with
+/// the per-fd answers stated and every identity, bound and re-observation real.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatedVnodeRead {
+    /// Both per-fd reads answer `EPERM`: the descriptor is opaque.
+    Opaque,
+    /// Both per-fd reads answer `ENOENT` on every observation.
+    Dead,
+    /// Both per-fd reads answer `ENOENT` on the first observation and are read
+    /// for real afterwards.
+    DeadOnce,
+    /// The path read answers `ENOENT` while the vnode facts are readable.
+    PathAbsent,
+    /// The vnode facts answer `ENOENT` while the path is readable.
+    FactsAbsent,
+}
+
+impl StatedVnodeRead {
+    /// The reading this stated answer stands for, exactly as the per-fd reads
+    /// would answer it.
+    fn reading(self, pid: u32, descriptor: i32) -> Result<DescriptorReading> {
+        match self {
+            Self::Opaque => Ok(DescriptorReading::Opaque),
+            Self::Dead | Self::DeadOnce => Ok(DescriptorReading::Dead),
+            Self::PathAbsent => Err(one_call_absent(
+                pid,
+                descriptor,
+                "the path read answered `ENOENT` while the vnode facts were readable",
+            )),
+            Self::FactsAbsent => Err(one_call_absent(
+                pid,
+                descriptor,
+                "the path read was readable while the vnode facts answered `ENOENT`",
+            )),
+        }
+    }
 }
 
 /// What a test states about one process's code-signing status, instead of the
@@ -1397,14 +1635,26 @@ impl StatedPlatform {
     }
 }
 
-/// Whether a test states that one of this process's vnode descriptors is opaque,
-/// by its index among the process's vnode descriptors. A production scan states
+/// The answer a test states for one of this process's vnode descriptors, by its
+/// index among the process's vnode descriptors. A production scan states
 /// nothing, so every descriptor is read for real.
-fn stated_opaque(faults: &[StatedListing], pid: u32, index: usize) -> bool {
-    faults
-        .iter()
-        .find(|stated| stated.pid == pid)
-        .is_some_and(|stated| index < stated.opaque)
+///
+/// A stated `Dead` answer persists across observations, because a revoked vnode
+/// answers `ENOENT` for as long as it exists; every other stated answer is
+/// consumed by its first use, so the dead-handle re-observation reads the
+/// descriptor for real afterwards.
+fn stated_vnode_read(
+    faults: &mut [StatedListing],
+    pid: u32,
+    index: usize,
+) -> Option<StatedVnodeRead> {
+    let stated = faults.iter_mut().find(|stated| stated.pid == pid)?;
+    let position = stated.vnode_reads.iter().position(|(at, _)| *at == index)?;
+    let answer = stated.vnode_reads[position].1;
+    if answer != StatedVnodeRead::Dead {
+        stated.vnode_reads.remove(position);
+    }
+    Some(answer)
 }
 
 /// The errno a test states for this process's next listing, consuming it. A
@@ -1438,7 +1688,7 @@ fn stop_before_backoff(
     backoff: Duration,
     timeout: Duration,
 ) -> Option<RetryStop> {
-    if settle_elapsed.saturating_add(backoff) >= EPERM_SETTLE_WINDOW {
+    if settle_elapsed.saturating_add(backoff) >= SETTLE_WINDOW {
         return Some(RetryStop::Unreadable);
     }
     if scan_elapsed.saturating_add(backoff) >= timeout {
@@ -1457,7 +1707,7 @@ fn stop_after_backoff(
     scan_elapsed: Duration,
     timeout: Duration,
 ) -> Option<RetryStop> {
-    if settle_elapsed >= EPERM_SETTLE_WINDOW {
+    if settle_elapsed >= SETTLE_WINDOW {
         return Some(RetryStop::Unreadable);
     }
     if scan_elapsed >= timeout {
@@ -1478,7 +1728,7 @@ fn stop_when_settled(
     scan_elapsed: Duration,
     timeout: Duration,
 ) -> Option<RetryStop> {
-    if settle_elapsed >= EPERM_SETTLE_WINDOW {
+    if settle_elapsed >= SETTLE_WINDOW {
         return Some(RetryStop::Unreadable);
     }
     if scan_elapsed >= timeout {
@@ -1537,7 +1787,7 @@ fn window_closed(record: &RetriedUnreadable) -> String {
         "the re-observation of {described} (pid {}, start {}) produced its answer after its {} ms settle window closed, so it is not evidence",
         record.pid,
         record.start,
-        EPERM_SETTLE_WINDOW.as_millis()
+        SETTLE_WINDOW.as_millis()
     )
 }
 
@@ -1790,6 +2040,57 @@ impl MacOs {
                 .collect()
         }))
     }
+
+    /// How many same-uid processes one dead-handle search examines.
+    #[cfg(test)]
+    const DEAD_HANDLE_SEARCH_PROCESSES: usize = 512;
+
+    /// The same-uid processes of this host that hold a vnode descriptor both of
+    /// whose per-fd reads answer `ENOENT`, up to a bounded number of them, with
+    /// the descriptor and the command the kernel's table reports.
+    ///
+    /// Read-only, and for tests only. This account cannot create a revoked or
+    /// reclaimed vnode on demand — an unlinked file and a pty slave whose master
+    /// closed both keep a readable path — so the real-observer test of the
+    /// dead-handle rule reads a live process of this host instead, and states the
+    /// fact when the host has none. Nothing about the scan itself changes, and
+    /// each candidate's identity is re-read by the scan exactly as it is for any
+    /// other process.
+    #[cfg(test)]
+    pub(crate) fn dead_handle_candidates(&self) -> Result<Vec<(ProcessIdentity, i32, String)>> {
+        const CANDIDATES: usize = 8;
+        let Some(rows) = self.process_table()? else {
+            return Ok(Vec::new());
+        };
+        let uid = self.effective_uid()?;
+        let self_pid = std::process::id();
+        let mut found = Vec::new();
+        for row in rows
+            .iter()
+            .filter(|row| row.identity.effective_uid == Some(uid) && row.identity.pid != self_pid)
+            .take(Self::DEAD_HANDLE_SEARCH_PROCESSES)
+        {
+            let DescriptorListing::Listed(fds) = self.list_descriptors(row.identity.pid) else {
+                continue;
+            };
+            for fd in fds {
+                if libc::c_int::try_from(fd.proc_fdtype).ok() != Some(libc::PROX_FDTYPE_VNODE) {
+                    continue;
+                }
+                if matches!(
+                    read_descriptor(row.identity.pid, fd.proc_fd, None),
+                    Ok(DescriptorReading::Dead)
+                ) {
+                    found.push((row.identity, fd.proc_fd, row.command.clone()));
+                    break;
+                }
+            }
+            if found.len() >= CANDIDATES {
+                break;
+            }
+        }
+        Ok(found)
+    }
 }
 
 /// One process in the kernel's table: the identity the scan classifies with, and
@@ -1972,6 +2273,12 @@ enum DescriptorReading {
     /// Both the path and the vnode facts answered `EPERM`, so where the
     /// descriptor points cannot be read at all.
     Opaque,
+    /// Both the path and the vnode facts answered `ENOENT`: a revoked or
+    /// reclaimed vnode, which cannot do I/O. It is a dead-handle *candidate*:
+    /// only a bounded re-observation that finds the same answer for the same
+    /// process identity reports it as a dead handle (Tom, 2026-10-28, decision
+    /// e33115d3, barge#023).
+    Dead,
 }
 
 /// One vnode descriptor, read as far as the platform allows.
@@ -1980,29 +2287,138 @@ enum DescriptorReading {
 /// only when both flavors answer `EPERM` is the descriptor opaque. A path this
 /// account may not read while its vnode facts are readable is not opaque — the
 /// exemption is about exactly the descriptors the platform hides twice — so it
-/// stays an unreadable fact and refuses. Any other failure refuses at once.
-fn read_descriptor(pid: u32, descriptor: i32) -> Result<DescriptorReading> {
+/// stays an unreadable fact and refuses. A path the kernel reports gone as
+/// `ENOENT` is confirmed the same way: only when both flavors answer `ENOENT` is
+/// the descriptor a dead-handle candidate, because one call answering it alone is
+/// a fact the scan cannot place and therefore unreadable. Any other failure
+/// refuses at once.
+fn read_descriptor(
+    pid: u32,
+    descriptor: i32,
+    stated: Option<StatedVnodeRead>,
+) -> Result<DescriptorReading> {
+    // A test states the per-fd answers a host cannot be asked to produce. The
+    // production scan states nothing and reads both of them.
+    if let Some(stated) = stated {
+        return stated.reading(pid, descriptor);
+    }
     let hidden = match descriptor_path(pid, descriptor) {
         DescriptorPath::Path(path) => return Ok(DescriptorReading::Path(path)),
         DescriptorPath::Closed => return Ok(DescriptorReading::Closed),
         DescriptorPath::Hidden(error) => error,
     };
-    if hidden.raw_os_error() != Some(libc::EPERM) {
-        return Err(unreadable_descriptors(pid, &hidden));
+    match hidden.raw_os_error() {
+        Some(libc::EPERM) => match descriptor_vnode_facts(pid, descriptor) {
+            VnodeFacts::Hidden => Ok(DescriptorReading::Opaque),
+            VnodeFacts::Closed => Ok(DescriptorReading::Closed),
+            VnodeFacts::Readable => Err(path_hidden_facts_readable(pid, descriptor)),
+            // Only one of the two reads reports the vnode gone: unreadable.
+            VnodeFacts::Absent => Err(one_call_absent(
+                pid,
+                descriptor,
+                "the path read answered `EPERM` while the vnode facts answered `ENOENT`",
+            )),
+            VnodeFacts::Unreadable(error) => Err(unreadable_descriptors(pid, &error)),
+        },
+        Some(libc::ENOENT) => match descriptor_vnode_facts(pid, descriptor) {
+            // Both per-fd reads agree, so this is a dead-handle candidate.
+            VnodeFacts::Absent => Ok(DescriptorReading::Dead),
+            VnodeFacts::Closed => Ok(DescriptorReading::Closed),
+            VnodeFacts::Readable => Err(one_call_absent(
+                pid,
+                descriptor,
+                "the path read answered `ENOENT` while the vnode facts were readable",
+            )),
+            VnodeFacts::Hidden => Err(one_call_absent(
+                pid,
+                descriptor,
+                "the path read answered `ENOENT` while the vnode facts answered `EPERM`",
+            )),
+            VnodeFacts::Unreadable(error) => Err(unreadable_descriptors(pid, &error)),
+        },
+        _ => Err(unreadable_descriptors(pid, &hidden)),
     }
-    match descriptor_vnode_facts(pid, descriptor) {
-        VnodeFacts::Hidden => Ok(DescriptorReading::Opaque),
-        VnodeFacts::Closed => Ok(DescriptorReading::Closed),
-        VnodeFacts::Readable => Err(Error::new(
-            ErrorKind::UnknownState,
-            format!(
-                "the vnode facts of descriptor {descriptor} of pid {pid} are readable while its path is not, so it cannot be placed"
-            ),
-        )
-        .with_detail("pid", u64::from(pid).into())
-        .with_detail("descriptor", i64::from(descriptor).into())),
-        VnodeFacts::Unreadable(error) => Err(unreadable_descriptors(pid, &error)),
-    }
+}
+
+/// The refusal for a descriptor whose path the platform hides while its vnode
+/// facts are readable: the OS blind spot is about exactly the descriptors both
+/// flavors hide, so this one stays an unreadable fact.
+fn path_hidden_facts_readable(pid: u32, descriptor: i32) -> Error {
+    Error::new(
+        ErrorKind::UnknownState,
+        format!(
+            "the vnode facts of descriptor {descriptor} of pid {pid} are readable while its path is not, so it cannot be placed"
+        ),
+    )
+    .with_detail("pid", u64::from(pid).into())
+    .with_detail("descriptor", i64::from(descriptor).into())
+}
+
+/// The refusal for a descriptor exactly one of whose two per-fd reads reports
+/// the vnode gone: the pair disagrees, so nothing about the descriptor is
+/// established and it is never a dead handle.
+fn one_call_absent(pid: u32, descriptor: i32, reads: &str) -> Error {
+    Error::new(
+        ErrorKind::UnknownState,
+        format!(
+            "only one of the two reads of descriptor {descriptor} of pid {pid} reports its vnode gone ({reads}), so a dead handle is not established"
+        ),
+    )
+    .with_detail("pid", u64::from(pid).into())
+    .with_detail("descriptor", i64::from(descriptor).into())
+}
+
+/// What one vnode descriptor was observed to be, after any bounded
+/// re-observation.
+#[derive(Debug)]
+enum Observed {
+    /// The path the platform reports for it.
+    Path(PathBuf),
+    /// The descriptor closed while it was observed, or its process is gone.
+    Closed,
+    /// Both the path and the vnode facts answered `EPERM`.
+    Opaque,
+    /// A dead handle: both per-fd reads answered `ENOENT` for the same process
+    /// identity on the re-observation, so the vnode is revoked or reclaimed and
+    /// cannot do I/O.
+    Dead(DeadHandle),
+    /// The observation cannot be completed, for this reason: unknown, never a
+    /// dead handle.
+    Unreadable(String),
+    /// The scan's own time bound would be crossed: bounded, never a dead handle.
+    Bounded,
+}
+
+/// The refusal for a dead-handle candidate that could not be re-observed inside
+/// its bound: persistence is not established, so it is unknown rather than a
+/// dead handle.
+fn dead_unsettled(pid: u32, descriptor: i32, start: u64, why: &str) -> String {
+    format!(
+        "descriptor {descriptor} of pid {pid} (start {start}) answered `ENOENT` to both of its per-fd reads and is not proved dead: {why}"
+    )
+}
+
+/// The refusal for a pid whose kernel identity changed while its dead descriptor
+/// was re-observed: the re-observation is not about the process that listed it.
+fn dead_identity_changed(
+    pid: u32,
+    descriptor: i32,
+    classified: ProcessIdentity,
+    now: ProcessIdentity,
+    when: &str,
+) -> String {
+    format!(
+        "pid {pid} reported start identity {} and effective uid {:?} {when}, not the classified {} and {:?}, so descriptor {descriptor} cannot be reported as a dead handle of that process",
+        now.start, now.effective_uid, classified.start, classified.effective_uid
+    )
+}
+
+/// The refusal for a pid whose kernel identity cannot be read while its dead
+/// descriptor is re-observed.
+fn dead_identity_unreadable(pid: u32, descriptor: i32, error: &Error) -> String {
+    format!(
+        "the kernel identity of pid {pid} is unreadable while descriptor {descriptor} is re-observed, so a dead handle is not established: {error}"
+    )
 }
 
 /// One descriptor's path, as `PROC_PIDFDVNODEPATHINFO` answers it.
@@ -2027,6 +2443,9 @@ enum VnodeFacts {
     Hidden,
     /// The descriptor closed between the two reads.
     Closed,
+    /// The kernel reports the vnode gone: `ENOENT`, the other half of a
+    /// dead-handle candidate.
+    Absent,
     /// Any other reason.
     Unreadable(io::Error),
 }
@@ -2093,6 +2512,7 @@ fn descriptor_vnode_facts(pid: u32, descriptor: i32) -> VnodeFacts {
     let error = io::Error::last_os_error();
     match error.raw_os_error() {
         Some(libc::EPERM) => VnodeFacts::Hidden,
+        Some(libc::ENOENT) => VnodeFacts::Absent,
         Some(libc::ESRCH | libc::EBADF) => VnodeFacts::Closed,
         _ => VnodeFacts::Unreadable(error),
     }
@@ -3241,7 +3661,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        stop_after_backoff, stop_before_backoff, stop_when_settled, RetryStop, EPERM_SETTLE_WINDOW,
+        stop_after_backoff, stop_before_backoff, stop_when_settled, RetryStop, SETTLE_WINDOW,
     };
 
     /// A scan deadline well clear of the settle window, so the two bounds are
@@ -3275,7 +3695,7 @@ mod tests {
         // inside the window is not started.
         assert_eq!(
             stop_before_backoff(
-                EPERM_SETTLE_WINDOW.saturating_sub(Duration::from_millis(10)),
+                SETTLE_WINDOW.saturating_sub(Duration::from_millis(10)),
                 Duration::ZERO,
                 Duration::from_millis(25),
                 SCAN_TIMEOUT
@@ -3303,7 +3723,7 @@ mod tests {
         // closed must not buy one more listing, even though the projection
         // before it passed.
         assert_eq!(
-            stop_after_backoff(EPERM_SETTLE_WINDOW, Duration::from_millis(30), SCAN_TIMEOUT),
+            stop_after_backoff(SETTLE_WINDOW, Duration::from_millis(30), SCAN_TIMEOUT),
             Some(RetryStop::Unreadable)
         );
     }
@@ -3334,7 +3754,7 @@ mod tests {
         // per-process window is checked again when the answer arrives, so a
         // retry or a read begun inside the window cannot resolve after it.
         assert_eq!(
-            stop_when_settled(EPERM_SETTLE_WINDOW, Duration::from_millis(30), SCAN_TIMEOUT),
+            stop_when_settled(SETTLE_WINDOW, Duration::from_millis(30), SCAN_TIMEOUT),
             Some(RetryStop::Unreadable)
         );
     }

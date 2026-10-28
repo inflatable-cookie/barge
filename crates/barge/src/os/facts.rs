@@ -621,7 +621,16 @@ pub trait ProcessObserver {
     /// [`Self::verify_platform_binary`] verifies the process it belongs to: then
     /// the descriptors are counted in [`DescriptorScan::Complete`]'s
     /// [`BlindSpotEvidence`] and do not block, and every readable descriptor of
-    /// that same process is still evaluated. A scan that reaches its
+    /// that same process is still evaluated. A vnode descriptor both of whose
+    /// per-fd reads answer `ENOENT` after the listing succeeded is re-observed
+    /// under that same bounded rule, re-reading the process's kernel identity:
+    /// when it persists with the same identity it is a [`DeadHandle`] — a
+    /// revoked or reclaimed vnode that cannot do I/O — recorded in
+    /// [`DescriptorScan::Complete`]'s [`DeadHandleEvidence`] and not a refusal.
+    /// `ENOENT` on the listing itself, on only one of the two per-fd reads, or
+    /// with a changed identity, an unreadable identity or a bound reached is
+    /// unreadable, never a dead handle, and no path or name is ever listed for
+    /// one. A scan that reaches its
     /// process, descriptor or time bound answers [`DescriptorScan::Bounded`],
     /// which is unknown and never safe. An unreadable effective uid, and an
     /// unreadable descriptor entry of this account's process that is not a
@@ -876,6 +885,70 @@ pub enum RetryResolution {
     Bounded,
 }
 
+/// The most dead handles one scan records.
+///
+/// Every one of them is recorded, and a scan that meets more refuses instead of
+/// dropping the surplus: a `Safe` verdict must not count a dead handle it cannot
+/// name. One process holding many revoked vnodes is unusual; the measured case
+/// is one descriptor (barge#008: descriptor 33 of a terminal pty-host).
+pub const DEAD_HANDLE_RECORDS: usize = 32;
+
+/// One vnode descriptor that is dead: both of the platform's per-fd reads answer
+/// `ENOENT` for it, and a bounded re-observation finds the same answer for the
+/// same process identity.
+///
+/// A revoked or reclaimed vnode cannot do I/O, so a descriptor to one cannot be a
+/// writer's claim on the root. It is recorded rather than refused, and its path
+/// is never read (Tom, 2026-10-28, decision e33115d3, barge#023).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeadHandle {
+    /// The process that holds it.
+    pub pid: u32,
+    /// The start identity the scan classified the process with and re-read
+    /// around the re-observation: the same number after a restart is a different
+    /// process.
+    pub start: u64,
+    /// The descriptor number inside that process.
+    pub descriptor: i32,
+    /// The command name the kernel's own table reports for the process.
+    pub command: String,
+}
+
+/// The dead handles one scan found.
+///
+/// `records` holds **every** handle `handles` counts — the record is never
+/// truncated — but it is bounded: a scan that meets more than
+/// [`DEAD_HANDLE_RECORDS`] of them cannot report them all, so it answers unknown
+/// instead of dropping one and claiming the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeadHandleEvidence {
+    /// How many dead vnode descriptors the scan classified. Always
+    /// `records.len()`.
+    pub handles: usize,
+    /// The record of those descriptors, in scan order: one entry per counted
+    /// descriptor, and never more than [`DEAD_HANDLE_RECORDS`].
+    pub records: Vec<DeadHandle>,
+}
+
+impl DeadHandleEvidence {
+    /// Record one dead handle.
+    ///
+    /// `false` means the record is full: this descriptor could not be kept, so
+    /// the evidence would be incomplete and the scan must answer unknown rather
+    /// than report a partial record as complete.
+    #[must_use = "an unrecorded dead handle makes the evidence incomplete, so the scan must refuse"]
+    pub fn record(&mut self, record: DeadHandle) -> bool {
+        if self.records.len() >= DEAD_HANDLE_RECORDS {
+            return false;
+        }
+        self.records.push(record);
+        self.handles = self.handles.saturating_add(1);
+        true
+    }
+}
+
 /// One open descriptor found under the scanned root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenDescriptor {
@@ -909,6 +982,11 @@ pub enum DescriptorScan {
         /// platform's own code-signing status explains them (Tom, 2026-10-26,
         /// decision e528a712).
         os_blind_spot: BlindSpotEvidence,
+        /// The vnode descriptors both of whose per-fd reads answer `ENOENT`,
+        /// re-observed and found the same for the same process identity: a
+        /// revoked or reclaimed vnode, which cannot do I/O. Counted and recorded
+        /// rather than refused (Tom, 2026-10-28, decision e33115d3, barge#023).
+        dead_handles: DeadHandleEvidence,
         /// The open descriptors at or under the root.
         open: Vec<OpenDescriptor>,
     },

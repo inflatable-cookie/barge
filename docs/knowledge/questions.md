@@ -77,3 +77,23 @@ declared folder (for example `scratch/`) and never the whole volume, report the
 change exactly and undo it. It would also need a rule for an absent volume at VM
 start. This is not in stage 1. Until it is designed, mount changes stay manual
 operator changes to the Colima profile.
+
+## Q-010 — What about a vnode descriptor that is dead (revoked or reclaimed)?
+
+Status: answered 2026-10-28
+Answer: when a vnode descriptor of a same-uid process answers `ENOENT` to
+**both** `PROC_PIDFDVNODEPATHINFO` and `PROC_PIDFDVNODEINFO` after a successful
+`PROC_PIDLISTFDS`, the scan re-observes it under barge#012's bounded rule,
+re-reading the pid's kernel identity, and reports a **dead handle** — pid, start
+identity, descriptor and command — in the `Safe` evidence as `dead_handles` and
+in `describe.custody`, where it does not block: a revoked or reclaimed vnode
+cannot do I/O. `ENOENT` on the listing itself, on only one of the two reads, a
+changed or unreadable identity and a bound reached stay `Unknown`, and no path or
+name is listed for a dead handle (Tom, decision e33115d3, implemented by
+barge#023); see the [stage 1
+design](contracts/stage1-design.md#writer-custody-and-safe-deletion).
+Measured before the decision (barge#008, macOS 26.6.2): a live same-uid
+terminal pty-host held descriptor 33, whose `PROC_PIDFDVNODEPATHINFO` and
+`PROC_PIDFDVNODEINFO` both answered `ENOENT` persistently and from every context
+while its descriptor listing succeeded, which made the product-custody census of
+a full-scan proof unreachable.

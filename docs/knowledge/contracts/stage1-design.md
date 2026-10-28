@@ -907,7 +907,7 @@ design states the limit and builds only on facts it can establish:
 | Fact Barge needs | Available evidence | Limit |
 | --- | --- | --- |
 | A cooperative holder is done | its hold file was released, or its recorded process is positively gone | a process that never took a hold, or escaped its group, is outside this |
-| No same-uid process has an open descriptor under the root | each process's effective uid and start identity from the kernel's own process table (`sysctl`/`KERN_PROC_ALL`), then `proc_pidinfo`/`PROC_PIDLISTFDS` and `PROC_PIDFDVNODEPATHINFO` for this account's processes only, matching vnode paths; a descriptor whose path the kernel hides is checked against the process's own code-signing status (`csops`/`CS_OPS_STATUS`) | a process of another effective uid is classified and reported, never inspected; a process created after the scan is not observed; a hidden vnode descriptor is an OS blind spot, counted and reported rather than refused, only for a process that status verifies as a platform binary with an unchanged start identity, and nothing can read where such a descriptor points |
+| No same-uid process has an open descriptor under the root | each process's effective uid and start identity from the kernel's own process table (`sysctl`/`KERN_PROC_ALL`), then `proc_pidinfo`/`PROC_PIDLISTFDS`, `PROC_PIDFDVNODEPATHINFO` and `PROC_PIDFDVNODEINFO` for this account's processes only, matching vnode paths; a descriptor whose path the kernel hides is checked against the process's own code-signing status (`csops`/`CS_OPS_STATUS`) | a process of another effective uid is classified and reported, never inspected; a process created after the scan is not observed; a hidden vnode descriptor is an OS blind spot, counted and reported rather than refused, only for a process that status verifies as a platform binary with an unchanged start identity, and nothing can read where such a descriptor points; a vnode descriptor both of whose per-fd reads answer `ENOENT` is a dead handle, recorded by pid, start identity, descriptor and command rather than refused, and its path is never read |
 | The root is the inode that was verified | `fstat` device + inode through the opened descriptor before and after each step | a rename by another user between steps stops the operation |
 | The volume is still the registered one | descriptor `fstatfs` + `ATTR_VOL_UUID`, re-verified | a vanished volume fails the call, it does not answer "absent and safe" |
 
@@ -917,12 +917,15 @@ guarantee. It may appear only as a diagnostic in a report, never as a custody
 verdict.
 
 The verdict is therefore explicitly *cooperative plus same-uid observation*.
-Three residuals are named rather than implied: a process of another effective uid,
+Four residuals are named rather than implied: a process of another effective uid,
 which the kernel's process table reports and custody counts but never inspects
 (Tom, 2026-10-26, ruling bcaa83d8); a vnode descriptor whose path and vnode facts
 the platform hides on a process it verifies as a platform binary, which is
 counted and reported as the OS blind spot (Tom, 2026-10-26, decision e528a712,
-Q-008); and a process that dropped its hold and kept writing. All are named here
+Q-008); a dead vnode descriptor, whose path and vnode facts both answer `ENOENT`,
+which is recorded as a dead handle and not refused because a revoked or reclaimed
+vnode cannot do I/O (Tom, 2026-10-28, decision e33115d3, Q-010); and a process
+that dropped its hold and kept writing. All are named here
 and in `describe` (`custody.capability`), and are
 the reason deletion additionally requires the intent journal and quarantine
 rename below, which make a wrong deletion recoverable up to the marker-unlink
@@ -966,10 +969,18 @@ reported in the evidence, and it does not block `Safe` (Tom, 2026-10-26, decisio
 e528a712, barge#013). Every readable descriptor of that same process is still
 evaluated, so one that lies inside the root still makes the verdict `Unsafe`, and
 every other hidden descriptor — a process that is not a verified platform binary,
-a status read that fails, an identity that moves around it — stays unreadable.
+a status read that fails, an identity that moves around it — stays unreadable. A
+vnode descriptor both of whose per-fd reads answer `ENOENT` is a **dead handle**
+when barge#012's bounded re-observation finds the same answer for the same kernel
+identity: it is recorded (pid, start identity, descriptor and command) and does
+not block `Safe`, because a revoked or reclaimed vnode cannot do I/O, and its path
+is never read (Tom, 2026-10-28, decision e33115d3, barge#023). `ENOENT` on the
+descriptor listing itself, on only one of the two per-fd reads, with a changed or
+unreadable identity, or with a bound reached stays unreadable.
 Any unreadable
 hold, an unreadable effective uid, a same-uid descriptor that stays unreadable
-after its retries or that no verified platform binary explains, a scan that hits
+after its retries or that no verified platform binary explains and no
+re-observation proves dead, a scan that hits
 its entry or time bound, a foreign-uid holder, or a `lsof`-style diagnostic that
 errors makes the verdict `Unknown`,
 which is a refusal. Deletion and swap take a `Safe` value by type, so a caller
@@ -1650,6 +1661,32 @@ Choices S5 made where this design left the mechanic to the slice:
   `proc_pidfdinfo`, because `libc` declares neither, and it is readable for any
   pid, which is what lets it speak about a process whose own descriptors it
   hides.
+- **A dead (revoked or reclaimed) vnode descriptor is a reported dead handle**
+  (added under barge#023, Tom's decision e33115d3, answering Q-010). barge#008's
+  full-scan proof stopped three times at the product-custody census of a live
+  same-uid process — a terminal pty-host — whose descriptor listing succeeded
+  while one vnode descriptor (fd 33) answered `ENOENT` to **both**
+  `PROC_PIDFDVNODEPATHINFO` and `PROC_PIDFDVNODEINFO`, persistently and from
+  every context. A revoked or reclaimed vnode cannot do I/O, so such a descriptor
+  cannot be a writer's claim on the root, and refusing it made a full-scan `Safe`
+  verdict unreachable on a real session for the second time. The rule is narrow
+  and proved: a vnode descriptor whose path answered `ENOENT` is confirmed
+  against the same descriptor's vnode facts, and only when **both** flavors say
+  `ENOENT` is it a dead-handle candidate. The candidate is then re-observed under
+  barge#012's bounded rule — the first backoff of the same schedule, inside the
+  same settle window and the scan's own deadline — with the pid's kernel identity
+  re-read before and after the second observation. It is recorded as a dead
+  handle only when that identity is the classified start identity and effective
+  uid both times and the second observation still answers `ENOENT` to both
+  flavors: the scan records pid, start identity, descriptor and command, and does
+  not block. Every other descriptor of the same process is evaluated normally, so
+  a readable one inside the root still makes the verdict `Unsafe`. Everything
+  else is unchanged and refuses with `Unknown`: `ENOENT` on the
+  `PROC_PIDLISTFDS` listing itself, `ENOENT` on only one of the two per-fd reads
+  (either one), any other errno, a changed or unreadable identity, and a bound
+  reached. There are no path or name lists, because a dead handle's path is not
+  read either. The record names every dead handle, bounded at 32 descriptors:
+  meeting more is `Unknown`, not a shorter list.
 - **What the evidence says.** The evidence records `self_excluded: <pid>` (the one
   process the scan excluded), `foreign_uid_processes` (how many processes of
   another effective uid it classified and did not inspect) and `retry`: how many
@@ -1671,7 +1708,8 @@ Choices S5 made where this design left the mechanic to the slice:
   too (`custody_retry`) when custody refuses after the intent was written. The
   scan's own answers carry it as well: `Complete`, `Bounded` and `Unreadable`. `describe.custody` names all of it: the
   exclusion, the foreign-uid blind spot that is reported rather than observed, the
-  OS blind spot of a verified platform binary's hidden descriptors, and
+  OS blind spot of a verified platform binary's hidden descriptors, the dead
+  handles a dead vnode descriptor is recorded as, and
   the retry rule with its positive facts and its two rechecked deadlines. A
   same-uid process the scan cannot read is an `Unreadable` answer rather than a
   returned error, so the record reaches the refusal; a returned error is only a
@@ -1703,7 +1741,21 @@ Choices S5 made where this design left the mechanic to the slice:
   lies inside the root is `unsafe`, a scan that meets more than the 32-process
   record bound refuses rather than drop one, and a real-observer test reads the kernel's
   own table to verify one live same-uid platform binary and to show that this
-  locally built test binary is not one. The deadline checks are also unit-tested on their own: a projection
+  locally built test binary is not one. The dead-handle rule's cases are stated
+  the same way, with the per-fd answers injected because this account cannot
+  create a revoked vnode on demand (an unlinked file and a pty slave whose master
+  closed both keep a readable path): a persistent `ENOENT` from both reads is
+  `safe` with the dead handle recorded and does not block, the same dead handle
+  beside a readable descriptor inside the root is `unsafe`, a descriptor that
+  reads on the re-observation is evaluated normally instead of recorded, `ENOENT`
+  from only one of the two reads (either one) is `unknown`, `ENOENT` on the
+  listing itself is `unknown` with no dead handle, a changed identity during the
+  re-observation is `unknown`, a scan that meets more than the 32-descriptor
+  record bound refuses rather than drop one, and the counterfactual refuses at
+  once with the bounded re-observation removed. A read-only real-observer case
+  classifies a live same-uid process of this host that really holds a dead vnode,
+  and states the same fact when the host has none at test time. The deadline
+  checks are also unit-tested on their own: a projection
   that would end past either bound is not taken, a delayed wake past either bound
   stops the retry instead of listing again, a terminal answer inside both bounds
   is accepted, and one read after the settle window or after the scan deadline is
