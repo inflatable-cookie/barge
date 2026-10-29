@@ -1393,18 +1393,28 @@ T6, and no native proof exists or is claimed.
   and atomically, at most 4 KiB, with no unknown fields. Root creation writes
   generation `0` with `last_release_ms: 0` and `releases: 0`, on both the area and
   the feature-folder creation routes.
-- **A release is recorded only after the hold is gone.** `barge area release`
-  takes the root lock the hold was written under, reads and validates the hold and
-  reads the activity record, **removes the hold file**, and only then writes
-  `last_release_ms: now` with `releases` and `generation` incremented. A refused
-  release therefore changes nothing, and a release whose hold file cannot be
-  removed records nothing at all — the activity record is byte-identical
-  afterwards. If the activity write fails *after* the hold is gone, the release
-  really did complete and the command reports unsettled state (`unknown_state`,
-  exit `3`) naming the released hold and the record path it could not write: no
-  release fact exists, so the root stays kept until the explicit baseline below
-  records one, rather than being reported idle on a guess. A release therefore
-  never records a release that did not complete, in either direction.
+- **A release writes its fact first and removes the hold second, and a release
+  that fails records nothing.** `barge area release` takes the root lock the hold
+  was written under, reads and validates the hold, reads the activity record and
+  that record's exact bytes, writes `last_release_ms: now` with `releases` and
+  `generation` incremented, and then removes the hold file. One invariant decides
+  the order: **an absent hold file always implies a recorded release.** The other
+  order — remove, then write — leaves a window in which an interrupted release
+  has no hold and only an *older* record, so an unsettled root would read as idle
+  and be ordered on a stale release time; that is the "unknown is never idle"
+  ruling's own case. With this order a crash or a failure between the two steps
+  can only leave a hold that is still present, which the idleness matrix already
+  gates on, and the record it leaves is the current release, never an older one.
+- **What each failure does.** An activity write that fails refuses before the
+  effect (`unknown_state`, exit `3`), leaves the hold in place, and records
+  nothing, which is the failure matrix's "refuse before the effect" row. A hold
+  removal that fails restores the previous record **byte for byte** and reports
+  `io` with `detail.restored: true`, so a failed release changes nothing. If that
+  restore also fails, the report is `unknown_state` naming the record path and the
+  hold; the hold is still there, so nothing is concluded from the record alone and
+  the next release or the baseline below settles it. A release therefore never
+  records a release that did not complete, and never leaves an old record where a
+  completed release should have written a new one.
 - **A release never invents a record.** A root with no record, or with one that
   does not verify, gets no new record from a release: the release report says so
   (`data.activity.state` is `missing` or `unverified`), the root stays kept, and
@@ -1465,7 +1475,13 @@ T6, and no native proof exists or is claimed.
   in T3 orders or prunes anything.
 - `barge describe`'s `formats` names `barge.activity/1`.
 
-One reading this slice fixes for later ones: an operator's idle baseline is a
-release *time* without a release *count*, so `last_release_ms > 0` is what makes a
-record `released` and `releases` counts only the consumer's own releases. A record
-that counts releases but records no release time is `unverified`, not idle.
+Two readings this slice fixes for later ones. First, an operator's idle baseline
+is a release *time* without a release *count*, so `last_release_ms > 0` is what
+makes a record `released` and `releases` counts only the consumer's own releases;
+a record that counts releases but records no release time is `unverified`, not
+idle. Second, the release ordering above is the fact-then-effect order, while the
+activity section's prose lists the removal first. Both cannot hold: removal first
+lets an interrupted release leave the root idle on an older record, and the
+failure matrix's own "refuse before the effect" row for an activity write requires
+the fact first. The implementation takes the order that satisfies the ruling and
+the matrix row, and this paragraph records the reading for the design's owner.

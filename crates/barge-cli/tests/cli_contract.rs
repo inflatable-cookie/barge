@@ -756,6 +756,10 @@ fn a_release_that_cannot_remove_the_hold_records_nothing_and_exits_unknown() {
     let document = stdout_document(&output);
     assert_eq!(document["schema"], "barge.error/1");
     assert_eq!(document["command"], "area.release");
+    assert_eq!(
+        document["error"]["detail"]["restored"], true,
+        "a failed release leaves the previous record in place"
+    );
     assert!(
         hold_directory.join("prover.json").is_file(),
         "the hold stays"

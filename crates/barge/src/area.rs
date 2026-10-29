@@ -2916,18 +2916,27 @@ pub struct Release {
 
 /// Release one holder's hold. A hold that is already absent is already released.
 ///
-/// The order is the design's, and it is the order that keeps the recorded fact
-/// true: take the root lock the hold was written under, **remove the hold record**,
-/// and only then write the activity record. A release therefore never records a
-/// release that did not happen. The hold read, the record validation and the
-/// activity read all happen before the unlink, so a refused release changes
-/// nothing. If the unlink itself fails, nothing was recorded and the hold is still
-/// there. If the activity write fails after the hold is gone, the release *did*
-/// complete and the failure is reported as unsettled state naming the released
-/// hold: no release fact exists, so the root stays kept until an operator's
-/// [`idle_baseline`] rather than being reported idle on a guess. A root with no
-/// activity record keeps none (design, O-013), never an inferred creation time or
-/// volume.
+/// One invariant decides the order, because it is what idleness can be concluded
+/// from: **an absent hold file implies a recorded release**. So the activity
+/// record is written first and the hold file is removed second, both under the
+/// root lock the hold was written under. A crash or a failure between the two can
+/// therefore only leave a hold that is *still present*, which the idleness matrix
+/// already gates on — never an absent hold beside an older record that a reader
+/// would trust as current, which would make an unsettled root look idle and order
+/// it on a stale release time.
+///
+/// A release that fails records nothing. The hold, the previous record and the
+/// previous record's exact bytes are read before any effect; a failed activity
+/// write refuses with the hold intact, and a failed hold removal **restores the
+/// previous record byte for byte** before the failure is reported. If that
+/// restore itself fails, the failure is `unknown_state` naming the record path and
+/// the hold, and the hold is still there, so nothing can be concluded idle from
+/// the record alone. The residual window is the crash the ordering allows: the
+/// record has the release, the hold file remains, and the matrix keeps the root on
+/// the hold until an operator's release or [`idle_baseline`] settles it.
+///
+/// A root with no activity record keeps none (design, O-013), never an inferred
+/// creation time or volume.
 pub fn release(
     state: &StatePaths,
     observer: &dyn ProcessObserver,
@@ -2983,47 +2992,100 @@ pub fn release(
         )
         .with_detail("path", path.display().to_string().into()));
     }
-    // Read the record before the effect, so a state directory that cannot be
-    // read refuses the release with the hold intact. The root lock is held from
-    // here to the write, so no other release can interleave.
+    let activity_path = state.activity_path(root_id)?;
+    // Everything the release needs is read before any effect, under the root
+    // lock: the previous record, its exact bytes, and the record's own validity.
     let previous = read_activity(state, observer, root_id)?;
-    std::fs::remove_file(&path).map_err(|error| {
-        Error::new(
-            ErrorKind::Io,
-            format!("cannot remove {}: {error}", path.display()),
-        )
-        .with_detail("path", path.display().to_string().into())
-    })?;
-    if let Some(directory) = path.parent() {
-        // Best effort: the removal is what matters, and a directory sync the
-        // platform refuses must not turn a completed release into a failure.
-        let _ = std::fs::File::open(directory).and_then(|handle| handle.sync_all());
-    }
+    let previous_bytes = activity_record_bytes(state, root_id)?;
+    // The fact comes first: an absent hold must always imply a recorded release.
+    let had_record = previous.record.is_some();
     let activity = match record_activity_release(state, previous) {
         Ok(activity) => activity,
         Err(error) => {
             return Err(Error::new(
                 ErrorKind::UnknownState,
                 format!(
-                    "the hold `{holder}` on root `{root_id}` was released, but its release fact could not be recorded: {error}; the root stays kept until `barge area idle-baseline` records it"
+                    "the release of `{holder}` on root `{root_id}` was refused before the hold was removed, so it changed nothing: {error}"
                 ),
             )
             .with_detail("hold_path", path.display().to_string().into())
             .with_detail(
                 "activity_path",
-                state
-                    .activity_path(root_id)
-                    .map_or_else(|_| String::new(), |path| path.display().to_string())
-                    .into(),
+                activity_path.display().to_string().into(),
             )
             .with_detail("cause", error.to_string().into()))
         }
     };
+    if let Err(remove_error) = std::fs::remove_file(&path) {
+        // The release did not complete, so it records nothing: put the previous
+        // record's exact bytes back before reporting the failure.
+        // Fail closed: a record that was written but whose previous bytes were
+        // never read cannot be restored, and that is reported rather than
+        // guessed away.
+        let restore_error = match (&had_record, &previous_bytes) {
+            (false, _) => None,
+            (true, Some(bytes)) => state::publish_atomic(&activity_path, bytes).err(),
+            (true, None) => Some(Error::new(
+                ErrorKind::UnknownState,
+                "the previous record's bytes were not read, so they could not be restored",
+            )),
+        };
+        let hold_path = path.display().to_string();
+        let activity_path = activity_path.display().to_string();
+        return Err(match restore_error {
+            None => Error::new(
+                ErrorKind::Io,
+                format!(
+                    "cannot remove {hold_path}: {remove_error}; nothing was recorded, so the hold still stands"
+                ),
+            )
+            .with_detail("hold_path", hold_path.into())
+            .with_detail("activity_path", activity_path.into())
+            .with_detail("restored", true.into()),
+            Some(restore_error) => Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "cannot remove {hold_path}: {remove_error}; the release fact was written but the previous record could not be restored ({restore_error}). The hold is still there, so the root is kept on the hold and not on the record, and its next release or `barge area idle-baseline` settles it"
+                ),
+            )
+            .with_detail("hold_path", hold_path.into())
+            .with_detail("activity_path", activity_path.into())
+            .with_detail("restored", false.into())
+            .with_detail("restore_error", restore_error.to_string().into()),
+        });
+    }
+    if let Some(directory) = path.parent() {
+        // Best effort: the removal is what matters, and a directory sync the
+        // platform refuses must not turn a completed release into a failure.
+        let _ = std::fs::File::open(directory).and_then(|handle| handle.sync_all());
+    }
     Ok(Release {
         path,
         released: true,
         activity,
     })
+}
+
+/// The exact bytes of a root's activity record, bounded, when one exists.
+///
+/// A release keeps them so an effect that fails can restore the record byte for
+/// byte rather than leaving a release recorded that never completed.
+fn activity_record_bytes(state: &StatePaths, root_id: &str) -> Result<Option<Vec<u8>>> {
+    let path = state.activity_path(root_id)?;
+    match state::read_bounded(
+        &path,
+        &Bounds::new(
+            crate::contract::ACTIVITY_CAP_BYTES,
+            1,
+            Deadline::after(READ_DEADLINE),
+        ),
+    ) {
+        ReadOutcome::Present(bytes) => Ok(Some(bytes)),
+        ReadOutcome::Absent => Ok(None),
+        ReadOutcome::Refused(error) => {
+            Err(error.with_detail("path", path.display().to_string().into()))
+        }
+    }
 }
 
 /// Read and decide one root's holds, bounded by the per-root cap.
@@ -6567,7 +6629,7 @@ mod tests {
     }
 
     #[test]
-    fn a_release_whose_activity_write_fails_is_reported_as_unrecorded() {
+    fn a_release_that_cannot_be_recorded_changes_nothing() {
         let fixture = Fixture::new("release-write-fails");
         fixture.register(&fixture.record);
         let declaration = fixture.declaration("example/pool");
@@ -6585,14 +6647,14 @@ mod tests {
             },
         )
         .expect("the hold is written");
-        let before = read_activity(&fixture.state, &observer, &root.root_id)
-            .expect("the record reads")
-            .record
-            .expect("the record parsed");
+        let path = fixture
+            .state
+            .activity_path(&root.root_id)
+            .expect("the activity path");
+        let before = std::fs::read(&path).expect("the record reads");
 
-        // The hold is removed (the release completed) but the record cannot be
-        // written: the release is reported as unsettled and no release fact
-        // exists, so the root stays kept.
+        // The fact cannot be written, so the release refuses before the effect:
+        // the hold stays and nothing is recorded.
         let activity_directory = fixture.state.activity_dir();
         std::fs::set_permissions(&activity_directory, std::fs::Permissions::from_mode(0o500))
             .expect("the activity directory is made read-only");
@@ -6603,58 +6665,165 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::UnknownState);
         assert!(error
             .message()
-            .contains("release fact could not be recorded"));
-        assert_eq!(
-            error.detail()["activity_path"],
-            fixture
-                .state
-                .activity_path(&root.root_id)
-                .expect("the path")
-                .display()
-                .to_string()
-                .as_str()
-        );
+            .contains("refused before the hold was removed"));
         assert!(
-            !fixture
+            fixture
                 .state
                 .holds_dir()
                 .join(&root.root_id)
                 .join("prover.json")
                 .is_file(),
-            "the hold really was released"
+            "the hold was not removed"
         );
-        let after = read_activity(&fixture.state, &observer, &root.root_id)
+        assert_eq!(
+            std::fs::read(&path).expect("the record reads"),
+            before,
+            "a release that cannot be recorded records nothing"
+        );
+        assert_blocked(
+            fixture.list(&resolved).roots[0].space_idle,
+            IdleReason::HoldLive,
+        );
+
+        // The ordinary retry then releases and records exactly one fact.
+        let released =
+            release(&fixture.state, &observer, &root.root_id, "prover").expect("the release works");
+        assert!(released.released);
+        assert_eq!(released.activity.record.expect("the record").releases, 1);
+        assert_eq!(
+            fixture.list(&resolved).roots[0].space_idle.state,
+            IdleState::Idle
+        );
+    }
+
+    #[test]
+    fn a_failed_release_never_leaves_an_earlier_release_trusted_as_current() {
+        // The record already holds an earlier release. If the *next* release is
+        // recorded and its effect fails, the earlier record has to come back
+        // exactly: a completed-hold-less root must never be ordered on an old
+        // release time.
+        let fixture = Fixture::new("release-earlier");
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        let request = HoldRequest {
+            root_id: root.root_id.clone(),
+            holder: "prover".to_owned(),
+            pid: std::process::id(),
+            scope: HoldScope::Write,
+            purpose: "a fixture holder".to_owned(),
+        };
+        hold(&fixture.state, &observer, &request).expect("the first hold is written");
+        release(&fixture.state, &observer, &root.root_id, "prover").expect("the first release");
+        let path = fixture
+            .state
+            .activity_path(&root.root_id)
+            .expect("the activity path");
+        let earlier = std::fs::read(&path).expect("the record reads");
+        let earlier_record = read_activity(&fixture.state, &observer, &root.root_id)
             .expect("the record reads")
             .record
             .expect("the record parsed");
-        assert_eq!(after, before, "no release fact was recorded");
-        let listed = fixture.list(&resolved);
-        assert_blocked(listed.roots[0].space_idle, IdleReason::ActivityUnreleased);
+        assert_eq!(earlier_record.releases, 1);
+        let key = LruKey::of(&earlier_record).expect("a released record");
 
-        // A retry changes nothing: the hold is already absent, so it records
-        // nothing new, and the root stays kept.
-        let again = release(&fixture.state, &observer, &root.root_id, "prover")
-            .expect("a second release is not an error");
-        assert!(!again.released);
-        assert_eq!(again.activity.state, ActivityStateName::Unreleased);
+        // A second release whose effect fails.
+        hold(&fixture.state, &observer, &request).expect("the second hold is written");
+        let hold_directory = fixture.state.holds_dir().join(&root.root_id);
+        std::fs::set_permissions(&hold_directory, std::fs::Permissions::from_mode(0o500))
+            .expect("the hold directory is made read-only");
+        let error = release(&fixture.state, &observer, &root.root_id, "prover")
+            .expect_err("the hold cannot be removed");
+        std::fs::set_permissions(&hold_directory, std::fs::Permissions::from_mode(0o700))
+            .expect("the hold directory is writable again");
+        assert_eq!(error.kind(), ErrorKind::Io);
+        assert_eq!(error.detail()["restored"], true);
+        assert_eq!(
+            std::fs::read(&path).expect("the record reads"),
+            earlier,
+            "the previous record is restored byte for byte"
+        );
+        assert_eq!(
+            LruKey::of(
+                &read_activity(&fixture.state, &observer, &root.root_id)
+                    .expect("the record reads")
+                    .record
+                    .expect("the record parsed")
+            )
+            .expect("a released record"),
+            key,
+            "the order still uses the last completed release"
+        );
+        // The hold is still there, so the root is kept on the hold, not on the
+        // leftover record.
+        assert_blocked(
+            fixture.list(&resolved).roots[0].space_idle,
+            IdleReason::HoldLive,
+        );
 
-        // The explicit baseline is the repair.
-        let platform = fixture.platform();
-        let facts = fixture.facts();
-        let mounts = fixture.mounts();
-        idle_baseline(
+        // The retry completes and records exactly one new release.
+        let released =
+            release(&fixture.state, &observer, &root.root_id, "prover").expect("the retry works");
+        assert_eq!(released.activity.record.expect("the record").releases, 2);
+        assert_eq!(
+            fixture.list(&resolved).roots[0].space_idle.state,
+            IdleState::Idle
+        );
+        assert!(!hold_directory.join("prover.json").exists());
+    }
+
+    #[test]
+    fn an_interrupted_release_leaves_a_hold_never_an_older_release() {
+        // The ordering's invariant, exercised as the crash window it allows: a
+        // release that recorded its fact but has not removed the hold. The record
+        // is the current release (never an older one), and the root is kept on
+        // the hold until the hold is settled.
+        let fixture = Fixture::new("release-interrupted");
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        hold(
             &fixture.state,
-            &platform,
-            &facts,
-            &mounts,
             &observer,
-            &IdleBaselineRequest {
+            &HoldRequest {
                 root_id: root.root_id.clone(),
-                volume_uuid: None,
-                mount_relative_path: None,
+                holder: "prover".to_owned(),
+                pid: std::process::id(),
+                scope: HoldScope::Write,
+                purpose: "a fixture holder".to_owned(),
             },
         )
-        .expect("the baseline repairs the record");
+        .expect("the hold is written");
+        let held = read_activity(&fixture.state, &observer, &root.root_id)
+            .expect("the record reads")
+            .record
+            .expect("the record parsed");
+        assert_eq!(held.releases, 0);
+
+        // Exactly what the release does first: record the fact. Then stop, as an
+        // interruption would.
+        let written = super::record_activity_release(
+            &fixture.state,
+            read_activity(&fixture.state, &observer, &root.root_id).expect("the record reads"),
+        )
+        .expect("the fact is written");
+        let current = written.record.expect("the record parsed");
+        assert_eq!(current.releases, 1);
+        assert!(current.last_release_ms > 0);
+
+        let listed = fixture.list(&resolved);
+        assert_eq!(listed.roots[0].activity.state, ActivityStateName::Released);
+        assert_blocked(listed.roots[0].space_idle, IdleReason::HoldLive);
+        assert!(
+            LruKey::of(&held).is_none(),
+            "the interrupted release is the record's current fact, never an older one"
+        );
+        assert!(LruKey::of(&current).is_some());
+
+        // Settling the hold the ordinary way completes the same fact once.
+        let released = release(&fixture.state, &observer, &root.root_id, "prover")
+            .expect("the release completes");
+        assert_eq!(released.activity.record.expect("the record").releases, 2);
         assert_eq!(
             fixture.list(&resolved).roots[0].space_idle.state,
             IdleState::Idle
