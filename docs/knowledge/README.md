@@ -22,8 +22,9 @@ Contracts own durable interfaces and formats:
   versions, the reference check, the gate that authorizes releasing a whole
   owned root, how that gate combines with the stage 3 space prune, the
   diagnostic that answers the carried "device or inode changed" finding, the
-  stage 4 matrix and bounds, the Oxide compatibility reading of the absence
-  rule, the stage 4 slices and the proposed validation.
+  read-only Oxide output-registry census and its drift report, the stage 4
+  matrix and bounds, the Oxide compatibility reading of the absence rule, the
+  stage 4 slices and the proposed validation.
 - [Host-job hand-off](contracts/host-job.md) owns how a host job calls
   `barge maintain`: the preview-then-real protocol, the digest it passes, the
   exit codes it records, what it must never do, and one example plist under

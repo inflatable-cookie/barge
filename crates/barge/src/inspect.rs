@@ -11,8 +11,11 @@
 //! unknown-state observation naming the file, never a default, and an absent
 //! file is reported as absent rather than as an empty record.
 //!
-//! Slice S2 reads Oxide's `removable.json` (v1 and v2) and `pools.json`. Root
-//! markers, receipts and scratch markers belong to slices S3 to S5.
+//! Slice S2 reads Oxide's `removable.json` (v1 and v2) and `pools.json`, and
+//! owns the one candidate-pool list every Oxide lookup shares. Root markers,
+//! receipts and scratch markers belong to slices S3 to S5; the output-registry
+//! census that reads its rows read-only belongs to slice F5 and lives in
+//! [`crate::census`].
 
 use std::path::{Path, PathBuf};
 
@@ -63,7 +66,7 @@ pub struct Observed<T> {
 }
 
 impl<T> Observed<T> {
-    fn new(source: &'static str, version: String, path: PathBuf, value: T) -> Self {
+    pub(crate) fn new(source: &'static str, version: String, path: PathBuf, value: T) -> Self {
         Self {
             source,
             version,
@@ -303,6 +306,9 @@ pub struct OxideObservations {
     pub pools: Observation<OxidePools>,
     /// Oxide's removable-volume registration.
     pub registration: Observation<OxideRegistration>,
+    /// Every internal pool directory that was looked at, in order. A pool is
+    /// where Oxide keeps `oxide-managed/removable.json` and `outputs/`.
+    pub internal_pools: Vec<PathBuf>,
     /// Every registration path that was looked at, in order.
     pub searched: Vec<PathBuf>,
 }
@@ -332,22 +338,38 @@ pub fn observe_oxide(account: &dyn AccountFacts) -> Result<OxideObservations> {
 /// unknown state, and Barge does not look past it for a more convenient one.
 pub fn observe_oxide_at(state_dir: &Path, cache_dir: &Path) -> OxideObservations {
     let pools = read_pools(&state_dir.join(OXIDE_POOLS_FILE));
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Observation::Reported(observed) = &pools {
-        for pool in observed.value().paths() {
-            candidates.push(registration_path(pool));
-        }
-    }
-    candidates.push(registration_path(&cache_dir.join(OXIDE_DEFAULT_POOL_DIR)));
-    candidates.push(registration_path(&cache_dir.join(OXIDE_LEGACY_POOL_DIR)));
-    candidates.dedup();
+    let internal_pools = pool_candidates(&pools, cache_dir);
+    let candidates: Vec<PathBuf> = internal_pools
+        .iter()
+        .map(|pool| registration_path(pool))
+        .collect();
 
     let registration = resolve_registration(&candidates);
     OxideObservations {
         pools,
         registration,
+        internal_pools,
         searched: candidates,
     }
+}
+
+/// Every internal pool directory to look in, in order: the pools Oxide's own
+/// record names, then its current and retired default pools.
+///
+/// A pool only appears once. Nothing is created or changed: this is the shared
+/// candidate list the registration and the output registry are both looked for
+/// in, so two readers of the same tool cannot disagree about where it lives.
+pub(crate) fn pool_candidates(pools: &Observation<OxidePools>, cache_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Observation::Reported(observed) = pools {
+        for pool in observed.value().paths() {
+            candidates.push(pool.clone());
+        }
+    }
+    candidates.push(cache_dir.join(OXIDE_DEFAULT_POOL_DIR));
+    candidates.push(cache_dir.join(OXIDE_LEGACY_POOL_DIR));
+    candidates.dedup();
+    candidates
 }
 
 /// Where a registration lives inside one internal pool.

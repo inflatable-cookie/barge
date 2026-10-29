@@ -146,8 +146,9 @@ kept.
   `install.cache.dir`, Effigy `[scratch] root`), Barge writes that setting only
   during an explicit adopt, reports the exact change and can undo it.
 - **Oxide state is read in place (Q-004).** Barge reads Oxide's existing
-  formats as they are (`pools.json`, `oxide-outputs` roots, markers and
-  receipts, scratch markers), so nothing moves on disk. Oxide switches to Barge
+  formats as they are (`pools.json`, `oxide-outputs` roots, markers, receipts and
+  its output-registry rows for the read-only census, scratch markers), so nothing
+  moves on disk. Oxide switches to Barge
   one part at a time, in the order above. Old formats retire only once both
   sides agree.
 

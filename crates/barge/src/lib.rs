@@ -29,6 +29,7 @@
 
 pub mod area;
 pub mod cache;
+pub mod census;
 pub mod contract;
 pub mod custody;
 pub mod delete;
