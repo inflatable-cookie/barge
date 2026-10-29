@@ -1234,10 +1234,19 @@ impl MacOs {
         match read_descriptor(identity.pid, descriptor, stated) {
             Ok(DescriptorReading::Path(path)) => Observed::Path(path),
             Ok(DescriptorReading::Opaque) => Observed::Opaque,
-            Ok(DescriptorReading::Closed) => Observed::Unreadable(
-                closed_descriptor(identity.pid, descriptor)
-                    .message()
-                    .to_owned(),
+            // A descriptor listed a moment ago and now read closed by both
+            // flavors is settled the same bounded way as a mixed pair: a
+            // re-listing that no longer names it, or a gone process, proves it
+            // closed (Oxide Supervisor 1a5b31a0, Tom db9ecb0d).
+            Ok(DescriptorReading::Closed) => self.settle_pair(
+                identity,
+                descriptor,
+                vnode_index,
+                started,
+                timeout,
+                backoffs,
+                faults,
+                SettleFrom::Closed,
             ),
             Ok(DescriptorReading::Dead) => self.settle_dead_handle(
                 identity,
@@ -1256,8 +1265,7 @@ impl MacOs {
                 timeout,
                 backoffs,
                 faults,
-                path,
-                facts,
+                SettleFrom::Disagreed { path, facts },
             ),
             Err(error) => Observed::Unreadable(error.message().to_owned()),
         }
@@ -1286,10 +1294,10 @@ impl MacOs {
         timeout: Duration,
         backoffs: &[Duration],
         faults: &mut [StatedListing],
-        mut path: String,
-        mut facts: String,
+        from: SettleFrom,
     ) -> Observed {
         let pid = classified.pid;
+        let mut last = from;
         for _ in 1..PAIR_RETRY_ATTEMPTS {
             if started.elapsed().saturating_add(PAIR_RETRY_BACKOFF) >= timeout {
                 return Observed::Bounded;
@@ -1380,11 +1388,9 @@ impl MacOs {
             match reading {
                 DescriptorReading::Path(next) => return Observed::Path(next),
                 DescriptorReading::Opaque => return Observed::Opaque,
-                DescriptorReading::Closed => {
-                    return Observed::Unreadable(
-                        closed_descriptor(pid, descriptor).message().to_owned(),
-                    )
-                }
+                // Still listed, yet read closed again: it closed between the
+                // re-listing and the read. Another bounded attempt settles it.
+                DescriptorReading::Closed => last = SettleFrom::Closed,
                 DescriptorReading::Dead => {
                     return self.settle_dead_handle(
                         classified,
@@ -1400,12 +1406,21 @@ impl MacOs {
                     path: next_path,
                     facts: next_facts,
                 } => {
-                    path = next_path;
-                    facts = next_facts;
+                    last = SettleFrom::Disagreed {
+                        path: next_path,
+                        facts: next_facts,
+                    };
                 }
             }
         }
-        Observed::Unreadable(mixed_pair_message(pid, descriptor, &path, &facts))
+        match last {
+            SettleFrom::Closed => {
+                Observed::Unreadable(closed_descriptor(pid, descriptor).message().to_owned())
+            }
+            SettleFrom::Disagreed { path, facts } => {
+                Observed::Unreadable(mixed_pair_message(pid, descriptor, &path, &facts))
+            }
+        }
     }
 
     /// The classified process's kernel identity at one pair re-read, or gone.
@@ -1588,8 +1603,19 @@ impl MacOs {
         let observed = match reading {
             DescriptorReading::Path(path) => Observed::Path(path),
             DescriptorReading::Opaque => Observed::Opaque,
+            // Closed between the two observations: settled like any other
+            // closed read, by a bounded re-listing, never assumed.
             DescriptorReading::Closed => {
-                Observed::Unreadable(closed_descriptor(pid, descriptor).message().to_owned())
+                return self.settle_pair(
+                    classified,
+                    descriptor,
+                    vnode_index,
+                    started,
+                    timeout,
+                    backoffs,
+                    faults,
+                    SettleFrom::Closed,
+                )
             }
             // Still dead for the classified identity, which was just re-read: it
             // is a dead handle, never a skip.
@@ -2732,6 +2758,13 @@ fn read_descriptor(
             facts: facts_answer(&facts),
         }),
     }
+}
+
+/// What started a bounded pair settlement: a first read that found the
+/// descriptor closed, or one whose path and vnode facts disagreed.
+enum SettleFrom {
+    Closed,
+    Disagreed { path: String, facts: String },
 }
 
 /// The refusal for a descriptor both of whose per-fd reads report it closed.

@@ -3727,6 +3727,54 @@ mod tests {
     }
 
     #[test]
+    fn a_first_read_closed_pair_is_gone_when_relisting_omits_it() {
+        // Tom db9ecb0d: a descriptor listed a moment ago and read closed by both
+        // flavors on the FIRST observation settles the same bounded way as a
+        // mixed pair. The re-listing no longer names it, so it holds nothing.
+        let holder = real_holder("custody-008-first-closed-gone");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let identity = child.identity();
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                relist_errno: Some(0),
+                vnode_reads: vec![(
+                    0,
+                    StatedVnodeRead::new(StatedCall::Closed, StatedCall::Closed),
+                )],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+    }
+
+    #[test]
+    fn a_first_read_closed_pair_reused_is_placed() {
+        // Closed once, then the listed descriptor reads the payload again: it is
+        // placed and evaluated, never skipped.
+        let holder = real_holder("custody-008-first-closed-reused");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let identity = child.identity();
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                vnode_reads: vec![(
+                    0,
+                    StatedVnodeRead::once(StatedCall::Closed, StatedCall::Closed),
+                )],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unsafe", "{:?}", verdict.reason());
+    }
+
+    #[test]
     fn a_closed_pair_relisted_and_reused_is_placed() {
         let holder = real_holder("custody-008-pair-closed-reused");
         let payload = holder.payload();

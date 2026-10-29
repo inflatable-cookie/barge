@@ -173,7 +173,12 @@ run would replay.
    the real run; the real run then exits `3` with exactly one pending intent, the
    intent record is not `deleted`, the area folder holds exactly one
    `.barge-prune-` leaf, the unit's visible name is gone, and the symlink's
-   referent still holds its exact bytes. Nothing replays it: the image is discarded
+   referent still holds its exact bytes. A shared host can make the pre-intent
+   custody census or the hold check undecidable for a moment, and Barge then keeps
+   the unit and exits `0`. Such a skip is recorded in `case_evidence` and retried
+   with a fresh preview and plan, up to three attempts in all (Tom `db9ecb0d`).
+   A unit that is gone with nothing pending, a changed referent or a
+   non-environmental skip fails at once. Nothing replays it: the image is discarded
    after the receipt.
 
 ### The ownership oracle
@@ -322,3 +327,14 @@ adoption, no qualification of a schedule, and no count of the reaper's own
 behaviour. The handover comparison against the reaper's dry run needs a real
 drive and stays an operator step; the [host-job contract](host-job.md) owns that
 half.
+
+### 2026-10-29: head `22a3af1`, Oxide Supervisor session (Tom `68c00238`)
+
+- **Diagnostic:** all 6 cases passed. The script exits `3` by design.
+- **Counted:** 5 of 6 passed. Case 6 failed because the real run exited `0`: the unit was
+  KEPT by a pre-intent custody skip, not deleted. A read-only source review found no path
+  that follows the link. The cause was a descriptor read closed outside the pair-retry path,
+  which counted as Unknown. Corrected under Tom `db9ecb0d`: a first-read or
+  dead-handle re-read closed descriptor settles through the same bounded re-listing,
+  and case 6 records and retries environmental skips. Evidence is in
+  `/Volumes/Builds/scratch/barge/evidence-s7-22a3af1-20261029T112812Z`.

@@ -97,6 +97,8 @@ AGED_DAYS = 30
 # The native scratch run's age past S4's seven-day native policy.
 NATIVE_AGE_DAYS = 8
 EXIT_INFRASTRUCTURE = 4
+# Case 6's bounded attempts when a shared host makes custody undecidable.
+CASE6_ATTEMPTS = 3
 # The bytes the pending-intent case's symlink points at: the oracle for "the walk
 # never followed the link".
 REFERENT_BYTES = b"the referent the maintain deletion must never follow\n"
@@ -945,15 +947,58 @@ class Proof:
         # 9a573a9 diagnostic exposed.
         os.symlink(referent, os.path.join(root["path"], "link"))
         self.age_area_root(root["path"])
-        plan_file = self.plan_path("case6")
-        _code, preview = self.preview(expect=0, plan_out=plan_file)
-        # The plan this run is authorised by must name exactly this unit: the case
-        # is about a planned deletion that stops mid-way, so a plan that named
-        # nothing would test nothing.
-        candidates = self.candidate_names(preview)
-        assert root["root_id"] in candidates, (root["root_id"], candidates)
-        assert preview["data"]["candidates"] == 1, preview["data"]["candidates"]
-        code, real = self.real(preview["data"]["plan_digest"], plan_file, expect=3)
+        # A shared host can make the pre-intent custody census or the hold check
+        # undecidable for a moment (another process closing a descriptor). Barge
+        # then KEEPS the unit and exits 0: the designed safe outcome, not this
+        # case's subject. Such a skip is recorded and retried with a fresh preview
+        # and plan, a bounded number of times (Tom db9ecb0d). A unit that is gone
+        # with nothing pending is a product failure at once.
+        environmental = ("custody is not proven", "a live or undecidable hold")
+        skips = []
+        for attempt in range(1, CASE6_ATTEMPTS + 1):
+            plan_file = self.plan_path(f"case6-{attempt}")
+            _code, preview = self.preview(expect=0, plan_out=plan_file)
+            # The plan this run is authorised by must name exactly this unit: the
+            # case is about a planned deletion that stops mid-way, so a plan that
+            # named nothing would test nothing.
+            candidates = self.candidate_names(preview)
+            assert root["root_id"] in candidates, (root["root_id"], candidates)
+            assert preview["data"]["candidates"] == 1, preview["data"]["candidates"]
+            code, real = self.real(preview["data"]["plan_digest"], plan_file, expect=None)
+            if code == 3:
+                break
+            with open(referent, "rb") as handle:
+                referent_intact = handle.read() == REFERENT_BYTES
+            skipped = [
+                row
+                for volume in real.get("data", {}).get("volumes", {}).get("rows", [])
+                for area in volume.get("areas", [])
+                for row in area.get("skipped", {}).get("rows", [])
+            ]
+            record = {
+                "case": "exit_3_with_a_pending_intent",
+                "attempt": attempt,
+                "exit": code,
+                "skipped": skipped[:8],
+                "root_present": os.path.lexists(root["path"]),
+                "referent_intact": referent_intact,
+                "pending": real.get("data", {}).get("pending"),
+            }
+            self.case_evidence.append(record)
+            assert referent_intact, "the symlink's referent changed"
+            if code != 0:
+                raise Fault("barge", f"maintain exited {code}, expected 3 or a recorded skip: {record}")
+            if not record["root_present"]:
+                raise Fault("barge", f"the unit is gone with nothing pending: {record}")
+            reasons = [row.get("reason", "") for row in skipped]
+            if not reasons or not all(r.startswith(environmental) for r in reasons):
+                raise Fault("barge", f"maintain kept the unit for a non-environmental reason: {record}")
+            skips.append(record)
+        else:
+            raise Fault(
+                "environment",
+                f"{CASE6_ATTEMPTS} attempts each kept the unit for an environmental reason: {skips}",
+            )
         assert real["data"]["pending"]["count"] == 1, real["data"]["pending"]
         assert real["data"]["volumes"]["rows"][0]["areas"][0]["pending"]["count"] == 1, real["data"]
         pending = self.pending_intents()
