@@ -90,6 +90,17 @@ const RETRY_BACKOFFS: [Duration; 3] = [
     Duration::from_millis(100),
 ];
 
+/// How many paired path-and-vnode observations one disagreeing descriptor is
+/// given, including the first. A transient disagreement of an unrelated process
+/// must not make the whole scan unreadable (Oxide Supervisor 1a5b31a0); three
+/// attempts that still disagree stay unreadable.
+const PAIR_RETRY_ATTEMPTS: usize = 3;
+
+/// The pause between those paired re-reads. Short on purpose: the disagreement
+/// it settles is a descriptor that closed between the two flavors, and a real
+/// refusal must still refuse quickly. Always inside the scan's own time bound.
+const PAIR_RETRY_BACKOFF: Duration = Duration::from_millis(10);
+
 /// The most time one re-observation may take, always inside the scan's own
 /// overall time bound. It is larger than the backoffs above, so the retry count
 /// is what normally stops a persistent answer.
@@ -1196,14 +1207,18 @@ impl MacOs {
     }
 
     /// One vnode descriptor observed as far as the platform allows, including the
-    /// bounded re-observation a dead-handle candidate needs.
+    /// bounded re-observation a dead-handle candidate needs and the paired
+    /// re-read of a path/vnode disagreement.
     ///
     /// Both of the descriptor's per-fd reads answering `ENOENT` is a question,
     /// not an answer: a revoked or reclaimed vnode cannot do I/O and is reported
     /// as a dead handle, but only after a bounded re-observation finds the same
     /// answer for the same process identity (Tom, 2026-10-28, decision e33115d3,
     /// barge#023). A descriptor that reads on the second observation is
-    /// evaluated like any other.
+    /// evaluated like any other. A mixed pair is a question too: one descriptor
+    /// that closed between its two flavors must not make the whole scan
+    /// unreadable, so it is re-read as a pair up to three times about 10 ms
+    /// apart (Oxide Supervisor 1a5b31a0).
     #[allow(clippy::too_many_arguments)]
     fn observe_descriptor(
         &self,
@@ -1228,7 +1243,137 @@ impl MacOs {
                 backoffs,
                 faults,
             ),
+            Ok(DescriptorReading::Disagreed { path, facts }) => self.settle_pair(
+                identity,
+                descriptor,
+                vnode_index,
+                started,
+                timeout,
+                backoffs,
+                faults,
+                path,
+                facts,
+            ),
             Err(error) => Observed::Unreadable(error.message().to_owned()),
+        }
+    }
+
+    /// Re-read one descriptor whose path and vnode facts disagreed, as a paired
+    /// observation, up to [`PAIR_RETRY_ATTEMPTS`] including the first.
+    ///
+    /// The first observation already disagreed. Each later attempt sleeps
+    /// [`PAIR_RETRY_BACKOFF`], re-reads the pid's kernel identity, then reads
+    /// both flavors again as one pair. The first agreeing pair is used: a path,
+    /// an OS blind spot, or a dead-handle candidate, which still has to prove
+    /// itself under decision e33115d3. A process the kernel reports gone at a
+    /// re-read holds nothing. A failed observation is refused before the
+    /// identity after it is consulted, so a disappearing process never discards
+    /// another errno. Three attempts that still disagree stay unreadable. A
+    /// closed descriptor is still never an answer.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_pair(
+        &self,
+        classified: ProcessIdentity,
+        descriptor: i32,
+        vnode_index: usize,
+        started: Instant,
+        timeout: Duration,
+        backoffs: &[Duration],
+        faults: &mut [StatedListing],
+        mut path: String,
+        mut facts: String,
+    ) -> Observed {
+        let pid = classified.pid;
+        for _ in 1..PAIR_RETRY_ATTEMPTS {
+            if started.elapsed().saturating_add(PAIR_RETRY_BACKOFF) >= timeout {
+                return Observed::Bounded;
+            }
+            std::thread::sleep(PAIR_RETRY_BACKOFF);
+            if started.elapsed() >= timeout {
+                return Observed::Bounded;
+            }
+            match self.pair_identity(
+                classified,
+                descriptor,
+                faults,
+                "when the disagreeing descriptor was re-read",
+            ) {
+                Ok(None) => return Observed::Closed,
+                Ok(Some(())) => {}
+                Err(reason) => return Observed::Unreadable(reason),
+            }
+            let stated = stated_vnode_read(faults, pid, vnode_index);
+            let reading = match read_descriptor(pid, descriptor, stated) {
+                Ok(reading) => reading,
+                // A failed observation is never discarded, and never settled by a
+                // process that disappears afterwards: it refuses here, before the
+                // identity after it is consulted.
+                Err(error) => return Observed::Unreadable(error.message().to_owned()),
+            };
+            match self.pair_identity(
+                classified,
+                descriptor,
+                faults,
+                "around the disagreeing descriptor's re-read",
+            ) {
+                Ok(None) => return Observed::Closed,
+                Ok(Some(())) => {}
+                Err(reason) => return Observed::Unreadable(reason),
+            }
+            match reading {
+                DescriptorReading::Path(next) => return Observed::Path(next),
+                DescriptorReading::Opaque => return Observed::Opaque,
+                DescriptorReading::Dead => {
+                    return self.settle_dead_handle(
+                        classified,
+                        descriptor,
+                        vnode_index,
+                        started,
+                        timeout,
+                        backoffs,
+                        faults,
+                    )
+                }
+                DescriptorReading::Disagreed {
+                    path: next_path,
+                    facts: next_facts,
+                } => {
+                    path = next_path;
+                    facts = next_facts;
+                }
+            }
+        }
+        Observed::Unreadable(mixed_pair_message(pid, descriptor, &path, &facts))
+    }
+
+    /// The classified process's kernel identity at one pair re-read, or gone.
+    ///
+    /// `Ok(None)` is the kernel reporting no such process: it holds nothing.
+    /// A changed or unreadable identity is unreadable, never a skip.
+    fn pair_identity(
+        &self,
+        classified: ProcessIdentity,
+        descriptor: i32,
+        faults: &mut [StatedListing],
+        when: &str,
+    ) -> std::result::Result<Option<()>, String> {
+        let pid = classified.pid;
+        match self.reobserve_identity(pid, faults) {
+            Ok(None) => Ok(None),
+            Err(error) => Err(pair_identity_unreadable(pid, descriptor, &error)),
+            Ok(Some(now))
+                if now.identity.start == classified.start
+                    && now.identity.effective_uid == classified.effective_uid =>
+            {
+                Ok(Some(()))
+            }
+            Ok(Some(now)) => Err(pair_identity_changed(
+                pid,
+                descriptor,
+                classified,
+                now.identity,
+                when,
+            )),
         }
     }
 
@@ -1389,6 +1534,12 @@ impl MacOs {
                 descriptor,
                 command: before.command,
             }),
+            // A second observation that disagrees is not a dead handle. The
+            // pair-retry rule does not run here: persistence of both ENOENT is
+            // not established, and decision e33115d3 is not relaxed.
+            DescriptorReading::Disagreed { path, facts } => {
+                Observed::Unreadable(mixed_pair_message(pid, descriptor, &path, &facts))
+            }
         };
         // The second observation and the final identity read are done, so the
         // answer is accepted only if both deadlines still hold after them.
@@ -1639,13 +1790,12 @@ impl StatedVnodeRead {
         self.facts
     }
 
-    /// Whether the pair keeps answering this way, which is what a persistent dead
-    /// handle does; every other stated pair is consumed by its first use so the
-    /// re-observation reads the descriptor for real.
+    /// Whether the pair keeps answering this way. A persistent dead handle and a
+    /// persistent mixed pair both do; `once` is the transient case, consumed so
+    /// the next observation — a dead-handle re-observation or a pair retry —
+    /// reads the descriptor for real.
     pub(crate) const fn persists(self) -> bool {
         !self.once
-            && matches!(self.path, StatedCall::Absent)
-            && matches!(self.facts, StatedCall::Absent)
     }
 }
 
@@ -1662,6 +1812,16 @@ impl StatedVnodeRead {
         }
     }
 
+    /// The pair, stated once: a transient disagreement or a transient dead
+    /// answer, after which the descriptor is read for real.
+    pub(crate) const fn once(path: StatedCall, facts: StatedCall) -> Self {
+        Self {
+            path,
+            facts,
+            once: true,
+        }
+    }
+
     /// Both per-fd reads answer `EPERM`: an OS blind spot.
     pub(crate) const fn opaque() -> Self {
         Self::new(StatedCall::Hidden, StatedCall::Hidden)
@@ -1675,10 +1835,15 @@ impl StatedVnodeRead {
     /// Both per-fd reads answer `ENOENT` once, then the descriptor is read for
     /// real: a transient answer, not a dead handle.
     pub(crate) const fn dead_once() -> Self {
-        Self {
-            once: true,
-            ..Self::dead()
-        }
+        Self::once(StatedCall::Absent, StatedCall::Absent)
+    }
+
+    /// The path is read for real and the vnode facts report the descriptor
+    /// closed, once: a transient disagreement, then the descriptor is read for
+    /// real. This is the diagnostic that made a whole-scan `Unknown` from one
+    /// unrelated process whose fd closed between the two flavors.
+    pub(crate) const fn facts_closed_once() -> Self {
+        Self::once(StatedCall::Real, StatedCall::Closed)
     }
 
     /// The path read answers `ENOENT`; the vnode facts are read for real.
@@ -1773,10 +1938,11 @@ impl StatedPlatform {
 /// index among the process's vnode descriptors. A production scan states
 /// nothing, so every descriptor is read for real.
 ///
-/// A stated `Dead` answer persists across observations, because a revoked vnode
-/// answers `ENOENT` for as long as it exists; every other stated answer is
-/// consumed by its first use, so the dead-handle re-observation reads the
-/// descriptor for real afterwards.
+/// A stated pair persists across observations unless `once` is set: a revoked
+/// vnode answers `ENOENT` for as long as it exists, and a persistent mixed pair
+/// has to refuse after three attempts. A transient pair is consumed by its
+/// first use so the next observation — a dead-handle re-observation or a pair
+/// retry — reads the descriptor for real afterwards.
 fn stated_vnode_read(
     faults: &mut [StatedListing],
     pid: u32,
@@ -2397,7 +2563,8 @@ fn bsd_info(pid: u32) -> Result<Option<libc::proc_bsdinfo>> {
 ///
 /// The two answers that are not a path are facts of their own: a descriptor that
 /// closed is gone, and one both flavors hide is opaque, which only a verified
-/// platform binary may have (Tom, 2026-10-26, decision e528a712).
+/// platform binary may have (Tom, 2026-10-26, decision e528a712). A mixed pair
+/// is a question, not an answer: it is re-read as a pair before it refuses.
 #[derive(Debug)]
 enum DescriptorReading {
     /// The path the platform reports for the descriptor.
@@ -2411,6 +2578,14 @@ enum DescriptorReading {
     /// process identity reports it as a dead handle (Tom, 2026-10-28, decision
     /// e33115d3, barge#023).
     Dead,
+    /// The two per-fd reads did not agree. The scan re-reads the pair before it
+    /// treats this as unreadable (Oxide Supervisor 1a5b31a0).
+    Disagreed {
+        /// What the path read reported, for the refusal if every attempt disagrees.
+        path: String,
+        /// What the vnode-facts read reported, for the same refusal.
+        facts: String,
+    },
 }
 
 /// One vnode descriptor, read as far as the platform allows.
@@ -2418,14 +2593,13 @@ enum DescriptorReading {
 /// Both of the platform's per-fd reads are evaluated, because every answer is a
 /// statement about the *pair*. Only three pairings are an answer: a readable path
 /// with readable vnode facts, `ENOENT` from both flavors (a dead-handle
-/// candidate), and `EPERM` from both flavors (the OS blind spot). Every other
-/// pairing is unknown and refuses, and a descriptor the platform reports closed is
-/// never carried: `ESRCH` and `EBADF` are other errnos, the fd may already have
-/// been closed and reused, and no read's result is ever carried by the other's. So
-/// a paired closed answer refuses like one closed answer beside `ENOENT`, `EPERM`,
-/// a readable path or a failure, a readable path beside vnode facts that report
-/// the vnode gone or hidden, a hidden path beside a readable or absent answer, and
-/// a path read that failed for any reason but the hidden answer.
+/// candidate), and `EPERM` from both flavors (the OS blind spot). A mixed pair is
+/// a disagreement, re-read as a pair before it refuses. A descriptor the platform
+/// reports closed is never carried: `ESRCH` and `EBADF` are other errnos, the fd
+/// may already have been closed and reused, and no read's result is ever carried
+/// by the other's. So a paired closed answer refuses like one closed answer beside
+/// `ENOENT`, `EPERM`, a readable path or a failure, and a path read that failed
+/// for any reason but the hidden answer refuses at once.
 fn read_descriptor(
     pid: u32,
     descriptor: i32,
@@ -2473,20 +2647,21 @@ fn read_descriptor(
         (DescriptorPath::Failed(error), _) if error.raw_os_error() != Some(libc::EPERM) => {
             Err(unreadable_descriptors(pid, &error))
         }
-        // A hidden path beside a closed answer disagrees in the same way: the
-        // hidden answer is only placeable when the vnode facts hide it too.
-        (path @ DescriptorPath::Failed(_), facts @ VnodeFacts::Closed) => {
-            Err(mixed_reads(pid, descriptor, &path, &facts))
-        }
         // A descriptor the platform reports closed is not an answer custody can
         // build on: `ESRCH` and `EBADF` are other errnos, the fd may already have
         // been closed and reused, and no read's result is ever carried by the
         // other's. Even two closed answers refuse, so nothing a closing descriptor
         // reports can make a scan safe.
         (DescriptorPath::Closed, VnodeFacts::Closed) => Err(closed_descriptor(pid, descriptor)),
-        // The pair disagrees. Nothing about the descriptor is established, so it
-        // is unknown and never a dead handle.
-        (path, facts) => Err(mixed_reads(pid, descriptor, &path, &facts)),
+        // The pair disagrees. Nothing about the descriptor is established yet:
+        // the scan re-reads both flavors as a pair before it refuses, so one
+        // transient close between the two reads cannot make the whole scan
+        // unreadable. A persistent disagreement stays unknown and is never a
+        // dead handle.
+        (path, facts) => Ok(DescriptorReading::Disagreed {
+            path: path_answer(&path),
+            facts: facts_answer(&facts),
+        }),
     }
 }
 
@@ -2506,20 +2681,37 @@ fn closed_descriptor(pid: u32, descriptor: i32) -> Error {
     .with_detail("descriptor", i64::from(descriptor).into())
 }
 
-/// The refusal for a descriptor whose two per-fd reads do not agree: only a
-/// readable path with readable facts, `ENOENT` from both and `EPERM` from both are
-/// an answer, so a mixed pair establishes nothing and is never a dead handle.
-fn mixed_reads(pid: u32, descriptor: i32, path: &DescriptorPath, facts: &VnodeFacts) -> Error {
-    Error::new(
-        ErrorKind::UnknownState,
-        format!(
-            "the two reads of descriptor {descriptor} of pid {pid} do not agree ({}; {}), so the descriptor cannot be placed and a dead handle is not established",
-            path_answer(path),
-            facts_answer(facts)
-        ),
+/// The refusal for a descriptor whose two per-fd reads still do not agree after
+/// the paired re-reads: only a readable path with readable facts, `ENOENT` from
+/// both and `EPERM` from both are an answer, so a persistent mixed pair
+/// establishes nothing and is never a dead handle.
+fn mixed_pair_message(pid: u32, descriptor: i32, path: &str, facts: &str) -> String {
+    format!(
+        "the two reads of descriptor {descriptor} of pid {pid} do not agree ({path}; {facts}), so the descriptor cannot be placed and a dead handle is not established"
     )
-    .with_detail("pid", u64::from(pid).into())
-    .with_detail("descriptor", i64::from(descriptor).into())
+}
+
+/// The refusal for a pid whose kernel identity changed while a disagreeing
+/// descriptor was re-read: the re-read is not about the process that listed it.
+fn pair_identity_changed(
+    pid: u32,
+    descriptor: i32,
+    classified: ProcessIdentity,
+    now: ProcessIdentity,
+    when: &str,
+) -> String {
+    format!(
+        "pid {pid} reported start identity {} and effective uid {:?} {when}, not the classified {} and {:?}, so descriptor {descriptor} cannot be placed",
+        now.start, now.effective_uid, classified.start, classified.effective_uid
+    )
+}
+
+/// The refusal for a pid whose kernel identity cannot be read while a
+/// disagreeing descriptor is re-read.
+fn pair_identity_unreadable(pid: u32, descriptor: i32, error: &Error) -> String {
+    format!(
+        "the kernel identity of pid {pid} is unreadable while descriptor {descriptor} is re-read, so the descriptor cannot be placed: {error}"
+    )
 }
 
 /// What one per-fd path read reported, for a refusal that a human reads.

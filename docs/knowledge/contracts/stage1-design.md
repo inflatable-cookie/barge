@@ -977,9 +977,13 @@ identity read: it is recorded (pid, start identity, descriptor and command) and
 does not block `Safe`, because a revoked or reclaimed vnode cannot do I/O, and its
 path is never read (Tom, 2026-10-28, decision e33115d3, barge#023). Only a
 readable path with readable facts, `ENOENT` from both reads and `EPERM` from both
-are an answer, so a mixed pair — including a readable path whose vnode facts
-answer `ENOENT` — is unreadable, and `ENOENT` on the descriptor listing itself,
-with a changed or unreadable identity, or with a bound reached stays unreadable.
+are an answer. A mixed pair is re-read as a paired path-and-vnode observation up
+to three times about 10 ms apart inside the scan's own time bound, and the first
+agreeing pair is used; a process that has exited at a re-read holds nothing;
+three attempts that still disagree stay unreadable (Oxide Supervisor 1a5b31a0,
+barge#008). `ENOENT` on the descriptor listing itself, a changed or unreadable
+identity, or a bound reached stays unreadable. A closed descriptor is still never
+an answer.
 Any unreadable
 hold, an unreadable effective uid, a same-uid descriptor that stays unreadable
 after its retries or that no verified platform binary explains and no
@@ -1709,6 +1713,20 @@ Choices S5 made where this design left the mechanic to the slice:
   identity, and a bound reached. There are no path or name lists, because a dead
   handle's path is not read either. The record names every dead handle, bounded
   at 32 descriptors: meeting more is `Unknown`, not a shorter list.
+- **A transient path/vnode disagreement is re-read as a pair** (corrected here
+  under barge#008, Oxide Supervisor 1a5b31a0). barge#008's uncounted diagnostic
+  at reviewed head `19e79b` failed because pid 42551 fd 3 closed between its
+  path and vnode-facts reads. The refusal was safe but too broad: one transient
+  disagreement of an unrelated process must not make the whole custody scan
+  unreadable. On a path/vnode disagreement for one descriptor, the scan re-reads
+  that descriptor as a paired path-and-vnode observation up to three attempts
+  about 10 ms apart, inside the scan's own time bound, and uses the first
+  agreeing pair. A process the kernel reports gone at a re-read holds nothing
+  under the existing exited rule. Three attempts that still disagree stay
+  `Unknown`. The dead-handle rule from decision e33115d3 is unchanged: both
+  `ENOENT` still needs its own bounded re-observation, a closed descriptor is
+  still never an answer, and a failed observation is still refused before the
+  identity after it is consulted.
 - **What the evidence says.** The evidence records `self_excluded: <pid>` (the one
   process the scan excluded), `foreign_uid_processes` (how many processes of
   another effective uid it classified and did not inspect) and `retry`: how many
@@ -1731,7 +1749,8 @@ Choices S5 made where this design left the mechanic to the slice:
   scan's own answers carry it as well: `Complete`, `Bounded` and `Unreadable`. `describe.custody` names all of it: the
   exclusion, the foreign-uid blind spot that is reported rather than observed, the
   OS blind spot of a verified platform binary's hidden descriptors, the dead
-  handles a dead vnode descriptor is recorded as, and
+  handles a dead vnode descriptor is recorded as, the paired re-read of a
+  path/vnode disagreement, and
   the retry rule with its positive facts and its two rechecked deadlines. A
   same-uid process the scan cannot read is an `Unreadable` answer rather than a
   returned error, so the record reaches the refusal; a returned error is only a
@@ -1784,8 +1803,11 @@ Choices S5 made where this design left the mechanic to the slice:
   the path read while the vnode facts report it closed, `EIO` from the vnode
   facts read, a closed path read beside `ENOENT`, `EPERM` or readable facts, a
   readable path beside closed vnode facts, and **both** reads reporting the
-  descriptor closed are all `unknown`, because `ESRCH` and `EBADF` are other
-  errnos. A second observation that fails with `EIO` while the pid is then
+  descriptor closed are all `unknown` after the three paired attempts, because
+  `ESRCH` and `EBADF` are other errnos. A transient mixed pair that then agrees
+  places the descriptor; a mixed pair that still disagrees across three attempts
+  stays `unknown`; a pid that exits during that re-read holds nothing. A second
+  observation that fails with `EIO` while the pid is then
   reported gone is `unknown` too — a disappearing process never settles a failed
   read — and the same disappearance after an answered paired `ENOENT` is `safe`
   with no dead handle recorded, because the descriptor went with the process. An identity that changes after a

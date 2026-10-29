@@ -29,12 +29,13 @@
 //!   descriptor is unreadable and refuses;
 //! - both of a vnode descriptor's per-fd reads are evaluated, and only a readable
 //!   path with readable facts, `ENOENT` from both and `EPERM` from both are an
-//!   answer: a descriptor whose path read a path while its facts answered
-//!   `ENOENT`, or whose two reads disagree in any other way, is unreadable. A
-//!   descriptor the platform reports closed is never an answer at all: `ESRCH`
-//!   and `EBADF` are other errnos, the fd may already have been closed and reused,
-//!   and no read's result is carried by the other's — so even two closed answers
-//!   refuse;
+//!   answer: a mixed pair is re-read as a pair up to three times about 10 ms
+//!   apart inside the scan's own time bound, and the first agreeing pair is used;
+//!   a process that has exited at a re-read holds nothing; three attempts that
+//!   still disagree stay unreadable. A descriptor the platform reports closed is
+//!   never an answer at all: `ESRCH` and `EBADF` are other errnos, the fd may
+//!   already have been closed and reused, and no read's result is carried by the
+//!   other's — so even two closed answers refuse;
 //! - a vnode descriptor whose path and vnode facts both answer `ENOENT`, and
 //!   still do for the same process identity on a bounded re-observation whose
 //!   deadlines are rechecked after that observation and the final identity read,
@@ -1056,7 +1057,7 @@ pub fn capability_report() -> CustodyReport {
             "that scan excludes the calling barge process's own descriptors, by its pid and the start identity read once and verified, and no other process: another barge process, its child or its parent is observed like any other same-uid writer".to_owned(),
             "that scan re-observes a same-uid process whose descriptor listing the kernel answers EPERM for, by re-reading the kernel's pid, start identity and effective uid and listing again at most three times inside a 250 ms settle window, with both that window and the scan's own deadline rechecked after every backoff, and settles it only on a positive fact: a later listing, a process the kernel reports gone, a changed start identity re-evaluated as the different process it now names, or a changed effective uid counted as the named blind spot; the same identity still answering EPERM is unknown and refuses, and elapsed time is never taken as proof".to_owned(),
             "that scan treats a vnode descriptor whose path and vnode facts the platform both answer EPERM for as an OS blind spot, counted and reported in the evidence and never a refusal, only when the process's own code-signing status carries the platform binary flag and its kernel start identity is unchanged before and after that read; a process that is not a verified platform binary, a status read that fails, and an identity that changes around it leave those descriptors unknown".to_owned(),
-            "that scan evaluates both of a vnode descriptor's per-fd reads, and treats only three pairings as an answer: a readable path with readable vnode facts, ENOENT from both, and EPERM from both (the OS blind spot); every other pairing is unknown and refuses, and a descriptor the platform reports closed is never carried — ESRCH and EBADF are other errnos, the fd may already have been closed and reused, and no read's result is carried by the other's, so even two closed answers refuse, as do a readable path whose vnode facts answer ENOENT and a path read that answers ENOENT, fails or reports a close beside any other answer".to_owned(),
+            "that scan evaluates both of a vnode descriptor's per-fd reads, and treats only three pairings as an answer: a readable path with readable vnode facts, ENOENT from both, and EPERM from both (the OS blind spot); a mixed pair is re-read as a paired path-and-vnode observation up to three attempts about 10 ms apart inside the scan's own time bound, and the first agreeing pair is used; a process that has exited at a re-read holds nothing; three attempts that still disagree stay unknown and refuse; a descriptor the platform reports closed is never carried — ESRCH and EBADF are other errnos, the fd may already have been closed and reused, and no read's result is carried by the other's, so even two closed answers refuse".to_owned(),
             "that scan re-observes a vnode descriptor whose path and vnode facts both answer ENOENT under the same bounded rule, re-reading the kernel's pid, start identity and effective uid before and after the second observation, rechecking both deadlines when that observation and the final identity read complete, and reports it as a dead handle — a revoked or reclaimed vnode that cannot do I/O — only when the second observation still answers ENOENT to both reads for the classified identity inside both bounds; a second observation that fails for any reason is never discarded, not even when the pid is then reported gone, ENOENT on the descriptor listing itself, a changed or unreadable identity and a bound reached are all unknown, and no path or name is listed for a dead handle".to_owned(),
             "that evidence names every dead handle it counts — pid, kernel start identity, descriptor and command — up to 32 of them, and a scan that meets more refuses rather than report a count it cannot show".to_owned(),
             "that evidence names every blind-spot process it counts — pid, kernel start identity, command and hidden-descriptor count — up to 32 of them, and a scan that meets more refuses rather than report a count it cannot show".to_owned(),
@@ -1160,10 +1161,9 @@ mod tests {
     impl Child {
         /// Spawn one child that announces it finished starting and then waits, so a
         /// scan never reads a descriptor the loader is about to close. A freshly
-        /// exec'd binary opens and closes its own image and libraries immediately,
-        /// and a scan that paired a readable path with the closed answer of such a
-        /// descriptor would be unknown by the pairing rule instead of observing the
-        /// fact under test.
+        /// exec'd binary opens and closes its own image and libraries immediately;
+        /// STOP keeps that table still across the paired re-reads a mixed pair
+        /// takes.
         fn spawn(configure: impl FnOnce(&mut std::process::Command)) -> Self {
             use std::io::Read;
             use std::os::fd::OwnedFd;
@@ -2206,6 +2206,16 @@ mod tests {
                 .any(|fact| fact.contains("platform binary") && fact.contains("OS blind spot")),
             "the capability names the blind spot as not observed: {:?}",
             report.excludes
+        );
+        assert!(
+            report
+                .establishes
+                .iter()
+                .any(|fact| fact.contains("mixed pair")
+                    && fact.contains("10 ms")
+                    && fact.contains("three attempts")),
+            "the capability names the paired re-read of a path/vnode disagreement: {:?}",
+            report.establishes
         );
         assert!(
             report
@@ -3385,7 +3395,9 @@ mod tests {
 
     /// One mixed pair of per-fd answers, exercised through the production
     /// pairing: only the read the test names is stated, so the other is the real
-    /// kernel read and [`crate::os`]'s own branching decides the case.
+    /// kernel read and [`crate::os`]'s own branching decides the case. A stated
+    /// mixed pair persists across the three paired attempts, so this is the
+    /// persistent-disagreement refusal.
     fn assert_mixed_pair_refuses(
         holder: &Holder,
         child: &Child,
@@ -3412,7 +3424,8 @@ mod tests {
         let child = Child::holding(&payload);
         // The descriptor's real path is readable and its real vnode facts are
         // readable, so each case below states exactly one half and leaves the
-        // other for the production read.
+        // other for the production read. The stated mixed pair persists across
+        // the three paired attempts, so a persistent disagreement still refuses.
         for (stated, label) in [
             (
                 StatedVnodeRead::path_absent(),
@@ -3653,12 +3666,82 @@ mod tests {
         // The path reads fine and the vnode facts then report the descriptor
         // closed. The pair disagrees, and a closed answer never carries the other
         // read's result: the fd may already have been closed and reused, so this
-        // is unknown — never a closed descriptor and never a dead handle.
+        // is unknown — never a closed descriptor and never a dead handle. The
+        // stated pair persists across the three paired attempts.
         assert_mixed_pair_refuses(
             &holder,
             &child,
             StatedVnodeRead::new(StatedCall::Real, StatedCall::Closed),
             "the path read a path while the vnode facts report the descriptor closed",
+        );
+    }
+
+    // ---- barge#008 / Supervisor 1a5b31a0: a transient path/vnode disagreement is re-read ----
+
+    #[test]
+    fn a_transient_path_vnode_disagreement_is_placed() {
+        let holder = real_holder("custody-008-pair-transient");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let identity = child.identity();
+        // The path reads and the vnode facts then report the descriptor closed,
+        // once: a descriptor that closed between the two flavors. The pair
+        // retry reads it for real, both flavors agree, and the descriptor is
+        // placed inside the root — the whole scan is not unreadable.
+        let observer = stated_vnode(identity, StatedVnodeRead::facts_closed_once());
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unsafe", "{:?}", verdict.reason());
+        assert!(
+            verdict
+                .reason()
+                .unwrap_or_default()
+                .contains("holds descriptor"),
+            "the re-read pair placed the descriptor: {:?}",
+            verdict.reason()
+        );
+    }
+
+    #[test]
+    fn a_persistent_path_vnode_disagreement_across_three_attempts_is_unknown() {
+        let holder = real_holder("custody-008-pair-persistent");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        // The same mixed pair on every attempt: three disagreements stay
+        // unreadable, and a closed answer still never carries the other read.
+        assert_mixed_pair_refuses(
+            &holder,
+            &child,
+            StatedVnodeRead::new(StatedCall::Real, StatedCall::Closed),
+            "a mixed pair that disagrees across three paired attempts",
+        );
+    }
+
+    #[test]
+    fn a_pid_that_exits_during_pair_retry_holds_nothing() {
+        let holder = real_holder("custody-008-pair-gone");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let identity = child.identity();
+        // The first observation disagrees; the pid is gone by the identity read
+        // after the first pair retry. A gone process holds nothing, so the
+        // descriptor went with it and the scan is not unreadable.
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                gone_after: Some(1),
+                vnode_reads: vec![(
+                    0,
+                    StatedVnodeRead::new(StatedCall::Real, StatedCall::Closed),
+                )],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+        assert!(
+            verdict.into_evidence().is_ok(),
+            "a gone process holds nothing"
         );
     }
 
