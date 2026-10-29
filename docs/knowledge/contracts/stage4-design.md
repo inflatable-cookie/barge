@@ -1223,13 +1223,26 @@ Choices F5 made where this contract left the mechanics to the slice:
   present but unreadable is `unknown_state` and is never looked past. An absent
   registry reports every path it looked at, so "no registry" never reads as "a
   registry with no rows".
+- **The pool list must be known, not assumed.** `pools.json` is the census's
+  source of sources, so the slice distinguishes its three outcomes. A **reported**
+  record gives the pools to search, followed by the defaults. An **absent** record
+  is a fact — Oxide recorded no pool, so only its defaults can be in use — and the
+  defaults are then the complete list. An **unreadable, oversized or divergent**
+  record is not a fact about which pools exist: the census reports
+  `unknown_state` naming that record, looks at no registry at all, and so neither
+  pronounces the registry absent because a pool Barge cannot see was skipped nor
+  reports a default pool's registry as the whole truth. An absent census is only
+  ever reached from a complete candidate list.
 - **Strict and bounded.** The document is read with Oxide's own caps — 4 MiB and
   4096 rows — and `deny_unknown_fields` at every level it reads. Its
   `version`/`schema` pair must be `/2` with 2 or `/1` with 1; an unknown pair, a
   zero revision, an unusable `created_by`, disagreeing `complete`/`incomplete`,
   an over-cap row count or a divergent field set is `unknown_state` naming the
-  file. `intents` and `cancelled_overflow` are accepted as members of the
-  document's field set and stay presence-only: the census reads rows.
+  file. Its `rows` member is required, because Oxide always writes it even when
+  it holds none: a document without `rows` is divergent, never an empty registry,
+  and its absence is not evidence that no root is recorded. `intents` and
+  `cancelled_overflow` are the members Oxide omits when they are empty, so they
+  are accepted as absent and stay presence-only: the census reads rows.
 - **Anchoring a recorded root.** The volume is found by the row's recorded UUID
   through the same bounded mount census a root verification uses, so a mount
   that moved still resolves. The recorded path's `/Volumes/<mount>` prefix is

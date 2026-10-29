@@ -17,7 +17,10 @@
 //! means the directory is not the one that was recorded, so the root is kept as
 //! `unknown(inode_changed)`. A row whose volume is away is
 //! `unknown(volume_unverified)`: never skipped, never called absent, and never
-//! counted as an empty registry.
+//! counted as an empty registry. The same rule holds one level up: a registry
+//! document without its `rows` member is divergent, and a pools record that
+//! cannot be read makes the census's own source unknown, so neither is ever
+//! reported as an empty or absent registry.
 //!
 //! Nothing here is authority. No row becomes a Barge record, nothing is
 //! written, and the report is used by `inspect` alone. The read boundary this
@@ -30,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::contract::RowSet;
 use crate::error::{Error, ErrorKind, Result};
 use crate::identity::{IdentityReason, RemountEvidence};
-use crate::inspect::{Observation, ObservationState, Observed};
+use crate::inspect::{Observation, ObservationState, Observed, OxidePools};
 use crate::os::{
     DirId, DirOps, EntryKind, ExpectedVolume, MountPrefix, MountRoot, VolumeFacts, VolumeUuid,
 };
@@ -274,9 +277,32 @@ pub struct OxideRegistryObservation {
 /// unreadable, oversized or of an unknown version is unknown state, and Barge
 /// never looks past it for a more convenient one. An absent registry names every
 /// path it looked at, so "no registry" never reads as "a registry with no rows".
-pub fn observe_oxide_registry(pools: &[PathBuf], deadline: Deadline) -> OxideRegistryObservation {
+///
+/// `known_pools` is the complete list, or `None` when Oxide's pools record could
+/// not be read. `None` is never an empty list: the census reports unknown state
+/// naming the record, because a pool Barge cannot see may hold the registry it
+/// would otherwise pronounce absent — or find a different one in a default pool
+/// and report that as the whole truth.
+pub fn observe_oxide_registry(
+    pools: &Observation<OxidePools>,
+    known_pools: Option<&[PathBuf]>,
+    deadline: Deadline,
+) -> OxideRegistryObservation {
+    let Some(known) = known_pools else {
+        return OxideRegistryObservation {
+            observation: Observation::Unknown {
+                source: OXIDE_REGISTRY_SOURCE,
+                path: pools.path().to_path_buf(),
+                detail: format!(
+                    "{}: Oxide's pools record could not be read, so the internal pool list is unknown and no registry was looked for; nothing is reported absent",
+                    pools.path().display()
+                ),
+            },
+            searched: Vec::new(),
+        };
+    };
     let mut searched: Vec<PathBuf> = Vec::new();
-    for pool in pools {
+    for pool in known {
         let path = pool.join(OXIDE_OUTPUTS_DIR).join(OXIDE_REGISTRY_FILE);
         searched.push(path.clone());
         match read_registry(&path, deadline) {
@@ -433,7 +459,9 @@ struct RawRegistry {
     #[serde(default)]
     incomplete: Option<RawIncomplete>,
     created_by: String,
-    #[serde(default)]
+    /// Oxide always writes `rows`, even when it holds none. A document without
+    /// it is divergent, never an empty registry: absence of the member is not
+    /// evidence that no root is recorded.
     rows: Vec<RawRow>,
     /// Accepted as a member of the document's own field set; never interpreted.
     #[allow(dead_code)]
@@ -555,7 +583,9 @@ struct OxideRootMarker {
 /// The census of one registry: every row's recorded facts and identity verdict.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OxideCensusReport {
-    /// The registry path that decided the observation.
+    /// The path that decided the observation: the registry that was read, the
+    /// first candidate that was looked at, or — when the internal pool list
+    /// itself is unknown — the pools record that made it so.
     pub path: PathBuf,
     /// Every registry path that was looked at, in order.
     pub searched: Vec<PathBuf>,
@@ -1243,7 +1273,9 @@ mod tests {
         OXIDE_REGISTRY_SIZE_CAP_BYTES, OXIDE_ROOT_MARKER_SIZE_CAP_BYTES,
     };
     use crate::contract::RowSet;
-    use crate::inspect::ObservationState;
+    use crate::inspect::{
+        read_pools, Observation, ObservationState, OxidePools, OXIDE_POOLS_SOURCE,
+    };
     use crate::os::{
         DeviceId, DirOps, FileSystem, MountPoint, MountPrefix, MountRoot, ProcessObserver,
         VolumeFacts, VolumeIdentity, VolumeUuid,
@@ -1446,7 +1478,8 @@ mod tests {
                 &serde_json::to_vec(&document).unwrap(),
             );
             super::observe_oxide_registry(
-                &[self.dir.join("pool")],
+                &absent_pools(),
+                Some(&[self.dir.join("pool")]),
                 Deadline::after(std::time::Duration::from_secs(5)),
             )
         }
@@ -1472,6 +1505,26 @@ mod tests {
         fn row<'a>(&self, report: &'a OxideCensusReport) -> &'a OxideCensusRow {
             assert_eq!(report.rows.count, 1, "{report:#?}");
             &report.rows.rows[0]
+        }
+    }
+
+    /// An absent pools record: Oxide recorded no pools, so only its defaults can
+    /// be in use, and the candidate list is complete.
+    fn absent_pools() -> Observation<OxidePools> {
+        Observation::Absent {
+            source: OXIDE_POOLS_SOURCE,
+            path: PathBuf::from("/fixture/state/pools.json"),
+            detail: "no pools record".to_owned(),
+        }
+    }
+
+    /// A pools record that could not be read: the pool list is unknown, so the
+    /// candidate list is not.
+    fn unknown_pools() -> Observation<OxidePools> {
+        Observation::Unknown {
+            source: OXIDE_POOLS_SOURCE,
+            path: PathBuf::from("/fixture/state/pools.json"),
+            detail: "/fixture/state/pools.json: the file is not one JSON document".to_owned(),
         }
     }
 
@@ -1839,7 +1892,8 @@ mod tests {
         );
         assert!(path.exists());
         let observation = observe_oxide_registry(
-            &[fixture.dir.join("pool")],
+            &absent_pools(),
+            Some(&[fixture.dir.join("pool")]),
             Deadline::after(std::time::Duration::from_secs(5)),
         );
         let report = fixture.report(&observation);
@@ -1878,7 +1932,8 @@ mod tests {
         assert_eq!(observed.value().schema(), 1);
         assert_eq!(observed.value().rows()[0].root_ino(), None);
         let observation = observe_oxide_registry(
-            &[fixture.dir.join("pool")],
+            &absent_pools(),
+            Some(&[fixture.dir.join("pool")]),
             Deadline::after(std::time::Duration::from_secs(5)),
         );
         let report = fixture.report(&observation);
@@ -1901,13 +1956,27 @@ mod tests {
         });
         let cases: Vec<(&str, Vec<u8>)> = vec![
             (
+                // Oxide always writes `rows`; a document without it is not an
+                // empty registry, and Barge must not report one.
+                "no-rows",
+                serde_json::to_vec(&serde_json::json!({
+                    "version": "oxide.outputs.registry/2",
+                    "schema": 2,
+                    "revision": 1,
+                    "complete": true,
+                    "created_by": "t"
+                }))
+                .unwrap(),
+            ),
+            (
                 "version-9",
                 serde_json::to_vec(&serde_json::json!({
                     "version": "oxide.outputs.registry/9",
                     "schema": 2,
                     "revision": 1,
                     "complete": true,
-                    "created_by": "t"
+                    "created_by": "t",
+                    "rows": []
                 }))
                 .unwrap(),
             ),
@@ -1918,7 +1987,8 @@ mod tests {
                     "schema": 1,
                     "revision": 1,
                     "complete": true,
-                    "created_by": "t"
+                    "created_by": "t",
+                    "rows": []
                 }))
                 .unwrap(),
             ),
@@ -1930,6 +2000,7 @@ mod tests {
                     "revision": 1,
                     "complete": true,
                     "created_by": "t",
+                    "rows": [],
                     "nonce": "a field Barge does not know"
                 }))
                 .unwrap(),
@@ -1941,7 +2012,8 @@ mod tests {
                     "schema": 2,
                     "revision": 0,
                     "complete": true,
-                    "created_by": "t"
+                    "created_by": "t",
+                    "rows": []
                 }))
                 .unwrap(),
             ),
@@ -1952,7 +2024,8 @@ mod tests {
                     "schema": 2,
                     "revision": 1,
                     "complete": false,
-                    "created_by": "t"
+                    "created_by": "t",
+                    "rows": []
                 }))
                 .unwrap(),
             ),
@@ -2030,8 +2103,11 @@ mod tests {
     fn an_absent_registry_is_absent_and_names_every_pool_it_looked_at() {
         let fixture = TempDir::new("census-absent");
         let pools = vec![fixture.join("first"), fixture.join("second")];
-        let observation =
-            observe_oxide_registry(&pools, Deadline::after(std::time::Duration::from_secs(5)));
+        let observation = observe_oxide_registry(
+            &absent_pools(),
+            Some(&pools),
+            Deadline::after(std::time::Duration::from_secs(5)),
+        );
         assert_eq!(observation.observation.state(), ObservationState::Absent);
         assert_eq!(
             observation.searched,
@@ -2068,6 +2144,124 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_pools_record_is_unknown_state_and_never_an_absent_census() {
+        // The default pool holds a registry, and Oxide's pools record cannot be
+        // read. The registry in the default pool may not be the one Oxide uses,
+        // so the census reports its source as unknown: it neither pronounces the
+        // registry absent nor reports the wrong one as the whole truth.
+        let fixture = TempDir::new("census-pools-unknown");
+        let cache = fixture.join("cache");
+        let default_pool = cache.join("build-pool");
+        std::fs::create_dir_all(default_pool.join("outputs")).expect("the default pool exists");
+        std::fs::write(
+            default_pool.join("outputs/registry.json"),
+            br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"t","rows":[]}"#,
+        )
+        .expect("the default pool registry is written");
+        let observation = observe_oxide_registry(
+            &unknown_pools(),
+            None,
+            Deadline::after(std::time::Duration::from_secs(5)),
+        );
+        assert_eq!(
+            observation.observation.state(),
+            ObservationState::UnknownState
+        );
+        assert_eq!(
+            observation.observation.path(),
+            Path::new("/fixture/state/pools.json"),
+            "the report names the record that made the pool list unknown"
+        );
+        assert!(
+            observation.searched.is_empty(),
+            "no registry was looked for, so nothing is reported absent"
+        );
+        let detail = observation
+            .observation
+            .detail()
+            .expect("an unknown observation says why");
+        assert!(detail.contains("pools record"), "{detail}");
+        assert!(detail.contains("nothing is reported absent"), "{detail}");
+
+        let platform = crate::os::platform();
+        let volume = FakeVolume {
+            uuid: VolumeUuid::parse(UUID).unwrap(),
+            mount: fixture.path().to_path_buf(),
+            recorded_mount: fixture.path().to_path_buf(),
+            device: DeviceId::new(1),
+            present: Cell::new(true),
+            duplicate: false,
+        };
+        let report = super::report(
+            &observation,
+            &platform,
+            &volume,
+            &volume,
+            &volume,
+            501,
+            Deadline::after(std::time::Duration::from_secs(5)),
+        );
+        assert_eq!(report.state, ObservationState::UnknownState);
+        assert!(report.document.is_none());
+        assert!(report.drift.is_none(), "an unknown source has no drift");
+        assert_eq!(report.rows.count, 0);
+        assert_eq!(report.rows.total, 0);
+        assert!(
+            !default_pool
+                .join("outputs/registry.json")
+                .metadata()
+                .is_ok_and(|metadata| { metadata.len() == 0 }),
+            "the default pool's registry was not touched"
+        );
+    }
+
+    #[test]
+    fn an_absent_pools_record_still_searches_the_default_pools() {
+        // An absent record is a fact: Oxide recorded no pool, so only its
+        // defaults can be in use and the list is complete. A registry there is
+        // reported, and the report says which default pool it came from.
+        let fixture = TempDir::new("census-pools-absent");
+        let cache = fixture.join("cache");
+        let default_pool = cache.join("build-pool");
+        let path = fixture.write(
+            "cache/build-pool/outputs/registry.json",
+            br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":4,"complete":true,"created_by":"t","rows":[]}"#,
+        );
+        let known = crate::inspect::default_pools(&cache);
+        assert_eq!(known.len(), 2);
+        let observation = observe_oxide_registry(
+            &absent_pools(),
+            Some(&known),
+            Deadline::after(std::time::Duration::from_secs(5)),
+        );
+        assert_eq!(observation.observation.state(), ObservationState::Reported);
+        assert_eq!(observation.observation.path(), path);
+        assert_eq!(observation.searched, vec![path.clone()]);
+        assert!(
+            default_pool.join("outputs/registry.json").is_file(),
+            "the registry is the one the fixture wrote"
+        );
+    }
+
+    #[test]
+    fn a_recorded_pools_list_is_searched_in_order_before_the_defaults() {
+        let fixture = TempDir::new("census-pools-recorded");
+        let cache = fixture.join("cache");
+        let recorded = fixture.join("recorded-pool");
+        let pools = fixture.write(
+            "state/pools.json",
+            &serde_json::to_vec(&vec![recorded.clone()]).expect("the record encodes"),
+        );
+        let pools = read_pools(&pools);
+        let known = crate::inspect::pool_candidates(&pools, &cache).expect("a known list");
+        assert_eq!(
+            known,
+            vec![recorded, cache.join("build-pool"), cache.join("pool")],
+            "the recorded pools come first and the defaults follow once"
+        );
+    }
+
+    #[test]
     fn a_present_but_unreadable_registry_is_not_looked_past() {
         let fixture = TempDir::new("census-present-unknown");
         let first = fixture.join("first");
@@ -2082,7 +2276,8 @@ mod tests {
         )
         .expect("a valid registry is written elsewhere");
         let observation = observe_oxide_registry(
-            &[first.clone(), second],
+            &absent_pools(),
+            Some(&[first.clone(), second]),
             Deadline::after(std::time::Duration::from_secs(5)),
         );
         assert_eq!(

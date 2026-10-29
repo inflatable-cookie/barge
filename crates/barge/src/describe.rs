@@ -613,7 +613,11 @@ pub fn inspect(request: &InspectRequest<'_>) -> Result<InspectData> {
     let registry = registry_report(&paths)?;
     let observations = inspect::observe_oxide(request.account)?;
     let deadline = Deadline::after(OXIDE_CENSUS_DEADLINE);
-    let census_registry = census::observe_oxide_registry(&observations.internal_pools, deadline);
+    let census_registry = census::observe_oxide_registry(
+        &observations.pools,
+        observations.known_pools.as_deref(),
+        deadline,
+    );
     let oxide_census = census::report(
         &census_registry,
         request.dirs,
@@ -1006,6 +1010,23 @@ mod tests {
                 &serde_json::to_vec(document).expect("the registry encodes"),
             )
         }
+
+        /// Write one Oxide output registry into Oxide's default cache pool, which
+        /// is all a reader can search when the pools record names no pool.
+        fn write_default_pool_registry(&self, document: &serde_json::Value) -> PathBuf {
+            self.dir.write(
+                "Library/Caches/oxide/build-pool/outputs/registry.json",
+                &serde_json::to_vec(document).expect("the registry encodes"),
+            )
+        }
+
+        /// Write an Oxide pools record that cannot be read.
+        fn write_unreadable_pools(&self) -> PathBuf {
+            self.dir.write(
+                "Library/Application Support/oxide/state/pools.json",
+                b"{ not a pools record",
+            )
+        }
     }
 
     /// One Oxide output-registry document with one recorded row.
@@ -1347,6 +1368,73 @@ mod tests {
             serde_json::to_vec(&oxide_registry()).expect("the fixture encodes"),
             "the census changed nothing on the recorded file"
         );
+    }
+
+    #[test]
+    fn an_unknown_pools_record_makes_the_census_unknown_never_absent() {
+        // Oxide's pools record cannot be read, so Barge cannot know which pools
+        // exist. A registry in the default pool may not be the one Oxide uses:
+        // the census reports its source as unknown instead of pronouncing the
+        // registry absent or reporting the wrong one.
+        let fixture = Fixture::new("inspect-census-pools-unknown");
+        let pools = fixture.write_unreadable_pools();
+        let default_registry = fixture.write_default_pool_registry(&oxide_registry());
+        let data = inspect(&fixture.inspect_request()).expect("inspect reads");
+        let census = &data.oxide_census;
+        assert_eq!(census.state, ObservationState::UnknownState);
+        assert_eq!(
+            census.path, pools,
+            "the report names the record that made the pool list unknown"
+        );
+        assert_ne!(census.path, default_registry);
+        assert!(
+            census.searched.is_empty(),
+            "nothing was looked for, so nothing is reported absent"
+        );
+        assert!(census.document.is_none());
+        assert!(census.drift.is_none(), "an unknown source has no drift");
+        assert_eq!(census.rows.count, 0);
+        let detail = census.detail.as_ref().expect("the reason is named");
+        assert!(detail.contains("pools record"), "{detail}");
+        assert!(
+            !fixture.state_override().exists(),
+            "inspect creates no state directory"
+        );
+    }
+
+    #[test]
+    fn an_absent_pools_record_searches_the_default_pools_and_reports_what_it_finds() {
+        // An absent record is a fact: Oxide recorded no pool, so only its
+        // defaults can be in use. A registry there is reported with its rows.
+        let fixture = Fixture::new("inspect-census-pools-absent");
+        let path = fixture.write_default_pool_registry(&oxide_registry());
+        let data = inspect(&fixture.inspect_request()).expect("inspect reads");
+        let census = &data.oxide_census;
+        assert_eq!(census.state, ObservationState::Reported);
+        assert_eq!(census.path, path);
+        assert_eq!(census.searched, vec![path.clone()]);
+        assert_eq!(census.rows.count, 1);
+        assert!(census.drift.is_some());
+    }
+
+    #[test]
+    fn a_registry_document_without_rows_is_unknown_state_in_the_inspect_document() {
+        let fixture = Fixture::new("inspect-census-no-rows");
+        let mut document = oxide_registry();
+        document
+            .as_object_mut()
+            .expect("a registry object")
+            .remove("rows");
+        let path = fixture.write_oxide_registry(&document);
+        let data = inspect(&fixture.inspect_request()).expect("inspect reads");
+        let census = &data.oxide_census;
+        assert_eq!(census.state, ObservationState::UnknownState);
+        assert_eq!(census.path, path);
+        assert!(census.document.is_none());
+        assert_eq!(census.rows.count, 0);
+        assert_eq!(census.rows.total, 0);
+        let detail = census.detail.as_ref().expect("the reason is named");
+        assert!(detail.contains("rows"), "{detail}");
     }
 
     #[test]

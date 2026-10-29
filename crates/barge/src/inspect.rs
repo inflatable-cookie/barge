@@ -306,9 +306,16 @@ pub struct OxideObservations {
     pub pools: Observation<OxidePools>,
     /// Oxide's removable-volume registration.
     pub registration: Observation<OxideRegistration>,
-    /// Every internal pool directory that was looked at, in order. A pool is
-    /// where Oxide keeps `oxide-managed/removable.json` and `outputs/`.
-    pub internal_pools: Vec<PathBuf>,
+    /// Every internal pool directory Barge knows about, in order, or `None` when
+    /// Oxide's pools record could not be read and the list is therefore unknown.
+    ///
+    /// A pool is where Oxide keeps `oxide-managed/removable.json` and `outputs/`.
+    /// `None` is never an empty list: a reader that reports totals over what the
+    /// pools hold (the output-registry census) must report that its source is
+    /// unknown rather than guess. The registration lookup still tries the default
+    /// pools in that case, because finding a registration file there is a positive
+    /// fact about that file; a census of the roots behind it is not.
+    pub known_pools: Option<Vec<PathBuf>>,
     /// Every registration path that was looked at, in order.
     pub searched: Vec<PathBuf>,
 }
@@ -338,8 +345,14 @@ pub fn observe_oxide(account: &dyn AccountFacts) -> Result<OxideObservations> {
 /// unknown state, and Barge does not look past it for a more convenient one.
 pub fn observe_oxide_at(state_dir: &Path, cache_dir: &Path) -> OxideObservations {
     let pools = read_pools(&state_dir.join(OXIDE_POOLS_FILE));
-    let internal_pools = pool_candidates(&pools, cache_dir);
-    let candidates: Vec<PathBuf> = internal_pools
+    let known_pools = pool_candidates(&pools, cache_dir);
+    // The registration is still looked for in the default pools when the record is
+    // unknown: a registration found there is a fact about that one file. The
+    // census, which reports totals over a whole registry, does not make that move.
+    let registration_pools = known_pools
+        .clone()
+        .unwrap_or_else(|| default_pools(cache_dir));
+    let candidates: Vec<PathBuf> = registration_pools
         .iter()
         .map(|pool| registration_path(pool))
         .collect();
@@ -348,28 +361,51 @@ pub fn observe_oxide_at(state_dir: &Path, cache_dir: &Path) -> OxideObservations
     OxideObservations {
         pools,
         registration,
-        internal_pools,
+        known_pools,
         searched: candidates,
     }
 }
 
 /// Every internal pool directory to look in, in order: the pools Oxide's own
-/// record names, then its current and retired default pools.
+/// record names, then its current and retired default pools; `None` when the
+/// record could not be read, because then the list itself is unknown.
+///
+/// An absent record is a fact — Oxide recorded no pools, so only its defaults can
+/// be in use — and reports the defaults. An unreadable, oversized or divergent
+/// record is not: the recorded pools may include one Barge cannot see, so `None`
+/// says the list is unknown rather than returning a shorter one.
 ///
 /// A pool only appears once. Nothing is created or changed: this is the shared
 /// candidate list the registration and the output registry are both looked for
 /// in, so two readers of the same tool cannot disagree about where it lives.
-pub(crate) fn pool_candidates(pools: &Observation<OxidePools>, cache_dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn pool_candidates(
+    pools: &Observation<OxidePools>,
+    cache_dir: &Path,
+) -> Option<Vec<PathBuf>> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Observation::Reported(observed) = pools {
-        for pool in observed.value().paths() {
-            candidates.push(pool.clone());
+    match pools {
+        Observation::Reported(observed) => {
+            candidates.extend(observed.value().paths().iter().cloned())
+        }
+        Observation::Absent { .. } => {}
+        Observation::Unknown { .. } => return None,
+    }
+    candidates.extend(default_pools(cache_dir));
+    let mut unique: Vec<PathBuf> = Vec::new();
+    for candidate in candidates {
+        if !unique.contains(&candidate) {
+            unique.push(candidate);
         }
     }
-    candidates.push(cache_dir.join(OXIDE_DEFAULT_POOL_DIR));
-    candidates.push(cache_dir.join(OXIDE_LEGACY_POOL_DIR));
-    candidates.dedup();
-    candidates
+    Some(unique)
+}
+
+/// Oxide's current and retired default internal pools.
+pub(crate) fn default_pools(cache_dir: &Path) -> Vec<PathBuf> {
+    vec![
+        cache_dir.join(OXIDE_DEFAULT_POOL_DIR),
+        cache_dir.join(OXIDE_LEGACY_POOL_DIR),
+    ]
 }
 
 /// Where a registration lives inside one internal pool.

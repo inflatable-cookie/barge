@@ -236,12 +236,15 @@ fn inspect_json_reports_the_state_the_registry_and_the_oxide_observations() {
     let searched = census["searched"]
         .as_array()
         .expect("the census names where it looked");
-    assert!(!searched.is_empty(), "{census}");
     assert!(
         searched.iter().all(|path| path
             .as_str()
             .is_some_and(|path| path.ends_with("outputs/registry.json"))),
         "every searched path is an Oxide output registry: {census}"
+    );
+    assert!(
+        !searched.is_empty() || census_state == "unknown_state",
+        "a census that looked at no registry at all is unknown, never absent: {census}"
     );
     let rows = &census["rows"];
     assert_eq!(rows["count"], rows["rows"].as_array().unwrap().len());
