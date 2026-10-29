@@ -111,3 +111,50 @@ terminal pty-host held descriptor 33, whose `PROC_PIDFDVNODEPATHINFO` and
 `PROC_PIDFDVNODEINFO` both answered `ENOENT` persistently and from every context
 while its descriptor listing succeeded, which made the product-custody census of
 a full-scan proof unreachable.
+
+## Q-011 — What makes an interrupted release unknown?
+
+Status: open — needs the design delegate (Oxide Supervisor); recorded by barge#024
+(slice T3) at the exact-head review's request (comment 6498979111).
+
+A consumer's release is one order of two steps: the activity fact is written, then
+the hold file is removed (or the reverse). Whichever order the frozen design
+fixes, an interruption between the two steps leaves a pair that the frozen
+`barge.activity/1` fields cannot distinguish from a completed release:
+
+- fact first (implemented today): a published release plus a hold file. A live or
+  undecidable hold keeps the root; once the holder is positively gone the hold is
+  **stale**, stage 1 defines a stale hold as not blocking idleness, and the
+  published fact decides — so an interrupted release reads as idle, and the LRU
+  key is that release's time.
+- removal first (the activity section's sentence): an absent hold plus the
+  previous record. The root reads idle on an **older** release time (or, with no
+  earlier release, is kept).
+
+Both were raised in review, in opposite directions (rounds 2 and 3 of barge#024),
+and both violate "unknown is never idle" in the window. The record is one atomic
+publish, so no ordering of the two steps closes it.
+
+Proposed answer, modelled on the pattern stage 1 already uses for this exact crash
+window (a durable phase published before an effect, a completion published after
+it, and the in-between state `Unknown` rather than complete — "the crash window
+between the successful final unlink and the durable `removed` phase is therefore
+pending, not complete"): give the activity record a `pending_release_ms` field,
+written before the hold removal and cleared by the completing write, with the
+idleness matrix refusing while it is set. Concretely, one release would be: read;
+write `pending_release_ms: now`, `generation + 1`; remove the hold; write
+`last_release_ms: now`, `releases + 1`, `generation + 1`, `pending_release_ms:
+null`. An interruption anywhere leaves `pending_release_ms` set, so the root is
+never idle on an unsettled release; a failed hold removal restores the previous
+bytes (clearing the pending flag) and reports `io`; a failed restore leaves the
+flag set, which is unknown rather than a release. The repair is the same explicit
+`barge area idle-baseline` (or re-running the release, which settles it).
+Alternatives, each needing the same ruling: a separate pending record under
+`state/activity/` (a second authoritative document); a stage 1 intent phase for
+releases (a new intent kind in a closed set); or accepting the window and saying
+so, which the current text does.
+
+The field is a format decision, not an implementation one: `barge.activity/1` is
+frozen with an exact field set, and the design freezes are the Oxide Supervisor's.
+Until it is answered, the implemented surface records the window and the slice's
+regressions pin today's outcome, so the answer is a visible change.

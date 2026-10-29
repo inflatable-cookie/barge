@@ -2943,6 +2943,25 @@ pub fn release(
     root_id: &str,
     holder: &str,
 ) -> Result<Release> {
+    release_with(state, observer, root_id, holder, |path, bytes| {
+        state::publish_atomic(path, bytes)
+    })
+}
+
+/// [`release`] with the restore step as a seam, so a test can prove a restore that
+/// fails is reported rather than silently accepted (the same seam shape as
+/// [`state::publish_atomic_with`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn release_with<F>(
+    state: &StatePaths,
+    observer: &dyn ProcessObserver,
+    root_id: &str,
+    holder: &str,
+    restore: F,
+) -> Result<Release>
+where
+    F: FnOnce(&Path, &[u8]) -> Result<()>,
+{
     state::validate_identifier("root_id", root_id)?;
     validate_name("holder", holder)?;
     registry::read(state)?;
@@ -3024,7 +3043,7 @@ pub fn release(
         // guessed away.
         let restore_error = match (&had_record, &previous_bytes) {
             (false, _) => None,
-            (true, Some(bytes)) => state::publish_atomic(&activity_path, bytes).err(),
+            (true, Some(bytes)) => restore(&activity_path, bytes).err(),
             (true, None) => Some(Error::new(
                 ErrorKind::UnknownState,
                 "the previous record's bytes were not read, so they could not be restored",
@@ -6777,7 +6796,15 @@ mod tests {
         // The ordering's invariant, exercised as the crash window it allows: a
         // release that recorded its fact but has not removed the hold. The record
         // is the current release (never an older one), and the root is kept on
-        // the hold until the hold is settled.
+        // the hold while the holder is live.
+        //
+        // This test also pins what happens once that leftover hold goes stale,
+        // which is the window this slice cannot close with the frozen record: the
+        // hold stops blocking, so the published fact decides and the root reads
+        // idle on the release that never removed its hold. That is an open design
+        // question for the design delegate (Q-011), not a claimed safety
+        // property, and the assertions below are what must change when it is
+        // answered.
         let fixture = Fixture::new("release-interrupted");
         let declaration = fixture.declaration("example/pool");
         let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
@@ -6820,10 +6847,121 @@ mod tests {
         );
         assert!(LruKey::of(&current).is_some());
 
+        // The leftover hold goes stale: its holder is positively gone, which stage
+        // 1 defines as not blocking idleness. The published fact then decides.
+        let hold_path = fixture
+            .state
+            .holds_dir()
+            .join(&root.root_id)
+            .join("prover.json");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&hold_path).expect("the hold reads"))
+                .expect("the hold parses");
+        document["boot_identity"] = "1600000000.0".into();
+        std::fs::write(
+            &hold_path,
+            serde_json::to_vec_pretty(&document).expect("the hold encodes"),
+        )
+        .expect("the hold is written");
+        std::fs::set_permissions(&hold_path, std::fs::Permissions::from_mode(0o600))
+            .expect("the hold is private");
+        let stale = read_holds(&fixture.state, &observer, &root.root_id).expect("the holds read");
+        assert_eq!(stale.holds[0].1, HoldState::Stale);
+        assert!(stale.is_idle(), "a stale hold does not block stage 1");
+        let listed = fixture.list(&resolved);
+        assert_eq!(
+            listed.roots[0].space_idle.state,
+            IdleState::Idle,
+            "Q-011: an interrupted release whose hold went stale is accepted as idle on the published fact"
+        );
+        assert!(
+            listed.roots[0].activity.last_release_ms == Some(current.last_release_ms),
+            "the order still uses the published release, never an older one"
+        );
+
         // Settling the hold the ordinary way completes the same fact once.
         let released = release(&fixture.state, &observer, &root.root_id, "prover")
             .expect("the release completes");
         assert_eq!(released.activity.record.expect("the record").releases, 2);
+        assert_eq!(
+            fixture.list(&resolved).roots[0].space_idle.state,
+            IdleState::Idle
+        );
+    }
+
+    #[test]
+    fn a_failed_restore_is_reported_and_leaves_the_hold_standing() {
+        let fixture = Fixture::new("release-restore-fails");
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        let request = HoldRequest {
+            root_id: root.root_id.clone(),
+            holder: "prover".to_owned(),
+            pid: std::process::id(),
+            scope: HoldScope::Write,
+            purpose: "a fixture holder".to_owned(),
+        };
+        hold(&fixture.state, &observer, &request).expect("the first hold is written");
+        release(&fixture.state, &observer, &root.root_id, "prover").expect("the first release");
+        let path = fixture
+            .state
+            .activity_path(&root.root_id)
+            .expect("the activity path");
+        let earlier = std::fs::read(&path).expect("the record reads");
+
+        // A second release records its fact, cannot remove the hold, and cannot
+        // put the previous record back either. The failure is reported as
+        // unsettled and the hold is still there, so the root is kept on the hold.
+        hold(&fixture.state, &observer, &request).expect("the second hold is written");
+        let hold_directory = fixture.state.holds_dir().join(&root.root_id);
+        std::fs::set_permissions(&hold_directory, std::fs::Permissions::from_mode(0o500))
+            .expect("the hold directory is made read-only");
+        let error = super::release_with(
+            &fixture.state,
+            &observer,
+            &root.root_id,
+            "prover",
+            |_path, _bytes| {
+                Err(Error::new(
+                    ErrorKind::Io,
+                    "injected: the previous record cannot be restored",
+                ))
+            },
+        )
+        .expect_err("the restore fails");
+        std::fs::set_permissions(&hold_directory, std::fs::Permissions::from_mode(0o700))
+            .expect("the hold directory is writable again");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert_eq!(error.detail()["restored"], false);
+        assert!(error
+            .message()
+            .contains("kept on the hold and not on the record"));
+        assert_eq!(
+            error.detail()["hold_path"],
+            hold_directory
+                .join("prover.json")
+                .display()
+                .to_string()
+                .as_str()
+        );
+        assert!(
+            hold_directory.join("prover.json").is_file(),
+            "the hold was not removed"
+        );
+        assert_ne!(
+            std::fs::read(&path).expect("the record reads"),
+            earlier,
+            "the new fact stayed published, which is why the report is unsettled"
+        );
+        assert_blocked(
+            fixture.list(&resolved).roots[0].space_idle,
+            IdleReason::HoldLive,
+        );
+
+        // The next release settles it, and the root is unambiguous again.
+        release(&fixture.state, &observer, &root.root_id, "prover")
+            .expect("the retry completes the release");
         assert_eq!(
             fixture.list(&resolved).roots[0].space_idle.state,
             IdleState::Idle

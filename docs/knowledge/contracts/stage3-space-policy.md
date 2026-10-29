@@ -1398,23 +1398,31 @@ T6, and no native proof exists or is claimed.
   was written under, reads and validates the hold, reads the activity record and
   that record's exact bytes, writes `last_release_ms: now` with `releases` and
   `generation` incremented, and then removes the hold file. One invariant decides
-  the order: **an absent hold file always implies a recorded release.** The other
-  order — remove, then write — leaves a window in which an interrupted release
-  has no hold and only an *older* record, so an unsettled root would read as idle
-  and be ordered on a stale release time; that is the "unknown is never idle"
-  ruling's own case. With this order a crash or a failure between the two steps
-  can only leave a hold that is still present, which the idleness matrix already
-  gates on, and the record it leaves is the current release, never an older one.
+  the order: **an absent hold file always implies a recorded release**, so no root
+  is ever idle and ordered on a release older than the one that removed its hold.
+  The other order — remove, then write — leaves exactly that window, which is the
+  "unknown is never idle" ruling's own case.
 - **What each failure does.** An activity write that fails refuses before the
   effect (`unknown_state`, exit `3`), leaves the hold in place, and records
   nothing, which is the failure matrix's "refuse before the effect" row. A hold
   removal that fails restores the previous record **byte for byte** and reports
   `io` with `detail.restored: true`, so a failed release changes nothing. If that
   restore also fails, the report is `unknown_state` naming the record path and the
-  hold; the hold is still there, so nothing is concluded from the record alone and
-  the next release or the baseline below settles it. A release therefore never
-  records a release that did not complete, and never leaves an old record where a
-  completed release should have written a new one.
+  hold, with `detail.restored: false`, and the hold is still there.
+- **The interruption window this slice cannot close (Q-011).** A release that is
+  interrupted between its fact and its hold removal leaves the published fact plus
+  a hold file. While that hold is live or undecidable the matrix keeps the root.
+  Once the holder is positively gone the hold is **stale**, and stage 1 defines a
+  stale hold as not blocking idleness, so the published fact decides and the root
+  reads idle on a release whose hold removal never happened; a failed restore
+  leaves the same pair. No ordering and no use of the frozen `barge.activity/1`
+  fields can distinguish that pair from a completed release, so this contract
+  records it as an open question for the design delegate
+  ([Q-011](../questions.md), "What makes an interrupted release unknown?")
+  rather than claiming the leftover hold keeps the root, which it does not. The
+  slice's own regressions pin the current outcome so the delegate's answer is a
+  visible change: `an_interrupted_release_leaves_a_hold_never_an_older_release`
+  and `a_failed_restore_is_reported_and_leaves_the_hold_standing`.
 - **A release never invents a record.** A root with no record, or with one that
   does not verify, gets no new record from a release: the release report says so
   (`data.activity.state` is `missing` or `unverified`), the root stays kept, and
