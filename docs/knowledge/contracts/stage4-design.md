@@ -1084,12 +1084,15 @@ Oxide's registration (`<pool>/oxide-managed`), and only a pool that holds an
 
 What "unknown" costs. An unreadable, oversized, schema-divergent or
 unknown-version registry or receipt makes the reference set incomplete, and an
-incomplete set keeps every root it covers — the batch, not one row. A registry row
-that does not state Oxide's own selection flags (`selected`, `pending`) or its
-required identity fields is a schema divergence, not a settled row: the reader
-refuses it rather than defaulting a missing selection to "not selected", and a
-root marker that omits a field Oxide always writes is unreadable for the same
-reason. A receipt is read at its own version's shape: each of
+incomplete set keeps every root it covers — the batch, not one row. The registry itself is read at its own field set: its
+`revision`, `complete` flag and `created_by` are required, an incomplete registry
+must carry Oxide's own `incomplete` record (and a complete one must not), each
+registry row must state Oxide's selection flags (`selected`, `pending`) and its
+required identity fields, and each unfinished prune intent must carry the root
+identity Oxide pins and one of Oxide's six phases. A document that omits any of
+these is a schema divergence — never a settled row, an empty registry or "no
+references" — and a root marker that omits a field Oxide always writes is
+unreadable for the same reason. A receipt is read at its own version's shape: each of
 `oxide.outputs.transition/1`, `/2` and `/3` must carry exactly the fields and the
 shape that version writes, `state` must be one of Oxide's five states, and a
 document that carries another version's shape or omits a required field

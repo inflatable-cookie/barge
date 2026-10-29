@@ -845,22 +845,113 @@ struct RawRegistry {
     version: String,
     #[serde(default)]
     schema: u32,
-    #[serde(default)]
+    // Oxide always writes the revision, the completeness flag, the creator and
+    // its own incomplete record. A registry that omits one is a document this
+    // build does not understand, and defaulting it would turn unknown reference
+    // evidence into "no references".
+    #[allow(dead_code)]
     revision: u64,
     complete: bool,
     #[serde(default)]
+    incomplete: Option<RawIncomplete>,
     #[allow(dead_code)]
-    incomplete: Option<serde_json::Value>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    created_by: Option<String>,
+    created_by: String,
     #[serde(default)]
     rows: Vec<RawRow>,
     #[serde(default)]
-    intents: Vec<serde_json::Value>,
+    intents: Vec<RawIntent>,
     #[serde(default)]
     #[allow(dead_code)]
     cancelled_overflow: Vec<String>,
+}
+
+/// Oxide's own record of why a registry is sticky-incomplete.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIncomplete {
+    #[allow(dead_code)]
+    reason: String,
+    #[allow(dead_code)]
+    since_ms: u64,
+    #[allow(dead_code)]
+    transaction: String,
+}
+
+/// One unfinished prune journal entry. Oxide's entry pins the whole root identity
+/// of the move it is making, and this reader takes the two facts it needs from a
+/// document that must otherwise be exactly the one Oxide writes.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIntent {
+    #[allow(dead_code)]
+    version: String,
+    #[allow(dead_code)]
+    id: String,
+    identity: RawIntentIdentity,
+    phase: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    quarantine: Option<PathBuf>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    preview_sha256: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    created_ms: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    updated_ms: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    resolved_ms: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    receipt_settled: bool,
+    #[serde(default)]
+    #[allow(dead_code)]
+    was_selected: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    prior_receipt_sha: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    group: Vec<serde_json::Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    expected_terminal_sha: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    terminal_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIntentIdentity {
+    #[allow(dead_code)]
+    checkout_id: String,
+    #[allow(dead_code)]
+    checkout: PathBuf,
+    #[allow(dead_code)]
+    receipt: PathBuf,
+    #[allow(dead_code)]
+    member: String,
+    root: PathBuf,
+    #[allow(dead_code)]
+    root_kind: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    volume_uuid: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    nonce: Option<String>,
+    #[allow(dead_code)]
+    generation: u64,
+    #[allow(dead_code)]
+    dev: u64,
+    #[allow(dead_code)]
+    ino: u64,
+    #[allow(dead_code)]
+    marker_digest: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -956,23 +1047,32 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
             cancelling: row.cancelling.is_some(),
         });
     }
+    // Oxide's own invariant: a registry that is not complete carries the record
+    // of why, and one that is complete carries none. Either half alone is
+    // contradictory.
+    match (raw.complete, raw.incomplete.is_some()) {
+        (false, true) | (true, false) => {}
+        (false, false) => {
+            return Err("an incomplete registry carries no incomplete record".to_owned())
+        }
+        (true, true) => {
+            return Err("a complete registry carries an incomplete record".to_owned());
+        }
+    }
     let mut intents = Vec::new();
     for intent in raw.intents {
-        // The journal is Oxide's own bounded record; this reader takes the two
-        // fields it needs and never interprets the rest. A journal entry without
-        // them is unknown, not empty.
-        let phase = intent
-            .get("phase")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "a prune intent carries no phase".to_owned())?;
-        let root = intent
-            .get("identity")
-            .and_then(|identity| identity.get("root"))
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "a prune intent carries no identity root".to_owned())?;
+        if !matches!(
+            intent.phase.as_str(),
+            "intent" | "renamed" | "deleting" | "marker_last" | "deleted" | "resolved"
+        ) {
+            return Err(format!(
+                "a prune intent states phase `{}`, which Oxide never writes",
+                intent.phase
+            ));
+        }
         intents.push(OxideIntent {
-            root: PathBuf::from(root),
-            phase: phase.to_owned(),
+            root: intent.identity.root,
+            phase: intent.phase,
         });
     }
     if raw.revision == 0 && !rows.is_empty() {
@@ -1601,7 +1701,7 @@ mod tests {
 
     #[test]
     fn an_unfinished_intent_names_its_root() {
-        let bytes = br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":2,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"i1","identity":{"root":"/Volumes/Builds/oxide/outputs/root"},"phase":"renamed"}]}"#;
+        let bytes = br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":2,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"i1","identity":{"checkout_id":"c1","checkout":"/Users/fixture/Dev/example","receipt":"/pool/outputs/c1.json","member":"target","root":"/Volumes/Builds/oxide/outputs/root","root_kind":"external","generation":1,"dev":7,"ino":42,"marker_digest":"aa"},"phase":"renamed","quarantine":"/pool/outputs/.prune-i1","preview_sha256":"00","created_ms":1,"updated_ms":2}]}"#;
         let OxideRegistry::Read { intents, .. } =
             parse_registry(bytes).expect("the registry reads")
         else {
@@ -1609,6 +1709,48 @@ mod tests {
         };
         assert_eq!(intents.len(), 1);
         assert_eq!(intents[0].phase, "renamed");
+        assert_eq!(
+            intents[0].root,
+            PathBuf::from("/Volumes/Builds/oxide/outputs/root")
+        );
+    }
+
+    #[test]
+    fn a_registry_missing_its_required_facts_is_unknown_never_empty() {
+        // Each document below omits a field Oxide always writes, contradicts its
+        // own completeness flag, or states an intent phase Oxide never writes. Each
+        // is a divergence: it must not be read as an empty, complete registry.
+        let divergent: [&[u8]; 6] = [
+            // No revision.
+            br#"{"version":"oxide.outputs.registry/2","schema":2,"complete":true,"created_by":"oxide","rows":[]}"#,
+            // No creator.
+            br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"rows":[]}"#,
+            // Incomplete without its record.
+            br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":false,"created_by":"oxide","rows":[]}"#,
+            // Complete with an incomplete record.
+            br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"incomplete":{"reason":"x","since_ms":1,"transaction":"t"},"created_by":"oxide","rows":[]}"#,
+            // An intent phase Oxide never writes.
+            br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"i1","identity":{"checkout_id":"c1","checkout":"/c","receipt":"/r","member":"target","root":"/o","root_kind":"external","generation":1,"dev":7,"ino":42,"marker_digest":"aa"},"phase":"bogus","quarantine":"/q","preview_sha256":"00","created_ms":1,"updated_ms":2}]}"#,
+            // An intent without its root identity.
+            br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"i1","identity":{"root":"/o"},"phase":"renamed","quarantine":"/q","preview_sha256":"00","created_ms":1,"updated_ms":2}]}"#,
+        ];
+        for (index, case) in divergent.iter().enumerate() {
+            assert!(
+                parse_registry(case).is_err(),
+                "divergent registry {index} was accepted as complete: {}",
+                String::from_utf8_lossy(case)
+            );
+        }
+        // The valid half: a sticky-incomplete registry with its record reads, and
+        // reports itself incomplete to the caller.
+        let incomplete = br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":false,"incomplete":{"reason":"x","since_ms":1,"transaction":"t"},"created_by":"oxide","rows":[]}"#;
+        assert!(matches!(
+            parse_registry(incomplete),
+            Ok(OxideRegistry::Read {
+                complete: false,
+                ..
+            })
+        ));
     }
 
     #[test]

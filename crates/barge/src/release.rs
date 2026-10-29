@@ -2176,6 +2176,33 @@ mod tests {
     }
 
     #[test]
+    fn a_registry_without_its_required_facts_keeps_the_root() {
+        // A registry that omits a field Oxide always writes (its revision here, its
+        // creator in the next case) is a divergence, not an empty registry: reading
+        // it as "no references" would release a root Oxide may still select.
+        for document in [
+            // No revision.
+            r#"{"version":"oxide.outputs.registry/2","schema":2,"complete":true,"created_by":"oxide","rows":[]}"#,
+            // No creator.
+            r#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"rows":[]}"#,
+        ] {
+            let fixture = Fixture::new("release-registry-divergent");
+            let root = fixture.root();
+            let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
+            std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
+            std::fs::write(outputs.join(reference::OXIDE_REGISTRY_FILE), document)
+                .expect("the divergent registry is written");
+            let report = fixture.plan();
+            let kept = row(&report, &root);
+            assert!(!kept.eligible, "{document}: {kept:?}");
+            assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+            assert!(!kept.references_complete);
+            assert!(!report.oxide.complete);
+            assert!(report.needs_human(), "{document}");
+        }
+    }
+
+    #[test]
     fn an_unreadable_pools_record_never_reads_as_no_oxide_records() {
         // Oxide's pools record can name the only pool that holds its outputs, so
         // an unreadable one leaves the reference set unknown. It is never read as
