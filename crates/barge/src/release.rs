@@ -49,7 +49,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::area::{self, ActivityMode, AreaDocument, PrunePolicy};
+use crate::area::{self, AreaDocument, PrunePolicy};
 use crate::contract::{RowSet, DOCUMENT_SIZE_CAP_BYTES, PRUNE_PLAN_SCHEMA};
 use crate::custody::{self, CustodyBounds, PendingIntent};
 use crate::digest::sha256_hex;
@@ -562,18 +562,13 @@ pub fn plan(
         &declaration,
         Some(&document),
     )?;
-    // The listing enumerates the area's entries and nothing else. The age
-    // decision is the stage 4 rule — a bounded scan of the root's subtree, never
-    // the marker's creation time alone — and it is taken per row, inside that
-    // root's own shared lock, so no row reports an activity read outside it.
-    let listing = area::list_roots_with(
-        dirs,
-        observer,
-        state_paths,
-        &resolved,
-        PLAN_ROOTS,
-        ActivityMode::Floor,
-    )?;
+    // The enumeration takes the folder's names and nothing else: no child is
+    // opened, no marker or hold is read, and no device or inode is compared
+    // before a row's own lock. The marker, the root's identity, its holds, its
+    // bounded activity scan and its Oxide marker are all read inside that row's
+    // shared root lock, so no row reports an observation a hold or a delete could
+    // be changing, and the age decision is the stage 4 rule taken there too.
+    let listing = area::list_names(dirs, &resolved, PLAN_ROOTS)?;
     let placements = BargeReferences::read(state_paths);
     let oxide = OxideSnapshot::read(account);
     let pending = pending_intents(state_paths)?;
@@ -581,7 +576,7 @@ pub fn plan(
 
     let mut rows = Vec::new();
     let truncated = listing.truncated;
-    for root in &listing.roots {
+    for root in &listing.names {
         rows.push(decide_root(
             state_paths,
             dirs,
@@ -723,27 +718,37 @@ fn decide_root(
     pending: &[PendingIntent],
     uid: u32,
     request: &ReleaseRequest<'_>,
-    root: &area::RootObservation,
+    root: &area::RootName,
 ) -> PrunePlanRow {
-    let root_id = root.root_id.clone().unwrap_or_else(|| root.name.clone());
-    let mount_relative_path = relative_to_mount(&root.configured_path, &resolved.mount_point);
-    // One root's shared lock, held for this row alone and dropped before the next
-    // root. A consumer's hold and a delete take this file exclusively, so a plan
-    // never observes a root whose own lock a live run holds; a holder that
-    // outlives the run's lock budget keeps this root only, and the rest of the
-    // area still plans.
-    let root_lock = if state::is_identifier(&root_id) {
+    let mount_relative_path = relative_to_mount(&root.path, &resolved.mount_point);
+    // One root's shared lock, taken before anything about the root is read and
+    // dropped before the next root. A Barge-created root's name is its root id, so
+    // its own lock is the one a hold or a delete takes; any other name — an
+    // adopted root's folder, for instance — is locked under the deletion unit's
+    // own key, which is the lock a delete of that unit takes. A consumer's hold and
+    // a delete take these exclusively, so a plan never observes a root whose own
+    // lock a live run holds; a holder that outlives the run's lock budget keeps
+    // this root only, and the rest of the area still plans.
+    let locked_key = if state::is_identifier(&root.name) {
+        None
+    } else {
+        Some(state::unit_lock_key(&record.volume_uuid, "", &root.name))
+    };
+    let root_lock = {
         let mut locks = state::LockSet::with_deadline(
             state_paths.clone(),
             Deadline::after(request.bounds.lock_wait),
         );
-        match locks.observe_root(&root_id) {
+        let observed = match &locked_key {
+            Some(key) => locks.observe_unit(key),
+            None => locks.observe_root(&root.name),
+        };
+        match observed {
             Ok(lock) => lock,
             Err(error) => {
                 return unobserved_row(
-                    &root_id,
+                    &root.name,
                     mount_relative_path,
-                    root,
                     "lock",
                     format!(
                         "the root's own lock could not be observed, so nothing about this root was read: {}",
@@ -752,23 +757,15 @@ fn decide_root(
                 );
             }
         }
-    } else {
-        // A name that is not a Barge root id cannot be a root Barge owns, and a
-        // lock file is never named from an unvalidated string. The row's own
-        // identity evidence keeps it; there is no root lock to take.
-        None
     };
-    // Every observation of this root is made under its own shared lock: the
-    // listing only enumerated the entry, and nothing about its marker, its
-    // activity or its identity is read until here. A root whose lock could not be
-    // taken was reported above without being looked at.
-    let handle = match dirs.open_path(&root.configured_path) {
+    // Everything about this root is read here, under its own lock, and nothing
+    // about it was read before: the enumeration supplied only its name.
+    let handle = match dirs.open_path(&root.path) {
         Ok(handle) => handle,
         Err(error) => {
             return unobserved_row(
-                &root_id,
+                &root.name,
                 mount_relative_path,
-                root,
                 "identity",
                 format!(
                     "the root could not be opened under its own lock, so nothing about it was read: {error}"
@@ -776,25 +773,51 @@ fn decide_root(
             );
         }
     };
-    let stored = identity::read(state_paths, dirs, &root_id, uid)
-        .ok()
-        .flatten();
-    let mount_relative_path = stored.as_ref().map_or(mount_relative_path, |record| {
-        record.mount_relative_path.clone()
-    });
     let expectation = area::MarkerExpectation {
         volume_uuid: &record.volume_uuid,
-        resolved_path: &root.configured_path,
+        resolved_path: &root.path,
         mount_point: Some(&resolved.mount_point),
         effective_uid: uid,
         now_ms: state::now_ms(),
     };
     let (marker_state, marker_digest) = area::read_marker_with_digest(dirs, &handle, &expectation);
+    let marker_root_id = match &marker_state {
+        area::MarkerState::Owned(marker) => Some(marker.root_id.clone()),
+        area::MarkerState::Absent | area::MarkerState::Unknown { .. } => None,
+    };
+    let owned_root_id = marker_root_id.clone().filter(|_| root.symlink == false);
+    // The row names the root by its marker's id when the marker says one, and by
+    // the directory's name otherwise; a name that is not a root id has no holds
+    // and no identity record to read.
+    let root_id = owned_root_id.clone().unwrap_or_else(|| root.name.clone());
+    let (holds, holds_error) = match &owned_root_id {
+        Some(id) => match area::read_holds(state_paths, observer, id) {
+            Ok(rows) => (rows, None),
+            Err(error) => (area::HoldReading::empty(), Some(error.to_string())),
+        },
+        None => (area::HoldReading::empty(), None),
+    };
+    let stored = match &owned_root_id {
+        Some(id) => identity::read(state_paths, dirs, id, uid).ok().flatten(),
+        None => None,
+    };
+    let mount_relative_path = stored.as_ref().map_or(mount_relative_path, |record| {
+        record.mount_relative_path.clone()
+    });
+    let activity = if root.symlink {
+        // A symlink is never followed, so nothing behind it is activity Barge can
+        // see. It stays unknown rather than empty.
+        area::RootActivity::unknown("the entry is a symbolic link, which is never followed")
+    } else {
+        area::scan_activity(dirs, &handle, None, state::now_ms())
+    };
     let locked = LockedObservation {
         identity: handle.identity(),
         marker_state,
         marker_digest,
-        activity: area::scan_activity(dirs, &handle, None, state::now_ms()),
+        activity,
+        holds,
+        holds_error,
     };
     let mut blockers: Vec<(&'static str, String)> = Vec::new();
 
@@ -806,7 +829,6 @@ fn decide_root(
         mounts,
         uid,
         &root_id,
-        root,
         &locked,
         stored.as_ref(),
     );
@@ -910,23 +932,19 @@ fn decide_root(
 
     // Condition 5 and 6: the references, then the absence proofs they need.
     let mut references = placements.references_for(
-        state_paths,
-        observer,
         document,
         declared_age.is_some(),
         &root_id,
-        &root.configured_path,
+        &root.path,
+        &locked.holds,
+        locked.holds_error.as_deref(),
     );
     let (marker, marker_unknown) = match reference::read_oxide_marker(dirs, &handle) {
         Ok(Some(marker)) => (Some(marker), None),
         Ok(None) => (None, None),
         Err(reason) => (None, Some(reason)),
     };
-    references.absorb(oxide.references_for(
-        &root.configured_path,
-        marker.as_ref(),
-        marker_unknown.as_deref(),
-    ));
+    references.absorb(oxide.references_for(&root.path, marker.as_ref(), marker_unknown.as_deref()));
     let references_truncated = references.rows.len() > REFERENCE_ROWS;
     let mut reference_rows = references.rows.clone();
     if references_truncated {
@@ -1010,6 +1028,10 @@ struct LockedObservation {
     marker_digest: Option<String>,
     /// The bounded last-activity scan.
     activity: area::RootActivity,
+    /// The root's hold reading, taken under the same lock.
+    holds: area::HoldReading,
+    /// Why the holds could not be read, when they could not.
+    holds_error: Option<String>,
 }
 
 impl LockedObservation {
@@ -1028,7 +1050,6 @@ fn identity_evidence(
     mounts: &dyn MountRoot,
     uid: u32,
     root_id: &str,
-    root: &area::RootObservation,
     locked: &LockedObservation,
     stored: Option<&crate::identity::RootIdentity>,
 ) -> IdentityEvidence {
@@ -1036,7 +1057,6 @@ fn identity_evidence(
     let inode = stored.map_or(Some(locked.identity.inode), |record| Some(record.inode));
     let device_at_record = stored.map(|record| record.device_at_record);
     let device_live = Some(locked.identity.device.get());
-    let _ = root;
     match identity::verify(state_paths, dirs, facts, mounts, uid, root_id) {
         IdentityVerdict::Verified {
             remount,
@@ -1106,8 +1126,7 @@ fn identity_reason(reason: IdentityReason) -> &'static str {
 fn unobserved_row(
     root_id: &str,
     mount_relative_path: String,
-    root: &area::RootObservation,
-    blocked_by: &str,
+    detail_blocked_by: &str,
     detail: String,
 ) -> PrunePlanRow {
     PrunePlanRow {
@@ -1116,9 +1135,9 @@ fn unobserved_row(
         identity: IdentityEvidence {
             verdict: "unknown".to_owned(),
             reason: None,
-            inode: root.inode,
+            inode: None,
             device_at_record: None,
-            device_live: root.device,
+            device_live: None,
             remount: None,
             mount_moved: None,
             marker_digest: None,
@@ -1136,7 +1155,7 @@ fn unobserved_row(
         absence: None,
         bytes: None,
         eligible: false,
-        blocked_by: Some(blocked_by.to_owned()),
+        blocked_by: Some(detail_blocked_by.to_owned()),
         reason: Some(detail),
     }
 }
@@ -1149,7 +1168,7 @@ fn unobserved_row(
 fn unit_for(
     record: &VolumeRecord,
     resolved: &area::ResolvedArea,
-    root: &area::RootObservation,
+    root: &area::RootName,
     locked: &LockedObservation,
 ) -> Option<DeletionUnit> {
     if !locked.owned() {
@@ -2068,6 +2087,50 @@ mod tests {
     }
 
     #[test]
+    fn an_old_child_time_never_replaces_a_missing_root_time() {
+        // The root directory's own modification time is the floor. Its entries'
+        // times can be decades old while the directory itself changed recently, so
+        // a platform that reports no directory time leaves the age unknown — the
+        // child's old time is never used instead.
+        let fixture = Fixture::new("release-no-root-time");
+        let root = fixture.root();
+        VolumeFixture::payload(&root.path, "target/debug/artifact", b"bytes");
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        File::options()
+            .write(true)
+            .open(root.path.join("target/debug/artifact"))
+            .expect("the artifact opens")
+            .set_modified(old)
+            .expect("the artifact's time is set");
+        let dirs = crate::testkit::Faults::default();
+        dirs.hiding_directory_modified_times();
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let report = fixture
+            .plan_with_dirs(
+                &dirs,
+                &observer,
+                &facts,
+                fixture.overdue(),
+                ReleaseBounds::design(),
+            )
+            .expect("the plan is built");
+        let kept = row(&report, &root);
+        assert!(!kept.eligible);
+        assert_eq!(kept.blocked_by.as_deref(), Some("policy"));
+        assert!(
+            kept.idle.last_activity_ms.is_none(),
+            "the child's old time never becomes the root's age"
+        );
+        assert!(
+            kept.idle.reason.as_deref().is_some_and(
+                |reason| reason.contains("root directory reports no modification time")
+            ),
+            "{kept:?}"
+        );
+    }
+
+    #[test]
     fn an_unreadable_pools_record_never_reads_as_no_oxide_records() {
         // Oxide's pools record can name the only pool that holds its outputs, so
         // an unreadable one leaves the reference set unknown. It is never read as
@@ -2140,6 +2203,117 @@ mod tests {
             report.oxide.control.as_deref(),
             Some(pool.join(crate::inspect::OXIDE_CONTROL_DIR).as_path())
         );
+    }
+
+    #[test]
+    fn nothing_about_a_root_is_read_before_its_own_lock() {
+        // The detector: a fault wrapper records every child it opens and every
+        // entry's facts it is asked for. While another run holds the root's lock,
+        // the plan must open nothing and read no entry facts under that root — the
+        // enumeration supplied only its name.
+        let fixture = Fixture::new("release-pre-lock");
+        let root = fixture.root();
+        let dirs = crate::testkit::Faults::default();
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let seen = observed.clone();
+        dirs.observing(Box::new(move |name: &str| {
+            seen.borrow_mut().push(name.to_owned());
+        }));
+
+        // With the lock free, the same wrapper does see the root opened and its
+        // marker read, which proves the detector can see a read at all.
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let report = fixture
+            .plan_with_dirs(
+                &dirs,
+                &observer,
+                &facts,
+                fixture.overdue(),
+                ReleaseBounds::design(),
+            )
+            .expect("the plan is built");
+        assert!(row(&report, &root).eligible);
+        assert!(
+            dirs.opened_child_names
+                .borrow()
+                .iter()
+                .any(|name| name == &root.root_id),
+            "the plan opens an owned root while it holds that root's lock"
+        );
+        assert!(
+            observed
+                .borrow()
+                .iter()
+                .any(|name| name == area::ROOT_MARKER_FILE),
+            "the marker is read while the lock is held"
+        );
+
+        // Now hold the root's lock and plan again: nothing under the root may be
+        // opened or observed, and the row carries no evidence at all.
+        let path = fixture
+            .volume
+            .state
+            .root_lock_path(&root.root_id)
+            .expect("the root lock path");
+        let held = state::StateLock::exclusive(
+            &path,
+            state::LockRank::Root,
+            Deadline::after(Duration::from_secs(5)),
+        )
+        .expect("the fixture holds the root's lock");
+        let dirs = crate::testkit::Faults::default();
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let seen = observed.clone();
+        dirs.observing(Box::new(move |name: &str| {
+            seen.borrow_mut().push(name.to_owned());
+        }));
+        let report = fixture
+            .plan_with_bounds(&observer, &facts, fixture.overdue(), no_wait())
+            .expect("a held root lock is a row");
+        let blocked = row(&report, &root);
+        assert_eq!(blocked.blocked_by.as_deref(), Some("lock"));
+        assert!(
+            !dirs
+                .opened_child_names
+                .borrow()
+                .iter()
+                .any(|name| name == &root.path.file_name().unwrap().to_string_lossy()),
+            "nothing under a locked root is opened: {:?}",
+            dirs.opened_child_names.borrow()
+        );
+        assert!(
+            !observed
+                .borrow()
+                .iter()
+                .any(|name| name == area::ROOT_MARKER_FILE),
+            "no marker is read outside the lock: {:?}",
+            observed.borrow()
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn a_registry_row_without_its_selection_flags_is_unknown() {
+        // Oxide's rows always state `selected` and `pending`. A row that omits
+        // them is a document this build does not understand; defaulting them to
+        // false would read a missing selection as a settled one.
+        let fixture = Fixture::new("release-row-flags");
+        let root = fixture.root();
+        let row_without_flags = format!(
+            r#"{{"checkout_id":"checkout-1","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"external","recipe":"target-debug-v1","generation":1}}"#,
+            fixture.account.home.join("checkout").display(),
+            fixture.account.home.join("receipt.json").display(),
+            root.path.display(),
+        );
+        oxide_registry(&fixture, &row_without_flags, true);
+        let report = fixture.plan();
+        let kept = row(&report, &root);
+        assert!(!kept.eligible);
+        assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+        assert!(!kept.references_complete);
+        assert!(!report.oxide.complete);
+        assert!(report.needs_human());
     }
 
     /// Publish one valid placement record whose recorded path is this root.

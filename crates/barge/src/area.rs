@@ -3301,6 +3301,87 @@ pub enum ActivityMode {
     Scan,
 }
 
+/// One entry an area folder holds, as a names-only enumeration reports it.
+///
+/// It is a name and the path the current configuration resolves to, plus whether
+/// the entry is a symbolic link. Nothing about the entry has been read: no
+/// marker, no hold, no opened descriptor, no device and no inode. A caller that
+/// must observe a root takes the root's own lock first and reads it there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootName {
+    /// The entry's name inside the area folder.
+    pub name: String,
+    /// The path the current configuration resolves for it.
+    pub path: PathBuf,
+    /// Whether the entry is a symbolic link, which is never followed.
+    pub symlink: bool,
+}
+
+/// One bounded, names-only enumeration of an area folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameListing {
+    /// The root-shaped entries kept, in the platform's listing order.
+    pub names: Vec<RootName>,
+    /// How many entries the folder held.
+    pub examined: usize,
+    /// Whether the enumeration was cut by the row or name bound.
+    pub truncated: bool,
+    /// Entries that are neither directories nor symlinks.
+    pub skipped_non_directories: usize,
+}
+
+/// Enumerate one resolved area's root-shaped entries and observe nothing else.
+///
+/// It lists the folder's names, keeps the directories and symlinks, and reports
+/// how many entries there were. It opens no child, reads no marker, reads no
+/// hold and compares no device or inode: a caller that decides anything about one
+/// of these entries must take that root's lock first and observe it under it. A
+/// symlink is reported as such and is never followed.
+pub fn list_names(
+    dirs: &dyn DirOps,
+    resolved: &ResolvedArea,
+    max_roots: usize,
+) -> Result<NameListing> {
+    let handle = match &resolved.dirs {
+        Direction::Existing { handle } => dirs.duplicate_dir(handle)?,
+        Direction::Missing { .. } => {
+            return Ok(NameListing {
+                names: Vec::new(),
+                examined: 0,
+                truncated: false,
+                skipped_non_directories: 0,
+            })
+        }
+    };
+    let name_cap = max_roots.clamp(1, LISTING_NAME_ROWS);
+    let listing = dirs.list_children(&handle, name_cap)?;
+    let mut names = Vec::new();
+    let mut skipped_non_directories = 0usize;
+    let mut truncated = listing.truncated;
+    for entry in &listing.entries {
+        let symlink = entry.facts.kind == EntryKind::Symlink;
+        if !symlink && entry.facts.kind != EntryKind::Directory {
+            skipped_non_directories = skipped_non_directories.saturating_add(1);
+            continue;
+        }
+        if names.len() >= max_roots {
+            truncated = true;
+            break;
+        }
+        names.push(RootName {
+            name: entry.name.clone(),
+            path: resolved.path.join(&entry.name),
+            symlink,
+        });
+    }
+    Ok(NameListing {
+        names,
+        examined: listing.total,
+        truncated,
+        skipped_non_directories,
+    })
+}
+
 /// List the roots of one resolved area, bounded.
 ///
 /// Only directories and symlinks are observed; every directory is a row whose
@@ -3448,7 +3529,11 @@ pub struct RootActivity {
 
 impl RootActivity {
     /// A scan that could not decide the age at all.
-    fn unknown(reason: impl Into<String>) -> Self {
+    ///
+    /// It exists for the scan itself and for a caller that could not scan (an
+    /// entry that is never followed, for instance): the document then says the
+    /// age is unknown instead of pretending nothing was found.
+    pub fn unknown(reason: impl Into<String>) -> Self {
         Self {
             last_activity_ms: None,
             logical_bytes: 0,
@@ -3504,13 +3589,18 @@ pub fn scan_activity(
             ))
         }
     };
-    // The floor is the root directory's own modification time. A platform that
-    // reports none for the root and none for any entry leaves the age unknown: a
-    // missing modification time is never read as "very old", because that would
+    // The floor is the root directory's own modification time, and without it
+    // there is no age at all: a child's timestamp can be arbitrarily old while
+    // the directory itself was changed recently, so a missing root time is never
+    // replaced by its entries' times and never read as "very old". Both would
     // make a live root eligible.
-    let floor = own_modified_ms.or(own.modified_ms);
+    let Some(floor) = own_modified_ms.or(own.modified_ms) else {
+        return RootActivity::unknown(
+            "the root directory reports no modification time, so its age cannot be floored",
+        );
+    };
     let mut activity = RootActivity {
-        last_activity_ms: floor,
+        last_activity_ms: Some(floor),
         logical_bytes: own.allocated_bytes,
         allocated_bytes: own.allocated_bytes,
         entries: 1,
@@ -5840,6 +5930,67 @@ mod tests {
         assert_eq!(volume.record.volume_uuid, fixture.uuid);
         assert!(root.path.is_dir());
         assert!(lock.exists(), "a successful creation takes the volume lock");
+    }
+
+    #[test]
+    fn a_root_without_its_own_modification_time_is_never_idle() {
+        // The root directory's own modification time is the floor, and it is the
+        // only fact that bounds its age: its entries' times can be arbitrarily old
+        // while the directory itself changed recently. A platform that reports no
+        // directory time must therefore leave the age unknown, never fall back to
+        // a child's timestamp. `barge maintain`'s area policy asks this same
+        // listing to scan, so this is that path's regression too.
+        let fixture = Fixture::new("activity-no-root-time");
+        fixture.register(&fixture.record);
+        let declaration = fixture.declaration("pool");
+        let (root, _) = fixture.create_root(&fixture.record, &declaration);
+        let artifact = root.path.join("target/debug/artifact");
+        std::fs::create_dir_all(artifact.parent().expect("the payload parent"))
+            .expect("the payload folder is created");
+        std::fs::write(&artifact, b"bytes").expect("the payload is written");
+        // An entry whose own modification time is decades old: with the root's
+        // time hidden, that is exactly the replacement the scan must refuse.
+        let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&artifact)
+            .expect("the payload opens")
+            .set_modified(old)
+            .expect("the payload's time is set");
+
+        let resolved = fixture.resolved(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        let dirs = crate::testkit::Faults::default();
+        dirs.hiding_directory_modified_times();
+        let listing = list_roots_with(
+            &dirs,
+            &observer,
+            &fixture.state,
+            &resolved,
+            4096,
+            ActivityMode::Scan,
+        )
+        .expect("the area lists");
+        let row = listing
+            .roots
+            .iter()
+            .find(|row| row.root_id.as_deref() == Some(root.root_id.as_str()))
+            .expect("the root is listed");
+        assert_eq!(
+            row.last_activity_ms, None,
+            "a child's old time never replaces the root's own missing one"
+        );
+        let activity = row
+            .activity
+            .as_ref()
+            .expect("the scan reports its evidence");
+        assert!(!activity.complete);
+        assert!(
+            activity.reason.as_deref().is_some_and(
+                |reason| reason.contains("root directory reports no modification time")
+            ),
+            "{activity:?}"
+        );
     }
 
     #[test]

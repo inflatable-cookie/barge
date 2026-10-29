@@ -610,6 +610,13 @@ pub struct Faults {
     /// When set, every fact this wrapper reports states no modification time, so
     /// a platform that reports none can be simulated without a second `DirOps`.
     pub no_modified_times: Cell<bool>,
+    /// When set, only a *directory's own* facts state no modification time, while
+    /// its entries still do. It is how a root whose own time is unavailable but
+    /// whose children carry old times is simulated.
+    pub no_directory_modified_times: Cell<bool>,
+    /// Every child name this wrapper opened, in order. A caller that must not
+    /// read an entry before its own lock uses it to prove nothing was opened.
+    pub opened_child_names: RefCell<Vec<String>>,
     /// A name whose entry read fails, so the walk aborts where a real read error
     /// would abort it.
     pub failing_facts_name: Option<String>,
@@ -737,6 +744,12 @@ impl Faults {
     /// Report no modification times at all, as a platform without them does.
     pub fn hiding_modified_times(&self) {
         self.no_modified_times.set(true);
+    }
+
+    /// Report no modification time for a directory's own facts, while its entries
+    /// keep theirs.
+    pub fn hiding_directory_modified_times(&self) {
+        self.no_directory_modified_times.set(true);
     }
 
     pub fn failing_remove(&self, name: &str, times: usize) {
@@ -1081,6 +1094,7 @@ impl DirOps for Faults {
     }
 
     fn open_child_dir(&self, parent: &DirHandle, name: &str) -> Result<DirHandle> {
+        self.opened_child_names.borrow_mut().push(name.to_owned());
         let swap = self
             .swap_on_dir_open
             .borrow_mut()
@@ -1220,8 +1234,11 @@ impl DirOps for Faults {
             ));
         }
         let mut listing = self.inner.list_children(parent, max_names)?;
-        if self.no_modified_times.get() {
-            for entry in &mut listing.entries {
+        for entry in &mut listing.entries {
+            if self.no_modified_times.get()
+                || (self.no_directory_modified_times.get()
+                    && entry.facts.kind == crate::os::EntryKind::Directory)
+            {
                 entry.facts.modified_ms = None;
             }
         }
@@ -1324,7 +1341,7 @@ impl DirOps for Faults {
 
     fn dir_facts(&self, handle: &DirHandle) -> Result<EntryFacts> {
         let mut facts = self.inner.dir_facts(handle)?;
-        if self.no_modified_times.get() {
+        if self.no_modified_times.get() || self.no_directory_modified_times.get() {
             facts.modified_ms = None;
         }
         Ok(facts)

@@ -1067,8 +1067,8 @@ cannot report in full is never a short set.
 What the reference readers read, and where. Barge's own: every placement record
 (the whole census, so a truncated one is `Unknown`), the area declaration the
 plan is built under (current when its policy never releases a root), and the
-root's hold records (a live or undecidable hold is current; a positively stale
-one is not). Oxide's, read in place and never written: the outputs registry
+root's hold records, which the caller reads under the root's own lock (a live or
+undecidable hold is current; a positively stale one is not). Oxide's, read in place and never written: the outputs registry
 `oxide.outputs.registry/2` and its `/1` predecessor, every checkout receipt
 (`oxide.outputs.transition/1`, `/2` and `/3`, each read for its own selection
 site), and one root marker `oxide.outputs.root/2` (a `/1` marker is unknown,
@@ -1084,8 +1084,11 @@ Oxide's registration (`<pool>/oxide-managed`), and only a pool that holds an
 
 What "unknown" costs. An unreadable, oversized, schema-divergent or
 unknown-version registry or receipt makes the reference set incomplete, and an
-incomplete set keeps every root it covers — the batch, not one row. So does an
-uncertain *discovery*: Oxide's own pools record can name the only pool that holds
+incomplete set keeps every root it covers — the batch, not one row. A registry row
+that does not state Oxide's own selection flags (`selected`, `pending`) or its
+required identity fields is a schema divergence, not a settled row: the reader
+refuses it rather than defaulting a missing selection to "not selected". So does
+an uncertain *discovery*: Oxide's own pools record can name the only pool that holds
 its `outputs/`, so an unreadable or divergent pools record, a candidate
 `outputs/` that exists and cannot be inspected, and two control directories that
 both hold outputs all make the snapshot unknown rather than empty. "No Oxide
@@ -1099,14 +1102,16 @@ proves what it can name exactly once.
 The last-activity clock. `OldestIdleAfter` compares `now - last_activity_ms`,
 and `last_activity_ms` is now the newest modification time found by a bounded,
 descriptor-relative scan of the root's subtree, with the root directory's own
-modification time as its floor. The scan never follows a symbolic link, and a
-modification time ahead of this run's clock, **an entry that reports no
-modification time at all** (or a root directory and subtree that report none, so
-that no floor exists), an unreadable subtree, a name that exceeds one listing's
-bound, a depth past 64 levels, or its deadline leaves the age unknown, which
-keeps the root. A missing modification time is never read as zero: zero would
-make a live root look decades idle on both delete paths, which is why the scan
-treats it as unknown rather than as an old timestamp. The same scan counts the row's bytes. The
+modification time as its floor. **The floor must exist**: a root directory that
+reports no modification time leaves the age unknown, because its entries' times
+can be decades old while the directory itself changed recently, so a child's time
+is never used in its place. The scan never follows a symbolic link, and a
+modification time ahead of this run's clock, an entry that reports no modification
+time at all, an unreadable subtree, a name that exceeds one listing's bound, a
+depth past 64 levels, or its deadline leaves the age unknown too, which keeps the
+root. A missing modification time is never read as zero: zero would make a live
+root look decades idle on both delete paths, which is why the scan treats it as
+unknown rather than as an old timestamp. The same scan counts the row's bytes. The
 bounds are `ACTIVITY_ENTRIES` (200 000 entries), `ACTIVITY_DEPTH` (64) and
 `ACTIVITY_WALL` (5 s) per root in `area`. Both delete paths now use this clock:
 `barge maintain`'s area policy asks the listing for the scan, and the release
@@ -1124,11 +1129,15 @@ its rank check is what proves it: the plan reads the registry under the shared
 observation lock and releases it, then takes the volume's shared lock for the
 rest of the pass, then one root's shared lock at a time, released before the next
 root so two roots are never held at once. **Every fact about a root is read under
-that root's own lock**: the area listing only enumerates entries, and the marker,
-its digest, the root directory's identity, the bounded activity scan and the
-reference readers' own root marker are all read after the shared root lock is
-taken, so no row reports an observation a consumer's hold or a delete could have
-been changing. Every shared wait is bounded by the run's own lock budget
+that root's own lock**: `area::list_names` supplies the folder's names and nothing
+else — it opens no child, reads no marker and no hold, and compares no device or
+inode — and the marker, its digest, the root directory's identity, its holds, the
+bounded activity scan and the root's own Oxide marker are all read after the
+shared root lock is taken, so no row reports an observation a consumer's hold or a
+delete could have been changing. A root whose name is its Barge root id takes that
+root's lock, which is the lock a hold takes; any other name — an adopted root's
+folder, for instance — takes the deletion unit's own lock key, which is the lock a
+delete of that unit takes, so the observation is serialised either way. Every shared wait is bounded by the run's own lock budget
 (`ReleaseBounds.lock_wait`, the state directory's own `LOCK_WAIT` by default). A
 volume lock a live owner holds past that budget refuses that volume's preview
 with `locked`, names the volume and the lock file, and changes nothing; a root

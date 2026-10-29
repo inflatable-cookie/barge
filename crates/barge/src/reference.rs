@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use crate::area::{self, AreaDocument, HoldReading, PrunePolicy};
 use crate::cache::{self, PlacementForm, PlacementSet};
 use crate::error::{Error, ErrorKind, Result};
-use crate::os::{AccountFacts, DirHandle, DirOps, ProcessObserver, VolumeUuid};
+use crate::os::{AccountFacts, DirHandle, DirOps, VolumeUuid};
 use crate::state::{self, Bounds, Deadline, ReadOutcome, StatePaths};
 
 /// A reference from one of Barge's own records.
@@ -229,15 +229,18 @@ impl BargeReferences {
     ///
     /// `declaration` is the area declaration the plan was built under and
     /// `policy_permits_release` says whether that declaration's prune policy
-    /// allows a root past its age to be released at all.
+    /// allows a root past its age to be released at all. `holds` is the root's hold
+    /// reading, which the caller takes under the root's own lock: this function
+    /// reads no state directory of its own, so a preview cannot observe a root
+    /// outside its lock.
     pub fn references_for(
         &self,
-        state: &StatePaths,
-        observer: &dyn ProcessObserver,
         declaration: &AreaDocument,
         policy_permits_release: bool,
         root_id: &str,
         root_path: &Path,
+        holds: &area::HoldReading,
+        holds_error: Option<&str>,
     ) -> ReferenceSet {
         let mut set = ReferenceSet::empty();
         if let Some(detail) = &self.placements_detail {
@@ -268,12 +271,12 @@ impl BargeReferences {
                 }
             )),
         );
-        match area::read_holds(state, observer, root_id) {
-            Ok(reading) => set.absorb(hold_reference(&reading)),
-            Err(error) => set.absorb(ReferenceSet::unknown(format!(
-                "the root's holds could not be read: {error}"
-            ))),
+        if let Some(reason) = holds_error {
+            set.absorb(ReferenceSet::unknown(format!(
+                "the root's holds could not be read: {reason}"
+            )));
         }
+        set.absorb(hold_reference(holds));
         set
     }
 }
@@ -801,25 +804,20 @@ struct RawRow {
     checkout: PathBuf,
     #[serde(default)]
     checkout_volume_uuid: Option<String>,
-    #[serde(default)]
     #[allow(dead_code)]
-    receipt: Option<PathBuf>,
-    #[serde(default)]
+    receipt: PathBuf,
     #[allow(dead_code)]
-    member: Option<String>,
+    member: String,
     root: PathBuf,
-    #[serde(default)]
     #[allow(dead_code)]
-    root_kind: Option<String>,
+    root_kind: String,
     #[serde(default)]
     #[allow(dead_code)]
     volume_uuid: Option<String>,
-    #[serde(default)]
     #[allow(dead_code)]
-    recipe: Option<String>,
+    recipe: String,
     #[serde(default)]
     nonce: Option<String>,
-    #[serde(default)]
     #[allow(dead_code)]
     generation: u64,
     #[serde(default)]
@@ -831,9 +829,11 @@ struct RawRow {
     #[serde(default)]
     #[allow(dead_code)]
     marker_digest: Option<String>,
-    #[serde(default)]
+    // Oxide's selection flags are required: a row that does not state them is a
+    // document this build does not understand, never a row that selects nothing.
+    // Defaulting them to `false` would read a missing selection as a settled one
+    // and could release a root Oxide still wants.
     selected: bool,
-    #[serde(default)]
     pending: bool,
     #[serde(default)]
     pruning: Option<String>,
@@ -994,15 +994,12 @@ fn read_receipt(
 struct RawReceipt {
     version: String,
     checkout: PathBuf,
-    #[serde(default)]
     #[allow(dead_code)]
     checkout_id: String,
-    #[serde(default)]
     #[allow(dead_code)]
     generation: u64,
-    #[serde(default)]
     #[allow(dead_code)]
-    state: Option<String>,
+    state: String,
     #[serde(default)]
     #[allow(dead_code)]
     layout: Option<String>,
@@ -1113,7 +1110,7 @@ fn parse_receipt(
             raw.version
         ));
     }
-    if !raw.checkout_id.is_empty() && raw.checkout_id != checkout_id {
+    if raw.checkout_id != checkout_id {
         return Err(format!(
             "the receipt for {checkout_id} names checkout id {}",
             raw.checkout_id
@@ -1229,7 +1226,6 @@ pub fn read_oxide_marker(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawMarker {
-    #[serde(default)]
     #[allow(dead_code)]
     version: String,
     checkout: PathBuf,

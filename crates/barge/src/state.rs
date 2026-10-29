@@ -956,6 +956,17 @@ impl LockSet {
         self.acquire_shared(LockRank::Volume, &path)
     }
 
+    /// Observe one deletion unit by its [`unit_lock_key`]: a shared lock, and
+    /// only when the lock file exists.
+    ///
+    /// It is the third rank, like the root lock, and it is the lock a delete or a
+    /// hold of a unit whose name is not a Barge root id takes. A preview of such a
+    /// unit holds it shared so it cannot read one mid-delete.
+    pub fn observe_unit(&mut self, key: &str) -> Result<Option<StateLock>> {
+        let path = self.state.unit_lock_path(key)?;
+        self.acquire_shared(LockRank::Root, &path)
+    }
+
     /// Observe one root: a shared lock, and only when the lock file exists.
     ///
     /// It is the third rank, so a caller may take one root at a time under the
