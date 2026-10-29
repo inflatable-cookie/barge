@@ -1225,6 +1225,10 @@ impl DirOps for Faults {
         self.inner.read_child_file(parent, name, cap)
     }
 
+    fn list_names(&self, parent: &DirHandle, max_names: usize) -> Result<crate::os::DirNames> {
+        self.inner.list_names(parent, max_names)
+    }
+
     fn list_children(&self, parent: &DirHandle, max_names: usize) -> Result<ChildListing> {
         if self.arm_after_mode.get() && self.fail_listing_after_mode.get() {
             self.arm_after_mode.set(false);

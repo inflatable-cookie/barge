@@ -3303,40 +3303,38 @@ pub enum ActivityMode {
 
 /// One entry an area folder holds, as a names-only enumeration reports it.
 ///
-/// It is a name and the path the current configuration resolves to, plus whether
-/// the entry is a symbolic link. Nothing about the entry has been read: no
-/// marker, no hold, no opened descriptor, no device and no inode. A caller that
-/// must observe a root takes the root's own lock first and reads it there.
+/// It is a name and the path the current configuration resolves to, and nothing
+/// else: no marker, no hold, no opened descriptor, no device, no inode and no
+/// entry-type check. A caller that must observe the entry takes its own lock
+/// first and reads it there, which is also where a symbolic link is discovered
+/// (it is never followed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootName {
     /// The entry's name inside the area folder.
     pub name: String,
     /// The path the current configuration resolves for it.
     pub path: PathBuf,
-    /// Whether the entry is a symbolic link, which is never followed.
-    pub symlink: bool,
 }
 
 /// One bounded, names-only enumeration of an area folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameListing {
-    /// The root-shaped entries kept, in the platform's listing order.
+    /// The entries enumerated, in the platform's listing order.
     pub names: Vec<RootName>,
     /// How many entries the folder held.
     pub examined: usize,
     /// Whether the enumeration was cut by the row or name bound.
     pub truncated: bool,
-    /// Entries that are neither directories nor symlinks.
-    pub skipped_non_directories: usize,
 }
 
-/// Enumerate one resolved area's root-shaped entries and observe nothing else.
+/// Enumerate one resolved area's entries by name and observe nothing else.
 ///
-/// It lists the folder's names, keeps the directories and symlinks, and reports
-/// how many entries there were. It opens no child, reads no marker, reads no
-/// hold and compares no device or inode: a caller that decides anything about one
-/// of these entries must take that root's lock first and observe it under it. A
-/// symlink is reported as such and is never followed.
+/// It uses [`DirOps::list_names`], which reads the directory's names and no
+/// entry's own facts: no marker, no hold, no device, no inode and no entry type.
+/// A caller that decides anything about one of these entries must take that
+/// entry's lock first and observe it under it. Because no entry is stated here, a
+/// child that cannot be stated cannot fail the enumeration either: that entry is
+/// reported by the caller's own row for it.
 pub fn list_names(
     dirs: &dyn DirOps,
     resolved: &ResolvedArea,
@@ -3349,36 +3347,27 @@ pub fn list_names(
                 names: Vec::new(),
                 examined: 0,
                 truncated: false,
-                skipped_non_directories: 0,
             })
         }
     };
     let name_cap = max_roots.clamp(1, LISTING_NAME_ROWS);
-    let listing = dirs.list_children(&handle, name_cap)?;
+    let listing = dirs.list_names(&handle, name_cap)?;
     let mut names = Vec::new();
-    let mut skipped_non_directories = 0usize;
     let mut truncated = listing.truncated;
-    for entry in &listing.entries {
-        let symlink = entry.facts.kind == EntryKind::Symlink;
-        if !symlink && entry.facts.kind != EntryKind::Directory {
-            skipped_non_directories = skipped_non_directories.saturating_add(1);
-            continue;
-        }
+    for name in listing.names {
         if names.len() >= max_roots {
             truncated = true;
             break;
         }
         names.push(RootName {
-            name: entry.name.clone(),
-            path: resolved.path.join(&entry.name),
-            symlink,
+            path: resolved.path.join(&name),
+            name,
         });
     }
     Ok(NameListing {
         names,
         examined: listing.total,
         truncated,
-        skipped_non_directories,
     })
 }
 
@@ -4195,6 +4184,10 @@ mod tests {
 
         fn list_children(&self, parent: &DirHandle, max_names: usize) -> Result<ChildListing> {
             self.inner.list_children(parent, max_names)
+        }
+
+        fn list_names(&self, parent: &DirHandle, max_names: usize) -> Result<crate::os::DirNames> {
+            self.inner.list_names(parent, max_names)
         }
 
         fn remove_child(
@@ -5670,6 +5663,13 @@ mod tests {
             }
             fn list_children(&self, parent: &DirHandle, max_names: usize) -> Result<ChildListing> {
                 self.inner.list_children(parent, max_names)
+            }
+            fn list_names(
+                &self,
+                parent: &DirHandle,
+                max_names: usize,
+            ) -> Result<crate::os::DirNames> {
+                self.inner.list_names(parent, max_names)
             }
             fn remove_child(
                 &self,

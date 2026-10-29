@@ -781,11 +781,51 @@ fn decide_root(
         now_ms: state::now_ms(),
     };
     let (marker_state, marker_digest) = area::read_marker_with_digest(dirs, &handle, &expectation);
-    let marker_root_id = match &marker_state {
-        area::MarkerState::Owned(marker) => Some(marker.root_id.clone()),
-        area::MarkerState::Absent | area::MarkerState::Unknown { .. } => None,
+    let marker_root_id = marker_id(&marker_state);
+    // An adopted root's directory name is not its root id, so the name-keyed lock
+    // above serialises with a delete of that unit while a consumer's hold — which
+    // is keyed by the marker's root id — would not see it. The root id is read
+    // under the name-keyed lock and then locked as well, and everything after this
+    // point is observed under both: the marker is read again so no fact between
+    // the two locks is used.
+    let mut root_id_lock = None;
+    let (marker_state, marker_digest) = match marker_root_id.as_deref() {
+        Some(id) if id != root.name && state::is_identifier(id) => {
+            let mut locks = state::LockSet::with_deadline(
+                state_paths.clone(),
+                Deadline::after(request.bounds.lock_wait),
+            );
+            match locks.observe_root(id) {
+                Ok(lock) => root_id_lock = lock,
+                Err(error) => {
+                    return unobserved_row(
+                        &root.name,
+                        mount_relative_path,
+                        "lock",
+                        format!(
+                            "the root's own lock could not be observed, so nothing about this root was read: {}",
+                            error.message()
+                        ),
+                    );
+                }
+            }
+            area::read_marker_with_digest(dirs, &handle, &expectation)
+        }
+        _ => (marker_state, marker_digest),
     };
-    let owned_root_id = marker_root_id.clone().filter(|_| !root.symlink);
+    let owned_root_id = marker_id(&marker_state);
+    if let (Some(locked_by), Some(now)) = (marker_root_id.as_deref(), owned_root_id.as_deref()) {
+        if locked_by != now {
+            return unobserved_row(
+                &root.name,
+                mount_relative_path,
+                "identity",
+                format!(
+                    "the root's marker names root {locked_by} before its lock and {now} after it, so it is kept"
+                ),
+            );
+        }
+    }
     // The row names the root by its marker's id when the marker says one, and by
     // the directory's name otherwise; a name that is not a root id has no holds
     // and no identity record to read.
@@ -804,13 +844,9 @@ fn decide_root(
     let mount_relative_path = stored.as_ref().map_or(mount_relative_path, |record| {
         record.mount_relative_path.clone()
     });
-    let activity = if root.symlink {
-        // A symlink is never followed, so nothing behind it is activity Barge can
-        // see. It stays unknown rather than empty.
-        area::RootActivity::unknown("the entry is a symbolic link, which is never followed")
-    } else {
-        area::scan_activity(dirs, &handle, None, state::now_ms())
-    };
+    // The root was opened, so it is a real directory; a symbolic link never
+    // reaches this point, because opening it no-follow would have been refused.
+    let activity = area::scan_activity(dirs, &handle, None, state::now_ms());
     let locked = LockedObservation {
         identity: handle.identity(),
         marker_state,
@@ -985,8 +1021,9 @@ fn decide_root(
         blockers.push(("absence", reason));
     }
 
-    // The row is decided; the root's own lock is released before the next root,
-    // so two roots are never held at once.
+    // The row is decided; both of the root's locks are released before the next
+    // root, so two roots are never held at once.
+    drop(root_id_lock);
     drop(root_lock);
     let eligible = blockers.is_empty();
     let (blocked_by, reason) = match blockers.into_iter().next() {
@@ -1011,6 +1048,14 @@ fn decide_root(
         eligible,
         blocked_by,
         reason,
+    }
+}
+
+/// The root id one marker states, when it is an owned marker.
+fn marker_id(marker: &area::MarkerState) -> Option<String> {
+    match marker {
+        area::MarkerState::Owned(marker) => Some(marker.root_id.clone()),
+        area::MarkerState::Absent | area::MarkerState::Unknown { .. } => None,
     }
 }
 
@@ -2268,8 +2313,10 @@ mod tests {
         dirs.observing(Box::new(move |name: &str| {
             seen.borrow_mut().push(name.to_owned());
         }));
+        // The instrumented wrapper is the plan's own `DirOps` here too, so the
+        // detector is in the path the plan actually uses.
         let report = fixture
-            .plan_with_bounds(&observer, &facts, fixture.overdue(), no_wait())
+            .plan_with_dirs(&dirs, &observer, &facts, fixture.overdue(), no_wait())
             .expect("a held root lock is a row");
         let blocked = row(&report, &root);
         assert_eq!(blocked.blocked_by.as_deref(), Some("lock"));
@@ -2278,9 +2325,17 @@ mod tests {
                 .opened_child_names
                 .borrow()
                 .iter()
-                .any(|name| name == &root.path.file_name().unwrap().to_string_lossy()),
+                .any(|name| name == &root.root_id),
             "nothing under a locked root is opened: {:?}",
             dirs.opened_child_names.borrow()
+        );
+        assert!(
+            !dirs
+                .opened_child_names
+                .borrow()
+                .iter()
+                .any(|name| name == &root.path.file_name().unwrap().to_string_lossy()),
+            "the enumeration opens no child at all"
         );
         assert!(
             !observed
@@ -2291,6 +2346,218 @@ mod tests {
             observed.borrow()
         );
         drop(held);
+    }
+
+    /// Rename a created root's directory and rewrite its marker so the marker is
+    /// an owned marker at the new name: an adopted root's shape, whose directory
+    /// name is not its root id.
+    fn as_adopted_root(fixture: &Fixture, root: &OwnedRoot, named: &str) -> PathBuf {
+        let marker_path = root.path.join(area::ROOT_MARKER_FILE);
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).expect("the marker is read"))
+                .expect("the marker is JSON");
+        marker["mount_relative_path"] = serde_json::Value::String(format!("pool/{named}"));
+        let renamed = root.path.parent().expect("the area folder").join(named);
+        std::fs::rename(&root.path, &renamed).expect("the root is renamed");
+        let marker_path = renamed.join(area::ROOT_MARKER_FILE);
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec(&marker).expect("the marker encodes"),
+        )
+        .expect("the marker is rewritten");
+        std::fs::set_permissions(&marker_path, std::fs::Permissions::from_mode(0o600))
+            .expect("the marker is private");
+        let _ = fixture;
+        renamed
+    }
+
+    #[test]
+    fn an_adopted_root_synchronises_with_the_hold_its_root_id_names() {
+        // A hold is keyed by the marker's root id, not by the directory's name. An
+        // adopted root whose folder is not its root id must therefore take the
+        // root-id lock too, or a live hold would not be seen and the preview could
+        // read the root mid-hold.
+        let fixture = Fixture::new("release-adopted-hold");
+        let root = fixture.root();
+        let renamed = as_adopted_root(&fixture, &root, "adopted-cache");
+        let path = fixture
+            .volume
+            .state
+            .root_lock_path(&root.root_id)
+            .expect("the root lock path");
+        let held = state::StateLock::exclusive(
+            &path,
+            state::LockRank::Root,
+            Deadline::after(Duration::from_secs(5)),
+        )
+        .expect("the fixture holds the root id's lock");
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let report = fixture
+            .plan_with_bounds(&observer, &facts, fixture.overdue(), no_wait())
+            .expect("the plan is built");
+        let blocked = report
+            .plan
+            .rows
+            .rows
+            .iter()
+            .find(|row| row.root_id == "adopted-cache")
+            .expect("the adopted root is a row");
+        assert_eq!(
+            blocked.blocked_by.as_deref(),
+            Some("lock"),
+            "a root-id hold is not seen: {blocked:?}"
+        );
+        assert!(blocked.bytes.is_none());
+        drop(held);
+
+        // With the root-id lock free the same row is observed and kept by its own
+        // identity evidence (the directory moved), which proves the row is decided.
+        let report = fixture.plan();
+        let kept = report
+            .plan
+            .rows
+            .rows
+            .iter()
+            .find(|row| row.root_id == root.root_id)
+            .expect("the adopted root is a row");
+        assert!(!kept.eligible);
+        assert_eq!(kept.blocked_by.as_deref(), Some("identity"));
+        assert!(renamed.is_dir());
+    }
+
+    #[test]
+    fn a_marker_only_reference_needs_its_consumer_path_absent() {
+        // An Oxide root marker names the checkout that owns the root. It is not a
+        // selection, so the gate must prove that checkout's path absent; a marker
+        // row that says "not current" without the proof would release a root whose
+        // consumer still exists.
+        let fixture = Fixture::new("release-marker-only");
+        let root = fixture.root();
+        let checkout = fixture.account.home.join("checkout");
+        std::fs::create_dir_all(&checkout).expect("the checkout exists");
+        let marker = serde_json::json!({
+            "version": reference::OXIDE_MARKER_V2,
+            "checkout": checkout.display().to_string(),
+            "checkout_id": "checkout-1",
+            "label": "example",
+            "recipe": "target-debug-v1",
+            "kind": "external",
+            "volume_uuid": FIXTURE_UUID,
+            "nonce": "00112233445566778899aabbccddeeff",
+            "checkout_volume_uuid": FIXTURE_UUID,
+            "generation": 1,
+            "created_ms": 1_000,
+        });
+        let marker_path = root.path.join(reference::OXIDE_MARKER_FILE);
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec(&marker).expect("the marker encodes"),
+        )
+        .expect("the Oxide marker is written");
+        std::fs::set_permissions(&marker_path, std::fs::Permissions::from_mode(0o600))
+            .expect("the marker is private");
+        // A receipt for the owning checkout that no longer names this root, so the
+        // marker is the only reference left and its absence proof is required.
+        let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
+        std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
+        std::fs::write(
+            outputs.join("checkout-1.json"),
+            format!(
+                r#"{{"version":"{}","checkout":"{}","checkout_id":"checkout-1","generation":2,"state":"committed","links":[{{"member":"target"}}],"roots":[],"updated_ms":1}}"#,
+                reference::OXIDE_RECEIPT_V2,
+                checkout.display()
+            ),
+        )
+        .expect("the receipt is written");
+
+        let report = fixture.plan();
+        let kept = row(&report, &root);
+        assert!(!kept.eligible, "{kept:?}");
+        assert_eq!(kept.blocked_by.as_deref(), Some("absence"));
+        let proof = kept
+            .absence
+            .as_ref()
+            .expect("the proof travels as evidence");
+        assert_eq!(proof.verdict, "present");
+        assert_eq!(proof.path, checkout);
+        assert!(kept.references.iter().any(|reference| {
+            reference.source == reference::OXIDE_MARKER
+                && !reference.current
+                && reference.path.as_deref() == Some(checkout.as_path())
+        }));
+
+        // With the checkout gone, the same marker reference is satisfied.
+        std::fs::remove_dir(&checkout).expect("the checkout is removed");
+        let report = fixture.plan();
+        let released = row(&report, &root);
+        assert!(released.eligible, "{released:?}");
+        assert_eq!(
+            released
+                .absence
+                .as_ref()
+                .map(|proof| proof.verdict.as_str()),
+            Some("absent")
+        );
+    }
+
+    #[test]
+    fn a_marker_without_its_required_fields_is_unknown() {
+        let fixture = Fixture::new("release-marker-divergent");
+        let root = fixture.root();
+        let mut marker = serde_json::json!({
+            "version": reference::OXIDE_MARKER_V2,
+            "checkout": fixture.account.home.join("checkout").display().to_string(),
+            "checkout_id": "checkout-1",
+            "label": "example",
+            "recipe": "target-debug-v1",
+            "kind": "external",
+            "generation": 1,
+            "created_ms": 1_000,
+        });
+        // Oxide always writes the label: a marker without it is divergent, and a
+        // divergent marker is never read as "no Oxide reference".
+        marker.as_object_mut().expect("an object").remove("label");
+        let marker_path = root.path.join(reference::OXIDE_MARKER_FILE);
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec(&marker).expect("the marker encodes"),
+        )
+        .expect("the Oxide marker is written");
+        std::fs::set_permissions(&marker_path, std::fs::Permissions::from_mode(0o600))
+            .expect("the marker is private");
+        let report = fixture.plan();
+        let kept = row(&report, &root);
+        assert!(!kept.eligible);
+        assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+        assert!(!kept.references_complete);
+    }
+
+    #[test]
+    fn a_regular_file_in_the_area_does_not_stop_the_other_roots() {
+        // The enumeration states no entry, so a neighbour that is not a directory
+        // cannot fail the batch: it is a row of its own, kept, and the real root
+        // still plans.
+        let fixture = Fixture::new("release-stray-file");
+        let root = fixture.root();
+        let stray = root
+            .path
+            .parent()
+            .expect("the area folder")
+            .join("not-a-root");
+        std::fs::write(&stray, b"payload").expect("the stray file is written");
+        let report = fixture.plan();
+        assert!(row(&report, &root).eligible);
+        let stray_row = report
+            .plan
+            .rows
+            .rows
+            .iter()
+            .find(|row| row.root_id == "not-a-root")
+            .expect("the stray entry is a row of its own");
+        assert!(!stray_row.eligible);
+        assert_eq!(stray_row.blocked_by.as_deref(), Some("identity"));
+        assert_eq!(report.plan.examined_count, 2);
     }
 
     #[test]

@@ -333,6 +333,23 @@ pub struct ChildEntry {
     pub facts: EntryFacts,
 }
 
+/// One bounded list of child names, read without any child's own facts.
+///
+/// It exists for a caller that must enumerate an area but must not read a
+/// single fact about the entries: reading a child's facts takes its metadata
+/// (device, inode, owner, mode, times), and a caller that has not yet taken the
+/// entry's own lock must not do that. A name that cannot be stated is therefore
+/// not an error here: no entry is stated at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirNames {
+    /// The names kept, in the platform's own order.
+    pub names: Vec<String>,
+    /// How many names the directory held, at least `names.len()`.
+    pub total: usize,
+    /// Whether names were left out.
+    pub truncated: bool,
+}
+
 /// One bounded directory listing.
 ///
 /// `truncated` is true exactly when the directory held more names than the cap,
@@ -463,6 +480,16 @@ pub trait DirOps {
     /// List one directory's children, keeping at most `max_names` names and
     /// reporting how many it held.
     fn list_children(&self, parent: &DirHandle, max_names: usize) -> Result<ChildListing>;
+
+    /// List one directory's children's *names* only, bounded, reading no child's
+    /// own facts.
+    ///
+    /// It is the enumeration a caller that has not yet taken an entry's lock must
+    /// use: no child is stated, so no child's metadata is read and no entry that
+    /// cannot be stated can fail the listing. The names are the same ones
+    /// [`DirOps::list_children`] reports, in the platform's own order, with the
+    /// same bound and the same `truncated` rule.
+    fn list_names(&self, parent: &DirHandle, max_names: usize) -> Result<DirNames>;
 
     /// Remove one child entry, never following a symbolic link. The kind says
     /// whether the entry is a directory, which is what decides between the

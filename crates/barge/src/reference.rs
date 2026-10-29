@@ -550,6 +550,9 @@ impl OxideSnapshot {
             )));
         }
         let uuid = marker.and_then(|marker| marker.checkout_volume.clone());
+        // The checkouts whose own records still select this root. A marker's
+        // reference is current only when its own checkout is one of them.
+        let mut selecting: Vec<PathBuf> = Vec::new();
         match &self.registry {
             OxideRegistry::Absent => {}
             OxideRegistry::Unknown { reason } => {
@@ -576,6 +579,7 @@ impl OxideSnapshot {
                             row.flags()
                         ));
                     if row.live() {
+                        selecting.push(row.checkout.clone());
                         set.rows.push(reference);
                     } else {
                         set.rows.push(reference.with_path(&row.checkout));
@@ -607,6 +611,9 @@ impl OxideSnapshot {
                         continue;
                     }
                     let current = receipt.current.iter().any(|root| root == root_path);
+                    if current {
+                        selecting.push(receipt.checkout.clone());
+                    }
                     let reference = ReferenceRow::new(OXIDE_RECEIPT, current).with_detail(format!(
                         "checkout {}'s receipt (id {}) names this root as {}",
                         receipt.checkout.display(),
@@ -630,12 +637,36 @@ impl OxideSnapshot {
             }
         }
         if let Some(marker) = marker {
-            set.rows
-                .push(ReferenceRow::new(OXIDE_MARKER, false).with_detail(format!(
-                    "the root's Oxide marker names checkout {} (id {})",
-                    marker.checkout.display(),
-                    marker.checkout_id
-                )));
+            // A marker names the checkout that owns the root. It is not a
+            // selection, so a marker-only reference is never current on its own:
+            // its own rule is "the consumer path is gone", and the gate must prove
+            // that path absent before the root can be released. Without the proof
+            // the row is simply unknown, which keeps the root.
+            let selected_here = selecting
+                .iter()
+                .any(|checkout| checkout == &marker.checkout);
+            if selected_here {
+                set.rows
+                    .push(ReferenceRow::new(OXIDE_MARKER, true).with_detail(format!(
+                        "the root's Oxide marker names checkout {} (id {}), which still selects it",
+                        marker.checkout.display(),
+                        marker.checkout_id
+                    )));
+            } else {
+                set.rows.push(
+                    ReferenceRow::new(OXIDE_MARKER, false)
+                        .with_path(&marker.checkout)
+                        .with_detail(format!(
+                            "the root's Oxide marker names checkout {} (id {}); its consumer path must be proved absent",
+                            marker.checkout.display(),
+                            marker.checkout_id
+                        )),
+                );
+                set.absence.push(AbsenceRequest {
+                    path: marker.checkout.clone(),
+                    volume: marker.checkout_volume.clone(),
+                });
+            }
             let receipt_present = match &self.receipts {
                 OxideReceipts::Absent => false,
                 OxideReceipts::Read(receipts) => receipts
@@ -1230,15 +1261,14 @@ struct RawMarker {
     version: String,
     checkout: PathBuf,
     checkout_id: String,
-    #[serde(default)]
+    // Oxide writes all of these; a marker that omits one is a document this build
+    // does not understand, never a marker with a defaulted fact.
     #[allow(dead_code)]
-    label: Option<String>,
-    #[serde(default)]
+    label: String,
     #[allow(dead_code)]
-    recipe: Option<String>,
-    #[serde(default)]
+    recipe: String,
     #[allow(dead_code)]
-    kind: Option<String>,
+    kind: String,
     #[serde(default)]
     #[allow(dead_code)]
     volume_uuid: Option<String>,
@@ -1247,10 +1277,8 @@ struct RawMarker {
     nonce: Option<String>,
     #[serde(default)]
     checkout_volume_uuid: Option<String>,
-    #[serde(default)]
     #[allow(dead_code)]
     generation: u64,
-    #[serde(default)]
     #[allow(dead_code)]
     created_ms: u64,
 }

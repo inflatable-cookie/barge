@@ -1087,8 +1087,12 @@ unknown-version registry or receipt makes the reference set incomplete, and an
 incomplete set keeps every root it covers — the batch, not one row. A registry row
 that does not state Oxide's own selection flags (`selected`, `pending`) or its
 required identity fields is a schema divergence, not a settled row: the reader
-refuses it rather than defaulting a missing selection to "not selected". So does
-an uncertain *discovery*: Oxide's own pools record can name the only pool that holds
+refuses it rather than defaulting a missing selection to "not selected", and a
+root marker that omits a field Oxide always writes is unreadable for the same
+reason. A root that carries only an Oxide marker and no still-selecting record is
+**not** releasable on the marker's own word: the marker is ownership, not a
+selection, so its row is not current and its consumer path needs an `Absent`
+proof of its own. So does an uncertain *discovery*: Oxide's own pools record can name the only pool that holds
 its `outputs/`, so an unreadable or divergent pools record, a candidate
 `outputs/` that exists and cannot be inspected, and two control directories that
 both hold outputs all make the snapshot unknown rather than empty. "No Oxide
@@ -1129,15 +1133,21 @@ its rank check is what proves it: the plan reads the registry under the shared
 observation lock and releases it, then takes the volume's shared lock for the
 rest of the pass, then one root's shared lock at a time, released before the next
 root so two roots are never held at once. **Every fact about a root is read under
-that root's own lock**: `area::list_names` supplies the folder's names and nothing
-else — it opens no child, reads no marker and no hold, and compares no device or
-inode — and the marker, its digest, the root directory's identity, its holds, the
-bounded activity scan and the root's own Oxide marker are all read after the
-shared root lock is taken, so no row reports an observation a consumer's hold or a
-delete could have been changing. A root whose name is its Barge root id takes that
-root's lock, which is the lock a hold takes; any other name — an adopted root's
-folder, for instance — takes the deletion unit's own lock key, which is the lock a
-delete of that unit takes, so the observation is serialised either way. Every shared wait is bounded by the run's own lock budget
+that root's own lock**: `area::list_names` uses the `os` layer's names-only
+enumeration (`DirOps::list_names`), which reads the directory stream and no
+entry's own facts at all — no child is opened or stated, so no device, inode,
+owner, mode or time is read, and an entry that cannot be stated cannot fail the
+batch either; it is simply a row of its own. The marker, its digest, the root
+directory's identity, its holds, the bounded activity scan and the root's own
+Oxide marker are all read after the shared root lock is taken, so no row reports
+an observation a consumer's hold or a delete could have been changing. An adopted
+root needs **both** locks: a root whose name is its Barge root id takes that root
+lock (which is the one a hold takes), and any other name first takes the deletion
+unit's own lock key — the lock a delete of that unit takes — then reads the
+marker, then takes the marker's root-id lock too, because a hold is keyed by the
+root id rather than by the folder's name. The marker is read again under the
+second lock, and a marker whose root id changed between the two reads keeps the
+root. Every shared wait is bounded by the run's own lock budget
 (`ReleaseBounds.lock_wait`, the state directory's own `LOCK_WAIT` by default). A
 volume lock a live owner holds past that budget refuses that volume's preview
 with `locked`, names the volume and the lock file, and changes nothing; a root
