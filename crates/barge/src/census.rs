@@ -53,6 +53,10 @@ pub const OXIDE_REGISTRY_SIZE_CAP_BYTES: usize = 4 * 1024 * 1024;
 pub const OXIDE_REGISTRY_ROWS: usize = 4096;
 /// Oxide's own owner-marker cap: one bounded read per root path.
 pub const OXIDE_ROOT_MARKER_SIZE_CAP_BYTES: usize = 64 * 1024;
+/// Oxide's current owner-marker version, which requires a nonce.
+const OXIDE_ROOT_MARKER_V2: &str = "oxide.outputs.root/2";
+/// Oxide's previous owner-marker version, which predates the nonce.
+const OXIDE_ROOT_MARKER_V1: &str = "oxide.outputs.root/1";
 /// The one deadline the whole census shares with the registry read.
 pub const OXIDE_CENSUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 /// The most components a recorded root path is walked through.
@@ -556,10 +560,12 @@ impl From<RawRow> for OxideRegistryRow {
 /// Oxide's owner marker inside one output root, as Oxide writes it.
 ///
 /// Every member of Oxide's field set is required by the strict parse, so a
-/// divergent marker is refused. The census compares the identity facts and the
-/// generation; `label`, `recipe`, `checkout_volume_uuid` and `created_ms` are
-/// read only in the sense that their presence and type are validated, and the
-/// marker's own bytes are compared through their digest.
+/// divergent marker is refused. A version-2 marker must also carry its nonce in
+/// the shape Oxide requires; a version-1 marker legitimately has none, so that
+/// rule is version-scoped. The census compares the identity facts and the
+/// generation afterwards; `label`, `recipe`, `checkout_volume_uuid` and
+/// `created_ms` are read only in the sense that their presence and type are
+/// validated, and the marker's own bytes are compared through their digest.
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -970,6 +976,17 @@ fn reason_name(reason: IdentityReason) -> &'static str {
     }
 }
 
+/// Whether a value is Oxide's marker nonce shape: 128 bits of lowercase
+/// hexadecimal, as Oxide's own marker validation requires.
+fn is_hex32(value: Option<&str>) -> bool {
+    value.is_some_and(|nonce| {
+        nonce.len() == 32
+            && nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
+}
+
 /// Observe one record's live identity, or `None` when the deadline expired
 /// before the observation could be decided.
 fn observe_row(
@@ -1160,7 +1177,7 @@ fn observe_row(
     };
     if !matches!(
         value.get("version").and_then(serde_json::Value::as_str),
-        Some("oxide.outputs.root/2" | "oxide.outputs.root/1")
+        Some(OXIDE_ROOT_MARKER_V2 | OXIDE_ROOT_MARKER_V1)
     ) {
         return Some(kept(IdentityReason::MarkerVersionUnknown, None));
     }
@@ -1171,6 +1188,15 @@ fn observe_row(
     let digest_equal = row
         .marker_digest()
         .map(|recorded| recorded == crate::digest::sha256_hex(&bytes));
+    // The marker's own version rule comes first, exactly as Oxide applies it: a
+    // version-2 marker must carry its 128-bit lowercase-hex nonce. A marker that
+    // breaks it is divergent even when the row agrees with it, because two
+    // identically absent or malformed nonces compare equal without identifying
+    // anything. A version-1 marker legitimately has none, so the rule is
+    // version-scoped.
+    if marker.version == OXIDE_ROOT_MARKER_V2 && !is_hex32(marker.nonce.as_deref()) {
+        return Some(kept(IdentityReason::MarkerSchemaDivergent, digest_equal));
+    }
     if marker.kind != row.root_kind()
         || marker.checkout != row.checkout()
         || marker.checkout_id != row.checkout_id
@@ -1814,6 +1840,88 @@ mod tests {
         assert_eq!(
             fixture.row(&report).identity.reason,
             Some(IdentityReason::MarkerSchemaDivergent)
+        );
+    }
+
+    #[test]
+    fn a_version_two_marker_without_its_nonce_is_unknown_even_when_the_row_agrees() {
+        // The concrete defect: a version-2 marker needs its 128-bit lowercase-hex
+        // nonce. When the row records the same absent or malformed value, the two
+        // sides compare equal without identifying anything, so the marker's own
+        // version rule has to refuse before identity is reported.
+        let fixture = Fixture::new("census-marker-nonce");
+        let mut row = fixture.row_json();
+
+        // Absent on both sides.
+        let mut absent: serde_json::Value =
+            serde_json::from_slice(&fixture.row.marker).expect("the fixture marker decodes");
+        absent
+            .as_object_mut()
+            .expect("a marker object")
+            .remove("nonce");
+        write_marker(
+            &fixture.row.root,
+            &serde_json::to_vec(&absent).expect("the marker encodes"),
+        );
+        row["nonce"] = serde_json::json!(null);
+        let report = fixture.census(vec![row.clone()]);
+        assert_eq!(
+            fixture.row(&report).identity.reason,
+            Some(IdentityReason::MarkerSchemaDivergent),
+            "a version-2 marker with no nonce is divergent"
+        );
+        assert_eq!(
+            fixture.row(&report).identity.verdict,
+            CensusVerdict::Unknown
+        );
+
+        // Malformed on both sides, in each way Oxide refuses.
+        for malformed in [
+            "not-a-nonce",
+            "ABCDEF0123456789ABCDEF0123456789",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+        ] {
+            write_marker(
+                &fixture.row.root,
+                &marker_bytes(
+                    "oxide.outputs.root/2",
+                    OxideRootKind::External,
+                    Some(UUID),
+                    Some(malformed),
+                    1,
+                ),
+            );
+            row["nonce"] = serde_json::json!(malformed);
+            let report = fixture.census(vec![row.clone()]);
+            let identity = &fixture.row(&report).identity;
+            assert_eq!(
+                identity.reason,
+                Some(IdentityReason::MarkerSchemaDivergent),
+                "`{malformed}` is not a nonce Oxide accepts"
+            );
+            assert_ne!(identity.verdict, CensusVerdict::Verified);
+        }
+
+        // The boundary, exactly as Oxide draws it: a version-1 marker predates
+        // the nonce, so the same absent value verifies there.
+        write_marker(
+            &fixture.row.root,
+            &marker_bytes(
+                "oxide.outputs.root/1",
+                OxideRootKind::External,
+                Some(UUID),
+                None,
+                1,
+            ),
+        );
+        row["nonce"] = serde_json::json!(null);
+        let report = fixture.census(vec![row]);
+        let identity = &fixture.row(&report).identity;
+        assert_eq!(
+            identity.verdict,
+            CensusVerdict::Verified,
+            "a version-1 marker legitimately has no nonce: {identity:#?}"
         );
     }
 

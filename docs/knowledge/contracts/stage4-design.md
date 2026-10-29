@@ -1262,10 +1262,16 @@ Choices F5 made where this contract left the mechanics to the slice:
   `unknown(inode_changed)` with both inodes reported. `gone` is reachable only
   from a volume that still verifies and a path that is `ENOENT`, and only after
   the mount census, the volume and the parent descriptor are re-read unchanged.
-  The recorded owner marker is checked in the same order as Oxide checks it
-  (kind, checkout, volume UUID, nonce, then generation), but its digest is
-  reported as `marker_digest_equal` and never decides identity — it is a plan
-  fact re-read at each step, exactly as [the identity rules](#the-facts-and-the-three-roles-a-fact-may-have)
+  The recorded owner marker's own version rules come first, exactly as Oxide
+  applies them: an `oxide.outputs.root/2` marker must carry its 128-bit
+  lowercase-hex nonce, so one with the member absent or malformed is
+  `unknown(marker_schema_divergent)` — even when the row records the identical
+  absent or malformed value, because two equal nonces that identify nothing are
+  not an identity — while an `oxide.outputs.root/1` marker legitimately has none.
+  After that the marker is checked in the same order as Oxide checks it (kind,
+  checkout, volume UUID, nonce, then generation), but its digest is reported as
+  `marker_digest_equal` and never decides identity — it is a plan fact re-read at
+  each step, exactly as [the identity rules](#the-facts-and-the-three-roles-a-fact-may-have)
   require. A row that records no device or inode is
   `unknown(identity_record_missing)` — in an Oxide row that is what is missing,
   and a `/1`-era row is the ordinary case — and a row that records no usable
