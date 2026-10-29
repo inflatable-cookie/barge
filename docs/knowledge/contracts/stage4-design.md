@@ -1084,7 +1084,13 @@ Oxide's registration (`<pool>/oxide-managed`), and only a pool that holds an
 
 What "unknown" costs. An unreadable, oversized, schema-divergent or
 unknown-version registry or receipt makes the reference set incomplete, and an
-incomplete set keeps every root it covers — the batch, not one row. A complete
+incomplete set keeps every root it covers — the batch, not one row. So does an
+uncertain *discovery*: Oxide's own pools record can name the only pool that holds
+its `outputs/`, so an unreadable or divergent pools record, a candidate
+`outputs/` that exists and cannot be inspected, and two control directories that
+both hold outputs all make the snapshot unknown rather than empty. "No Oxide
+record names this root" is only ever concluded from a complete look, never from a
+look that failed. A complete
 snapshot is reported on the command document, and an incomplete one forces exit
 `3`. More than one distinct consumer path for one root, or two records that
 disagree about one path's volume, is also unknown and keeps that root: the plan
@@ -1094,9 +1100,13 @@ The last-activity clock. `OldestIdleAfter` compares `now - last_activity_ms`,
 and `last_activity_ms` is now the newest modification time found by a bounded,
 descriptor-relative scan of the root's subtree, with the root directory's own
 modification time as its floor. The scan never follows a symbolic link, and a
-modification time ahead of this run's clock, an unreadable subtree, a name that
-exceeds one listing's bound, a depth past 64 levels, or its deadline leaves the
-age unknown, which keeps the root. The same scan counts the row's bytes. The
+modification time ahead of this run's clock, **an entry that reports no
+modification time at all** (or a root directory and subtree that report none, so
+that no floor exists), an unreadable subtree, a name that exceeds one listing's
+bound, a depth past 64 levels, or its deadline leaves the age unknown, which
+keeps the root. A missing modification time is never read as zero: zero would
+make a live root look decades idle on both delete paths, which is why the scan
+treats it as unknown rather than as an old timestamp. The same scan counts the row's bytes. The
 bounds are `ACTIVITY_ENTRIES` (200 000 entries), `ACTIVITY_DEPTH` (64) and
 `ACTIVITY_WALL` (5 s) per root in `area`. Both delete paths now use this clock:
 `barge maintain`'s area policy asks the listing for the scan, and the release
@@ -1113,15 +1123,20 @@ Locking follows [the lock table](#lock-order-with-the-stage-1-locks) exactly, an
 its rank check is what proves it: the plan reads the registry under the shared
 observation lock and releases it, then takes the volume's shared lock for the
 rest of the pass, then one root's shared lock at a time, released before the next
-root so two roots are never held at once. Every shared wait is bounded by the
-run's own lock budget (`ReleaseBounds.lock_wait`, the state directory's own
-`LOCK_WAIT` by default). A volume lock a live owner holds past that budget
-refuses that volume's preview with `locked`, names the volume and the lock file,
-and changes nothing; a root lock that cannot be taken keeps that root alone, as a
-row with `blocked_by: lock`, no observation and no eligibility, while every other
-root of the area still plans. A lock file that does not exist is nothing to wait
-for: a read-only command creates no lock, no file and no directory, and the
-observation is a `None` rather than a new file.
+root so two roots are never held at once. **Every fact about a root is read under
+that root's own lock**: the area listing only enumerates entries, and the marker,
+its digest, the root directory's identity, the bounded activity scan and the
+reference readers' own root marker are all read after the shared root lock is
+taken, so no row reports an observation a consumer's hold or a delete could have
+been changing. Every shared wait is bounded by the run's own lock budget
+(`ReleaseBounds.lock_wait`, the state directory's own `LOCK_WAIT` by default). A
+volume lock a live owner holds past that budget refuses that volume's preview
+with `locked`, names the volume and the lock file, and changes nothing; a root
+lock that cannot be taken keeps that root alone, as a row with `blocked_by:
+lock`, no observation at all (no marker digest, no bytes, no reference set) and
+no eligibility, while every other root of the area still plans. A lock file that
+does not exist is nothing to wait for: a read-only command creates no lock, no
+file and no directory, and the observation is a `None` rather than a new file.
 
 [O4-001](#open-design-issues) leaves one decision to the implementation brief:
 whether any additional unprivileged fact — a per-volume registration receipt

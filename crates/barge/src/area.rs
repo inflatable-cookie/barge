@@ -3504,9 +3504,13 @@ pub fn scan_activity(
             ))
         }
     };
-    let floor = own_modified_ms.or(own.modified_ms).unwrap_or(0);
+    // The floor is the root directory's own modification time. A platform that
+    // reports none for the root and none for any entry leaves the age unknown: a
+    // missing modification time is never read as "very old", because that would
+    // make a live root eligible.
+    let floor = own_modified_ms.or(own.modified_ms);
     let mut activity = RootActivity {
-        last_activity_ms: Some(floor),
+        last_activity_ms: floor,
         logical_bytes: own.allocated_bytes,
         allocated_bytes: own.allocated_bytes,
         entries: 1,
@@ -3521,6 +3525,12 @@ pub fn scan_activity(
         activity.complete = false;
         activity.last_activity_ms = None;
         activity.reason = Some(reason);
+        return activity;
+    }
+    if activity.last_activity_ms.is_none() {
+        activity.complete = false;
+        activity.reason =
+            Some("neither the root directory nor any entry reports a modification time".to_owned());
         return activity;
     }
     if let Some(newest) = activity.last_activity_ms {
@@ -3563,10 +3573,14 @@ fn walk_activity(
         activity.allocated_bytes = activity
             .allocated_bytes
             .saturating_add(entry.facts.allocated_bytes);
-        if let Some(modified) = entry.facts.modified_ms {
-            let newest = activity.last_activity_ms.unwrap_or(0);
-            activity.last_activity_ms = Some(newest.max(modified));
-        }
+        let Some(modified) = entry.facts.modified_ms else {
+            return Err(format!(
+                "the entry `{}` reports no modification time, so the root's newest activity cannot be decided",
+                entry.name
+            ));
+        };
+        let newest = activity.last_activity_ms.unwrap_or(0);
+        activity.last_activity_ms = Some(newest.max(modified));
         if entry.facts.kind != EntryKind::Directory {
             // A symbolic link is never followed: what is behind it is not
             // activity Barge can see, and following it would leave the root.
@@ -3793,10 +3807,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        declare, folder_components, hold, list_roots, read_declarations, read_holds, read_marker,
-        release, resolve, show, validate_name, AreaDeclaration, HoldRequest, HoldScope, HoldState,
-        MarkerExpectation, MarkerState, MarkerStateName, RootKind, RootSpec, AREA_DIRECTORY_MODE,
-        ROOT_DIRECTORY_MODE, ROOT_MARKER_FILE,
+        declare, folder_components, hold, list_roots, list_roots_with, read_declarations,
+        read_holds, read_marker, release, resolve, show, validate_name, ActivityMode,
+        AreaDeclaration, HoldRequest, HoldScope, HoldState, MarkerExpectation, MarkerState,
+        MarkerStateName, RootKind, RootSpec, AREA_DIRECTORY_MODE, ROOT_DIRECTORY_MODE,
+        ROOT_MARKER_FILE,
     };
     use crate::digest::sha256_hex;
     use crate::error::{Error, ErrorKind, Result};
@@ -4323,6 +4338,17 @@ mod tests {
             .expect("the root is created");
             let resolved = self.resolved(record, declaration);
             (root, resolved)
+        }
+
+        fn list_with_activity(
+            &self,
+            resolved: &super::ResolvedArea,
+            observer: &FakeObserver,
+            activity: ActivityMode,
+        ) -> super::RootListing {
+            let platform = self.platform();
+            list_roots_with(&platform, observer, &self.state, resolved, 4096, activity)
+                .expect("the area lists")
         }
 
         fn list(&self, resolved: &super::ResolvedArea) -> super::RootListing {
@@ -5814,5 +5840,67 @@ mod tests {
         assert_eq!(volume.record.volume_uuid, fixture.uuid);
         assert!(root.path.is_dir());
         assert!(lock.exists(), "a successful creation takes the volume lock");
+    }
+
+    #[test]
+    fn a_root_without_modification_times_is_never_idle() {
+        // The scan decides an age both delete paths compare against. A platform
+        // that reports no modification time at all must leave that age unknown:
+        // reading it as zero would make a live root look decades idle, here and on
+        // `barge maintain`'s area policy, which asks the same listing to scan.
+        let fixture = Fixture::new("activity-no-times");
+        fixture.register(&fixture.record);
+        let declaration = fixture.declaration("pool");
+        let (root, _) = fixture.create_root(&fixture.record, &declaration);
+        let artifact = root.path.join("target/debug/artifact");
+        std::fs::create_dir_all(artifact.parent().expect("the payload parent"))
+            .expect("the payload folder is created");
+        std::fs::write(&artifact, b"bytes").expect("the payload is written");
+
+        let resolved = fixture.resolved(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        let scanned = fixture.list_with_activity(&resolved, &observer, ActivityMode::Scan);
+        let row = scanned
+            .roots
+            .iter()
+            .find(|row| row.root_id.as_deref() == Some(root.root_id.as_str()))
+            .expect("the root is listed");
+        assert!(
+            row.last_activity_ms.is_some(),
+            "the real platform reports modification times"
+        );
+
+        let dirs = crate::testkit::Faults::default();
+        dirs.hiding_modified_times();
+        let listing = list_roots_with(
+            &dirs,
+            &observer,
+            &fixture.state,
+            &resolved,
+            4096,
+            ActivityMode::Scan,
+        )
+        .expect("the area lists");
+        let row = listing
+            .roots
+            .iter()
+            .find(|row| row.root_id.as_deref() == Some(root.root_id.as_str()))
+            .expect("the root is listed");
+        assert_eq!(
+            row.last_activity_ms, None,
+            "a missing modification time is unknown, never zero"
+        );
+        let activity = row
+            .activity
+            .as_ref()
+            .expect("the scan reports its evidence");
+        assert!(!activity.complete);
+        assert!(
+            activity
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("modification time")),
+            "{activity:?}"
+        );
     }
 }

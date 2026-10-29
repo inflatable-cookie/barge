@@ -607,6 +607,9 @@ pub struct Faults {
     /// A device the descriptor a capture is verified through reports, so the
     /// parent binding fails and the captured facts cannot be read.
     pub parent_device_shift: Cell<Option<DeviceId>>,
+    /// When set, every fact this wrapper reports states no modification time, so
+    /// a platform that reports none can be simulated without a second `DirOps`.
+    pub no_modified_times: Cell<bool>,
     /// A name whose entry read fails, so the walk aborts where a real read error
     /// would abort it.
     pub failing_facts_name: Option<String>,
@@ -731,6 +734,11 @@ impl Faults {
     }
 
     /// Refuse one directory removal with `ENOTEMPTY` `times` times.
+    /// Report no modification times at all, as a platform without them does.
+    pub fn hiding_modified_times(&self) {
+        self.no_modified_times.set(true);
+    }
+
     pub fn failing_remove(&self, name: &str, times: usize) {
         self.not_empty.borrow_mut().insert(name.to_owned(), times);
     }
@@ -1151,6 +1159,9 @@ impl DirOps for Faults {
                 facts.device = device;
             }
         }
+        if self.no_modified_times.get() {
+            facts.modified_ms = None;
+        }
         // The racer replaces the entry after the check that just read these
         // facts, so the returned observation describes an object that is no
         // longer at the name: the exact window a check-then-unlink by name loses.
@@ -1208,7 +1219,13 @@ impl DirOps for Faults {
                 "the listing after the mode change did not happen",
             ));
         }
-        self.inner.list_children(parent, max_names)
+        let mut listing = self.inner.list_children(parent, max_names)?;
+        if self.no_modified_times.get() {
+            for entry in &mut listing.entries {
+                entry.facts.modified_ms = None;
+            }
+        }
+        Ok(listing)
     }
 
     fn remove_child(
@@ -1306,7 +1323,11 @@ impl DirOps for Faults {
     }
 
     fn dir_facts(&self, handle: &DirHandle) -> Result<EntryFacts> {
-        self.inner.dir_facts(handle)
+        let mut facts = self.inner.dir_facts(handle)?;
+        if self.no_modified_times.get() {
+            facts.modified_ms = None;
+        }
+        Ok(facts)
     }
 
     fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> Result<()> {

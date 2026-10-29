@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::area::{self, AreaDocument, HoldReading, PrunePolicy};
 use crate::cache::{self, PlacementForm, PlacementSet};
-use crate::error::Result;
+use crate::error::{Error, ErrorKind, Result};
 use crate::os::{AccountFacts, DirHandle, DirOps, ProcessObserver, VolumeUuid};
 use crate::state::{self, Bounds, Deadline, ReadOutcome, StatePaths};
 
@@ -664,21 +664,89 @@ fn row_names_root(row: &OxideRow, root_path: &Path) -> bool {
 }
 
 /// Find Oxide's control directory: the one whose `outputs/` folder exists.
+///
+/// `Ok(None)` means every pool Oxide names, and every default pool, was looked at
+/// and none holds an `outputs/` folder: no Oxide record can name a root here.
+/// Anything that makes "every pool" uncertain is an error, never an empty
+/// answer — Oxide's pools record may name the only pool that has outputs, so
+/// reading an unreadable record as "no pools" would licence a release it should
+/// keep. Two control directories that both hold outputs are ambiguous for the
+/// same reason and are refused rather than picked between.
 fn control_directory(account: &dyn AccountFacts) -> Result<Option<PathBuf>> {
     let state_dir = account.tool_state_dir(crate::inspect::OXIDE_TOOL)?;
     let cache_dir = account.tool_cache_dir(crate::inspect::OXIDE_TOOL)?;
     let observations = crate::inspect::observe_oxide_at(&state_dir, &cache_dir);
+    if let crate::inspect::Observation::Unknown {
+        path,
+        detail,
+        source,
+    } = &observations.pools
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "Oxide's pools record at {} cannot be read as `{source}`, so the pools that could hold its outputs are unknown: {detail}",
+                path.display()
+            ),
+        )
+        .with_detail("path", path.display().to_string().into()));
+    }
+    let mut found: Vec<PathBuf> = Vec::new();
     for registration in &observations.searched {
         // A registration path is `<pool>/oxide-managed/removable.json`, so the
         // control directory is its parent.
         let Some(control) = registration.parent() else {
             continue;
         };
-        if control.join(OXIDE_OUTPUTS_DIR).is_dir() {
-            return Ok(Some(control.to_path_buf()));
+        let outputs = control.join(OXIDE_OUTPUTS_DIR);
+        match std::fs::metadata(&outputs) {
+            Ok(metadata) if metadata.is_dir() => {
+                if !found.iter().any(|seen| seen == control) {
+                    found.push(control.to_path_buf());
+                }
+            }
+            Ok(_) => {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    format!(
+                        "{} exists and is not a directory, so Oxide's outputs cannot be read",
+                        outputs.display()
+                    ),
+                )
+                .with_detail("path", outputs.display().to_string().into()))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    format!(
+                        "{} cannot be inspected, so whether Oxide's outputs live there is unknown: {error}",
+                        outputs.display()
+                    ),
+                )
+                .with_detail("path", outputs.display().to_string().into()))
+            }
         }
     }
-    Ok(None)
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(found.pop()),
+        _ => Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "{} Oxide control directories hold an `outputs` folder, so which one is Oxide's is unknown",
+                found.len()
+            ),
+        )
+        .with_detail(
+            "paths",
+            found
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<String>>()
+                .into(),
+        )),
+    }
 }
 
 /// Read Oxide's outputs registry strictly.

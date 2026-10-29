@@ -49,7 +49,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::area::{self, ActivityMode, AreaDocument, MarkerStateName, PrunePolicy};
+use crate::area::{self, ActivityMode, AreaDocument, PrunePolicy};
 use crate::contract::{RowSet, DOCUMENT_SIZE_CAP_BYTES, PRUNE_PLAN_SCHEMA};
 use crate::custody::{self, CustodyBounds, PendingIntent};
 use crate::digest::sha256_hex;
@@ -562,15 +562,17 @@ pub fn plan(
         &declaration,
         Some(&document),
     )?;
-    // The age decision is the stage 4 rule: a bounded scan of each root's
-    // subtree, never the marker's creation time alone.
+    // The listing enumerates the area's entries and nothing else. The age
+    // decision is the stage 4 rule — a bounded scan of the root's subtree, never
+    // the marker's creation time alone — and it is taken per row, inside that
+    // root's own shared lock, so no row reports an activity read outside it.
     let listing = area::list_roots_with(
         dirs,
         observer,
         state_paths,
         &resolved,
         PLAN_ROOTS,
-        ActivityMode::Scan,
+        ActivityMode::Floor,
     )?;
     let placements = BargeReferences::read(state_paths);
     let oxide = OxideSnapshot::read(account);
@@ -738,10 +740,11 @@ fn decide_root(
         match locks.observe_root(&root_id) {
             Ok(lock) => lock,
             Err(error) => {
-                return locked_row(
+                return unobserved_row(
                     &root_id,
                     mount_relative_path,
                     root,
+                    "lock",
                     format!(
                         "the root's own lock could not be observed, so nothing about this root was read: {}",
                         error.message()
@@ -755,12 +758,44 @@ fn decide_root(
         // identity evidence keeps it; there is no root lock to take.
         None
     };
+    // Every observation of this root is made under its own shared lock: the
+    // listing only enumerated the entry, and nothing about its marker, its
+    // activity or its identity is read until here. A root whose lock could not be
+    // taken was reported above without being looked at.
+    let handle = match dirs.open_path(&root.configured_path) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return unobserved_row(
+                &root_id,
+                mount_relative_path,
+                root,
+                "identity",
+                format!(
+                    "the root could not be opened under its own lock, so nothing about it was read: {error}"
+                ),
+            );
+        }
+    };
     let stored = identity::read(state_paths, dirs, &root_id, uid)
         .ok()
         .flatten();
     let mount_relative_path = stored.as_ref().map_or(mount_relative_path, |record| {
         record.mount_relative_path.clone()
     });
+    let expectation = area::MarkerExpectation {
+        volume_uuid: &record.volume_uuid,
+        resolved_path: &root.configured_path,
+        mount_point: Some(&resolved.mount_point),
+        effective_uid: uid,
+        now_ms: state::now_ms(),
+    };
+    let (marker_state, marker_digest) = area::read_marker_with_digest(dirs, &handle, &expectation);
+    let locked = LockedObservation {
+        identity: handle.identity(),
+        marker_state,
+        marker_digest,
+        activity: area::scan_activity(dirs, &handle, None, state::now_ms()),
+    };
     let mut blockers: Vec<(&'static str, String)> = Vec::new();
 
     // Condition 2: the durable identity.
@@ -772,6 +807,7 @@ fn decide_root(
         uid,
         &root_id,
         root,
+        &locked,
         stored.as_ref(),
     );
     if identity.verdict != "verified" {
@@ -785,7 +821,7 @@ fn decide_root(
     }
 
     // Condition 3: custody.
-    let (custody, custody_reason) = match unit_for(record, resolved, root) {
+    let (custody, custody_reason) = match unit_for(record, resolved, root, &locked) {
         Some(unit) => {
             let verdict = custody::take_custody(
                 dirs,
@@ -823,14 +859,7 @@ fn decide_root(
         PrunePolicy::None => None,
         PrunePolicy::OldestIdleAfter { age_seconds } => Some(*age_seconds),
     };
-    let scan = root.activity.clone().unwrap_or_else(|| area::RootActivity {
-        last_activity_ms: None,
-        logical_bytes: 0,
-        allocated_bytes: 0,
-        entries: 0,
-        complete: false,
-        reason: Some("the listing did not scan the root".to_owned()),
-    });
+    let scan = locked.activity.clone();
     let idle =
         match (declared_age, scan.last_activity_ms) {
             (None, _) => IdleEvidence {
@@ -888,13 +917,10 @@ fn decide_root(
         &root_id,
         &root.configured_path,
     );
-    let (marker, marker_unknown) = match dirs.open_path(&root.configured_path) {
-        Ok(handle) => match reference::read_oxide_marker(dirs, &handle) {
-            Ok(Some(marker)) => (Some(marker), None),
-            Ok(None) => (None, None),
-            Err(reason) => (None, Some(reason)),
-        },
-        Err(error) => (None, Some(format!("the root cannot be opened: {error}"))),
+    let (marker, marker_unknown) = match reference::read_oxide_marker(dirs, &handle) {
+        Ok(Some(marker)) => (Some(marker), None),
+        Ok(None) => (None, None),
+        Err(reason) => (None, Some(reason)),
     };
     references.absorb(oxide.references_for(
         &root.configured_path,
@@ -970,6 +996,29 @@ fn decide_root(
     }
 }
 
+/// What one root's own shared lock protects: the facts this plan reads about it.
+///
+/// Every fact in here was read after the lock was taken and released with it, so
+/// no row ever reports an observation a live run could have been mutating.
+#[derive(Debug, Clone)]
+struct LockedObservation {
+    /// The root directory's identity, read through the opened descriptor.
+    identity: crate::os::DirId,
+    /// The marker as it was at this observation.
+    marker_state: area::MarkerState,
+    /// The SHA-256 of that marker's exact bytes, when it was read.
+    marker_digest: Option<String>,
+    /// The bounded last-activity scan.
+    activity: area::RootActivity,
+}
+
+impl LockedObservation {
+    /// Whether this observation found an owned root's marker.
+    fn owned(&self) -> bool {
+        matches!(self.marker_state, area::MarkerState::Owned(_))
+    }
+}
+
 /// The identity evidence for one root, from the durable record and the walk.
 #[allow(clippy::too_many_arguments)]
 fn identity_evidence(
@@ -980,11 +1029,14 @@ fn identity_evidence(
     uid: u32,
     root_id: &str,
     root: &area::RootObservation,
+    locked: &LockedObservation,
     stored: Option<&crate::identity::RootIdentity>,
 ) -> IdentityEvidence {
-    let marker_digest = root.marker_digest.clone();
-    let inode = stored.map_or(root.inode, |record| Some(record.inode));
+    let marker_digest = locked.marker_digest.clone();
+    let inode = stored.map_or(Some(locked.identity.inode), |record| Some(record.inode));
     let device_at_record = stored.map(|record| record.device_at_record);
+    let device_live = Some(locked.identity.device.get());
+    let _ = root;
     match identity::verify(state_paths, dirs, facts, mounts, uid, root_id) {
         IdentityVerdict::Verified {
             remount,
@@ -1006,7 +1058,7 @@ fn identity_evidence(
             reason: Some(identity_reason(reason).to_owned()),
             inode,
             device_at_record,
-            device_live: root.device,
+            device_live,
             remount: None,
             mount_moved: None,
             marker_digest,
@@ -1016,7 +1068,7 @@ fn identity_evidence(
             reason: None,
             inode,
             device_at_record,
-            device_live: root.device,
+            device_live,
             remount: None,
             mount_moved: None,
             marker_digest,
@@ -1044,16 +1096,18 @@ fn identity_reason(reason: IdentityReason) -> &'static str {
     }
 }
 
-/// One root's row when its own lock could not be observed.
+/// One root's row when it could not be observed under its own lock.
 ///
 /// Nothing about the root is read: a shared lock that cannot be taken means a live
 /// run may be mutating it, and an observation of a root mid-delete is exactly the
-/// stale fact the gate refuses to act on. The row keeps that root only — it is
-/// never a candidate — and names the fact rather than staying silent.
-fn locked_row(
+/// stale fact the gate refuses to act on; a root that cannot be opened under the
+/// lock cannot be observed either. The row keeps that root only — it is never a
+/// candidate — and names the fact rather than staying silent.
+fn unobserved_row(
     root_id: &str,
     mount_relative_path: String,
     root: &area::RootObservation,
+    blocked_by: &str,
     detail: String,
 ) -> PrunePlanRow {
     PrunePlanRow {
@@ -1082,7 +1136,7 @@ fn locked_row(
         absence: None,
         bytes: None,
         eligible: false,
-        blocked_by: Some("lock".to_owned()),
+        blocked_by: Some(blocked_by.to_owned()),
         reason: Some(detail),
     }
 }
@@ -1096,13 +1150,14 @@ fn unit_for(
     record: &VolumeRecord,
     resolved: &area::ResolvedArea,
     root: &area::RootObservation,
+    locked: &LockedObservation,
 ) -> Option<DeletionUnit> {
-    if root.state != MarkerStateName::Owned {
+    if !locked.owned() {
         return None;
     }
-    let device = root.device?;
-    let inode = root.inode?;
-    let marker_digest = root.marker_digest.clone()?;
+    let device = locked.identity.device.get();
+    let inode = locked.identity.inode;
+    let marker_digest = locked.marker_digest.clone()?;
     Some(DeletionUnit {
         volume_uuid: record.volume_uuid.clone(),
         root_dir: record.root_dir.clone(),
@@ -1391,6 +1446,20 @@ mod tests {
             now_ms: u64,
             bounds: ReleaseBounds,
         ) -> Result<PruneReport> {
+            let platform = self.volume.platform();
+            self.plan_with_dirs(&platform, observer, facts, now_ms, bounds)
+        }
+
+        /// One plan over an explicit `DirOps`, so a fault wrapper can stand in for
+        /// the platform.
+        fn plan_with_dirs(
+            &self,
+            dirs: &dyn DirOps,
+            observer: &FakeObserver,
+            facts: &FakeVolume,
+            now_ms: u64,
+            bounds: ReleaseBounds,
+        ) -> Result<PruneReport> {
             let mounts = self.volume.mounts();
             let request = ReleaseRequest {
                 bounds,
@@ -1398,7 +1467,7 @@ mod tests {
             };
             plan(
                 &self.volume.state,
-                &self.volume.platform(),
+                dirs,
                 facts,
                 &mounts,
                 observer,
@@ -1844,11 +1913,19 @@ mod tests {
                 .is_some_and(|reason| reason.contains("nothing about this root was read")),
             "{blocked:?}"
         );
+        // No observation at all was taken, which is what proves the marker, the
+        // activity and the references are read under the root's own lock: the
+        // listing alone could not have supplied any of them.
         assert!(
             !blocked.references_complete,
             "nothing about the root was read"
         );
         assert!(blocked.bytes.is_none(), "nothing about the root was read");
+        assert!(
+            blocked.identity.marker_digest.is_none(),
+            "the marker was not read outside the lock"
+        );
+        assert!(blocked.identity.device_at_record.is_none());
         // The other root of the same area still plans and is a candidate.
         let released = row(&report, &first);
         assert!(released.eligible, "{released:?}");
@@ -1949,6 +2026,120 @@ mod tests {
             .expect_err("the volume after a root is out of order");
         assert_eq!(error.kind(), ErrorKind::Usage);
         drop(owned);
+    }
+
+    #[test]
+    fn a_missing_modification_time_is_unknown_and_never_old() {
+        // A platform that reports no modification time at all must leave the age
+        // unknown. Reading "no timestamp" as zero would make a live root look
+        // thirty years idle, on this path and on `barge maintain`'s, which shares
+        // the scan.
+        let fixture = Fixture::new("release-no-times");
+        let root = fixture.root();
+        VolumeFixture::payload(&root.path, "target/debug/artifact", b"bytes");
+        let dirs = crate::testkit::Faults::default();
+        dirs.hiding_modified_times();
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let report = fixture
+            .plan_with_dirs(
+                &dirs,
+                &observer,
+                &facts,
+                fixture.overdue(),
+                ReleaseBounds::design(),
+            )
+            .expect("the plan is built");
+        let kept = row(&report, &root);
+        assert!(!kept.eligible);
+        assert_eq!(kept.blocked_by.as_deref(), Some("policy"));
+        assert!(
+            kept.idle.last_activity_ms.is_none(),
+            "a missing modification time is unknown, never zero"
+        );
+        assert!(
+            kept.idle
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("modification time")),
+            "{kept:?}"
+        );
+        assert!(kept.bytes.is_some_and(|bytes| !bytes.complete));
+    }
+
+    #[test]
+    fn an_unreadable_pools_record_never_reads_as_no_oxide_records() {
+        // Oxide's pools record can name the only pool that holds its outputs, so
+        // an unreadable one leaves the reference set unknown. It is never read as
+        // "there are no Oxide records", which would release a root Oxide may still
+        // select.
+        let fixture = Fixture::new("release-pools-unknown");
+        let root = fixture.root();
+        let oxide_state = fixture
+            .account
+            .home
+            .join("Library/Application Support/oxide/state");
+        std::fs::create_dir_all(&oxide_state).expect("Oxide's state directory");
+        std::fs::write(
+            oxide_state.join(crate::inspect::OXIDE_POOLS_FILE),
+            b"{ truncated",
+        )
+        .expect("the divergent pools record");
+        let report = fixture.plan();
+        let kept = row(&report, &root);
+        assert!(!kept.eligible);
+        assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+        assert!(!kept.references_complete);
+        assert!(!report.oxide.complete);
+        assert!(report.needs_human(), "an unknown snapshot needs a human");
+    }
+
+    #[test]
+    fn the_pools_record_names_where_oxides_outputs_are_read() {
+        // The positive half: a pool that only Oxide's own record names is found,
+        // and a row that still selects the root keeps it.
+        let fixture = Fixture::new("release-pools-record");
+        let root = fixture.root();
+        let oxide_state = fixture
+            .account
+            .home
+            .join("Library/Application Support/oxide/state");
+        std::fs::create_dir_all(&oxide_state).expect("Oxide's state directory");
+        let pool = fixture.account.home.join("Dev/oxide");
+        std::fs::write(
+            oxide_state.join(crate::inspect::OXIDE_POOLS_FILE),
+            serde_json::to_vec(&vec![pool.clone()]).expect("the pools record encodes"),
+        )
+        .expect("the pools record");
+        let outputs = pool
+            .join(crate::inspect::OXIDE_CONTROL_DIR)
+            .join(reference::OXIDE_OUTPUTS_DIR);
+        std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
+        let registry_row = format!(
+            r#"{{"checkout_id":"checkout-1","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"external","recipe":"target-debug-v1","generation":1,"selected":true,"pending":false}}"#,
+            fixture.account.home.join("checkout").display(),
+            fixture.account.home.join("receipt.json").display(),
+            root.path.display(),
+        );
+        std::fs::write(
+            outputs.join(reference::OXIDE_REGISTRY_FILE),
+            format!(
+                r#"{{"version":"{}","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[{registry_row}]}}"#,
+                reference::OXIDE_REGISTRY_V2
+            ),
+        )
+        .expect("the registry is written");
+
+        let report = fixture.plan();
+        let kept = row(&report, &root);
+        assert!(!kept.eligible, "{kept:?}");
+        assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+        assert!(kept.references_complete, "the snapshot read completely");
+        assert!(report.oxide.complete);
+        assert_eq!(
+            report.oxide.control.as_deref(),
+            Some(pool.join(crate::inspect::OXIDE_CONTROL_DIR).as_path())
+        );
     }
 
     /// Publish one valid placement record whose recorded path is this root.
