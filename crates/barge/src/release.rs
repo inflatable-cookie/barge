@@ -17,9 +17,10 @@
 //!    its consumer path, established now.
 //!
 //! This slice plans and never acts. `barge prune --plan` produces
-//! `barge.prune.plan/1`, one area on one volume, with every row carrying all six
-//! conditions whether or not it is eligible — which is what makes one plan a
-//! diagnostic as well as a permission. `barge.prune/1` is the command document
+//! `barge.prune.plan/1`, one area on one volume, where condition 1 is the plan's
+//! own precondition and every row carries conditions 2 to 6 with their evidence
+//! whether or not it is eligible — which is what makes one plan a diagnostic as
+//! well as a permission. `barge.prune/1` is the command document
 //! around it, exactly as `barge.maintain/1` wraps the maintain plan: the plan,
 //! its SHA-256, the volume's state and the Oxide snapshot's own completeness.
 //! The effect, its intent evidence and its replay are stage 4 F4.
@@ -37,9 +38,14 @@
 //! - **The plan is not a permission.** Its bytes and digest are the artifact a
 //!   real run will present, and every predicate in them is evidence that must be
 //!   re-established, because the path can reappear and the volume can be pulled
-//!   between the two.
+//!   between the two. It still takes the design's locks in the design's order —
+//!   the registry observation lock and released, then the volume's shared lock,
+//!   then one root's shared lock at a time — so a preview never reads a root or a
+//!   volume a live run is mutating, and a lock it cannot take inside its own
+//!   budget is a report rather than something waited out.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -55,7 +61,7 @@ use crate::os::{
 use crate::prune::VolumeState;
 use crate::reference::{self, BargeReferences, OxideSnapshot, ReferenceRow};
 use crate::registry::{Availability, Durability, VolumeRecord};
-use crate::state::{self, StatePaths};
+use crate::state::{self, Deadline, StatePaths};
 use crate::unit::{DeletionUnit, MarkerFamily, UnitGrant, UnitKind, UnitMarker};
 
 /// How many references one root's row reports before it says the set was
@@ -73,13 +79,18 @@ const ABSENCE_VERDICT_UNKNOWN: &str = "unknown";
 pub struct ReleaseBounds {
     /// The custody scan's bounds, which a plan shares with the effect.
     pub custody: CustodyBounds,
+    /// How long one shared lock may wait for a live owner. It is the run's own
+    /// deadline for a lock: a holder past it is refused, never waited out twice.
+    pub lock_wait: Duration,
 }
 
 impl ReleaseBounds {
-    /// The design's bounds.
+    /// The design's bounds: the custody scan's, and the state directory's own lock
+    /// wait.
     pub fn design() -> Self {
         Self {
             custody: CustodyBounds::default(),
+            lock_wait: state::LOCK_WAIT,
         }
     }
 }
@@ -517,6 +528,31 @@ pub fn plan(
         );
     }
 
+    // The lock order the design fixes: the registry's observation lock was taken
+    // and released by `read_registry`, and this is the volume's shared lock held
+    // for the rest of the pass. A real prune of this volume takes the same file
+    // exclusively, so a preview never reads a volume mid-prune; a holder that
+    // outlives this run's lock budget refuses the preview and changes nothing.
+    let mut locks = state::LockSet::with_deadline(
+        state_paths.clone(),
+        Deadline::after(request.bounds.lock_wait),
+    );
+    let volume_lock = match locks.observe_volume(&record.volume_uuid) {
+        Ok(lock) => lock,
+        Err(error) => {
+            let path = state_paths.volume_lock_path(&record.volume_uuid);
+            return Err(Error::new(
+                ErrorKind::Locked,
+                format!(
+                    "volume {}'s lock could not be observed, so this volume's release plan was refused: {}; nothing was changed",
+                    record.volume_uuid,
+                    error.message()
+                ),
+            )
+            .with_detail("volume_uuid", record.volume_uuid.as_str().into())
+            .with_detail("lock", path.display().to_string().into()));
+        }
+    };
     let resolved = area::resolve(
         dirs,
         facts,
@@ -562,6 +598,9 @@ pub fn plan(
             root,
         ));
     }
+    // One root's shared lock at a time: every row took and released its own, so
+    // the volume's observation lock is the only one still held here.
+    drop(volume_lock);
     let examined = listing.examined;
     finish(
         volume,
@@ -685,13 +724,43 @@ fn decide_root(
     root: &area::RootObservation,
 ) -> PrunePlanRow {
     let root_id = root.root_id.clone().unwrap_or_else(|| root.name.clone());
+    let mount_relative_path = relative_to_mount(&root.configured_path, &resolved.mount_point);
+    // One root's shared lock, held for this row alone and dropped before the next
+    // root. A consumer's hold and a delete take this file exclusively, so a plan
+    // never observes a root whose own lock a live run holds; a holder that
+    // outlives the run's lock budget keeps this root only, and the rest of the
+    // area still plans.
+    let root_lock = if state::is_identifier(&root_id) {
+        let mut locks = state::LockSet::with_deadline(
+            state_paths.clone(),
+            Deadline::after(request.bounds.lock_wait),
+        );
+        match locks.observe_root(&root_id) {
+            Ok(lock) => lock,
+            Err(error) => {
+                return locked_row(
+                    &root_id,
+                    mount_relative_path,
+                    root,
+                    format!(
+                        "the root's own lock could not be observed, so nothing about this root was read: {}",
+                        error.message()
+                    ),
+                );
+            }
+        }
+    } else {
+        // A name that is not a Barge root id cannot be a root Barge owns, and a
+        // lock file is never named from an unvalidated string. The row's own
+        // identity evidence keeps it; there is no root lock to take.
+        None
+    };
     let stored = identity::read(state_paths, dirs, &root_id, uid)
         .ok()
         .flatten();
-    let mount_relative_path = stored.as_ref().map_or_else(
-        || relative_to_mount(&root.configured_path, &resolved.mount_point),
-        |record| record.mount_relative_path.clone(),
-    );
+    let mount_relative_path = stored.as_ref().map_or(mount_relative_path, |record| {
+        record.mount_relative_path.clone()
+    });
     let mut blockers: Vec<(&'static str, String)> = Vec::new();
 
     // Condition 2: the durable identity.
@@ -872,6 +941,9 @@ fn decide_root(
         blockers.push(("absence", reason));
     }
 
+    // The row is decided; the root's own lock is released before the next root,
+    // so two roots are never held at once.
+    drop(root_lock);
     let eligible = blockers.is_empty();
     let (blocked_by, reason) = match blockers.into_iter().next() {
         Some((condition, reason)) => (Some(condition.to_owned()), Some(reason)),
@@ -969,6 +1041,49 @@ fn identity_reason(reason: IdentityReason) -> &'static str {
         IdentityReason::MarkerVersionUnknown => "marker_version_unknown",
         IdentityReason::MarkerSchemaDivergent => "marker_schema_divergent",
         IdentityReason::MarkerGenerationUnexpected => "marker_generation_unexpected",
+    }
+}
+
+/// One root's row when its own lock could not be observed.
+///
+/// Nothing about the root is read: a shared lock that cannot be taken means a live
+/// run may be mutating it, and an observation of a root mid-delete is exactly the
+/// stale fact the gate refuses to act on. The row keeps that root only — it is
+/// never a candidate — and names the fact rather than staying silent.
+fn locked_row(
+    root_id: &str,
+    mount_relative_path: String,
+    root: &area::RootObservation,
+    detail: String,
+) -> PrunePlanRow {
+    PrunePlanRow {
+        root_id: root_id.to_owned(),
+        mount_relative_path,
+        identity: IdentityEvidence {
+            verdict: "unknown".to_owned(),
+            reason: None,
+            inode: root.inode,
+            device_at_record: None,
+            device_live: root.device,
+            remount: None,
+            mount_moved: None,
+            marker_digest: None,
+        },
+        custody: "unknown".to_owned(),
+        custody_reason: Some(detail.clone()),
+        idle: IdleEvidence {
+            last_activity_ms: None,
+            age_seconds: None,
+            declared_age_seconds: None,
+            reason: Some(detail.clone()),
+        },
+        references: Vec::new(),
+        references_complete: false,
+        absence: None,
+        bytes: None,
+        eligible: false,
+        blocked_by: Some("lock".to_owned()),
+        reason: Some(detail),
     }
 }
 
@@ -1266,8 +1381,21 @@ mod tests {
             facts: &FakeVolume,
             now_ms: u64,
         ) -> Result<PruneReport> {
+            self.plan_with_bounds(observer, facts, now_ms, ReleaseBounds::design())
+        }
+
+        fn plan_with_bounds(
+            &self,
+            observer: &FakeObserver,
+            facts: &FakeVolume,
+            now_ms: u64,
+            bounds: ReleaseBounds,
+        ) -> Result<PruneReport> {
             let mounts = self.volume.mounts();
-            let request = self.request(now_ms);
+            let request = ReleaseRequest {
+                bounds,
+                ..self.request(now_ms)
+            };
             plan(
                 &self.volume.state,
                 &self.volume.platform(),
@@ -1666,6 +1794,161 @@ mod tests {
         assert!(!link_row.eligible);
         assert_eq!(link_row.blocked_by.as_deref(), Some("identity"));
         std::fs::remove_file(&link).expect("the link is removed");
+    }
+
+    /// A lock budget that does not wait: the first refusal is the answer.
+    fn no_wait() -> ReleaseBounds {
+        ReleaseBounds {
+            lock_wait: Duration::ZERO,
+            ..ReleaseBounds::design()
+        }
+    }
+
+    /// Create one lock file by taking it exclusively and releasing it.
+    fn touch_lock(path: &PathBuf, rank: state::LockRank) {
+        drop(
+            state::StateLock::exclusive(path, rank, Deadline::after(Duration::from_secs(5)))
+                .expect("the fixture lock file is created"),
+        );
+    }
+
+    #[test]
+    fn a_held_root_lock_excludes_only_that_root() {
+        let fixture = Fixture::new("release-held-root");
+        let first = fixture.root();
+        let second = fixture.root();
+        let path = fixture
+            .volume
+            .state
+            .root_lock_path(&second.root_id)
+            .expect("the root lock path");
+        let held = state::StateLock::exclusive(
+            &path,
+            state::LockRank::Root,
+            Deadline::after(Duration::from_secs(5)),
+        )
+        .expect("the fixture holds the root's lock");
+
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let report = fixture
+            .plan_with_bounds(&observer, &facts, fixture.overdue(), no_wait())
+            .expect("a held root lock is a row, not a refusal");
+        let blocked = row(&report, &second);
+        assert!(!blocked.eligible);
+        assert_eq!(blocked.blocked_by.as_deref(), Some("lock"));
+        assert!(
+            blocked
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("nothing about this root was read")),
+            "{blocked:?}"
+        );
+        assert!(
+            !blocked.references_complete,
+            "nothing about the root was read"
+        );
+        assert!(blocked.bytes.is_none(), "nothing about the root was read");
+        // The other root of the same area still plans and is a candidate.
+        let released = row(&report, &first);
+        assert!(released.eligible, "{released:?}");
+        assert_eq!(report.plan.eligible_count, 1);
+        assert_eq!(report.plan.examined_count, 2);
+        assert!(!report.needs_human(), "one busy root needs no human");
+        assert!(
+            std::fs::metadata(&second.path).is_ok(),
+            "nothing was changed"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn a_held_volume_lock_refuses_the_preview_and_names_the_lock_file() {
+        let fixture = Fixture::new("release-held-volume");
+        let root = fixture.root();
+        let path = fixture.volume.state.volume_lock_path(&fixture.volume.uuid);
+        let held = state::StateLock::exclusive(
+            &path,
+            state::LockRank::Volume,
+            Deadline::after(Duration::from_secs(5)),
+        )
+        .expect("the fixture holds the volume's lock");
+
+        let mounts = fixture.volume.mounts();
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let request = ReleaseRequest {
+            bounds: no_wait(),
+            ..fixture.request(fixture.overdue())
+        };
+        let error = plan(
+            &fixture.volume.state,
+            &fixture.volume.platform(),
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.account,
+            &request,
+        )
+        .expect_err("a held volume lock refuses this volume's preview");
+        assert_eq!(error.kind(), ErrorKind::Locked);
+        assert_eq!(
+            error.detail().get("lock").and_then(|value| value.as_str()),
+            Some(path.display().to_string().as_str()),
+            "the refusal names the lock file"
+        );
+        assert!(
+            error
+                .message()
+                .contains(&fixture.volume.uuid.as_str().to_owned()),
+            "the refusal names the volume"
+        );
+        assert!(std::fs::metadata(&root.path).is_ok(), "nothing was changed");
+        drop(held);
+    }
+
+    #[test]
+    fn the_plan_observes_the_volume_before_a_root_and_never_the_reverse() {
+        // The order the plan relies on, proved through the rank check rather than
+        // asserted about the code: volume then root is accepted, root then volume
+        // is a usage refusal before any file is touched.
+        let fixture = Fixture::new("release-lock-order");
+        let root = fixture.root();
+        let volume_path = fixture.volume.state.volume_lock_path(&fixture.volume.uuid);
+        let root_path = fixture
+            .volume
+            .state
+            .root_lock_path(&root.root_id)
+            .expect("the root lock path");
+        touch_lock(&volume_path, state::LockRank::Volume);
+        touch_lock(&root_path, state::LockRank::Root);
+
+        let mut locks = state::LockSet::with_deadline(
+            fixture.volume.state.clone(),
+            Deadline::after(Duration::from_secs(5)),
+        );
+        let volume = locks
+            .observe_volume(&fixture.volume.uuid)
+            .expect("the volume is observed");
+        assert!(volume.is_some(), "an existing lock file is observed");
+        let owned = locks
+            .observe_root(&root.root_id)
+            .expect("the root is observed after the volume");
+        assert!(owned.is_some());
+        drop((volume, owned));
+
+        let mut reverse = state::LockSet::with_deadline(
+            fixture.volume.state.clone(),
+            Deadline::after(Duration::from_secs(5)),
+        );
+        let owned = reverse
+            .observe_root(&root.root_id)
+            .expect("the root is observed first here");
+        let error = reverse
+            .observe_volume(&fixture.volume.uuid)
+            .expect_err("the volume after a root is out of order");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        drop(owned);
     }
 
     /// Publish one valid placement record whose recorded path is this root.

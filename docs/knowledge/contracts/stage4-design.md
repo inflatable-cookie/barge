@@ -1109,19 +1109,19 @@ for a reference that is not current; a current reference already keeps the root,
 so no proof is spent on it. Second, nothing in the plan is a permission: F4 must
 re-establish every predicate, and the plan's digest binds evidence, not consent.
 
-One deviation from [the lock table](#lock-order-with-the-stage-1-locks), recorded
-rather than hidden: the plan takes the registry's shared observation lock and
-releases it before it walks, and it takes **no** volume or root lock. The table's
-"volume shared, then one root shared at a time" was written for a preview that
-must not interleave with a real pass; this plan is evidence, every fact in it is
-re-established at the effect (F4, which takes `volume-<uuid>.lock` exclusively for
-the whole run), and a root's custody is decided with the pending-intent journal in
-hand, so an in-flight prune's intent already keeps that root. Holding a shared
-volume lock for a walk of a whole area would instead block a real prune's
-exclusive lock for the length of a read that authorizes nothing. `barge
-maintain`'s landed preview holds only the registry observation lock for the same
-reason, and this slice follows that precedent. If a later slice makes a preview
-authoritative, the locks come back with it.
+Locking follows [the lock table](#lock-order-with-the-stage-1-locks) exactly, and
+its rank check is what proves it: the plan reads the registry under the shared
+observation lock and releases it, then takes the volume's shared lock for the
+rest of the pass, then one root's shared lock at a time, released before the next
+root so two roots are never held at once. Every shared wait is bounded by the
+run's own lock budget (`ReleaseBounds.lock_wait`, the state directory's own
+`LOCK_WAIT` by default). A volume lock a live owner holds past that budget
+refuses that volume's preview with `locked`, names the volume and the lock file,
+and changes nothing; a root lock that cannot be taken keeps that root alone, as a
+row with `blocked_by: lock`, no observation and no eligibility, while every other
+root of the area still plans. A lock file that does not exist is nothing to wait
+for: a read-only command creates no lock, no file and no directory, and the
+observation is a `None` rather than a new file.
 
 [O4-001](#open-design-issues) leaves one decision to the implementation brief:
 whether any additional unprivileged fact — a per-volume registration receipt
