@@ -729,7 +729,10 @@ fn decide_root(
         }
         None => (
             "unknown".to_owned(),
-            Some("the entry is not an owned root, so no deletion unit can be built for it".to_owned()),
+            Some(
+                "the entry is not an owned root, so no deletion unit can be built for it"
+                    .to_owned(),
+            ),
         ),
     };
     if custody != "safe" {
@@ -747,40 +750,37 @@ fn decide_root(
         PrunePolicy::None => None,
         PrunePolicy::OldestIdleAfter { age_seconds } => Some(*age_seconds),
     };
-    let scan = root.activity.clone().unwrap_or_else(|| {
-        area::RootActivity {
-            last_activity_ms: None,
-            logical_bytes: 0,
-            allocated_bytes: 0,
-            entries: 0,
-            complete: false,
-            reason: Some("the listing did not scan the root".to_owned()),
-        }
+    let scan = root.activity.clone().unwrap_or_else(|| area::RootActivity {
+        last_activity_ms: None,
+        logical_bytes: 0,
+        allocated_bytes: 0,
+        entries: 0,
+        complete: false,
+        reason: Some("the listing did not scan the root".to_owned()),
     });
-    let idle = match (declared_age, scan.last_activity_ms) {
-        (None, _) => IdleEvidence {
-            last_activity_ms: scan.last_activity_ms,
-            age_seconds: None,
-            declared_age_seconds: None,
-            reason: Some("the area declares no prune age, so no root is released".to_owned()),
-        },
-        (Some(declared), Some(last)) => IdleEvidence {
-            last_activity_ms: Some(last),
-            age_seconds: Some(request.now_ms.saturating_sub(last) / 1000),
-            declared_age_seconds: Some(declared),
-            reason: scan.reason.clone(),
-        },
-        (Some(declared), None) => IdleEvidence {
-            last_activity_ms: None,
-            age_seconds: None,
-            declared_age_seconds: Some(declared),
-            reason: Some(
-                scan.reason
-                    .clone()
-                    .unwrap_or_else(|| "the root's last activity could not be observed".to_owned()),
-            ),
-        },
-    };
+    let idle =
+        match (declared_age, scan.last_activity_ms) {
+            (None, _) => IdleEvidence {
+                last_activity_ms: scan.last_activity_ms,
+                age_seconds: None,
+                declared_age_seconds: None,
+                reason: Some("the area declares no prune age, so no root is released".to_owned()),
+            },
+            (Some(declared), Some(last)) => IdleEvidence {
+                last_activity_ms: Some(last),
+                age_seconds: Some(request.now_ms.saturating_sub(last) / 1000),
+                declared_age_seconds: Some(declared),
+                reason: scan.reason.clone(),
+            },
+            (Some(declared), None) => IdleEvidence {
+                last_activity_ms: None,
+                age_seconds: None,
+                declared_age_seconds: Some(declared),
+                reason: Some(scan.reason.clone().unwrap_or_else(|| {
+                    "the root's last activity could not be observed".to_owned()
+                })),
+            },
+        };
     match declared_age {
         None => blockers.push((
             "policy",
@@ -863,7 +863,7 @@ fn decide_root(
             format!("a reference still names this root: {}", sources.join(", ")),
         ));
     }
-    let (absence, absence_reason) = prove_references(dirs, facts, &references.absence, request);
+    let (absence, absence_reason) = prove_references(dirs, facts, &references.absence);
     if let Some(reason) = absence_reason {
         blockers.push(("absence", reason));
     }
@@ -1008,17 +1008,13 @@ fn prove_references(
     dirs: &dyn DirOps,
     facts: &dyn AbsenceVolume,
     requests: &[reference::AbsenceRequest],
-    request: &ReleaseRequest<'_>,
 ) -> (Option<AbsenceEvidence>, Option<String>) {
     if requests.is_empty() {
         return (None, None);
     }
     let mut distinct: Vec<&reference::AbsenceRequest> = Vec::new();
     for candidate in requests {
-        match distinct
-            .iter()
-            .find(|seen| seen.path == candidate.path)
-        {
+        match distinct.iter().find(|seen| seen.path == candidate.path) {
             Some(seen) if seen.volume != candidate.volume => {
                 return (
                     None,
@@ -1042,9 +1038,9 @@ fn prove_references(
         );
     }
     let wanted = distinct[0];
-    let evidence = match absence_for(dirs, facts, &wanted.path, wanted.volume.as_ref(), request) {
+    let evidence = match absence_for(dirs, facts, &wanted.path, wanted.volume.as_ref()) {
         Ok(evidence) => evidence,
-        Err(error) => unknown_absence(&wanted.path, request, error.message()),
+        Err(error) => unknown_absence(&wanted.path, error.message()),
     };
     let blocked = (evidence.verdict != "absent").then(|| {
         format!(
@@ -1063,7 +1059,6 @@ fn absence_for(
     facts: &dyn AbsenceVolume,
     path: &Path,
     volume: Option<&VolumeUuid>,
-    request: &ReleaseRequest<'_>,
 ) -> Result<AbsenceEvidence> {
     let prefix = facts.volume_prefix(path);
     let expected = match prefix.as_ref() {
@@ -1074,7 +1069,6 @@ fn absence_for(
             let Some(uuid) = volume else {
                 return Ok(unknown_absence(
                     path,
-                    request,
                     "the record names no volume for a path under the mount parent",
                 ));
             };
@@ -1109,11 +1103,7 @@ fn relative_to_mount(path: &Path, mount: &Path) -> String {
 }
 
 /// A proof that could not be established at all, as the document spells it.
-fn unknown_absence(
-    path: &Path,
-    request: &ReleaseRequest<'_>,
-    reason: impl Into<String>,
-) -> AbsenceEvidence {
+fn unknown_absence(path: &Path, reason: impl Into<String>) -> AbsenceEvidence {
     AbsenceEvidence {
         schema: "barge.absence/1".to_owned(),
         path: path.to_path_buf(),
@@ -1125,7 +1115,7 @@ fn unknown_absence(
         ancestor: None,
         leaf: None,
         components_walked: 0,
-        proved_ms: request.now_ms,
+        proved_ms: crate::state::now_ms(),
         reason: Some(reason.into()),
     }
 }
@@ -1243,7 +1233,11 @@ mod tests {
 
         fn root(&self) -> OwnedRoot {
             self.volume
-                .create_root(&self.volume.record, &self.declaration, area::RootKind::AreaRoot)
+                .create_root(
+                    &self.volume.record,
+                    &self.declaration,
+                    area::RootKind::AreaRoot,
+                )
                 .0
         }
 
@@ -1343,7 +1337,7 @@ mod tests {
         assert!(released.eligible, "{released:?}");
         assert_eq!(released.identity.verdict, "verified");
         assert_eq!(released.custody, "safe");
-        assert_eq!(released.references_complete, true);
+        assert!(released.references_complete);
         assert!(released.absence.is_none(), "no reference needs a proof");
         assert!(!report.needs_human(), "an ordinary release needs no human");
         assert_eq!(report.plan.eligible_count, 1);
@@ -1352,15 +1346,18 @@ mod tests {
         // Condition 2: no durable identity record keeps the root.
         let missing = Fixture::new("release-identity");
         let missing_root = missing.root();
-        std::fs::remove_file(identity_path(&missing, &missing_root)).expect("the record is removed");
+        std::fs::remove_file(identity_path(&missing, &missing_root))
+            .expect("the record is removed");
         let report = missing.plan();
         let kept = row(&report, &missing_root);
         assert!(!kept.eligible);
         assert_eq!(kept.blocked_by.as_deref(), Some("identity"));
-        assert_eq!(kept.identity.reason.as_deref(), Some("identity_record_missing"));
         assert_eq!(
+            kept.identity.reason.as_deref(),
+            Some("identity_record_missing")
+        );
+        assert!(
             std::fs::metadata(&missing_root.path).is_ok(),
-            true,
             "the root is untouched"
         );
 
@@ -1403,9 +1400,10 @@ mod tests {
         let kept = row(&report, &undeclared_root);
         assert!(!kept.eligible);
         assert_eq!(kept.blocked_by.as_deref(), Some("policy"));
-        assert!(kept.references.iter().any(|reference| {
-            reference.source == reference::BARGE_AREA && reference.current
-        }));
+        assert!(kept
+            .references
+            .iter()
+            .any(|reference| { reference.source == reference::BARGE_AREA && reference.current }));
 
         // Condition 5: a placement that names the root is current.
         let placed = Fixture::new("release-references");
@@ -1440,10 +1438,14 @@ mod tests {
             assert_eq!(report.volume.loud, loud);
             assert_eq!(report.needs_human(), exit);
             assert_eq!(report.plan.rows.count, 0, "nothing is observed or released");
-            assert!(!fixture.volume.root.exists() || std::fs::read_dir(&fixture.volume.root)
-                .expect("the mount root lists")
-                .next()
-                .is_none(), "no mount point was recreated");
+            assert!(
+                !fixture.volume.root.exists()
+                    || std::fs::read_dir(&fixture.volume.root)
+                        .expect("the mount root lists")
+                        .next()
+                        .is_none(),
+                "no mount point was recreated"
+            );
         }
     }
 
@@ -1543,7 +1545,9 @@ mod tests {
                 .as_millis() as u64,
             "the scan reports the payload's own modification time"
         );
-        assert!(kept.bytes.is_some_and(|bytes| bytes.complete && bytes.logical > 0));
+        assert!(kept
+            .bytes
+            .is_some_and(|bytes| bytes.complete && bytes.logical > 0));
 
         // A modification time ahead of this run's clock is unknown, never idle.
         let future = SystemTime::now() + Duration::from_secs(3_600);
@@ -1636,11 +1640,18 @@ mod tests {
     fn a_symlink_entry_is_never_released() {
         let fixture = Fixture::new("release-symlink");
         let root = fixture.root();
-        let link = root.path.parent().expect("the area folder").join("a-symlink");
+        let link = root
+            .path
+            .parent()
+            .expect("the area folder")
+            .join("a-symlink");
         std::os::unix::fs::symlink(&root.path, &link).expect("the link is created");
         let report = fixture.plan();
         let kept = row(&report, &root);
-        assert!(kept.eligible, "the real root is not penalised by its neighbour");
+        assert!(
+            kept.eligible,
+            "the real root is not penalised by its neighbour"
+        );
         let link_row = report
             .plan
             .rows
@@ -1663,17 +1674,17 @@ mod tests {
             allocated_bytes: 0,
         };
         let form = crate::cache::PlacementForm::HeldRoot(crate::cache::HeldRootForm {
+            path: root.path.clone(),
+            publication: None,
+            held_root: crate::cache::HeldRoot {
                 path: root.path.clone(),
-                publication: None,
-                held_root: crate::cache::HeldRoot {
-                    path: root.path.clone(),
-                    root_id: root.root_id.clone(),
-                    nonce: root.nonce.clone(),
-                    device: root.identity.device.get(),
-                    inode: root.identity.inode,
-                    marker_digest: root.marker_digest.clone(),
-                    observed,
-                },
+                root_id: root.root_id.clone(),
+                nonce: root.nonce.clone(),
+                device: root.identity.device.get(),
+                inode: root.identity.inode,
+                marker_digest: root.marker_digest.clone(),
+                observed,
+            },
         });
         let record = crate::cache::PlacementRecord {
             schema: crate::contract::PLACEMENT_SCHEMA.to_owned(),
@@ -1762,7 +1773,10 @@ mod tests {
         let kept = row(&report, &root);
         assert!(!kept.eligible);
         assert_eq!(kept.blocked_by.as_deref(), Some("absence"));
-        let proof = kept.absence.as_ref().expect("the proof travels as evidence");
+        let proof = kept
+            .absence
+            .as_ref()
+            .expect("the proof travels as evidence");
         assert_eq!(proof.verdict, "present");
         assert_eq!(proof.path, checkout);
 
@@ -1771,9 +1785,15 @@ mod tests {
         let report = fixture.plan();
         let released = row(&report, &root);
         assert!(released.eligible, "{released:?}");
-        let proof = released.absence.as_ref().expect("the proof travels as evidence");
+        let proof = released
+            .absence
+            .as_ref()
+            .expect("the proof travels as evidence");
         assert_eq!(proof.verdict, "absent");
-        assert_eq!(proof.leaf.as_ref().map(|leaf| leaf.result.as_str()), Some("enoent"));
+        assert_eq!(
+            proof.leaf.as_ref().map(|leaf| leaf.result.as_str()),
+            Some("enoent")
+        );
     }
 
     #[test]

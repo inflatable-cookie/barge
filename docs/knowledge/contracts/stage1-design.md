@@ -117,6 +117,9 @@ Library modules, each with one job:
 | `custody` | Writer-custody evidence for a deletion unit, verdicts, deletion authorization. |
 | `delete` | Whole-unit deletion, Finder tolerance, quarantine and replay. |
 | `prune` | Area prune policy evaluation, plan/preview, intent journal. |
+| `identity` | A root's durable identity record, its verification verdicts and their reason codes, and the one explicit repair (slice F1, [stage 4](stage4-design.md)). |
+| `reference` | The reference readers the release gate asks: Barge's placements, declarations and holds, and Oxide's registry, receipts and root markers read strictly in place (slice F3, [stage 4](stage4-design.md)). |
+| `release` | The release gate's plan: `barge.prune.plan/1`, its six conditions, its evidence rows and its digest (slice F3, [stage 4](stage4-design.md)). |
 | `describe` | The versioned documents the library and CLI return. |
 
 The OS layer is a set of narrow traits (`VolumeFacts`, `MountRoot`, `DirOps`,

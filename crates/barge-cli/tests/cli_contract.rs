@@ -1280,9 +1280,7 @@ fn write_prune_state(state_dir: &Path, availability: &str) {
         volume_uuid: VolumeUuid::parse("A6AC3ED7-33EA-46B4-8082-7254CF291ED2").expect("a UUID"),
         // A mount point nothing is attached at: the plan must report the volume
         // absent rather than recreate or read through the stale path.
-        mount_hint: Some(PathBuf::from(
-            "/Volumes/Barge-Cli-Fixture-Absent-A6AC3ED7",
-        )),
+        mount_hint: Some(PathBuf::from("/Volumes/Barge-Cli-Fixture-Absent-A6AC3ED7")),
         availability,
         durability: Durability::Expendable,
         root_dir: String::new(),
@@ -1334,7 +1332,11 @@ fn prune_plans_one_area_and_only_writes_the_file_it_was_given() {
         ],
         &state_dir,
     );
-    assert_eq!(output.status.code(), Some(0), "an ephemeral absence is a skip");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an ephemeral absence is a skip"
+    );
     let document = stdout_document(&output);
     assert_eq!(document["schema"], "barge.prune/1");
     assert_eq!(document["command"], "prune");
@@ -1373,7 +1375,11 @@ fn prune_plans_one_area_and_only_writes_the_file_it_was_given() {
         ],
         &other_state,
     );
-    assert_eq!(output.status.code(), Some(3), "a permanent absence needs a human");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a permanent absence needs a human"
+    );
     let document = stdout_document(&output);
     assert_eq!(document["data"]["volume"]["loud"], true);
     assert!(!other_fixture.join("plan.json").exists());
@@ -1400,18 +1406,57 @@ fn prune_refuses_the_effect_form_missing_arguments_and_an_unregistered_volume() 
     assert!(!state_dir.exists(), "a refusal creates nothing");
 
     for args in [
-        vec!["prune", "--plan", "--volume", "A6AC3ED7-33EA-46B4-8082-7254CF291ED2"],
+        vec![
+            "prune",
+            "--plan",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+        ],
         vec!["prune", "--plan", "--area", "example/pool"],
-        vec!["prune", "--plan", "--area", "nodivider", "--volume", "A6AC3ED7-33EA-46B4-8082-7254CF291ED2"],
-        vec!["prune", "--plan", "--area", "Example/Pool", "--volume", "A6AC3ED7-33EA-46B4-8082-7254CF291ED2"],
-        vec!["prune", "--plan", "--area", "example/pool", "--volume", "A6AC3ED7-33EA-46B4-8082-7254CF291ED2", "--unknown"],
-        vec!["prune", "--plan", "--area", "example/pool", "--volume", "A6AC3ED7-33EA-46B4-8082-7254CF291ED2", "stray"],
+        vec![
+            "prune",
+            "--plan",
+            "--area",
+            "nodivider",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+        ],
+        vec![
+            "prune",
+            "--plan",
+            "--area",
+            "Example/Pool",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+        ],
+        vec![
+            "prune",
+            "--plan",
+            "--area",
+            "example/pool",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "--unknown",
+        ],
+        vec![
+            "prune",
+            "--plan",
+            "--area",
+            "example/pool",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "stray",
+        ],
     ] {
         let mut args = args;
         args.push("--json");
         let output = run_in(&args, &state_dir);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
-        assert_eq!(stdout_document(&output)["error"]["kind"], "usage", "{args:?}");
+        assert_eq!(
+            stdout_document(&output)["error"]["kind"],
+            "usage",
+            "{args:?}"
+        );
     }
     assert!(!state_dir.exists());
 

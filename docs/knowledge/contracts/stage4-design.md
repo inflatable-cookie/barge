@@ -29,6 +29,14 @@ censuses reported as unknown. `barge area root identify --volume <uuid> --path
 verifying its volume and marker and obtaining safe custody. It never overwrites
 a record.
 
+The release gate plans and does not act: `barge prune --plan --area <ns>/<area>
+--volume <uuid>` writes one `barge.prune.plan/1` inside `barge.prune/1`, with
+every row's six conditions and their evidence, and changes nothing. Its age is
+the bounded scan of the root's subtree this contract fixes, its reference set is
+read from Barge's own placements, area declarations and holds and from Oxide's
+registry, receipts and root markers strictly in place, and the intent, the
+effect and the replay remain F4.
+
 No part of this contract authorizes a native run, a real drive, a mount or host
 setting change, a data move, a deletion, or any change to Oxide.
 
@@ -815,12 +823,16 @@ fields are understood by both.
 | `barge.intent` | `/2`, landed in S5 (with `/1` still read); optional fields added | `state/intents/<intent-id>.json` | adds `identity` and `absence`; the unit's `device`, `inode` and optional marker digest stay the within-run observation |
 | `barge.describe` | `/1`, optional fields added | `barge describe` | adds `identity.capability` (what may be compared across a remount) and `volumes[].mounts` (how many live mounts carry each registered UUID) |
 | `barge.inspect` | `/1`, optional fields added | `barge inspect` | adds the Oxide registry observation and the per-row identity census |
+| `barge.prune` | `/1` | `barge prune --plan` | the command document around the plan, as `barge.maintain/1` wraps `barge.maintain.plan/1`: the plan, its SHA-256, when it was planned, the volume's state and whether the Oxide reference snapshot was complete |
 
 The versioning rules are stage 1's: adding an optional field stays inside a
 major; removing one, changing a type or a meaning is a new major.
-`barge.prune.plan/1` has no writer yet, so its field set is completed here
-rather than extended and the reader's "exactly this field set" rule holds from
-the first write. `barge.maintain.plan/1` has no writer either (S7 is unlanded).
+`barge.prune.plan/1` landed in F3 with the field set this contract fixes, so the
+reader's "exactly this field set" rule holds from the first write; the concrete
+row fields F3 completed are recorded in [F3's own note](#f3-landed-surface).
+`barge.maintain.plan/1` landed in S7 without the release fields this contract
+adds to it; a `release` array there is still F4's, because it can only name what
+a release plan proved.
 `barge.intent/2` has landed in S5, so its additions are optional fields with the
 reader updated in the same slice, and an intent written before F4 (a `/2`
 record, or a `/1` record mapped on read) stays valid and readable.
@@ -1025,6 +1037,84 @@ Its `barge.absence/1` document is evidence for one observation; it must be
 established again at effect time. The primitive does not itself authorize a
 prune or change any consumer's state.
 
+### F3 landed surface
+
+The release gate is planned, not performed: `barge prune --plan --area
+<namespace>/<area> --volume <uuid>` builds one `barge.prune.plan/1`, writes it
+where `--plan-out` asks, and prints it inside `barge.prune/1` with its SHA-256.
+The verb refuses every form that is not the plan, because the effect it would
+imply needs F4's intent evidence, its replay and its separate authorization.
+
+What the rows carry. Each row is one root the area listing found, in listing
+order, and it carries all six conditions whether or not it is eligible:
+`root_id`, `mount_relative_path`, `identity` (the durable verdict, its reason
+code, both devices, the remount and mount-moved facts and the marker digest this
+plan read), `custody` with its reason, `idle` (`last_activity_ms`, the observed
+`age_seconds`, the declared age, and the reason the age is unknown when it is),
+`references` with `references_complete`, `absence` (the `barge.absence/1`
+document itself, when a reference requires one), `bytes` (the scan's logical and
+allocated totals and whether it reached the whole subtree), and then `eligible`
+with the first blocking condition and its reason. Lists inside the plan are the
+contract's bounded `RowSet`s, so a list whose counts disagree with its rows is
+refused on read. A root with more than 64 references is kept: a set the plan
+cannot report in full is never a short set.
+
+What the reference readers read, and where. Barge's own: every placement record
+(the whole census, so a truncated one is `Unknown`), the area declaration the
+plan is built under (current when its policy never releases a root), and the
+root's hold records (a live or undecidable hold is current; a positively stale
+one is not). Oxide's, read in place and never written: the outputs registry
+`oxide.outputs.registry/2` and its `/1` predecessor, every checkout receipt
+(`oxide.outputs.transition/1`, `/2` and `/3`, each read for its own selection
+site), and one root marker `oxide.outputs.root/2` (a `/1` marker is unknown,
+because its field set predates the nonce and the checkout volume). A registry
+row that is selected, **pending**, pruning, reserved or cancelling is current:
+that is Oxide's own `Row::live` set, which is one flag wider than this contract's
+list, and the wider one is the safe direction. An unfinished prune intent in the
+registry journal names its root too. A reference that is not current contributes
+the consumer path whose absence the gate must prove, together with the volume
+UUID its record holds. The control directory is found where S2 already looks for
+Oxide's registration (`<pool>/oxide-managed`), and only a pool that holds an
+`outputs/` folder is read.
+
+What "unknown" costs. An unreadable, oversized, schema-divergent or
+unknown-version registry or receipt makes the reference set incomplete, and an
+incomplete set keeps every root it covers — the batch, not one row. A complete
+snapshot is reported on the command document, and an incomplete one forces exit
+`3`. More than one distinct consumer path for one root, or two records that
+disagree about one path's volume, is also unknown and keeps that root: the plan
+proves what it can name exactly once.
+
+The last-activity clock. `OldestIdleAfter` compares `now - last_activity_ms`,
+and `last_activity_ms` is now the newest modification time found by a bounded,
+descriptor-relative scan of the root's subtree, with the root directory's own
+modification time as its floor. The scan never follows a symbolic link, and a
+modification time ahead of this run's clock, an unreadable subtree, a name that
+exceeds one listing's bound, a depth past 64 levels, or its deadline leaves the
+age unknown, which keeps the root. The same scan counts the row's bytes. The
+bounds are `ACTIVITY_ENTRIES` (200 000 entries), `ACTIVITY_DEPTH` (64) and
+`ACTIVITY_WALL` (5 s) per root in `area`. Both delete paths now use this clock:
+`barge maintain`'s area policy asks the listing for the scan, and the release
+plan does the same. A read-only listing (`barge describe`, `barge area root
+list`) keeps the cheap floor instead, so a report never walks a consumer's whole
+tree; a document that decides an age reads the scan's own `activity` evidence.
+
+Two consequences worth stating. First, the release plan proves an absence only
+for a reference that is not current; a current reference already keeps the root,
+so no proof is spent on it. Second, nothing in the plan is a permission: F4 must
+re-establish every predicate, and the plan's digest binds evidence, not consent.
+
+[O4-001](#open-design-issues) leaves one decision to the implementation brief:
+whether any additional unprivileged fact — a per-volume registration receipt
+written at registration time, for instance — is worth the coupling it buys
+against a block-cloned volume attached alone. F3 records it: none is added. The
+residual is accepted as O4-001 proposes, because a clone carries only expendable
+owned roots and the conservative mitigations (refusing simultaneous duplicate
+mounts, reporting `mount_moved` and the mount census) are already in the
+contract, and because a receipt on the drive is copied by the clone too. Treating
+a clone as unknown would be an operator scope decision, not an implementation
+detail.
+
 ## Proposed validation
 
 Design-only validation for this contract is `effigy docs:check` once per changed
@@ -1177,21 +1267,26 @@ qualification claim, and none contradicts a frozen ruling.
   never parsed. The implementation brief must record the concrete refusal path
   for a truncated or partial mount table (proposed: `unknown_state`, never "no
   mount").
-- **O4-005 — Last activity for an area root.** An `area_root` has no conclusion,
-  so stage 1's idleness has no clock for it. Proposed: the newest modification
-  time in a bounded scan, with the marker directory's mtime as the floor, and a
-  future time, an unreadable subtree or a bound hit as `Unknown`. A consumer that
-  wants a different clock declares one in its area. This decides the age of
-  Oxide's roots when it adopts, so it should be confirmed with the same review
-  that confirms O4-006.
+- **O4-005 — Last activity for an area root.** Decided by F3 as proposed, and
+  landed in `area`'s scan: an `area_root` has no conclusion, so its clock is the
+  newest modification time in a bounded scan of its subtree, with the root
+  directory's own mtime as the floor, and a future time, an unreadable subtree,
+  a reached bound or a missed deadline as `Unknown`. `last_activity_ms` is never
+  a marker's `created_ms` alone. A consumer that wants a different clock declares
+  one in its area; Barge does not infer one. The stage 3 space path's own
+  idleness is still its recorded release, which this does not touch.
 - **O4-006 — Reading Oxide's prune registry in place.** Stage 1 reads Oxide's
-  registry "presence and version only". The census in
-  [reading the census](#reading-the-census-without-adopting-anything) reads its
-  rows to answer the carried finding. Proposed: read-only, strict, bounded, never
-  authoritative, used by `barge inspect` alone, and retired when Oxide adopts its
-  area. This widens a read boundary that stage 1 set deliberately, so the
-  architect should confirm it before F5; the alternative is to answer the finding
-  only after Oxide's adoption, which delays the 91 held roots further.
+  registry "presence and version only", and this contract widens that boundary in
+  two places: F3's release gate reads the registry, its receipts and one root
+  marker as references, and F5's census in
+  [reading the census](#reading-the-census-without-adopting-anything) reads the
+  registry's rows to answer the carried finding. Every reading keeps the four
+  properties that make the widening safe — read-only, strict, bounded, never
+  authoritative — and a version, a field set or a bound this build does not know
+  is `Unknown`, which keeps the roots it covers. The F3 slice row names registry
+  rows as a reference source, so the earlier "used by `barge inspect` alone" is
+  the one clause of this issue F3's own frozen row corrects; the properties it
+  set are unchanged, and the reading is still retired when Oxide adopts its area.
 - **O4-007 — Who may prune an Oxide root, and when.** Proposed: nobody but
   Oxide until Oxide declares its areas and switches, so the gate is proven
   against Barge-owned roots first; the 91 legacy roots then need an operator list

@@ -217,12 +217,10 @@ impl BargeReferences {
                     )
                 }),
                 placements,
-                },
+            },
             Err(error) => Self {
                 placements: PlacementSet::empty(),
-                placements_detail: Some(format!(
-                    "the placement census could not be read: {error}"
-                )),
+                placements_detail: Some(format!("the placement census could not be read: {error}")),
             },
         }
     }
@@ -316,11 +314,10 @@ fn hold_reference(reading: &HoldReading) -> ReferenceSet {
         .filter(|(_, state, _)| matches!(state, area::HoldState::Live | area::HoldState::Unknown))
         .count();
     let stale = reading.holds.len().saturating_sub(live);
-    set.rows.push(
-        ReferenceRow::new(BARGE_HOLD, live > 0).with_detail(format!(
+    set.rows
+        .push(ReferenceRow::new(BARGE_HOLD, live > 0).with_detail(format!(
             "{live} live or undecidable hold(s) and {stale} positively stale hold(s)"
-        )),
-    );
+        )));
     set
 }
 
@@ -484,8 +481,7 @@ impl OxideSnapshot {
             OxideRegistry::Read { complete, .. } => *complete,
             OxideRegistry::Unknown { .. } => false,
         };
-        registry_complete
-            && !matches!(self.receipts, OxideReceipts::Unknown { .. })
+        registry_complete && !matches!(self.receipts, OxideReceipts::Unknown { .. })
     }
 
     /// Read Oxide's reference records for this account, bounded and read-only.
@@ -505,7 +501,9 @@ impl OxideSnapshot {
                     registry: OxideRegistry::Unknown {
                         reason: reason.clone(),
                     },
-                    receipts: OxideReceipts::Unknown { reason: reason.clone() },
+                    receipts: OxideReceipts::Unknown {
+                        reason: reason.clone(),
+                    },
                     detail: Some(reason),
                 };
             }
@@ -568,13 +566,12 @@ impl OxideSnapshot {
                 }
                 for row in rows.iter().filter(|row| row_names_root(row, root_path)) {
                     let row_volume = row.checkout_volume.clone();
-                    let reference = ReferenceRow::new(OXIDE_REGISTRY, row.live()).with_detail(
-                        format!(
+                    let reference =
+                        ReferenceRow::new(OXIDE_REGISTRY, row.live()).with_detail(format!(
                             "the registry row for checkout {} is {}",
                             row.checkout.display(),
                             row.flags()
-                        ),
-                    );
+                        ));
                     if row.live() {
                         set.rows.push(reference);
                     } else {
@@ -586,13 +583,11 @@ impl OxideSnapshot {
                     }
                 }
                 for intent in intents.iter().filter(|intent| intent.root == root_path) {
-                    set.rows.push(
-                        ReferenceRow::new(OXIDE_REGISTRY, true)
-                            .with_detail(format!(
-                                "an unfinished prune intent (phase `{}`) names this root",
-                                intent.phase
-                            )),
-                    );
+                    set.rows
+                        .push(ReferenceRow::new(OXIDE_REGISTRY, true).with_detail(format!(
+                            "an unfinished prune intent (phase `{}`) names this root",
+                            intent.phase
+                        )));
                 }
             }
         }
@@ -632,13 +627,12 @@ impl OxideSnapshot {
             }
         }
         if let Some(marker) = marker {
-            set.rows.push(
-                ReferenceRow::new(OXIDE_MARKER, false).with_detail(format!(
+            set.rows
+                .push(ReferenceRow::new(OXIDE_MARKER, false).with_detail(format!(
                     "the root's Oxide marker names checkout {} (id {})",
                     marker.checkout.display(),
                     marker.checkout_id
-                )),
-            );
+                )));
             let receipt_present = match &self.receipts {
                 OxideReceipts::Absent => false,
                 OxideReceipts::Read(receipts) => receipts
@@ -660,9 +654,11 @@ impl OxideSnapshot {
 
 /// Whether one registry row names one root.
 ///
-/// The path is the primary key. The immutable nonce is compared too, so a row
-/// recorded at another path for the same root cannot be missed; neither fact is
-/// used to authorise anything on its own.
+/// The recorded root path is the key. The row's nonce is carried as evidence and
+/// is never compared: a Barge-owned root's nonce is Barge's, an Oxide marker's is
+/// Oxide's, so comparing them would decide a fact neither record states. Path
+/// equality authorises nothing on its own either — it only makes a reference row
+/// current, which keeps the root.
 fn row_names_root(row: &OxideRow, root_path: &Path) -> bool {
     row.root == root_path
 }
@@ -808,9 +804,7 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
     for row in raw.rows {
         let checkout_volume = match row.checkout_volume_uuid.as_deref() {
             Some(raw) => Some(VolumeUuid::parse(raw).map_err(|error| {
-                format!(
-                    "a registry row states a checkout volume that is not a UUID: {error}"
-                )
+                format!("a registry row states a checkout volume that is not a UUID: {error}")
             })?),
             None => None,
         };
@@ -864,7 +858,10 @@ fn read_receipts(outputs: &Path, deadline: Deadline) -> OxideReceipts {
         Ok(listing) => listing,
         Err(error) => {
             return OxideReceipts::Unknown {
-                reason: format!("{}: the folder cannot be listed: {error}", outputs.display()),
+                reason: format!(
+                    "{}: the folder cannot be listed: {error}",
+                    outputs.display()
+                ),
             }
         }
     };
@@ -1056,14 +1053,15 @@ fn parse_receipt(
     }
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut current: Vec<PathBuf> = Vec::new();
-    let note = |root: &PathBuf, is_current: bool, roots: &mut Vec<PathBuf>, current: &mut Vec<PathBuf>| {
-        if !roots.iter().any(|seen| seen == root) {
-            roots.push(root.clone());
-        }
-        if is_current && !current.iter().any(|seen| seen == root) {
-            current.push(root.clone());
-        }
-    };
+    let note =
+        |root: &PathBuf, is_current: bool, roots: &mut Vec<PathBuf>, current: &mut Vec<PathBuf>| {
+            if !roots.iter().any(|seen| seen == root) {
+                roots.push(root.clone());
+            }
+            if is_current && !current.iter().any(|seen| seen == root) {
+                current.push(root.clone());
+            }
+        };
     for placement in &raw.links {
         if let Some(selected) = &placement.selected {
             note(&selected.root, true, &mut roots, &mut current);
@@ -1226,12 +1224,16 @@ mod tests {
     #[test]
     fn both_registry_majors_read_and_an_unknown_one_is_unknown() {
         let v2 = br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":3,"complete":true,"created_by":"oxide","rows":[{"checkout_id":"c1","checkout":"/Users/fixture/Dev/example","receipt":"/pool/receipt.json","member":"target","root":"/Volumes/Builds/oxide/outputs/root","root_kind":"external","recipe":"target-debug-v1","nonce":"00112233445566778899aabbccddeeff","generation":1,"root_dev":7,"root_ino":42,"marker_digest":"aa","selected":false,"pending":false}]}"#;
-        let OxideRegistry::Read { rows, complete, .. } = parse_registry(v2).expect("v2 reads") else {
+        let OxideRegistry::Read { rows, complete, .. } = parse_registry(v2).expect("v2 reads")
+        else {
             panic!("a registry that reads is a Read");
         };
         assert!(complete);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].root, PathBuf::from("/Volumes/Builds/oxide/outputs/root"));
+        assert_eq!(
+            rows[0].root,
+            PathBuf::from("/Volumes/Builds/oxide/outputs/root")
+        );
         assert!(!rows[0].live(), "a settled row names no root as wanted");
 
         let v1 = br#"{"version":"oxide.outputs.registry/1","revision":1,"complete":true,"created_by":"oxide","rows":[]}"#;
@@ -1248,7 +1250,8 @@ mod tests {
     #[test]
     fn an_unfinished_intent_names_its_root() {
         let bytes = br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":2,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"i1","identity":{"root":"/Volumes/Builds/oxide/outputs/root"},"phase":"renamed"}]}"#;
-        let OxideRegistry::Read { intents, .. } = parse_registry(bytes).expect("the registry reads")
+        let OxideRegistry::Read { intents, .. } =
+            parse_registry(bytes).expect("the registry reads")
         else {
             panic!("a registry that reads is a Read");
         };
