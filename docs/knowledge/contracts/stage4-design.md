@@ -1113,9 +1113,11 @@ checkout keeps while the move is in progress, so it is a current reference. An
 arbitrary non-null journal fails these checks and is divergent, never an empty
 complete receipt, and neither is a journal with one pinned field removed. The
 registry's own unfinished prune intents are read the same way: every field Oxide
-pins is required (its version, id, full root identity, phase, quarantine leaf,
-plan digest and both times), its phase must be one Oxide writes, and its
-quarantine leaf, digest, root identity and marker digest must be usable. A
+pins is required (its id, full root identity, phase, quarantine leaf, plan digest
+and both times), its `version` must be exactly the `oxide.outputs.prune-intent/1`
+format this build reads — **an unknown intent version is a divergence, never a
+settled move** — its phase must be one Oxide writes, and its quarantine leaf,
+digest, root identity and marker digest must be usable. A
 divergent journal of either kind makes the shared snapshot incomplete, and an
 incomplete shared source keeps the **whole batch** it covers: no other root of
 that plan is eligible. Ownership must agree as well: a receipt or registry row

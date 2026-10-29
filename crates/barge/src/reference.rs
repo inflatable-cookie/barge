@@ -64,6 +64,8 @@ pub const OXIDE_MARKER_V2: &str = "oxide.outputs.root/2";
 /// Oxide's predecessor root marker. Its field set predates the nonce and the
 /// checkout volume, so this reader reports it as unknown rather than guessing.
 pub const OXIDE_MARKER_V1: &str = "oxide.outputs.root/1";
+/// One unfinished prune journal entry's format.
+pub const OXIDE_INTENT_V1: &str = "oxide.outputs.prune-intent/1";
 /// Oxide's whole-target receipt.
 pub const OXIDE_RECEIPT_V1: &str = "oxide.outputs.transition/1";
 /// Oxide's committed-receipt form.
@@ -883,7 +885,6 @@ struct RawIncomplete {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawIntent {
-    #[allow(dead_code)]
     version: String,
     #[allow(dead_code)]
     id: String,
@@ -1090,6 +1091,15 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
     }
     let mut intents = Vec::new();
     for intent in raw.intents {
+        // The journal entry states its own version, and a version this build does
+        // not read is a divergence: reading it as complete would let an
+        // unrecognised move count as a settled one.
+        if intent.version != OXIDE_INTENT_V1 {
+            return Err(format!(
+                "a prune intent states `{}`, which is not the {OXIDE_INTENT_V1} version this build reads",
+                intent.version
+            ));
+        }
         if !matches!(
             intent.phase.as_str(),
             "intent" | "renamed" | "deleting" | "marker_last" | "deleted" | "resolved"
@@ -2092,6 +2102,55 @@ mod tests {
         assert!(
             parse_registry(&bytes).is_err(),
             "an intent with an unusable root identity was accepted"
+        );
+    }
+
+    #[test]
+    fn an_unknown_prune_intent_version_is_divergent() {
+        // The intent states its own version, and the only one this build reads is
+        // `oxide.outputs.prune-intent/1`. A version it does not know is a
+        // divergence, not a settled move.
+        let intent = |version: &str| {
+            serde_json::json!({
+                "version": version,
+                "id": "i1",
+                "identity": {
+                    "checkout_id": "c1",
+                    "checkout": "/c",
+                    "receipt": "/r",
+                    "member": "target",
+                    "root": "/o",
+                    "root_kind": "external",
+                    "generation": 1,
+                    "dev": 7,
+                    "ino": 42,
+                    "marker_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                "phase": "renamed",
+                "quarantine": "/q",
+                "preview_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "created_ms": 1,
+                "updated_ms": 2
+            })
+        };
+        let registry = |version: &str| {
+            serde_json::json!({
+                "version": "oxide.outputs.registry/2",
+                "schema": 2,
+                "revision": 1,
+                "complete": true,
+                "created_by": "oxide",
+                "rows": [],
+                "intents": [intent(version)]
+            })
+        };
+        let known = serde_json::to_vec(&registry(OXIDE_INTENT_V1)).expect("the fixture encodes");
+        assert!(parse_registry(&known).is_ok(), "the pinned version reads");
+        let unknown =
+            serde_json::to_vec(&registry("oxide.outputs.prune-intent/99")).expect("encodes");
+        assert!(
+            parse_registry(&unknown).is_err(),
+            "an unknown intent version was accepted as complete"
         );
     }
 

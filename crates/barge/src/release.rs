@@ -2207,6 +2207,65 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_intent_version_keeps_the_whole_covered_batch() {
+        // An intent whose version this build does not read makes the registry
+        // unknown, so the shared snapshot is incomplete and no other root of the
+        // plan may become eligible.
+        let fixture = Fixture::new("release-intent-version-batch");
+        let first = fixture.root();
+        let second = fixture.root();
+        let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
+        std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
+        let intent = serde_json::json!({
+            "version": "oxide.outputs.prune-intent/99",
+            "id": "i1",
+            "identity": {
+                "checkout_id": "checkout-1",
+                "checkout": fixture.account.home.join("checkout").display().to_string(),
+                "receipt": fixture.account.home.join("receipt.json").display().to_string(),
+                "member": "target",
+                "root": first.path.display().to_string(),
+                "root_kind": "external",
+                "generation": 1,
+                "dev": first.identity.device.get(),
+                "ino": first.identity.inode,
+                "marker_digest": first.marker_digest,
+            },
+            "phase": "renamed",
+            "quarantine": first.path.with_extension("prune-i1").display().to_string(),
+            "preview_sha256": "0".repeat(64),
+            "created_ms": 1,
+            "updated_ms": 2,
+        });
+        let registry = serde_json::json!({
+            "version": reference::OXIDE_REGISTRY_V2,
+            "schema": 2,
+            "revision": 1,
+            "complete": true,
+            "created_by": "oxide",
+            "rows": [],
+            "intents": [intent],
+        });
+        std::fs::write(
+            outputs.join(reference::OXIDE_REGISTRY_FILE),
+            serde_json::to_vec(&registry).expect("the registry encodes"),
+        )
+        .expect("the registry is written");
+
+        let report = fixture.plan();
+        for root in [&first, &second] {
+            let kept = row(&report, root);
+            assert!(!kept.eligible, "{kept:?}");
+            assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+            assert!(!kept.references_complete, "the batch is kept, not one root");
+        }
+        assert_eq!(report.plan.eligible_count, 0);
+        assert_eq!(report.plan.examined_count, 2);
+        assert!(!report.oxide.complete);
+        assert!(report.needs_human());
+    }
+
+    #[test]
     fn a_registry_without_its_required_facts_keeps_the_root() {
         // A registry that omits a field Oxide always writes (its revision here, its
         // creator in the next case) is a divergence, not an empty registry: reading
