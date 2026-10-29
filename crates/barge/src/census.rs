@@ -775,7 +775,9 @@ pub struct CensusIdentity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_mount: Option<PathBuf>,
     /// Whether the live owner-marker digest equals the recorded one, when both
-    /// exist. The digest is a plan fact, never identity (stage 4 design, "The
+    /// exist. It is compared on the bytes that were read, before they are
+    /// parsed, so a divergent or unknown-version marker still reports whether it
+    /// changed. The digest is a plan fact, never identity (stage 4 design, "The
     /// facts, and the three roles a fact may have").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub marker_digest_equal: Option<bool>,
@@ -821,8 +823,10 @@ pub struct OxideCensusDrift {
     pub inode_changed: usize,
     /// Rows whose owner-marker bytes differ from the recorded digest, whatever
     /// their identity verdict: a marker that changed is evidence even when the
-    /// row is otherwise undecidable. A digest the census could not read is not a
-    /// change and is not counted.
+    /// row is otherwise undecidable, and even when the bytes that changed are
+    /// divergent, malformed or of an unknown version. Only a marker the census
+    /// could not read at all — absent, unreadable, oversized or another user's —
+    /// has no digest, and that is not counted as a change.
     pub marker_changed: usize,
     /// Rows whose recorded volume verified and whose recorded path is not there.
     pub gone: usize,
@@ -1178,23 +1182,26 @@ fn observe_row(
         Ok(Some(bytes)) => bytes,
         _ => return Some(kept(IdentityReason::MarkerUnreadable, None)),
     };
+    // The digest is compared on the bytes that were read, before any parse: a
+    // marker whose bytes changed is evidence even when those bytes are divergent
+    // or of an unknown version, and reading them succeeded.
+    let digest_equal = row
+        .marker_digest()
+        .map(|recorded| recorded == crate::digest::sha256_hex(&bytes));
     let value: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
-        Err(_) => return Some(kept(IdentityReason::MarkerSchemaDivergent, None)),
+        Err(_) => return Some(kept(IdentityReason::MarkerSchemaDivergent, digest_equal)),
     };
     if !matches!(
         value.get("version").and_then(serde_json::Value::as_str),
         Some(OXIDE_ROOT_MARKER_V2 | OXIDE_ROOT_MARKER_V1)
     ) {
-        return Some(kept(IdentityReason::MarkerVersionUnknown, None));
+        return Some(kept(IdentityReason::MarkerVersionUnknown, digest_equal));
     }
     let marker: OxideRootMarker = match serde_json::from_slice(&bytes) {
         Ok(marker) => marker,
-        Err(_) => return Some(kept(IdentityReason::MarkerSchemaDivergent, None)),
+        Err(_) => return Some(kept(IdentityReason::MarkerSchemaDivergent, digest_equal)),
     };
-    let digest_equal = row
-        .marker_digest()
-        .map(|recorded| recorded == crate::digest::sha256_hex(&bytes));
     // The marker's own version rule comes first, exactly as Oxide applies it: a
     // version-2 marker must carry its 128-bit lowercase-hex nonce. A marker that
     // breaks it is divergent even when the row agrees with it, because two
@@ -1844,6 +1851,11 @@ mod tests {
             fixture.row(&report).identity.reason,
             Some(IdentityReason::MarkerVersionUnknown)
         );
+        assert_eq!(
+            report.drift.as_ref().map(|drift| drift.marker_changed),
+            Some(1),
+            "readable unknown-version bytes are still compared and counted"
+        );
         write_marker(
             &fixture.row.root,
             b"{\"version\":\"oxide.outputs.root/2\",\"foreign\":true}",
@@ -1852,6 +1864,11 @@ mod tests {
         assert_eq!(
             fixture.row(&report).identity.reason,
             Some(IdentityReason::MarkerSchemaDivergent)
+        );
+        assert_eq!(
+            report.drift.as_ref().map(|drift| drift.marker_changed),
+            Some(1),
+            "readable divergent bytes are still compared and counted"
         );
     }
 
@@ -1906,6 +1923,44 @@ mod tests {
         assert_eq!(
             report.drift.as_ref().map(|drift| drift.marker_changed),
             Some(0)
+        );
+
+        // Readable but divergent bytes, with a recorded digest that differs:
+        // counted, because the bytes were read and compared before they were
+        // rejected.
+        write_marker(
+            &fixture.row.root,
+            b"{\"version\":\"oxide.outputs.root/2\",\"foreign\":true}",
+        );
+        let report = fixture.census(vec![fixture.row_json()]);
+        let identity = &fixture.row(&report).identity;
+        assert_eq!(identity.reason, Some(IdentityReason::MarkerSchemaDivergent));
+        assert_eq!(identity.marker_digest_equal, Some(false));
+        assert_eq!(
+            report.drift.as_ref().map(|drift| drift.marker_changed),
+            Some(1)
+        );
+
+        // Readable bytes of an unknown version whose recorded digest is those
+        // very bytes: the bytes did not change, so nothing is counted.
+        let unknown_version = marker_bytes(
+            "oxide.outputs.root/9",
+            OxideRootKind::External,
+            Some(UUID),
+            Some(NONCE),
+            1,
+        );
+        write_marker(&fixture.row.root, &unknown_version);
+        let mut row = fixture.row_json();
+        row["marker_digest"] = serde_json::json!(crate::digest::sha256_hex(&unknown_version));
+        let report = fixture.census(vec![row]);
+        let identity = &fixture.row(&report).identity;
+        assert_eq!(identity.reason, Some(IdentityReason::MarkerVersionUnknown));
+        assert_eq!(identity.marker_digest_equal, Some(true));
+        assert_eq!(
+            report.drift.as_ref().map(|drift| drift.marker_changed),
+            Some(0),
+            "unchanged bytes are not a change, whatever their version"
         );
 
         // Verified with the original marker and a recorded digest that differs:

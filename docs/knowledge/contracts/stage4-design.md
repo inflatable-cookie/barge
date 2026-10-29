@@ -1286,9 +1286,13 @@ Choices F5 made where this contract left the mechanics to the slice:
   device differs from the recorded one — exactly the roots a recorded-device
   comparison refuses — `inode_changed`, `marker_changed`, `gone`, `unknown`, and
   `unknown_reasons` by code. `marker_changed` counts every row whose marker bytes
-  differ from the digest Oxide recorded, whatever the row's identity verdict: an
-  unknown verdict never hides an observation the census did make, and a digest
-  the census could not read is not a change. `examined` and `unexamined` bound
+  differ from the digest Oxide recorded, whatever the row's identity verdict and
+  whatever those bytes turned out to be: an unknown verdict never hides an
+  observation the census did make, and readable bytes that are divergent,
+  malformed or of an unknown version are compared before they are parsed, so
+  they count too. Only a marker the census could not read at all — absent,
+  unreadable, oversized or another user's — has no digest, and that is not a
+  change. `examined` and `unexamined` bound
   the claim: the census shares one 10 s deadline with the registry read, and rows
   it did not reach are counted, never assumed.
 - **Read-only, and no adoption.** The census takes no lock, creates nothing and
