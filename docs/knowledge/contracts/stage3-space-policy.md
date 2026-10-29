@@ -1381,3 +1381,71 @@ creating files. Its rows and the space rows in `barge describe` report the
 declared policy, or `policy_undeclared` when absent, and identify a floor below
 the default with `floor_below_default`. An absent registered volume is reported
 as absent. Area attribution and policy decisions belong to their later slices.
+
+### Implemented activity, idleness and least-recently-used surface
+
+Slice T3 implements this contract's activity record, the pressure idleness matrix
+and the volume-wide least-recently-used order. It plans no candidate, prunes
+nothing and decides nothing: `barge.space.prune/1` and the guard belong to T4 to
+T6, and no native proof exists or is claimed.
+
+- **`barge.activity/1`** is written at `state/activity/<root-id>.json`, privately
+  and atomically, at most 4 KiB, with no unknown fields. Root creation writes
+  generation `0` with `last_release_ms: 0` and `releases: 0`, on both the area and
+  the feature-folder creation routes. `barge area release` writes
+  `last_release_ms: now` and increments `releases` and `generation`, under the
+  same root lock that wrote the hold and **before** the hold file is removed, so a
+  failed activity write refuses the release and leaves the hold in place.
+- **A release never invents a record.** A root with no record, or with one that
+  does not verify, gets no new record from a release: the release report says so
+  (`data.activity.state` is `missing` or `unverified`), the root stays kept, and
+  the repair is the explicit command below. This is O-013's resolution: losing
+  account state makes roots kept until an operator acts. `barge.area.release/1`
+  therefore carries an `activity` row; it is the release's own account of what it
+  recorded, not a second authority.
+- **`barge area idle-baseline --root <root-id> [--volume <uuid> --path
+  <mount-relative-path>]`** is that repair. Without the two location options it
+  resolves the root from its durable `barge.root.identity/1` record; the explicit
+  pair exists for a root that predates that record. Containment is decided before
+  any record is compared, an explicit pair that disagrees with the durable record
+  is refused as `unknown_state` rather than resolved in either direction, and the
+  marker must still name the requested root. It re-verifies the volume and the marker, refuses a live hold
+  (`refused_boundary`) and an undecidable or over-bound hold
+  (`custody_not_proven`), takes the stage 1 custody verdict for the root, and then
+  writes `last_release_ms: now` while holding the root lock. It preserves the
+  recorded release count and creation time, fills an unrecorded creation time from
+  the verified marker, bumps the generation, and refuses a record whose volume
+  disagrees with the root rather than resolving the disagreement. It creates no
+  state layout until the root is located and verified, so a refusal for a root
+  Barge cannot find leaves nothing behind. Its document is
+  `barge.area.idle-baseline/1`.
+- **The idleness matrix** is `area::assess_idleness`, over the marker, the
+  activity record, the holds and the area's `reserve` participation, with the
+  first blocking input reported as the reason: `marker_unverified`,
+  `participation_excluded`, `participation_undeclared`, `hold_live`,
+  `hold_unknown`, `activity_unknown` (missing or invalid), `activity_unreleased`,
+  `activity_future` (this stage's own name for the failure matrix's clock-skew row:
+  the report says the release is in the future and the root is not idle), and
+  `unconcluded_scratch` for a scratch root that is not positively concluded
+  (outcome `closed`, closure `positive`, nested scope `exclusive`, kept reason
+  `evidence`; the pressure predicate relaxes only the age). A hold list cut by its
+  per-root bound is `hold_unknown`, and nothing else is idle.
+- **`barge.area.root.list/1`** rows carry two additions: `activity`, the record as
+  read (`released`, `unreleased`, `missing` or `unverified`, with its fields when
+  it verified), and `space_idle`, the matrix's verdict. The existing `idle` field
+  is unchanged and remains stage 1's hold-only idleness that `maintain`'s age
+  policy reads; it is deliberately not the pressure verdict, because an age policy
+  and "may this yield now" are different questions. A row from a build before this
+  slice reports neither addition, and absence is never idleness.
+- **The least-recently-used order** is `area::LruKey` over the released records:
+  older `last_release_ms`, then older `first_created_ms`, then `root_id`
+  ascending. It carries no area, so the order is volume-wide by construction, and
+  a root whose creation time was never recorded is ordered after every known one
+  rather than being treated as the oldest. T4 orders candidates with it; nothing
+  in T3 orders or prunes anything.
+- `barge describe`'s `formats` names `barge.activity/1`.
+
+One reading this slice fixes for later ones: an operator's idle baseline is a
+release *time* without a release *count*, so `last_release_ms > 0` is what makes a
+record `released` and `releases` counts only the consumer's own releases. A record
+that counts releases but records no release time is `unverified`, not idle.

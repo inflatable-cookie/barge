@@ -1204,6 +1204,16 @@ pub fn create_root_in_feature(
                     crate::identity::IdentityOrigin::Created,
                 )?;
                 crate::identity::write_once(state, dirs, &root_lock, effective_uid, &identity)?;
+                // The root's activity record starts at generation zero with no
+                // release: a root that was never released is never idle, so a
+                // consumer that dies holding it keeps it (stage 3 design,
+                // "Activity records").
+                record_activity_creation(
+                    state,
+                    &folder.volume_uuid,
+                    &owned.root_id,
+                    owned.created_ms,
+                )?;
                 return Ok(owned);
             }
             Err(error) => {
@@ -1438,6 +1448,11 @@ pub fn create_root(
                     crate::identity::IdentityOrigin::Created,
                 )?;
                 crate::identity::write_once(state, dirs, &root_lock, effective_uid, &identity)?;
+                // The root's activity record starts at generation zero with no
+                // release: a root that was never released is never idle, so a
+                // consumer that dies holding it keeps it (stage 3 design,
+                // "Activity records").
+                record_activity_creation(state, &resolved.volume_uuid, &root_id, owned.created_ms)?;
                 return Ok(owned);
             }
             Err(error) => {
@@ -2887,8 +2902,33 @@ pub fn hold(
     Ok(Hold { record, path })
 }
 
+/// One completed release: where the hold was, whether this call removed one, and
+/// the root's activity record as it stands afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Release {
+    /// The hold file's path, whether or not it was there.
+    pub path: PathBuf,
+    /// Whether this call removed a hold file.
+    pub released: bool,
+    /// The root's activity record as it reads after the call.
+    pub activity: ActivityReading,
+}
+
 /// Release one holder's hold. A hold that is already absent is already released.
-pub fn release(state: &StatePaths, root_id: &str, holder: &str) -> Result<PathBuf> {
+///
+/// The release is the only fact from which the space policy concludes idleness,
+/// so a root that has an activity record gets it updated here, under the same
+/// root lock the hold was written under and **before** the hold file is removed: a
+/// failed activity write refuses the release and leaves the hold in place, so no
+/// release is ever recorded for a hold that is still there. A root with no
+/// activity record keeps none; the repair is [`idle_baseline`] (design, O-013),
+/// never an inferred creation time or volume.
+pub fn release(
+    state: &StatePaths,
+    observer: &dyn ProcessObserver,
+    root_id: &str,
+    holder: &str,
+) -> Result<Release> {
     state::validate_identifier("root_id", root_id)?;
     validate_name("holder", holder)?;
     registry::read(state)?;
@@ -2903,7 +2943,13 @@ pub fn release(state: &StatePaths, root_id: &str, holder: &str) -> Result<PathBu
         &path,
         &Bounds::new(HOLD_CAP_BYTES, HOLD_ROWS, Deadline::after(READ_DEADLINE)),
     ) {
-        ReadOutcome::Absent => return Ok(path),
+        ReadOutcome::Absent => {
+            return Ok(Release {
+                path,
+                released: false,
+                activity: read_activity(state, observer, root_id)?,
+            })
+        }
         ReadOutcome::Present(bytes) => bytes,
         ReadOutcome::Refused(error) => {
             return Err(error.with_detail("path", path.display().to_string().into()))
@@ -2932,6 +2978,7 @@ pub fn release(state: &StatePaths, root_id: &str, holder: &str) -> Result<PathBu
         )
         .with_detail("path", path.display().to_string().into()));
     }
+    let activity = record_activity_release(state, observer, root_id)?;
     std::fs::remove_file(&path).map_err(|error| {
         Error::new(
             ErrorKind::Io,
@@ -2944,7 +2991,11 @@ pub fn release(state: &StatePaths, root_id: &str, holder: &str) -> Result<PathBu
         // platform refuses must not turn a completed release into a failure.
         let _ = std::fs::File::open(directory).and_then(|handle| handle.sync_all());
     }
-    Ok(path)
+    Ok(Release {
+        path,
+        released: true,
+        activity,
+    })
 }
 
 /// Read and decide one root's holds, bounded by the per-root cap.
@@ -3173,6 +3224,933 @@ fn decide_hold(
     }
 }
 
+// ---- Activity records, the idleness matrix and the LRU order (slice T3) ----
+//
+// Holds are released by deleting the hold file, so the release itself leaves no
+// trace. The activity record is that trace: one small authoritative file per
+// root in account state, written when Barge creates the root and updated on
+// every release. Idleness under the space policy is decided from this record, the
+// root's holds, its marker and its area's `reserve` participation, and nothing
+// else: filesystem mtimes, entry counts and a consumer's own ledgers are not
+// inputs (stage 3 design, "Idleness, activity and least-recently-used order").
+
+/// One `barge.activity/1` record: the durable, positive fact that a root was
+/// released.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivityRecord {
+    /// Always `barge.activity/1`.
+    pub schema: String,
+    /// The root this record is about.
+    pub root_id: String,
+    /// The verified volume the root is on, as canonical UUID text.
+    pub volume_uuid: String,
+    /// When the root was last recorded as released, which an operator's
+    /// [`idle_baseline`] also records. `0` means no release or baseline has been
+    /// recorded, and such a root is never idle.
+    pub last_release_ms: u64,
+    /// When the record's root was created. `0` means the creation time was never
+    /// recorded, which only a record first written by a release can say.
+    pub first_created_ms: u64,
+    /// How many releases the record has recorded. An idle baseline records the
+    /// release time without claiming a release happened, so this count is a
+    /// separate fact from `last_release_ms`.
+    pub releases: u64,
+    /// Increases on every write after the creation record, which is generation
+    /// zero.
+    pub generation: u64,
+    /// When this record itself was written.
+    pub recorded_ms: u64,
+}
+
+impl ActivityRecord {
+    /// Validate the record's own identity and internal consistency.
+    ///
+    /// A record that names another root, another format, a non-canonical volume
+    /// uuid, a release count that disagrees with its timestamp or a creation time
+    /// ahead of its own write is unknown: it is never repaired and never
+    /// defaulted.
+    pub fn validate(&self) -> Result<()> {
+        let invalid = |reason: &str| {
+            Error::new(
+                ErrorKind::UnknownState,
+                format!("the activity record is not usable: {reason}"),
+            )
+        };
+        if self.schema != crate::contract::ACTIVITY_SCHEMA {
+            return Err(invalid("it is not a barge.activity/1 record"));
+        }
+        if !state::is_identifier(&self.root_id) {
+            return Err(invalid("its root id is not 32 hex digits"));
+        }
+        let uuid = VolumeUuid::parse(&self.volume_uuid)
+            .map_err(|_| invalid("its volume uuid is not a uuid"))?;
+        if uuid.as_str() != self.volume_uuid {
+            return Err(invalid("its volume uuid is not canonical"));
+        }
+        if self.releases > 0 && self.last_release_ms == 0 {
+            return Err(invalid("it records releases but no last release time"));
+        }
+        if self.first_created_ms > self.recorded_ms && self.first_created_ms != 0 {
+            return Err(invalid("its creation time is after its own write"));
+        }
+        if self.last_release_ms > self.recorded_ms {
+            return Err(invalid("its last release is after its own write"));
+        }
+        Ok(())
+    }
+}
+
+/// How one root's activity record reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityStateName {
+    /// The record verifies and records at least one release.
+    Released,
+    /// The record verifies but records no release: the root was created and
+    /// never released.
+    Unreleased,
+    /// There is no record at all.
+    Missing,
+    /// A record is there but does not verify.
+    Unverified,
+}
+
+/// One root's activity as a document reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivityRow {
+    /// Whether the record verifies, records no release, is missing or is not
+    /// readable.
+    pub state: ActivityStateName,
+    /// The last recorded release, when a record was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_release_ms: Option<u64>,
+    /// The recorded creation time, when a record was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_created_ms: Option<u64>,
+    /// The recorded release count, when a record was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releases: Option<u64>,
+    /// The record's generation, when a record was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    /// When the record was written, when one was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recorded_ms: Option<u64>,
+    /// Why a missing or unverified record is reported that way, when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Default for ActivityRow {
+    /// A row a document from before this slice does not carry. Absence is
+    /// reported as unverified, never as a release.
+    fn default() -> Self {
+        Self {
+            state: ActivityStateName::Unverified,
+            last_release_ms: None,
+            first_created_ms: None,
+            releases: None,
+            generation: None,
+            recorded_ms: None,
+            reason: Some("the document does not report this root's activity record".to_owned()),
+        }
+    }
+}
+
+/// What reading one root's activity record found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityReading {
+    /// How the record reads.
+    pub state: ActivityStateName,
+    /// The record, when it verified.
+    pub record: Option<ActivityRecord>,
+    /// Why it is missing or unverified, when a reason exists.
+    pub reason: Option<String>,
+}
+
+impl ActivityReading {
+    /// No record exists.
+    pub fn missing() -> Self {
+        Self {
+            state: ActivityStateName::Missing,
+            record: None,
+            reason: Some(
+                "no activity record exists for the root, so Barge has recorded no release for it"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    /// A record that did not verify.
+    pub fn unverified(reason: impl Into<String>) -> Self {
+        Self {
+            state: ActivityStateName::Unverified,
+            record: None,
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// The row a document reports.
+    pub fn row(&self) -> ActivityRow {
+        ActivityRow {
+            state: self.state,
+            last_release_ms: self.record.as_ref().map(|record| record.last_release_ms),
+            first_created_ms: self.record.as_ref().map(|record| record.first_created_ms),
+            releases: self.record.as_ref().map(|record| record.releases),
+            generation: self.record.as_ref().map(|record| record.generation),
+            recorded_ms: self.record.as_ref().map(|record| record.recorded_ms),
+            reason: self.reason.clone(),
+        }
+    }
+}
+
+/// Read one root's activity record, bounded and strict.
+///
+/// A missing file is reported as missing, an unreadable, oversized, symlinked,
+/// foreign-owned or schema-divergent one as unverified. A read failure of the
+/// state directory itself is an error a caller reports per object rather than a
+/// reason to fail unrelated work.
+pub fn read_activity(
+    state: &StatePaths,
+    observer: &dyn ProcessObserver,
+    root_id: &str,
+) -> Result<ActivityReading> {
+    state::validate_identifier("root_id", root_id)?;
+    if !state.is_initialized()? {
+        return Ok(ActivityReading::missing());
+    }
+    let path = state.activity_path(root_id)?;
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ActivityReading::missing())
+        }
+        Err(error) => {
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!("cannot read {}: {error}", path.display()),
+            )
+            .with_detail("path", path.display().to_string().into()))
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(ActivityReading::unverified(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    let effective_uid = observer.effective_uid()?;
+    if metadata.uid() != effective_uid {
+        return Ok(ActivityReading::unverified(format!(
+            "{} is owned by uid {}, not this account's {effective_uid}",
+            path.display(),
+            metadata.uid()
+        )));
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Ok(ActivityReading::unverified(format!(
+            "{} has mode {:o}, which is not private",
+            path.display(),
+            metadata.mode() & 0o7777
+        )));
+    }
+    let bytes = match state::read_bounded(
+        &path,
+        &Bounds::new(
+            crate::contract::ACTIVITY_CAP_BYTES,
+            1,
+            Deadline::after(READ_DEADLINE),
+        ),
+    ) {
+        ReadOutcome::Present(bytes) => bytes,
+        ReadOutcome::Absent => return Ok(ActivityReading::missing()),
+        ReadOutcome::Refused(error) => return Ok(ActivityReading::unverified(error.to_string())),
+    };
+    let record: ActivityRecord = match serde_json::from_slice(&bytes) {
+        Ok(record) => record,
+        Err(error) => {
+            return Ok(ActivityReading::unverified(format!(
+                "the activity record is unreadable: {error}"
+            )))
+        }
+    };
+    if let Err(error) = record.validate() {
+        return Ok(ActivityReading::unverified(error.to_string()));
+    }
+    if record.root_id != root_id {
+        return Ok(ActivityReading::unverified(format!(
+            "the activity record names root `{}`, not `{root_id}`",
+            record.root_id
+        )));
+    }
+    let state_name = if record.last_release_ms == 0 {
+        ActivityStateName::Unreleased
+    } else {
+        ActivityStateName::Released
+    };
+    Ok(ActivityReading {
+        state: state_name,
+        record: Some(record),
+        reason: None,
+    })
+}
+
+/// Publish one activity record atomically and privately.
+fn publish_activity(state: &StatePaths, record: &ActivityRecord) -> Result<PathBuf> {
+    record.validate()?;
+    let directory = state.activity_dir();
+    ensure_private_directory(&directory)?;
+    let path = state.activity_path(&record.root_id)?;
+    let mut bytes = serde_json::to_vec_pretty(record).map_err(|error| {
+        Error::new(
+            ErrorKind::Io,
+            format!("could not encode the activity record: {error}"),
+        )
+    })?;
+    bytes.push(b'\n');
+    if bytes.len() > crate::contract::ACTIVITY_CAP_BYTES {
+        return Err(Error::new(
+            ErrorKind::ResourceBound,
+            format!(
+                "the activity record is over the {}-byte cap",
+                crate::contract::ACTIVITY_CAP_BYTES
+            ),
+        )
+        .with_detail("cap", crate::contract::ACTIVITY_CAP_BYTES.into()));
+    }
+    state::publish_atomic(&path, &bytes)?;
+    Ok(path)
+}
+
+/// Record a root's creation: no release yet, generation zero.
+///
+/// The caller holds this root's lock (rank 3), which is the lock every later
+/// write to the same record takes.
+fn record_activity_creation(
+    state: &StatePaths,
+    volume_uuid: &VolumeUuid,
+    root_id: &str,
+    created_ms: u64,
+) -> Result<ActivityRecord> {
+    let now = state::now_ms();
+    let record = ActivityRecord {
+        schema: crate::contract::ACTIVITY_SCHEMA.to_owned(),
+        root_id: root_id.to_owned(),
+        volume_uuid: volume_uuid.as_str().to_owned(),
+        last_release_ms: 0,
+        first_created_ms: created_ms.min(now),
+        releases: 0,
+        generation: 0,
+        recorded_ms: now,
+    };
+    publish_activity(state, &record)?;
+    Ok(record)
+}
+
+/// Record one release of a root that already has a record.
+///
+/// The caller holds the root lock. A root with no record, or with one that does
+/// not verify, gets no new record: a release is a release fact, not a licence to
+/// invent a creation time or a volume. The repair for a missing record is the
+/// explicit [`idle_baseline`] command (design, O-013).
+fn record_activity_release(
+    state: &StatePaths,
+    observer: &dyn ProcessObserver,
+    root_id: &str,
+) -> Result<ActivityReading> {
+    let reading = read_activity(state, observer, root_id)?;
+    let Some(previous) = reading.record.clone() else {
+        return Ok(reading);
+    };
+    let now = state::now_ms();
+    let record = ActivityRecord {
+        last_release_ms: now,
+        releases: previous.releases.saturating_add(1),
+        generation: previous.generation.saturating_add(1),
+        recorded_ms: now,
+        ..previous
+    };
+    publish_activity(state, &record)?;
+    Ok(ActivityReading {
+        state: ActivityStateName::Released,
+        record: Some(record),
+        reason: None,
+    })
+}
+
+/// Why a root is not idle under the space policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleReason {
+    /// The marker did not verify as an owned root of this volume and path.
+    MarkerUnverified,
+    /// The activity record is missing or invalid.
+    ActivityUnknown,
+    /// The activity record verifies but records no release.
+    ActivityUnreleased,
+    /// The activity record's last release is in the future (clock skew).
+    ActivityFuture,
+    /// A live hold covers the root.
+    HoldLive,
+    /// A hold cannot be decided.
+    HoldUnknown,
+    /// The area's `reserve` is `excluded`, or the folder is not an area.
+    ParticipationExcluded,
+    /// The root's area is not declared at all.
+    ParticipationUndeclared,
+    /// A scratch root is not positively concluded, so it is never pressure
+    /// pruned.
+    UnconcludedScratch,
+}
+
+impl IdleReason {
+    /// The name a document reports.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MarkerUnverified => "marker_unverified",
+            Self::ActivityUnknown => "activity_unknown",
+            Self::ActivityUnreleased => "activity_unreleased",
+            Self::ActivityFuture => "activity_future",
+            Self::HoldLive => "hold_live",
+            Self::HoldUnknown => "hold_unknown",
+            Self::ParticipationExcluded => "participation_excluded",
+            Self::ParticipationUndeclared => "participation_undeclared",
+            Self::UnconcludedScratch => "unconcluded_scratch",
+        }
+    }
+}
+
+/// The two states the pressure idleness matrix decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleState {
+    /// Every input positively concluded idleness.
+    Idle,
+    /// At least one input did not, so the root is kept.
+    NotIdle,
+}
+
+/// One root's idleness under the space policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdleRow {
+    /// Idle or not idle.
+    pub state: IdleState,
+    /// The first input that kept the root, when it is not idle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<IdleReason>,
+}
+
+impl IdleRow {
+    /// A root that is not idle for this reason.
+    pub const fn blocked(reason: IdleReason) -> Self {
+        Self {
+            state: IdleState::NotIdle,
+            reason: Some(reason),
+        }
+    }
+
+    /// Whether the root may yield under the reserve.
+    pub const fn is_idle(&self) -> bool {
+        matches!(self.state, IdleState::Idle)
+    }
+}
+
+impl Default for IdleRow {
+    /// A row a document from before this slice does not carry. Absence is never
+    /// idleness, so the default keeps the root.
+    fn default() -> Self {
+        Self {
+            state: IdleState::NotIdle,
+            reason: None,
+        }
+    }
+}
+
+/// Why a root's bytes may or may not yield under the reserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleParticipation {
+    /// A declared area whose `reserve` is `counts`: its idle roots yield.
+    Counts,
+    /// A declared area whose `reserve` is `excluded`: its roots never yield for
+    /// space.
+    Excluded,
+    /// Barge's own scratch feature, which participates by construction.
+    Scratch,
+    /// A folder Barge has no declaration for: never Barge's to prune.
+    Undeclared,
+}
+
+impl IdleParticipation {
+    /// The participation a declared area's `reserve` value gives.
+    pub const fn of_area(reserve: ReserveParticipation) -> Self {
+        match reserve {
+            ReserveParticipation::Counts => Self::Counts,
+            ReserveParticipation::Excluded => Self::Excluded,
+        }
+    }
+}
+
+/// Everything the pressure idleness matrix decides on.
+#[derive(Debug, Clone, Copy)]
+pub struct IdleInputs<'a> {
+    /// What the marker read decided.
+    pub marker: &'a MarkerState,
+    /// What the activity record read decided.
+    pub activity: &'a ActivityReading,
+    /// What the holds read decided.
+    pub holds: &'a HoldReading,
+    /// Whether the root's area participates.
+    pub participation: IdleParticipation,
+    /// The current time, so a future-dated release is not idle.
+    pub now_ms: u64,
+}
+
+/// Decide one root's idleness under the space policy.
+///
+/// A root is idle only when its marker verifies, its activity record verifies and
+/// records a release, every hold is positively absent or stale, its area
+/// participates, and (for a scratch root) its run is positively concluded. The
+/// first input that does not conclude keeps the root and is reported; anything
+/// undecidable is not idle, and there is no "probably done" widening (stage 3
+/// design, "The only source of idleness").
+pub fn assess_idleness(inputs: &IdleInputs<'_>) -> IdleRow {
+    let marker = match inputs.marker {
+        MarkerState::Owned(marker) => marker,
+        MarkerState::Absent | MarkerState::Unknown { .. } => {
+            return IdleRow::blocked(IdleReason::MarkerUnverified)
+        }
+    };
+    match inputs.participation {
+        IdleParticipation::Counts | IdleParticipation::Scratch => {}
+        IdleParticipation::Excluded => return IdleRow::blocked(IdleReason::ParticipationExcluded),
+        IdleParticipation::Undeclared => {
+            return IdleRow::blocked(IdleReason::ParticipationUndeclared)
+        }
+    }
+    // Holds come before the activity record: a root a consumer is writing right
+    // now is kept because it is held, which is the fact the stop's attribution
+    // reports, not because its release has not been recorded yet.
+    for (_, state, _) in &inputs.holds.holds {
+        match state {
+            HoldState::Live => return IdleRow::blocked(IdleReason::HoldLive),
+            HoldState::Unknown => return IdleRow::blocked(IdleReason::HoldUnknown),
+            HoldState::Stale => {}
+        }
+    }
+    if inputs.holds.truncated {
+        // A hold list cut by its bound cannot prove the absence of a live hold.
+        return IdleRow::blocked(IdleReason::HoldUnknown);
+    }
+    match inputs.activity.state {
+        ActivityStateName::Released => {}
+        ActivityStateName::Unreleased => return IdleRow::blocked(IdleReason::ActivityUnreleased),
+        ActivityStateName::Missing | ActivityStateName::Unverified => {
+            return IdleRow::blocked(IdleReason::ActivityUnknown)
+        }
+    }
+    let Some(record) = inputs.activity.record.as_ref() else {
+        return IdleRow::blocked(IdleReason::ActivityUnknown);
+    };
+    if record.last_release_ms > inputs.now_ms || record.recorded_ms > inputs.now_ms {
+        return IdleRow::blocked(IdleReason::ActivityFuture);
+    }
+    if marker.kind == RootKind::ScratchRun && !positively_concluded(marker.conclusion) {
+        return IdleRow::blocked(IdleReason::UnconcludedScratch);
+    }
+    IdleRow {
+        state: IdleState::Idle,
+        reason: None,
+    }
+}
+
+/// Whether a scratch root's conclusion is the one the expiry predicate accepts:
+/// closed, positive, exclusive and kept as evidence. The pressure predicate
+/// relaxes only the age, never these four facts (design, O-015).
+pub fn positively_concluded(conclusion: Option<RootConclusion>) -> bool {
+    conclusion.is_some_and(|conclusion| {
+        conclusion.outcome == ConclusionOutcome::Closed
+            && conclusion.closure == ConclusionClosure::Positive
+            && conclusion.nested_scope == NestedScope::Exclusive
+            && conclusion.kept_reason == KeptReason::Evidence
+    })
+}
+
+/// One idle root's position in the volume-wide least-recently-used order.
+///
+/// The order is the design's: the older recorded release first, then the older
+/// recorded creation, then the root id ascending as a stable, arbitrary
+/// tie-break. `first_created_ms == 0` is the record's "never recorded" value and
+/// is ordered after every known creation time, so a tie is never resolved by
+/// treating an unknown age as the oldest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LruKey {
+    /// The last recorded release.
+    pub last_release_ms: u64,
+    /// The recorded creation time, `0` when it was never recorded.
+    pub first_created_ms: u64,
+    /// The root the key orders.
+    pub root_id: String,
+}
+
+impl LruKey {
+    /// The key a released record gives, or none when the record records no
+    /// release: a root that is not idle is never a candidate.
+    pub fn of(record: &ActivityRecord) -> Option<Self> {
+        if record.last_release_ms == 0 {
+            return None;
+        }
+        Some(Self {
+            last_release_ms: record.last_release_ms,
+            first_created_ms: record.first_created_ms,
+            root_id: record.root_id.clone(),
+        })
+    }
+
+    /// The creation time with an unknown value ordered last.
+    const fn creation_rank(&self) -> u64 {
+        if self.first_created_ms == 0 {
+            u64::MAX
+        } else {
+            self.first_created_ms
+        }
+    }
+}
+
+impl Ord for LruKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.last_release_ms
+            .cmp(&other.last_release_ms)
+            .then_with(|| self.creation_rank().cmp(&other.creation_rank()))
+            .then_with(|| self.root_id.cmp(&other.root_id))
+    }
+}
+
+impl PartialOrd for LruKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// What a caller asks [`idle_baseline`] to repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleBaselineRequest {
+    /// The root to baseline.
+    pub root_id: String,
+    /// Where the root is, when Barge has no durable identity record for it. Both
+    /// this and `mount_relative_path` are given, or neither.
+    pub volume_uuid: Option<VolumeUuid>,
+    /// The root's path below the volume's mount point, as an explicit
+    /// alternative to the durable identity record.
+    pub mount_relative_path: Option<String>,
+}
+
+/// The `barge.area.idle-baseline/1` document's data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdleBaselineReport {
+    /// The root that was repaired.
+    pub root_id: String,
+    /// The verified volume it is on.
+    pub volume_uuid: VolumeUuid,
+    /// The path the walk reached.
+    pub path: PathBuf,
+    /// The activity record as written.
+    pub activity: ActivityRow,
+    /// The custody verdict the write was gated on. Only `safe` is ever written.
+    pub custody: String,
+}
+
+/// Write a fresh activity record asserting a root is idle as of now.
+///
+/// This is the design's only repair for a lost or invalid activity record: Barge
+/// never infers idleness from an absent record, and without this command the root
+/// stays kept, forever if need be. It re-verifies the volume and the root's
+/// marker, refuses if any hold is live or undecidable, takes the stage 1 custody
+/// verdict for the root, and then writes the record while holding the root lock.
+#[allow(clippy::too_many_arguments)]
+pub fn idle_baseline(
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    request: &IdleBaselineRequest,
+) -> Result<IdleBaselineReport> {
+    state::validate_identifier("root_id", &request.root_id)?;
+    if request.volume_uuid.is_some() != request.mount_relative_path.is_some() {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "an explicit location needs both the volume and the root's mount-relative path, or neither",
+        ));
+    }
+    // Every mutating path starts at the registry: an invalid registry refuses
+    // before any effect, and it is never rebuilt from markers. The state layout
+    // is created only once the root is located and verified, so a refusal for a
+    // root Barge cannot find leaves nothing behind at all.
+    registry::read(state)?;
+    let effective_uid = observer.effective_uid()?;
+    if let Some(relative) = &request.mount_relative_path {
+        // Containment is decided before any record is compared: a path outside
+        // the volume is refused whatever the records say.
+        folder_components("mount_relative_path", relative)?;
+    }
+    let (volume_uuid, relative) = match (&request.volume_uuid, &request.mount_relative_path) {
+        (Some(volume_uuid), Some(relative)) => {
+            // An explicit location never overrules Barge's own durable record: a
+            // disagreement is reported, not resolved in either direction.
+            if let Some(durable) =
+                crate::identity::read(state, dirs, &request.root_id, effective_uid)?
+            {
+                if durable.volume_uuid != volume_uuid.as_str()
+                    || &durable.mount_relative_path != relative
+                {
+                    return Err(Error::new(
+                        ErrorKind::UnknownState,
+                        format!(
+                            "root {}'s durable identity record names {} at {}, not the given {volume_uuid} at {relative}; the disagreement is reported, not resolved",
+                            request.root_id, durable.volume_uuid, durable.mount_relative_path
+                        ),
+                    )
+                    .with_detail("record_volume_uuid", durable.volume_uuid.clone().into())
+                    .with_detail("record_path", durable.mount_relative_path.clone().into()));
+                }
+            }
+            (volume_uuid.clone(), relative.clone())
+        }
+        _ => match crate::identity::read(state, dirs, &request.root_id, effective_uid)? {
+            Some(record) => (VolumeUuid::parse(&record.volume_uuid)?, record.mount_relative_path),
+            None => {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    format!(
+                        "Barge has no durable record of where root {} is, so it cannot re-verify the root; give its volume and mount-relative path explicitly",
+                        request.root_id
+                    ),
+                )
+                .with_detail("root_id", request.root_id.clone().into()))
+            }
+        },
+    };
+    let components = folder_components("mount_relative_path", &relative)?;
+    let (name, parent) = components.split_last().ok_or_else(|| {
+        Error::new(
+            ErrorKind::RefusedContainment,
+            "a root is never the volume's own root directory",
+        )
+        .with_detail("value", relative.clone().into())
+    })?;
+    if parent.is_empty() {
+        return Err(Error::new(
+            ErrorKind::RefusedContainment,
+            "a root is never created directly at a volume's mount root",
+        )
+        .with_detail("value", relative.clone().into()));
+    }
+    let folder = parent.join("/");
+    let record = registered_volume(state, &volume_uuid)?;
+    record.declared_durability()?;
+    let volume = VolumeRoot::open(dirs, facts, mounts, &record)?;
+    let mount_point = volume.mount_point().to_path_buf();
+    let device = volume.identity().device;
+    let walked = walk_folder(
+        dirs,
+        volume.into_handle(),
+        parent,
+        device,
+        &mount_point,
+        effective_uid,
+    )?;
+    if !walked.exists() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!("the root's folder `{folder}` is not on volume {volume_uuid}"),
+        )
+        .with_detail("volume_uuid", volume_uuid.as_str().into())
+        .with_detail("folder", folder.clone().into()));
+    }
+    let root_path = walked.path.join(name);
+    let root = dirs.open_child_dir(&walked.handle, name)?;
+    let expectation = MarkerExpectation {
+        volume_uuid: &volume_uuid,
+        resolved_path: &root_path,
+        mount_point: Some(&mount_point),
+        effective_uid,
+        now_ms: state::now_ms(),
+    };
+    let (marker, marker_digest) = read_marker_with_digest(dirs, &root, &expectation);
+    let marker = match marker {
+        MarkerState::Owned(marker) => marker,
+        MarkerState::Absent => {
+            return Err(Error::new(
+                ErrorKind::RefusedBoundary,
+                format!(
+                    "{} carries no marker, so it is not a root Barge owns",
+                    root_path.display()
+                ),
+            )
+            .with_detail("path", root_path.display().to_string().into()))
+        }
+        MarkerState::Unknown { reason } => {
+            return Err(Error::new(
+                ErrorKind::RefusedBoundary,
+                format!(
+                    "the marker at {} does not verify: {reason}",
+                    root_path.display()
+                ),
+            )
+            .with_detail("path", root_path.display().to_string().into())
+            .with_detail("reason", reason.into()))
+        }
+    };
+    if marker.root_id != request.root_id {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "{} is root {}, not the requested {}",
+                root_path.display(),
+                marker.root_id,
+                request.root_id
+            ),
+        )
+        .with_detail("path", root_path.display().to_string().into())
+        .with_detail("root_id", marker.root_id.clone().into()));
+    }
+    let marker_digest = marker_digest.ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnknownState,
+            "the root's marker digest was not read, so custody cannot be proved",
+        )
+    })?;
+    state.initialize()?;
+    let mut locks = state::LockSet::new(state.clone());
+    let _lock = locks.lock_root(&request.root_id)?;
+    // A live or undecidable hold is refused before anything is written, and the
+    // root lock above is what a racing `hold` takes too.
+    let holds = read_holds(state, observer, &request.root_id)?;
+    for (hold, hold_state, reason) in &holds.holds {
+        match hold_state {
+            HoldState::Live => {
+                return Err(Error::new(
+                    ErrorKind::RefusedBoundary,
+                    format!(
+                        "root {} is held by `{}` on pid {}; an idle baseline needs no hold",
+                        request.root_id, hold.holder, hold.pid
+                    ),
+                )
+                .with_detail("holder", hold.holder.clone().into())
+                .with_detail("pid", u64::from(hold.pid).into()))
+            }
+            HoldState::Unknown => {
+                return Err(Error::new(
+                    ErrorKind::CustodyNotProven,
+                    format!(
+                        "the hold `{}` on root {} cannot be decided: {}",
+                        hold.holder,
+                        request.root_id,
+                        reason.as_deref().unwrap_or("no reason was recorded")
+                    ),
+                )
+                .with_detail("holder", hold.holder.clone().into()))
+            }
+            HoldState::Stale => {}
+        }
+    }
+    if holds.truncated {
+        return Err(Error::new(
+            ErrorKind::CustodyNotProven,
+            format!(
+                "root {} carries more hold files than the {HOLD_ROWS}-hold bound, so none can be proved absent",
+                request.root_id
+            ),
+        ));
+    }
+    let intents = state::read_intents(state, crate::contract::INTENT_ROWS)?;
+    if intents.truncated {
+        return Err(Error::new(
+            ErrorKind::CustodyNotProven,
+            "the intent census is truncated, so custody cannot be proved",
+        ));
+    }
+    let unit = crate::unit::DeletionUnit {
+        volume_uuid: volume_uuid.clone(),
+        root_dir: String::new(),
+        folder: folder.clone(),
+        parent: String::new(),
+        name: name.clone(),
+        kind: crate::unit::UnitKind::Directory,
+        device: root.identity().device,
+        inode: root.identity().inode,
+        marker: Some(crate::unit::UnitMarker::new(
+            crate::unit::MarkerFamily::Barge,
+            marker_digest,
+        )),
+        grant: crate::unit::UnitGrant::native_root(&request.root_id),
+        plan_digest: "0".repeat(64),
+    };
+    let pending = crate::custody::PendingIntent::pending(&intents.records);
+    crate::custody::take_custody(
+        dirs,
+        facts,
+        mounts,
+        observer,
+        state,
+        &unit,
+        &pending,
+        crate::custody::CustodyBounds::default(),
+    )
+    .into_evidence()?;
+    let previous = read_activity(state, observer, &request.root_id)?;
+    if let Some(existing) = previous.record.as_ref() {
+        if existing.volume_uuid != volume_uuid.as_str() {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "root {}'s activity record names volume {}, but the root is on {volume_uuid}; the disagreement is reported, not resolved",
+                    request.root_id, existing.volume_uuid
+                ),
+            )
+            .with_detail("record_volume_uuid", existing.volume_uuid.clone().into())
+            .with_detail("volume_uuid", volume_uuid.as_str().into()));
+        }
+    }
+    let now = state::now_ms();
+    let first_created_ms = previous
+        .record
+        .as_ref()
+        .map(|record| record.first_created_ms)
+        .filter(|value| *value != 0)
+        .unwrap_or(marker.created_ms);
+    let record = ActivityRecord {
+        schema: crate::contract::ACTIVITY_SCHEMA.to_owned(),
+        root_id: request.root_id.clone(),
+        volume_uuid: volume_uuid.as_str().to_owned(),
+        last_release_ms: now,
+        first_created_ms: first_created_ms.min(now),
+        releases: previous.record.as_ref().map_or(0, |record| record.releases),
+        generation: previous
+            .record
+            .as_ref()
+            .map_or(1, |record| record.generation.saturating_add(1)),
+        recorded_ms: now,
+    };
+    publish_activity(state, &record)?;
+    Ok(IdleBaselineReport {
+        root_id: request.root_id.clone(),
+        volume_uuid,
+        path: root_path,
+        activity: ActivityReading {
+            state: ActivityStateName::Released,
+            record: Some(record),
+            reason: None,
+        }
+        .row(),
+        custody: crate::custody::CAPABILITY.to_owned(),
+    })
+}
+
 /// One root as a listing observes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3220,9 +4198,18 @@ pub struct RootObservation {
     /// consumer content is interpreted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_activity_ms: Option<u64>,
-    /// Whether no live hold covers the root. Idleness comes only from Barge's
-    /// own holds.
+    /// Whether no live hold covers the root, which is stage 1's idleness for
+    /// `maintain`'s age policy: its holds are the only input it reads.
     pub idle: bool,
+    /// The root's activity record as this listing read it. A document from a
+    /// build before this field reports `unverified`, never a release.
+    #[serde(default)]
+    pub activity: ActivityRow,
+    /// Whether the root is idle under the stage 3 pressure idleness matrix,
+    /// which adds the activity record and the area's `reserve` participation to
+    /// the marker and holds. Absent in an older document is never idleness.
+    #[serde(default)]
+    pub space_idle: IdleRow,
     /// The root's holds, bounded to the per-root cap.
     pub holds: Vec<HoldRow>,
     /// Whether more holds exist than the per-root cap.
@@ -3266,7 +4253,9 @@ impl RootListing {
 /// Only directories and symlinks are observed; every directory is a row whose
 /// marker state says whether it is owned, unmarked or unknown. A marker is never
 /// adopted, a symlink is never followed and no consumer content is read. Holds
-/// come from the state directory and are the only basis for idleness.
+/// and activity records come from the state directory: they are the only basis
+/// for idleness, and a row whose holds or activity cannot be read is reported
+/// kept rather than failing the listing.
 pub fn list_roots(
     dirs: &dyn DirOps,
     observer: &dyn ProcessObserver,
@@ -3293,6 +4282,7 @@ pub fn list_roots(
                 &entry.name,
                 &resolved.path.join(&entry.name),
                 "the entry is a symbolic link, which is never followed or owned".to_owned(),
+                IdleReason::MarkerUnverified,
             ));
             continue;
         }
@@ -3308,6 +4298,7 @@ pub fn list_roots(
                     &entry.name,
                     &configured_path,
                     error.to_string(),
+                    IdleReason::MarkerUnverified,
                 ));
                 continue;
             }
@@ -3320,9 +4311,18 @@ pub fn list_roots(
             now_ms,
         };
         let (marker, marker_digest) = read_marker_with_digest(dirs, &root, &expectation);
-        let holds = if state::validate_identifier("root_id", &entry.name).is_err() {
-            HoldReading::empty()
+        let named_root = state::is_identifier(&entry.name);
+        let activity = if named_root {
+            match read_activity(state, observer, &entry.name) {
+                Ok(activity) => activity,
+                // One undecidable record never blocks the other rows: this root
+                // is reported kept and the listing continues.
+                Err(error) => ActivityReading::unverified(error.to_string()),
+            }
         } else {
+            ActivityReading::missing()
+        };
+        let holds = if named_root {
             match read_holds(state, observer, &entry.name) {
                 Ok(holds) => holds,
                 Err(error) => {
@@ -3330,10 +4330,13 @@ pub fn list_roots(
                         &entry.name,
                         &configured_path,
                         format!("the root's holds are unreadable: {error}"),
+                        IdleReason::HoldUnknown,
                     ));
                     continue;
                 }
             }
+        } else {
+            HoldReading::empty()
         };
         roots.push(observe_root(
             &entry.name,
@@ -3343,6 +4346,9 @@ pub fn list_roots(
             marker,
             marker_digest,
             &holds,
+            activity,
+            IdleParticipation::of_area(resolved.declaration.reserve),
+            now_ms,
         ));
     }
     Ok(RootListing {
@@ -3353,6 +4359,7 @@ pub fn list_roots(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn observe_root(
     name: &str,
     root: &DirHandle,
@@ -3361,7 +4368,17 @@ fn observe_root(
     marker: MarkerState,
     marker_digest: Option<String>,
     holds: &HoldReading,
+    activity: ActivityReading,
+    participation: IdleParticipation,
+    now_ms: u64,
 ) -> RootObservation {
+    let space_idle = assess_idleness(&IdleInputs {
+        marker: &marker,
+        activity: &activity,
+        holds,
+        participation,
+        now_ms,
+    });
     let mut row = RootObservation {
         name: name.to_owned(),
         state: marker.name(),
@@ -3378,6 +4395,8 @@ fn observe_root(
         created_ms: None,
         last_activity_ms: None,
         idle: holds.is_idle(),
+        activity: activity.row(),
+        space_idle,
         holds: holds.rows(),
         holds_truncated: holds.truncated,
     };
@@ -3412,7 +4431,12 @@ fn observe_root(
     row
 }
 
-fn unreadable_root(name: &str, configured_path: &Path, reason: String) -> RootObservation {
+fn unreadable_root(
+    name: &str,
+    configured_path: &Path,
+    reason: String,
+    idle_reason: IdleReason,
+) -> RootObservation {
     RootObservation {
         name: name.to_owned(),
         state: MarkerStateName::Unknown,
@@ -3428,8 +4452,14 @@ fn unreadable_root(name: &str, configured_path: &Path, reason: String) -> RootOb
         marker_digest: None,
         created_ms: None,
         last_activity_ms: None,
-        // An unreadable root's holds are unknown, so it is never reported idle.
+        // An unreadable root's marker, holds or activity are unknown, so it is
+        // never reported idle under either idleness rule.
         idle: false,
+        activity: ActivityReading::unverified(
+            "the root could not be observed, so its activity is unknown".to_owned(),
+        )
+        .row(),
+        space_idle: IdleRow::blocked(idle_reason),
         holds: Vec::new(),
         holds_truncated: false,
     }
@@ -3523,6 +4553,10 @@ pub struct ReleaseReport {
     pub root_id: String,
     /// The holder that released.
     pub holder: String,
+    /// The root's activity record as it reads after the release. A root with no
+    /// record keeps none: `missing` here is the `barge area idle-baseline`
+    /// repair case, never an inferred release.
+    pub activity: ActivityRow,
 }
 
 /// Bytes as lowercase hexadecimal.
@@ -3545,10 +4579,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        declare, folder_components, hold, list_roots, read_declarations, read_holds, read_marker,
-        release, resolve, show, validate_name, AreaDeclaration, HoldRequest, HoldScope, HoldState,
-        MarkerExpectation, MarkerState, MarkerStateName, RootKind, RootSpec, AREA_DIRECTORY_MODE,
-        ROOT_DIRECTORY_MODE, ROOT_MARKER_FILE,
+        assess_idleness, declare, folder_components, hold, idle_baseline, list_roots,
+        read_activity, read_declarations, read_holds, read_marker, release, resolve, show,
+        validate_name, ActivityReading, ActivityRecord, ActivityStateName, AreaDeclaration,
+        HoldReading, HoldRequest, HoldScope, HoldState, IdleBaselineRequest, IdleInputs,
+        IdleParticipation, IdleReason, IdleRow, IdleState, LruKey, MarkerExpectation, MarkerState,
+        MarkerStateName, RootKind, RootSpec, AREA_DIRECTORY_MODE, ROOT_DIRECTORY_MODE,
+        ROOT_MARKER_FILE,
     };
     use crate::digest::sha256_hex;
     use crate::error::{Error, ErrorKind, Result};
@@ -5118,12 +6155,12 @@ mod tests {
         assert_eq!(listing.roots[0].holds.len(), 1);
         assert!(!listing.roots[0].idle);
 
-        release(&fixture.state, &root.root_id, "prover").expect("the hold releases");
+        release(&fixture.state, &observer, &root.root_id, "prover").expect("the hold releases");
         let reading = read_holds(&fixture.state, &observer, &root.root_id).expect("the holds read");
         assert!(reading.holds.is_empty());
         assert!(reading.is_idle(), "no live hold is idle");
         // Releasing again is not an error: it is already released.
-        release(&fixture.state, &root.root_id, "prover").expect("a second release");
+        release(&fixture.state, &observer, &root.root_id, "prover").expect("a second release");
     }
 
     #[test]
@@ -5166,7 +6203,8 @@ mod tests {
         rewrite_marker(&path, |value| {
             value["holder"] = "someone-else".into();
         });
-        let error = release(&fixture.state, &root.root_id, "h1").expect_err("the mismatch refuses");
+        let error = release(&fixture.state, &observer, &root.root_id, "h1")
+            .expect_err("the mismatch refuses");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
         assert!(path.is_file(), "the unknown hold is kept");
         let reading = read_holds(&fixture.state, &observer, &root.root_id).expect("the holds read");
@@ -5240,6 +6278,857 @@ mod tests {
         )
         .expect_err("a gone process cannot hold");
         assert_eq!(error.kind(), ErrorKind::CustodyNotProven);
+    }
+
+    // ---- slice T3: activity records, the idleness matrix and the LRU order ---
+
+    fn record(root_id: &str, release: u64, created: u64, releases: u64) -> ActivityRecord {
+        ActivityRecord {
+            schema: crate::contract::ACTIVITY_SCHEMA.to_owned(),
+            root_id: root_id.to_owned(),
+            volume_uuid: UUID.to_owned(),
+            last_release_ms: release,
+            first_created_ms: created,
+            releases,
+            generation: releases,
+            recorded_ms: release.max(created).max(1),
+        }
+    }
+
+    fn released(root_id: &str, release: u64, created: u64) -> ActivityReading {
+        ActivityReading {
+            state: ActivityStateName::Released,
+            reason: None,
+            record: Some(record(root_id, release, created, 1)),
+        }
+    }
+
+    fn owned_marker(kind: RootKind) -> MarkerState {
+        let mut value = serde_json::json!({
+            "schema": crate::contract::ROOT_SCHEMA,
+            "root_id": "0".repeat(32),
+            "nonce": "1".repeat(32),
+            "volume_uuid": UUID,
+            "owner": "barge",
+            "kind": kind,
+            "area": {"namespace": "example", "area": "pool", "effective": null},
+            "created_ms": 10,
+            "generation": 1,
+            "origin": "created",
+            "conclusion": null
+        });
+        if kind == RootKind::ScratchRun {
+            value["conclusion"] = serde_json::json!({
+                "concluded_ms": 10,
+                "outcome": "closed",
+                "closure": "positive",
+                "kept_reason": "evidence",
+                "nested_scope": "exclusive"
+            });
+        }
+        MarkerState::Owned(Box::new(
+            serde_json::from_value(value).expect("the fixture marker parses"),
+        ))
+    }
+
+    fn idle_inputs<'a>(
+        marker: &'a MarkerState,
+        activity: &'a ActivityReading,
+        holds: &'a HoldReading,
+        participation: IdleParticipation,
+    ) -> IdleInputs<'a> {
+        IdleInputs {
+            marker,
+            activity,
+            holds,
+            participation,
+            now_ms: 1_000,
+        }
+    }
+
+    fn assert_blocked(row: IdleRow, reason: IdleReason) {
+        assert_eq!(row.state, IdleState::NotIdle);
+        assert_eq!(row.reason, Some(reason));
+    }
+
+    #[test]
+    fn a_new_root_records_activity_at_generation_zero_with_no_release() {
+        let fixture = Fixture::new("activity-creation");
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let path = fixture
+            .state
+            .activity_path(&root.root_id)
+            .expect("the activity path");
+        assert!(path.is_file(), "creation writes the activity record");
+        let mode = std::fs::metadata(&path)
+            .expect("the record has metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "an activity record is private");
+        let reading =
+            read_activity(&fixture.state, &fixture.observer(), &root.root_id).expect("it reads");
+        assert_eq!(reading.state, ActivityStateName::Unreleased);
+        let record = reading.record.expect("the record parsed");
+        assert_eq!(record.schema, "barge.activity/1");
+        assert_eq!(record.root_id, root.root_id);
+        assert_eq!(record.volume_uuid, UUID);
+        assert_eq!(record.last_release_ms, 0);
+        assert_eq!(record.releases, 0);
+        assert_eq!(record.generation, 0);
+        assert_eq!(record.first_created_ms, root.created_ms);
+        // A root that was created and never released is reported at the volume
+        // root's own listing, where its bytes must be *kept*.
+        let listing = fixture.list(&resolved);
+        let row = &listing.roots[0];
+        assert_eq!(row.activity.state, ActivityStateName::Unreleased);
+        assert!(
+            row.idle,
+            "stage 1's hold-only idleness is untouched by the activity record"
+        );
+        assert_blocked(row.space_idle, IdleReason::ActivityUnreleased);
+    }
+
+    #[test]
+    fn a_release_records_one_release_fact_and_an_absent_hold_records_nothing_new() {
+        let fixture = Fixture::new("activity-release");
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        let request = HoldRequest {
+            root_id: root.root_id.clone(),
+            holder: "prover".to_owned(),
+            pid: std::process::id(),
+            scope: HoldScope::Write,
+            purpose: "a fixture holder".to_owned(),
+        };
+        hold(&fixture.state, &observer, &request).expect("the hold is written");
+        let listed = fixture.list(&resolved);
+        assert_blocked(listed.roots[0].space_idle, IdleReason::HoldLive);
+
+        let released =
+            release(&fixture.state, &observer, &root.root_id, "prover").expect("the hold releases");
+        assert!(released.released);
+        assert_eq!(released.activity.state, ActivityStateName::Released);
+        let first = read_activity(&fixture.state, &observer, &root.root_id)
+            .expect("the record reads")
+            .record
+            .expect("the record parsed");
+        assert_eq!(first.releases, 1);
+        assert_eq!(first.generation, 1);
+        assert!(first.last_release_ms > 0);
+        assert_eq!(first.first_created_ms, root.created_ms);
+
+        // Releasing again records nothing new: the hold is already absent.
+        let again = release(&fixture.state, &observer, &root.root_id, "prover")
+            .expect("a second release is not an error");
+        assert!(!again.released);
+        let after = read_activity(&fixture.state, &observer, &root.root_id)
+            .expect("the record reads")
+            .record
+            .expect("the record parsed");
+        assert_eq!(after.generation, first.generation);
+        assert_eq!(after.releases, first.releases);
+
+        // A second hold and release is a second fact.
+        hold(&fixture.state, &observer, &request).expect("the hold is written again");
+        release(&fixture.state, &observer, &root.root_id, "prover").expect("it releases");
+        let twice = read_activity(&fixture.state, &observer, &root.root_id)
+            .expect("the record reads")
+            .record
+            .expect("the record parsed");
+        assert_eq!(twice.releases, 2);
+        assert_eq!(twice.generation, 2);
+        let listed = fixture.list(&resolved);
+        assert_eq!(listed.roots[0].space_idle.state, IdleState::Idle);
+    }
+
+    #[test]
+    fn a_release_never_invents_an_activity_record() {
+        let fixture = Fixture::new("activity-no-invention");
+        fixture.register(&fixture.record);
+        let root_id = "0".repeat(32);
+        let observer = fixture.observer();
+        hold(
+            &fixture.state,
+            &observer,
+            &HoldRequest {
+                root_id: root_id.clone(),
+                holder: "prover".to_owned(),
+                pid: std::process::id(),
+                scope: HoldScope::Write,
+                purpose: "a hold on a root Barge has no record of".to_owned(),
+            },
+        )
+        .expect("the hold is written");
+        let released =
+            release(&fixture.state, &observer, &root_id, "prover").expect("the hold releases");
+        assert!(released.released);
+        assert_eq!(released.activity.state, ActivityStateName::Missing);
+        assert!(
+            !fixture
+                .state
+                .activity_path(&root_id)
+                .expect("the path")
+                .exists(),
+            "a release of an unrecorded root writes no activity record"
+        );
+    }
+
+    #[test]
+    fn an_activity_record_that_does_not_verify_is_unknown_and_never_idle() {
+        let fixture = Fixture::new("activity-invalid");
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        let path = fixture
+            .state
+            .activity_path(&root.root_id)
+            .expect("the activity path");
+        let valid = std::fs::read(&path).expect("the record reads");
+        for edit in [
+            |value: &mut serde_json::Value| value["schema"] = "barge.activity/2".into(),
+            |value: &mut serde_json::Value| value["root_id"] = "1".repeat(32).into(),
+            |value: &mut serde_json::Value| value["volume_uuid"] = "not-a-uuid".into(),
+            |value: &mut serde_json::Value| value["releases"] = 3.into(),
+            |value: &mut serde_json::Value| value["first_created_ms"] = u64::MAX.into(),
+            |value: &mut serde_json::Value| value["unknown_field"] = true.into(),
+        ] {
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&valid).expect("the record parses");
+            edit(&mut document);
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&document).expect("the record encodes"),
+            )
+            .expect("the record is written");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("the record is private");
+            let reading =
+                read_activity(&fixture.state, &observer, &root.root_id).expect("the record reads");
+            assert_eq!(reading.state, ActivityStateName::Unverified, "{document}");
+            let listed = fixture.list(&resolved);
+            assert_blocked(listed.roots[0].space_idle, IdleReason::ActivityUnknown);
+        }
+        // A record the platform cannot read is unknown too, never a release.
+        std::fs::write(&path, b"not json").expect("the record is overwritten");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("the record is private");
+        assert_eq!(
+            read_activity(&fixture.state, &observer, &root.root_id)
+                .expect("the record reads")
+                .state,
+            ActivityStateName::Unverified
+        );
+        // A record with a mode that is not private is not trusted.
+        std::fs::write(&path, &valid).expect("the record is restored");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("the record is world readable");
+        assert_eq!(
+            read_activity(&fixture.state, &observer, &root.root_id)
+                .expect("the record reads")
+                .state,
+            ActivityStateName::Unverified
+        );
+        // A missing file is missing, and the root stays kept.
+        std::fs::remove_file(&path).expect("the record is removed");
+        let reading =
+            read_activity(&fixture.state, &observer, &root.root_id).expect("the record reads");
+        assert_eq!(reading.state, ActivityStateName::Missing);
+        let listed = fixture.list(&resolved);
+        assert_blocked(listed.roots[0].space_idle, IdleReason::ActivityUnknown);
+    }
+
+    #[test]
+    fn the_idleness_matrix_keeps_every_root_that_is_not_positively_idle() {
+        let live = HoldReading {
+            holds: vec![(
+                super::HoldRecord {
+                    schema: crate::contract::HOLD_SCHEMA.to_owned(),
+                    root_id: "0".repeat(32),
+                    holder: "prover".to_owned(),
+                    pid: 7,
+                    process_start: 7,
+                    boot_identity: BOOT.to_owned(),
+                    scope: HoldScope::Write,
+                    purpose: "a fixture holder".to_owned(),
+                    held_ms: 5,
+                },
+                HoldState::Live,
+                None,
+            )],
+            total: 1,
+            truncated: false,
+        };
+        let mut stale = live.clone();
+        stale.holds[0].1 = HoldState::Stale;
+        let mut undecidable = live.clone();
+        undecidable.holds[0].1 = HoldState::Unknown;
+        let mut truncated = HoldReading::empty();
+        truncated.truncated = true;
+
+        let owned = owned_marker(RootKind::AreaRoot);
+        let absent = MarkerState::Absent;
+        let unknown = MarkerState::Unknown {
+            reason: "the marker is foreign".to_owned(),
+        };
+        let activity = released(&"0".repeat(32), 500, 100);
+        let unreleased = ActivityReading {
+            state: ActivityStateName::Unreleased,
+            record: Some(record(&"0".repeat(32), 0, 100, 0)),
+            reason: None,
+        };
+        let future = released(&"0".repeat(32), 5_000, 100);
+        let mut future_own_write = activity.clone();
+        if let Some(record) = future_own_write.record.as_mut() {
+            record.recorded_ms = 5_000;
+        }
+
+        assert_eq!(
+            assess_idleness(&idle_inputs(
+                &owned,
+                &activity,
+                &HoldReading::empty(),
+                IdleParticipation::Counts
+            ))
+            .state,
+            IdleState::Idle
+        );
+        assert_eq!(
+            assess_idleness(&idle_inputs(
+                &owned,
+                &activity,
+                &stale,
+                IdleParticipation::Scratch
+            ))
+            .state,
+            IdleState::Idle,
+            "a stale hold does not keep a root busy"
+        );
+        assert_blocked(
+            assess_idleness(&idle_inputs(
+                &absent,
+                &activity,
+                &HoldReading::empty(),
+                IdleParticipation::Counts,
+            )),
+            IdleReason::MarkerUnverified,
+        );
+        assert_blocked(
+            assess_idleness(&idle_inputs(
+                &unknown,
+                &activity,
+                &HoldReading::empty(),
+                IdleParticipation::Counts,
+            )),
+            IdleReason::MarkerUnverified,
+        );
+        assert_blocked(
+            assess_idleness(&idle_inputs(
+                &owned,
+                &ActivityReading::missing(),
+                &HoldReading::empty(),
+                IdleParticipation::Counts,
+            )),
+            IdleReason::ActivityUnknown,
+        );
+        assert_blocked(
+            assess_idleness(&idle_inputs(
+                &owned,
+                &ActivityReading::unverified("unreadable"),
+                &HoldReading::empty(),
+                IdleParticipation::Counts,
+            )),
+            IdleReason::ActivityUnknown,
+        );
+        assert_blocked(
+            assess_idleness(&idle_inputs(
+                &owned,
+                &unreleased,
+                &HoldReading::empty(),
+                IdleParticipation::Counts,
+            )),
+            IdleReason::ActivityUnreleased,
+        );
+        assert_blocked(
+            assess_idleness(&idle_inputs(
+                &owned,
+                &future,
+                &HoldReading::empty(),
+                IdleParticipation::Counts,
+            )),
+            IdleReason::ActivityFuture,
+        );
+        assert_blocked(
+            assess_idleness(&idle_inputs(
+                &owned,
+                &future_own_write,
+                &HoldReading::empty(),
+                IdleParticipation::Counts,
+            )),
+            IdleReason::ActivityFuture,
+        );
+        assert_blocked(
+            assess_idleness(&idle_inputs(
+                &owned,
+                &activity,
+                &live,
+                IdleParticipation::Counts,
+            )),
+            IdleReason::HoldLive,
+        );
+        assert_blocked(
+            assess_idleness(&idle_inputs(
+                &owned,
+                &activity,
+                &undecidable,
+                IdleParticipation::Counts,
+            )),
+            IdleReason::HoldUnknown,
+        );
+        assert_blocked(
+            assess_idleness(&idle_inputs(
+                &owned,
+                &activity,
+                &truncated,
+                IdleParticipation::Counts,
+            )),
+            IdleReason::HoldUnknown,
+        );
+        assert_blocked(
+            assess_idleness(&idle_inputs(
+                &owned,
+                &activity,
+                &HoldReading::empty(),
+                IdleParticipation::Excluded,
+            )),
+            IdleReason::ParticipationExcluded,
+        );
+        assert_blocked(
+            assess_idleness(&idle_inputs(
+                &owned,
+                &activity,
+                &HoldReading::empty(),
+                IdleParticipation::Undeclared,
+            )),
+            IdleReason::ParticipationUndeclared,
+        );
+        // A scratch root is pressure-eligible only when it is positively
+        // concluded: the pressure predicate relaxes the age, never the four
+        // facts the conclusion records.
+        let concluded = owned_marker(RootKind::ScratchRun);
+        assert_eq!(
+            assess_idleness(&idle_inputs(
+                &concluded,
+                &activity,
+                &HoldReading::empty(),
+                IdleParticipation::Scratch
+            ))
+            .state,
+            IdleState::Idle,
+            "a positively concluded scratch root is pressure-eligible"
+        );
+        for conclusion in [
+            None,
+            Some(super::RootConclusion {
+                concluded_ms: 900,
+                outcome: super::ConclusionOutcome::Retained,
+                closure: super::ConclusionClosure::Positive,
+                kept_reason: super::KeptReason::Evidence,
+                nested_scope: super::NestedScope::Exclusive,
+            }),
+            Some(super::RootConclusion {
+                concluded_ms: 900,
+                outcome: super::ConclusionOutcome::Closed,
+                closure: super::ConclusionClosure::None,
+                kept_reason: super::KeptReason::Evidence,
+                nested_scope: super::NestedScope::Exclusive,
+            }),
+            Some(super::RootConclusion {
+                concluded_ms: 900,
+                outcome: super::ConclusionOutcome::Closed,
+                closure: super::ConclusionClosure::Positive,
+                kept_reason: super::KeptReason::Evidence,
+                nested_scope: super::NestedScope::Hosting,
+            }),
+            Some(super::RootConclusion {
+                concluded_ms: 900,
+                outcome: super::ConclusionOutcome::Closed,
+                closure: super::ConclusionClosure::Positive,
+                kept_reason: super::KeptReason::Exception,
+                nested_scope: super::NestedScope::Exclusive,
+            }),
+        ] {
+            let MarkerState::Owned(mut marker) = owned_marker(RootKind::ScratchRun) else {
+                unreachable!("the fixture marker is owned")
+            };
+            marker.conclusion = conclusion;
+            let kept = MarkerState::Owned(marker);
+            assert_blocked(
+                assess_idleness(&idle_inputs(
+                    &kept,
+                    &activity,
+                    &HoldReading::empty(),
+                    IdleParticipation::Scratch,
+                )),
+                IdleReason::UnconcludedScratch,
+            );
+        }
+    }
+
+    #[test]
+    fn the_lru_order_is_release_then_creation_then_root_id_across_areas() {
+        // Two "areas" are just roots here: the order is volume-wide, so no
+        // candidate carries its area into the comparison.
+        let older_release = LruKey::of(&record(&"a".repeat(32), 100, 50, 1)).expect("a release");
+        let newer_release = LruKey::of(&record(&"b".repeat(32), 200, 10, 1)).expect("a release");
+        assert!(
+            older_release < newer_release,
+            "the older release goes first"
+        );
+        assert!(LruKey::of(&record(&"c".repeat(32), 0, 10, 0)).is_none());
+
+        let mut keys = [
+            LruKey::of(&record(&"f".repeat(32), 300, 20, 1)).expect("a release"),
+            LruKey::of(&record(&"e".repeat(32), 300, 10, 1)).expect("a release"),
+            LruKey::of(&record(&"d".repeat(32), 300, 10, 1)).expect("a release"),
+            LruKey::of(&record(&"9".repeat(32), 300, 0, 1)).expect("a release"),
+            LruKey::of(&record(&"0".repeat(32), 100, 99, 1)).expect("a release"),
+        ];
+        keys.sort();
+        let order: Vec<String> = keys.iter().map(|key| key.root_id.clone()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "0".repeat(32),
+                "d".repeat(32),
+                "e".repeat(32),
+                "f".repeat(32),
+                "9".repeat(32),
+            ],
+            "older release, then older creation, then root id; an unrecorded creation is last"
+        );
+        keys.reverse();
+        assert_eq!(
+            keys.iter().map(|key| key.root_id.clone()).next(),
+            Some("9".repeat(32)),
+            "the order is total and reverses cleanly"
+        );
+    }
+
+    #[test]
+    fn an_idle_baseline_repairs_a_lost_record_and_refuses_a_held_root() {
+        let fixture = Fixture::new("activity-baseline");
+        fixture.register(&fixture.record);
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        let path = fixture
+            .state
+            .activity_path(&root.root_id)
+            .expect("the activity path");
+        std::fs::remove_file(&path).expect("the record is lost");
+
+        // A live hold refuses, and nothing is written.
+        hold(
+            &fixture.state,
+            &observer,
+            &HoldRequest {
+                root_id: root.root_id.clone(),
+                holder: "prover".to_owned(),
+                pid: std::process::id(),
+                scope: HoldScope::Write,
+                purpose: "a fixture holder".to_owned(),
+            },
+        )
+        .expect("the hold is written");
+        let platform = fixture.platform();
+        let facts = fixture.facts();
+        let mounts = fixture.mounts();
+        let request = IdleBaselineRequest {
+            root_id: root.root_id.clone(),
+            volume_uuid: None,
+            mount_relative_path: None,
+        };
+        let error = idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &request,
+        )
+        .expect_err("a held root is refused");
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        assert!(!path.exists(), "a refused baseline writes no record");
+        release(&fixture.state, &observer, &root.root_id, "prover").expect("the hold releases");
+
+        // An undecidable hold refuses as custody not proven.
+        let held = hold(
+            &fixture.state,
+            &observer,
+            &HoldRequest {
+                root_id: root.root_id.clone(),
+                holder: "undecidable".to_owned(),
+                pid: std::process::id(),
+                scope: HoldScope::Write,
+                purpose: "a fixture holder".to_owned(),
+            },
+        )
+        .expect("the hold is written");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&held.path).expect("the hold reads"))
+                .expect("the hold parses");
+        document["pid"] = 4242.into();
+        std::fs::write(
+            &held.path,
+            serde_json::to_vec_pretty(&document).expect("the hold encodes"),
+        )
+        .expect("the hold is written");
+        let mut undecidable = fixture.observer();
+        undecidable.unreadable.insert(4242);
+        let error = idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &undecidable,
+            &request,
+        )
+        .expect_err("an undecidable hold is refused");
+        assert_eq!(error.kind(), ErrorKind::CustodyNotProven);
+        std::fs::remove_file(&held.path).expect("the fixture hold is removed");
+        std::fs::remove_dir(fixture.state.holds_dir().join(&root.root_id))
+            .expect("the fixture hold directory is removed");
+
+        // The repair writes a fresh record, resolved from the durable identity.
+        let report = idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &request,
+        )
+        .expect("the baseline writes");
+        assert_eq!(report.root_id, root.root_id);
+        assert_eq!(report.path, root.path);
+        assert_eq!(report.activity.state, ActivityStateName::Released);
+        assert_eq!(report.activity.releases, Some(0));
+        assert_eq!(report.activity.generation, Some(1));
+        assert_eq!(report.activity.first_created_ms, Some(root.created_ms));
+        let written = read_activity(&fixture.state, &observer, &root.root_id)
+            .expect("the record reads")
+            .record
+            .expect("the record parsed");
+        assert_eq!(written.volume_uuid, UUID);
+        assert!(written.last_release_ms > 0);
+        let listed = fixture.list(&resolved);
+        assert_eq!(listed.roots[0].space_idle.state, IdleState::Idle);
+
+        // A second baseline keeps the counted releases and bumps the generation.
+        hold(
+            &fixture.state,
+            &observer,
+            &HoldRequest {
+                root_id: root.root_id.clone(),
+                holder: "prover".to_owned(),
+                pid: std::process::id(),
+                scope: HoldScope::Write,
+                purpose: "a fixture holder".to_owned(),
+            },
+        )
+        .expect("the hold is written");
+        release(&fixture.state, &observer, &root.root_id, "prover").expect("the hold releases");
+        let reported = idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &request,
+        )
+        .expect("a second baseline writes");
+        assert_eq!(reported.activity.releases, Some(1));
+        // generation 1 was the first baseline, 2 the release, 3 this baseline.
+        assert_eq!(reported.activity.generation, Some(3));
+    }
+
+    #[test]
+    fn an_idle_baseline_refuses_what_it_cannot_verify() {
+        let fixture = Fixture::new("activity-baseline-refusals");
+        fixture.register(&fixture.record);
+        let declaration = fixture.declaration("example/pool");
+        let (root, _) = fixture.create_root(&fixture.record, &declaration);
+        let platform = fixture.platform();
+        let facts = fixture.facts();
+        let mounts = fixture.mounts();
+        let observer = fixture.observer();
+
+        // A root Barge has no record of.
+        let error = idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &IdleBaselineRequest {
+                root_id: "1".repeat(32),
+                volume_uuid: None,
+                mount_relative_path: None,
+            },
+        )
+        .expect_err("an unknown root is refused");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+
+        // Half an explicit location is a usage refusal.
+        let error = idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &IdleBaselineRequest {
+                root_id: root.root_id.clone(),
+                volume_uuid: Some(fixture.uuid.clone()),
+                mount_relative_path: None,
+            },
+        )
+        .expect_err("half a location is refused");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+
+        // The explicit location must be the root the marker names.
+        let other = "2".repeat(32);
+        let error = idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &IdleBaselineRequest {
+                root_id: other.clone(),
+                volume_uuid: Some(fixture.uuid.clone()),
+                mount_relative_path: Some(format!("example/pool/{}", root.root_id)),
+            },
+        )
+        .expect_err("a marker that names another root is refused");
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        assert!(
+            !fixture
+                .state
+                .activity_path(&other)
+                .expect("the path")
+                .exists(),
+            "a refused baseline writes nothing"
+        );
+
+        // A marker that does not verify is refused before custody.
+        rewrite_marker(&marker_path(&root), |value| {
+            value["resolved_path"] = "/somewhere/else".into();
+        });
+        let error = idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &IdleBaselineRequest {
+                root_id: root.root_id.clone(),
+                volume_uuid: Some(fixture.uuid.clone()),
+                mount_relative_path: Some(format!("example/pool/{}", root.root_id)),
+            },
+        )
+        .expect_err("an unverified marker is refused");
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+
+        // An explicit location that disagrees with Barge's durable identity
+        // record is refused rather than resolved.
+        let error = idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &IdleBaselineRequest {
+                root_id: root.root_id.clone(),
+                volume_uuid: Some(fixture.uuid.clone()),
+                mount_relative_path: Some(format!("example/pool/{}", "3".repeat(32))),
+            },
+        )
+        .expect_err("a location that disagrees with the identity record is refused");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert_eq!(
+            error.detail()["record_path"],
+            format!("example/pool/{}", root.root_id).as_str()
+        );
+
+        // An explicit path outside the volume is refused by containment.
+        let error = idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &IdleBaselineRequest {
+                root_id: root.root_id.clone(),
+                volume_uuid: Some(fixture.uuid.clone()),
+                mount_relative_path: Some("../escape".to_owned()),
+            },
+        )
+        .expect_err("a path outside the volume is refused");
+        assert_eq!(error.kind(), ErrorKind::RefusedContainment);
+
+        // An absent volume is never reconstructed from the record.
+        let absent = fixture.absent_facts();
+        let error = idle_baseline(
+            &fixture.state,
+            &platform,
+            &absent,
+            &mounts,
+            &observer,
+            &IdleBaselineRequest {
+                root_id: root.root_id.clone(),
+                volume_uuid: None,
+                mount_relative_path: None,
+            },
+        )
+        .expect_err("an absent volume is refused");
+        assert_eq!(error.kind(), ErrorKind::VolumeAbsent);
+    }
+
+    #[test]
+    fn an_idle_baseline_is_refused_by_an_invalid_registry_and_writes_nothing() {
+        let fixture = Fixture::new("activity-baseline-registry");
+        let declaration = fixture.declaration("example/pool");
+        let (root, _) = fixture.create_root(&fixture.record, &declaration);
+        fixture.state.initialize().expect("the layout exists");
+        std::fs::write(fixture.state.registry_path(), b"{ not a registry")
+            .expect("the invalid registry is written");
+        let path = fixture
+            .state
+            .activity_path(&root.root_id)
+            .expect("the activity path");
+        std::fs::remove_file(&path).expect("the record is lost");
+        let platform = fixture.platform();
+        let facts = fixture.facts();
+        let mounts = fixture.mounts();
+        let observer = fixture.observer();
+        let error = idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &IdleBaselineRequest {
+                root_id: root.root_id.clone(),
+                volume_uuid: None,
+                mount_relative_path: None,
+            },
+        )
+        .expect_err("an invalid registry refuses");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(!path.exists(), "the refusal wrote no record");
     }
 
     #[test]

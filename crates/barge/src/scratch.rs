@@ -3966,7 +3966,13 @@ mod tests {
             .expect("the run concludes");
             // A concluded run releases its owner hold; that is what makes the
             // root idle, and expiry is never taken on a live holder's root.
-            area::release(&self.fixture.state, &root_id, holder).expect("the hold is released");
+            area::release(
+                &self.fixture.state,
+                &self.fixture.observer(),
+                &root_id,
+                holder,
+            )
+            .expect("the hold is released");
         }
 
         fn plan(&self, days: u64) -> super::ExpireReport {
@@ -6599,7 +6605,13 @@ mod tests {
             .pending()
             .next()
             .is_none());
-        area::release(&harness.fixture.state, &name, "owner").expect("release");
+        area::release(
+            &harness.fixture.state,
+            &harness.fixture.observer(),
+            &name,
+            "owner",
+        )
+        .expect("release");
         let current = |_record: &crate::registry::VolumeRecord| Ok(());
         let report = crate::delete::delete_unit_authorized(
             &harness.fixture.state,

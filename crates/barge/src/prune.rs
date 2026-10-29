@@ -2096,7 +2096,13 @@ mod tests {
                 },
             )
             .expect("the run concludes");
-            area::release(&self.fixture.state, &root_id, holder).expect("the hold is released");
+            area::release(
+                &self.fixture.state,
+                &self.fixture.observer(),
+                &root_id,
+                holder,
+            )
+            .expect("the hold is released");
         }
 
         fn scratch_folder(&self) -> PathBuf {

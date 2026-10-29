@@ -128,6 +128,7 @@ fn describe_json_prints_one_document_and_creates_nothing() {
     assert_eq!(data["formats"]["describe"], "barge.describe/1");
     assert_eq!(data["formats"]["error"], "barge.error/1");
     assert_eq!(data["formats"]["registry"], "barge.registry/1");
+    assert_eq!(data["formats"]["activity"], "barge.activity/1");
     assert_eq!(data["state"]["dir"], state_dir.display().to_string());
     assert_eq!(data["state"]["initialized"], false);
     assert_eq!(data["state"]["source"], "environment_override");
@@ -688,6 +689,10 @@ fn area_hold_and_release_record_and_remove_one_hold() {
     let document = stdout_document(&output);
     assert_eq!(document["schema"], "barge.area.release/1");
     assert_eq!(document["data"]["released"], true);
+    // A root Barge has no activity record for is reported as missing, and the
+    // release invents none: the repair is the explicit `area idle-baseline`.
+    assert_eq!(document["data"]["activity"]["state"], "missing");
+    assert!(!state_dir.join(format!("activity/{root}.json")).exists());
     assert!(!path.exists());
 
     let output = run_area(
@@ -700,6 +705,60 @@ fn area_hold_and_release_record_and_remove_one_hold() {
         "a second release is not an error"
     );
     assert_eq!(stdout_document(&output)["data"]["released"], false);
+}
+
+#[test]
+fn area_idle_baseline_refuses_a_root_it_cannot_locate_and_writes_nothing() {
+    let (_fixture, state_dir) = absent_state_dir("area-idle-baseline");
+    let root = "0123456789abcdef0123456789abcdef";
+    let output = run_area(&["idle-baseline", "--root", root], &state_dir);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a root Barge has no record of is unknown state"
+    );
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.error/1");
+    assert_eq!(document["command"], "area.idle-baseline");
+    assert_eq!(document["error"]["kind"], "unknown_state");
+    assert_eq!(document["error"]["detail"]["root_id"], root);
+    assert!(
+        !state_dir.join("activity").exists(),
+        "a refused baseline writes no activity directory"
+    );
+
+    // Half an explicit location is a usage refusal, and still writes nothing.
+    let output = run_area(
+        &[
+            "idle-baseline",
+            "--root",
+            root,
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+    assert!(!state_dir.join("activity").exists());
+
+    // A malformed volume uuid is refused by the same parse every verb uses, and
+    // an unknown uuid is unknown state rather than a usage error there.
+    let output = run_area(
+        &[
+            "idle-baseline",
+            "--root",
+            root,
+            "--volume",
+            "not-a-uuid",
+            "--path",
+            "barge/example/pool",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "unknown_state");
+    assert!(!state_dir.exists(), "a refused parse creates no state");
 }
 
 #[test]
