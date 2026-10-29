@@ -1013,13 +1013,16 @@ fn observe_row(
         return None;
     }
     let unknown = |reason| Some(CensusIdentity::unknown(reason));
-    let Some(recorded_dev) = row.root_dev() else {
-        // The row records no identity facts to compare against. A v1-era row is
-        // the ordinary case, and the honest answer is that nothing can decide.
-        return unknown(IdentityReason::IdentityRecordMissing);
-    };
-    let Some(recorded_ino) = row.root_ino() else {
-        return unknown(IdentityReason::IdentityRecordMissing);
+    // A row may record no device or inode, which a `/1`-era row legitimately
+    // does. The stored comparison is then unavailable, but the physical
+    // observation is not: the volume, the walk and the marker are all still read,
+    // so a reachable marker's changed bytes are evidence the drift report owes an
+    // operator. The verdict stays unknown, and a path that is absent stays unknown
+    // too, because without a recorded inode the recorded directory cannot be tied
+    // to that path.
+    let recorded = match (row.root_dev(), row.root_ino()) {
+        (Some(device), Some(inode)) => Some((device, inode)),
+        _ => None,
     };
     let Some(raw_uuid) = row.volume_uuid() else {
         return unknown(IdentityReason::VolumeUnverified);
@@ -1109,6 +1112,9 @@ fn observe_row(
         current = opened;
     }
     if leaf_gone {
+        if recorded.is_none() {
+            return unknown(IdentityReason::IdentityRecordMissing);
+        }
         // "Gone" is only reachable from a volume that still verifies, and only
         // when nothing moved under the walk that reached the missing leaf.
         let stable = volume.reverify(facts).is_ok()
@@ -1120,7 +1126,7 @@ fn observe_row(
                 reason: None,
                 inode_equal: None,
                 device_equal: None,
-                recorded_device: Some(recorded_dev),
+                recorded_device: recorded.map(|(device, _)| device),
                 live_device: None,
                 live_inode: None,
                 recorded_mount: Some(recorded_mount),
@@ -1134,19 +1140,16 @@ fn observe_row(
     }
     let live = current.identity();
     let live_device = live.device.get();
-    let inode_equal = live.inode == recorded_ino;
-    let device_equal = live_device == recorded_dev;
-    let remount = RemountEvidence {
-        device_at_record: recorded_dev,
-        device_live: live_device,
-        changed: !device_equal,
-    };
-    let kept = |reason, marker_digest_equal| CensusIdentity {
+    // Both comparisons are absent, never `false`, when the row recorded nothing to
+    // compare: an unavailable fact is not a disagreement.
+    let inode_equal = recorded.map(|(_, inode)| live.inode == inode);
+    let device_equal = recorded.map(|(device, _)| live_device == device);
+    let kept = |reason: IdentityReason, marker_digest_equal| CensusIdentity {
         verdict: CensusVerdict::Unknown,
         reason: Some(reason),
-        inode_equal: Some(inode_equal),
-        device_equal: Some(device_equal),
-        recorded_device: Some(recorded_dev),
+        inode_equal,
+        device_equal,
+        recorded_device: recorded.map(|(device, _)| device),
         live_device: Some(live_device),
         live_inode: Some(live.inode),
         recorded_mount: Some(recorded_mount.clone()),
@@ -1154,13 +1157,15 @@ fn observe_row(
         marker_digest_equal,
         remount: None,
     };
-    // A changed inode decides the verdict, and the marker is still read: whether
-    // its bytes changed is evidence the drift report owes an operator, and the
-    // first decisive reason is the inode's, exactly as a root verification orders
-    // it. A marker that cannot be read keeps the inode's reason and has no digest.
-    let inode_changed = !inode_equal;
+    // A missing recorded identity or a changed inode decides the verdict, and the
+    // marker is still read: whether its bytes changed is evidence the drift report
+    // owes an operator. The first decisive reason wins, exactly as a root
+    // verification orders it, and a marker that cannot be read keeps that reason
+    // with no digest.
     let marker_reason = |reason: IdentityReason| {
-        if inode_changed {
+        if recorded.is_none() {
+            IdentityReason::IdentityRecordMissing
+        } else if inode_equal == Some(false) {
             IdentityReason::InodeChanged
         } else {
             reason
@@ -1200,7 +1205,10 @@ fn observe_row(
     let digest_equal = row
         .marker_digest()
         .map(|recorded| recorded == crate::digest::sha256_hex(&bytes));
-    if inode_changed {
+    if recorded.is_none() {
+        return Some(kept(IdentityReason::IdentityRecordMissing, digest_equal));
+    }
+    if inode_equal == Some(false) {
         return Some(kept(IdentityReason::InodeChanged, digest_equal));
     }
     let value: serde_json::Value = match serde_json::from_slice(&bytes) {
@@ -1258,18 +1266,25 @@ fn observe_row(
     if !stable {
         return Some(kept(IdentityReason::PathChanged, digest_equal));
     }
+    let Some((recorded_device, _)) = recorded else {
+        return Some(kept(IdentityReason::IdentityRecordMissing, digest_equal));
+    };
     Some(CensusIdentity {
         verdict: CensusVerdict::Verified,
         reason: None,
         inode_equal: Some(true),
-        device_equal: Some(device_equal),
-        recorded_device: Some(recorded_dev),
+        device_equal: Some(recorded_device == live_device),
+        recorded_device: Some(recorded_device),
         live_device: Some(live_device),
         live_inode: Some(live.inode),
         recorded_mount: Some(recorded_mount),
         live_mount: Some(live_mount),
         marker_digest_equal: digest_equal,
-        remount: Some(remount),
+        remount: Some(RemountEvidence {
+            device_at_record: recorded_device,
+            device_live: live_device,
+            changed: recorded_device != live_device,
+        }),
     })
 }
 
@@ -2099,6 +2114,83 @@ mod tests {
     }
 
     #[test]
+    fn a_row_without_recorded_identity_still_compares_its_marker() {
+        // A `/1`-era row records no device or inode. The stored comparison is
+        // absent, but the walk and the marker read are not: changed marker bytes
+        // are still observed and counted, and the verdict stays unknown.
+        let fixture = Fixture::new("census-missing-identity");
+        let mut row = fixture.row_json();
+        row.as_object_mut()
+            .expect("a row object")
+            .remove("root_ino");
+
+        // Unchanged bytes: compared, nothing counted.
+        let report = fixture.census(vec![row.clone()]);
+        let identity = &fixture.row(&report).identity;
+        assert_eq!(identity.reason, Some(IdentityReason::IdentityRecordMissing));
+        assert_eq!(identity.inode_equal, None, "no recorded inode to compare");
+        assert_eq!(identity.device_equal, None);
+        assert_eq!(identity.live_inode, Some(fixture.row.inode));
+        assert_eq!(identity.live_device, Some(fixture.row.device));
+        assert_eq!(identity.marker_digest_equal, Some(true));
+        assert_eq!(
+            report.drift.as_ref().map(|drift| drift.marker_changed),
+            Some(0)
+        );
+
+        // Rewritten bytes: observed and counted, whatever the verdict.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fixture.row.marker).expect("the fixture marker decodes");
+        value["label"] = serde_json::json!("profile: dev (rewritten)");
+        write_marker(
+            &fixture.row.root,
+            &serde_json::to_vec(&value).expect("the marker encodes"),
+        );
+        let report = fixture.census(vec![row.clone()]);
+        let identity = &fixture.row(&report).identity;
+        assert_eq!(identity.reason, Some(IdentityReason::IdentityRecordMissing));
+        assert_eq!(identity.marker_digest_equal, Some(false));
+        let drift = report.drift.as_ref().expect("the drift report");
+        assert_eq!(drift.marker_changed, 1);
+        assert_eq!(drift.unknown, 1);
+        assert_eq!(drift.inode_changed, 0);
+
+        // The same with the device missing instead of the inode.
+        write_marker(&fixture.row.root, &fixture.row.marker);
+        let mut without_device = fixture.row_json();
+        without_device
+            .as_object_mut()
+            .expect("a row object")
+            .remove("root_dev");
+        let report = fixture.census(vec![without_device]);
+        let identity = &fixture.row(&report).identity;
+        assert_eq!(identity.reason, Some(IdentityReason::IdentityRecordMissing));
+        assert_eq!(identity.marker_digest_equal, Some(true));
+        assert_eq!(identity.device_equal, None);
+
+        // A marker that cannot be read has no digest, so nothing is counted.
+        std::fs::remove_file(fixture.row.root.join(super::OXIDE_ROOT_MARKER_FILE))
+            .expect("the fixture marker is removed");
+        let report = fixture.census(vec![row.clone()]);
+        let identity = &fixture.row(&report).identity;
+        assert_eq!(identity.reason, Some(IdentityReason::IdentityRecordMissing));
+        assert_eq!(identity.marker_digest_equal, None);
+        assert_eq!(
+            report.drift.as_ref().map(|drift| drift.marker_changed),
+            Some(0)
+        );
+
+        // An absent path is not `gone` for such a row: without a recorded inode
+        // the recorded directory cannot be tied to that path.
+        std::fs::remove_dir_all(&fixture.row.root).expect("the fixture root is removed");
+        let report = fixture.census(vec![row]);
+        let identity = &fixture.row(&report).identity;
+        assert_eq!(identity.reason, Some(IdentityReason::IdentityRecordMissing));
+        assert_eq!(identity.verdict, CensusVerdict::Unknown);
+        assert_eq!(report.drift.as_ref().map(|drift| drift.gone), Some(0));
+    }
+
+    #[test]
     fn an_oversized_or_symlinked_marker_is_unknown_not_read() {
         let fixture = Fixture::new("census-marker-unreadable");
         let marker = fixture.row.root.join(super::OXIDE_ROOT_MARKER_FILE);
@@ -2135,6 +2227,11 @@ mod tests {
         assert_eq!(
             report.rows.rows[0].identity.reason,
             Some(IdentityReason::IdentityRecordMissing)
+        );
+        assert_eq!(
+            report.rows.rows[0].identity.marker_digest_equal,
+            Some(true),
+            "the marker is still compared for a row with no recorded inode"
         );
         assert_eq!(
             report.rows.rows[1].identity.reason,

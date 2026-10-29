@@ -1277,7 +1277,12 @@ Choices F5 made where this contract left the mechanics to the slice:
   require. A row that records no device or inode is
   `unknown(identity_record_missing)` — in an Oxide row that is what is missing,
   and a `/1`-era row is the ordinary case — and a row that records no usable
-  volume UUID is `unknown(volume_unverified)`. A value is never defaulted.
+  volume UUID is `unknown(volume_unverified)`. A value is never defaulted. A row
+  missing its recorded identity facts is still walked and its marker still read:
+  the stored inode and device comparisons are absent, but changed marker bytes are
+  reported and counted like any other, and a recorded path that is absent stays
+  `unknown(identity_record_missing)` rather than `gone`, because without a
+  recorded inode the recorded directory cannot be tied to that path.
 - **Per row, never per batch.** One undecidable row never stops the others: a
   volume that is away, a marker that is unexpected and a row without recorded
   identity facts each keep only their own row. `inode_equal` and `device_equal`
