@@ -25,6 +25,7 @@ use barge::area::{
     RootListReport, RootSpec, ShowReport,
 };
 use barge::cache::{self, AdoptRequest, CacheKind, FormRequest, UndoRequest};
+use barge::census::OxideCensusReport;
 use barge::contract::{
     self, AREA_DECLARE_SCHEMA, AREA_HOLD_SCHEMA, AREA_LIST_SCHEMA, AREA_RELEASE_SCHEMA,
     AREA_ROOT_CREATE_SCHEMA, AREA_ROOT_LIST_SCHEMA, AREA_SHOW_SCHEMA, CACHE_ADOPT_SCHEMA,
@@ -1584,6 +1585,11 @@ fn inspect() -> Result<InspectData, Error> {
         environment_home: environment_home.as_deref(),
         state_dir_override: state_dir_override.as_deref(),
         tool_version: env!("CARGO_PKG_VERSION"),
+        dirs: &platform,
+        facts: &platform,
+        mounts: &platform,
+        prefixes: &platform,
+        observer: &platform,
     })
 }
 
@@ -1703,8 +1709,9 @@ fn inspect_summary(data: &InspectData) -> String {
         describe::RegistryReportState::Invalid => "invalid".to_owned(),
     };
     let oxide = &data.oxide;
+    let census = &data.oxide_census;
     format!(
-        "barge {} ({INSPECT_SCHEMA})\nstate directory: {} ({state}, from {})\nhome: {}\nregistry: {} ({registry})\noxide registration: {} ({})\noxide pools: {} ({})\n",
+        "barge {} ({INSPECT_SCHEMA})\nstate directory: {} ({state}, from {})\nhome: {}\nregistry: {} ({registry})\noxide registration: {} ({})\noxide pools: {} ({})\noxide outputs census: {} ({})\n",
         data.tool.version,
         data.state.dir.display(),
         source_name(data.state.source),
@@ -1714,6 +1721,33 @@ fn inspect_summary(data: &InspectData) -> String {
         observation_name(oxide.registration.state),
         oxide.pools.path.display(),
         observation_name(oxide.pools.state),
+        census.path.display(),
+        census_line(census),
+    )
+}
+
+/// The census line: the registry's state, then what the census counted. An
+/// absent or unknown registry says so and never reads as a drift of zero.
+fn census_line(census: &OxideCensusReport) -> String {
+    let Some(drift) = &census.drift else {
+        return observation_name(census.state).to_owned();
+    };
+    format!(
+        "{}, {} of {} rows examined, {} verified, {} device moved, {} inode changed, {} marker changed, {} gone, {} unknown{}",
+        observation_name(census.state),
+        drift.examined,
+        census.rows.total,
+        drift.verified,
+        drift.device_moved,
+        drift.inode_changed,
+        drift.marker_changed,
+        drift.gone,
+        drift.unknown,
+        if drift.unexamined == 0 {
+            String::new()
+        } else {
+            format!(", {} not reached", drift.unexamined)
+        },
     )
 }
 

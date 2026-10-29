@@ -27,7 +27,10 @@ the identity capability and each registered UUID's census, with unavailable
 censuses reported as unknown. `barge area root identify --volume <uuid> --path
 <mount-relative-path>` explicitly identifies a root without a record only after
 verifying its volume and marker and obtaining safe custody. It never overwrites
-a record.
+a record. `barge inspect` censuses Oxide's output-registry rows read-only and
+reports, per row, whether the recorded device moved or the recorded directory
+changed, with the drift counted — the evidence the carried finding needs, and no
+adoption.
 
 No part of this contract authorizes a native run, a real drive, a mount or host
 setting change, a data move, a deletion, or any change to Oxide.
@@ -814,7 +817,7 @@ fields are understood by both.
 | `barge.maintain.plan` | `/1`, fields completed | `barge maintain --plan` | adds the `release` array and per-area plan digests; the space stage's own rows are the stage 3 design's |
 | `barge.intent` | `/2`, landed in S5 (with `/1` still read); optional fields added | `state/intents/<intent-id>.json` | adds `identity` and `absence`; the unit's `device`, `inode` and optional marker digest stay the within-run observation |
 | `barge.describe` | `/1`, optional fields added | `barge describe` | adds `identity.capability` (what may be compared across a remount) and `volumes[].mounts` (how many live mounts carry each registered UUID) |
-| `barge.inspect` | `/1`, optional fields added | `barge inspect` | adds the Oxide registry observation and the per-row identity census |
+| `barge.inspect` | `/1`, optional fields added | `barge inspect` | adds `oxide_census`: the Oxide output-registry observation, its per-row identity census and the drift summary |
 
 The versioning rules are stage 1's: adding an optional field stays inside a
 major; removing one, changing a type or a meaning is a new major.
@@ -1191,9 +1194,119 @@ qualification claim, and none contradicts a frozen ruling.
   authoritative, used by `barge inspect` alone, and retired when Oxide adopts its
   area. This widens a read boundary that stage 1 set deliberately, so the
   architect should confirm it before F5; the alternative is to answer the finding
-  only after Oxide's adoption, which delays the 91 held roots further.
+  only after Oxide's adoption, which delays the 91 held roots further. F5 lands
+  it in that form; [the F5 note](#f5-output-registry-census) records the
+  concrete readings a slice had to fix inside it.
 - **O4-007 — Who may prune an Oxide root, and when.** Proposed: nobody but
   Oxide until Oxide declares its areas and switches, so the gate is proven
   against Barge-owned roots first; the 91 legacy roots then need an operator list
   and an adoption decision that `ff13f2ef` already tracks. Nothing in this
   contract authorizes a single Oxide root to be deleted by Barge.
+
+### F5 output-registry census
+
+`barge inspect` reports one further read-only observation: Oxide's output
+registry, `<internal pool>/outputs/registry.json`, at `oxide.outputs.registry/2`
+and `/1`. The report is `barge.inspect/1`'s optional `oxide_census` field (an
+optional field inside the major, so an older document still reads); it holds the
+registry's own state, then one row per recorded reference and the drift summary.
+Nothing in it becomes authoritative, no marker is read beyond one bounded 64 KiB
+read per root, and no row is ever skipped. A row whose recorded volume is away
+reports `unknown(volume_unverified)` instead of disappearing.
+
+Choices F5 made where this contract left the mechanics to the slice:
+
+- **Finding the registry.** The candidate internal pools are the ones the
+  registration lookup already uses: every pool Oxide's own `pools.json` names,
+  then `Library/Caches/oxide/build-pool` and `Library/Caches/oxide/pool`. The
+  first candidate whose `outputs/registry.json` is present decides; one that is
+  present but unreadable is `unknown_state` and is never looked past. An absent
+  registry reports every path it looked at, so "no registry" never reads as "a
+  registry with no rows".
+- **The pool list must be known, not assumed.** `pools.json` is the census's
+  source of sources, so the slice distinguishes its three outcomes. A **reported**
+  record gives the pools to search, followed by the defaults. An **absent** record
+  is a fact — Oxide recorded no pool, so only its defaults can be in use — and the
+  defaults are then the complete list. An **unreadable, oversized or divergent**
+  record is not a fact about which pools exist: the census reports
+  `unknown_state` naming that record, looks at no registry at all, and so neither
+  pronounces the registry absent because a pool Barge cannot see was skipped nor
+  reports a default pool's registry as the whole truth. An absent census is only
+  ever reached from a complete candidate list.
+- **Strict and bounded.** The document is read with Oxide's own caps — 4 MiB and
+  4096 rows — and `deny_unknown_fields` at every level it reads. Its
+  `version`/`schema` pair must be `/2` with 2 or `/1` with 1; an unknown pair, a
+  zero revision, an unusable `created_by`, disagreeing `complete`/`incomplete`,
+  an over-cap row count or a divergent field set is `unknown_state` naming the
+  file. Its `rows` member is required, because Oxide always writes it even when
+  it holds none: a document without `rows` is divergent, never an empty registry,
+  and its absence is not evidence that no root is recorded. `intents` and
+  `cancelled_overflow` are the members Oxide omits when they are empty, so they
+  are accepted as absent and stay presence-only: the census reads rows.
+- **Anchoring a recorded root.** The volume is found by the row's recorded UUID
+  through the same bounded mount census a root verification uses, so a mount
+  that moved still resolves. The recorded path's `/Volumes/<mount>` prefix is
+  replaced by the verified live mount and every component below it is walked
+  exactly, through held descriptors with no-follow `fstatat`/`openat` pairs, the
+  same walk [verifying a root](#verifying-a-root) takes. A recorded UUID that is
+  not canonical, and a path the platform has no mount prefix for, are
+  `unknown(volume_unverified)` and `unknown(path_changed)`: nothing is repaired
+  and nothing is guessed. `path_changed` is the census's name for every way the
+  recorded path fails to name the recorded directory — an unusable remainder, a
+  missing intermediate component, a component replaced between its reading and
+  its opening, or more than 64 components — because all of them mean the same
+  thing and none of them is absence.
+- **The verdict.** `verified`, `unknown(reason)` or `gone`. A device change is
+  never a refusal: it is `device_equal: false` with `remount` carrying both
+  numbers, and the verdict stays `verified`. A changed inode is
+  `unknown(inode_changed)` with both inodes reported, and its marker is still read
+  and compared: the inode decides the verdict first, but changed marker bytes are
+  evidence an operator is owed, so the census reports and counts them too. `gone` is reachable only
+  from a volume that still verifies and a path that is `ENOENT`, and only after
+  the mount census, the volume and the parent descriptor are re-read unchanged.
+  The recorded owner marker's own version rules come first, exactly as Oxide
+  applies them: an `oxide.outputs.root/2` marker must carry its 128-bit
+  lowercase-hex nonce, so one with the member absent or malformed is
+  `unknown(marker_schema_divergent)` — even when the row records the identical
+  absent or malformed value, because two equal nonces that identify nothing are
+  not an identity — while an `oxide.outputs.root/1` marker legitimately has none.
+  After that the marker is checked in the same order as Oxide checks it (kind,
+  checkout, volume UUID, nonce, then generation), but its digest is reported as
+  `marker_digest_equal` and never decides identity — it is a plan fact re-read at
+  each step, exactly as [the identity rules](#the-facts-and-the-three-roles-a-fact-may-have)
+  require. A row that records no device or inode is
+  `unknown(identity_record_missing)` — in an Oxide row that is what is missing,
+  and a `/1`-era row is the ordinary case — and a row that records no usable
+  volume UUID is `unknown(volume_unverified)`. A value is never defaulted. A row
+  missing a recorded identity fact is still walked and its marker still read, and
+  each comparison is made whenever its own recorded fact is present: a recorded
+  device is compared with the live one when the inode is missing, and the reverse,
+  so one fact's absence never suppresses the other's diagnostic result. A
+  comparison the row cannot support is absent, never `false`. Changed marker bytes
+  are reported and counted like any other, and a recorded path that is absent
+  stays `unknown(identity_record_missing)` rather than `gone`, because without a
+  recorded inode the recorded directory cannot be tied to that path.
+- **Per row, never per batch.** One undecidable row never stops the others: a
+  volume that is away, a marker that is unexpected and a row without recorded
+  identity facts each keep only their own row. `inode_equal` and `device_equal`
+  are absent rather than `false` when the comparison could not be made, so an
+  unavailable fact never reads as a disagreement.
+- **The drift report.** `oxide_census.drift` counts what the carried finding
+  needs as one number: `verified`, of which `device_moved` are roots whose live
+  device differs from the recorded one — exactly the roots a recorded-device
+  comparison refuses — `inode_changed`, `marker_changed`, `gone`, `unknown`, and
+  `unknown_reasons` by code. `inode_changed` and `marker_changed` count the
+  differences the census observed, whatever the row's identity verdict: an inode
+  that differs is evidence even when a missing recorded fact already keeps the row,
+  a marker whose bytes differ is evidence whatever those bytes turned out to be
+  (readable divergent, malformed or unknown-version bytes are compared before they
+  are parsed, so they count too), and an unknown verdict never hides an observation
+  the census did make. Only a comparison the row could not support is `None` and
+  never counted: no recorded inode or device, or a marker the census could not read
+  at all — absent, unreadable, oversized or another user's. `device_moved` stays
+  the verified-rows number it is defined to be. `examined` and `unexamined` bound
+  the claim: the census shares one 10 s deadline with the registry read, and rows
+  it did not reach are counted, never assumed.
+- **Read-only, and no adoption.** The census takes no lock, creates nothing and
+  writes nothing. `inspect` remains the only command that uses it, and no row
+  becomes a Barge record; Oxide's roots stay Oxide's to prune (O4-007).
