@@ -1429,26 +1429,41 @@ T6, and no native proof exists or is claimed.
     bytes visible, so the release restores the previous record **byte for byte**
     and reports the same refusal with `detail.restored: true`; the hold is
     untouched in both cases;
-  - if that restore also fails, or a hold removal fails and cannot be undone, the
-    report is `unknown_state` (exit `3`) naming the record path and the hold, with
-    `detail.restored: false`: the advanced record may stay visible unconfirmed and
-    the hold is still there, so the root is kept on the hold and the next release
-    or the baseline settles it. A failed hold removal that can be undone restores
-    the previous record and reports `io` with `detail.restored: true`.
+  - if the publish landed **unconfirmed** and the previous record cannot be
+    restored, the unconfirmed record is **removed** and the report is
+    `unknown_state` (exit `3`) with `detail.restored: false` and
+    `detail.removed: true`: an absent record is `activity_unknown`, which is never
+    idle, so no root is ever made idle by a fact the platform did not confirm
+    durable, and the explicit baseline is the repair;
+  - a failed hold removal that can be undone reports `io` with
+    `detail.restored: true`, and one that cannot is `unknown_state` with
+    `detail.restored: false` — but its publish *was* confirmed, so the visible
+    record is a real release and the hold is what keeps the root while its holder
+    is live;
+  - the residual this format cannot mark: the publish landed unconfirmed, the
+    previous record cannot be restored **and** the unconfirmed record cannot be
+    removed. That is reported as `unknown_state` with `detail.restored: false` and
+    `detail.removed: false`, and the message says the visible record must not be
+    relied on; the hold keeps the root while its holder is live, and only an
+    operator settles it (repair the state volume, then re-release or run the
+    baseline). This is a state-volume failure reported as a limit, like the
+    custody limits, not a publication that is assumed durable.
 
   A release therefore never reports that it changed nothing when it changed
-  something, and never leaves an unconfirmed record as if it were a completed
-  release without saying so.
+  something, never leaves an unconfirmed record in place as a release, and never
+  lets an unconfirmed publication decide idleness while it can still be removed.
 - **What an interruption means, and why it is not unknown.** A release interrupted
   between its fact and its hold removal leaves the published fact plus a hold file,
   and that pair means exactly this (`c9d30b41`): while the holder is **positively
   live**, its hold keeps the root non-idle, so a published-but-still-held root is
   never a candidate; once the holder is **positively gone** the stale hold no
   longer blocks idleness (stage 1 defines a stale hold that way) and the published
-  release time determines the LRU order. A failed restore leaves the same pair and
-  the same meaning. This is not an unknown: the consumer published a release, and
-  the leftover hold is a stale record of a holder that is proven gone, so no fact
-  is missing. What the order rules out is the other outcome — an absent hold beside
+  release time determines the LRU order. "Published" means the record's publish
+  returned success; a publish the platform did not confirm durable is not a
+  release and is handled by the failure rules above, which remove it rather than
+  let it decide. This is not an unknown: the consumer published a release, and the
+  leftover hold is a stale record of a holder that is proven gone, so no fact is
+  missing. What the order rules out is the other outcome — an absent hold beside
   an older release time — because a released root would then be ordered on a
   release that did not remove its hold. Both cases are pinned by
   `an_interrupted_release_leaves_a_hold_never_an_older_release` and

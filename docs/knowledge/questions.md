@@ -124,7 +124,8 @@ published release time determines the LRU order. An interrupted release is
 therefore a recorded release with a leftover stale hold, not an unknown, and a
 release that fails records nothing: a failed hold removal restores the previous
 record byte for byte, a publish the platform does not confirm durable after its
-rename is rolled back the same way, and a failed restore is reported as unsettled
-with the hold standing (Oxide Supervisor, decision `c9d30b41`, implemented by
-barge#024); see the [stage 3
+rename is rolled back the same way and, if it cannot be rolled back, removed so
+the root reads as activity unknown rather than idle, and a failed restore is
+reported as unsettled with the hold standing (Oxide Supervisor, decision
+`c9d30b41`, implemented by barge#024); see the [stage 3
 design](contracts/stage3-space-policy.md#activity-records).
