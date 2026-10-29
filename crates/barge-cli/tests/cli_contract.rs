@@ -708,6 +708,76 @@ fn area_hold_and_release_record_and_remove_one_hold() {
 }
 
 #[test]
+fn a_release_that_cannot_remove_the_hold_records_nothing_and_exits_unknown() {
+    let (_fixture, state_dir) = absent_state_dir("area-release-unlink");
+    let root = "0123456789abcdef0123456789abcdef";
+    let pid = std::process::id().to_string();
+    let output = run_area(
+        &[
+            "hold",
+            "--root",
+            root,
+            "--holder",
+            "prover",
+            "--pid",
+            &pid,
+            "--scope",
+            "write",
+            "--purpose",
+            "a fixture hold",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(0), "the hold succeeds");
+    // A root with no activity record keeps none, so the release below records
+    // nothing either way; the hold removal itself is what must not be claimed.
+    let activity_path = state_dir.join(format!("activity/{root}.json"));
+    assert!(!activity_path.exists());
+    let hold_directory = state_dir.join(format!("holds/{root}"));
+    std::fs::set_permissions(
+        &hold_directory,
+        std::os::unix::fs::PermissionsExt::from_mode(0o500),
+    )
+    .expect("the hold directory is made read-only");
+    let output = run_area(
+        &["release", "--root", root, "--holder", "prover"],
+        &state_dir,
+    );
+    std::fs::set_permissions(
+        &hold_directory,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("the hold directory is writable again");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a hold that cannot be removed is not a completed release"
+    );
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.error/1");
+    assert_eq!(document["command"], "area.release");
+    assert!(
+        hold_directory.join("prover.json").is_file(),
+        "the hold stays"
+    );
+    assert!(
+        !activity_path.exists(),
+        "a failed release writes no activity record"
+    );
+
+    // The retry completes normally.
+    let output = run_area(
+        &["release", "--root", root, "--holder", "prover"],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let document = stdout_document(&output);
+    assert_eq!(document["data"]["released"], true);
+    assert_eq!(document["data"]["activity"]["state"], "missing");
+    assert!(!hold_directory.join("prover.json").exists());
+}
+
+#[test]
 fn area_idle_baseline_refuses_a_root_it_cannot_locate_and_writes_nothing() {
     let (_fixture, state_dir) = absent_state_dir("area-idle-baseline");
     let root = "0123456789abcdef0123456789abcdef";

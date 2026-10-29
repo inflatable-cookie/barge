@@ -2916,13 +2916,18 @@ pub struct Release {
 
 /// Release one holder's hold. A hold that is already absent is already released.
 ///
-/// The release is the only fact from which the space policy concludes idleness,
-/// so a root that has an activity record gets it updated here, under the same
-/// root lock the hold was written under and **before** the hold file is removed: a
-/// failed activity write refuses the release and leaves the hold in place, so no
-/// release is ever recorded for a hold that is still there. A root with no
-/// activity record keeps none; the repair is [`idle_baseline`] (design, O-013),
-/// never an inferred creation time or volume.
+/// The order is the design's, and it is the order that keeps the recorded fact
+/// true: take the root lock the hold was written under, **remove the hold record**,
+/// and only then write the activity record. A release therefore never records a
+/// release that did not happen. The hold read, the record validation and the
+/// activity read all happen before the unlink, so a refused release changes
+/// nothing. If the unlink itself fails, nothing was recorded and the hold is still
+/// there. If the activity write fails after the hold is gone, the release *did*
+/// complete and the failure is reported as unsettled state naming the released
+/// hold: no release fact exists, so the root stays kept until an operator's
+/// [`idle_baseline`] rather than being reported idle on a guess. A root with no
+/// activity record keeps none (design, O-013), never an inferred creation time or
+/// volume.
 pub fn release(
     state: &StatePaths,
     observer: &dyn ProcessObserver,
@@ -2978,7 +2983,10 @@ pub fn release(
         )
         .with_detail("path", path.display().to_string().into()));
     }
-    let activity = record_activity_release(state, observer, root_id)?;
+    // Read the record before the effect, so a state directory that cannot be
+    // read refuses the release with the hold intact. The root lock is held from
+    // here to the write, so no other release can interleave.
+    let previous = read_activity(state, observer, root_id)?;
     std::fs::remove_file(&path).map_err(|error| {
         Error::new(
             ErrorKind::Io,
@@ -2991,6 +2999,26 @@ pub fn release(
         // platform refuses must not turn a completed release into a failure.
         let _ = std::fs::File::open(directory).and_then(|handle| handle.sync_all());
     }
+    let activity = match record_activity_release(state, previous) {
+        Ok(activity) => activity,
+        Err(error) => {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "the hold `{holder}` on root `{root_id}` was released, but its release fact could not be recorded: {error}; the root stays kept until `barge area idle-baseline` records it"
+                ),
+            )
+            .with_detail("hold_path", path.display().to_string().into())
+            .with_detail(
+                "activity_path",
+                state
+                    .activity_path(root_id)
+                    .map_or_else(|_| String::new(), |path| path.display().to_string())
+                    .into(),
+            )
+            .with_detail("cause", error.to_string().into()))
+        }
+    };
     Ok(Release {
         path,
         released: true,
@@ -3557,10 +3585,8 @@ fn record_activity_creation(
 /// explicit [`idle_baseline`] command (design, O-013).
 fn record_activity_release(
     state: &StatePaths,
-    observer: &dyn ProcessObserver,
-    root_id: &str,
+    reading: ActivityReading,
 ) -> Result<ActivityReading> {
-    let reading = read_activity(state, observer, root_id)?;
     let Some(previous) = reading.record.clone() else {
         return Ok(reading);
     };
@@ -3603,6 +3629,10 @@ pub enum IdleReason {
     /// A scratch root is not positively concluded, so it is never pressure
     /// pruned.
     UnconcludedScratch,
+    /// The activity record or the hold reading is not bound to the root the
+    /// verified marker proves: another root's record, another volume's record, or
+    /// a hold key that is not the marker's root id.
+    IdentityMismatch,
 }
 
 impl IdleReason {
@@ -3618,6 +3648,7 @@ impl IdleReason {
             Self::ParticipationExcluded => "participation_excluded",
             Self::ParticipationUndeclared => "participation_undeclared",
             Self::UnconcludedScratch => "unconcluded_scratch",
+            Self::IdentityMismatch => "identity_mismatch",
         }
     }
 }
@@ -3698,6 +3729,12 @@ impl IdleParticipation {
 pub struct IdleInputs<'a> {
     /// What the marker read decided.
     pub marker: &'a MarkerState,
+    /// The root id the activity record and the holds were read under. Evidence is
+    /// only this root's when that key is the root id the marker proves.
+    pub root_id: &'a str,
+    /// The verified volume's canonical uuid text as the marker was read on it. A
+    /// record written on another volume is not this root's release.
+    pub volume_uuid: &'a str,
     /// What the activity record read decided.
     pub activity: &'a ActivityReading,
     /// What the holds read decided.
@@ -3723,6 +3760,12 @@ pub fn assess_idleness(inputs: &IdleInputs<'_>) -> IdleRow {
             return IdleRow::blocked(IdleReason::MarkerUnverified)
         }
     };
+    // The evidence must belong to the root the verified marker proves. A record
+    // read under another key, or one written on another volume, is not this
+    // root's release, and a hold read under another key is not this root's hold.
+    if inputs.root_id != marker.root_id {
+        return IdleRow::blocked(IdleReason::IdentityMismatch);
+    }
     match inputs.participation {
         IdleParticipation::Counts | IdleParticipation::Scratch => {}
         IdleParticipation::Excluded => return IdleRow::blocked(IdleReason::ParticipationExcluded),
@@ -3754,6 +3797,9 @@ pub fn assess_idleness(inputs: &IdleInputs<'_>) -> IdleRow {
     let Some(record) = inputs.activity.record.as_ref() else {
         return IdleRow::blocked(IdleReason::ActivityUnknown);
     };
+    if record.root_id != marker.root_id || record.volume_uuid != inputs.volume_uuid {
+        return IdleRow::blocked(IdleReason::IdentityMismatch);
+    }
     if record.last_release_ms > inputs.now_ms || record.recorded_ms > inputs.now_ms {
         return IdleRow::blocked(IdleReason::ActivityFuture);
     }
@@ -4027,36 +4073,36 @@ pub fn idle_baseline(
     state.initialize()?;
     let mut locks = state::LockSet::new(state.clone());
     let _lock = locks.lock_root(&request.root_id)?;
-    // A live or undecidable hold is refused before anything is written, and the
+    // The design refuses a baseline while **any** hold exists, not only a live
+    // one: a present hold file — live, stale or undecidable — means the root's
+    // custody is not positively settled, so the operator releases it first. The
     // root lock above is what a racing `hold` takes too.
     let holds = read_holds(state, observer, &request.root_id)?;
-    for (hold, hold_state, reason) in &holds.holds {
-        match hold_state {
-            HoldState::Live => {
-                return Err(Error::new(
-                    ErrorKind::RefusedBoundary,
-                    format!(
-                        "root {} is held by `{}` on pid {}; an idle baseline needs no hold",
-                        request.root_id, hold.holder, hold.pid
-                    ),
-                )
+    if let Some((hold, hold_state, reason)) = holds.holds.first() {
+        let state_name = match hold_state {
+            HoldState::Live => "live",
+            HoldState::Stale => "stale",
+            HoldState::Unknown => "undecidable",
+        };
+        let message = format!(
+            "root {} carries a {state_name} hold `{}` on pid {}; an idle baseline needs no hold at all, so release it first",
+            request.root_id, hold.holder, hold.pid
+        );
+        return Err(match hold_state {
+            HoldState::Live | HoldState::Stale => Error::new(ErrorKind::RefusedBoundary, message)
                 .with_detail("holder", hold.holder.clone().into())
-                .with_detail("pid", u64::from(hold.pid).into()))
-            }
-            HoldState::Unknown => {
-                return Err(Error::new(
-                    ErrorKind::CustodyNotProven,
-                    format!(
-                        "the hold `{}` on root {} cannot be decided: {}",
-                        hold.holder,
-                        request.root_id,
-                        reason.as_deref().unwrap_or("no reason was recorded")
-                    ),
-                )
-                .with_detail("holder", hold.holder.clone().into()))
-            }
-            HoldState::Stale => {}
-        }
+                .with_detail("pid", u64::from(hold.pid).into())
+                .with_detail("hold_state", state_name.into()),
+            HoldState::Unknown => Error::new(
+                ErrorKind::CustodyNotProven,
+                format!(
+                    "{message}; it cannot be decided: {}",
+                    reason.as_deref().unwrap_or("no reason was recorded")
+                ),
+            )
+            .with_detail("holder", hold.holder.clone().into())
+            .with_detail("hold_state", state_name.into()),
+        });
     }
     if holds.truncated {
         return Err(Error::new(
@@ -4311,19 +4357,26 @@ pub fn list_roots(
             now_ms,
         };
         let (marker, marker_digest) = read_marker_with_digest(dirs, &root, &expectation);
-        let named_root = state::is_identifier(&entry.name);
-        let activity = if named_root {
-            match read_activity(state, observer, &entry.name) {
+        // The activity record and the holds are keyed by the root id the marker
+        // proves, never by the directory's name: an adopted root's name can differ
+        // from its root id, and another root's record must not decide this one.
+        let root_key = match &marker {
+            MarkerState::Owned(marker) => Some(marker.root_id.clone()),
+            MarkerState::Absent | MarkerState::Unknown { .. } => {
+                state::is_identifier(&entry.name).then(|| entry.name.clone())
+            }
+        };
+        let activity = match &root_key {
+            Some(key) => match read_activity(state, observer, key) {
                 Ok(activity) => activity,
                 // One undecidable record never blocks the other rows: this root
                 // is reported kept and the listing continues.
                 Err(error) => ActivityReading::unverified(error.to_string()),
-            }
-        } else {
-            ActivityReading::missing()
+            },
+            None => ActivityReading::missing(),
         };
-        let holds = if named_root {
-            match read_holds(state, observer, &entry.name) {
+        let holds = match &root_key {
+            Some(key) => match read_holds(state, observer, key) {
                 Ok(holds) => holds,
                 Err(error) => {
                     roots.push(unreadable_root(
@@ -4334,9 +4387,8 @@ pub fn list_roots(
                     ));
                     continue;
                 }
-            }
-        } else {
-            HoldReading::empty()
+            },
+            None => HoldReading::empty(),
         };
         roots.push(observe_root(
             &entry.name,
@@ -4347,6 +4399,8 @@ pub fn list_roots(
             marker_digest,
             &holds,
             activity,
+            root_key.as_deref(),
+            resolved.volume_uuid.as_str(),
             IdleParticipation::of_area(resolved.declaration.reserve),
             now_ms,
         ));
@@ -4369,11 +4423,15 @@ fn observe_root(
     marker_digest: Option<String>,
     holds: &HoldReading,
     activity: ActivityReading,
+    root_key: Option<&str>,
+    volume_uuid: &str,
     participation: IdleParticipation,
     now_ms: u64,
 ) -> RootObservation {
     let space_idle = assess_idleness(&IdleInputs {
         marker: &marker,
+        root_id: root_key.unwrap_or(name),
+        volume_uuid,
         activity: &activity,
         holds,
         participation,
@@ -6331,6 +6389,9 @@ mod tests {
         ))
     }
 
+    /// The root id the marker fixture proves.
+    const FIXTURE_ROOT: &str = "00000000000000000000000000000000";
+
     fn idle_inputs<'a>(
         marker: &'a MarkerState,
         activity: &'a ActivityReading,
@@ -6339,6 +6400,8 @@ mod tests {
     ) -> IdleInputs<'a> {
         IdleInputs {
             marker,
+            root_id: FIXTURE_ROOT,
+            volume_uuid: UUID,
             activity,
             holds,
             participation,
@@ -6442,6 +6505,354 @@ mod tests {
         assert_eq!(twice.generation, 2);
         let listed = fixture.list(&resolved);
         assert_eq!(listed.roots[0].space_idle.state, IdleState::Idle);
+    }
+
+    #[test]
+    fn a_release_whose_unlink_fails_records_no_release() {
+        let fixture = Fixture::new("release-unlink-fails");
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        hold(
+            &fixture.state,
+            &observer,
+            &HoldRequest {
+                root_id: root.root_id.clone(),
+                holder: "prover".to_owned(),
+                pid: std::process::id(),
+                scope: HoldScope::Write,
+                purpose: "a fixture holder".to_owned(),
+            },
+        )
+        .expect("the hold is written");
+        let before = read_activity(&fixture.state, &observer, &root.root_id)
+            .expect("the record reads")
+            .record
+            .expect("the record parsed");
+
+        // The hold file cannot be removed, so the release never happens. The
+        // activity record must not claim it did.
+        let hold_directory = fixture.state.holds_dir().join(&root.root_id);
+        std::fs::set_permissions(&hold_directory, std::fs::Permissions::from_mode(0o500))
+            .expect("the hold directory is made read-only");
+        let error = release(&fixture.state, &observer, &root.root_id, "prover")
+            .expect_err("the unlink fails");
+        std::fs::set_permissions(&hold_directory, std::fs::Permissions::from_mode(0o700))
+            .expect("the hold directory is writable again");
+        assert_eq!(error.kind(), ErrorKind::Io);
+        let after = read_activity(&fixture.state, &observer, &root.root_id)
+            .expect("the record reads")
+            .record
+            .expect("the record parsed");
+        assert_eq!(after, before, "a failed release records nothing");
+        assert_eq!(after.releases, 0);
+        assert_eq!(after.generation, 0);
+        assert!(
+            hold_directory.join("prover.json").is_file(),
+            "the hold is still there"
+        );
+        let listed = fixture.list(&resolved);
+        assert_blocked(listed.roots[0].space_idle, IdleReason::HoldLive);
+
+        // The ordinary retry then records exactly one release.
+        let released =
+            release(&fixture.state, &observer, &root.root_id, "prover").expect("the release works");
+        assert!(released.released);
+        let after = read_activity(&fixture.state, &observer, &root.root_id)
+            .expect("the record reads")
+            .record
+            .expect("the record parsed");
+        assert_eq!(after.releases, 1);
+        assert_eq!(after.generation, 1);
+    }
+
+    #[test]
+    fn a_release_whose_activity_write_fails_is_reported_as_unrecorded() {
+        let fixture = Fixture::new("release-write-fails");
+        fixture.register(&fixture.record);
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        hold(
+            &fixture.state,
+            &observer,
+            &HoldRequest {
+                root_id: root.root_id.clone(),
+                holder: "prover".to_owned(),
+                pid: std::process::id(),
+                scope: HoldScope::Write,
+                purpose: "a fixture holder".to_owned(),
+            },
+        )
+        .expect("the hold is written");
+        let before = read_activity(&fixture.state, &observer, &root.root_id)
+            .expect("the record reads")
+            .record
+            .expect("the record parsed");
+
+        // The hold is removed (the release completed) but the record cannot be
+        // written: the release is reported as unsettled and no release fact
+        // exists, so the root stays kept.
+        let activity_directory = fixture.state.activity_dir();
+        std::fs::set_permissions(&activity_directory, std::fs::Permissions::from_mode(0o500))
+            .expect("the activity directory is made read-only");
+        let error = release(&fixture.state, &observer, &root.root_id, "prover")
+            .expect_err("the activity write fails");
+        std::fs::set_permissions(&activity_directory, std::fs::Permissions::from_mode(0o700))
+            .expect("the activity directory is writable again");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(error
+            .message()
+            .contains("release fact could not be recorded"));
+        assert_eq!(
+            error.detail()["activity_path"],
+            fixture
+                .state
+                .activity_path(&root.root_id)
+                .expect("the path")
+                .display()
+                .to_string()
+                .as_str()
+        );
+        assert!(
+            !fixture
+                .state
+                .holds_dir()
+                .join(&root.root_id)
+                .join("prover.json")
+                .is_file(),
+            "the hold really was released"
+        );
+        let after = read_activity(&fixture.state, &observer, &root.root_id)
+            .expect("the record reads")
+            .record
+            .expect("the record parsed");
+        assert_eq!(after, before, "no release fact was recorded");
+        let listed = fixture.list(&resolved);
+        assert_blocked(listed.roots[0].space_idle, IdleReason::ActivityUnreleased);
+
+        // A retry changes nothing: the hold is already absent, so it records
+        // nothing new, and the root stays kept.
+        let again = release(&fixture.state, &observer, &root.root_id, "prover")
+            .expect("a second release is not an error");
+        assert!(!again.released);
+        assert_eq!(again.activity.state, ActivityStateName::Unreleased);
+
+        // The explicit baseline is the repair.
+        let platform = fixture.platform();
+        let facts = fixture.facts();
+        let mounts = fixture.mounts();
+        idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &IdleBaselineRequest {
+                root_id: root.root_id.clone(),
+                volume_uuid: None,
+                mount_relative_path: None,
+            },
+        )
+        .expect("the baseline repairs the record");
+        assert_eq!(
+            fixture.list(&resolved).roots[0].space_idle.state,
+            IdleState::Idle
+        );
+    }
+
+    #[test]
+    fn the_idleness_matrix_binds_evidence_to_the_root_the_marker_proves() {
+        let owned = owned_marker(RootKind::AreaRoot);
+        let activity = released(FIXTURE_ROOT, 500, 100);
+        let holds = HoldReading::empty();
+        assert_eq!(
+            assess_idleness(&idle_inputs(
+                &owned,
+                &activity,
+                &holds,
+                IdleParticipation::Counts
+            ))
+            .state,
+            IdleState::Idle
+        );
+
+        // Evidence read under another key is not this root's evidence.
+        assert_blocked(
+            assess_idleness(&IdleInputs {
+                marker: &owned,
+                root_id: &"1".repeat(32),
+                volume_uuid: UUID,
+                activity: &activity,
+                holds: &holds,
+                participation: IdleParticipation::Counts,
+                now_ms: 1_000,
+            }),
+            IdleReason::IdentityMismatch,
+        );
+        // A record written on another volume is not this root's release.
+        assert_blocked(
+            assess_idleness(&IdleInputs {
+                marker: &owned,
+                root_id: FIXTURE_ROOT,
+                volume_uuid: OTHER_UUID,
+                activity: &activity,
+                holds: &holds,
+                participation: IdleParticipation::Counts,
+                now_ms: 1_000,
+            }),
+            IdleReason::IdentityMismatch,
+        );
+        // A record that names another root is never this root's release.
+        let foreign = released(&"2".repeat(32), 500, 100);
+        assert_blocked(
+            assess_idleness(&idle_inputs(
+                &owned,
+                &foreign,
+                &holds,
+                IdleParticipation::Counts,
+            )),
+            IdleReason::IdentityMismatch,
+        );
+    }
+
+    #[test]
+    fn a_listing_reads_activity_and_holds_by_the_markers_root_id() {
+        let fixture = Fixture::new("activity-binding");
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let path = fixture
+            .state
+            .activity_path(&root.root_id)
+            .expect("the activity path");
+        rewrite_marker(&path, |value| {
+            value["volume_uuid"] = OTHER_UUID.into();
+        });
+        let listed = fixture.list(&resolved);
+        let row = &listed.roots[0];
+        assert_eq!(
+            row.activity.state,
+            ActivityStateName::Unreleased,
+            "the record itself still reads"
+        );
+        assert_blocked(row.space_idle, IdleReason::ActivityUnreleased);
+
+        // A record that records a release on another volume is not this root's.
+        let released_record = record(&root.root_id, 1, 1, 1);
+        let mut document = serde_json::to_value(&released_record).expect("the record encodes");
+        document["volume_uuid"] = OTHER_UUID.into();
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).expect("the record encodes"),
+        )
+        .expect("the record is written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("the record is private");
+        let listed = fixture.list(&resolved);
+        let row = &listed.roots[0];
+        assert_eq!(row.activity.state, ActivityStateName::Released);
+        assert!(
+            row.idle,
+            "stage 1's hold-only idleness still reads the holds only"
+        );
+        assert_blocked(row.space_idle, IdleReason::IdentityMismatch);
+
+        // Another root's record under this root's key does not decide this root.
+        let other = record(&"3".repeat(32), 1, 1, 1);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&other).expect("the record encodes"),
+        )
+        .expect("the record is written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("the record is private");
+        let listed = fixture.list(&resolved);
+        assert_blocked(listed.roots[0].space_idle, IdleReason::ActivityUnknown);
+        assert!(!observed_idle(&fixture, &resolved, &root.root_id));
+    }
+
+    /// Whether a listing reports the root idle under the pressure matrix.
+    fn observed_idle(fixture: &Fixture, resolved: &super::ResolvedArea, root_id: &str) -> bool {
+        fixture
+            .list(resolved)
+            .roots
+            .iter()
+            .find(|row| row.root_id.as_deref() == Some(root_id))
+            .is_some_and(|row| row.space_idle.is_idle())
+    }
+
+    #[test]
+    fn an_idle_baseline_refuses_any_present_hold_including_a_stale_one() {
+        let fixture = Fixture::new("baseline-stale-hold");
+        fixture.register(&fixture.record);
+        let declaration = fixture.declaration("example/pool");
+        let (root, _) = fixture.create_root(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        // A hold written under another boot is positively stale: stage 1 treats
+        // it as not blocking idleness, and the design still refuses a baseline
+        // while the hold file exists.
+        let mut previous_boot = fixture.observer();
+        previous_boot.boot = "1600000000.0".to_owned();
+        let held = hold(
+            &fixture.state,
+            &previous_boot,
+            &HoldRequest {
+                root_id: root.root_id.clone(),
+                holder: "previous-boot".to_owned(),
+                pid: std::process::id(),
+                scope: HoldScope::Write,
+                purpose: "a holder from before the reboot".to_owned(),
+            },
+        )
+        .expect("the hold is written");
+        let reading = read_holds(&fixture.state, &observer, &root.root_id).expect("the holds read");
+        assert_eq!(reading.holds[0].1, HoldState::Stale);
+        assert!(reading.is_idle(), "a stale hold does not block stage 1");
+        let path = fixture
+            .state
+            .activity_path(&root.root_id)
+            .expect("the activity path");
+        std::fs::remove_file(&path).expect("the record is lost");
+
+        let platform = fixture.platform();
+        let facts = fixture.facts();
+        let mounts = fixture.mounts();
+        let error = idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &IdleBaselineRequest {
+                root_id: root.root_id.clone(),
+                volume_uuid: None,
+                mount_relative_path: None,
+            },
+        )
+        .expect_err("a present stale hold refuses the baseline");
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        assert_eq!(error.detail()["hold_state"], "stale");
+        assert_eq!(error.detail()["holder"], "previous-boot");
+        assert!(!path.exists(), "a refused baseline writes no record");
+
+        // Releasing the hold is the operator's step, and then the baseline works.
+        release(&fixture.state, &observer, &root.root_id, "previous-boot")
+            .expect("the stale hold releases");
+        assert!(!held.path.exists());
+        idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &IdleBaselineRequest {
+                root_id: root.root_id.clone(),
+                volume_uuid: None,
+                mount_relative_path: None,
+            },
+        )
+        .expect("the baseline writes once no hold exists");
+        assert!(path.is_file());
     }
 
     #[test]

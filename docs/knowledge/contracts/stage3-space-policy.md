@@ -1392,10 +1392,19 @@ T6, and no native proof exists or is claimed.
 - **`barge.activity/1`** is written at `state/activity/<root-id>.json`, privately
   and atomically, at most 4 KiB, with no unknown fields. Root creation writes
   generation `0` with `last_release_ms: 0` and `releases: 0`, on both the area and
-  the feature-folder creation routes. `barge area release` writes
-  `last_release_ms: now` and increments `releases` and `generation`, under the
-  same root lock that wrote the hold and **before** the hold file is removed, so a
-  failed activity write refuses the release and leaves the hold in place.
+  the feature-folder creation routes.
+- **A release is recorded only after the hold is gone.** `barge area release`
+  takes the root lock the hold was written under, reads and validates the hold and
+  reads the activity record, **removes the hold file**, and only then writes
+  `last_release_ms: now` with `releases` and `generation` incremented. A refused
+  release therefore changes nothing, and a release whose hold file cannot be
+  removed records nothing at all — the activity record is byte-identical
+  afterwards. If the activity write fails *after* the hold is gone, the release
+  really did complete and the command reports unsettled state (`unknown_state`,
+  exit `3`) naming the released hold and the record path it could not write: no
+  release fact exists, so the root stays kept until the explicit baseline below
+  records one, rather than being reported idle on a guess. A release therefore
+  never records a release that did not complete, in either direction.
 - **A release never invents a record.** A root with no record, or with one that
   does not verify, gets no new record from a release: the release report says so
   (`data.activity.state` is `missing` or `unverified`), the root stays kept, and
@@ -1409,10 +1418,14 @@ T6, and no native proof exists or is claimed.
   pair exists for a root that predates that record. Containment is decided before
   any record is compared, an explicit pair that disagrees with the durable record
   is refused as `unknown_state` rather than resolved in either direction, and the
-  marker must still name the requested root. It re-verifies the volume and the marker, refuses a live hold
-  (`refused_boundary`) and an undecidable or over-bound hold
-  (`custody_not_proven`), takes the stage 1 custody verdict for the root, and then
-  writes `last_release_ms: now` while holding the root lock. It preserves the
+  marker must still name the requested root. It re-verifies the volume and the
+  marker and refuses while **any** hold is recorded, as the design's activity
+  section says: a live *or* stale hold is `refused_boundary` naming the holder and
+  its state (stage 1 treats a stale hold as not blocking idleness, but a baseline
+  is an operator's assertion, so the hold is released first), an undecidable or
+  over-bound hold is `custody_not_proven`, and the root lock it takes is what a
+  racing `hold` takes too. It then takes the stage 1 custody verdict for the root
+  and writes `last_release_ms: now` while holding the root lock. It preserves the
   recorded release count and creation time, fills an unrecorded creation time from
   the verified marker, bumps the generation, and refuses a record whose volume
   disagrees with the root rather than resolving the disagreement. It creates no
@@ -1422,14 +1435,21 @@ T6, and no native proof exists or is claimed.
 - **The idleness matrix** is `area::assess_idleness`, over the marker, the
   activity record, the holds and the area's `reserve` participation, with the
   first blocking input reported as the reason: `marker_unverified`,
-  `participation_excluded`, `participation_undeclared`, `hold_live`,
-  `hold_unknown`, `activity_unknown` (missing or invalid), `activity_unreleased`,
+  `identity_mismatch`, `participation_excluded`, `participation_undeclared`,
+  `hold_live`, `hold_unknown`, `activity_unknown` (missing or invalid),
+  `activity_unreleased`,
   `activity_future` (this stage's own name for the failure matrix's clock-skew row:
   the report says the release is in the future and the root is not idle), and
   `unconcluded_scratch` for a scratch root that is not positively concluded
   (outcome `closed`, closure `positive`, nested scope `exclusive`, kept reason
   `evidence`; the pressure predicate relaxes only the age). A hold list cut by its
-  per-root bound is `hold_unknown`, and nothing else is idle.
+  per-root bound is `hold_unknown`, and nothing else is idle. Evidence is bound
+  to the verified root identity and never merely associated with a directory: the
+  activity record and the holds are read under the root id the marker proves (not
+  the directory's name, which an adopted root may differ from), `identity_mismatch`
+  is reported when that key is not the marker's root id or when the record names
+  another root or another volume's uuid, and a record or hold belonging to another
+  root therefore never makes this root idle.
 - **`barge.area.root.list/1`** rows carry two additions: `activity`, the record as
   read (`released`, `unreleased`, `missing` or `unverified`, with its fields when
   it verified), and `space_idle`, the matrix's verdict. The existing `idle` field
