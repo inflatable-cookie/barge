@@ -39,6 +39,12 @@ alias = "barge"
   "scripts/native/s6-cache-placement-proof.sh diagnostic",
 ]
 
+# The proof's own apparatus self-check: the case map and its dispatch, the pinned
+# supervisor digest, the nine-premise trace, the case ordering and registry
+# restore guards, and the environment inventory. No image, no scratch and no
+# child process.
+"maintain:native:test" = "python3 scripts/native/s7-maintain-proof.py --self-check"
+
 [test.suites.rust]
 # The library and CLI suites. The budgets are the test route's timeout and
 # forced exit: an expired admission window starts no child, and an expired
@@ -86,3 +92,24 @@ run = "python3 scripts/test-scratch-expiry.py --self-check"
 # Proof-only interposer exercise: fresh caller scratch, no image or native proof.
 [tasks."scratch:expiry:shim:test"]
 run = "python3 scripts/test-scratch-enotempty-shim.py"
+
+# S7's elevated native proof (docs/knowledge/contracts/s7-maintain-proof.md): the
+# one bounded native for `barge maintain`, on one owned APFS image of at most
+# 64 MiB attached `-owners on`, under Oxide's qualified shared supervisor whose
+# bytes the script hash-pins itself. Its whole command is the one fixed script;
+# the CLI under test is named by `BARGE_PROOF_BIN`, which the owner supplies from
+# the head being proved. `--plan` is effect-free, so the proof's previews change
+# nothing; only an authorised real run deletes, and only inside the guard's image.
+#
+# HELD for owner activation: the declarations activate nothing, and each run is
+# separately activated (diagnostic first, then the counted pass at the exact
+# head). A missing receipt is a missing proof.
+[tasks."maintain:native"]
+admission = "heavy"
+run = "python3 scripts/native/s7-maintain-proof.py counted"
+
+# The uncounted twin: keep-going, latched first fault, dependent-skip, and a
+# `qualified: false` receipt. It proves nothing on its own.
+[tasks."maintain:native:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/native/s7-maintain-proof.py diagnostic"

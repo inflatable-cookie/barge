@@ -977,9 +977,15 @@ identity read: it is recorded (pid, start identity, descriptor and command) and
 does not block `Safe`, because a revoked or reclaimed vnode cannot do I/O, and its
 path is never read (Tom, 2026-10-28, decision e33115d3, barge#023). Only a
 readable path with readable facts, `ENOENT` from both reads and `EPERM` from both
-are an answer, so a mixed pair — including a readable path whose vnode facts
-answer `ENOENT` — is unreadable, and `ENOENT` on the descriptor listing itself,
-with a changed or unreadable identity, or with a bound reached stays unreadable.
+are an answer. A mixed pair is re-read as a paired path-and-vnode observation up
+to three times about 10 ms apart inside the scan's own time bound, and the first
+agreeing pair is used; a process that has exited at a re-read holds nothing;
+a closed retry pair prompts a bounded descriptor re-listing: an omitted fd is gone,
+while a listed fd is paired again and a still-closed pair refuses; three attempts
+that still disagree stay unreadable (Oxide Supervisor 1a5b31a0,
+barge#008). `ENOENT` on the descriptor listing itself, a changed or unreadable
+identity, or a bound reached stays unreadable. A closed descriptor is still never
+an answer.
 Any unreadable
 hold, an unreadable effective uid, a same-uid descriptor that stays unreadable
 after its retries or that no verified platform binary explains and no
@@ -1236,7 +1242,9 @@ Barge owns no timer, daemon or hook. A host launchd job calls one command:
   and continues with the other volumes; it never recreates a mount point.
 - The job's own file (`~/Library/LaunchAgents/<label>.plist`), its schedule and
   its replacement of `com.tom.scratch-reaper` are host changes with their own
-  operator gate. This design defines the command and its contract only.
+  operator gate. This design defines the command and its contract only; [the
+  host-job contract](host-job.md) owns the hand-off, the example plist and the
+  recording rule.
 - Oxide's outputs prune entry stays in the existing host job until stage 4;
   `maintain` never runs it, never reads a receipt, and never deletes an Oxide
   root.
@@ -1707,6 +1715,23 @@ Choices S5 made where this design left the mechanic to the slice:
   identity, and a bound reached. There are no path or name lists, because a dead
   handle's path is not read either. The record names every dead handle, bounded
   at 32 descriptors: meeting more is `Unknown`, not a shorter list.
+- **A transient path/vnode disagreement is re-read as a pair** (corrected here
+  under barge#008, Oxide Supervisor 1a5b31a0). barge#008's uncounted diagnostic
+  at reviewed head `19e79b` failed because pid 42551 fd 3 closed between its
+  path and vnode-facts reads. The refusal was safe but too broad: one transient
+  disagreement of an unrelated process must not make the whole custody scan
+  unreadable. On a path/vnode disagreement for one descriptor, the scan re-reads
+  that descriptor as a paired path-and-vnode observation up to three attempts
+  about 10 ms apart, inside the scan's own time bound, and uses the first
+  agreeing pair. A process the kernel reports gone at a re-read holds nothing
+  under the existing exited rule. Three attempts that still disagree stay
+  `Unknown`. If a retry pair reports closed, a bounded descriptor re-listing
+  establishes whether the fd is gone; if listed, it is paired again, and a
+  still-closed pair refuses. A disagreement during dead-handle re-observation
+  also refuses without a pair retry. The dead-handle rule from decision e33115d3 is unchanged: both
+  `ENOENT` still needs its own bounded re-observation, a closed descriptor is
+  still never an answer, and a failed observation is still refused before the
+  identity after it is consulted.
 - **What the evidence says.** The evidence records `self_excluded: <pid>` (the one
   process the scan excluded), `foreign_uid_processes` (how many processes of
   another effective uid it classified and did not inspect) and `retry`: how many
@@ -1729,7 +1754,8 @@ Choices S5 made where this design left the mechanic to the slice:
   scan's own answers carry it as well: `Complete`, `Bounded` and `Unreadable`. `describe.custody` names all of it: the
   exclusion, the foreign-uid blind spot that is reported rather than observed, the
   OS blind spot of a verified platform binary's hidden descriptors, the dead
-  handles a dead vnode descriptor is recorded as, and
+  handles a dead vnode descriptor is recorded as, the paired re-read of a
+  path/vnode disagreement, and
   the retry rule with its positive facts and its two rechecked deadlines. A
   same-uid process the scan cannot read is an `Unreadable` answer rather than a
   returned error, so the record reaches the refusal; a returned error is only a
@@ -1782,8 +1808,11 @@ Choices S5 made where this design left the mechanic to the slice:
   the path read while the vnode facts report it closed, `EIO` from the vnode
   facts read, a closed path read beside `ENOENT`, `EPERM` or readable facts, a
   readable path beside closed vnode facts, and **both** reads reporting the
-  descriptor closed are all `unknown`, because `ESRCH` and `EBADF` are other
-  errnos. A second observation that fails with `EIO` while the pid is then
+  descriptor closed are all `unknown` when they persist, because
+  `ESRCH` and `EBADF` are other errnos. A transient mixed pair that then agrees
+  places the descriptor; a mixed pair that still disagrees across three attempts
+  stays `unknown`; a pid that exits during that re-read holds nothing. A second
+  observation that fails with `EIO` while the pid is then
   reported gone is `unknown` too — a disappearing process never settles a failed
   read — and the same disappearance after an answered paired `ENOENT` is `safe`
   with no dead handle recorded, because the descriptor went with the process. An identity that changes after a
@@ -2268,6 +2297,12 @@ Choices S4 made where this design left the mechanic to the slice:
   `volume_absent` loudly and writes nothing; on an ephemeral volume it reports
   `volume_present: false`, an empty plan and no effect. Neither recreates or
   writes a stale mount point.
+- **A stopped sweep is never a success.** `barge.scratch.expire/1` is printed
+  from the same `ExpireRun` the maintain stage uses, so a stage that stopped on a
+  failure that is not one unit's refusal — its own report rows, the unit that
+  failed and every later unit kept — or a run cut short by its clock forces exit
+  `3`, exactly as the maintain stage does. No stop is dropped between the library
+  and the exit code.
 - **Command documents.** `barge.scratch.alloc/1`, `barge.scratch.conclude/1`,
   `barge.scratch.expire/1` (with `barge.scratch.plan/1` inside it),
   `barge.scratch.grants/1`, `barge.scratch.delegate/1`, `barge.scratch.claim/1`
@@ -2401,6 +2436,184 @@ Choices S4 made where this design left the mechanic to the slice:
   change, no Oxide or Effigy adoption, and no native receipt until the owner
   activates the runs. `scratch:expiry:native` and its `:diagnostic` twin are
   declared and held.
+
+- **S7** is this slice: `barge maintain` in preview and real form, its exit
+  codes, the completion of `describe`, and the host-job hand-off. `maintain`
+  sweeps every registered, present volume's scratch folder through S4's sweep and
+  then applies each declared area's prune policy, in registry order and then
+  declaration order, and does nothing else. It reads no Oxide receipt, runs no
+  Oxide prune and deletes no Oxide root: every effect goes through S4's
+  grant-checked sweep or S5's custody and delete path on a root whose
+  `barge.root/1` marker Barge wrote. The job file itself, its schedule and the
+  retirement of `com.tom.scratch-reaper` stay an operator gate; [the host-job
+  contract](host-job.md) owns that hand-off and ships one example plist under
+  `docs/`, uninstalled.
+
+Choices S7 made where this design left the mechanic to the slice:
+
+- **Command documents.** `barge.maintain/1` is the command's document: the
+  bounded canonical `barge.maintain.plan/1`, its SHA-256, when the plan was built,
+  and what the run did. The plan holds only stable facts (the volume rows, each
+  scratch step's own `barge.scratch.plan/1` and digest, each area step's policy,
+  candidates and kept rows), so its digest is reproducible across a preview and
+  its real run; the clock and every effect live outside it. **No plan byte is
+  derived from elapsed time**: a row states the declared age it was decided
+  against, never how long a root has been idle, because a value that moves every
+  second would make the preview's digest unusable a moment later. The real run
+  therefore accepts a preview's plan as long as the plan itself is what it says,
+  and re-evaluates each root's idleness against its own clock immediately before
+  the effect: a root that crossed the age threshold in between is kept as that
+  unit only.
+- **The CLI's two forms.** A preview is the default and is effect-free:
+  `barge maintain --json` prints the plan and its digest, and `--plan-out <file>`
+  writes exactly the bytes the digest covers where the caller asked. A real run
+  is `barge maintain --json --plan <file> --plan-sha256 <hex>`: the preview's
+  exact bytes and their digest, both required. `--plan` without its digest, or a
+  digest without the bytes, refuses as `usage` before any effect, so neither flag
+  is ever an effect on its own. The host job keeps the bytes with `--plan-out`
+  and passes both back.
+- **The plan is the authorization, and a change stops only its own unit.** A real
+  run applies exactly the units the preview's plan names; it never recomputes a
+  plan of its own, because a recomputation would turn any single unit's change
+  into a refusal of the whole run. The digest binds the bytes, the rows name the
+  units and their identities, and every unit is re-verified immediately before
+  its effect: the scratch stage re-reads its unit's grant, marker, identity,
+  holds and age through S4's `reassess` and the deletion's own authorization,
+  and each area root is re-read under the volume lock (declaration, identity,
+  marker digest, holds, idleness and the registry record's generation). The
+  area's policy is compared with the policy the preview saved, never with a value
+  derived from the current declaration, both before the stage and again under the
+  effect lock, so a declaration edited in either window cannot decide the age the
+  plan's units are judged by. The volume's **registry generation and durability
+  are re-read before the scratch stage, again inside every scratch unit's own
+  effect window, and inside every area root's re-verification**: a record that
+  changed (any registry write) or a durability that no longer permits pruning —
+  `kept`, or `undeclared` — keeps the units the plan named. The scratch stage's
+  per-unit authorization re-reads the record under the volume lock and compares its
+  generation with the plan's, so a `kept` declaration or a registry write made
+  after the real run started stops the remaining units instead of deleting them;
+  `scratch::expire_plan`, `delete::delete_unit_authorized` and every area root's
+  re-verification refuse a non-expendable record of their own accord, so a plan
+  made for an expendable volume can never prune a volume that afterwards says its
+  data is kept. A unit that changed in between — a
+  live hold, a withdrawn delegation or claim, a marker that appeared, a changed
+  identity or revision, or a volume whose record left the registry or moved its
+  `root_dir` — is kept and reported as that unit (or that volume's units) only,
+  and the rest of the plan still runs. A plan whose own bytes do not match
+  `--plan-sha256` is a `usage` refusal before any effect: that is the authorization
+  itself being unusable, not a unit changing. A plan whose *embedded scratch step*
+  is not self-consistent is the same kind of refusal: every step is checked before
+  the run applies anything, so it is a `usage` refusal before any effect with
+  nothing changed. A volume whose record left the registry or whose `root_dir`
+  moved is reported **loudly** with every unit the plan named for it kept, and the
+  other volumes still run. An absent volume is reported per its availability: a
+  permanent volume's absence is loud, an ephemeral volume's is quiet. A stage that
+  already ran keeps its own rows: a volume that goes away before its areas are
+  reached reports those areas as kept and never restates units it already deleted
+  as kept. A volume that cannot be verified again before its areas is a mid-run
+  failure and therefore a `data.stopped` stop (exit `3`), never a refusal document.
+  A stage that stops on a failure that is not one unit's refusal keeps the rows it
+  earned: the units it deleted, the intents it left pending, and the unit whose
+  effect failed as that stage's skipped row, and every later candidate of that
+  stage as a skipped row carrying the stop reason. Its rows are never dropped with
+  the error, and the stages it did not reach are reported as kept. A volume whose
+  scratch stage cannot even open is reported in full — every planned unit kept,
+  with the unreached stage counted — and the run stops there. The registry record
+  is read again immediately before each volume's stage, never trusted from the
+  run's opening read, so a revision that landed after the run started keeps that
+  volume's units instead of authorising the stale record; a registry that cannot be
+  read again at that point is another mid-run failure, so it is a `data.stopped`
+  stop (exit `3`) with that volume's units kept and the earlier rows intact. A
+  preview names every intent an earlier run left pending, so the document forces
+  exit `3` even when the plan names no candidate; the host job still runs its real
+  step only when the preview names a candidate, per the rule above, and the
+  pending intent is settled by a later real run's replay.
+- **Exit codes.** `0` completed, including a partial completion with nothing
+  pending. A `3` that still reports a plan is a completed run: the host job's
+  contract keeps the `3` on record and still performs the authorized real step for
+  the candidates it named, so one absent permanent volume does not stop the other
+  volumes' work. `2` refused before any effect, from the closed error kinds. `3` a
+  pending intent, a replay that stopped short, a wall-clock stop, **or an absent
+  permanent volume**: absence is a fact, but a drive that should be attached and
+  is not needs a human, and the exit code is the only channel the host contract
+  gives that report. An absent ephemeral volume is `0` and quiet — **also when it
+  goes away between the preview and the effect**: its planned units are kept and
+  reported with `loud: false`, while only a permanent volume's absence is loud. A
+  volume whose durability is `undeclared` is reported loudly (exit `3`) because
+  expending data is never inferred; a volume declared `kept` keeps its units
+  quietly, because an operator's decision to keep data is not a failure. A record
+  that left the registry or moved its `root_dir` between the preview and the effect
+  is loud whatever the volume's availability: that is unknown authority, not a
+  drive that is merely away.
+- **A mid-run error is a stop, not a refusal.** `2` means "refused before any
+  effect", which cannot be true once an earlier volume was maintained, so a
+  failure inside a real run is reported in `data.stopped`, forces exit `3`, and
+  names the unit or stage it stopped on. The affected unit is recorded in that
+  stage's `skipped` rows with the error, and nothing after it is attempted.
+- **The wall clock.** 600 s, with no new effect starting inside the last 30 s.
+  The deadline is carried into every stage the run performs, including S4's
+  scratch stage and every replay path inside it: `scratch::expire_plan` checks it
+  before the intent replay and before each planned unit's effect, and
+  `delete::replay_pending` stops starting intent replays at it and reports each
+  intent it did not reach as still pending with the wall-clock reason. The clock is
+  checked again **at the effect boundary**, after a unit's re-verification and
+  immediately before its effect starts, and again after each attempt, so a slow
+  re-assessment can never let an effect begin inside the stop window. The clock
+  also travels into the deletion and the replay themselves (`DeleteBounds.deadline`),
+  which check it at their own durable boundaries. A deletion checks it **after the
+  volume, unit and intent-write locks are held and immediately before the intent
+  record is published**, so a lock wait cannot carry the record past the stop
+  window: a spent clock writes no intent, journals nothing and keeps the unit. It
+  checks again immediately before the quarantine rename, so no destructive step
+  starts on a spent clock and the intent stays pending for a later replay. A replay
+  checks it **before it can do anything at all** — its first possible durable act
+  is the settle that follows an absent folder or parent at the `removed` phase — and
+  **again immediately after each of those observations**, because reading a folder
+  or a parent can itself consume the clock, **again after its own preflight and
+  locks**, **again after the leaf and marker observations and immediately before
+  its phase decision** — which is where a replay resumes a deletion, rolls an
+  intent back or advances the journal — **again immediately before every journal
+  write it performs** (the rollback's removal, the reconcile that records a rename,
+  and each completion phase, whether it comes from the replay's own leaf removal or
+  from the shared completion path), and **again inside `settle` with the volume,
+  unit and intent-write locks held and immediately before the `deleted` phase is
+  advanced**. The resumed walk itself is bounded by **the earlier of its per-root
+  deadline and the run's clock**, and its stop reason names whichever bound
+  actually stopped it, so a resumed deletion can never keep walking past the run's
+  stop window on its own 120 s budget. An overrun therefore never records a
+  completion and never resumes a deletion inside the stop window.
+  Slow locks, a slow registry re-read or a slow custody scan therefore cannot carry
+  an effect past the stop window, however much preflight they consume. So neither a stage with many units nor a long journal
+  of earlier intents can outlive the run's bound and then be reported as a success. Reaching it sets `timed_out`,
+  reports every stage and candidate the run did not reach with counts, and forces
+  exit `3` — including when the plan had no candidate at all and only a replay
+  consumed the clock, and including a stage whose last unit was re-verified and
+  then skipped for its own reason after the clock had already passed. A deletion that was already running when the clock was
+  reached is not counted as unreached: it stays in `deleted` or `pending`, the run
+  is still a timeout, and only the units after it are reported as unreached. A
+  timeout is never success.
+- **Area prune mechanics.** A step exists only for a declaration whose policy is
+  `oldest-idle:<seconds>`; a candidate is an owned root (`barge.root/1`, any kind)
+  with no live or undecidable hold and last activity — its own directory mtime or
+  its marker's creation time, whichever is newer — older than the declared age.
+  An unmarked, unknown or foreign-marker entry is never a candidate: S5's
+  containment rule already refuses to delete one. The deletion is S5's, with the
+  native-root grant the marker itself is, and the re-verification re-reads the
+  declaration (`area::show`), the root's identity, marker digest, holds and age,
+  and the registry record's generation, which must still be the one the plan
+  named. Each of those is a `refused_boundary` for that root only, so the other
+  roots of the same area still go; a pending intent stops the rest of that area's
+  stage and is reported.
+- **`describe` completion.** An area row now carries the declaration's `absent`,
+  `prune` and `reserve` policies, which is the last part of the design's
+  `describe` list that was still empty. They are optional on read and always
+  written, so a document from before them still reads and a reader never guesses
+  a policy.
+- **What S7 does not claim.** No real-drive maintain run, no LaunchAgent, no
+  reaper replacement, no Oxide or Effigy adoption, and no native receipt until
+  the owner activates the runs. `maintain:native` and its `:diagnostic` twin are
+  declared and held; [the S7 native proof plan](s7-maintain-proof.md) is the
+  premise record and the case bodies.
 
 ## Proposed validation
 

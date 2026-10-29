@@ -273,6 +273,9 @@ impl AreaRow {
             area: document.area.clone(),
             folder: document.folder.clone(),
             overrides: document.overrides.clone(),
+            absent: Some(document.absent.clone()),
+            prune: Some(document.prune.clone()),
+            reserve: Some(document.reserve),
         }
     }
 }
@@ -294,7 +297,12 @@ impl VolumeRow {
 }
 
 /// One declared consumer area, as `describe` reports it (stage 1 design,
-/// "Area declaration record on disk"). Slice S3 fills these rows.
+/// "Area declaration record on disk"). Slice S3 fills these rows; slice S7 adds
+/// the area's policies, so every field the design names is reported.
+///
+/// The three policy fields are optional on read and always written: they landed
+/// inside `barge.describe/1`, so a document from before them still reads, and a
+/// reader never has to guess a policy a document did not state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AreaRow {
     /// The consumer-chosen namespace; opaque to Barge.
@@ -305,6 +313,16 @@ pub struct AreaRow {
     pub folder: String,
     /// Per-volume overrides, keyed by volume UUID.
     pub overrides: BTreeMap<String, String>,
+    /// What a caller sees when the volume is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absent: Option<crate::area::AbsentPolicy>,
+    /// How this area's owned roots may be pruned, which is also what
+    /// `barge maintain` applies to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prune: Option<crate::area::PrunePolicy>,
+    /// Whether this area's bytes count toward the volume's reserve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve: Option<crate::area::ReserveParticipation>,
 }
 
 /// One placement, as `describe` reports it (stage 1 design, "Kinds and
@@ -1729,6 +1747,66 @@ mod tests {
         assert!(
             root.path.join(crate::area::ROOT_MARKER_FILE).is_file(),
             "the root stays where it was created"
+        );
+    }
+
+    #[test]
+    fn the_area_row_reports_the_policies_maintain_applies() {
+        let fixture = Fixture::new("describe-area-policies");
+        let state = fixture.state();
+        let mut declaration = crate::area::AreaDeclaration {
+            namespace: "example".to_owned(),
+            area: "pool".to_owned(),
+            folder: "pool".to_owned(),
+            overrides: std::collections::BTreeMap::new(),
+            absent: crate::area::AbsentPolicy::Wait,
+            prune: crate::area::PrunePolicy::OldestIdleAfter { age_seconds: 3600 },
+            reserve: crate::area::ReserveParticipation::Excluded,
+        };
+        crate::area::declare(&state, &declaration, 1_792_525_019_847)
+            .expect("the area is declared");
+        let data = describe(&fixture.request()).expect("describe reads");
+        assert_eq!(data.areas.count, 1);
+        let row = &data.areas.rows[0];
+        assert_eq!(row.absent, Some(crate::area::AbsentPolicy::Wait));
+        assert_eq!(
+            row.prune,
+            Some(crate::area::PrunePolicy::OldestIdleAfter { age_seconds: 3600 })
+        );
+        assert_eq!(
+            row.reserve,
+            Some(crate::area::ReserveParticipation::Excluded)
+        );
+
+        // The policies are optional on read, so a document written before them
+        // still reads rather than being refused or guessed at.
+        let bytes = document(&data);
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("the document");
+        let area = value["data"]["areas"]["rows"][0]
+            .as_object_mut()
+            .expect("the area row is an object");
+        area.remove("absent");
+        area.remove("prune");
+        area.remove("reserve");
+        let mut older = serde_json::to_vec(&value).expect("the document encodes");
+        older.push(b'\n');
+        let read = read_describe_document(&older).expect("an older document reads");
+        assert_eq!(read.areas.rows[0].prune, None);
+
+        // A declaration with no prune policy is reported as such, never as a
+        // default age.
+        declaration.prune = crate::area::PrunePolicy::None;
+        declaration.reserve = crate::area::ReserveParticipation::Counts;
+        crate::area::declare(&state, &declaration, 1_792_525_019_848)
+            .expect("the area is redeclared");
+        let data = describe(&fixture.request()).expect("describe reads");
+        assert_eq!(
+            data.areas.rows[0].prune,
+            Some(crate::area::PrunePolicy::None)
+        );
+        assert_eq!(
+            data.areas.rows[0].reserve,
+            Some(crate::area::ReserveParticipation::Counts)
         );
     }
 

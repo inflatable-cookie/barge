@@ -92,6 +92,11 @@ pub const SCRATCH_ALLOC_SCHEMA: &str = "barge.scratch.alloc/1";
 pub const SCRATCH_CONCLUDE_SCHEMA: &str = "barge.scratch.conclude/1";
 /// The scratch expiry command document.
 pub const SCRATCH_EXPIRE_SCHEMA: &str = "barge.scratch.expire/1";
+/// The maintain command document (slice S7), preview and real.
+pub const MAINTAIN_SCHEMA: &str = "barge.maintain/1";
+/// The maintain plan document. Its canonical bytes are exactly what the digest
+/// covers and what a real run must present.
+pub const MAINTAIN_PLAN_SCHEMA: &str = "barge.maintain.plan/1";
 /// The scratch grants report command document.
 pub const SCRATCH_GRANTS_SCHEMA: &str = "barge.scratch.grants/1";
 /// The scratch delegation declaration command document.

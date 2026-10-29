@@ -24,10 +24,18 @@ Contracts own durable interfaces and formats:
   diagnostic that answers the carried "device or inode changed" finding, the
   stage 4 matrix and bounds, the Oxide compatibility reading of the absence
   rule, the stage 4 slices and the proposed validation.
+- [Host-job hand-off](contracts/host-job.md) owns how a host job calls
+  `barge maintain`: the preview-then-real protocol, the digest it passes, the
+  exit codes it records, what it must never do, and one example plist under
+  `docs/`, uninstalled.
 - [S6 native proof](contracts/s6-native-proof.md) records S6's elevated native
   proof plan: the fixed command, the pinned supervisor bytes, the nine HIGH
   premises traced through the case bodies, the receipt shape and the activation
   order. It is a plan, not a receipt.
+- [S7 native proof](contracts/s7-maintain-proof.md) records S7's elevated native
+  proof plan: `barge maintain` preview and real on one owned image, the pinned
+  supervisor, the nine premises, the six cases, the receipt shape and the
+  activation order. It is a plan, not a receipt.
 
 Rust quality policy owns the strict profile for the Rust workspace:
 [activation](contracts/language-quality-activation.json) records the

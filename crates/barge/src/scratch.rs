@@ -1602,7 +1602,7 @@ pub fn sweep(
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
     request: &SweepRequest<'_>,
-) -> Result<ExpireReport> {
+) -> Result<ExpireRun> {
     if !request.preview {
         let Some(digest) = request.plan_digest else {
             return Err(Error::new(
@@ -1644,16 +1644,21 @@ pub fn sweep(
         }
         let plan = empty_plan(&record);
         let digest = plan_digest(&plan)?;
-        return Ok(ExpireReport {
-            volume_uuid: record.volume_uuid.as_str().to_owned(),
-            volume_present: false,
-            preview: request.preview,
-            plan_digest: digest,
-            plan,
-            deleted: RowSet::empty(),
-            pending: RowSet::empty(),
-            skipped: RowSet::empty(),
-            replay: None,
+        return Ok(ExpireRun {
+            report: ExpireReport {
+                volume_uuid: record.volume_uuid.as_str().to_owned(),
+                volume_present: false,
+                preview: request.preview,
+                plan_digest: digest,
+                plan,
+                deleted: RowSet::empty(),
+                pending: RowSet::empty(),
+                skipped: RowSet::empty(),
+                replay: None,
+            },
+            timed_out: false,
+            unreached: 0,
+            stopped: None,
         });
     }
 
@@ -1669,16 +1674,21 @@ pub fn sweep(
     )?;
     let digest = plan_digest(&plan)?;
     if request.preview {
-        return Ok(ExpireReport {
-            volume_uuid: record.volume_uuid.as_str().to_owned(),
-            volume_present: true,
-            preview: true,
-            plan_digest: digest,
-            plan,
-            deleted: RowSet::empty(),
-            pending: RowSet::empty(),
-            skipped: RowSet::empty(),
-            replay: None,
+        return Ok(ExpireRun {
+            report: ExpireReport {
+                volume_uuid: record.volume_uuid.as_str().to_owned(),
+                volume_present: true,
+                preview: true,
+                plan_digest: digest,
+                plan,
+                deleted: RowSet::empty(),
+                pending: RowSet::empty(),
+                skipped: RowSet::empty(),
+                replay: None,
+            },
+            timed_out: false,
+            unreached: 0,
+            stopped: None,
         });
     }
     if request.plan_digest != Some(digest.as_str()) {
@@ -1694,29 +1704,187 @@ pub fn sweep(
         .with_detail("candidates", plan.candidates.count.into()));
     }
 
-    // A real run first settles what an earlier run left pending, from the
-    // recorded identity only, so the effects below are not blocked by work the
-    // sweep already knows how to finish. A preview never replays.
-    let replay = delete::replay_pending(
+    expire_plan(
         state_paths,
         dirs,
         facts,
         mounts,
         observer,
+        &record,
+        &plan,
+        record.generation,
         request.delete_bounds,
-    )?;
+        request.now_ms,
+        None,
+    )
+}
+
+/// Apply one `barge.scratch.plan/1` exactly as it stands, re-verifying each unit.
+///
+/// This is `barge maintain`'s entry point: the maintain plan carries S4's own
+/// scratch plan, and a real maintain run applies those rows rather than
+/// recomputing and comparing a whole new plan. Each candidate is re-read
+/// immediately before its effect (`reassess` and the deletion's own
+/// authorization), so a unit that became ineligible — a live hold, a withdrawn
+/// delegation or claim, a marker that appeared, a changed identity or a moved
+/// configuration — is kept and reported as that unit only, and the other planned
+/// units still go. `sweep` keeps its own contract, which recomputes the plan and
+/// refuses the whole run when the digest differs.
+///
+/// The digest recorded in the report and in each intent is the digest of the
+/// plan's own bytes, so the journal can always be re-derived from the plan the
+/// caller presented.
+///
+/// `deadline` is the caller's wall clock. When it is reached, no further effect
+/// starts: the intent replay is skipped, every planned candidate that was not
+/// attempted is reported in `skipped` with the wall-clock reason, and
+/// [`ExpireRun::timed_out`] says so even when the effect that pushed past it had
+/// already completed. An effect that was already running when the clock was
+/// reached is never lost from the accounting: it stays in `deleted` or `pending`,
+/// and only the candidates after it count as unreached.
+#[allow(clippy::too_many_arguments)]
+pub fn expire_plan(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    record: &VolumeRecord,
+    plan: &SweepPlan,
+    expected_generation: u64,
+    delete_bounds: DeleteBounds,
+    now_ms: u64,
+    deadline: Option<Instant>,
+) -> Result<ExpireRun> {
+    if plan.volume_uuid != record.volume_uuid {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the plan is for volume {}, not the verified {}",
+                plan.volume_uuid, record.volume_uuid
+            ),
+        )
+        .with_detail("plan_volume_uuid", plan.volume_uuid.as_str().into())
+        .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
+    }
+    let digest = plan_digest(plan)?;
+
+    // Only an expendable volume may be pruned, and only under the record the plan
+    // was made for. A record that now says `kept` (or declares nothing), or that
+    // has been written since the plan, keeps every planned unit: applying a plan
+    // made under another record would delete data the volume no longer authorizes.
+    if record.generation != expected_generation {
+        let reason = format!(
+            "the volume record changed since the plan (generation {expected_generation} to {}), so the planned unit is kept",
+            record.generation
+        );
+        return Ok(kept_plan_run(record, plan, &digest, &reason));
+    }
+    if !record.durability.permits_pruning() {
+        let reason = format!(
+            "the volume now declares `{}`, which never permits pruning, so the planned unit is kept",
+            durability_name(record.durability)
+        );
+        return Ok(kept_plan_run(record, plan, &digest, &reason));
+    }
+    let root_dir = plan.root_dir.clone();
+
+    // A volume that went away between the plan and this run is reported: every
+    // planned unit is kept, and the run continues with the other volumes.
+    if let Err(error) = area::VolumeRoot::open(dirs, facts, mounts, record) {
+        if error.kind() != ErrorKind::VolumeAbsent {
+            return Err(error);
+        }
+        let skipped: Vec<SkippedRow> = plan
+            .candidates
+            .rows
+            .iter()
+            .map(|row| SkippedRow {
+                name: row.name.clone(),
+                scope: row.scope.clone(),
+                reason: format!(
+                    "the volume {} is not attached, so the planned unit is kept",
+                    record.volume_uuid
+                ),
+            })
+            .collect();
+        let total = skipped.len();
+        return Ok(ExpireRun {
+            report: ExpireReport {
+                volume_uuid: record.volume_uuid.as_str().to_owned(),
+                volume_present: false,
+                preview: false,
+                plan_digest: digest,
+                plan: plan.clone(),
+                deleted: RowSet::empty(),
+                pending: RowSet::empty(),
+                skipped: RowSet::bounded(skipped, total, ROOT_ROWS),
+                replay: None,
+            },
+            timed_out: false,
+            unreached: 0,
+            stopped: None,
+        });
+    }
 
     let scratch = plan.folder.clone();
     let mut deleted: Vec<DeletedRow> = Vec::new();
     let mut pending: Vec<PendingRow> = Vec::new();
     let mut skipped: Vec<SkippedRow> = Vec::new();
+    let mut timed_out = false;
+    let mut unreached = 0usize;
+    let mut stopped: Option<String> = None;
+    // A real run first settles what an earlier run left pending, from the
+    // recorded identity only, so the effects below are not blocked by work the
+    // run already knows how to finish. A preview never replays, and a run whose
+    // clock is already spent starts no replay either.
+    let replay = if expired(deadline) {
+        timed_out = true;
+        None
+    } else {
+        Some(delete::replay_pending(
+            state_paths,
+            dirs,
+            facts,
+            mounts,
+            observer,
+            delete_bounds,
+            deadline,
+        )?)
+    };
+    // A replay that ran to the caller's clock — or a stage reached with an empty
+    // candidate list — is still a timeout: the run overran its bound and must
+    // never be reported as a success, and no later effect starts.
+    if expired(deadline) {
+        timed_out = true;
+    }
     let mut intent_seen = false;
     for row in plan.candidates.rows.iter() {
+        if let Some(reason) = &stopped {
+            skipped.push(SkippedRow {
+                name: row.name.clone(),
+                scope: row.scope.clone(),
+                reason: format!("the stage stopped before this unit: {reason}"),
+            });
+            continue;
+        }
         if intent_seen {
             skipped.push(SkippedRow {
                 name: row.name.clone(),
                 scope: row.scope.clone(),
                 reason: "a pending intent stopped this sweep; a later run replays it".to_owned(),
+            });
+            continue;
+        }
+        // The caller's wall clock stops every further effect; what it did not
+        // reach is reported with counts rather than left out.
+        if timed_out || expired(deadline) {
+            timed_out = true;
+            unreached = unreached.saturating_add(1);
+            skipped.push(SkippedRow {
+                name: row.name.clone(),
+                scope: row.scope.clone(),
+                reason: WALL_CLOCK_REASON.to_owned(),
             });
             continue;
         }
@@ -1727,10 +1895,10 @@ pub fn sweep(
             mounts,
             observer,
             state_paths,
-            request.volume_uuid,
+            &record.volume_uuid,
             &row.scope,
             &row.name,
-            request.now_ms,
+            now_ms,
         ) {
             Ok(fresh) => fresh,
             Err(error) if is_per_unit_refusal(&error) => {
@@ -1741,7 +1909,18 @@ pub fn sweep(
                 });
                 continue;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                skipped.push(SkippedRow {
+                    name: row.name.clone(),
+                    scope: row.scope.clone(),
+                    reason: format!("the unit could not be verified again: {error}"),
+                });
+                stopped = Some(format!(
+                    "the stage stopped while re-verifying {}: {error}",
+                    row.name
+                ));
+                continue;
+            }
         };
         let Some(fresh) = fresh else {
             skipped.push(SkippedRow {
@@ -1766,7 +1945,7 @@ pub fn sweep(
             });
             continue;
         }
-        let declaration = scratch_declaration(&record, &scratch);
+        let declaration = scratch_declaration(record, &scratch);
         let (parent, claim) = match &row.scope {
             UnitScope::Project { name } => (name.clone(), format!("project:{name}")),
             UnitScope::TopLevel => (String::new(), "top_level_adhoc".to_owned()),
@@ -1795,10 +1974,24 @@ pub fn sweep(
             ),
             UnitFamily::Unmarked => (None, UnitGrant::claim(claim)),
         };
+        // Re-verification above reads markers, holds and directories and can be
+        // slow, so the clock is checked again here, at the effect boundary: an
+        // effect never starts inside the stop window because the check that
+        // preceded it was cheap.
+        if expired(deadline) {
+            timed_out = true;
+            unreached = unreached.saturating_add(1);
+            skipped.push(SkippedRow {
+                name: row.name.clone(),
+                scope: row.scope.clone(),
+                reason: WALL_CLOCK_REASON.to_owned(),
+            });
+            continue;
+        }
         let kind = row.kind;
         let unit = DeletionUnit {
-            volume_uuid: request.volume_uuid.clone(),
-            root_dir: record.root_dir.clone(),
+            volume_uuid: record.volume_uuid.clone(),
+            root_dir: root_dir.clone(),
             folder: scratch.clone(),
             parent,
             name: row.name.clone(),
@@ -1817,8 +2010,9 @@ pub fn sweep(
                 observer,
                 state_paths,
                 fresh,
+                expected_generation,
                 row,
-                request.now_ms,
+                now_ms,
             )
         };
         match delete::delete_unit_authorized(
@@ -1830,7 +2024,7 @@ pub fn sweep(
             &declaration,
             None,
             &unit,
-            request.delete_bounds,
+            delete_bounds,
             Some(&authorization),
         ) {
             Ok(report) => {
@@ -1866,27 +2060,93 @@ pub fn sweep(
                     reason: error.to_string(),
                 });
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                skipped.push(SkippedRow {
+                    name: row.name.clone(),
+                    scope: row.scope.clone(),
+                    reason: format!("the unit's effect failed: {error}"),
+                });
+                stopped = Some(format!(
+                    "the stage stopped while deleting {}: {error}",
+                    row.name
+                ));
+                continue;
+            }
         }
+        // An effect that finished past the caller's clock is still this run's
+        // work — it is in `deleted` or `pending` — but the run did not finish
+        // inside its bound, so it is a timeout and no later effect starts.
+        if expired(deadline) {
+            timed_out = true;
+        }
+    }
+    // A stage whose last candidate was re-verified and then skipped — refused,
+    // no longer eligible, or its identity changed — still crossed the clock, so
+    // the stage reports the timeout instead of a success.
+    if expired(deadline) {
+        timed_out = true;
     }
     let deleted_total = deleted.len();
     let pending_total = pending.len();
     let skipped_total = skipped.len();
-    Ok(ExpireReport {
-        volume_uuid: record.volume_uuid.as_str().to_owned(),
-        volume_present: true,
-        preview: false,
-        plan_digest: digest,
-        plan,
-        deleted: RowSet::bounded(deleted, deleted_total, ROOT_ROWS),
-        pending: RowSet::bounded(pending, pending_total, ROOT_ROWS),
-        skipped: RowSet::bounded(skipped, skipped_total, ROOT_ROWS),
-        replay: Some(replay),
+    Ok(ExpireRun {
+        report: ExpireReport {
+            volume_uuid: record.volume_uuid.as_str().to_owned(),
+            volume_present: true,
+            preview: false,
+            plan_digest: digest,
+            plan: plan.clone(),
+            deleted: RowSet::bounded(deleted, deleted_total, ROOT_ROWS),
+            pending: RowSet::bounded(pending, pending_total, ROOT_ROWS),
+            skipped: RowSet::bounded(skipped, skipped_total, ROOT_ROWS),
+            replay,
+        },
+        timed_out,
+        unreached,
+        stopped,
     })
 }
 
-/// A refusal that concerns one unit and must not abort the sweep.
-fn is_per_unit_refusal(error: &Error) -> bool {
+/// A durability's name, as a report spells it.
+const fn durability_name(durability: registry::Durability) -> &'static str {
+    match durability {
+        registry::Durability::Expendable => "expendable",
+        registry::Durability::Kept => "kept",
+        registry::Durability::Undeclared => "undeclared",
+    }
+}
+
+/// The reason one planned scratch unit was not attempted: the caller's wall
+/// clock was reached before its effect.
+const WALL_CLOCK_REASON: &str =
+    "the run's wall clock was reached before this effect, so the planned unit is kept";
+
+/// Whether a caller's deadline has been reached. `None` is no deadline.
+fn expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+/// What one application of a plan did, and what the caller's deadline left
+/// undone. `report` is S4's own document; the other two fields are the maintain
+/// run's accounting, so a stage that ran out of clock is never reported as a
+/// complete run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpireRun {
+    /// The `barge.scratch.expire/1` report for the stage.
+    pub report: ExpireReport,
+    /// Whether the caller's deadline was reached: before an effect (so it never
+    /// started), or while one was running (so the run overran its bound).
+    pub timed_out: bool,
+    /// How many planned candidates were never attempted because of it.
+    pub unreached: usize,
+    /// Why the stage stopped before its last candidate, if it did: a failure that
+    /// is not one unit's refusal. The rows above are the work already done.
+    pub stopped: Option<String>,
+}
+
+/// A refusal that concerns one unit and must not abort the sweep or a maintain
+/// stage. Slice S7's area prune reuses the same set, so there is one list.
+pub(crate) fn is_per_unit_refusal(error: &Error) -> bool {
     matches!(
         error.kind(),
         ErrorKind::CustodyNotProven
@@ -1913,6 +2173,38 @@ pub fn plan_digest(plan: &SweepPlan) -> Result<String> {
         ));
     }
     Ok(sha256_hex(&bytes))
+}
+
+/// Every planned unit kept, with one reason: the record no longer authorizes
+/// pruning this plan.
+fn kept_plan_run(record: &VolumeRecord, plan: &SweepPlan, digest: &str, reason: &str) -> ExpireRun {
+    let skipped: Vec<SkippedRow> = plan
+        .candidates
+        .rows
+        .iter()
+        .map(|row| SkippedRow {
+            name: row.name.clone(),
+            scope: row.scope.clone(),
+            reason: reason.to_owned(),
+        })
+        .collect();
+    let total = skipped.len();
+    ExpireRun {
+        report: ExpireReport {
+            volume_uuid: record.volume_uuid.as_str().to_owned(),
+            volume_present: true,
+            preview: false,
+            plan_digest: digest.to_owned(),
+            plan: plan.clone(),
+            deleted: RowSet::empty(),
+            pending: RowSet::empty(),
+            skipped: RowSet::bounded(skipped, total, ROOT_ROWS),
+            replay: None,
+        },
+        timed_out: false,
+        unreached: 0,
+        stopped: None,
+    }
 }
 
 fn empty_plan(record: &VolumeRecord) -> SweepPlan {
@@ -2011,9 +2303,34 @@ fn authorize_under(
     observer: &dyn ProcessObserver,
     state_paths: &StatePaths,
     record: &VolumeRecord,
+    expected_generation: u64,
     row: &PlanRow,
     now_ms: u64,
 ) -> Result<()> {
+    // The record is re-read under the volume lock and the plan was made under one
+    // record: a durability that no longer permits pruning, or any registry write
+    // since the plan, keeps this unit. The snapshot the run started with is not
+    // enough, because either can change while earlier units are deleted.
+    if !record.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "the volume now declares `{}`, which never permits pruning, so the unit is kept",
+                durability_name(record.durability)
+            ),
+        )
+        .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
+    }
+    if record.generation != expected_generation {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "the volume record changed since the plan (generation {expected_generation} to {}), so the unit is kept",
+                record.generation
+            ),
+        )
+        .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
+    }
     let Some(current) = reassess_under(
         dirs,
         facts,
@@ -3429,6 +3746,20 @@ fn reassess(
     now_ms: u64,
 ) -> Result<Option<Assessment>> {
     let record = area::registered_volume(state_paths, volume_uuid)?;
+    // A record that no longer permits pruning keeps this unit, as a per-unit
+    // refusal: an `undeclared` record is loud at the volume level, and a `kept`
+    // one is quiet, but neither is a reason to stop the whole stage.
+    if !record.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "volume {} does not permit pruning now (`{}`), so the unit is kept",
+                record.volume_uuid,
+                durability_name(record.durability)
+            ),
+        )
+        .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
+    }
     record.declared_durability()?;
     reassess_under(
         dirs,
@@ -3530,9 +3861,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        alloc, conclude, declare_claim, declare_delegation, plan_digest, scratch_folder, sweep,
-        unmarked_provenance_digest_parts, AllocRequest, ConcludeRequest, MarkerReading,
-        SweepBounds, SweepPolicy, SweepRequest, UnitFamily, EFFIGY_AGE_SECONDS,
+        alloc, conclude, declare_claim, declare_delegation, expire_plan, plan_digest,
+        scratch_folder, sweep, unmarked_provenance_digest_parts, AllocRequest, ConcludeRequest,
+        MarkerReading, SweepBounds, SweepPolicy, SweepRequest, UnitFamily, EFFIGY_AGE_SECONDS,
         EFFIGY_KEEP_AGE_SECONDS, NATIVE_AGE_SECONDS, OXIDE_AGE_SECONDS,
     };
     use crate::area::{
@@ -3664,6 +3995,7 @@ mod tests {
                 &request,
             )
             .expect("the plan is computed")
+            .report
         }
 
         fn plan_at(&self, now_ms: u64) -> super::ExpireReport {
@@ -3692,6 +4024,7 @@ mod tests {
                 &request,
             )
             .expect("the plan is computed")
+            .report
         }
 
         fn expire_at(&self, now_ms: u64, digest: &str) -> super::ExpireReport {
@@ -3720,6 +4053,7 @@ mod tests {
                 &request,
             )
             .expect("the real sweep reports")
+            .report
         }
 
         fn expire(&self, days: u64, digest: &str) -> super::ExpireReport {
@@ -3748,6 +4082,7 @@ mod tests {
                 &request,
             )
             .expect("the real sweep reports")
+            .report
         }
 
         fn expire_with(&self, dirs: &dyn DirOps, days: u64, digest: &str) -> super::ExpireReport {
@@ -3775,6 +4110,7 @@ mod tests {
                 &request,
             )
             .expect("the real sweep reports")
+            .report
         }
 
         fn claim(&self, project: &str, idle: u64) {
@@ -4769,6 +5105,75 @@ mod tests {
     }
 
     #[test]
+    fn a_sweep_that_stops_keeps_its_rows_and_is_never_a_success() {
+        let harness = Harness::new("scratch-sweep-stop");
+        let first = harness.alloc("alpha", "owner");
+        harness.conclude(
+            &first,
+            "owner",
+            ConclusionOutcome::Closed,
+            ConclusionClosure::Positive,
+            KeptReason::Evidence,
+            NestedScope::Exclusive,
+        );
+        let second = harness.alloc("beta", "owner");
+        harness.conclude(
+            &second,
+            "owner",
+            ConclusionOutcome::Closed,
+            ConclusionClosure::Positive,
+            KeptReason::Evidence,
+            NestedScope::Exclusive,
+        );
+        let days = NATIVE_AGE_SECONDS / (24 * 60 * 60) + 1;
+        let plan = harness.plan(days);
+        assert_eq!(plan.plan.candidates.count, 2, "{:?}", plan.plan.candidates);
+        let failing = plan.plan.candidates.rows[1].name.clone();
+
+        // The second unit's effect fails in a way that is not that unit's refusal.
+        // The sweep stops, and the run it returns carries that stop: the CLI reads
+        // `stopped` for its exit code, so a partial sweep can never look like 0.
+        // Observation one is the plan's own classification; two is the re-read
+        // immediately before the effect.
+        let mut faults = Faults::new();
+        faults.failing_facts_at(&failing, 2);
+        let observer = harness.fixture.observer();
+        let facts = harness.fixture.facts();
+        let mounts = harness.fixture.mounts();
+        let uuid = harness.fixture.uuid.clone();
+        let request = SweepRequest {
+            volume_uuid: &uuid,
+            preview: false,
+            plan_digest: Some(&plan.plan_digest),
+            bounds: SweepBounds::default(),
+            delete_bounds: DeleteBounds {
+                retry_pause: std::time::Duration::ZERO,
+                ..DeleteBounds::default()
+            },
+            now_ms: sweep_now(days, 0),
+        };
+        let run = sweep(
+            &harness.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            &request,
+        )
+        .expect("the sweep reports instead of refusing");
+        let stopped = run.stopped.as_deref().expect("the stop is reported");
+        assert!(stopped.contains("the stage stopped"), "{stopped}");
+        assert!(!run.timed_out);
+        assert_eq!(run.report.deleted.count, 1, "the first deletion is kept");
+        assert_eq!(
+            run.report.deleted.rows[0].name,
+            plan.plan.candidates.rows[0].name
+        );
+        assert_eq!(run.report.skipped.count, 1, "the failing unit is reported");
+        assert_eq!(run.report.skipped.rows[0].name, failing);
+    }
+
+    #[test]
     fn enotempty_leaves_a_pending_intent_and_the_quarantine_leaf() {
         let harness = Harness::new("scratch-delete-enotempty");
         let path = harness.alloc("project-a", "owner");
@@ -4792,6 +5197,156 @@ mod tests {
             crate::state::IntentPhase::MarkerLast
         );
         assert!(report.pending.rows[0].reason.contains("not empty"));
+    }
+
+    #[test]
+    fn an_expire_plan_stage_starts_no_effect_once_its_deadline_is_reached() {
+        let harness = Harness::new("scratch-stage-deadline");
+        let root = harness.alloc("deadline", "owner");
+        harness.conclude(
+            &root,
+            "owner",
+            ConclusionOutcome::Closed,
+            ConclusionClosure::Positive,
+            KeptReason::Evidence,
+            NestedScope::Exclusive,
+        );
+        let days = NATIVE_AGE_SECONDS / (24 * 60 * 60) + 1;
+        let preview = harness.plan(days);
+        assert_eq!(preview.plan.candidates.count, 1);
+
+        let observer = harness.fixture.observer();
+        let facts = harness.fixture.facts();
+        let mounts = harness.fixture.mounts();
+        let platform = harness.fixture.platform();
+        // A caller whose clock is already spent: the replay never starts, the
+        // planned unit is never attempted, and every planned unit is reported.
+        let run = expire_plan(
+            &harness.fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &harness.fixture.record,
+            &preview.plan,
+            harness.fixture.record.generation,
+            DeleteBounds {
+                retry_pause: std::time::Duration::ZERO,
+                ..DeleteBounds::default()
+            },
+            sweep_now(days, 0),
+            Some(std::time::Instant::now()),
+        )
+        .expect("the stage reports");
+        assert!(run.timed_out, "{run:?}");
+        assert_eq!(run.unreached, preview.plan.candidates.count);
+        assert_eq!(run.report.deleted.count, 0);
+        assert_eq!(run.report.pending.count, 0);
+        assert_eq!(run.report.skipped.count, 1);
+        assert!(
+            run.report.skipped.rows[0].reason.contains("wall clock"),
+            "{}",
+            run.report.skipped.rows[0].reason
+        );
+        assert!(run.report.replay.is_none(), "no replay starts either");
+        assert!(root.is_dir(), "the planned unit is kept");
+    }
+
+    #[test]
+    fn an_expire_plan_stage_with_no_candidates_reports_a_spent_clock() {
+        let harness = Harness::new("scratch-stage-deadline-empty");
+        // A run that is not old enough to be eligible: the plan has no candidate
+        // at all, which is the shape that must still report a timeout.
+        let _root = harness.alloc("fresh", "owner");
+        let preview = harness.plan(0);
+        assert_eq!(preview.plan.candidates.count, 0);
+
+        let observer = harness.fixture.observer();
+        let facts = harness.fixture.facts();
+        let mounts = harness.fixture.mounts();
+        let platform = harness.fixture.platform();
+        let run = expire_plan(
+            &harness.fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &harness.fixture.record,
+            &preview.plan,
+            harness.fixture.record.generation,
+            DeleteBounds {
+                retry_pause: std::time::Duration::ZERO,
+                ..DeleteBounds::default()
+            },
+            sweep_now(0, 0),
+            Some(std::time::Instant::now()),
+        )
+        .expect("the stage reports");
+        assert!(run.timed_out, "an empty plan must not hide a spent clock");
+        assert_eq!(run.unreached, 0);
+        assert_eq!(run.report.deleted.count, 0);
+        assert_eq!(run.report.pending.count, 0);
+        assert!(
+            run.report.replay.is_none(),
+            "no replay starts on a spent clock"
+        );
+    }
+
+    #[test]
+    fn an_expire_plan_stage_on_a_kept_volume_keeps_every_planned_unit() {
+        let harness = Harness::new("scratch-stage-kept");
+        let root = harness.alloc("kept", "owner");
+        harness.conclude(
+            &root,
+            "owner",
+            ConclusionOutcome::Closed,
+            ConclusionClosure::Positive,
+            KeptReason::Evidence,
+            NestedScope::Exclusive,
+        );
+        let days = NATIVE_AGE_SECONDS / (24 * 60 * 60) + 1;
+        let preview = harness.plan(days);
+        assert_eq!(preview.plan.candidates.count, 1);
+
+        // The record now declares the volume kept, at the same generation: a plan
+        // made for an expendable volume may never prune a volume that says its data
+        // is kept.
+        let mut kept_record = harness.fixture.record.clone();
+        kept_record.durability = crate::registry::Durability::Kept;
+        assert_eq!(kept_record.generation, harness.fixture.record.generation);
+        let observer = harness.fixture.observer();
+        let facts = harness.fixture.facts();
+        let mounts = harness.fixture.mounts();
+        let platform = harness.fixture.platform();
+        let run = expire_plan(
+            &harness.fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &kept_record,
+            &preview.plan,
+            harness.fixture.record.generation,
+            DeleteBounds {
+                retry_pause: std::time::Duration::ZERO,
+                ..DeleteBounds::default()
+            },
+            sweep_now(days, 0),
+            None,
+        )
+        .expect("the stage reports");
+        assert_eq!(run.report.deleted.count, 0);
+        assert_eq!(run.report.pending.count, 0);
+        assert_eq!(run.report.skipped.count, 1);
+        assert!(
+            run.report.skipped.rows[0]
+                .reason
+                .contains("never permits pruning"),
+            "{}",
+            run.report.skipped.rows[0].reason
+        );
+        assert!(!run.timed_out);
+        assert!(root.is_dir(), "the planned unit is kept");
     }
 
     #[test]
@@ -4855,7 +5410,8 @@ mod tests {
             &observer,
             &request,
         )
-        .expect("an ephemeral volume's absence is a report");
+        .expect("an ephemeral volume's absence is a report")
+        .report;
         assert!(!report.volume_present);
         assert_eq!(report.plan.candidates.count, 0);
         assert!(!harness.fixture.root.join("scratch").exists());
@@ -4960,7 +5516,8 @@ mod tests {
             &harness.fixture.observer(),
             &request,
         )
-        .expect("preview");
+        .expect("preview")
+        .report;
         assert!(report.plan.truncated);
         assert_eq!(report.plan.candidates.count, 0);
         assert!(harness
@@ -5040,6 +5597,7 @@ mod tests {
             &harness.fixture.observer(),
             &harness.fixture.state,
             &record,
+            record.generation,
             row,
             now,
         )
@@ -5761,7 +6319,8 @@ mod tests {
             &observer,
             &request,
         )
-        .expect("the bounded preview reports");
+        .expect("the bounded preview reports")
+        .report;
         assert!(report.plan.truncated, "the bound is reported");
         assert!(report.plan.examined <= 2);
     }
@@ -5850,6 +6409,7 @@ mod tests {
                 &observer,
                 &harness.fixture.state,
                 &claimed,
+                claimed.generation,
                 &unmarked,
                 now,
             )
@@ -5869,6 +6429,7 @@ mod tests {
             &observer,
             &harness.fixture.state,
             &stricter,
+            stricter.generation,
             &unmarked,
             now,
         )
@@ -5887,6 +6448,7 @@ mod tests {
                 &observer,
                 &harness.fixture.state,
                 &withdrawn,
+                withdrawn.generation,
                 &unmarked,
                 now,
             )
@@ -5916,6 +6478,7 @@ mod tests {
             &observer,
             &harness.fixture.state,
             &claimed,
+            claimed.generation,
             &marked_row,
             now,
         )
@@ -5929,6 +6492,7 @@ mod tests {
                 &observer,
                 &harness.fixture.state,
                 &delegated,
+                delegated.generation,
                 &marked_row,
                 now,
             )
@@ -5946,6 +6510,7 @@ mod tests {
                 &observer,
                 &harness.fixture.state,
                 &claimed,
+                claimed.generation,
                 &wrong_kind,
                 now
             )
@@ -5965,6 +6530,7 @@ mod tests {
                 &observer,
                 &harness.fixture.state,
                 &claimed,
+                claimed.generation,
                 &moved,
                 now,
             )
@@ -6385,6 +6951,7 @@ mod tests {
                     retry_pause: std::time::Duration::ZERO,
                     ..DeleteBounds::default()
                 },
+                None,
             )
             .expect("the replay reports");
             assert!(
@@ -6485,7 +7052,8 @@ mod tests {
             &observer,
             &request,
         )
-        .expect("the bounded preview reports");
+        .expect("the bounded preview reports")
+        .report;
         assert!(report.plan.truncated, "the bound is reported");
         assert!(
             report.plan.examined <= 6,

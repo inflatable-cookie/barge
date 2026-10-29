@@ -145,6 +145,11 @@ pub struct DeleteBounds {
     pub retry_pause: Duration,
     /// The custody bounds the deletion's verdict ran within.
     pub custody: CustodyBounds,
+    /// The caller's wall clock, when it has one. No durable step of a deletion or
+    /// a replay starts after it: the preflight (locks, registry read, custody) can
+    /// be slow, so the bound is checked at the durable boundaries themselves, not
+    /// only before the call.
+    pub deadline: Option<Instant>,
 }
 
 impl Default for DeleteBounds {
@@ -156,6 +161,7 @@ impl Default for DeleteBounds {
             retry_attempts: ENOTEMPTY_ATTEMPTS,
             retry_pause: ENOTEMPTY_PAUSE,
             custody: CustodyBounds::default(),
+            deadline: None,
         }
     }
 }
@@ -363,6 +369,24 @@ pub(crate) fn delete_unit_authorized(
     // not contain its folder, and a unit that is not in the folder the
     // configuration resolves all refuse before a directory or lock exists.
     let record = area::registered_volume(state_paths, &volume_uuid)?;
+    // Only an expendable record authorizes a deletion, and this is a per-unit
+    // refusal so the caller keeps the unit and reports it rather than stopping the
+    // stage: an `undeclared` record is loud at the volume level.
+    if !record.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "volume {} does not permit pruning now (`{}`), so the unit is kept",
+                record.volume_uuid,
+                match record.durability {
+                    crate::registry::Durability::Expendable => "expendable",
+                    crate::registry::Durability::Kept => "kept",
+                    crate::registry::Durability::Undeclared => "undeclared",
+                }
+            ),
+        )
+        .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
+    }
     record.declared_durability()?;
     let volume = area::prepare(
         state_paths,
@@ -431,6 +455,21 @@ pub(crate) fn delete_unit_authorized(
     // The registry is re-read under the locks before the intent is written, so a
     // record that changed while the plan ran is refused rather than trusted.
     let record = area::registered_volume(state_paths, &volume_uuid)?;
+    if !record.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "volume {} does not permit pruning now (`{}`), so the unit is kept",
+                record.volume_uuid,
+                match record.durability {
+                    crate::registry::Durability::Expendable => "expendable",
+                    crate::registry::Durability::Kept => "kept",
+                    crate::registry::Durability::Undeclared => "undeclared",
+                }
+            ),
+        )
+        .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
+    }
     record.declared_durability()?;
     if let Some(authorize) = authorize {
         authorize(&record)?;
@@ -507,6 +546,17 @@ pub(crate) fn delete_unit_authorized(
         foreign_captures: Vec::new(),
     };
     let write = locks.begin_intent_write()?;
+    // The first durable step is this intent record, and the lock waits above (and
+    // the whole preflight before them) can consume the stop window. The clock is
+    // therefore checked here, at the last moment before the record: a spent clock
+    // writes no intent, changes nothing, and keeps the unit.
+    if expired(bounds.deadline) {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the run's wall clock was reached before this deletion's intent was published; the unit is kept",
+        )
+        .with_detail("unit", unit.name.clone().into()));
+    }
     state::publish_intent(&write, state_paths, &intent)?;
 
     // The effect may not start on a custody verdict that has aged: it is
@@ -536,6 +586,20 @@ pub(crate) fn delete_unit_authorized(
         return Ok(report);
     }
 
+    // The rename is the first destructive step. The custody verdict above is
+    // re-decided after the intent and can itself be slow, so the clock is checked
+    // again here: a spent clock leaves the intent pending for a later replay and
+    // the unit untouched, never a rename inside the stop window.
+    if expired(bounds.deadline) {
+        return Ok(pending_report(
+            &intent,
+            quarantine,
+            Counts::default(),
+            "the run's wall clock was reached before the unit was renamed, so the intent stays pending"
+                .to_owned(),
+            Some(evidence),
+        ));
+    }
     // The quarantine rename is atomic and exclusive inside the unit's parent: an
     // existing name refuses instead of being replaced, and a cross-device or
     // changed-inode result stops before anything is deleted.
@@ -1031,6 +1095,18 @@ fn finish_deletion(
     // The durable completion evidence: Barge's own final unlink of a verified
     // captured private name succeeded. A replay may settle the intent only after
     // this phase; without it, an absence is unknown, never a completion.
+    // This path is shared by the live deletion and a resumed replay, and the walk
+    // and the leaf removal before it can be slow: no completion phase is recorded
+    // on a spent caller clock. The intent stays pending at its current phase.
+    if expired(bounds.deadline) {
+        return pending_report(
+            &journal.intent(),
+            quarantine,
+            counts,
+            WALL_CLOCK_REASON.to_owned(),
+            None,
+        );
+    }
     match state::advance_intent(write, state_paths, &journal.intent(), IntentPhase::Removed) {
         Ok(removed) => {
             current = removed.clone();
@@ -1045,6 +1121,15 @@ fn finish_deletion(
                 None,
             )
         }
+    }
+    if expired(bounds.deadline) {
+        return pending_report(
+            &current,
+            quarantine,
+            counts,
+            WALL_CLOCK_REASON.to_owned(),
+            None,
+        );
     }
     match state::advance_intent(write, state_paths, &current, IntentPhase::Deleted) {
         Ok(settled) => DeleteReport {
@@ -1312,7 +1397,13 @@ impl<'a> WalkState<'a> {
             mount,
             uid: observer.effective_uid()?,
             bounds,
-            deadline: Instant::now() + bounds.timeout,
+            // The walk's own per-root deadline and the caller's run clock both
+            // bound it: whichever comes first stops it, so a resumed deletion
+            // never keeps walking past the run's stop window on its own budget.
+            deadline: match bounds.deadline {
+                Some(run) => (Instant::now() + bounds.timeout).min(run),
+                None => Instant::now() + bounds.timeout,
+            },
             examined: 0,
             expected: HashSet::new(),
             journal,
@@ -1443,14 +1534,35 @@ impl<'a> WalkState<'a> {
 
     /// Account for `added` examined entries: the deadline, the periodic volume
     /// re-verification, and nothing else.
+    /// The walk's effect boundary: a spent caller clock stops it before it
+    /// captures, journals or unlinks anything else. `Ok(Some(reason))` means the
+    /// caller must stop the walk with that reason and change nothing further.
+    fn effect_stop(&mut self) -> Result<Option<String>> {
+        self.budget(0)
+    }
+
     fn budget(&mut self, added: usize) -> Result<Option<String>> {
         self.examined = self.examined.saturating_add(added);
         if Instant::now() >= self.deadline {
-            return Ok(Some(format!(
-                "the per-root deadline of {}s was reached after {} entries",
-                self.bounds.timeout.as_secs(),
-                self.examined
-            )));
+            // The walked bound is whichever comes first: the caller's run clock or
+            // the per-root deadline. The reason names the one that actually bound,
+            // so a maintain stop is never reported as a per-root timeout.
+            let run_clock_binds = self
+                .bounds
+                .deadline
+                .is_some_and(|run| Instant::now() >= run);
+            return Ok(Some(if run_clock_binds {
+                format!(
+                    "the run's wall clock was reached after {} entries, so the deletion stopped",
+                    self.examined
+                )
+            } else {
+                format!(
+                    "the per-root deadline of {}s was reached after {} entries",
+                    self.bounds.timeout.as_secs(),
+                    self.examined
+                )
+            }));
         }
         if self.examined >= REVERIFY_ENTRIES {
             self.verify_volume()?;
@@ -1594,6 +1706,9 @@ impl<'a> WalkState<'a> {
     /// replaces an entry. A taken private name is retried with fresh random
     /// bytes, so a collision can never be mistaken for a capture.
     fn capture(&mut self, handle: &DirHandle, name: &str) -> Result<Capture> {
+        if let Some(reason) = self.effect_stop()? {
+            return Ok(Capture::Stopped(reason));
+        }
         for _ in 0..CAPTURE_ATTEMPTS {
             let private = format!("{CAPTURE_PREFIX}{}", hex(&self.dirs.random_bytes(16)?));
             match self.dirs.rename_child(handle, name, &private)? {
@@ -1827,6 +1942,9 @@ impl<'a> WalkState<'a> {
             Some(index) => self.chain[index] = record.clone(),
             None => self.chain.push(record.clone()),
         }
+        if let Some(reason) = self.effect_stop()? {
+            return Ok(Walk::Stop(reason));
+        }
         if let Err(error) = self.publish_chain() {
             return Ok(Walk::Stop(format!(
                 "the capture of `{}` could not be recorded, so it is not unlinked: {error}",
@@ -1869,6 +1987,9 @@ impl<'a> WalkState<'a> {
                 "`{}` is no longer the recorded capture of `{}`, so it is not unlinked and the intent stays pending",
                 record.private, record.original
             )));
+        }
+        if let Some(reason) = self.effect_stop()? {
+            return Ok(Walk::Stop(reason));
         }
         match self
             .dirs
@@ -1953,6 +2074,9 @@ impl<'a> WalkState<'a> {
         }
         // The recursion refreshed the chain; make this directory the last recorded
         // entry before its own removal.
+        if let Some(reason) = self.effect_stop()? {
+            return Ok(Walk::Stop(reason));
+        }
         if let Err(error) = self.publish_chain() {
             return Ok(Walk::Stop(restore_custody(
                 custody,
@@ -2157,6 +2281,9 @@ impl<'a> WalkState<'a> {
                 // replay that stops at `marker_last`, before the leaf is captured,
                 // then reads no completed capture as a missing one, and resumes the
                 // leaf capture instead of reporting an unknown.
+                if let Some(reason) = self.effect_stop()? {
+                    return Ok(Walk::Stop(reason));
+                }
                 if let Err(error) = self.publish_chain() {
                     return Ok(Walk::Stop(format!(
                         "the marker was unlinked but the completed capture could not be recorded: {error}"
@@ -2296,6 +2423,9 @@ impl<'a> WalkState<'a> {
     ) -> Result<Removal> {
         let attempts = self.bounds.retry_attempts.max(1);
         for attempt in 0..attempts {
+            if let Some(reason) = self.effect_stop()? {
+                return Ok(Removal::Stopped(reason));
+            }
             match self
                 .dirs
                 .remove_child(parent, name, RemoveKind::Directory)?
@@ -2485,6 +2615,7 @@ pub fn replay_pending(
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
     bounds: DeleteBounds,
+    deadline: Option<Instant>,
 ) -> Result<ReplayReport> {
     let intents = state::read_intents(state_paths, INTENT_ROWS)?;
     let mut report = ReplayReport {
@@ -2503,6 +2634,19 @@ pub fn replay_pending(
     state_paths.initialize()?;
 
     for intent in pending {
+        // A caller's wall clock governs the replay too: once it is reached no
+        // further intent is replayed, and each one the run did not reach is
+        // reported as still pending rather than left out of the accounting.
+        if expired(deadline) {
+            report.pending.push(PendingRow {
+                intent_id: intent.intent_id.clone(),
+                unit_name: intent.unit.name.clone(),
+                unit_kind: intent.unit.kind.as_str().to_owned(),
+                phase: intent.phase,
+                reason: WALL_CLOCK_REASON.to_owned(),
+            });
+            continue;
+        }
         let Some(record) = registry.volume(&intent.volume_uuid).cloned() else {
             report.pending.push(PendingRow {
                 intent_id: intent.intent_id.clone(),
@@ -2550,6 +2694,25 @@ pub fn replay_pending(
     Ok(report)
 }
 
+/// Why one pending intent was not replayed: the caller's wall clock was reached
+/// before it, so it stays pending for a later run.
+const WALL_CLOCK_REASON: &str =
+    "the run's wall clock was reached before this intent was replayed, so it stays pending";
+
+/// Refuse a journal write on a spent caller clock: a replay that would roll an
+/// intent back or advance its phase reports the intent as pending instead.
+fn journal_clock_spent(deadline: Option<Instant>) -> Option<ReplayOutcome> {
+    if expired(deadline) {
+        return Some(ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned()));
+    }
+    None
+}
+
+/// Whether a caller's deadline has been reached. `None` is no deadline.
+fn expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
 /// What one replay decided.
 enum ReplayOutcome {
     /// The both-absent proof settled it.
@@ -2573,6 +2736,12 @@ fn replay_one(
     intent: &IntentRecord,
     bounds: DeleteBounds,
 ) -> Result<ReplayOutcome> {
+    // The clock is checked before anything this replay can do, because the first
+    // thing it can do is durable: the settle that follows an absent folder or
+    // parent at the `removed` phase. A spent clock leaves that intent pending.
+    if expired(bounds.deadline) {
+        return Ok(ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned()));
+    }
     let opened = area::open_folder(
         dirs,
         facts,
@@ -2587,8 +2756,17 @@ fn replay_one(
         // Only the durable `removed` phase - recorded after Barge's own final
         // unlink succeeded - proves completion; an absence without it is unknown.
         if intent.phase == IntentPhase::Removed {
-            settle(state_paths, intent)?;
-            return Ok(ReplayOutcome::Settled);
+            // The observation above can itself be slow, so the clock is checked
+            // again after it: a settle is a durable completion and never runs on a
+            // spent clock.
+            if expired(bounds.deadline) {
+                return Ok(ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned()));
+            }
+            return Ok(if settle(state_paths, intent, bounds.deadline)? {
+                ReplayOutcome::Settled
+            } else {
+                ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned())
+            });
         }
         return Ok(ReplayOutcome::Pending(
             "the area folder is gone but the removed phase was not recorded, so completion is unknown"
@@ -2605,8 +2783,15 @@ fn replay_one(
         // The unit's parent is positively absent, so the unit and its capture are
         // too - and again only the durable `removed` phase proves completion.
         if intent.phase == IntentPhase::Removed {
-            settle(state_paths, intent)?;
-            return Ok(ReplayOutcome::Settled);
+            // The parent observation can be slow too; the same rule applies.
+            if expired(bounds.deadline) {
+                return Ok(ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned()));
+            }
+            return Ok(if settle(state_paths, intent, bounds.deadline)? {
+                ReplayOutcome::Settled
+            } else {
+                ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned())
+            });
         }
         return Ok(ReplayOutcome::Pending(
             "the unit's parent is gone but the removed phase was not recorded, so completion is unknown"
@@ -2617,6 +2802,12 @@ fn replay_one(
     let mut locks = LockSet::new(state_paths.clone());
     let _volume_lock = locks.lock_volume(&intent.volume_uuid)?;
     let _unit_lock = lock_deletion_unit(&mut locks, &unit)?;
+    // The replay's preflight (volume, folder, locks) can be slow, so the caller's
+    // clock is checked here, before its first durable step: a spent clock leaves
+    // the intent pending and changes nothing.
+    if expired(bounds.deadline) {
+        return Ok(ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned()));
+    }
     let write = locks.begin_intent_write()?;
 
     let leaf_facts = dirs.child_facts(&parent, intent.capture_name())?;
@@ -2668,11 +2859,23 @@ fn replay_one(
         _ => None,
     };
 
+    // The leaf and marker observations above, and the mode restoration before
+    // them, can all be slow. The phase decision below is where a replay resumes a
+    // deletion, rolls an intent back or advances the journal — every durable step
+    // this replay has left — so the clock is checked again here, at that boundary:
+    // a spent window leaves the intent pending and changes nothing further.
+    if expired(bounds.deadline) {
+        return Ok(ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned()));
+    }
+
     match intent.phase {
         IntentPhase::Intent => {
             // The rename may not have happened: if the unit is still in place
             // with its recorded identity, the intent is rolled back.
             if unit_still_in_place(dirs, observer, intent, &parent)? {
+                if let Some(outcome) = journal_clock_spent(bounds.deadline) {
+                    return Ok(outcome);
+                }
                 state::remove_intent(state_paths, &intent.intent_id)?;
                 return Ok(ReplayOutcome::RolledBack);
             }
@@ -2681,6 +2884,9 @@ fn replay_one(
                     return Ok(ReplayOutcome::Pending(reason));
                 }
                 // The rename happened before its phase was recorded: resume.
+                if let Some(outcome) = journal_clock_spent(bounds.deadline) {
+                    return Ok(outcome);
+                }
                 let renamed =
                     state::advance_intent(&write, state_paths, intent, IntentPhase::Renamed)?;
                 let report = finish_deletion(
@@ -2741,6 +2947,9 @@ fn replay_one(
             // absent for the intent to settle; a leaf that is there again is a new
             // object at the private name, which is unknown.
             if leaf_facts.is_none() {
+                if let Some(outcome) = journal_clock_spent(bounds.deadline) {
+                    return Ok(outcome);
+                }
                 state::advance_intent(&write, state_paths, intent, IntentPhase::Deleted)?;
                 return Ok(ReplayOutcome::Settled);
             }
@@ -2802,7 +3011,12 @@ fn replay_one(
             match walk.remove_leaf(&parent, intent, leaf_mode, &mut counts)? {
                 Removal::Gone => {
                     // The replay's own final unlink is the durable completion
-                    // evidence, recorded before the intent settles.
+                    // evidence, recorded before the intent settles. Removing the leaf
+                    // can itself be slow, so the clock is checked again here, at the
+                    // journal boundary: a spent window records nothing.
+                    if let Some(outcome) = journal_clock_spent(bounds.deadline) {
+                        return Ok(outcome);
+                    }
                     let removed =
                         state::advance_intent(&write, state_paths, intent, IntentPhase::Removed)?;
                     state::advance_intent(&write, state_paths, &removed, IntentPhase::Deleted)?;
@@ -3003,14 +3217,26 @@ fn recorded_mismatch(leftovers: &[ForeignCapture]) -> Option<String> {
 
 /// Settle an intent whose area folder or unit parent is positively gone and whose
 /// durable `removed` phase was recorded.
-fn settle(state_paths: &StatePaths, intent: &IntentRecord) -> Result<()> {
+fn settle(
+    state_paths: &StatePaths,
+    intent: &IntentRecord,
+    deadline: Option<Instant>,
+) -> Result<bool> {
     let unit = intent.deletion_unit();
     let mut locks = LockSet::new(state_paths.clone());
     let _volume_lock = locks.lock_volume(&intent.volume_uuid)?;
     let _unit_lock = lock_deletion_unit(&mut locks, &unit)?;
     let write = locks.begin_intent_write()?;
+    // Settling is itself a durable effect, and the lock waits above can consume
+    // the caller's stop window after the caller's own check. The clock is
+    // therefore checked here, with the locks held and immediately before the
+    // phase advance: `false` means nothing was recorded and the intent stays
+    // pending for a later run.
+    if expired(deadline) {
+        return Ok(false);
+    }
     state::advance_intent(&write, state_paths, intent, IntentPhase::Deleted)?;
-    Ok(())
+    Ok(true)
 }
 
 /// A lowercase hexadecimal rendering of fresh bytes.
@@ -3027,7 +3253,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         delete_unit_on_volume, replay_pending, DeleteBounds, DeleteOutcome, ReplayReport,
@@ -3325,6 +3551,7 @@ mod tests {
                 &mounts,
                 &observer,
                 self.bounds(),
+                None,
             )
             .expect("the replay reports")
         }
@@ -3482,8 +3709,9 @@ mod tests {
         mounts: &crate::testkit::FakeMounts,
         observer: &dyn ProcessObserver,
         bounds: DeleteBounds,
+        deadline: Option<Instant>,
     ) -> crate::error::Result<ReplayReport> {
-        replay_pending(state_paths, dirs, facts, mounts, observer, bounds)
+        replay_pending(state_paths, dirs, facts, mounts, observer, bounds, deadline)
     }
 
     /// Record one capture on the prepared intent, after its phases are published.
@@ -3756,6 +3984,88 @@ mod tests {
     }
 
     #[test]
+    fn replay_stops_at_the_caller_s_deadline_and_leaves_the_intent_pending() {
+        let prepared = prepared("replay-deadline");
+        let root = prepared.unit_path().clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        publish(&prepared, &[]);
+
+        // A caller whose clock is already spent starts no replay: the intent is
+        // reported as still pending with the wall-clock reason, and nothing is
+        // rolled back, resumed or removed.
+        let faults = Faults::new();
+        let facts = prepared.fixture.facts();
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let report = replay_with(
+            &prepared.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            prepared.bounds(),
+            Some(Instant::now()),
+        )
+        .expect("the replay reports");
+        assert_eq!(report.examined, 1, "{report:?}");
+        assert_eq!(report.settled, 0);
+        assert_eq!(report.rolled_back, 0);
+        assert_eq!(report.resumed, 0);
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(
+            report.pending[0].reason.contains("wall clock"),
+            "{}",
+            report.pending[0].reason
+        );
+        assert!(root.join("payload.txt").is_file(), "nothing was touched");
+        assert_eq!(
+            prepared.pending_intents().len(),
+            1,
+            "the intent stays pending for a later run"
+        );
+    }
+
+    #[test]
+    fn a_spent_deadline_refuses_before_the_intent_is_written() {
+        let prepared = prepared("deadline-before-intent");
+        let root = prepared.unit_path().clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+
+        // The caller's clock is spent: the deletion's preflight can be as slow as
+        // it likes, but nothing durable may be written and the unit stays.
+        let faults = Faults::new();
+        let facts = prepared.fixture.facts();
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let mut bounds = prepared.bounds();
+        bounds.deadline = Some(Instant::now());
+        let error = super::delete_unit_authorized(
+            &prepared.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            &prepared.declaration,
+            None,
+            &prepared.unit,
+            bounds,
+            None,
+        )
+        .expect_err("a spent clock refuses before the first durable step");
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        assert!(
+            error.message().contains("intent was published"),
+            "{}",
+            error.message()
+        );
+        assert!(root.join("payload.txt").is_file(), "nothing was touched");
+        assert!(
+            prepared.pending_intents().is_empty(),
+            "no intent record was written"
+        );
+    }
+
+    #[test]
     fn replay_rolls_back_an_intent_whose_root_is_still_in_place() {
         let prepared = prepared("replay-rollback");
         let root = prepared.unit_path().clone();
@@ -3846,6 +4156,360 @@ mod tests {
             report.pending[0].reason
         );
         assert_eq!(prepared.pending_intents().len(), 1);
+    }
+
+    #[test]
+    fn a_spent_deadline_never_settles_a_removed_intent_on_an_absent_folder() {
+        let prepared = prepared("replay-deadline-removed");
+        let root = prepared.unit_path().clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        publish(&prepared, &[]);
+        rename_to_quarantine(&prepared);
+        std::fs::remove_dir_all(prepared.quarantine()).expect("the leaf is removed");
+        publish(
+            &prepared,
+            &[
+                IntentPhase::Renamed,
+                IntentPhase::MarkerLast,
+                IntentPhase::Removed,
+            ],
+        );
+        // The area folder itself is gone, which is the replay's earliest durable
+        // decision: at the `removed` phase it would settle. A spent clock must stop
+        // it before that, so no completion is recorded on an overrun.
+        std::fs::remove_dir_all(&prepared.area).expect("the area folder is removed");
+
+        let faults = Faults::new();
+        let facts = prepared.fixture.facts();
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let report = replay_with(
+            &prepared.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            prepared.bounds(),
+            Some(Instant::now()),
+        )
+        .expect("the replay reports");
+        assert_eq!(report.settled, 0, "{report:?}");
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(
+            report.pending[0].reason.contains("wall clock"),
+            "{}",
+            report.pending[0].reason
+        );
+        let intents = prepared.pending_intents();
+        assert_eq!(intents.len(), 1, "the intent stays pending");
+        assert_eq!(
+            intents[0].phase,
+            IntentPhase::Removed,
+            "no settle was recorded"
+        );
+    }
+
+    #[test]
+    fn an_observation_that_consumes_the_clock_never_settles_a_removed_intent() {
+        let prepared = prepared("replay-observation-deadline");
+        let root = prepared.unit_path().clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        publish(&prepared, &[]);
+        rename_to_quarantine(&prepared);
+        std::fs::remove_dir_all(prepared.quarantine()).expect("the leaf is removed");
+        publish(
+            &prepared,
+            &[
+                IntentPhase::Renamed,
+                IntentPhase::MarkerLast,
+                IntentPhase::Removed,
+            ],
+        );
+        // The area folder is gone, so this replay's decision is the settle at the
+        // `removed` phase — but the observation that reveals the absence takes the
+        // rest of the caller's clock. The entry check passes and the post-
+        // observation check must refuse: nothing is settled on an overrun.
+        std::fs::remove_dir_all(&prepared.area).expect("the area folder is removed");
+        let faults = Faults::new();
+        // The walk observes the folder one component at a time, so the pause is on
+        // the first component: the absence is discovered after it.
+        let first_component = prepared
+            .declaration
+            .folder
+            .split('/')
+            .next()
+            .expect("a folder component")
+            .to_owned();
+        faults.sleeping_observation_prefix(&first_component, Duration::from_millis(2_300));
+        let facts = prepared.fixture.facts();
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let mut bounds = prepared.bounds();
+        bounds.deadline = Some(Instant::now() + Duration::from_secs(2));
+        let report = replay_with(
+            &prepared.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            bounds,
+            bounds.deadline,
+        )
+        .expect("the replay reports");
+        assert_eq!(report.settled, 0, "{report:?}");
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(
+            report.pending[0].reason.contains("wall clock"),
+            "{}",
+            report.pending[0].reason
+        );
+        let intents = prepared.pending_intents();
+        assert_eq!(intents.len(), 1, "the intent stays pending");
+        assert_eq!(
+            intents[0].phase,
+            IntentPhase::Removed,
+            "no settle was recorded"
+        );
+    }
+
+    #[test]
+    fn a_settle_with_a_spent_clock_records_nothing_and_leaves_the_intent_pending() {
+        let prepared = prepared("settle-deadline");
+        let root = prepared.unit_path().clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        let intent = publish(
+            &prepared,
+            &[
+                IntentPhase::Renamed,
+                IntentPhase::MarkerLast,
+                IntentPhase::Removed,
+            ],
+        );
+
+        // The lock waits inside the settle can consume the caller's stop window,
+        // so the clock is re-checked with those locks held: a spent clock records
+        // no completion and the intent stays at `removed` for a later run.
+        assert!(
+            !super::settle(&prepared.fixture.state, &intent, Some(Instant::now()))
+                .expect("the settle reports"),
+            "a spent clock does not settle"
+        );
+        let intents = prepared.pending_intents();
+        assert_eq!(intents.len(), 1, "the intent stays pending");
+        assert_eq!(intents[0].phase, IntentPhase::Removed, "no settled phase");
+
+        // The counterfactual: with no caller clock the same intent settles.
+        assert!(
+            super::settle(&prepared.fixture.state, &intent, None).expect("the settle reports"),
+            "an unclocked settle records the completion"
+        );
+        assert!(
+            prepared.pending_intents().is_empty(),
+            "the intent is settled"
+        );
+    }
+
+    #[test]
+    fn a_slow_leaf_observation_never_resumes_a_renamed_intent_past_the_clock() {
+        let prepared = prepared("replay-resume-deadline");
+        let root = prepared.unit_path().clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        publish(&prepared, &[]);
+        rename_to_quarantine(&prepared);
+        publish(&prepared, &[IntentPhase::Renamed]);
+
+        // The entry and lock checks pass; the leaf observation that follows them
+        // takes the rest of the caller's clock. A replay must not resume the
+        // deletion or advance the journal after that: the leaf stays and the
+        // intent stays pending.
+        let faults = Faults::new();
+        faults.sleeping_observation_prefix(QUARANTINE_PREFIX, Duration::from_millis(2_300));
+        let facts = prepared.fixture.facts();
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let mut bounds = prepared.bounds();
+        bounds.deadline = Some(Instant::now() + Duration::from_secs(2));
+        let report = replay_with(
+            &prepared.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            bounds,
+            bounds.deadline,
+        )
+        .expect("the replay reports");
+        assert_eq!(report.resumed, 0, "{report:?}");
+        assert_eq!(report.settled, 0, "{report:?}");
+        assert_eq!(report.entries_removed, 0, "{report:?}");
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(
+            report.pending[0].reason.contains("wall clock"),
+            "{}",
+            report.pending[0].reason
+        );
+        assert!(
+            prepared.quarantine().join("payload.txt").is_file(),
+            "the resumed deletion never started"
+        );
+        let intents = prepared.pending_intents();
+        assert_eq!(intents.len(), 1, "the intent stays pending");
+        assert_eq!(intents[0].phase, IntentPhase::Renamed, "no phase advanced");
+    }
+
+    #[test]
+    fn a_slow_leaf_removal_never_advances_the_journal_past_the_clock() {
+        let prepared = prepared("replay-marker-last-deadline");
+        publish(&prepared, &[]);
+        rename_to_quarantine(&prepared);
+        // A real marker-last stop has the unit's marker already unlinked last; the
+        // leaf and its payload are what remain.
+        std::fs::remove_file(prepared.quarantine().join(ROOT_MARKER_FILE))
+            .expect("the marker is removed last");
+        publish(&prepared, &[IntentPhase::Renamed, IntentPhase::MarkerLast]);
+
+        // The phase decision and the leaf observation pass; removing the captured
+        // leaf takes the rest of the clock. The replay must not record `removed`
+        // or `deleted` after it, and the intent stays at `marker_last`.
+        let faults = Faults::new();
+        faults.sleeping_remove_prefix(CAPTURE_PREFIX, Duration::from_millis(2_300));
+        let facts = prepared.fixture.facts();
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let mut bounds = prepared.bounds();
+        bounds.deadline = Some(Instant::now() + Duration::from_secs(2));
+        let report = replay_with(
+            &prepared.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            bounds,
+            bounds.deadline,
+        )
+        .expect("the replay reports");
+        assert_eq!(report.settled, 0, "{report:?}");
+        assert_eq!(report.resumed, 0, "{report:?}");
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(
+            report.pending[0].reason.contains("wall clock"),
+            "{}",
+            report.pending[0].reason
+        );
+        let intents = prepared.pending_intents();
+        assert_eq!(intents.len(), 1, "the intent stays pending");
+        assert_eq!(
+            intents[0].phase,
+            IntentPhase::MarkerLast,
+            "no completion phase was recorded"
+        );
+    }
+
+    #[test]
+    fn a_resumed_walk_stops_at_the_run_clock_not_only_its_own_budget() {
+        let prepared = prepared("replay-walk-deadline");
+        let root = prepared.unit_path().clone();
+        VolumeFixture::payload(&root, "payload.txt", b"bytes");
+        publish(&prepared, &[]);
+        rename_to_quarantine(&prepared);
+        publish(&prepared, &[IntentPhase::Renamed]);
+
+        // The resumed walk's own per-root budget is far longer than the caller's
+        // clock, and a removal inside it consumes the clock. The walk must stop at
+        // the run clock: the intent stays at `renamed` and no completion phase is
+        // recorded.
+        let faults = Faults::new();
+        faults.sleeping_remove_prefix(CAPTURE_PREFIX, Duration::from_millis(2_300));
+        let facts = prepared.fixture.facts();
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let mut bounds = prepared.bounds();
+        bounds.deadline = Some(Instant::now() + Duration::from_secs(2));
+        let report = replay_with(
+            &prepared.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            bounds,
+            bounds.deadline,
+        )
+        .expect("the replay reports");
+        assert_eq!(report.settled, 0, "{report:?}");
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(
+            report.pending[0].reason.contains("wall clock"),
+            "{}",
+            report.pending[0].reason
+        );
+        let intents = prepared.pending_intents();
+        assert_eq!(intents.len(), 1, "the intent stays pending");
+        // The walk's own effect gates stop it before the marker-last bookkeeping
+        // and before any completion phase, so the intent is still at `renamed`.
+        assert_eq!(
+            intents[0].phase,
+            IntentPhase::Renamed,
+            "no completion phase"
+        );
+    }
+
+    #[test]
+    fn a_walk_stops_starting_effects_once_the_run_clock_is_spent() {
+        let prepared = prepared("replay-walk-effects");
+        let root = prepared.unit_path().clone();
+        VolumeFixture::payload(&root, "a.txt", b"first");
+        VolumeFixture::payload(&root, "b.txt", b"second");
+        publish(&prepared, &[]);
+        rename_to_quarantine(&prepared);
+        publish(&prepared, &[IntentPhase::Renamed]);
+
+        // The walk's first capture-and-unlink outlives the two-second run clock.
+        // The walk must not start another capture, journal write or unlink after
+        // it: exactly one entry is removed, the second stays behind, and the intent
+        // is left pending without a completion phase.
+        let faults = Faults::new();
+        faults.sleeping_remove_prefix(CAPTURE_PREFIX, Duration::from_millis(2_300));
+        let facts = prepared.fixture.facts();
+        let mounts = prepared.fixture.mounts();
+        let observer = prepared.fixture.observer();
+        let mut bounds = prepared.bounds();
+        bounds.deadline = Some(Instant::now() + Duration::from_secs(2));
+        let report = replay_with(
+            &prepared.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &observer,
+            bounds,
+            bounds.deadline,
+        )
+        .expect("the replay reports");
+        assert_eq!(report.settled, 0, "{report:?}");
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(
+            report.pending[0].reason.contains("wall clock"),
+            "{}",
+            report.pending[0].reason
+        );
+        // A pending report deliberately does not count its removals as a resumed
+        // completion, so the filesystem is the oracle: exactly one of the two
+        // payloads was removed before the clock was spent.
+        let intents = prepared.pending_intents();
+        assert_eq!(intents.len(), 1, "the intent stays pending");
+        assert_ne!(
+            intents[0].phase,
+            IntentPhase::Removed,
+            "no completion phase"
+        );
+        // One of the two payloads is still somewhere under the leaf: the walk did
+        // not start its removal after the clock was spent.
+        let payloads: Vec<String> = std::fs::read_dir(prepared.quarantine())
+            .expect("the quarantine leaf")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name == "a.txt" || name == "b.txt")
+            .collect();
+        assert_eq!(payloads.len(), 1, "one payload remains: {payloads:?}");
     }
 
     #[test]
@@ -4731,6 +5395,7 @@ mod tests {
             &mounts,
             &observer,
             prepared.bounds(),
+            None,
         )
         .expect("the replay reports");
         assert_eq!(replay.settled, 0, "{replay:?}");
@@ -4833,6 +5498,7 @@ mod tests {
             &mounts,
             &observer,
             prepared.bounds(),
+            None,
         )
         .expect("the replay reports");
         assert_eq!(replay.settled, 0, "{replay:?}");
@@ -4928,6 +5594,7 @@ mod tests {
             &mounts,
             &observer,
             prepared.bounds(),
+            None,
         )
         .expect("the replay reports");
         assert_eq!(replay.resumed, 0, "{replay:?}");
@@ -6676,6 +7343,7 @@ mod tests {
             &prepared.fixture.mounts(),
             &prepared.fixture.observer(),
             prepared.bounds(),
+            None,
         )
         .expect("the replay reports");
         assert_eq!(replay.settled, 0, "{replay:?}");
@@ -6831,6 +7499,7 @@ mod tests {
             &prepared.fixture.mounts(),
             &prepared.fixture.observer(),
             prepared.bounds(),
+            None,
         )
         .expect_err("an ambiguous journal is refused");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
@@ -6939,6 +7608,7 @@ mod tests {
             &mounts,
             &observer,
             prepared.bounds(),
+            None,
         )
         .expect_err("an unknown intent major refuses");
         assert_eq!(error.kind(), ErrorKind::UnknownState);

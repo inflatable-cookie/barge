@@ -76,7 +76,7 @@ fn stdout_document(output: &Output) -> Value {
 
 /// The usage's first line; the full text names every area verb too.
 const USAGE: &str =
-    "usage: barge <describe|inspect|space|volume|area|cache|diagnostic|scratch> [--json]";
+    "usage: barge <describe|inspect|space|volume|maintain|area|cache|diagnostic|scratch> [--json]";
 
 #[test]
 fn descriptor_census_refuses_bad_arguments_and_missing_roots_without_scanning() {
@@ -1082,6 +1082,142 @@ fn a_scratch_conclude_without_its_five_facts_is_a_usage_refusal() {
     assert!(document["error"]["detail"]["usage"]
         .as_str()
         .is_some_and(|usage| usage.contains("scratch conclude")));
+}
+
+#[test]
+fn maintain_previews_one_bounded_plan_and_writes_only_the_file_it_was_given() {
+    let (fixture, state_dir) = absent_state_dir("maintain-preview");
+    let plan_out = fixture.join("plan.json");
+    let output = run_in(
+        &[
+            "maintain",
+            "--json",
+            "--plan-out",
+            plan_out.to_str().unwrap(),
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(0), "a preview completes");
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.maintain/1");
+    assert_eq!(document["command"], "maintain");
+    assert_eq!(document["data"]["preview"], true);
+    assert_eq!(document["data"]["plan"]["schema"], "barge.maintain.plan/1");
+    assert_eq!(document["data"]["plan"]["volumes"]["count"], 0);
+    assert_eq!(document["data"]["candidates"], 0);
+    let digest = document["data"]["plan_digest"]
+        .as_str()
+        .expect("the plan digest is a string");
+    assert_eq!(digest.len(), 64);
+    assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    // The file the caller asked for holds exactly the plan bytes the digest
+    // covers, and the state directory was never created.
+    let saved = std::fs::read(&plan_out).expect("the plan file was written");
+    let plan: Value = serde_json::from_slice(&saved).expect("the plan file parses");
+    assert_eq!(plan["schema"], "barge.maintain.plan/1");
+    assert_eq!(barge::digest::sha256_hex(&saved), digest);
+    assert!(!state_dir.exists(), "a preview creates no state");
+
+    // The real run authorized by that plan and its digest has no work to do and
+    // completes.
+    let output = run_in(
+        &[
+            "maintain",
+            "--json",
+            "--plan",
+            plan_out.to_str().unwrap(),
+            "--plan-sha256",
+            digest,
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(0), "no work is not a failure");
+    let document = stdout_document(&output);
+    assert_eq!(document["data"]["preview"], false);
+    assert_eq!(document["data"]["pending"]["count"], 0);
+    assert!(!state_dir.exists() || !state_dir.join("registry.json").exists());
+}
+
+#[test]
+fn maintain_refuses_a_missing_digest_a_tampered_plan_and_an_unknown_state() {
+    let (fixture, state_dir) = absent_state_dir("maintain-refusals");
+    let plan_out = fixture.join("plan.json");
+
+    // A plan file without its digest is a usage refusal, not a real run.
+    let output = run_in(
+        &["maintain", "--json", "--plan", plan_out.to_str().unwrap()],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+    assert!(!plan_out.exists());
+
+    // A digest that is not a SHA-256 is refused before any effect.
+    let output = run_in(&["maintain", "--json", "--plan-sha256", "abc"], &state_dir);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+
+    // A digest without the preview's bytes does not name the plan's units.
+    let output = run_in(
+        &["maintain", "--json", "--plan-sha256", &"a".repeat(64)],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "usage");
+    assert!(
+        document["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("exact plan bytes"),
+        "{}",
+        document["error"]["message"]
+    );
+
+    // A preview's saved plan whose bytes were changed is refused.
+    let output = run_in(
+        &[
+            "maintain",
+            "--json",
+            "--plan-out",
+            plan_out.to_str().unwrap(),
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let digest = stdout_document(&output)["data"]["plan_digest"]
+        .as_str()
+        .expect("the plan digest is a string")
+        .to_owned();
+    let mut saved = std::fs::read(&plan_out).expect("the plan file");
+    saved.push(b' ');
+    std::fs::write(&plan_out, &saved).expect("the changed plan file");
+    let output = run_in(
+        &[
+            "maintain",
+            "--json",
+            "--plan",
+            plan_out.to_str().unwrap(),
+            "--plan-sha256",
+            &digest,
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+
+    // An invalid registry is unknown state: exit 3, never a run with no volumes.
+    std::fs::create_dir_all(&state_dir).expect("the fixture state directory");
+    std::fs::write(state_dir.join("registry.json"), b"{ truncated").expect("the registry");
+    let output = run_in(&["maintain", "--json"], &state_dir);
+    assert_eq!(output.status.code(), Some(3));
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "unknown_state");
+    assert_eq!(
+        document["error"]["detail"]["path"],
+        state_dir.join("registry.json").display().to_string()
+    );
 }
 
 #[test]
