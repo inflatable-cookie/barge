@@ -1104,6 +1104,20 @@ for a reference that is not current; a current reference already keeps the root,
 so no proof is spent on it. Second, nothing in the plan is a permission: F4 must
 re-establish every predicate, and the plan's digest binds evidence, not consent.
 
+One deviation from [the lock table](#lock-order-with-the-stage-1-locks), recorded
+rather than hidden: the plan takes the registry's shared observation lock and
+releases it before it walks, and it takes **no** volume or root lock. The table's
+"volume shared, then one root shared at a time" was written for a preview that
+must not interleave with a real pass; this plan is evidence, every fact in it is
+re-established at the effect (F4, which takes `volume-<uuid>.lock` exclusively for
+the whole run), and a root's custody is decided with the pending-intent journal in
+hand, so an in-flight prune's intent already keeps that root. Holding a shared
+volume lock for a walk of a whole area would instead block a real prune's
+exclusive lock for the length of a read that authorizes nothing. `barge
+maintain`'s landed preview holds only the registry observation lock for the same
+reason, and this slice follows that precedent. If a later slice makes a preview
+authoritative, the locks come back with it.
+
 [O4-001](#open-design-issues) leaves one decision to the implementation brief:
 whether any additional unprivileged fact — a per-volume registration receipt
 written at registration time, for instance — is worth the coupling it buys

@@ -58,9 +58,6 @@ use crate::registry::{Availability, Durability, VolumeRecord};
 use crate::state::{self, StatePaths};
 use crate::unit::{DeletionUnit, MarkerFamily, UnitGrant, UnitKind, UnitMarker};
 
-/// The command document `barge prune --plan` writes.
-pub const RELEASE_SCHEMA: &str = "barge.prune/1";
-
 /// How many references one root's row reports before it says the set was
 /// truncated. A root with more is kept: an unread list is never a short one.
 pub const REFERENCE_ROWS: usize = 64;

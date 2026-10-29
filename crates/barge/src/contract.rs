@@ -97,6 +97,8 @@ pub const MAINTAIN_SCHEMA: &str = "barge.maintain/1";
 /// The maintain plan document. Its canonical bytes are exactly what the digest
 /// covers and what a real run must present.
 pub const MAINTAIN_PLAN_SCHEMA: &str = "barge.maintain.plan/1";
+/// The release plan command document: `barge.prune.plan/1` plus its digest.
+pub const PRUNE_SCHEMA: &str = "barge.prune/1";
 /// The release plan document `barge prune --plan` writes. Its canonical bytes are
 /// exactly what the digest covers; the effect that will present them is stage 4
 /// F4.

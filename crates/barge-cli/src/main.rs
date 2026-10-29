@@ -1068,7 +1068,7 @@ fn prune_plan(args: &[String]) -> Result<Report, Error> {
     }
     let human = release_summary(&report);
     let exit = if report.needs_human() { 3 } else { 0 };
-    Report::outcome(release::RELEASE_SCHEMA, "prune", &report, human, exit)
+    Report::outcome(contract::PRUNE_SCHEMA, "prune", &report, human, exit)
 }
 
 /// The human summary of `barge.prune/1`.
