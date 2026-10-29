@@ -448,9 +448,10 @@ durable, positive fact. Barge writes one small record per root:
   live the hold keeps the root non-idle, and once the holder is positively gone the
   stale hold no longer blocks idleness and the published release time determines
   the LRU order. An activity write that fails refuses with the hold intact; a hold
-  removal that fails restores the previous record byte for byte. `barge.activity/1`
-  stays frozen under this decision: no pending phase and no separate pending
-  record.
+  removal that fails restores the previous record byte for byte, and a publish the
+  platform does not confirm durable after its rename is rolled back the same way
+  (or reported as unsettled when the rollback fails). `barge.activity/1` stays
+  frozen under this decision: no pending phase and no separate pending record.
 - **Missing is not idle.** A root with no activity record — an older root from
   before this stage, or a state directory that was lost — is reported as
   `activity_unknown` and never pressure-pruned. Losing account state must not
@@ -1417,13 +1418,27 @@ T6, and no native proof exists or is claimed.
   Inversion — remove, then write — is rejected, because it leaves an absent hold
   beside an *older* record: a root would be idle and ordered on a release older
   than the one that removed its hold.
-- **What each failure does.** An activity write that fails refuses before the
-  effect (`unknown_state`, exit `3`), leaves the hold in place, and records
-  nothing, which is the failure matrix's "refuse before the effect" row. A hold
-  removal that fails restores the previous record **byte for byte** and reports
-  `io` with `detail.restored: true`, so a failed release changes nothing. If that
-  restore also fails, the report is `unknown_state` naming the record path and the
-  hold, with `detail.restored: false`, and the hold is still there.
+- **What each failure does.** The record's own publish renames and then syncs the
+  directory, so its failure does not always mean the new bytes are absent, and the
+  report never claims "nothing changed" while an advanced record is visible:
+  - a publish that fails **before** its rename leaves the record exactly as it was;
+    the release refuses with the publish's own kind (`io`, exit `3`), the hold in
+    place, and `detail.restored: true`, which is the failure matrix's "refuse
+    before the effect" row;
+  - a publish that fails **after** its rename (the directory sync) has left the new
+    bytes visible, so the release restores the previous record **byte for byte**
+    and reports the same refusal with `detail.restored: true`; the hold is
+    untouched in both cases;
+  - if that restore also fails, or a hold removal fails and cannot be undone, the
+    report is `unknown_state` (exit `3`) naming the record path and the hold, with
+    `detail.restored: false`: the advanced record may stay visible unconfirmed and
+    the hold is still there, so the root is kept on the hold and the next release
+    or the baseline settles it. A failed hold removal that can be undone restores
+    the previous record and reports `io` with `detail.restored: true`.
+
+  A release therefore never reports that it changed nothing when it changed
+  something, and never leaves an unconfirmed record as if it were a completed
+  release without saying so.
 - **What an interruption means, and why it is not unknown.** A release interrupted
   between its fact and its hold removal leaves the published fact plus a hold file,
   and that pair means exactly this (`c9d30b41`): while the holder is **positively

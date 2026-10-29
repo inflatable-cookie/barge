@@ -2943,25 +2943,29 @@ pub fn release(
     root_id: &str,
     holder: &str,
 ) -> Result<Release> {
-    release_with(state, observer, root_id, holder, |path, bytes| {
-        state::publish_atomic(path, bytes)
-    })
+    release_with(
+        state,
+        observer,
+        root_id,
+        holder,
+        &state::publish_atomic,
+        &state::publish_atomic,
+    )
 }
 
-/// [`release`] with the restore step as a seam, so a test can prove a restore that
-/// fails is reported rather than silently accepted (the same seam shape as
-/// [`state::publish_atomic_with`]).
+/// [`release`] with its two record writes as seams — the fact's publish and the
+/// restore — so a test can prove a publish that fails after its rename, or a
+/// restore that fails, is reported rather than silently accepted (the same seam
+/// shape as [`state::publish_atomic_with`]).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn release_with<F>(
+pub(crate) fn release_with(
     state: &StatePaths,
     observer: &dyn ProcessObserver,
     root_id: &str,
     holder: &str,
-    restore: F,
-) -> Result<Release>
-where
-    F: FnOnce(&Path, &[u8]) -> Result<()>,
-{
+    write: &dyn Fn(&Path, &[u8]) -> Result<()>,
+    restore: &dyn Fn(&Path, &[u8]) -> Result<()>,
+) -> Result<Release> {
     state::validate_identifier("root_id", root_id)?;
     validate_name("holder", holder)?;
     registry::read(state)?;
@@ -3018,21 +3022,64 @@ where
     let previous_bytes = activity_record_bytes(state, root_id)?;
     // The fact comes first: an absent hold must always imply a recorded release.
     let had_record = previous.record.is_some();
-    let activity = match record_activity_release(state, previous) {
+    let activity = match record_activity_release(state, previous, write) {
         Ok(activity) => activity,
         Err(error) => {
-            return Err(Error::new(
-                ErrorKind::UnknownState,
-                format!(
-                    "the release of `{holder}` on root `{root_id}` was refused before the hold was removed, so it changed nothing: {error}"
-                ),
-            )
-            .with_detail("hold_path", path.display().to_string().into())
-            .with_detail(
-                "activity_path",
-                activity_path.display().to_string().into(),
-            )
-            .with_detail("cause", error.to_string().into()))
+            // The publish renames and then syncs the directory, so a failure does
+            // not always mean the new bytes are absent: only a record that is
+            // still exactly the previous bytes changed nothing. Anything else is
+            // treated like a failed hold removal, so the report and the visible
+            // record never disagree.
+            let landed = match (&previous_bytes, activity_record_bytes(state, root_id)?) {
+                (Some(before), Some(now)) => now != *before,
+                (_, Some(_)) => true,
+                (_, None) => false,
+            };
+            let hold_path = path.display().to_string();
+            let record_path = activity_path.display().to_string();
+            let failed_kind = error.kind();
+            if !landed {
+                return Err(Error::new(
+                    failed_kind,
+                    format!(
+                        "the release of `{holder}` on root `{root_id}` was refused before the hold was removed and the activity record is unchanged: {error}"
+                    ),
+                )
+                .with_detail("hold_path", hold_path.into())
+                .with_detail("activity_path", record_path.into())
+                .with_detail("restored", true.into())
+                .with_detail("cause", error.to_string().into()));
+            }
+            let restore_error = match &previous_bytes {
+                Some(bytes) => restore(&activity_path, bytes).err(),
+                None => Some(Error::new(
+                    ErrorKind::UnknownState,
+                    "the previous record's bytes were not read, so they could not be restored",
+                )),
+            };
+            return Err(match restore_error {
+                None => Error::new(
+                    failed_kind,
+                    format!(
+                        "the release of `{holder}` on root `{root_id}` was refused before the hold was removed, and the advanced activity record was restored: {error}"
+                    ),
+                )
+                .with_detail("hold_path", hold_path.into())
+                .with_detail("activity_path", record_path.into())
+                .with_detail("restored", true.into())
+                .with_detail("cause", error.to_string().into()),
+                Some(restore_error) => Error::new(
+                    ErrorKind::UnknownState,
+                    format!(
+                        "the activity record for root `{root_id}` was advanced but its publish was not confirmed durable ({error}), and the previous record could not be restored ({restore_error}). The hold is still there, so the root is kept on the hold and not on the record, and its next release or `barge area idle-baseline` settles it"
+                    ),
+                )
+                .with_detail("hold_path", hold_path.into())
+                .with_detail("activity_path", record_path.into())
+                .with_detail("restored", false.into())
+                .with_detail("cause", error.to_string().into())
+                .with_detail("restore_error", restore_error.to_string().into()),
+            });
         }
     };
     if let Err(remove_error) = std::fs::remove_file(&path) {
@@ -3608,6 +3655,18 @@ pub fn read_activity(
 
 /// Publish one activity record atomically and privately.
 fn publish_activity(state: &StatePaths, record: &ActivityRecord) -> Result<PathBuf> {
+    publish_activity_with(state, record, &state::publish_atomic)
+}
+
+/// [`publish_activity`] through a publisher seam, so a test can prove what a
+/// publish that fails *after* its rename does. [`state::publish_atomic`] renames
+/// and then syncs the directory, so its failure does not always mean the new bytes
+/// are absent.
+fn publish_activity_with(
+    state: &StatePaths,
+    record: &ActivityRecord,
+    write: &dyn Fn(&Path, &[u8]) -> Result<()>,
+) -> Result<PathBuf> {
     record.validate()?;
     let directory = state.activity_dir();
     ensure_private_directory(&directory)?;
@@ -3629,7 +3688,7 @@ fn publish_activity(state: &StatePaths, record: &ActivityRecord) -> Result<PathB
         )
         .with_detail("cap", crate::contract::ACTIVITY_CAP_BYTES.into()));
     }
-    state::publish_atomic(&path, &bytes)?;
+    write(&path, &bytes)?;
     Ok(path)
 }
 
@@ -3667,6 +3726,7 @@ fn record_activity_creation(
 fn record_activity_release(
     state: &StatePaths,
     reading: ActivityReading,
+    write: &dyn Fn(&Path, &[u8]) -> Result<()>,
 ) -> Result<ActivityReading> {
     let Some(previous) = reading.record.clone() else {
         return Ok(reading);
@@ -3679,7 +3739,7 @@ fn record_activity_release(
         recorded_ms: now,
         ..previous
     };
-    publish_activity(state, &record)?;
+    publish_activity_with(state, &record, write)?;
     Ok(ActivityReading {
         state: ActivityStateName::Released,
         record: Some(record),
@@ -6681,10 +6741,13 @@ mod tests {
             .expect_err("the activity write fails");
         std::fs::set_permissions(&activity_directory, std::fs::Permissions::from_mode(0o700))
             .expect("the activity directory is writable again");
-        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        // The write failed before its rename, so the record is untouched and the
+        // report says exactly that.
+        assert_eq!(error.kind(), ErrorKind::Io);
+        assert_eq!(error.detail()["restored"], true);
         assert!(error
             .message()
-            .contains("refused before the hold was removed"));
+            .contains("was refused before the hold was removed"));
         assert!(
             fixture
                 .state
@@ -6832,6 +6895,7 @@ mod tests {
         let written = super::record_activity_release(
             &fixture.state,
             read_activity(&fixture.state, &observer, &root.root_id).expect("the record reads"),
+            &crate::state::publish_atomic,
         )
         .expect("the fact is written");
         let current = written.record.expect("the record parsed");
@@ -6890,6 +6954,178 @@ mod tests {
     }
 
     #[test]
+    fn a_publish_that_fails_after_its_rename_restores_the_record() {
+        // `state::publish_atomic` renames and then syncs the directory, so its
+        // failure does not always mean the new bytes are absent. A release whose
+        // fact landed but whose directory sync failed must not report that it
+        // changed nothing, and must not leave the advanced record behind: the
+        // previous record comes back, and the hold is untouched.
+        let fixture = Fixture::new("release-post-rename");
+        fixture.register(&fixture.record);
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        let request = HoldRequest {
+            root_id: root.root_id.clone(),
+            holder: "prover".to_owned(),
+            pid: std::process::id(),
+            scope: HoldScope::Write,
+            purpose: "a fixture holder".to_owned(),
+        };
+        hold(&fixture.state, &observer, &request).expect("the first hold is written");
+        release(&fixture.state, &observer, &root.root_id, "prover").expect("the first release");
+        let path = fixture
+            .state
+            .activity_path(&root.root_id)
+            .expect("the activity path");
+        let earlier = std::fs::read(&path).expect("the record reads");
+        hold(&fixture.state, &observer, &request).expect("the second hold is written");
+
+        // The publish lands the new bytes and then fails, exactly as a directory
+        // sync failure after the rename does.
+        let after_rename = |target: &Path, bytes: &[u8]| -> Result<()> {
+            crate::state::publish_atomic(target, bytes)?;
+            Err(Error::new(
+                ErrorKind::Io,
+                "injected: the activity directory sync failed after the rename",
+            ))
+        };
+        let error = super::release_with(
+            &fixture.state,
+            &observer,
+            &root.root_id,
+            "prover",
+            &after_rename,
+            &crate::state::publish_atomic,
+        )
+        .expect_err("the publish fails after its rename");
+        assert_eq!(error.kind(), ErrorKind::Io);
+        assert_eq!(error.detail()["restored"], true);
+        assert_eq!(
+            std::fs::read(&path).expect("the record reads"),
+            earlier,
+            "the advanced record is rolled back, so the report and the record agree"
+        );
+        assert!(
+            fixture
+                .state
+                .holds_dir()
+                .join(&root.root_id)
+                .join("prover.json")
+                .is_file(),
+            "the hold was not removed"
+        );
+        assert_blocked(
+            fixture.list(&resolved).roots[0].space_idle,
+            IdleReason::HoldLive,
+        );
+
+        // The retry releases and records exactly one new fact.
+        let released =
+            release(&fixture.state, &observer, &root.root_id, "prover").expect("the retry works");
+        assert_eq!(released.activity.record.expect("the record").releases, 2);
+        assert_eq!(
+            fixture.list(&resolved).roots[0].space_idle.state,
+            IdleState::Idle
+        );
+    }
+
+    #[test]
+    fn a_post_rename_failure_whose_restore_fails_is_reported_as_unsettled() {
+        // The same post-rename failure, but the rollback fails too: the advanced
+        // record stays visible and is not confirmed durable, so the release
+        // reports unsettled state and the hold is what keeps the root. Once the
+        // holder is positively gone the stale hold stops blocking and the
+        // published time decides (decision c9d30b41), which is what the report
+        // told the caller.
+        let fixture = Fixture::new("release-post-rename-unsettled");
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        hold(
+            &fixture.state,
+            &observer,
+            &HoldRequest {
+                root_id: root.root_id.clone(),
+                holder: "prover".to_owned(),
+                pid: std::process::id(),
+                scope: HoldScope::Write,
+                purpose: "a fixture holder".to_owned(),
+            },
+        )
+        .expect("the hold is written");
+        let path = fixture
+            .state
+            .activity_path(&root.root_id)
+            .expect("the activity path");
+        let before = std::fs::read(&path).expect("the record reads");
+
+        let after_rename = |target: &Path, bytes: &[u8]| -> Result<()> {
+            crate::state::publish_atomic(target, bytes)?;
+            Err(Error::new(
+                ErrorKind::Io,
+                "injected: the activity directory sync failed after the rename",
+            ))
+        };
+        let restore_fails = |_target: &Path, _bytes: &[u8]| -> Result<()> {
+            Err(Error::new(
+                ErrorKind::Io,
+                "injected: the previous record cannot be restored",
+            ))
+        };
+        let error = super::release_with(
+            &fixture.state,
+            &observer,
+            &root.root_id,
+            "prover",
+            &after_rename,
+            &restore_fails,
+        )
+        .expect_err("both the publish and its rollback fail");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert_eq!(error.detail()["restored"], false);
+        assert!(error.message().contains("not confirmed durable"));
+        assert_ne!(
+            std::fs::read(&path).expect("the record reads"),
+            before,
+            "the advanced record is still visible, which is why the report is unsettled"
+        );
+        let advanced = read_activity(&fixture.state, &observer, &root.root_id)
+            .expect("the record reads")
+            .record
+            .expect("the record parsed");
+        assert_eq!(
+            fixture.list(&resolved).roots[0].space_idle,
+            IdleRow::blocked(IdleReason::HoldLive)
+        );
+
+        // A live holder keeps the root; an exited holder does not block, and the
+        // advanced time is the root's order.
+        let hold_path = fixture
+            .state
+            .holds_dir()
+            .join(&root.root_id)
+            .join("prover.json");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&hold_path).expect("the hold reads"))
+                .expect("the hold parses");
+        document["boot_identity"] = "1600000000.0".into();
+        std::fs::write(
+            &hold_path,
+            serde_json::to_vec_pretty(&document).expect("the hold encodes"),
+        )
+        .expect("the hold is written");
+        std::fs::set_permissions(&hold_path, std::fs::Permissions::from_mode(0o600))
+            .expect("the hold is private");
+        let listed = fixture.list(&resolved);
+        assert_eq!(listed.roots[0].space_idle.state, IdleState::Idle);
+        assert_eq!(
+            listed.roots[0].activity.last_release_ms,
+            Some(advanced.last_release_ms)
+        );
+    }
+
+    #[test]
     fn a_failed_restore_is_reported_and_leaves_the_hold_standing() {
         let fixture = Fixture::new("release-restore-fails");
         let declaration = fixture.declaration("example/pool");
@@ -6922,7 +7158,8 @@ mod tests {
             &observer,
             &root.root_id,
             "prover",
-            |_path, _bytes| {
+            &crate::state::publish_atomic,
+            &|_path: &Path, _bytes: &[u8]| {
                 Err(Error::new(
                     ErrorKind::Io,
                     "injected: the previous record cannot be restored",
