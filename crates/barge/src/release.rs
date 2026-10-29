@@ -2701,6 +2701,88 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_with_an_unknown_kind_cannot_qualify_its_root() {
+        // The counterfactual the review names: a root whose only remaining Oxide
+        // record is its marker, whose checkout path is gone — so its absence proof
+        // would pass — and whose marker states a root kind Oxide never writes. The
+        // divergent marker is unreadable ownership, so the reference set is
+        // incomplete and the root cannot be marked eligible.
+        let fixture = Fixture::new("release-marker-kind");
+        let root = fixture.root();
+        let marker = serde_json::json!({
+            "version": reference::OXIDE_MARKER_V2,
+            "checkout": fixture.account.home.join("gone-checkout").display().to_string(),
+            "checkout_id": "checkout-1",
+            "label": "example",
+            "recipe": "target-debug-v1",
+            "kind": "future_kind",
+            "checkout_volume_uuid": FIXTURE_UUID,
+            "generation": 1,
+            "created_ms": 1_000,
+        });
+        let marker_path = root.path.join(reference::OXIDE_MARKER_FILE);
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec(&marker).expect("the marker encodes"),
+        )
+        .expect("the Oxide marker is written");
+        std::fs::set_permissions(&marker_path, std::fs::Permissions::from_mode(0o600))
+            .expect("the marker is private");
+        let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
+        std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
+        std::fs::write(
+            outputs.join("checkout-1.json"),
+            format!(
+                r#"{{"version":"{}","checkout":"{}","checkout_id":"checkout-1","generation":2,"state":"committed","links":[{{"member":"target"}}],"roots":[],"updated_ms":1}}"#,
+                reference::OXIDE_RECEIPT_V2,
+                fixture.account.home.join("gone-checkout").display()
+            ),
+        )
+        .expect("the receipt is written");
+
+        let report = fixture.plan();
+        let kept = row(&report, &root);
+        assert!(!kept.eligible, "{kept:?}");
+        assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+        assert!(!kept.references_complete);
+        assert!(
+            kept.absence.is_none(),
+            "no proof was even needed: the set is unknown"
+        );
+
+        // The same root with an understood kind is released, which proves the
+        // absence proof alone would have qualified it.
+        let marker = serde_json::json!({
+            "version": reference::OXIDE_MARKER_V2,
+            "checkout": fixture.account.home.join("gone-checkout").display().to_string(),
+            "checkout_id": "checkout-1",
+            "label": "example",
+            "recipe": "target-debug-v1",
+            "kind": "external",
+            "checkout_volume_uuid": FIXTURE_UUID,
+            "generation": 1,
+            "created_ms": 1_000,
+        });
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec(&marker).expect("the marker encodes"),
+        )
+        .expect("the Oxide marker is rewritten");
+        std::fs::set_permissions(&marker_path, std::fs::Permissions::from_mode(0o600))
+            .expect("the marker is private");
+        let report = fixture.plan();
+        let released = row(&report, &root);
+        assert!(released.eligible, "{released:?}");
+        assert_eq!(
+            released
+                .absence
+                .as_ref()
+                .map(|proof| proof.verdict.as_str()),
+            Some("absent")
+        );
+    }
+
+    #[test]
     fn a_marker_without_its_required_fields_is_unknown() {
         let fixture = Fixture::new("release-marker-divergent");
         let root = fixture.root();

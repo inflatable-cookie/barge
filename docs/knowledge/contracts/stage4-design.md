@@ -1095,8 +1095,10 @@ of the two Oxide writes (`external` or `local`). Each unfinished prune intent mu
 also carry the root identity Oxide pins and one of Oxide's six phases. A document
 that omits any of these, or states a root kind this build does not know, is a
 schema divergence — never a settled row, an empty registry or "no references" —
-and a root marker that omits a field Oxide always writes is unreadable for the
-same reason. A receipt is read at its own version's shape: each of
+and a root marker that omits a field Oxide always writes — or states a root kind
+outside `external` and `local` — is unreadable for the same reason: a divergent
+marker is not understood ownership, so the reference set it belongs to is
+incomplete and its root is kept rather than qualified by its own absence proof. A receipt is read at its own version's shape: each of
 `oxide.outputs.transition/1`, `/2` and `/3` must carry exactly the fields and the
 shape that version writes, `state` must be one of Oxide's five states, and a
 document that carries another version's shape or omits a required field

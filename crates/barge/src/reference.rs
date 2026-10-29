@@ -1728,6 +1728,10 @@ pub fn read_oxide_marker(
     }
     let raw: RawMarker = serde_json::from_value(value)
         .map_err(|error| format!("the marker is not the field set Oxide writes: {error}"))?;
+    // The marker states its root kind too, and only Oxide's two kinds are
+    // understood: a divergent marker is unreadable ownership, so the reference set
+    // it belongs to is incomplete and its root is kept.
+    check_root_kind("the root's Oxide marker", &raw.kind)?;
     let checkout_volume = match raw.checkout_volume_uuid.as_deref() {
         Some(raw) => Some(
             VolumeUuid::parse(raw)
@@ -1755,7 +1759,6 @@ struct RawMarker {
     label: String,
     #[allow(dead_code)]
     recipe: String,
-    #[allow(dead_code)]
     kind: String,
     #[serde(default)]
     #[allow(dead_code)]
@@ -2380,6 +2383,49 @@ mod tests {
             parse_receipt(&unknown, "c1").is_err(),
             "a migration journal root of an unknown kind was accepted"
         );
+    }
+
+    #[test]
+    fn an_unknown_marker_kind_is_not_understood_ownership() {
+        // The root's own Oxide marker states its kind, and only Oxide's two kinds
+        // are understood. A marker of an unknown kind is unreadable, which makes
+        // the reference set it belongs to incomplete rather than treating the root
+        // as owned evidence.
+        let fixture = crate::testkit::TempDir::new("oxide-marker-kind");
+        let platform = crate::os::platform();
+        let marker = |kind: &str| {
+            serde_json::json!({
+                "version": OXIDE_MARKER_V2,
+                "checkout": "/Users/fixture/Dev/example",
+                "checkout_id": "checkout-1",
+                "label": "example",
+                "recipe": "target-debug-v1",
+                "kind": kind,
+                "volume_uuid": "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+                "nonce": "00112233445566778899aabbccddeeff",
+                "checkout_volume_uuid": "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+                "generation": 1,
+                "created_ms": 1_000,
+            })
+        };
+        for (kind, readable) in [("external", true), ("local", true), ("future_kind", false)] {
+            let dir = fixture.join(kind);
+            std::fs::create_dir_all(&dir).expect("the fixture root");
+            let path = dir.join(OXIDE_MARKER_FILE);
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&marker(kind)).expect("the marker encodes"),
+            )
+            .expect("the marker is written");
+            std::fs::set_permissions(
+                &path,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+            )
+            .expect("the marker is private");
+            let handle = platform.open_path(&dir).expect("the fixture root opens");
+            let found = read_oxide_marker(&platform, &handle);
+            assert_eq!(found.is_ok(), readable, "kind `{kind}`: {found:?}");
+        }
     }
 
     #[test]
