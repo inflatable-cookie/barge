@@ -97,6 +97,10 @@ pub const MAINTAIN_SCHEMA: &str = "barge.maintain/1";
 /// The maintain plan document. Its canonical bytes are exactly what the digest
 /// covers and what a real run must present.
 pub const MAINTAIN_PLAN_SCHEMA: &str = "barge.maintain.plan/1";
+/// The release plan document `barge prune --plan` writes. Its canonical bytes are
+/// exactly what the digest covers; the effect that will present them is stage 4
+/// F4.
+pub const PRUNE_PLAN_SCHEMA: &str = "barge.prune.plan/1";
 /// The scratch grants report command document.
 pub const SCRATCH_GRANTS_SCHEMA: &str = "barge.scratch.grants/1";
 /// The scratch delegation declaration command document.
@@ -154,6 +158,9 @@ pub struct FormatVersions {
     /// `barge.space/<major>`.
     #[serde(default)]
     pub space: String,
+    /// `barge.prune.plan/<major>`: the release plan `barge prune --plan` writes.
+    #[serde(default)]
+    pub prune_plan: String,
     /// Volume registration and report formats.
     #[serde(default)]
     pub volume_register: String,
@@ -179,6 +186,7 @@ impl FormatVersions {
             hold: HOLD_SCHEMA.to_owned(),
             intent: INTENT_SCHEMA.to_owned(),
             space: crate::space::SPACE_SCHEMA.to_owned(),
+            prune_plan: PRUNE_PLAN_SCHEMA.to_owned(),
             volume_register: "barge.volume.register/1".to_owned(),
             volume_update: "barge.volume.update/1".to_owned(),
             volume_describe: "barge.volume.describe/1".to_owned(),

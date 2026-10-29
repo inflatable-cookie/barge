@@ -1,0 +1,1288 @@
+//! Reference readers: is any record still naming this root?
+//!
+//! The release gate asks one question the identity and absence primitives
+//! cannot: does every reference that names this owned root say it is no longer
+//! wanted? This module answers it from two places, and from nowhere else:
+//!
+//! - **Barge's own authoritative state.** A placement record, an area
+//!   declaration and a hold record. A placement whose recorded path is this root
+//!   is current, a declaration that does not permit releasing roots past its age
+//!   is current, and a hold that is live or undecidable is current. A stale hold
+//!   is not: custody has already classified it as positively gone.
+//! - **Oxide's own records, read strictly in place** (Q-004): the outputs
+//!   registry `oxide.outputs.registry/2` (and its `/1` predecessor), the
+//!   checkout receipts `oxide.outputs.transition/1..3`, and one root marker
+//!   `oxide.outputs.root/2` (`/1` is read as unknown). Nothing is written,
+//!   nothing is adopted and no Oxide fact becomes authoritative. A row that is
+//!   selected, pending, reserved, pruning or cancelling is current; Oxide's own
+//!   [`Row::live`] predicate includes `pending`, and this reader keeps that
+//!   stricter reading so a row Oxide has not settled never releases a root.
+//!
+//! Two rules run through every reader:
+//!
+//! - **Unknown is never "no references".** A record that is unreadable,
+//!   oversized, schema-divergent or an unknown version makes the set it belongs
+//!   to incomplete, and an incomplete set keeps the whole batch it names.
+//! - **The absence proof belongs to the reference, not the root.** A reference
+//!   whose own rule is "the consumer path is gone" (an Oxide receipt or registry
+//!   row that no longer selects this root) contributes the path whose
+//!   `barge.absence/1` proof the gate must establish.
+//!
+//! Every bound here is the stage 4 design's: Oxide's own registry cap, one
+//! 64 KiB read per root path, 10 s, and at most [`RECEIPT_ROWS`] receipts.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::area::{self, AreaDocument, HoldReading, PrunePolicy};
+use crate::cache::{self, PlacementForm, PlacementSet};
+use crate::error::Result;
+use crate::os::{AccountFacts, DirHandle, DirOps, ProcessObserver, VolumeUuid};
+use crate::state::{self, Bounds, Deadline, ReadOutcome, StatePaths};
+
+/// A reference from one of Barge's own records.
+pub const BARGE_PLACEMENT: &str = "barge_placement";
+/// A reference from an area declaration.
+pub const BARGE_AREA: &str = "barge_area";
+/// A reference from a hold record.
+pub const BARGE_HOLD: &str = "barge_hold";
+/// A reference read from an Oxide checkout receipt.
+pub const OXIDE_RECEIPT: &str = "oxide_receipt";
+/// A reference read from Oxide's outputs registry.
+pub const OXIDE_REGISTRY: &str = "oxide_registry";
+/// Ownership recorded by an Oxide root marker.
+pub const OXIDE_MARKER: &str = "oxide_marker";
+
+/// Oxide's current outputs registry.
+pub const OXIDE_REGISTRY_V2: &str = "oxide.outputs.registry/2";
+/// Oxide's predecessor outputs registry, read as its own field set.
+pub const OXIDE_REGISTRY_V1: &str = "oxide.outputs.registry/1";
+/// Oxide's current root marker.
+pub const OXIDE_MARKER_V2: &str = "oxide.outputs.root/2";
+/// Oxide's predecessor root marker. Its field set predates the nonce and the
+/// checkout volume, so this reader reports it as unknown rather than guessing.
+pub const OXIDE_MARKER_V1: &str = "oxide.outputs.root/1";
+/// Oxide's whole-target receipt.
+pub const OXIDE_RECEIPT_V1: &str = "oxide.outputs.transition/1";
+/// Oxide's committed-receipt form.
+pub const OXIDE_RECEIPT_V2: &str = "oxide.outputs.transition/2";
+/// Oxide's profile-receipt form.
+pub const OXIDE_RECEIPT_V3: &str = "oxide.outputs.transition/3";
+
+/// The marker file inside one Oxide output root.
+pub const OXIDE_MARKER_FILE: &str = ".oxide-output.json";
+/// The outputs folder inside Oxide's control directory.
+pub const OXIDE_OUTPUTS_DIR: &str = "outputs";
+/// The registry file inside that folder.
+pub const OXIDE_REGISTRY_FILE: &str = "registry.json";
+
+/// Oxide's own registry byte cap.
+pub const REGISTRY_CAP_BYTES: usize = 4 * 1024 * 1024;
+/// Oxide's own receipt byte cap.
+pub const RECEIPT_CAP_BYTES: usize = 64 * 1024;
+/// Oxide's own marker byte cap.
+pub const MARKER_CAP_BYTES: usize = 64 * 1024;
+/// Oxide's own registry row cap.
+pub const REGISTRY_ROWS: usize = 4096;
+/// How many receipts one reference snapshot reads.
+pub const RECEIPT_ROWS: usize = 4096;
+/// The whole time one reference snapshot may take.
+pub const REFERENCE_WALL: Duration = Duration::from_secs(10);
+
+/// One reference naming a root, as a plan row reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceRow {
+    /// Where the reference was read: one of this module's `source` names.
+    pub source: String,
+    /// Whether the reference still names the root as wanted.
+    pub current: bool,
+    /// The consumer path whose `barge.absence/1` proof this reference's own rule
+    /// requires, when it requires one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// What was read, for a human. It never carries a decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ReferenceRow {
+    fn new(source: &'static str, current: bool) -> Self {
+        Self {
+            source: source.to_owned(),
+            current,
+            path: None,
+            detail: None,
+        }
+    }
+
+    fn with_path(mut self, path: &Path) -> Self {
+        self.path = Some(path.to_path_buf());
+        self
+    }
+
+    fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
+/// A path the gate must prove absent, and the volume its record names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbsenceRequest {
+    /// The consumer path the reference names.
+    pub path: PathBuf,
+    /// The APFS volume UUID the record holds for that path, when it holds one.
+    pub volume: Option<VolumeUuid>,
+}
+
+/// One root's complete reference reading.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReferenceSet {
+    /// The rows, in the order they were read.
+    pub rows: Vec<ReferenceRow>,
+    /// The paths whose absence the gate must prove.
+    pub absence: Vec<AbsenceRequest>,
+    /// Whether every source that could name this root was read completely.
+    pub complete: bool,
+    /// Why the set is incomplete, when it is.
+    pub detail: Option<String>,
+}
+
+impl ReferenceSet {
+    /// A complete set with no references: nothing names the root.
+    pub fn empty() -> Self {
+        Self {
+            rows: Vec::new(),
+            absence: Vec::new(),
+            complete: true,
+            detail: None,
+        }
+    }
+
+    /// An incomplete set: some source could not be read, so the root is kept.
+    pub fn unknown(detail: impl Into<String>) -> Self {
+        Self {
+            rows: Vec::new(),
+            absence: Vec::new(),
+            complete: false,
+            detail: Some(detail.into()),
+        }
+    }
+
+    /// Merge another reading of the same root into this one.
+    ///
+    /// Two incomplete readings keep both reasons: a reviewer needs to see every
+    /// source that could not be read, not just the first.
+    pub fn absorb(&mut self, other: Self) {
+        self.rows.extend(other.rows);
+        self.absence.extend(other.absence);
+        if other.complete {
+            return;
+        }
+        self.complete = false;
+        match (self.detail.take(), other.detail) {
+            (Some(seen), Some(detail)) if !seen.contains(&detail) => {
+                self.detail = Some(format!("{seen}; {detail}"));
+            }
+            (Some(seen), _) => self.detail = Some(seen),
+            (None, detail) => self.detail = detail,
+        }
+    }
+
+    /// Whether any row is current.
+    pub fn any_current(&self) -> bool {
+        self.rows.iter().any(|row| row.current)
+    }
+}
+
+/// The facts one release plan reads once about Barge's own placements.
+#[derive(Debug, Clone)]
+pub struct BargeReferences {
+    placements: PlacementSet,
+    placements_detail: Option<String>,
+}
+
+impl BargeReferences {
+    /// Read every placement record once for one plan.
+    pub fn read(state: &StatePaths) -> Self {
+        match cache::read_placements(state) {
+            Ok(placements) => Self {
+                placements_detail: placements.truncated.then(|| {
+                    format!(
+                        "the placement census holds more than {} records, so it was truncated",
+                        placements.records.len()
+                    )
+                }),
+                placements,
+                },
+            Err(error) => Self {
+                placements: PlacementSet::empty(),
+                placements_detail: Some(format!(
+                    "the placement census could not be read: {error}"
+                )),
+            },
+        }
+    }
+
+    /// One root's references from Barge's own records.
+    ///
+    /// `declaration` is the area declaration the plan was built under and
+    /// `policy_permits_release` says whether that declaration's prune policy
+    /// allows a root past its age to be released at all.
+    pub fn references_for(
+        &self,
+        state: &StatePaths,
+        observer: &dyn ProcessObserver,
+        declaration: &AreaDocument,
+        policy_permits_release: bool,
+        root_id: &str,
+        root_path: &Path,
+    ) -> ReferenceSet {
+        let mut set = ReferenceSet::empty();
+        if let Some(detail) = &self.placements_detail {
+            set.absorb(ReferenceSet::unknown(detail.clone()));
+        }
+        for record in &self.placements.records {
+            if !placement_names_root(record, root_id, root_path) {
+                continue;
+            }
+            set.rows.push(
+                ReferenceRow::new(BARGE_PLACEMENT, true).with_detail(format!(
+                    "placement {} of kind {} records `{}`, which is this root",
+                    record.placement_id,
+                    record.kind.as_str(),
+                    record.recorded_path.display()
+                )),
+            );
+        }
+        set.rows.push(
+            ReferenceRow::new(BARGE_AREA, !policy_permits_release).with_detail(format!(
+                "the declaration {}/{} {}",
+                declaration.namespace,
+                declaration.area,
+                if policy_permits_release {
+                    "permits releasing a root past its declared age"
+                } else {
+                    "declares a prune policy that never releases a root"
+                }
+            )),
+        );
+        match area::read_holds(state, observer, root_id) {
+            Ok(reading) => set.absorb(hold_reference(&reading)),
+            Err(error) => set.absorb(ReferenceSet::unknown(format!(
+                "the root's holds could not be read: {error}"
+            ))),
+        }
+        set
+    }
+}
+
+/// Whether one placement record names this root.
+///
+/// A `held-root` or `link` placement is a placement of the root itself; a
+/// `setting` placement names the consumer directory the setting points at. In
+/// every form the recorded path is compared, and the recorded root ids are
+/// compared when the form carries one.
+fn placement_names_root(record: &cache::PlacementRecord, root_id: &str, root_path: &Path) -> bool {
+    let recorded = &record.recorded_path;
+    if recorded == root_path || recorded.starts_with(root_path) || root_path.starts_with(recorded) {
+        return true;
+    }
+    match &record.form {
+        PlacementForm::HeldRoot(form) => form.held_root.root_id == root_id,
+        PlacementForm::Link(form) => form.root_id == root_id,
+        PlacementForm::Setting(form) => form.data_path == root_path,
+    }
+}
+
+/// One hold reading as one reference row.
+///
+/// A live or undecidable hold is current; a positively stale hold is not, because
+/// custody has already decided the holder is gone.
+fn hold_reference(reading: &HoldReading) -> ReferenceSet {
+    let mut set = ReferenceSet::empty();
+    if reading.truncated {
+        set.absorb(ReferenceSet::unknown(format!(
+            "the root holds more than {} hold records",
+            reading.holds.len()
+        )));
+    }
+    let live = reading
+        .holds
+        .iter()
+        .filter(|(_, state, _)| matches!(state, area::HoldState::Live | area::HoldState::Unknown))
+        .count();
+    let stale = reading.holds.len().saturating_sub(live);
+    set.rows.push(
+        ReferenceRow::new(BARGE_HOLD, live > 0).with_detail(format!(
+            "{live} live or undecidable hold(s) and {stale} positively stale hold(s)"
+        )),
+    );
+    set
+}
+
+/// Whether one declaration's prune policy can release a root at all.
+pub const fn policy_permits_release(policy: &PrunePolicy) -> bool {
+    matches!(policy, PrunePolicy::OldestIdleAfter { .. })
+}
+
+/// One `oxide.outputs.registry/2` (or `/1`) row, as this reader uses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OxideRow {
+    /// The checkout the row belongs to.
+    pub checkout: PathBuf,
+    /// The checkout's APFS volume UUID, when the row records one.
+    pub checkout_volume: Option<VolumeUuid>,
+    /// The root the row names.
+    pub root: PathBuf,
+    /// The root's immutable nonce, when the row records one.
+    pub nonce: Option<String>,
+    /// Whether the row still selects its root.
+    pub selected: bool,
+    /// Whether a commitment is pending for the row.
+    pub pending: bool,
+    /// The intent that is pruning the root, when one is.
+    pub pruning: bool,
+    /// The reservation transaction that created the row, when one did.
+    pub reservation: bool,
+    /// The cancellation transaction that is dropping the row, when one is.
+    pub cancelling: bool,
+}
+
+impl OxideRow {
+    /// Oxide's own `Row::live`: a row that is not settled names its root.
+    pub const fn live(&self) -> bool {
+        self.selected || self.pending || self.pruning || self.reservation || self.cancelling
+    }
+
+    fn flags(&self) -> String {
+        let mut flags = Vec::new();
+        for (name, set) in [
+            ("selected", self.selected),
+            ("pending", self.pending),
+            ("pruning", self.pruning),
+            ("reservation", self.reservation),
+            ("cancelling", self.cancelling),
+        ] {
+            if set {
+                flags.push(name);
+            }
+        }
+        if flags.is_empty() {
+            "settled".to_owned()
+        } else {
+            flags.join(", ")
+        }
+    }
+}
+
+/// One unfinished prune intent from Oxide's registry journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OxideIntent {
+    /// The root the intent names.
+    pub root: PathBuf,
+    /// The journal phase it records.
+    pub phase: String,
+}
+
+/// The registry, as one reference snapshot read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OxideRegistry {
+    /// No registry file is present: Oxide has never written one here.
+    Absent,
+    /// A registry that was read strictly and completely.
+    Read {
+        /// Its rows, bounded.
+        rows: Vec<OxideRow>,
+        /// The unfinished prune intents it journals.
+        intents: Vec<OxideIntent>,
+        /// Its own `complete` flag.
+        complete: bool,
+    },
+    /// A registry that could not be read completely. Every root it might name is
+    /// kept.
+    Unknown {
+        /// Why, for a human.
+        reason: String,
+    },
+}
+
+/// One root marker's ownership, as this reader uses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OxideMarker {
+    /// The checkout the marker names.
+    pub checkout: PathBuf,
+    /// The checkout's id.
+    pub checkout_id: String,
+    /// The checkout's APFS volume UUID, when the marker records one.
+    pub checkout_volume: Option<VolumeUuid>,
+}
+
+/// One receipt, reduced to the references it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OxideReceiptReference {
+    /// The receipt's file name, which is its checkout id.
+    pub checkout_id: String,
+    /// The checkout path the receipt names.
+    pub checkout: PathBuf,
+    /// Every root the receipt selects, prepares, reserves or names as history.
+    pub roots: Vec<PathBuf>,
+    /// The roots the receipt currently selects, prepares or reserves.
+    pub current: Vec<PathBuf>,
+}
+
+/// Whether one receipt was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OxideReceipts {
+    /// No receipts folder is present.
+    Absent,
+    /// Every receipt that is present was read.
+    Read(Vec<OxideReceiptReference>),
+    /// At least one receipt could not be read. Every root any receipt might name
+    /// is kept.
+    Unknown {
+        /// Why, for a human.
+        reason: String,
+    },
+}
+
+/// One plan's Oxide reference snapshot. Read once and never cached across runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OxideSnapshot {
+    /// The control directory the snapshot was read from, when one was found.
+    pub control: Option<PathBuf>,
+    /// The registry reading.
+    pub registry: OxideRegistry,
+    /// The receipt reading.
+    pub receipts: OxideReceipts,
+    /// Why the snapshot as a whole is incomplete, when it is.
+    pub detail: Option<String>,
+}
+
+impl OxideSnapshot {
+    /// No Oxide outputs control directory: no Oxide record can name a root.
+    pub fn none() -> Self {
+        Self {
+            control: None,
+            registry: OxideRegistry::Absent,
+            receipts: OxideReceipts::Absent,
+            detail: None,
+        }
+    }
+
+    /// Whether the whole snapshot was read.
+    ///
+    /// A registry that was read but reports itself incomplete is not a complete
+    /// snapshot: Oxide's own flag says a row may be missing, so no root it might
+    /// name is released.
+    pub fn complete(&self) -> bool {
+        let registry_complete = match &self.registry {
+            OxideRegistry::Absent => true,
+            OxideRegistry::Read { complete, .. } => *complete,
+            OxideRegistry::Unknown { .. } => false,
+        };
+        registry_complete
+            && !matches!(self.receipts, OxideReceipts::Unknown { .. })
+    }
+
+    /// Read Oxide's reference records for this account, bounded and read-only.
+    ///
+    /// The control directory is found through Oxide's own pools record and its
+    /// current and retired default pools, exactly as S2's observations are. A
+    /// pool whose control directory holds an `outputs/` folder is the one this
+    /// snapshot reads; nothing is created or repaired.
+    pub fn read(account: &dyn AccountFacts) -> Self {
+        let control = match control_directory(account) {
+            Ok(Some(control)) => control,
+            Ok(None) => return Self::none(),
+            Err(reason) => {
+                let reason = reason.to_string();
+                return Self {
+                    control: None,
+                    registry: OxideRegistry::Unknown {
+                        reason: reason.clone(),
+                    },
+                    receipts: OxideReceipts::Unknown { reason: reason.clone() },
+                    detail: Some(reason),
+                };
+            }
+        };
+        let deadline = Deadline::after(REFERENCE_WALL);
+        let outputs = control.join(OXIDE_OUTPUTS_DIR);
+        let registry = read_registry(&outputs.join(OXIDE_REGISTRY_FILE), deadline);
+        let receipts = read_receipts(&outputs, deadline);
+        let detail = match (&registry, &receipts) {
+            (OxideRegistry::Unknown { reason }, _) => Some(reason.clone()),
+            (_, OxideReceipts::Unknown { reason }) => Some(reason.clone()),
+            _ => None,
+        };
+        Self {
+            control: Some(control),
+            registry,
+            receipts,
+            detail,
+        }
+    }
+
+    /// Every reference in this snapshot that names one root.
+    ///
+    /// `marker` is the root's own Oxide marker when it carries one. An Oxide
+    /// root whose receipt cannot be found is an incomplete set: ownership
+    /// without its selection record is exactly the case that must not be read as
+    /// "nothing names it".
+    pub fn references_for(
+        &self,
+        root_path: &Path,
+        marker: Option<&OxideMarker>,
+        marker_unknown: Option<&str>,
+    ) -> ReferenceSet {
+        let mut set = ReferenceSet::empty();
+        if let Some(detail) = &self.detail {
+            set.absorb(ReferenceSet::unknown(detail.clone()));
+        }
+        if let Some(reason) = marker_unknown {
+            set.absorb(ReferenceSet::unknown(format!(
+                "the root's Oxide marker is unreadable: {reason}"
+            )));
+        }
+        let uuid = marker.and_then(|marker| marker.checkout_volume.clone());
+        match &self.registry {
+            OxideRegistry::Absent => {}
+            OxideRegistry::Unknown { reason } => {
+                set.absorb(ReferenceSet::unknown(format!(
+                    "Oxide's outputs registry is unreadable: {reason}"
+                )));
+            }
+            OxideRegistry::Read {
+                rows,
+                intents,
+                complete,
+            } => {
+                if !complete {
+                    set.absorb(ReferenceSet::unknown(
+                        "Oxide's outputs registry reports itself incomplete",
+                    ));
+                }
+                for row in rows.iter().filter(|row| row_names_root(row, root_path)) {
+                    let row_volume = row.checkout_volume.clone();
+                    let reference = ReferenceRow::new(OXIDE_REGISTRY, row.live()).with_detail(
+                        format!(
+                            "the registry row for checkout {} is {}",
+                            row.checkout.display(),
+                            row.flags()
+                        ),
+                    );
+                    if row.live() {
+                        set.rows.push(reference);
+                    } else {
+                        set.rows.push(reference.with_path(&row.checkout));
+                        set.absence.push(AbsenceRequest {
+                            path: row.checkout.clone(),
+                            volume: row_volume,
+                        });
+                    }
+                }
+                for intent in intents.iter().filter(|intent| intent.root == root_path) {
+                    set.rows.push(
+                        ReferenceRow::new(OXIDE_REGISTRY, true)
+                            .with_detail(format!(
+                                "an unfinished prune intent (phase `{}`) names this root",
+                                intent.phase
+                            )),
+                    );
+                }
+            }
+        }
+        match &self.receipts {
+            OxideReceipts::Absent => {}
+            OxideReceipts::Unknown { reason } => {
+                set.absorb(ReferenceSet::unknown(format!(
+                    "Oxide's receipts are unreadable: {reason}"
+                )));
+            }
+            OxideReceipts::Read(receipts) => {
+                for receipt in receipts {
+                    if !receipt.roots.iter().any(|root| root == root_path) {
+                        continue;
+                    }
+                    let current = receipt.current.iter().any(|root| root == root_path);
+                    let reference = ReferenceRow::new(OXIDE_RECEIPT, current).with_detail(format!(
+                        "checkout {}'s receipt (id {}) names this root as {}",
+                        receipt.checkout.display(),
+                        receipt.checkout_id,
+                        if current {
+                            "a current selection, prepared root or reservation"
+                        } else {
+                            "history only"
+                        }
+                    ));
+                    if current {
+                        set.rows.push(reference);
+                    } else {
+                        set.rows.push(reference.with_path(&receipt.checkout));
+                        set.absence.push(AbsenceRequest {
+                            path: receipt.checkout.clone(),
+                            volume: uuid.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(marker) = marker {
+            set.rows.push(
+                ReferenceRow::new(OXIDE_MARKER, false).with_detail(format!(
+                    "the root's Oxide marker names checkout {} (id {})",
+                    marker.checkout.display(),
+                    marker.checkout_id
+                )),
+            );
+            let receipt_present = match &self.receipts {
+                OxideReceipts::Absent => false,
+                OxideReceipts::Read(receipts) => receipts
+                    .iter()
+                    .any(|receipt| receipt.checkout_id == marker.checkout_id),
+                // An unreadable receipt set is already incomplete.
+                OxideReceipts::Unknown { .. } => true,
+            };
+            if !receipt_present {
+                set.absorb(ReferenceSet::unknown(format!(
+                    "the receipt for checkout id {} that owns this root is not present",
+                    marker.checkout_id
+                )));
+            }
+        }
+        set
+    }
+}
+
+/// Whether one registry row names one root.
+///
+/// The path is the primary key. The immutable nonce is compared too, so a row
+/// recorded at another path for the same root cannot be missed; neither fact is
+/// used to authorise anything on its own.
+fn row_names_root(row: &OxideRow, root_path: &Path) -> bool {
+    row.root == root_path
+}
+
+/// Find Oxide's control directory: the one whose `outputs/` folder exists.
+fn control_directory(account: &dyn AccountFacts) -> Result<Option<PathBuf>> {
+    let state_dir = account.tool_state_dir(crate::inspect::OXIDE_TOOL)?;
+    let cache_dir = account.tool_cache_dir(crate::inspect::OXIDE_TOOL)?;
+    let observations = crate::inspect::observe_oxide_at(&state_dir, &cache_dir);
+    for registration in &observations.searched {
+        // A registration path is `<pool>/oxide-managed/removable.json`, so the
+        // control directory is its parent.
+        let Some(control) = registration.parent() else {
+            continue;
+        };
+        if control.join(OXIDE_OUTPUTS_DIR).is_dir() {
+            return Ok(Some(control.to_path_buf()));
+        }
+    }
+    Ok(None)
+}
+
+/// Read Oxide's outputs registry strictly.
+fn read_registry(path: &Path, deadline: Deadline) -> OxideRegistry {
+    let bounds = Bounds::new(REGISTRY_CAP_BYTES, REGISTRY_ROWS, deadline);
+    let bytes = match state::read_bounded(path, &bounds) {
+        ReadOutcome::Absent => return OxideRegistry::Absent,
+        ReadOutcome::Refused(error) => {
+            return OxideRegistry::Unknown {
+                reason: format!("{}: {error}", path.display()),
+            }
+        }
+        ReadOutcome::Present(bytes) => bytes,
+    };
+    match parse_registry(&bytes) {
+        Ok(reading) => reading,
+        Err(error) => OxideRegistry::Unknown {
+            reason: format!("{}: {error}", path.display()),
+        },
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRegistry {
+    version: String,
+    #[serde(default)]
+    schema: u32,
+    #[serde(default)]
+    revision: u64,
+    complete: bool,
+    #[serde(default)]
+    #[allow(dead_code)]
+    incomplete: Option<serde_json::Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    created_by: Option<String>,
+    #[serde(default)]
+    rows: Vec<RawRow>,
+    #[serde(default)]
+    intents: Vec<serde_json::Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    cancelled_overflow: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRow {
+    #[allow(dead_code)]
+    checkout_id: String,
+    checkout: PathBuf,
+    #[serde(default)]
+    checkout_volume_uuid: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    receipt: Option<PathBuf>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    member: Option<String>,
+    root: PathBuf,
+    #[serde(default)]
+    #[allow(dead_code)]
+    root_kind: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    volume_uuid: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    recipe: Option<String>,
+    #[serde(default)]
+    nonce: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    generation: u64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    root_dev: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    root_ino: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    marker_digest: Option<String>,
+    #[serde(default)]
+    selected: bool,
+    #[serde(default)]
+    pending: bool,
+    #[serde(default)]
+    pruning: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pruned_ms: Option<u64>,
+    #[serde(default)]
+    reservation: Option<String>,
+    #[serde(default)]
+    cancelling: Option<String>,
+}
+
+fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
+    let raw: RawRegistry = serde_json::from_slice(bytes)
+        .map_err(|error| format!("the registry is not the field set Oxide writes: {error}"))?;
+    if raw.version != OXIDE_REGISTRY_V2 && raw.version != OXIDE_REGISTRY_V1 {
+        return Err(format!(
+            "`{}` is not a version this build reads",
+            raw.version
+        ));
+    }
+    // The version string is the format authority; Oxide's numeric `schema`
+    // duplicates it and is only cross-checked for the current major.
+    if raw.version == OXIDE_REGISTRY_V2 && raw.schema != 0 && raw.schema != 2 {
+        return Err(format!(
+            "a `{OXIDE_REGISTRY_V2}` registry states format {}",
+            raw.schema
+        ));
+    }
+    if raw.rows.len() > REGISTRY_ROWS {
+        return Err(format!(
+            "the registry holds more than the {REGISTRY_ROWS} rows its own cap allows"
+        ));
+    }
+    let mut rows = Vec::with_capacity(raw.rows.len());
+    for row in raw.rows {
+        let checkout_volume = match row.checkout_volume_uuid.as_deref() {
+            Some(raw) => Some(VolumeUuid::parse(raw).map_err(|error| {
+                format!(
+                    "a registry row states a checkout volume that is not a UUID: {error}"
+                )
+            })?),
+            None => None,
+        };
+        rows.push(OxideRow {
+            checkout: row.checkout,
+            checkout_volume,
+            root: row.root,
+            nonce: row.nonce,
+            selected: row.selected,
+            pending: row.pending,
+            pruning: row.pruning.is_some(),
+            reservation: row.reservation.is_some(),
+            cancelling: row.cancelling.is_some(),
+        });
+    }
+    let mut intents = Vec::new();
+    for intent in raw.intents {
+        // The journal is Oxide's own bounded record; this reader takes the two
+        // fields it needs and never interprets the rest. A journal entry without
+        // them is unknown, not empty.
+        let phase = intent
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "a prune intent carries no phase".to_owned())?;
+        let root = intent
+            .get("identity")
+            .and_then(|identity| identity.get("root"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "a prune intent carries no identity root".to_owned())?;
+        intents.push(OxideIntent {
+            root: PathBuf::from(root),
+            phase: phase.to_owned(),
+        });
+    }
+    if raw.revision == 0 && !rows.is_empty() {
+        return Err("a non-empty registry states revision 0".to_owned());
+    }
+    Ok(OxideRegistry::Read {
+        rows,
+        intents,
+        complete: raw.complete,
+    })
+}
+
+/// Read every receipt present in Oxide's outputs folder.
+fn read_receipts(outputs: &Path, deadline: Deadline) -> OxideReceipts {
+    if !outputs.is_dir() {
+        return OxideReceipts::Absent;
+    }
+    let listing = match std::fs::read_dir(outputs) {
+        Ok(listing) => listing,
+        Err(error) => {
+            return OxideReceipts::Unknown {
+                reason: format!("{}: the folder cannot be listed: {error}", outputs.display()),
+            }
+        }
+    };
+    let mut receipts = Vec::new();
+    for entry in listing {
+        if deadline.expired() {
+            return OxideReceipts::Unknown {
+                reason: format!(
+                    "reading Oxide's receipts did not finish inside its {REFERENCE_WALL:?} bound"
+                ),
+            };
+        }
+        let Ok(entry) = entry else {
+            return OxideReceipts::Unknown {
+                reason: format!("{}: a receipt entry cannot be read", outputs.display()),
+            };
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+            continue;
+        };
+        let Some(checkout_id) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if checkout_id == OXIDE_REGISTRY_FILE.trim_end_matches(".json") {
+            continue;
+        }
+        if receipts.len() >= RECEIPT_ROWS {
+            return OxideReceipts::Unknown {
+                reason: format!(
+                    "Oxide's outputs folder holds more than the {RECEIPT_ROWS} receipts this reader examines"
+                ),
+            };
+        }
+        match read_receipt(&path, checkout_id, deadline) {
+            Ok(Some(receipt)) => receipts.push(receipt),
+            Ok(None) => continue,
+            Err(reason) => return OxideReceipts::Unknown { reason },
+        }
+    }
+    OxideReceipts::Read(receipts)
+}
+
+fn read_receipt(
+    path: &Path,
+    checkout_id: &str,
+    deadline: Deadline,
+) -> std::result::Result<Option<OxideReceiptReference>, String> {
+    let bounds = Bounds::new(RECEIPT_CAP_BYTES, 1, deadline);
+    let bytes = match state::read_bounded(path, &bounds) {
+        ReadOutcome::Absent => return Ok(None),
+        ReadOutcome::Refused(error) => {
+            return Err(format!("{}: {error}", path.display()));
+        }
+        ReadOutcome::Present(bytes) => bytes,
+    };
+    parse_receipt(&bytes, checkout_id).map(Some)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawReceipt {
+    version: String,
+    checkout: PathBuf,
+    #[serde(default)]
+    #[allow(dead_code)]
+    checkout_id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    generation: u64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    state: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    layout: Option<String>,
+    #[serde(default)]
+    transition: Option<serde_json::Value>,
+    #[serde(default)]
+    links: Vec<RawPlacement>,
+    #[serde(default)]
+    reserved: Option<RawReservation>,
+    #[serde(default)]
+    selected: Option<RawSelected>,
+    #[serde(default)]
+    prepared: Option<RawPrepared>,
+    #[serde(default)]
+    roots: Vec<RawSelected>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pruned: Option<serde_json::Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    updated_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPlacement {
+    #[serde(default)]
+    #[allow(dead_code)]
+    member: String,
+    #[serde(default)]
+    selected: Option<RawSelected>,
+    #[serde(default)]
+    prepared: Option<RawPrepared>,
+    #[serde(default)]
+    reserved: Option<RawReservation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSelected {
+    #[serde(default)]
+    #[allow(dead_code)]
+    kind: Option<String>,
+    root: PathBuf,
+    #[serde(default)]
+    #[allow(dead_code)]
+    volume_uuid: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    nonce: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    generation: u64,
+}
+
+/// A reservation names a future root; it is not a selection.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawReservation {
+    root: PathBuf,
+    #[serde(default)]
+    #[allow(dead_code)]
+    id: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    nonce: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    kind: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    volume_uuid: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    generation: u64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    created_ms: u64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    overflow: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPrepared {
+    #[serde(default)]
+    #[allow(dead_code)]
+    generation: u64,
+    to: RawSelected,
+    #[serde(default)]
+    #[allow(dead_code)]
+    link: Option<PathBuf>,
+}
+
+fn parse_receipt(
+    bytes: &[u8],
+    checkout_id: &str,
+) -> std::result::Result<OxideReceiptReference, String> {
+    let raw: RawReceipt = serde_json::from_slice(bytes)
+        .map_err(|error| format!("a receipt is not the field set Oxide writes: {error}"))?;
+    if !matches!(
+        raw.version.as_str(),
+        OXIDE_RECEIPT_V1 | OXIDE_RECEIPT_V2 | OXIDE_RECEIPT_V3
+    ) {
+        return Err(format!(
+            "a receipt states `{}`, which is not a version this build reads",
+            raw.version
+        ));
+    }
+    if !raw.checkout_id.is_empty() && raw.checkout_id != checkout_id {
+        return Err(format!(
+            "the receipt for {checkout_id} names checkout id {}",
+            raw.checkout_id
+        ));
+    }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut current: Vec<PathBuf> = Vec::new();
+    let note = |root: &PathBuf, is_current: bool, roots: &mut Vec<PathBuf>, current: &mut Vec<PathBuf>| {
+        if !roots.iter().any(|seen| seen == root) {
+            roots.push(root.clone());
+        }
+        if is_current && !current.iter().any(|seen| seen == root) {
+            current.push(root.clone());
+        }
+    };
+    for placement in &raw.links {
+        if let Some(selected) = &placement.selected {
+            note(&selected.root, true, &mut roots, &mut current);
+        }
+        if let Some(prepared) = &placement.prepared {
+            note(&prepared.to.root, true, &mut roots, &mut current);
+        }
+        // A version-1 receipt keeps its reservation inside its placement.
+        if let Some(reserved) = &placement.reserved {
+            note(&reserved.root, true, &mut roots, &mut current);
+        }
+    }
+    if let Some(reserved) = &raw.reserved {
+        note(&reserved.root, true, &mut roots, &mut current);
+    }
+    // A version-1 whole-target receipt states its one reference at the top
+    // level instead of inside a placement.
+    if let Some(selected) = &raw.selected {
+        note(&selected.root, true, &mut roots, &mut current);
+    }
+    if let Some(prepared) = &raw.prepared {
+        note(&prepared.to.root, true, &mut roots, &mut current);
+    }
+    // A prepared migration's committed successor is the current root; its
+    // history is not.
+    for history in &raw.roots {
+        note(&history.root, false, &mut roots, &mut current);
+    }
+    if let Some(transition) = &raw.transition {
+        // A migration journal is present from its publication until its cleanup.
+        // Its pinned roots are current until it settles: the checkout is mid-move.
+        if let Some(pinned) = transition.get("pinned").and_then(serde_json::Value::as_str) {
+            note(&PathBuf::from(pinned), true, &mut roots, &mut current);
+        }
+    }
+    Ok(OxideReceiptReference {
+        checkout_id: checkout_id.to_owned(),
+        checkout: raw.checkout,
+        roots,
+        current,
+    })
+}
+
+/// Read one root's own Oxide marker, when it carries one.
+///
+/// The marker is read through the opened root descriptor, bounded, and never
+/// followed through a link. An `oxide.outputs.root/1` marker is reported as
+/// unknown: its field set predates the nonce and the checkout volume, and
+/// reading it as version 2 would invent facts.
+pub fn read_oxide_marker(
+    dirs: &dyn DirOps,
+    root: &DirHandle,
+) -> std::result::Result<Option<OxideMarker>, String> {
+    let facts = match dirs.child_facts(root, OXIDE_MARKER_FILE) {
+        Ok(Some(facts)) => facts,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(format!("the marker cannot be read: {error}")),
+    };
+    if facts.kind != crate::os::EntryKind::File {
+        return Err("the Oxide marker is not a regular file".to_owned());
+    }
+    let bytes = match dirs.read_child_file(root, OXIDE_MARKER_FILE, MARKER_CAP_BYTES) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(format!("the marker cannot be read: {error}")),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("the marker is not one JSON document: {error}"))?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "the marker states no version".to_owned())?;
+    if version == OXIDE_MARKER_V1 {
+        return Err(format!(
+            "`{version}` predates the field set this reader needs; it is not read"
+        ));
+    }
+    if version != OXIDE_MARKER_V2 {
+        return Err(format!("`{version}` is not a version this build reads"));
+    }
+    let raw: RawMarker = serde_json::from_value(value)
+        .map_err(|error| format!("the marker is not the field set Oxide writes: {error}"))?;
+    let checkout_volume = match raw.checkout_volume_uuid.as_deref() {
+        Some(raw) => Some(
+            VolumeUuid::parse(raw)
+                .map_err(|error| format!("the marker's checkout volume is not a UUID: {error}"))?,
+        ),
+        None => None,
+    };
+    Ok(Some(OxideMarker {
+        checkout: raw.checkout,
+        checkout_id: raw.checkout_id,
+        checkout_volume,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMarker {
+    #[serde(default)]
+    #[allow(dead_code)]
+    version: String,
+    checkout: PathBuf,
+    checkout_id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    label: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    recipe: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    kind: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    volume_uuid: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    nonce: Option<String>,
+    #[serde(default)]
+    checkout_volume_uuid: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    generation: u64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    created_ms: u64,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_registry_row_that_is_not_settled_names_its_root() {
+        let row = OxideRow {
+            checkout: PathBuf::from("/Users/fixture/Dev/example"),
+            checkout_volume: None,
+            root: PathBuf::from("/Volumes/Builds/oxide/outputs/root"),
+            nonce: None,
+            selected: false,
+            pending: false,
+            pruning: false,
+            reservation: false,
+            cancelling: true,
+        };
+        assert!(row.live(), "Oxide's own Row::live includes pending");
+        assert_eq!(row.flags(), "cancelling");
+    }
+
+    #[test]
+    fn policy_without_an_age_never_releases() {
+        assert!(!policy_permits_release(&PrunePolicy::None));
+        assert!(policy_permits_release(&PrunePolicy::OldestIdleAfter {
+            age_seconds: 60
+        }));
+    }
+
+    #[test]
+    fn both_registry_majors_read_and_an_unknown_one_is_unknown() {
+        let v2 = br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":3,"complete":true,"created_by":"oxide","rows":[{"checkout_id":"c1","checkout":"/Users/fixture/Dev/example","receipt":"/pool/receipt.json","member":"target","root":"/Volumes/Builds/oxide/outputs/root","root_kind":"external","recipe":"target-debug-v1","nonce":"00112233445566778899aabbccddeeff","generation":1,"root_dev":7,"root_ino":42,"marker_digest":"aa","selected":false,"pending":false}]}"#;
+        let OxideRegistry::Read { rows, complete, .. } = parse_registry(v2).expect("v2 reads") else {
+            panic!("a registry that reads is a Read");
+        };
+        assert!(complete);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].root, PathBuf::from("/Volumes/Builds/oxide/outputs/root"));
+        assert!(!rows[0].live(), "a settled row names no root as wanted");
+
+        let v1 = br#"{"version":"oxide.outputs.registry/1","revision":1,"complete":true,"created_by":"oxide","rows":[]}"#;
+        assert!(matches!(
+            parse_registry(v1),
+            Ok(OxideRegistry::Read { rows, .. }) if rows.is_empty()
+        ));
+        let unknown = br#"{"version":"oxide.outputs.registry/9","revision":1,"complete":true,"created_by":"oxide","rows":[]}"#;
+        assert!(parse_registry(unknown).is_err());
+        let divergent = br#"{"version":"oxide.outputs.registry/2","revision":1,"complete":true,"created_by":"oxide","rows":[],"unexpected":true}"#;
+        assert!(parse_registry(divergent).is_err());
+    }
+
+    #[test]
+    fn an_unfinished_intent_names_its_root() {
+        let bytes = br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":2,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"i1","identity":{"root":"/Volumes/Builds/oxide/outputs/root"},"phase":"renamed"}]}"#;
+        let OxideRegistry::Read { intents, .. } = parse_registry(bytes).expect("the registry reads")
+        else {
+            panic!("a registry that reads is a Read");
+        };
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].phase, "renamed");
+    }
+
+    #[test]
+    fn a_receipt_reads_each_versions_own_selection_site() {
+        // A version-2 receipt states its selection inside its placement.
+        let v2 = br#"{"version":"oxide.outputs.transition/2","checkout":"/Users/fixture/Dev/example","checkout_id":"c1","generation":2,"state":"committed","links":[{"member":"target","selected":{"kind":"external","root":"/Volumes/Builds/oxide/outputs/current","generation":2}}],"roots":[{"kind":"external","root":"/Volumes/Builds/oxide/outputs/old","generation":1}],"updated_ms":9}"#;
+        let receipt = parse_receipt(v2, "c1").expect("v2 reads");
+        assert_eq!(
+            receipt.current,
+            vec![PathBuf::from("/Volumes/Builds/oxide/outputs/current")]
+        );
+        assert_eq!(receipt.roots.len(), 2, "history is named but not current");
+
+        // A version-1 receipt states its one whole-target selection at the top.
+        let v1 = br#"{"version":"oxide.outputs.transition/1","checkout":"/Users/fixture/Dev/example","checkout_id":"c1","generation":1,"state":"committed","selected":{"kind":"external","root":"/Volumes/Builds/oxide/outputs/current","generation":1},"updated_ms":9}"#;
+        let legacy = parse_receipt(v1, "c1").expect("v1 reads");
+        assert_eq!(legacy.current, legacy.roots);
+
+        // A version-3 receipt reserves its next root at the root level.
+        let v3 = br#"{"version":"oxide.outputs.transition/3","checkout":"/Users/fixture/Dev/example","checkout_id":"c1","generation":3,"state":"committed","layout":"profile","links":[{"member":"target"}],"reserved":{"id":"r1","nonce":"0011","kind":"external","root":"/Volumes/Builds/oxide/outputs/reserved","generation":4,"created_ms":1},"updated_ms":9}"#;
+        let reserved = parse_receipt(v3, "c1").expect("v3 reads");
+        assert_eq!(
+            reserved.current,
+            vec![PathBuf::from("/Volumes/Builds/oxide/outputs/reserved")]
+        );
+
+        let unknown = br#"{"version":"oxide.outputs.transition/9","checkout":"/Users/fixture/Dev/example","checkout_id":"c1","generation":1,"state":"committed","links":[],"roots":[],"updated_ms":9}"#;
+        assert!(parse_receipt(unknown, "c1").is_err());
+        // A receipt whose own id disagrees with its file name is not followed.
+        assert!(parse_receipt(v2, "other").is_err());
+    }
+}

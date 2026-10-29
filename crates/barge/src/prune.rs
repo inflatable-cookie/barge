@@ -765,12 +765,15 @@ impl Builder<'_> {
             &declaration,
             Some(document),
         )?;
-        let listing = area::list_roots(
+        // The age this step decides is the stage 4 rule: a bounded scan of the
+        // root's subtree, never the marker's creation time alone.
+        let listing = area::list_roots_with(
             self.dirs,
             self.observer,
             self.state_paths,
             &resolved,
             ROOT_ROWS,
+            area::ActivityMode::Scan,
         )?;
         let age_ms = age_seconds.saturating_mul(1000);
         let mut candidates = Vec::new();
@@ -1784,7 +1787,14 @@ fn reverify_area_root(
         &declaration,
         Some(&stored),
     )?;
-    let listing = area::list_roots(dirs, observer, state_paths, &resolved, ROOT_ROWS)?;
+    let listing = area::list_roots_with(
+        dirs,
+        observer,
+        state_paths,
+        &resolved,
+        ROOT_ROWS,
+        area::ActivityMode::Scan,
+    )?;
     let Some(observed) = listing
         .roots
         .iter()

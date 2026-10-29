@@ -209,9 +209,10 @@ use crate::area::{self, AreaDeclaration, OwnedRoot, ResolvedArea, RootSpec};
 use crate::contract::HOLD_SCHEMA;
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
-    AccountFacts, ChildListing, ChildRemoval, DescriptorScan, DescriptorScanRequest, DeviceId,
-    DirHandle, DirId, DirOps, EntryFacts, FileSystem, MacOs, MountPoint, MountRoot, OpenDescriptor,
-    ProcessObserver, RemoveKind, RenameOutcome, VolumeFacts, VolumeIdentity, VolumeUuid,
+    AbsenceVolume, AccountFacts, ChildListing, ChildRemoval, DescriptorScan, DescriptorScanRequest,
+    DeviceId, DirHandle, DirId, DirOps, EntryFacts, FileSystem, MacOs, MountPoint, MountRoot,
+    OpenDescriptor, ProcessObserver, RemoveKind, RenameOutcome, VolumeFacts, VolumeIdentity,
+    VolumeUuid,
 };
 use crate::registry::{
     Availability, Durability, FolderOverrides, RecordOrigin, RegistryDocument, RegistryWriter,
@@ -304,6 +305,75 @@ impl VolumeFacts for FakeVolume {
             device,
             volume_uuid: Some(self.uuid.clone()),
             boot_volume: false,
+        })
+    }
+}
+
+/// The volume locator's seam over the fixture volume: its one mount.
+impl crate::os::VolumeLocator for FakeVolume {
+    fn mounts_for_uuid(&self, uuid: &VolumeUuid) -> Result<Vec<MountPoint>> {
+        Ok(if self.present.get() && &self.uuid == uuid {
+            vec![MountPoint::new(self.root.clone())]
+        } else {
+            Vec::new()
+        })
+    }
+}
+
+/// The mount-root proof over the fixture volume itself, for a caller that takes
+/// one seam instead of two.
+impl MountRoot for FakeVolume {
+    fn mount_root(&self, path: &Path) -> Result<MountPoint> {
+        if path != self.root {
+            return Err(Error::new(
+                ErrorKind::VolumeMismatch,
+                format!("{} is not the fixture mount root", path.display()),
+            ));
+        }
+        Ok(MountPoint::new(self.root.clone()))
+    }
+}
+
+/// The absence proof's volume seam over the fixture volume.
+///
+/// The fixture root stands in for both the registered volume and the boot Data
+/// volume: a directory outside the fixture root is read as an ancestor on the
+/// fixture's boot Data stand-in, whose device, UUID and mount point are the
+/// fixture's. That is a fixture fiction with one purpose — proving the walk and
+/// the volume proof without a real drive — and it is the only way these tests
+/// touch an absence proof.
+impl AbsenceVolume for FakeVolume {
+    /// The prefix the fixture volume is mounted at, for a path inside it.
+    ///
+    /// A real platform answers only for a path under its mount parent; the
+    /// fixture answers for the one directory it stands in for, so a consumer path
+    /// outside it is decided against the boot Data stand-in below.
+    fn volume_prefix(&self, path: &Path) -> Option<PathBuf> {
+        (path != self.root && path.starts_with(&self.root)).then(|| self.root.clone())
+    }
+
+    /// The identity of the directory one opened descriptor names.
+    ///
+    /// The fixture volume is one real directory tree, so the identity is the
+    /// fixture's UUID and mount point with the descriptor's own device.
+    fn identify_directory(&self, handle: &DirHandle) -> Result<VolumeIdentity> {
+        Ok(VolumeIdentity {
+            mount_point: self.root.clone(),
+            filesystem: FileSystem::Apfs,
+            device: handle.identity().device,
+            volume_uuid: Some(self.uuid.clone()),
+            boot_volume: false,
+        })
+    }
+
+    /// The fixture's boot Data stand-in: the fixture volume itself.
+    fn boot_data(&self) -> Result<VolumeIdentity> {
+        Ok(VolumeIdentity {
+            mount_point: self.root.clone(),
+            filesystem: FileSystem::Apfs,
+            device: self.device,
+            volume_uuid: Some(self.uuid.clone()),
+            boot_volume: true,
         })
     }
 }
