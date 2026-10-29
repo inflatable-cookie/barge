@@ -752,10 +752,13 @@ pub struct CensusIdentity {
     /// Why it is unknown, when it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<IdentityReason>,
-    /// Whether the live inode equals the recorded one.
+    /// Whether the live inode equals the recorded one, when both values were
+    /// read. Missing on one side leaves this absent, never `false`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inode_equal: Option<bool>,
-    /// Whether the live device equals the recorded one.
+    /// Whether the live device equals the recorded one, when both values were
+    /// read. Missing on one side leaves this absent, never `false`, and never
+    /// suppresses `inode_equal`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_equal: Option<bool>,
     /// The device Oxide recorded, when it recorded one.
@@ -819,7 +822,10 @@ pub struct OxideCensusDrift {
     /// Verified rows whose live device differs from the recorded one: exactly
     /// what a recorded-device comparison refuses, and what a remount produces.
     pub device_moved: usize,
-    /// Rows kept because the recorded inode differs from the live one.
+    /// Rows whose recorded and live inode differ, whatever their identity
+    /// verdict: a difference is evidence even when a missing recorded fact or
+    /// another failure already keeps the row. A comparison the row could not
+    /// support is `None`, and that is never counted.
     pub inode_changed: usize,
     /// Rows whose owner-marker bytes differ from the recorded digest, whatever
     /// their identity verdict: a marker that changed is evidence even when the
@@ -940,6 +946,9 @@ fn count(
     // came out verified: an unknown verdict must not hide an observation the
     // census did make. A digest the census could not read is `None`, and an
     // unavailable comparison is never counted as a change.
+    if identity.inode_equal == Some(false) {
+        drift.inode_changed += 1;
+    }
     if identity.marker_digest_equal == Some(false) {
         drift.marker_changed += 1;
     }
@@ -956,9 +965,6 @@ fn count(
             let Some(reason) = identity.reason else {
                 return;
             };
-            if reason == IdentityReason::InodeChanged {
-                drift.inode_changed += 1;
-            }
             match reasons.iter_mut().find(|(seen, _)| *seen == reason) {
                 Some((_, count)) => *count += 1,
                 None => reasons.push((reason, 1)),
@@ -1013,17 +1019,18 @@ fn observe_row(
         return None;
     }
     let unknown = |reason| Some(CensusIdentity::unknown(reason));
-    // A row may record no device or inode, which a `/1`-era row legitimately
-    // does. The stored comparison is then unavailable, but the physical
-    // observation is not: the volume, the walk and the marker are all still read,
-    // so a reachable marker's changed bytes are evidence the drift report owes an
-    // operator. The verdict stays unknown, and a path that is absent stays unknown
-    // too, because without a recorded inode the recorded directory cannot be tied
-    // to that path.
-    let recorded = match (row.root_dev(), row.root_ino()) {
-        (Some(device), Some(inode)) => Some((device, inode)),
-        _ => None,
-    };
+    // A row may record no device or no inode, which a `/1`-era row legitimately
+    // does. Each comparison is available on its own: a recorded device is still
+    // compared with the live one when the inode is missing, and the reverse, so a
+    // diagnostic difference is never suppressed by the other fact's absence. What
+    // is missing keeps the verdict unknown - the physical observation is not
+    // missing, though, so the volume, the walk and the marker are all still read
+    // and a reachable marker's changed bytes are counted. A path that is absent
+    // stays unknown too, because without a recorded inode the recorded directory
+    // cannot be tied to that path.
+    let recorded_device = row.root_dev();
+    let recorded_inode = row.root_ino();
+    let identity_missing = recorded_device.is_none() || recorded_inode.is_none();
     let Some(raw_uuid) = row.volume_uuid() else {
         return unknown(IdentityReason::VolumeUnverified);
     };
@@ -1112,7 +1119,7 @@ fn observe_row(
         current = opened;
     }
     if leaf_gone {
-        if recorded.is_none() {
+        if identity_missing {
             return unknown(IdentityReason::IdentityRecordMissing);
         }
         // "Gone" is only reachable from a volume that still verifies, and only
@@ -1126,7 +1133,7 @@ fn observe_row(
                 reason: None,
                 inode_equal: None,
                 device_equal: None,
-                recorded_device: recorded.map(|(device, _)| device),
+                recorded_device,
                 live_device: None,
                 live_inode: None,
                 recorded_mount: Some(recorded_mount),
@@ -1140,16 +1147,17 @@ fn observe_row(
     }
     let live = current.identity();
     let live_device = live.device.get();
-    // Both comparisons are absent, never `false`, when the row recorded nothing to
-    // compare: an unavailable fact is not a disagreement.
-    let inode_equal = recorded.map(|(_, inode)| live.inode == inode);
-    let device_equal = recorded.map(|(device, _)| live_device == device);
+    // Each comparison is absent, never `false`, exactly when its own recorded fact
+    // is missing: an unavailable comparison is not a disagreement, and one fact's
+    // absence never suppresses the other's result.
+    let inode_equal = recorded_inode.map(|inode| live.inode == inode);
+    let device_equal = recorded_device.map(|device| live_device == device);
     let kept = |reason: IdentityReason, marker_digest_equal| CensusIdentity {
         verdict: CensusVerdict::Unknown,
         reason: Some(reason),
         inode_equal,
         device_equal,
-        recorded_device: recorded.map(|(device, _)| device),
+        recorded_device,
         live_device: Some(live_device),
         live_inode: Some(live.inode),
         recorded_mount: Some(recorded_mount.clone()),
@@ -1163,7 +1171,7 @@ fn observe_row(
     // verification orders it, and a marker that cannot be read keeps that reason
     // with no digest.
     let marker_reason = |reason: IdentityReason| {
-        if recorded.is_none() {
+        if identity_missing {
             IdentityReason::IdentityRecordMissing
         } else if inode_equal == Some(false) {
             IdentityReason::InodeChanged
@@ -1205,7 +1213,7 @@ fn observe_row(
     let digest_equal = row
         .marker_digest()
         .map(|recorded| recorded == crate::digest::sha256_hex(&bytes));
-    if recorded.is_none() {
+    if identity_missing {
         return Some(kept(IdentityReason::IdentityRecordMissing, digest_equal));
     }
     if inode_equal == Some(false) {
@@ -1266,9 +1274,12 @@ fn observe_row(
     if !stable {
         return Some(kept(IdentityReason::PathChanged, digest_equal));
     }
-    let Some((recorded_device, _)) = recorded else {
+    let Some(recorded_device) = recorded_device else {
         return Some(kept(IdentityReason::IdentityRecordMissing, digest_equal));
     };
+    if recorded_inode.is_none() {
+        return Some(kept(IdentityReason::IdentityRecordMissing, digest_equal));
+    }
     Some(CensusIdentity {
         verdict: CensusVerdict::Verified,
         reason: None,
@@ -2124,12 +2135,19 @@ mod tests {
             .expect("a row object")
             .remove("root_ino");
 
-        // Unchanged bytes: compared, nothing counted.
+        // Unchanged bytes: compared, nothing counted. The recorded device is
+        // still compared even though the inode is missing: one fact's absence
+        // never suppresses the other's available result.
         let report = fixture.census(vec![row.clone()]);
         let identity = &fixture.row(&report).identity;
         assert_eq!(identity.reason, Some(IdentityReason::IdentityRecordMissing));
         assert_eq!(identity.inode_equal, None, "no recorded inode to compare");
-        assert_eq!(identity.device_equal, None);
+        assert_eq!(
+            identity.device_equal,
+            Some(true),
+            "the recorded device is still compared on its own"
+        );
+        assert_eq!(identity.recorded_device, Some(fixture.row.device));
         assert_eq!(identity.live_inode, Some(fixture.row.inode));
         assert_eq!(identity.live_device, Some(fixture.row.device));
         assert_eq!(identity.marker_digest_equal, Some(true));
@@ -2155,18 +2173,65 @@ mod tests {
         assert_eq!(drift.unknown, 1);
         assert_eq!(drift.inode_changed, 0);
 
-        // The same with the device missing instead of the inode.
+        // The same with the device missing instead of the inode: the recorded
+        // inode is still compared.
         write_marker(&fixture.row.root, &fixture.row.marker);
         let mut without_device = fixture.row_json();
         without_device
             .as_object_mut()
             .expect("a row object")
             .remove("root_dev");
-        let report = fixture.census(vec![without_device]);
+        let report = fixture.census(vec![without_device.clone()]);
         let identity = &fixture.row(&report).identity;
         assert_eq!(identity.reason, Some(IdentityReason::IdentityRecordMissing));
         assert_eq!(identity.marker_digest_equal, Some(true));
-        assert_eq!(identity.device_equal, None);
+        assert_eq!(identity.device_equal, None, "no recorded device to compare");
+        assert_eq!(
+            identity.inode_equal,
+            Some(true),
+            "the recorded inode is still compared on its own"
+        );
+
+        // The device missing and the recorded inode differing: the verdict stays
+        // unknown for the missing identity, and the observed inode difference is
+        // still reported and counted.
+        let mut without_device_changed_inode = without_device;
+        without_device_changed_inode["root_ino"] = serde_json::json!(fixture.row.inode + 1);
+        let report = fixture.census(vec![without_device_changed_inode]);
+        let identity = &fixture.row(&report).identity;
+        assert_eq!(identity.reason, Some(IdentityReason::IdentityRecordMissing));
+        assert_eq!(identity.inode_equal, Some(false));
+        assert_eq!(identity.live_inode, Some(fixture.row.inode));
+        let drift = report.drift.as_ref().expect("the drift report");
+        assert_eq!(
+            drift.inode_changed, 1,
+            "an observed inode difference is counted whatever the verdict"
+        );
+        assert_eq!(drift.device_moved, 0);
+
+        // The inode missing and the recorded device differing: the device
+        // difference is reported, and `device_moved` stays the verified-rows
+        // number the carried finding is about.
+        let mut changed_device = fixture.row_json();
+        changed_device
+            .as_object_mut()
+            .expect("a row object")
+            .remove("root_ino");
+        changed_device["root_dev"] = serde_json::json!(fixture.row.device + 1);
+        let report = fixture.census(vec![changed_device]);
+        let identity = &fixture.row(&report).identity;
+        assert_eq!(identity.reason, Some(IdentityReason::IdentityRecordMissing));
+        assert_eq!(identity.device_equal, Some(false));
+        assert_eq!(identity.recorded_device, Some(fixture.row.device + 1));
+        assert_eq!(identity.live_device, Some(fixture.row.device));
+        assert_eq!(
+            report.drift.as_ref().map(|drift| drift.device_moved),
+            Some(0)
+        );
+        assert_eq!(
+            report.drift.as_ref().map(|drift| drift.inode_changed),
+            Some(0)
+        );
 
         // A marker that cannot be read has no digest, so nothing is counted.
         std::fs::remove_file(fixture.row.root.join(super::OXIDE_ROOT_MARKER_FILE))

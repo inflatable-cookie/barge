@@ -1278,10 +1278,13 @@ Choices F5 made where this contract left the mechanics to the slice:
   `unknown(identity_record_missing)` — in an Oxide row that is what is missing,
   and a `/1`-era row is the ordinary case — and a row that records no usable
   volume UUID is `unknown(volume_unverified)`. A value is never defaulted. A row
-  missing its recorded identity facts is still walked and its marker still read:
-  the stored inode and device comparisons are absent, but changed marker bytes are
-  reported and counted like any other, and a recorded path that is absent stays
-  `unknown(identity_record_missing)` rather than `gone`, because without a
+  missing a recorded identity fact is still walked and its marker still read, and
+  each comparison is made whenever its own recorded fact is present: a recorded
+  device is compared with the live one when the inode is missing, and the reverse,
+  so one fact's absence never suppresses the other's diagnostic result. A
+  comparison the row cannot support is absent, never `false`. Changed marker bytes
+  are reported and counted like any other, and a recorded path that is absent
+  stays `unknown(identity_record_missing)` rather than `gone`, because without a
   recorded inode the recorded directory cannot be tied to that path.
 - **Per row, never per batch.** One undecidable row never stops the others: a
   volume that is away, a marker that is unexpected and a row without recorded
@@ -1292,14 +1295,16 @@ Choices F5 made where this contract left the mechanics to the slice:
   needs as one number: `verified`, of which `device_moved` are roots whose live
   device differs from the recorded one — exactly the roots a recorded-device
   comparison refuses — `inode_changed`, `marker_changed`, `gone`, `unknown`, and
-  `unknown_reasons` by code. `marker_changed` counts every row whose marker bytes
-  differ from the digest Oxide recorded, whatever the row's identity verdict and
-  whatever those bytes turned out to be: an unknown verdict never hides an
-  observation the census did make, and readable bytes that are divergent,
-  malformed or of an unknown version are compared before they are parsed, so
-  they count too. Only a marker the census could not read at all — absent,
-  unreadable, oversized or another user's — has no digest, and that is not a
-  change. `examined` and `unexamined` bound
+  `unknown_reasons` by code. `inode_changed` and `marker_changed` count the
+  differences the census observed, whatever the row's identity verdict: an inode
+  that differs is evidence even when a missing recorded fact already keeps the row,
+  a marker whose bytes differ is evidence whatever those bytes turned out to be
+  (readable divergent, malformed or unknown-version bytes are compared before they
+  are parsed, so they count too), and an unknown verdict never hides an observation
+  the census did make. Only a comparison the row could not support is `None` and
+  never counted: no recorded inode or device, or a marker the census could not read
+  at all — absent, unreadable, oversized or another user's. `device_moved` stays
+  the verified-rows number it is defined to be. `examined` and `unexamined` bound
   the claim: the census shares one 10 s deadline with the registry read, and rows
   it did not reach are counted, never assumed.
 - **Read-only, and no adoption.** The census takes no lock, creates nothing and
