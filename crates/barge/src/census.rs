@@ -1154,25 +1154,37 @@ fn observe_row(
         marker_digest_equal,
         remount: None,
     };
-    if !inode_equal {
-        return Some(kept(IdentityReason::InodeChanged, None));
-    }
+    // A changed inode decides the verdict, and the marker is still read: whether
+    // its bytes changed is evidence the drift report owes an operator, and the
+    // first decisive reason is the inode's, exactly as a root verification orders
+    // it. A marker that cannot be read keeps the inode's reason and has no digest.
+    let inode_changed = !inode_equal;
+    let marker_reason = |reason: IdentityReason| {
+        if inode_changed {
+            IdentityReason::InodeChanged
+        } else {
+            reason
+        }
+    };
     if deadline.expired() {
         return None;
     }
     let marker_facts = match dirs.child_facts(&current, OXIDE_ROOT_MARKER_FILE) {
         Ok(Some(facts)) => facts,
-        Ok(None) => return Some(kept(IdentityReason::MarkerAbsent, None)),
-        Err(_) => return Some(kept(IdentityReason::MarkerUnreadable, None)),
+        Ok(None) => return Some(kept(marker_reason(IdentityReason::MarkerAbsent), None)),
+        Err(_) => return Some(kept(marker_reason(IdentityReason::MarkerUnreadable), None)),
     };
     if marker_facts.uid != uid {
-        return Some(kept(IdentityReason::MarkerForeignOwner, None));
+        return Some(kept(
+            marker_reason(IdentityReason::MarkerForeignOwner),
+            None,
+        ));
     }
     if marker_facts.kind != EntryKind::File
         || !marker_facts.is_private()
         || marker_facts.size > OXIDE_ROOT_MARKER_SIZE_CAP_BYTES as u64
     {
-        return Some(kept(IdentityReason::MarkerUnreadable, None));
+        return Some(kept(marker_reason(IdentityReason::MarkerUnreadable), None));
     }
     let bytes = match dirs.read_child_file(
         &current,
@@ -1180,7 +1192,7 @@ fn observe_row(
         OXIDE_ROOT_MARKER_SIZE_CAP_BYTES,
     ) {
         Ok(Some(bytes)) => bytes,
-        _ => return Some(kept(IdentityReason::MarkerUnreadable, None)),
+        _ => return Some(kept(marker_reason(IdentityReason::MarkerUnreadable), None)),
     };
     // The digest is compared on the bytes that were read, before any parse: a
     // marker whose bytes changed is evidence even when those bytes are divergent
@@ -1188,6 +1200,9 @@ fn observe_row(
     let digest_equal = row
         .marker_digest()
         .map(|recorded| recorded == crate::digest::sha256_hex(&bytes));
+    if inode_changed {
+        return Some(kept(IdentityReason::InodeChanged, digest_equal));
+    }
     let value: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(_) => return Some(kept(IdentityReason::MarkerSchemaDivergent, digest_equal)),
@@ -1902,24 +1917,46 @@ mod tests {
         assert_eq!(drift.verified, 0);
 
         // Unknown for a changed inode, with the recorded marker unchanged: the
-        // digest agrees, so nothing is counted as a change.
+        // marker is still read for the drift evidence, and its digest agrees, so
+        // nothing is counted as a change.
         write_marker(&fixture.row.root, &fixture.row.marker);
         let mut row = fixture.row_json();
         row["root_ino"] = serde_json::json!(fixture.row.inode + 1);
         let report = fixture.census(vec![row.clone()]);
         let identity = &fixture.row(&report).identity;
         assert_eq!(identity.reason, Some(IdentityReason::InodeChanged));
-        assert_eq!(identity.marker_digest_equal, None);
+        assert_eq!(identity.marker_digest_equal, Some(true));
         assert_eq!(
             report.drift.as_ref().map(|drift| drift.marker_changed),
             Some(0),
-            "a marker the census did not compare is not a change"
+            "unchanged bytes are not a change"
         );
 
-        // Unknown because the marker cannot be read: no digest, no count.
+        // A changed inode and changed marker bytes together: the inode keeps its
+        // reason, and the change the census observed is still counted.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fixture.row.marker).expect("the fixture marker decodes");
+        value["label"] = serde_json::json!("profile: dev (rewritten)");
+        write_marker(
+            &fixture.row.root,
+            &serde_json::to_vec(&value).expect("the marker encodes"),
+        );
+        let report = fixture.census(vec![row.clone()]);
+        let identity = &fixture.row(&report).identity;
+        assert_eq!(identity.reason, Some(IdentityReason::InodeChanged));
+        assert_eq!(identity.marker_digest_equal, Some(false));
+        let drift = report.drift.as_ref().expect("the drift report");
+        assert_eq!(drift.marker_changed, 1);
+        assert_eq!(drift.inode_changed, 1);
+
+        // Unknown because the marker cannot be read: the inode's reason stays and
+        // there is no digest, so nothing is counted.
         std::fs::remove_file(fixture.row.root.join(super::OXIDE_ROOT_MARKER_FILE))
             .expect("the fixture marker is removed");
         let report = fixture.census(vec![row]);
+        let identity = &fixture.row(&report).identity;
+        assert_eq!(identity.reason, Some(IdentityReason::InodeChanged));
+        assert_eq!(identity.marker_digest_equal, None);
         assert_eq!(
             report.drift.as_ref().map(|drift| drift.marker_changed),
             Some(0)

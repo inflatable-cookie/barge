@@ -1259,7 +1259,9 @@ Choices F5 made where this contract left the mechanics to the slice:
 - **The verdict.** `verified`, `unknown(reason)` or `gone`. A device change is
   never a refusal: it is `device_equal: false` with `remount` carrying both
   numbers, and the verdict stays `verified`. A changed inode is
-  `unknown(inode_changed)` with both inodes reported. `gone` is reachable only
+  `unknown(inode_changed)` with both inodes reported, and its marker is still read
+  and compared: the inode decides the verdict first, but changed marker bytes are
+  evidence an operator is owed, so the census reports and counts them too. `gone` is reachable only
   from a volume that still verifies and a path that is `ENOENT`, and only after
   the mount census, the volume and the parent descriptor are re-read unchanged.
   The recorded owner marker's own version rules come first, exactly as Oxide
