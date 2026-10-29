@@ -1285,9 +1285,12 @@ Choices F5 made where this contract left the mechanics to the slice:
   needs as one number: `verified`, of which `device_moved` are roots whose live
   device differs from the recorded one — exactly the roots a recorded-device
   comparison refuses — `inode_changed`, `marker_changed`, `gone`, `unknown`, and
-  `unknown_reasons` by code. `examined` and `unexamined` bound the claim: the
-  census shares one 10 s deadline with the registry read, and rows it did not
-  reach are counted, never assumed.
+  `unknown_reasons` by code. `marker_changed` counts every row whose marker bytes
+  differ from the digest Oxide recorded, whatever the row's identity verdict: an
+  unknown verdict never hides an observation the census did make, and a digest
+  the census could not read is not a change. `examined` and `unexamined` bound
+  the claim: the census shares one 10 s deadline with the registry read, and rows
+  it did not reach are counted, never assumed.
 - **Read-only, and no adoption.** The census takes no lock, creates nothing and
   writes nothing. `inspect` remains the only command that uses it, and no row
   becomes a Barge record; Oxide's roots stay Oxide's to prune (O4-007).

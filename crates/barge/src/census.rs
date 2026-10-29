@@ -819,7 +819,10 @@ pub struct OxideCensusDrift {
     pub device_moved: usize,
     /// Rows kept because the recorded inode differs from the live one.
     pub inode_changed: usize,
-    /// Rows whose owner-marker bytes differ from the recorded digest.
+    /// Rows whose owner-marker bytes differ from the recorded digest, whatever
+    /// their identity verdict: a marker that changed is evidence even when the
+    /// row is otherwise undecidable. A digest the census could not read is not a
+    /// change and is not counted.
     pub marker_changed: usize,
     /// Rows whose recorded volume verified and whose recorded path is not there.
     pub gone: usize,
@@ -929,14 +932,18 @@ fn count(
     reasons: &mut Vec<(IdentityReason, usize)>,
     identity: &CensusIdentity,
 ) {
+    // A marker whose bytes changed is evidence whether or not the row's identity
+    // came out verified: an unknown verdict must not hide an observation the
+    // census did make. A digest the census could not read is `None`, and an
+    // unavailable comparison is never counted as a change.
+    if identity.marker_digest_equal == Some(false) {
+        drift.marker_changed += 1;
+    }
     match identity.verdict {
         CensusVerdict::Verified => {
             drift.verified += 1;
             if identity.device_equal == Some(false) {
                 drift.device_moved += 1;
-            }
-            if identity.marker_digest_equal == Some(false) {
-                drift.marker_changed += 1;
             }
         }
         CensusVerdict::Gone => drift.gone += 1,
@@ -1798,6 +1805,11 @@ mod tests {
             fixture.row(&report).identity.reason,
             Some(IdentityReason::MarkerIdentityMismatch)
         );
+        assert_eq!(
+            report.drift.as_ref().map(|drift| drift.marker_changed),
+            Some(1),
+            "a changed marker is counted even though the verdict is unknown"
+        );
 
         // An unexpected generation is its own reason.
         write_marker(
@@ -1840,6 +1852,75 @@ mod tests {
         assert_eq!(
             fixture.row(&report).identity.reason,
             Some(IdentityReason::MarkerSchemaDivergent)
+        );
+    }
+
+    #[test]
+    fn a_changed_marker_is_counted_whatever_the_row_verdict() {
+        // The concrete defect: `marker_changed` used to be incremented only for
+        // verified rows, so a row kept for another reason hid an observed marker
+        // change. A marker that changed is evidence whatever the verdict is, and
+        // a digest the census could not read is never counted as a change.
+        let fixture = Fixture::new("census-marker-changed-count");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fixture.row.marker).expect("the fixture marker decodes");
+        value["nonce"] = serde_json::json!("33333333333333333333333333333333");
+        write_marker(
+            &fixture.row.root,
+            &serde_json::to_vec(&value).expect("the marker encodes"),
+        );
+
+        // Unknown for a marker-identity reason, with the changed bytes observed:
+        // counted.
+        let report = fixture.census(vec![fixture.row_json()]);
+        let identity = &fixture.row(&report).identity;
+        assert_eq!(
+            identity.reason,
+            Some(IdentityReason::MarkerIdentityMismatch)
+        );
+        assert_eq!(identity.marker_digest_equal, Some(false));
+        let drift = report.drift.as_ref().expect("the drift report");
+        assert_eq!(drift.marker_changed, 1);
+        assert_eq!(drift.unknown, 1);
+        assert_eq!(drift.verified, 0);
+
+        // Unknown for a changed inode, with the recorded marker unchanged: the
+        // digest agrees, so nothing is counted as a change.
+        write_marker(&fixture.row.root, &fixture.row.marker);
+        let mut row = fixture.row_json();
+        row["root_ino"] = serde_json::json!(fixture.row.inode + 1);
+        let report = fixture.census(vec![row.clone()]);
+        let identity = &fixture.row(&report).identity;
+        assert_eq!(identity.reason, Some(IdentityReason::InodeChanged));
+        assert_eq!(identity.marker_digest_equal, None);
+        assert_eq!(
+            report.drift.as_ref().map(|drift| drift.marker_changed),
+            Some(0),
+            "a marker the census did not compare is not a change"
+        );
+
+        // Unknown because the marker cannot be read: no digest, no count.
+        std::fs::remove_file(fixture.row.root.join(super::OXIDE_ROOT_MARKER_FILE))
+            .expect("the fixture marker is removed");
+        let report = fixture.census(vec![row]);
+        assert_eq!(
+            report.drift.as_ref().map(|drift| drift.marker_changed),
+            Some(0)
+        );
+
+        // Verified with the original marker and a recorded digest that differs:
+        // counted, so the verified path still reports it.
+        write_marker(&fixture.row.root, &fixture.row.marker);
+        let mut row = fixture.row_json();
+        row["marker_digest"] =
+            serde_json::json!("4444444444444444444444444444444444444444444444444444444444444444");
+        let report = fixture.census(vec![row]);
+        let identity = &fixture.row(&report).identity;
+        assert_eq!(identity.verdict, CensusVerdict::Verified);
+        assert_eq!(identity.marker_digest_equal, Some(false));
+        assert_eq!(
+            report.drift.as_ref().map(|drift| drift.marker_changed),
+            Some(1)
         );
     }
 
