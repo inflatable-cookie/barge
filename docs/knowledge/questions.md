@@ -89,7 +89,9 @@ process that has exited at a re-read holds nothing; three attempts that still
 disagree refuse as `Unknown`, including a readable path whose vnode facts answer
 `ENOENT` and a path read that answers `ENOENT` beside a closed vnode-facts read
 (Oxide Supervisor 1a5b31a0, barge#008). A descriptor the platform reports closed
-is never an answer at all: `ESRCH` and `EBADF` are other errnos, so even two
+is never an answer at all: `ESRCH` and `EBADF` are other errnos. A closed
+retry pair is followed by a bounded re-listing: an omitted fd is gone; a listed
+fd is paired again and a still-closed pair refuses. Outside that retry, two
 closed answers are `Unknown`, as is one closed answer beside any other answer —
 whichever read saw the close — because no read's answer is carried by the other's
 and the fd may already have been closed and reused. When both reads answer `ENOENT` after a

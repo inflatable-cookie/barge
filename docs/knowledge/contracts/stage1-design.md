@@ -980,7 +980,9 @@ readable path with readable facts, `ENOENT` from both reads and `EPERM` from bot
 are an answer. A mixed pair is re-read as a paired path-and-vnode observation up
 to three times about 10 ms apart inside the scan's own time bound, and the first
 agreeing pair is used; a process that has exited at a re-read holds nothing;
-three attempts that still disagree stay unreadable (Oxide Supervisor 1a5b31a0,
+a closed retry pair prompts a bounded descriptor re-listing: an omitted fd is gone,
+while a listed fd is paired again and a still-closed pair refuses; three attempts
+that still disagree stay unreadable (Oxide Supervisor 1a5b31a0,
 barge#008). `ENOENT` on the descriptor listing itself, a changed or unreadable
 identity, or a bound reached stays unreadable. A closed descriptor is still never
 an answer.
@@ -1723,7 +1725,10 @@ Choices S5 made where this design left the mechanic to the slice:
   about 10 ms apart, inside the scan's own time bound, and uses the first
   agreeing pair. A process the kernel reports gone at a re-read holds nothing
   under the existing exited rule. Three attempts that still disagree stay
-  `Unknown`. The dead-handle rule from decision e33115d3 is unchanged: both
+  `Unknown`. If a retry pair reports closed, a bounded descriptor re-listing
+  establishes whether the fd is gone; if listed, it is paired again, and a
+  still-closed pair refuses. A disagreement during dead-handle re-observation
+  also refuses without a pair retry. The dead-handle rule from decision e33115d3 is unchanged: both
   `ENOENT` still needs its own bounded re-observation, a closed descriptor is
   still never an answer, and a failed observation is still refused before the
   identity after it is consulted.
@@ -1803,7 +1808,7 @@ Choices S5 made where this design left the mechanic to the slice:
   the path read while the vnode facts report it closed, `EIO` from the vnode
   facts read, a closed path read beside `ENOENT`, `EPERM` or readable facts, a
   readable path beside closed vnode facts, and **both** reads reporting the
-  descriptor closed are all `unknown` after the three paired attempts, because
+  descriptor closed are all `unknown` when they persist, because
   `ESRCH` and `EBADF` are other errnos. A transient mixed pair that then agrees
   places the descriptor; a mixed pair that still disagrees across three attempts
   stays `unknown`; a pid that exits during that re-read holds nothing. A second

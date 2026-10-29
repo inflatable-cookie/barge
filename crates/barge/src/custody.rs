@@ -3702,6 +3702,79 @@ mod tests {
     }
 
     #[test]
+    fn a_descriptor_closed_through_pair_retry_is_gone_when_relisting_omits_it() {
+        let holder = real_holder("custody-008-pair-closed-gone");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let identity = child.identity();
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                relist_errno: Some(0),
+                vnode_reads: vec![
+                    (0, StatedVnodeRead::facts_closed_once()),
+                    (
+                        0,
+                        StatedVnodeRead::new(StatedCall::Closed, StatedCall::Closed),
+                    ),
+                ],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+    }
+
+    #[test]
+    fn a_closed_pair_relisted_and_reused_is_placed() {
+        let holder = real_holder("custody-008-pair-closed-reused");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let identity = child.identity();
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                vnode_reads: vec![
+                    (0, StatedVnodeRead::facts_closed_once()),
+                    (
+                        0,
+                        StatedVnodeRead::once(StatedCall::Closed, StatedCall::Closed),
+                    ),
+                ],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unsafe", "{:?}", verdict.reason());
+    }
+
+    #[test]
+    fn a_closed_pair_still_listed_and_closed_refuses() {
+        let holder = real_holder("custody-008-pair-closed-listed");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let identity = child.identity();
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                vnode_reads: vec![
+                    (0, StatedVnodeRead::facts_closed_once()),
+                    (
+                        0,
+                        StatedVnodeRead::new(StatedCall::Closed, StatedCall::Closed),
+                    ),
+                ],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+    }
+
+    #[test]
     fn a_persistent_path_vnode_disagreement_across_three_attempts_is_unknown() {
         let holder = real_holder("custody-008-pair-persistent");
         let payload = holder.payload();

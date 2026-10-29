@@ -1234,6 +1234,11 @@ impl MacOs {
         match read_descriptor(identity.pid, descriptor, stated) {
             Ok(DescriptorReading::Path(path)) => Observed::Path(path),
             Ok(DescriptorReading::Opaque) => Observed::Opaque,
+            Ok(DescriptorReading::Closed) => Observed::Unreadable(
+                closed_descriptor(identity.pid, descriptor)
+                    .message()
+                    .to_owned(),
+            ),
             Ok(DescriptorReading::Dead) => self.settle_dead_handle(
                 identity,
                 descriptor,
@@ -1269,7 +1274,8 @@ impl MacOs {
     /// re-read holds nothing. A failed observation is refused before the
     /// identity after it is consulted, so a disappearing process never discards
     /// another errno. Three attempts that still disagree stay unreadable. A
-    /// closed descriptor is still never an answer.
+    /// closed pair is never an answer: a bounded re-listing must establish that
+    /// the descriptor is gone, or a listed descriptor is paired again.
     #[allow(clippy::too_many_arguments)]
     fn settle_pair(
         &self,
@@ -1303,13 +1309,64 @@ impl MacOs {
                 Err(reason) => return Observed::Unreadable(reason),
             }
             let stated = stated_vnode_read(faults, pid, vnode_index);
-            let reading = match read_descriptor(pid, descriptor, stated) {
+            let mut reading = match read_descriptor(pid, descriptor, stated) {
                 Ok(reading) => reading,
                 // A failed observation is never discarded, and never settled by a
                 // process that disappears afterwards: it refuses here, before the
                 // identity after it is consulted.
                 Err(error) => return Observed::Unreadable(error.message().to_owned()),
             };
+            if matches!(reading, DescriptorReading::Closed) {
+                let listing = match faults
+                    .iter_mut()
+                    .find(|fault| fault.pid == pid)
+                    .and_then(|fault| fault.relist_errno.take())
+                {
+                    Some(errno) => DescriptorListing::from_errno(errno),
+                    None => self.list_descriptors(pid),
+                };
+                if started.elapsed() >= timeout {
+                    return Observed::Bounded;
+                }
+                match listing {
+                    DescriptorListing::Gone { .. } => return Observed::Closed,
+                    DescriptorListing::Unreadable(error) => {
+                        return Observed::Unreadable(
+                            unreadable_descriptors(pid, &error).message().to_owned(),
+                        );
+                    }
+                    DescriptorListing::Listed(fds) => {
+                        if fds.len() >= SCAN_DESCRIPTORS_PER_PROCESS {
+                            return Observed::Bounded;
+                        }
+                        let identity = self.pair_identity(
+                            classified,
+                            descriptor,
+                            faults,
+                            "around the descriptor re-listing",
+                        );
+                        if started.elapsed() >= timeout {
+                            return Observed::Bounded;
+                        }
+                        match identity {
+                            Ok(None) => return Observed::Closed,
+                            Ok(Some(())) => {}
+                            Err(reason) => return Observed::Unreadable(reason),
+                        }
+                        if !fds.iter().any(|fd| fd.proc_fd == descriptor) {
+                            return Observed::Closed;
+                        }
+                        let stated = stated_vnode_read(faults, pid, vnode_index);
+                        reading = match read_descriptor(pid, descriptor, stated) {
+                            Ok(reading) => reading,
+                            Err(error) => return Observed::Unreadable(error.message().to_owned()),
+                        };
+                        if started.elapsed() >= timeout {
+                            return Observed::Bounded;
+                        }
+                    }
+                }
+            }
             match self.pair_identity(
                 classified,
                 descriptor,
@@ -1323,6 +1380,11 @@ impl MacOs {
             match reading {
                 DescriptorReading::Path(next) => return Observed::Path(next),
                 DescriptorReading::Opaque => return Observed::Opaque,
+                DescriptorReading::Closed => {
+                    return Observed::Unreadable(
+                        closed_descriptor(pid, descriptor).message().to_owned(),
+                    )
+                }
                 DescriptorReading::Dead => {
                     return self.settle_dead_handle(
                         classified,
@@ -1526,6 +1588,9 @@ impl MacOs {
         let observed = match reading {
             DescriptorReading::Path(path) => Observed::Path(path),
             DescriptorReading::Opaque => Observed::Opaque,
+            DescriptorReading::Closed => {
+                Observed::Unreadable(closed_descriptor(pid, descriptor).message().to_owned())
+            }
             // Still dead for the classified identity, which was just re-read: it
             // is a dead handle, never a skip.
             DescriptorReading::Dead => Observed::Dead(DeadHandle {
@@ -1712,6 +1777,8 @@ pub(crate) struct StatedListing {
     /// answer. `EPERM` is the answer the scan re-observes; any other entry is
     /// refused at once, exactly as a real one would be.
     pub(crate) errnos: Vec<i32>,
+    /// A stated answer for a closed-pair descriptor re-listing.
+    pub(crate) relist_errno: Option<i32>,
     /// A start identity the re-observation reports instead of the kernel's.
     pub(crate) start: Option<u64>,
     /// An effective uid the re-observation reports instead of the kernel's.
@@ -2578,6 +2645,8 @@ enum DescriptorReading {
     /// process identity reports it as a dead handle (Tom, 2026-10-28, decision
     /// e33115d3, barge#023).
     Dead,
+    /// Both reads report closed; this is not itself an answer.
+    Closed,
     /// The two per-fd reads did not agree. The scan re-reads the pair before it
     /// treats this as unreadable (Oxide Supervisor 1a5b31a0).
     Disagreed {
@@ -2652,7 +2721,7 @@ fn read_descriptor(
         // been closed and reused, and no read's result is ever carried by the
         // other's. Even two closed answers refuse, so nothing a closing descriptor
         // reports can make a scan safe.
-        (DescriptorPath::Closed, VnodeFacts::Closed) => Err(closed_descriptor(pid, descriptor)),
+        (DescriptorPath::Closed, VnodeFacts::Closed) => Ok(DescriptorReading::Closed),
         // The pair disagrees. Nothing about the descriptor is established yet:
         // the scan re-reads both flavors as a pair before it refuses, so one
         // transient close between the two reads cannot make the whole scan
