@@ -2502,6 +2502,60 @@ mod tests {
     }
 
     #[test]
+    fn a_receipt_that_names_another_checkout_for_the_markers_id_keeps_the_root() {
+        // The marker names checkout A for id checkout-1; the receipt for that id
+        // names checkout B. Which checkout owns the root is then unknown, so the
+        // reference set is incomplete and the root is kept — even though A's path
+        // is gone, which would otherwise satisfy the marker's absence requirement.
+        let fixture = Fixture::new("release-marker-conflict");
+        let root = fixture.root();
+        let marked = fixture.account.home.join("marked-checkout");
+        let other = fixture.account.home.join("other-checkout");
+        let marker = serde_json::json!({
+            "version": reference::OXIDE_MARKER_V2,
+            "checkout": marked.display().to_string(),
+            "checkout_id": "checkout-1",
+            "label": "example",
+            "recipe": "target-debug-v1",
+            "kind": "external",
+            "checkout_volume_uuid": FIXTURE_UUID,
+            "generation": 1,
+            "created_ms": 1_000,
+        });
+        let marker_path = root.path.join(reference::OXIDE_MARKER_FILE);
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec(&marker).expect("the marker encodes"),
+        )
+        .expect("the Oxide marker is written");
+        std::fs::set_permissions(&marker_path, std::fs::Permissions::from_mode(0o600))
+            .expect("the marker is private");
+        let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
+        std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
+        std::fs::write(
+            outputs.join("checkout-1.json"),
+            format!(
+                r#"{{"version":"{}","checkout":"{}","checkout_id":"checkout-1","generation":2,"state":"committed","links":[{{"member":"target"}}],"roots":[],"updated_ms":1}}"#,
+                reference::OXIDE_RECEIPT_V2,
+                other.display()
+            ),
+        )
+        .expect("the receipt is written");
+
+        let report = fixture.plan();
+        let kept = row(&report, &root);
+        assert!(!kept.eligible, "{kept:?}");
+        assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+        assert!(!kept.references_complete);
+        assert!(
+            kept.reason.as_deref().is_some_and(|reason| reason
+                .contains("which checkout owns this root is unknown")
+                || reason.contains("names checkout")),
+            "{kept:?}"
+        );
+    }
+
+    #[test]
     fn a_marker_without_its_required_fields_is_unknown() {
         let fixture = Fixture::new("release-marker-divergent");
         let root = fixture.root();

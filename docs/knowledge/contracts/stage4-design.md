@@ -1089,7 +1089,15 @@ that does not state Oxide's own selection flags (`selected`, `pending`) or its
 required identity fields is a schema divergence, not a settled row: the reader
 refuses it rather than defaulting a missing selection to "not selected", and a
 root marker that omits a field Oxide always writes is unreadable for the same
-reason. A root that carries only an Oxide marker and no still-selecting record is
+reason. A receipt is read at its own version's shape: each of
+`oxide.outputs.transition/1`, `/2` and `/3` must carry exactly the fields and the
+shape that version writes, `state` must be one of Oxide's five states, and a
+document that carries another version's shape or omits a required field
+(`state`, `updated_ms`, a placement's `member`, a selection's `kind` and
+`generation`, a version-3 `layout`, a whole-target version-3 migration journal) is
+divergent. Ownership must agree as well: a receipt or registry row that carries
+the marker's checkout id but names a different checkout path contradicts the
+marker, so which checkout owns the root is unknown and the root is kept. A root that carries only an Oxide marker and no still-selecting record is
 **not** releasable on the marker's own word: the marker is ownership, not a
 selection, so its row is not current and its consumer path needs an `Absent`
 proof of its own. So does an uncertain *discovery*: Oxide's own pools record can name the only pool that holds

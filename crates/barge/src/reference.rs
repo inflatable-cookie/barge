@@ -332,7 +332,9 @@ pub const fn policy_permits_release(policy: &PrunePolicy) -> bool {
 /// One `oxide.outputs.registry/2` (or `/1`) row, as this reader uses it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OxideRow {
-    /// The checkout the row belongs to.
+    /// The checkout id the row belongs to.
+    pub checkout_id: String,
+    /// The checkout path the row belongs to.
     pub checkout: PathBuf,
     /// The checkout's APFS volume UUID, when the row records one.
     pub checkout_volume: Option<VolumeUuid>,
@@ -667,6 +669,40 @@ impl OxideSnapshot {
                     volume: marker.checkout_volume.clone(),
                 });
             }
+            // Ownership has to agree. A record that carries the marker's checkout
+            // id but names another checkout path contradicts the marker, and which
+            // checkout owns this root is then unknown rather than settled.
+            match &self.receipts {
+                OxideReceipts::Read(receipts) => {
+                    for receipt in receipts
+                        .iter()
+                        .filter(|receipt| receipt.checkout_id == marker.checkout_id)
+                        .filter(|receipt| receipt.checkout != marker.checkout)
+                    {
+                        set.absorb(ReferenceSet::unknown(format!(
+                            "the receipt for checkout id {} names checkout {}, but the root's marker names {}",
+                            marker.checkout_id,
+                            receipt.checkout.display(),
+                            marker.checkout.display()
+                        )));
+                    }
+                }
+                OxideReceipts::Absent | OxideReceipts::Unknown { .. } => {}
+            }
+            if let OxideRegistry::Read { rows, .. } = &self.registry {
+                for row in rows
+                    .iter()
+                    .filter(|row| row.checkout_id == marker.checkout_id)
+                    .filter(|row| row.checkout != marker.checkout)
+                {
+                    set.absorb(ReferenceSet::unknown(format!(
+                        "the registry row for checkout id {} names checkout {}, but the root's marker names {}",
+                        marker.checkout_id,
+                        row.checkout.display(),
+                        marker.checkout.display()
+                    )));
+                }
+            }
             let receipt_present = match &self.receipts {
                 OxideReceipts::Absent => false,
                 OxideReceipts::Read(receipts) => receipts
@@ -908,6 +944,7 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
             None => None,
         };
         rows.push(OxideRow {
+            checkout_id: row.checkout_id,
             checkout: row.checkout,
             checkout_volume,
             root: row.root,
@@ -1029,10 +1066,13 @@ struct RawReceipt {
     checkout_id: String,
     #[allow(dead_code)]
     generation: u64,
+    // Oxide always writes every field below except the optional ones serde
+    // defaults, and it always writes one of its own states. A document that omits
+    // a required field or states a state this build does not know is a divergence,
+    // not a receipt with defaulted facts.
     #[allow(dead_code)]
     state: String,
     #[serde(default)]
-    #[allow(dead_code)]
     layout: Option<String>,
     #[serde(default)]
     transition: Option<serde_json::Value>,
@@ -1049,7 +1089,6 @@ struct RawReceipt {
     #[serde(default)]
     #[allow(dead_code)]
     pruned: Option<serde_json::Value>,
-    #[serde(default)]
     #[allow(dead_code)]
     updated_ms: u64,
 }
@@ -1057,7 +1096,6 @@ struct RawReceipt {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPlacement {
-    #[serde(default)]
     #[allow(dead_code)]
     member: String,
     #[serde(default)]
@@ -1071,9 +1109,8 @@ struct RawPlacement {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSelected {
-    #[serde(default)]
     #[allow(dead_code)]
-    kind: Option<String>,
+    kind: String,
     root: PathBuf,
     #[serde(default)]
     #[allow(dead_code)]
@@ -1081,7 +1118,6 @@ struct RawSelected {
     #[serde(default)]
     #[allow(dead_code)]
     nonce: Option<String>,
-    #[serde(default)]
     #[allow(dead_code)]
     generation: u64,
 }
@@ -1091,22 +1127,17 @@ struct RawSelected {
 #[serde(deny_unknown_fields)]
 struct RawReservation {
     root: PathBuf,
-    #[serde(default)]
     #[allow(dead_code)]
-    id: Option<String>,
-    #[serde(default)]
+    id: String,
     #[allow(dead_code)]
-    nonce: Option<String>,
-    #[serde(default)]
+    nonce: String,
     #[allow(dead_code)]
-    kind: Option<String>,
+    kind: String,
     #[serde(default)]
     #[allow(dead_code)]
     volume_uuid: Option<String>,
-    #[serde(default)]
     #[allow(dead_code)]
     generation: u64,
-    #[serde(default)]
     #[allow(dead_code)]
     created_ms: u64,
     #[serde(default)]
@@ -1117,13 +1148,11 @@ struct RawReservation {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPrepared {
-    #[serde(default)]
     #[allow(dead_code)]
     generation: u64,
     to: RawSelected,
-    #[serde(default)]
     #[allow(dead_code)]
-    link: Option<PathBuf>,
+    link: PathBuf,
 }
 
 fn parse_receipt(
@@ -1146,6 +1175,75 @@ fn parse_receipt(
             "the receipt for {checkout_id} names checkout id {}",
             raw.checkout_id
         ));
+    }
+    if !matches!(
+        raw.state.as_str(),
+        "committed" | "prepared" | "detached" | "pruned" | "pruning"
+    ) {
+        return Err(format!(
+            "a receipt states `{}`, which is not a state Oxide writes",
+            raw.state
+        ));
+    }
+    // Each version states its own shape. A document whose shape belongs to another
+    // version is contradictory rather than merely old, so it is refused.
+    match raw.version.as_str() {
+        OXIDE_RECEIPT_V1 => {
+            if raw.layout.is_some()
+                || raw.transition.is_some()
+                || !raw.links.is_empty()
+                || raw.reserved.is_some()
+                || raw.pruned.is_some()
+                || matches!(raw.state.as_str(), "pruned" | "pruning")
+            {
+                return Err(
+                    "a version-1 receipt carries only its whole-target selection".to_owned(),
+                );
+            }
+            if raw.selected.is_none() && raw.prepared.is_none() {
+                return Err(
+                    "a version-1 receipt names neither a selection nor a prepared root".to_owned(),
+                );
+            }
+        }
+        OXIDE_RECEIPT_V2 => {
+            if raw.layout.is_some() || raw.transition.is_some() {
+                return Err(
+                    "a version-2 receipt carries no successor layout or migration".to_owned(),
+                );
+            }
+            if raw.selected.is_some() || raw.prepared.is_some() {
+                return Err(
+                    "a version-2 receipt carries placements, not top-level references".to_owned(),
+                );
+            }
+        }
+        _ => {
+            if raw.selected.is_some() || raw.prepared.is_some() {
+                return Err(
+                    "a version-3 receipt carries placements, not top-level references".to_owned(),
+                );
+            }
+            match raw.layout.as_deref() {
+                Some("profile") if raw.transition.is_none() => {}
+                // A migration journal is published in the successor format before
+                // its commit; its placement is still the legacy whole target.
+                Some("whole_target") if raw.transition.is_some() => {}
+                Some(other) => {
+                    return Err(format!(
+                        "a version-3 receipt declares layout `{other}`, not profile or whole_target"
+                    ))
+                }
+                None => return Err("a version-3 receipt must declare its layout".to_owned()),
+            }
+            if raw
+                .links
+                .iter()
+                .any(|placement| placement.reserved.is_some())
+            {
+                return Err("a version-3 reservation is root-level, not per placement".to_owned());
+            }
+        }
     }
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut current: Vec<PathBuf> = Vec::new();
@@ -1291,6 +1389,7 @@ mod tests {
     #[test]
     fn a_registry_row_that_is_not_settled_names_its_root() {
         let row = OxideRow {
+            checkout_id: "checkout-1".to_owned(),
             checkout: PathBuf::from("/Users/fixture/Dev/example"),
             checkout_volume: None,
             root: PathBuf::from("/Volumes/Builds/oxide/outputs/root"),
@@ -1379,5 +1478,44 @@ mod tests {
         assert!(parse_receipt(unknown, "c1").is_err());
         // A receipt whose own id disagrees with its file name is not followed.
         assert!(parse_receipt(v2, "other").is_err());
+    }
+
+    #[test]
+    fn a_receipt_with_a_missing_field_or_a_wrong_shape_is_divergent() {
+        // Every document below omits a field Oxide always writes, states a state
+        // this build does not know, or carries another version's shape. Each is a
+        // divergence: never a receipt with defaulted facts, and never evidence
+        // that a reference set is complete.
+        let cases: [&[u8]; 9] = [
+            // No `state`.
+            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"links":[],"roots":[],"updated_ms":9}"#,
+            // A state Oxide never writes.
+            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"state":"finished","links":[],"roots":[],"updated_ms":9}"#,
+            // No `updated_ms`.
+            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","links":[],"roots":[]}"#,
+            // A version-3 receipt without its layout.
+            br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","links":[],"roots":[],"updated_ms":9}"#,
+            // A version-2 receipt with a successor layout.
+            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","layout":"profile","links":[],"roots":[],"updated_ms":9}"#,
+            // A version-2 receipt with a top-level reference.
+            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","selected":{"kind":"external","root":"/r","generation":1},"links":[],"roots":[],"updated_ms":9}"#,
+            // A version-1 receipt with placements.
+            br#"{"version":"oxide.outputs.transition/1","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","links":[{"member":"target"}],"roots":[],"updated_ms":9}"#,
+            // A whole-target version-3 receipt without its migration journal.
+            br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","layout":"whole_target","links":[],"roots":[],"updated_ms":9}"#,
+            // A placement without its member.
+            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","links":[{"selected":{"kind":"external","root":"/r","generation":1}}],"roots":[],"updated_ms":9}"#,
+        ];
+        for (index, case) in cases.iter().enumerate() {
+            assert!(
+                parse_receipt(case, "c1").is_err(),
+                "case {index} was accepted as a receipt: {}",
+                String::from_utf8_lossy(case)
+            );
+        }
+        // A version-3 receipt whose history entry omits its generation is
+        // divergent too: Oxide always records it.
+        let history = br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","links":[],"roots":[{"kind":"external","root":"/r"}],"updated_ms":9}"#;
+        assert!(parse_receipt(history, "c1").is_err());
     }
 }
