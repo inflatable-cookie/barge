@@ -1181,16 +1181,17 @@ fn read_receipts(outputs: &Path, deadline: Deadline) -> OxideReceipts {
     read_receipts_with(outputs, deadline, &read_receipt)
 }
 
+/// How one listed receipt is read: the receipt, `None` when the listed name is no
+/// longer there, or the reason it could not be read.
+type ReceiptRead<'a> =
+    &'a dyn Fn(&Path, &str, Deadline) -> std::result::Result<Option<OxideReceiptReference>, String>;
+
 /// [`read_receipts`] with its per-receipt read injected, so a test can prove what a
 /// receipt that disappears after it was listed does.
 fn read_receipts_with(
     outputs: &Path,
     deadline: Deadline,
-    read_one: &dyn Fn(
-        &Path,
-        &str,
-        Deadline,
-    ) -> std::result::Result<Option<OxideReceiptReference>, String>,
+    read_one: ReceiptRead<'_>,
 ) -> OxideReceipts {
     let outputs_state = match std::fs::metadata(outputs) {
         Ok(metadata) if metadata.is_dir() => true,
