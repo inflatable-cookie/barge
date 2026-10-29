@@ -1075,7 +1075,7 @@ struct RawReceipt {
     #[serde(default)]
     layout: Option<String>,
     #[serde(default)]
-    transition: Option<serde_json::Value>,
+    transition: Option<RawMigration>,
     #[serde(default)]
     links: Vec<RawPlacement>,
     #[serde(default)]
@@ -1143,6 +1143,126 @@ struct RawReservation {
     #[serde(default)]
     #[allow(dead_code)]
     overflow: Option<serde_json::Value>,
+}
+
+/// Oxide's migration journal, read strictly: it pins the old link, parent, marker
+/// and receipt, so a document that omits or invents a field is divergent.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMigration {
+    generation: u64,
+    phase: String,
+    root: RawSelected,
+    members: Vec<String>,
+    link: PathBuf,
+    #[serde(default)]
+    #[allow(dead_code)]
+    link_text: Option<PathBuf>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    link_dev: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    link_ino: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    parent_dev: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    parent_ino: Option<u64>,
+    stage: PathBuf,
+    backup: PathBuf,
+    #[serde(default)]
+    #[allow(dead_code)]
+    stage_dev: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    stage_ino: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    marker_pin: Option<serde_json::Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    marker_backup: Option<PathBuf>,
+    prior_receipt_sha: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    registry_revision: u64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    created_ms: u64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    updated_ms: u64,
+}
+
+/// Whether a migration journal is exactly the shape Oxide publishes for this
+/// receipt. A journal is durable evidence of a move in progress, so an unknown
+/// phase, a generation its phase cannot have, an empty or unsorted member set, a
+/// relative path or a digest that is not a SHA-256 is a divergence rather than a
+/// journal with defaulted facts.
+fn validate_migration(
+    journal: &RawMigration,
+    checkout: &Path,
+    receipt_generation: u64,
+) -> std::result::Result<(), String> {
+    if !matches!(
+        journal.phase.as_str(),
+        "prepared" | "staged" | "marker_upgraded" | "backed_up" | "swapped" | "committed"
+    ) {
+        return Err(format!(
+            "a migration journal states phase `{}`, which Oxide never writes",
+            journal.phase
+        ));
+    }
+    let expected = if journal.phase == "committed" {
+        receipt_generation
+    } else {
+        receipt_generation.saturating_add(1)
+    };
+    if journal.generation != expected || journal.generation == 0 {
+        return Err(format!(
+            "a migration journal names generation {}, but its phase needs {expected}",
+            journal.generation
+        ));
+    }
+    if journal.link != checkout.join("target") {
+        return Err(format!(
+            "a migration journal names link {}, not the checkout's own target",
+            journal.link.display()
+        ));
+    }
+    let mut sorted = journal.members.clone();
+    sorted.sort();
+    sorted.dedup();
+    if journal.members.is_empty() || sorted != journal.members {
+        return Err("a migration journal's member set is empty, unsorted or not unique".to_owned());
+    }
+    for path in [&journal.stage, &journal.backup] {
+        if !path.is_absolute() {
+            return Err(format!(
+                "a migration journal names a relative path {}",
+                path.display()
+            ));
+        }
+    }
+    if journal.prior_receipt_sha.len() != 64
+        || !journal
+            .prior_receipt_sha
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("a migration journal pins no 64-hex receipt digest".to_owned());
+    }
+    match journal.root.nonce.as_deref() {
+        Some(nonce) if nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) => {}
+        _ => {
+            return Err(
+                "a migration journal needs one 128-bit root nonce for the root it keeps".to_owned(),
+            )
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1245,6 +1365,48 @@ fn parse_receipt(
             }
         }
     }
+    // The placements must be the ones this receipt's layout holds. A version-1
+    // receipt names its one reference at the top level instead of a placement, so
+    // it is the only whole-target shape without one.
+    let whole_target = raw.version == OXIDE_RECEIPT_V1
+        || raw.version == OXIDE_RECEIPT_V2
+        || raw.layout.as_deref() == Some("whole_target");
+    if whole_target {
+        if raw.links.len() > 1
+            || raw
+                .links
+                .iter()
+                .any(|placement| placement.member != "target")
+        {
+            return Err("a whole-target receipt holds exactly one `target` placement".to_owned());
+        }
+        if raw.version != OXIDE_RECEIPT_V1 && raw.links.len() != 1 {
+            return Err("a whole-target receipt holds exactly one `target` placement".to_owned());
+        }
+    } else {
+        if raw.links.is_empty() {
+            return Err("a profile receipt holds at least one member placement".to_owned());
+        }
+        let members: Vec<&String> = raw
+            .links
+            .iter()
+            .map(|placement| &placement.member)
+            .collect();
+        let mut sorted = members.clone();
+        sorted.sort();
+        sorted.dedup();
+        if sorted != members {
+            return Err(
+                "a profile receipt's placements are not unique and sorted by member".to_owned(),
+            );
+        }
+    }
+    if raw.roots.len() > 8 {
+        return Err("a receipt holds more roots than Oxide keeps".to_owned());
+    }
+    if let Some(journal) = &raw.transition {
+        validate_migration(journal, &raw.checkout, raw.generation)?;
+    }
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut current: Vec<PathBuf> = Vec::new();
     let note =
@@ -1284,12 +1446,11 @@ fn parse_receipt(
     for history in &raw.roots {
         note(&history.root, false, &mut roots, &mut current);
     }
-    if let Some(transition) = &raw.transition {
-        // A migration journal is present from its publication until its cleanup.
-        // Its pinned roots are current until it settles: the checkout is mid-move.
-        if let Some(pinned) = transition.get("pinned").and_then(serde_json::Value::as_str) {
-            note(&PathBuf::from(pinned), true, &mut roots, &mut current);
-        }
+    if let Some(journal) = &raw.transition {
+        // A journal is present from its publication until its cleanup, and the
+        // root it names is the one this checkout keeps: the checkout is mid-move,
+        // so that root is current until the journal settles.
+        note(&journal.root.root, true, &mut roots, &mut current);
     }
     Ok(OxideReceiptReference {
         checkout_id: checkout_id.to_owned(),
@@ -1517,5 +1678,74 @@ mod tests {
         // divergent too: Oxide always records it.
         let history = br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","links":[],"roots":[{"kind":"external","root":"/r"}],"updated_ms":9}"#;
         assert!(parse_receipt(history, "c1").is_err());
+    }
+
+    #[test]
+    fn a_migration_journal_is_read_strictly_and_names_the_root_it_keeps() {
+        // A whole-target version-3 receipt carries the journal of the move in
+        // progress, and the root that journal names is the one the checkout keeps.
+        let good = br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"c1","generation":3,"state":"committed","layout":"whole_target","links":[{"member":"target"}],"transition":{"generation":4,"phase":"staged","root":{"kind":"external","root":"/r","nonce":"00112233445566778899aabbccddeeff","generation":3},"members":["debug","release"],"link":"/c/target","link_text":"/r","link_dev":1,"link_ino":2,"parent_dev":1,"parent_ino":2,"stage":"/c/.target.oxide-new-4","backup":"/c/.target.oxide-old-4","prior_receipt_sha":"0000000000000000000000000000000000000000000000000000000000000000","registry_revision":3,"created_ms":1,"updated_ms":2},"updated_ms":9}"#;
+        let receipt = parse_receipt(good, "c1").expect("a valid journal reads");
+        assert_eq!(
+            receipt.current,
+            vec![PathBuf::from("/r")],
+            "the journal's own root is current while the move is in progress"
+        );
+
+        // Every document below is a malformed journal: an empty object (present
+        // but carrying none of the facts), an unknown phase, a generation its
+        // phase cannot have, an unsorted member set, a relative stage path, a
+        // digest that is not a SHA-256, a root without its nonce, and an invented
+        // field. Each makes the whole receipt divergent, never an empty complete
+        // one.
+        let malformed: [&str; 7] = [
+            "{}",
+            r#"{"generation":4,"phase":"bogus","root":{"kind":"external","root":"/r","nonce":"00112233445566778899aabbccddeeff","generation":3},"members":["debug"],"link":"/c/target","stage":"/s","backup":"/b","prior_receipt_sha":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+            r#"{"generation":1,"phase":"staged","root":{"kind":"external","root":"/r","nonce":"00112233445566778899aabbccddeeff","generation":3},"members":["debug"],"link":"/c/target","stage":"/s","backup":"/b","prior_receipt_sha":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+            r#"{"generation":4,"phase":"staged","root":{"kind":"external","root":"/r","nonce":"00112233445566778899aabbccddeeff","generation":3},"members":["release","debug"],"link":"/c/target","stage":"/s","backup":"/b","prior_receipt_sha":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+            r#"{"generation":4,"phase":"staged","root":{"kind":"external","root":"/r","nonce":"00112233445566778899aabbccddeeff","generation":3},"members":["debug"],"link":"/c/target","stage":"relative","backup":"/b","prior_receipt_sha":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+            r#"{"generation":4,"phase":"staged","root":{"kind":"external","root":"/r","nonce":"00112233445566778899aabbccddeeff","generation":3},"members":["debug"],"link":"/c/target","stage":"/s","backup":"/b","prior_receipt_sha":"not-a-digest"}"#,
+            r#"{"generation":4,"phase":"staged","root":{"kind":"external","root":"/r","generation":3},"members":["debug"],"link":"/c/target","stage":"/s","backup":"/b","prior_receipt_sha":"0000000000000000000000000000000000000000000000000000000000000000","pinned":"/r"}"#,
+        ];
+        for (index, journal) in malformed.iter().enumerate() {
+            let document = format!(
+                r#"{{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"c1","generation":3,"state":"committed","layout":"whole_target","links":[{{"member":"target"}}],"transition":{journal},"updated_ms":9}}"#
+            );
+            assert!(
+                parse_receipt(document.as_bytes(), "c1").is_err(),
+                "malformed journal {index} was accepted: {document}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_receipt_holds_the_placements_its_layout_names() {
+        // Whole target: exactly one `target` placement (a version-2 receipt).
+        for placements in ["[]", r#"[{"member":"debug"}]"#] {
+            let document = format!(
+                r#"{{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","links":{placements},"roots":[],"updated_ms":9}}"#
+            );
+            assert!(
+                parse_receipt(document.as_bytes(), "c1").is_err(),
+                "a whole-target receipt without its `target` placement was accepted"
+            );
+        }
+        // Profile: at least one placement, unique and sorted by member.
+        for placements in [
+            "[]",
+            r#"[{"member":"release"},{"member":"debug"}]"#,
+            r#"[{"member":"debug"},{"member":"debug"}]"#,
+        ] {
+            let document = format!(
+                r#"{{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","layout":"profile","links":{placements},"roots":[],"updated_ms":9}}"#
+            );
+            assert!(
+                parse_receipt(document.as_bytes(), "c1").is_err(),
+                "a profile receipt with an unusable placement set was accepted"
+            );
+        }
+        // The sorted, unique profile set reads.
+        let good = br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","layout":"profile","links":[{"member":"debug"},{"member":"release"}],"roots":[],"updated_ms":9}"#;
+        assert!(parse_receipt(good, "c1").is_ok());
     }
 }

@@ -1094,8 +1094,16 @@ reason. A receipt is read at its own version's shape: each of
 shape that version writes, `state` must be one of Oxide's five states, and a
 document that carries another version's shape or omits a required field
 (`state`, `updated_ms`, a placement's `member`, a selection's `kind` and
-`generation`, a version-3 `layout`, a whole-target version-3 migration journal) is
-divergent. Ownership must agree as well: a receipt or registry row that carries
+`generation`, a version-3 `layout`) is divergent. The placements must be the ones
+the layout holds — one `target` placement for a whole target, at least one
+unique, sorted member placement for a profile — and the migration journal of a
+version-3 whole-target receipt is read strictly: its phase must be one Oxide
+writes, its generation must be the one that phase can carry, its member set must
+be non-empty, sorted and unique, its link must be the checkout's own `target`,
+its paths absolute and its `prior_receipt_sha` a SHA-256, and its root must carry
+the 128-bit nonce; the root the journal names is the one the checkout keeps while
+the move is in progress, so it is a current reference. An arbitrary non-null
+journal fails these checks and is divergent, never an empty complete receipt. Ownership must agree as well: a receipt or registry row that carries
 the marker's checkout id but names a different checkout path contradicts the
 marker, so which checkout owns the root is unknown and the root is kept. A root that carries only an Oxide marker and no still-selecting record is
 **not** releasable on the marker's own word: the marker is ownership, not a
