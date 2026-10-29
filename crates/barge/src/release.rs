@@ -785,7 +785,7 @@ fn decide_root(
         area::MarkerState::Owned(marker) => Some(marker.root_id.clone()),
         area::MarkerState::Absent | area::MarkerState::Unknown { .. } => None,
     };
-    let owned_root_id = marker_root_id.clone().filter(|_| root.symlink == false);
+    let owned_root_id = marker_root_id.clone().filter(|_| !root.symlink);
     // The row names the root by its marker's id when the marker says one, and by
     // the directory's name otherwise; a name that is not a root id has no holds
     // and no identity record to read.
