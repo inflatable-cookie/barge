@@ -953,7 +953,14 @@ class Proof:
         # case's subject. Such a skip is recorded and retried with a fresh preview
         # and plan, a bounded number of times (Tom db9ecb0d). A unit that is gone
         # with nothing pending is a product failure at once.
-        environmental = ("custody is not proven", "a live or undecidable hold")
+        # Only the census being undecidable is environmental. Every other custody
+        # refusal (a real holder, moved identity or marker, an unverified volume,
+        # a pending intent) is a product outcome and fails at once.
+        environmental = (
+            "custody is not proven: the open-descriptor scan is unreadable",
+            "custody is not proven: the open-descriptor scan reached its",
+            "a live or undecidable hold",
+        )
         skips = []
         for attempt in range(1, CASE6_ATTEMPTS + 1):
             plan_file = self.plan_path(f"case6-{attempt}")
@@ -990,6 +997,10 @@ class Proof:
                 raise Fault("barge", f"maintain exited {code}, expected 3 or a recorded skip: {record}")
             if not record["root_present"]:
                 raise Fault("barge", f"the unit is gone with nothing pending: {record}")
+            # A kept unit leaves no trace: nothing pending and no quarantine leaf.
+            record["prune_leaves"] = self.quarantine_leaves(self.area_folder())
+            if (record["pending"] or {}).get("count", 0) != 0 or record["prune_leaves"]:
+                raise Fault("barge", f"exit 0 left a pending intent or a prune leaf: {record}")
             reasons = [row.get("reason", "") for row in skipped]
             if not reasons or not all(r.startswith(environmental) for r in reasons):
                 raise Fault("barge", f"maintain kept the unit for a non-environmental reason: {record}")

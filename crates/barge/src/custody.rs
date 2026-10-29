@@ -3775,6 +3775,57 @@ mod tests {
     }
 
     #[test]
+    fn a_dead_handle_reread_closed_is_gone_when_relisting_omits_it() {
+        // Dead on the first observation, closed on the dead handle's re-read: it
+        // settles by the bounded re-listing, and a listing without it is closed.
+        let holder = real_holder("custody-008-dead-closed-gone");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let identity = child.identity();
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                relist_errno: Some(0),
+                vnode_reads: vec![
+                    (0, StatedVnodeRead::dead_once()),
+                    (
+                        0,
+                        StatedVnodeRead::new(StatedCall::Closed, StatedCall::Closed),
+                    ),
+                ],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+    }
+
+    #[test]
+    fn a_dead_handle_reread_closed_and_still_listed_refuses() {
+        let holder = real_holder("custody-008-dead-closed-listed");
+        let payload = holder.payload();
+        let child = Child::holding(&payload);
+        let identity = child.identity();
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                vnode_reads: vec![
+                    (0, StatedVnodeRead::dead_once()),
+                    (
+                        0,
+                        StatedVnodeRead::new(StatedCall::Closed, StatedCall::Closed),
+                    ),
+                ],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+    }
+
+    #[test]
     fn a_closed_pair_relisted_and_reused_is_placed() {
         let holder = real_holder("custody-008-pair-closed-reused");
         let payload = holder.payload();

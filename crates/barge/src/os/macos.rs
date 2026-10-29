@@ -1297,6 +1297,7 @@ impl MacOs {
         from: SettleFrom,
     ) -> Observed {
         let pid = classified.pid;
+        let after_dead = matches!(from, SettleFrom::ClosedAfterDead);
         let mut last = from;
         for _ in 1..PAIR_RETRY_ATTEMPTS {
             if started.elapsed().saturating_add(PAIR_RETRY_BACKOFF) >= timeout {
@@ -1391,6 +1392,13 @@ impl MacOs {
                 // Still listed, yet read closed again: it closed between the
                 // re-listing and the read. Another bounded attempt settles it.
                 DescriptorReading::Closed => last = SettleFrom::Closed,
+                // Reached from a dead handle's re-read: a third dead reading is
+                // never settled again here, so the two settlements cannot cycle.
+                DescriptorReading::Dead if after_dead => {
+                    return Observed::Unreadable(
+                        closed_descriptor(pid, descriptor).message().to_owned(),
+                    )
+                }
                 DescriptorReading::Dead => {
                     return self.settle_dead_handle(
                         classified,
@@ -1414,7 +1422,7 @@ impl MacOs {
             }
         }
         match last {
-            SettleFrom::Closed => {
+            SettleFrom::Closed | SettleFrom::ClosedAfterDead => {
                 Observed::Unreadable(closed_descriptor(pid, descriptor).message().to_owned())
             }
             SettleFrom::Disagreed { path, facts } => {
@@ -1614,7 +1622,7 @@ impl MacOs {
                     timeout,
                     backoffs,
                     faults,
-                    SettleFrom::Closed,
+                    SettleFrom::ClosedAfterDead,
                 )
             }
             // Still dead for the classified identity, which was just re-read: it
@@ -2762,8 +2770,11 @@ fn read_descriptor(
 
 /// What started a bounded pair settlement: a first read that found the
 /// descriptor closed, or one whose path and vnode facts disagreed.
+/// `ClosedAfterDead` is a dead handle's re-read that found it closed; it never
+/// hands a later dead reading back to the dead-handle settlement.
 enum SettleFrom {
     Closed,
+    ClosedAfterDead,
     Disagreed { path: String, facts: String },
 }
 
