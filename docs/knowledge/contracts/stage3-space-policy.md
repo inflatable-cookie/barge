@@ -1449,19 +1449,28 @@ T6, and no native proof exists or is claimed.
     `detail.restored: false` — but its publish *was* confirmed, so the visible
     record is a real release and the hold is what keeps the root while its holder
     is live;
-  - the bounded residual no step in the frozen format can close: a state volume
-    that refuses **every** write, so the unconfirmed record can be neither
-    restored, removed nor invalidated. That is reported as `unknown_state` with
+  - the residual no step in the frozen format can close: a state volume that
+    refuses **every** write, so the unconfirmed record can be neither restored,
+    removed nor invalidated. That is reported as `unknown_state` with
     `detail.restored: false`, `detail.removed: false` and `detail.invalidated:
     false`, and the message says the store that refuses every write cannot be
-    marked and that the hold is the only thing keeping the root. It is a broken
-    state store reported as a limit, like the custody limits, and only an operator
-    settles it (repair the state volume, then re-release or run the baseline).
+    marked. This is a genuine gap and **not** a claimed safety property: the
+    unconfirmed record can stay readable, and once its leftover hold is stale the
+    matrix has nothing left to gate on and reads it as a release. The frozen record
+    has no way to say "this fact's publication was not confirmed", so this contract
+    records it as an open question for the design delegate ([Q-012](../questions.md),
+    "How is an unconfirmed activity record marked as unknown when the state volume
+    refuses every write?") instead of implying a protection the code does not have.
+    The `a_state_volume_that_refuses_every_write_cannot_be_marked` regression pins
+    today's outcome so the delegate's answer is a visible change.
 
   A release therefore never reports that it changed nothing when it changed
-  something, and never leaves an unconfirmed record readable as a release: it is
-  restored, else removed, else invalidated, and only a store that refuses every
-  write leaves it in place — reported, never assumed durable.
+  something, and never leaves an unconfirmed record readable as a release while any
+  of the three recovery steps can still run: it is restored, else removed, else
+  invalidated in place. `barge area idle-baseline` publishes its own fact through
+  the same recovery, so a baseline whose publication fails after its rename cannot
+  leave a readable idle fact either. Only a store that refuses every write leaves an
+  unconfirmed record, and that is reported, never assumed durable.
 - **What an interruption means, and why it is not unknown.** A release interrupted
   between its fact and its hold removal leaves the published fact plus a hold file,
   and that pair means exactly this (`c9d30b41`): while the holder is **positively
@@ -1504,8 +1513,10 @@ T6, and no native proof exists or is claimed.
   the verified marker, bumps the generation, and refuses a record whose volume
   disagrees with the root rather than resolving the disagreement. It creates no
   state layout until the root is located and verified, so a refusal for a root
-  Barge cannot find leaves nothing behind. Its document is
-  `barge.area.idle-baseline/1`.
+  Barge cannot find leaves nothing behind. Its own fact is published through the
+  same fail-closed recovery as a release, so a baseline whose publication fails
+  after its rename is restored, removed or invalidated rather than left readable.
+  Its document is `barge.area.idle-baseline/1`.
 - **The idleness matrix** is `area::assess_idleness`, over the marker, the
   activity record, the holds and the area's `reserve` participation, with the
   first blocking input reported as the reason: `marker_unverified`,
