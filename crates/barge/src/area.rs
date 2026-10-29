@@ -2951,6 +2951,7 @@ pub fn release(
         &state::publish_atomic,
         &state::publish_atomic,
         &remove_state_file,
+        &invalidate_state_file,
     )
 }
 
@@ -2963,6 +2964,31 @@ fn remove_state_file(path: &Path) -> Result<()> {
         )
         .with_detail("path", path.display().to_string().into())
     })
+}
+
+/// Make one account-state record invalid in place, so it can never be read as an
+/// authoritative fact.
+///
+/// This is the last recovery step for a record whose publication was not confirmed
+/// durable. It truncates the record rather than renaming or unlinking it, so it
+/// needs only the file's own write permission and not the directory's: it is
+/// available exactly where a restore and a removal are not. A truncated record is
+/// an invalid record, which the design already defines as `activity_unknown` and
+/// never idle (O-013), and a crash part-way through leaves an invalid record too,
+/// never a valid one.
+fn invalidate_state_file(path: &Path) -> Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map(|_| ())
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("cannot invalidate {}: {error}", path.display()),
+            )
+            .with_detail("path", path.display().to_string().into())
+        })
 }
 
 /// [`release`] with its two record writes as seams — the fact's publish and the
@@ -2978,6 +3004,7 @@ pub(crate) fn release_with(
     write: &dyn Fn(&Path, &[u8]) -> Result<()>,
     restore: &dyn Fn(&Path, &[u8]) -> Result<()>,
     remove: &dyn Fn(&Path) -> Result<()>,
+    invalidate: &dyn Fn(&Path) -> Result<()>,
 ) -> Result<Release> {
     state::validate_identifier("root_id", root_id)?;
     validate_name("holder", holder)?;
@@ -3100,19 +3127,41 @@ pub(crate) fn release_with(
                         .with_detail("removed", true.into())
                         .with_detail("cause", error.to_string().into())
                         .with_detail("restore_error", restore_error.to_string().into()),
-                        Err(remove_error) => Error::new(
-                            ErrorKind::UnknownState,
-                            format!(
-                                "the activity record for root `{root_id}` was advanced but its publish was not confirmed durable ({error}); the previous record could not be restored ({restore_error}) and the unconfirmed record could not be removed ({remove_error}). The visible record must not be relied on: the hold keeps the root while its holder is live, and only an operator settles it (repair the state volume, then re-release or run `barge area idle-baseline`)"
-                            ),
-                        )
-                        .with_detail("hold_path", hold_path.into())
-                        .with_detail("activity_path", record_path.into())
-                        .with_detail("restored", false.into())
-                        .with_detail("removed", false.into())
-                        .with_detail("cause", error.to_string().into())
-                        .with_detail("restore_error", restore_error.to_string().into())
-                        .with_detail("remove_error", remove_error.to_string().into()),
+                        // The record cannot be put back or taken away, so it is
+                        // made invalid in place: an invalid record is
+                        // `activity_unknown` under O-013, which is never idle, and
+                        // truncation needs only the file's own write permission.
+                        Err(remove_error) => match invalidate(&activity_path) {
+                            Ok(()) => Error::new(
+                                ErrorKind::UnknownState,
+                                format!(
+                                    "the activity record for root `{root_id}` was advanced but its publish was not confirmed durable ({error}); the previous record could not be restored ({restore_error}) and the unconfirmed record could not be removed ({remove_error}), so it was invalidated in place: the root reads as activity unknown and is never idle until `barge area idle-baseline` records it. The hold is still there"
+                                ),
+                            )
+                            .with_detail("hold_path", hold_path.into())
+                            .with_detail("activity_path", record_path.into())
+                            .with_detail("restored", false.into())
+                            .with_detail("removed", false.into())
+                            .with_detail("invalidated", true.into())
+                            .with_detail("cause", error.to_string().into())
+                            .with_detail("restore_error", restore_error.to_string().into())
+                            .with_detail("remove_error", remove_error.to_string().into()),
+                            Err(invalidate_error) => Error::new(
+                                ErrorKind::UnknownState,
+                                format!(
+                                    "the activity record for root `{root_id}` was advanced but its publish was not confirmed durable ({error}); the previous record could not be restored ({restore_error}), the unconfirmed record could not be removed ({remove_error}) and it could not be invalidated ({invalidate_error}). A state volume that refuses every write cannot be marked, so the hold is the only thing keeping the root, and only an operator settles it: repair the state volume, then re-release or run `barge area idle-baseline`"
+                                ),
+                            )
+                            .with_detail("hold_path", hold_path.into())
+                            .with_detail("activity_path", record_path.into())
+                            .with_detail("restored", false.into())
+                            .with_detail("removed", false.into())
+                            .with_detail("invalidated", false.into())
+                            .with_detail("cause", error.to_string().into())
+                            .with_detail("restore_error", restore_error.to_string().into())
+                            .with_detail("remove_error", remove_error.to_string().into())
+                            .with_detail("invalidate_error", invalidate_error.to_string().into()),
+                        },
                     }
                 }
             });
@@ -7034,6 +7083,7 @@ mod tests {
             &after_rename,
             &crate::state::publish_atomic,
             &super::remove_state_file,
+            &super::invalidate_state_file,
         )
         .expect_err("the publish fails after its rename");
         assert_eq!(error.kind(), ErrorKind::Io);
@@ -7118,6 +7168,7 @@ mod tests {
             &after_rename,
             &restore_fails,
             &super::remove_state_file,
+            &super::invalidate_state_file,
         )
         .expect_err("both the publish and its rollback fail");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
@@ -7205,12 +7256,13 @@ mod tests {
     }
 
     #[test]
-    fn a_double_rollback_failure_names_the_unconfirmed_record() {
-        // The irreducible residual: the publish landed unconfirmed, the previous
-        // record cannot be restored, and the record cannot be removed either. The
-        // report says the visible record must not be relied on, and a live holder
-        // keeps the root; nothing here claims the record is a release.
+    fn a_double_rollback_failure_invalidates_the_unconfirmed_record() {
+        // The publish landed unconfirmed, the previous record cannot be restored
+        // and the record cannot be removed. It is invalidated in place: an
+        // invalid record is activity unknown under O-013, so it can never decide
+        // idleness or order a root, whether the leftover holder is live or gone.
         let fixture = Fixture::new("release-double-rollback");
+        fixture.register(&fixture.record);
         let declaration = fixture.declaration("example/pool");
         let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
         let observer = fixture.observer();
@@ -7251,25 +7303,144 @@ mod tests {
             &after_rename,
             &always_fails,
             &cannot_remove,
+            &super::invalidate_state_file,
         )
-        .expect_err("the publish and both rollbacks fail");
+        .expect_err("the publish, its rollback and the removal fail");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
         assert_eq!(error.detail()["restored"], false);
         assert_eq!(error.detail()["removed"], false);
-        assert!(error.message().contains("must not be relied on"));
-        assert!(path.is_file(), "the unconfirmed record is still visible");
-        assert_blocked(
-            fixture.list(&resolved).roots[0].space_idle,
-            IdleReason::HoldLive,
+        assert_eq!(error.detail()["invalidated"], true);
+        assert!(error.message().contains("invalidated in place"));
+        assert!(path.is_file(), "the record is still there, but invalid");
+        assert_eq!(
+            read_activity(&fixture.state, &observer, &root.root_id)
+                .expect("the record reads")
+                .state,
+            ActivityStateName::Unverified,
+            "the unconfirmed record is made unreadable, never a release"
         );
 
-        // The caller-visible state is still recoverable: the next release with the
-        // real seams settles it once the state volume works again.
-        release(&fixture.state, &observer, &root.root_id, "prover")
-            .expect("the retry completes the release");
+        // A live holder keeps the root, and a stale one does not make the
+        // invalidated record idle either.
+        let listed = fixture.list(&resolved);
+        assert_eq!(
+            listed.roots[0].activity.state,
+            ActivityStateName::Unverified
+        );
+        assert_blocked(listed.roots[0].space_idle, IdleReason::HoldLive);
+        let hold_path = fixture
+            .state
+            .holds_dir()
+            .join(&root.root_id)
+            .join("prover.json");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&hold_path).expect("the hold reads"))
+                .expect("the hold parses");
+        document["boot_identity"] = "1600000000.0".into();
+        std::fs::write(
+            &hold_path,
+            serde_json::to_vec_pretty(&document).expect("the hold encodes"),
+        )
+        .expect("the hold is written");
+        std::fs::set_permissions(&hold_path, std::fs::Permissions::from_mode(0o600))
+            .expect("the hold is private");
+        let stale = read_holds(&fixture.state, &observer, &root.root_id).expect("the holds read");
+        assert_eq!(stale.holds[0].1, HoldState::Stale);
+        let listed = fixture.list(&resolved);
+        assert_blocked(listed.roots[0].space_idle, IdleReason::ActivityUnknown);
+        assert_eq!(
+            listed.roots[0].activity.last_release_ms, None,
+            "the invalidated record offers no release time to the order"
+        );
+
+        // The repair chain: the leftover hold releases (recording nothing,
+        // because the record is invalid), then the explicit baseline records a
+        // fresh fact and the root becomes idle.
+        let released = release(&fixture.state, &observer, &root.root_id, "prover")
+            .expect("the stale hold is removable");
+        assert_eq!(released.activity.state, ActivityStateName::Unverified);
+        let platform = fixture.platform();
+        let facts = fixture.facts();
+        let mounts = fixture.mounts();
+        idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &IdleBaselineRequest {
+                root_id: root.root_id.clone(),
+                volume_uuid: None,
+                mount_relative_path: None,
+            },
+        )
+        .expect("the baseline repairs the record");
         assert_eq!(
             fixture.list(&resolved).roots[0].space_idle.state,
             IdleState::Idle
+        );
+    }
+
+    #[test]
+    fn a_state_volume_that_refuses_every_write_cannot_be_marked() {
+        // The residual no frozen-format step can close: the publish landed
+        // unconfirmed and the record can be neither restored, removed nor
+        // invalidated. The report says a store that refuses every write cannot be
+        // marked and that the hold is the only thing keeping the root; a live
+        // holder does keep it.
+        let fixture = Fixture::new("release-triple-rollback");
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        hold(
+            &fixture.state,
+            &observer,
+            &HoldRequest {
+                root_id: root.root_id.clone(),
+                holder: "prover".to_owned(),
+                pid: std::process::id(),
+                scope: HoldScope::Write,
+                purpose: "a fixture holder".to_owned(),
+            },
+        )
+        .expect("the hold is written");
+        let after_rename = |target: &Path, bytes: &[u8]| -> Result<()> {
+            crate::state::publish_atomic(target, bytes)?;
+            Err(Error::new(
+                ErrorKind::Io,
+                "injected: the activity directory sync failed after the rename",
+            ))
+        };
+        let always_fails = |_target: &Path, _bytes: &[u8]| -> Result<()> {
+            Err(Error::new(ErrorKind::Io, "injected: rollback fails"))
+        };
+        let always_fails_too = |_path: &Path| -> Result<()> {
+            Err(Error::new(
+                ErrorKind::Io,
+                "injected: the state volume refuses",
+            ))
+        };
+        let error = super::release_with(
+            &fixture.state,
+            &observer,
+            &root.root_id,
+            "prover",
+            &after_rename,
+            &always_fails,
+            &always_fails_too,
+            &always_fails_too,
+        )
+        .expect_err("nothing can be written");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert_eq!(error.detail()["restored"], false);
+        assert_eq!(error.detail()["removed"], false);
+        assert_eq!(error.detail()["invalidated"], false);
+        assert!(error
+            .message()
+            .contains("refuses every write cannot be marked"));
+        assert_blocked(
+            fixture.list(&resolved).roots[0].space_idle,
+            IdleReason::HoldLive,
         );
     }
 
@@ -7314,6 +7485,7 @@ mod tests {
                 ))
             },
             &super::remove_state_file,
+            &super::invalidate_state_file,
         )
         .expect_err("the restore fails");
         std::fs::set_permissions(&hold_directory, std::fs::Permissions::from_mode(0o700))

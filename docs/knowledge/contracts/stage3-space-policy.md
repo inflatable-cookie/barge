@@ -1435,23 +1435,33 @@ T6, and no native proof exists or is claimed.
     `detail.removed: true`: an absent record is `activity_unknown`, which is never
     idle, so no root is ever made idle by a fact the platform did not confirm
     durable, and the explicit baseline is the repair;
+  - if that removal fails too, the unconfirmed record is **invalidated in place** —
+    truncated, so it can never be read as a release. Truncation needs only the
+    file's own write permission and not the directory's, so it is available
+    exactly where a restore and a removal are not, and a crash part-way through
+    leaves an invalid record too. The report is `unknown_state` with
+    `detail.restored: false`, `detail.removed: false` and
+    `detail.invalidated: true`, and an invalid record is `activity_unknown` under
+    O-013: it is never idle and offers no release time to the LRU order, so the
+    root cannot become a candidate until the baseline records a fresh fact;
   - a failed hold removal that can be undone reports `io` with
     `detail.restored: true`, and one that cannot is `unknown_state` with
     `detail.restored: false` — but its publish *was* confirmed, so the visible
     record is a real release and the hold is what keeps the root while its holder
     is live;
-  - the residual this format cannot mark: the publish landed unconfirmed, the
-    previous record cannot be restored **and** the unconfirmed record cannot be
-    removed. That is reported as `unknown_state` with `detail.restored: false` and
-    `detail.removed: false`, and the message says the visible record must not be
-    relied on; the hold keeps the root while its holder is live, and only an
-    operator settles it (repair the state volume, then re-release or run the
-    baseline). This is a state-volume failure reported as a limit, like the
-    custody limits, not a publication that is assumed durable.
+  - the bounded residual no step in the frozen format can close: a state volume
+    that refuses **every** write, so the unconfirmed record can be neither
+    restored, removed nor invalidated. That is reported as `unknown_state` with
+    `detail.restored: false`, `detail.removed: false` and `detail.invalidated:
+    false`, and the message says the store that refuses every write cannot be
+    marked and that the hold is the only thing keeping the root. It is a broken
+    state store reported as a limit, like the custody limits, and only an operator
+    settles it (repair the state volume, then re-release or run the baseline).
 
   A release therefore never reports that it changed nothing when it changed
-  something, never leaves an unconfirmed record in place as a release, and never
-  lets an unconfirmed publication decide idleness while it can still be removed.
+  something, and never leaves an unconfirmed record readable as a release: it is
+  restored, else removed, else invalidated, and only a store that refuses every
+  write leaves it in place — reported, never assumed durable.
 - **What an interruption means, and why it is not unknown.** A release interrupted
   between its fact and its hold removal leaves the published fact plus a hold file,
   and that pair means exactly this (`c9d30b41`): while the holder is **positively
