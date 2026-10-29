@@ -289,6 +289,13 @@ pub struct PrunePlanRow {
 }
 
 /// The `barge.prune.plan/1` body: one bounded canonical plan and nothing else.
+///
+/// The gate's first condition — the volume is verified, APFS, not boot and
+/// mounted once — is the plan's own precondition rather than a row field: a plan
+/// exists only for a volume that verified, and the command document's
+/// `volume.state` records that it did. An attached volume that fails to verify is
+/// a refused command, so no row can claim condition 1 on a volume it did not
+/// establish.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrunePlan {

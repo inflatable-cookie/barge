@@ -1045,8 +1045,13 @@ where `--plan-out` asks, and prints it inside `barge.prune/1` with its SHA-256.
 The verb refuses every form that is not the plan, because the effect it would
 imply needs F4's intent evidence, its replay and its separate authorization.
 
+Condition 1 is the plan's own precondition rather than a row field: a plan exists
+only for a volume that verified, the command document's `volume.state` records
+that it did, and an attached volume that fails to verify is a refused command
+rather than a plan whose rows all say "kept".
+
 What the rows carry. Each row is one root the area listing found, in listing
-order, and it carries all six conditions whether or not it is eligible:
+order, and it carries conditions 2 to 6 whether or not it is eligible:
 `root_id`, `mount_relative_path`, `identity` (the durable verdict, its reason
 code, both devices, the remount and mount-moved facts and the marker digest this
 plan read), `custody` with its reason, `idle` (`last_activity_ms`, the observed
