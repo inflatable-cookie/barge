@@ -66,6 +66,19 @@ pub const OXIDE_MARKER_V2: &str = "oxide.outputs.root/2";
 pub const OXIDE_MARKER_V1: &str = "oxide.outputs.root/1";
 /// One unfinished prune journal entry's format.
 pub const OXIDE_INTENT_V1: &str = "oxide.outputs.prune-intent/1";
+/// The two root kinds Oxide's own document accepts. A value outside this set is a
+/// document this build does not understand, never a root of an unknown kind.
+pub const OXIDE_ROOT_KINDS: [&str; 2] = ["external", "local"];
+
+/// Whether a root-kind value is one Oxide writes.
+fn check_root_kind(what: &str, kind: &str) -> std::result::Result<(), String> {
+    if OXIDE_ROOT_KINDS.contains(&kind) {
+        return Ok(());
+    }
+    Err(format!(
+        "{what} states root kind `{kind}`, which is not one Oxide writes"
+    ))
+}
 /// Oxide's whole-target receipt.
 pub const OXIDE_RECEIPT_V1: &str = "oxide.outputs.transition/1";
 /// Oxide's committed-receipt form.
@@ -1064,6 +1077,7 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
             })?),
             None => None,
         };
+        check_root_kind("a registry row", &row.root_kind)?;
         rows.push(OxideRow {
             checkout_id: row.checkout_id,
             checkout: row.checkout,
@@ -1109,6 +1123,7 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
                 intent.phase
             ));
         }
+        check_root_kind("a prune intent", &intent.identity.root_kind)?;
         if intent.id.is_empty() || !intent.quarantine.is_absolute() {
             return Err("a prune intent names no usable quarantine leaf".to_owned());
         }
@@ -1591,6 +1606,35 @@ fn parse_receipt(
     }
     if let Some(journal) = &raw.transition {
         validate_migration(journal, &raw.checkout, raw.generation)?;
+    }
+    // Every root a receipt names states its kind, and only Oxide's two kinds are
+    // understood. A selection, a history entry, a reservation or a journal root
+    // of an unknown kind is a divergence rather than a root of no kind.
+    for placement in &raw.links {
+        if let Some(selected) = &placement.selected {
+            check_root_kind("a receipt placement", &selected.kind)?;
+        }
+        if let Some(prepared) = &placement.prepared {
+            check_root_kind("a prepared placement", &prepared.to.kind)?;
+        }
+        if let Some(reserved) = &placement.reserved {
+            check_root_kind("a receipt reservation", &reserved.kind)?;
+        }
+    }
+    if let Some(selected) = &raw.selected {
+        check_root_kind("a receipt reference", &selected.kind)?;
+    }
+    if let Some(prepared) = &raw.prepared {
+        check_root_kind("a prepared reference", &prepared.to.kind)?;
+    }
+    for history in &raw.roots {
+        check_root_kind("a receipt history entry", &history.kind)?;
+    }
+    if let Some(reserved) = &raw.reserved {
+        check_root_kind("a receipt reservation", &reserved.kind)?;
+    }
+    if let Some(journal) = &raw.transition {
+        check_root_kind("a migration journal", &journal.root.kind)?;
     }
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut current: Vec<PathBuf> = Vec::new();
@@ -2151,6 +2195,190 @@ mod tests {
         assert!(
             parse_registry(&unknown).is_err(),
             "an unknown intent version was accepted as complete"
+        );
+    }
+
+    #[test]
+    fn an_unknown_root_kind_is_divergent_everywhere_it_can_appear() {
+        // Oxide's own document accepts exactly `external` and `local`. A kind
+        // outside that set is a document this build does not understand, and it
+        // must be refused wherever a root kind is stated: a registry row, its
+        // prune intent, a receipt selection, a history entry, a prepared
+        // placement, a reservation and a migration journal's root.
+        assert!(check_root_kind("a registry row", "external").is_ok());
+        assert!(check_root_kind("a registry row", "local").is_ok());
+        assert!(check_root_kind("a registry row", "future_kind").is_err());
+
+        let registry_row = |kind: &str| {
+            serde_json::json!({
+                "version": "oxide.outputs.registry/2",
+                "schema": 2,
+                "revision": 1,
+                "complete": true,
+                "created_by": "oxide",
+                "rows": [{
+                    "checkout_id": "c1",
+                    "checkout": "/c",
+                    "receipt": "/r",
+                    "member": "target",
+                    "root": "/o",
+                    "root_kind": kind,
+                    "recipe": "target-debug-v1",
+                    "generation": 1,
+                    "selected": false,
+                    "pending": false
+                }]
+            })
+        };
+        let known = serde_json::to_vec(&registry_row("external")).expect("encodes");
+        assert!(parse_registry(&known).is_ok());
+        let unknown = serde_json::to_vec(&registry_row("future_kind")).expect("encodes");
+        assert!(
+            parse_registry(&unknown).is_err(),
+            "a registry row of an unknown root kind was accepted"
+        );
+
+        let intent_registry = |kind: &str| {
+            serde_json::json!({
+                "version": "oxide.outputs.registry/2",
+                "schema": 2,
+                "revision": 1,
+                "complete": true,
+                "created_by": "oxide",
+                "rows": [],
+                "intents": [{
+                    "version": OXIDE_INTENT_V1,
+                    "id": "i1",
+                    "identity": {
+                        "checkout_id": "c1",
+                        "checkout": "/c",
+                        "receipt": "/r",
+                        "member": "target",
+                        "root": "/o",
+                        "root_kind": kind,
+                        "generation": 1,
+                        "dev": 7,
+                        "ino": 42,
+                        "marker_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    },
+                    "phase": "renamed",
+                    "quarantine": "/q",
+                    "preview_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "created_ms": 1,
+                    "updated_ms": 2
+                }]
+            })
+        };
+        let known = serde_json::to_vec(&intent_registry("local")).expect("encodes");
+        assert!(parse_registry(&known).is_ok());
+        let unknown = serde_json::to_vec(&intent_registry("future_kind")).expect("encodes");
+        assert!(
+            parse_registry(&unknown).is_err(),
+            "a prune intent of an unknown root kind was accepted"
+        );
+
+        // Every receipt site, one at a time.
+        let receipt = |what: &str, kind: &str| {
+            let selected = serde_json::json!({
+                "kind": kind,
+                "root": "/r",
+                "nonce": "00112233445566778899aabbccddeeff",
+                "generation": 1
+            });
+            let mut document = serde_json::json!({
+                "version": "oxide.outputs.transition/2",
+                "checkout": "/c",
+                "checkout_id": "c1",
+                "generation": 2,
+                "state": "committed",
+                "links": [{"member": "target", "selected": selected}],
+                "roots": [],
+                "updated_ms": 9
+            });
+            match what {
+                "history" => {
+                    document["links"] = serde_json::json!([{"member": "target"}]);
+                    document["roots"] = serde_json::json!([{
+                        "kind": kind,
+                        "root": "/old",
+                        "generation": 1
+                    }]);
+                }
+                "prepared" => {
+                    document["links"] = serde_json::json!([{
+                        "member": "target",
+                        "prepared": {
+                            "generation": 3,
+                            "to": {"kind": kind, "root": "/new", "generation": 3},
+                            "link": "/c/target"
+                        }
+                    }]);
+                }
+                "reservation" => {
+                    document["links"] = serde_json::json!([{"member": "target"}]);
+                    document["reserved"] = serde_json::json!({
+                        "id": "r1",
+                        "nonce": "00112233445566778899aabbccddeeff",
+                        "kind": kind,
+                        "root": "/future",
+                        "generation": 3,
+                        "created_ms": 1
+                    });
+                }
+                _ => {}
+            }
+            serde_json::to_vec(&document).expect("encodes")
+        };
+        for what in ["selection", "history", "prepared", "reservation"] {
+            let known = receipt(what, "external");
+            assert!(
+                parse_receipt(&known, "c1").is_ok(),
+                "a valid `{what}` did not read"
+            );
+            let unknown = receipt(what, "future_kind");
+            assert!(
+                parse_receipt(&unknown, "c1").is_err(),
+                "a receipt `{what}` of an unknown root kind was accepted"
+            );
+        }
+
+        // A migration journal's own root.
+        let journal = |kind: &str| {
+            serde_json::json!({
+                "version": "oxide.outputs.transition/3",
+                "checkout": "/c",
+                "checkout_id": "c1",
+                "generation": 3,
+                "state": "committed",
+                "layout": "whole_target",
+                "links": [{"member": "target"}],
+                "transition": {
+                    "generation": 4,
+                    "phase": "staged",
+                    "root": {"kind": kind, "root": "/r", "nonce": "00112233445566778899aabbccddeeff", "generation": 3},
+                    "members": ["debug"],
+                    "link": "/c/target",
+                    "link_text": "/r",
+                    "link_dev": 1,
+                    "link_ino": 2,
+                    "parent_dev": 1,
+                    "parent_ino": 2,
+                    "stage": "/s",
+                    "backup": "/b",
+                    "prior_receipt_sha": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "registry_revision": 3,
+                    "created_ms": 1,
+                    "updated_ms": 2
+                },
+                "updated_ms": 9
+            })
+        };
+        let known = serde_json::to_vec(&journal("external")).expect("encodes");
+        assert!(parse_receipt(&known, "c1").is_ok());
+        let unknown = serde_json::to_vec(&journal("future_kind")).expect("encodes");
+        assert!(
+            parse_receipt(&unknown, "c1").is_err(),
+            "a migration journal root of an unknown kind was accepted"
         );
     }
 

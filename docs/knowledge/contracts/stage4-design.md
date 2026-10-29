@@ -1088,13 +1088,17 @@ incomplete set keeps every root it covers — the batch, not one row. The regist
 `revision`, `complete` flag and `created_by` are required, an incomplete registry
 must carry Oxide's own `incomplete` record (and a complete one must not), each
 registry row must state Oxide's selection flags (`selected`, `pending`) and its
-required identity fields, and each unfinished prune intent must carry the root
-identity Oxide pins and one of Oxide's six phases. A document that omits any of
-these is a schema divergence — never a settled row, an empty registry or "no
-references" — and a root marker that omits a field Oxide always writes is
-unreadable for the same reason. A receipt is read at its own version's shape:
-each of `oxide.outputs.transition/1`, `/2` and `/3` must carry exactly the fields
-and the shape that version writes, `state` must be one of Oxide's five states, and a
+required identity fields, and every root kind any of these records states — a
+registry row's, a prune intent's, a receipt selection's, a history entry's, a
+prepared placement's, a reservation's or a migration journal root's — must be one
+of the two Oxide writes (`external` or `local`). Each unfinished prune intent must
+also carry the root identity Oxide pins and one of Oxide's six phases. A document
+that omits any of these, or states a root kind this build does not know, is a
+schema divergence — never a settled row, an empty registry or "no references" —
+and a root marker that omits a field Oxide always writes is unreadable for the
+same reason. A receipt is read at its own version's shape: each of
+`oxide.outputs.transition/1`, `/2` and `/3` must carry exactly the fields and the
+shape that version writes, `state` must be one of Oxide's five states, and a
 document that carries another version's shape or omits a required field
 (`state`, `updated_ms`, a placement's `member`, a selection's `kind` and
 `generation`, a version-3 `layout`) is divergent. The placements must be the ones

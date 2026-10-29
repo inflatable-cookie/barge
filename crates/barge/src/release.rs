@@ -2266,6 +2266,34 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_root_kind_keeps_the_whole_covered_batch() {
+        // A registry row whose root kind Oxide never writes is a divergence, so the
+        // shared snapshot is incomplete and no other root of the plan is eligible.
+        let fixture = Fixture::new("release-unknown-kind-batch");
+        let first = fixture.root();
+        let second = fixture.root();
+        let registry_row = format!(
+            r#"{{"checkout_id":"checkout-1","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"future_kind","recipe":"target-debug-v1","generation":1,"selected":false,"pending":false}}"#,
+            fixture.account.home.join("checkout").display(),
+            fixture.account.home.join("receipt.json").display(),
+            first.path.display(),
+        );
+        oxide_registry(&fixture, &registry_row, true);
+
+        let report = fixture.plan();
+        for root in [&first, &second] {
+            let kept = row(&report, root);
+            assert!(!kept.eligible, "{kept:?}");
+            assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+            assert!(!kept.references_complete, "the batch is kept, not one root");
+        }
+        assert_eq!(report.plan.eligible_count, 0);
+        assert_eq!(report.plan.examined_count, 2);
+        assert!(!report.oxide.complete);
+        assert!(report.needs_human());
+    }
+
+    #[test]
     fn a_registry_without_its_required_facts_keeps_the_root() {
         // A registry that omits a field Oxide always writes (its revision here, its
         // creator in the next case) is a divergence, not an empty registry: reading
