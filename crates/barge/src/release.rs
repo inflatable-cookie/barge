@@ -1314,7 +1314,7 @@ pub fn read_prune_plan(bytes: &[u8]) -> Result<PrunePlan> {
 mod tests {
     use std::fs::File;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
     use super::*;
@@ -1805,7 +1805,7 @@ mod tests {
     }
 
     /// Create one lock file by taking it exclusively and releasing it.
-    fn touch_lock(path: &PathBuf, rank: state::LockRank) {
+    fn touch_lock(path: &Path, rank: state::LockRank) {
         drop(
             state::StateLock::exclusive(path, rank, Deadline::after(Duration::from_secs(5)))
                 .expect("the fixture lock file is created"),
