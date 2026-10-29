@@ -889,39 +889,68 @@ struct RawIntent {
     id: String,
     identity: RawIntentIdentity,
     phase: String,
-    #[serde(default)]
+    // Oxide pins all of these on every journal entry: the quarantine leaf it
+    // moved the root to, the plan digest that authorized the move and both times.
+    // A journal that omits one is a document this build does not understand, and
+    // defaulting it would read an unfinished move as a settled one.
     #[allow(dead_code)]
-    quarantine: Option<PathBuf>,
-    #[serde(default)]
+    quarantine: PathBuf,
     #[allow(dead_code)]
-    preview_sha256: Option<String>,
-    #[serde(default)]
+    preview_sha256: String,
     #[allow(dead_code)]
-    created_ms: Option<u64>,
-    #[serde(default)]
+    created_ms: u64,
     #[allow(dead_code)]
-    updated_ms: Option<u64>,
+    updated_ms: u64,
     #[serde(default)]
     #[allow(dead_code)]
     resolved_ms: Option<u64>,
     #[serde(default)]
     #[allow(dead_code)]
     receipt_settled: bool,
+    #[serde(default = "selected_by_default")]
+    #[allow(dead_code)]
+    was_selected: bool,
     #[serde(default)]
     #[allow(dead_code)]
-    was_selected: Option<bool>,
+    prior_receipt_sha: String,
     #[serde(default)]
     #[allow(dead_code)]
-    prior_receipt_sha: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    group: Vec<serde_json::Value>,
+    group: Vec<RawGroupRow>,
     #[serde(default)]
     #[allow(dead_code)]
     expected_terminal_sha: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
     terminal_ms: Option<u64>,
+}
+
+/// One reference of an intent's (checkout, root) group.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGroupRow {
+    #[allow(dead_code)]
+    member: String,
+    #[allow(dead_code)]
+    generation: u64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    nonce: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    root_dev: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    root_ino: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    marker_digest: Option<String>,
+    #[allow(dead_code)]
+    selected: bool,
+}
+
+/// An intent's representative row is selected unless it says otherwise.
+const fn selected_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -1069,6 +1098,30 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
                 "a prune intent states phase `{}`, which Oxide never writes",
                 intent.phase
             ));
+        }
+        if intent.id.is_empty() || !intent.quarantine.is_absolute() {
+            return Err("a prune intent names no usable quarantine leaf".to_owned());
+        }
+        if intent.preview_sha256.len() != 64
+            || !intent
+                .preview_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("a prune intent pins no 64-hex plan digest".to_owned());
+        }
+        if intent.identity.dev == 0
+            || intent.identity.ino == 0
+            || intent.identity.generation == 0
+            || !intent.identity.root.is_absolute()
+            || intent.identity.marker_digest.len() != 64
+            || !intent
+                .identity
+                .marker_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("a prune intent names an unusable root identity for the move".to_owned());
         }
         intents.push(OxideIntent {
             root: intent.identity.root,
@@ -1255,21 +1308,20 @@ struct RawMigration {
     root: RawSelected,
     members: Vec<String>,
     link: PathBuf,
-    #[serde(default)]
+    // The eight fields below are pinned by every journal Oxide writes: the old
+    // link's exact text and identity, the parent's identity, the registry revision
+    // the journal was published at and both times. A journal that omits one is
+    // divergent, never a journal with defaulted facts.
     #[allow(dead_code)]
-    link_text: Option<PathBuf>,
-    #[serde(default)]
+    link_text: PathBuf,
     #[allow(dead_code)]
-    link_dev: Option<u64>,
-    #[serde(default)]
+    link_dev: u64,
     #[allow(dead_code)]
-    link_ino: Option<u64>,
-    #[serde(default)]
+    link_ino: u64,
     #[allow(dead_code)]
-    parent_dev: Option<u64>,
-    #[serde(default)]
+    parent_dev: u64,
     #[allow(dead_code)]
-    parent_ino: Option<u64>,
+    parent_ino: u64,
     stage: PathBuf,
     backup: PathBuf,
     #[serde(default)]
@@ -1279,21 +1331,28 @@ struct RawMigration {
     #[allow(dead_code)]
     stage_ino: Option<u64>,
     #[serde(default)]
-    #[allow(dead_code)]
-    marker_pin: Option<serde_json::Value>,
+    marker_pin: Option<RawMarkerPin>,
     #[serde(default)]
     #[allow(dead_code)]
     marker_backup: Option<PathBuf>,
     prior_receipt_sha: String,
-    #[serde(default)]
     #[allow(dead_code)]
     registry_revision: u64,
-    #[serde(default)]
     #[allow(dead_code)]
     created_ms: u64,
-    #[serde(default)]
     #[allow(dead_code)]
     updated_ms: u64,
+}
+
+/// An old root marker's exact identity, so a rollback restores those bytes.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMarkerPin {
+    #[allow(dead_code)]
+    dev: u64,
+    #[allow(dead_code)]
+    ino: u64,
+    sha256: String,
 }
 
 /// Whether a migration journal is exactly the shape Oxide publishes for this
@@ -1338,12 +1397,28 @@ fn validate_migration(
     if journal.members.is_empty() || sorted != journal.members {
         return Err("a migration journal's member set is empty, unsorted or not unique".to_owned());
     }
-    for path in [&journal.stage, &journal.backup] {
+    for path in [&journal.stage, &journal.backup, &journal.link_text] {
         if !path.is_absolute() {
             return Err(format!(
                 "a migration journal names a relative path {}",
                 path.display()
             ));
+        }
+    }
+    if journal.link_dev == 0
+        || journal.link_ino == 0
+        || journal.parent_dev == 0
+        || journal.parent_ino == 0
+    {
+        return Err("a migration journal names no usable link or parent identity".to_owned());
+    }
+    if let Some(pin) = &journal.marker_pin {
+        if pin.dev == 0
+            || pin.ino == 0
+            || pin.sha256.len() != 64
+            || !pin.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("a migration journal pins no usable old marker".to_owned());
         }
     }
     if journal.prior_receipt_sha.len() != 64
@@ -1701,7 +1776,7 @@ mod tests {
 
     #[test]
     fn an_unfinished_intent_names_its_root() {
-        let bytes = br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":2,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"i1","identity":{"checkout_id":"c1","checkout":"/Users/fixture/Dev/example","receipt":"/pool/outputs/c1.json","member":"target","root":"/Volumes/Builds/oxide/outputs/root","root_kind":"external","generation":1,"dev":7,"ino":42,"marker_digest":"aa"},"phase":"renamed","quarantine":"/pool/outputs/.prune-i1","preview_sha256":"00","created_ms":1,"updated_ms":2}]}"#;
+        let bytes = br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":2,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"i1","identity":{"checkout_id":"c1","checkout":"/Users/fixture/Dev/example","receipt":"/pool/outputs/c1.json","member":"target","root":"/Volumes/Builds/oxide/outputs/root","root_kind":"external","generation":1,"dev":7,"ino":42,"marker_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"phase":"renamed","quarantine":"/pool/outputs/.prune-i1","preview_sha256":"0000000000000000000000000000000000000000000000000000000000000000","created_ms":1,"updated_ms":2}]}"#;
         let OxideRegistry::Read { intents, .. } =
             parse_registry(bytes).expect("the registry reads")
         else {
@@ -1730,9 +1805,9 @@ mod tests {
             // Complete with an incomplete record.
             br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"incomplete":{"reason":"x","since_ms":1,"transaction":"t"},"created_by":"oxide","rows":[]}"#,
             // An intent phase Oxide never writes.
-            br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"i1","identity":{"checkout_id":"c1","checkout":"/c","receipt":"/r","member":"target","root":"/o","root_kind":"external","generation":1,"dev":7,"ino":42,"marker_digest":"aa"},"phase":"bogus","quarantine":"/q","preview_sha256":"00","created_ms":1,"updated_ms":2}]}"#,
+            br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"i1","identity":{"checkout_id":"c1","checkout":"/c","receipt":"/r","member":"target","root":"/o","root_kind":"external","generation":1,"dev":7,"ino":42,"marker_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"phase":"bogus","quarantine":"/q","preview_sha256":"0000000000000000000000000000000000000000000000000000000000000000","created_ms":1,"updated_ms":2}]}"#,
             // An intent without its root identity.
-            br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"i1","identity":{"root":"/o"},"phase":"renamed","quarantine":"/q","preview_sha256":"00","created_ms":1,"updated_ms":2}]}"#,
+            br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"i1","identity":{"root":"/o"},"phase":"renamed","quarantine":"/q","preview_sha256":"0000000000000000000000000000000000000000000000000000000000000000","created_ms":1,"updated_ms":2}]}"#,
         ];
         for (index, case) in divergent.iter().enumerate() {
             assert!(
@@ -1858,6 +1933,166 @@ mod tests {
                 "malformed journal {index} was accepted: {document}"
             );
         }
+    }
+
+    #[test]
+    fn every_pinned_journal_field_is_required() {
+        // The review's own counterfactual: removing any one of the eight fields
+        // Oxide pins on a migration journal must be refused, never read as a
+        // complete receipt.
+        let pinned = [
+            ("link_text", r#""/r""#),
+            ("link_dev", "1"),
+            ("link_ino", "2"),
+            ("parent_dev", "1"),
+            ("parent_ino", "2"),
+            ("registry_revision", "3"),
+            ("created_ms", "1"),
+            ("updated_ms", "2"),
+        ];
+        let valid = serde_json::json!({
+            "version": "oxide.outputs.transition/3",
+            "checkout": "/c",
+            "checkout_id": "c1",
+            "generation": 3,
+            "state": "committed",
+            "layout": "whole_target",
+            "links": [{"member": "target"}],
+            "transition": {
+                "generation": 4,
+                "phase": "staged",
+                "root": {"kind": "external", "root": "/r", "nonce": "00112233445566778899aabbccddeeff", "generation": 3},
+                "members": ["debug", "release"],
+                "link": "/c/target",
+                "link_text": "/r",
+                "link_dev": 1,
+                "link_ino": 2,
+                "parent_dev": 1,
+                "parent_ino": 2,
+                "stage": "/c/.target.oxide-new-4",
+                "backup": "/c/.target.oxide-old-4",
+                "prior_receipt_sha": "0000000000000000000000000000000000000000000000000000000000000000",
+                "registry_revision": 3,
+                "created_ms": 1,
+                "updated_ms": 2
+            },
+            "updated_ms": 9
+        });
+        let bytes = serde_json::to_vec(&valid).expect("the fixture encodes");
+        let receipt = parse_receipt(&bytes, "c1").expect("the complete journal reads");
+        assert_eq!(receipt.current, vec![PathBuf::from("/r")]);
+        let _ = pinned;
+        for field in [
+            "link_text",
+            "link_dev",
+            "link_ino",
+            "parent_dev",
+            "parent_ino",
+            "registry_revision",
+            "created_ms",
+            "updated_ms",
+        ] {
+            let mut document = valid.clone();
+            document["transition"]
+                .as_object_mut()
+                .expect("a journal object")
+                .remove(field);
+            let bytes = serde_json::to_vec(&document).expect("the fixture encodes");
+            assert!(
+                parse_receipt(&bytes, "c1").is_err(),
+                "a journal without `{field}` was accepted as complete"
+            );
+        }
+        // The pinned shapes are checked too: a digest that is not a SHA-256, a
+        // zero link identity and an unusable old marker pin are each refused.
+        for (field, value) in [
+            ("prior_receipt_sha", serde_json::json!("not-a-digest")),
+            ("link_dev", serde_json::json!(0)),
+            (
+                "marker_pin",
+                serde_json::json!({"dev": 1, "ino": 2, "sha256": "zz"}),
+            ),
+            (
+                "marker_pin",
+                serde_json::json!({"dev": 1, "ino": 2, "sha256": "aa", "invented": 1}),
+            ),
+        ] {
+            let mut document = valid.clone();
+            document["transition"][field] = value;
+            let bytes = serde_json::to_vec(&document).expect("the fixture encodes");
+            assert!(
+                parse_receipt(&bytes, "c1").is_err(),
+                "a journal with an unusable `{field}` was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn every_pinned_prune_journal_field_is_required() {
+        // The same for a registry's unfinished prune intent: the four fields Oxide
+        // pins are required, and its root identity must be usable.
+        let valid = serde_json::json!({
+            "version": "oxide.outputs.registry/2",
+            "schema": 2,
+            "revision": 2,
+            "complete": true,
+            "created_by": "oxide",
+            "rows": [],
+            "intents": [{
+                "version": "oxide.outputs.prune-intent/1",
+                "id": "i1",
+                "identity": {
+                    "checkout_id": "c1",
+                    "checkout": "/c",
+                    "receipt": "/r",
+                    "member": "target",
+                    "root": "/o",
+                    "root_kind": "external",
+                    "generation": 1,
+                    "dev": 7,
+                    "ino": 42,
+                    "marker_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                "phase": "renamed",
+                "quarantine": "/q",
+                "preview_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "created_ms": 1,
+                "updated_ms": 2
+            }]
+        });
+        let bytes = serde_json::to_vec(&valid).expect("the fixture encodes");
+        assert!(parse_registry(&bytes).is_ok(), "the complete intent reads");
+        for field in ["quarantine", "preview_sha256", "created_ms", "updated_ms"] {
+            let mut document = valid.clone();
+            document["intents"][0]
+                .as_object_mut()
+                .expect("an intent object")
+                .remove(field);
+            let bytes = serde_json::to_vec(&document).expect("the fixture encodes");
+            assert!(
+                parse_registry(&bytes).is_err(),
+                "an intent without `{field}` was accepted as complete"
+            );
+        }
+        for (field, value) in [
+            ("preview_sha256", serde_json::json!("00")),
+            ("quarantine", serde_json::json!("relative")),
+        ] {
+            let mut document = valid.clone();
+            document["intents"][0][field] = value;
+            let bytes = serde_json::to_vec(&document).expect("the fixture encodes");
+            assert!(
+                parse_registry(&bytes).is_err(),
+                "an intent with an unusable `{field}` was accepted"
+            );
+        }
+        let mut document = valid;
+        document["intents"][0]["identity"]["dev"] = serde_json::json!(0);
+        let bytes = serde_json::to_vec(&document).expect("the fixture encodes");
+        assert!(
+            parse_registry(&bytes).is_err(),
+            "an intent with an unusable root identity was accepted"
+        );
     }
 
     #[test]

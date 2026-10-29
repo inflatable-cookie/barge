@@ -2176,6 +2176,37 @@ mod tests {
     }
 
     #[test]
+    fn a_divergent_journal_keeps_the_whole_covered_batch() {
+        // A divergent journal in Oxide's receipt folder makes the shared snapshot
+        // incomplete, and an incomplete shared source keeps the whole batch it
+        // covers: neither root of this area is eligible, not just the one the
+        // journal might have named.
+        let fixture = Fixture::new("release-divergent-journal-batch");
+        let first = fixture.root();
+        let second = fixture.root();
+        let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
+        std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
+        // The journal omits every field Oxide pins on a migration journal.
+        std::fs::write(
+            outputs.join("checkout-1.json"),
+            br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"checkout-1","generation":3,"state":"committed","layout":"whole_target","links":[{"member":"target"}],"transition":{},"updated_ms":9}"#,
+        )
+        .expect("the divergent receipt is written");
+
+        let report = fixture.plan();
+        for root in [&first, &second] {
+            let kept = row(&report, root);
+            assert!(!kept.eligible, "{kept:?}");
+            assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+            assert!(!kept.references_complete, "the batch is kept, not one root");
+        }
+        assert_eq!(report.plan.eligible_count, 0);
+        assert_eq!(report.plan.examined_count, 2);
+        assert!(!report.oxide.complete);
+        assert!(report.needs_human());
+    }
+
+    #[test]
     fn a_registry_without_its_required_facts_keeps_the_root() {
         // A registry that omits a field Oxide always writes (its revision here, its
         // creator in the next case) is a divergence, not an empty registry: reading
