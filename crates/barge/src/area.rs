@@ -6954,18 +6954,51 @@ mod tests {
             earlier,
             "the new fact stayed published, which is why the report is unsettled"
         );
+        let published = read_activity(&fixture.state, &observer, &root.root_id)
+            .expect("the record reads")
+            .record
+            .expect("the record parsed");
         assert_blocked(
             fixture.list(&resolved).roots[0].space_idle,
             IdleReason::HoldLive,
         );
 
-        // The next release settles it, and the root is unambiguous again.
-        release(&fixture.state, &observer, &root.root_id, "prover")
+        // The holder exits: its hold is stale, which stage 1 defines as not
+        // blocking idleness, so the published fact decides and the LRU order uses
+        // its time (decision c9d30b41).
+        let hold_path = hold_directory.join("prover.json");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&hold_path).expect("the hold reads"))
+                .expect("the hold parses");
+        document["boot_identity"] = "1600000000.0".into();
+        std::fs::write(
+            &hold_path,
+            serde_json::to_vec_pretty(&document).expect("the hold encodes"),
+        )
+        .expect("the hold is written");
+        std::fs::set_permissions(&hold_path, std::fs::Permissions::from_mode(0o600))
+            .expect("the hold is private");
+        let stale = read_holds(&fixture.state, &observer, &root.root_id).expect("the holds read");
+        assert_eq!(stale.holds[0].1, HoldState::Stale);
+        let listed = fixture.list(&resolved);
+        assert_eq!(listed.roots[0].space_idle.state, IdleState::Idle);
+        assert_eq!(
+            listed.roots[0].activity.last_release_ms,
+            Some(published.last_release_ms),
+            "the order uses the published release time, not the restored one"
+        );
+        assert!(LruKey::of(&published).is_some());
+
+        // The next release settles the leftover hold, and the root is
+        // unambiguous again.
+        let released = release(&fixture.state, &observer, &root.root_id, "prover")
             .expect("the retry completes the release");
+        assert_eq!(released.activity.record.expect("the record").releases, 3);
         assert_eq!(
             fixture.list(&resolved).roots[0].space_idle.state,
             IdleState::Idle
         );
+        assert!(!hold_path.exists());
     }
 
     #[test]

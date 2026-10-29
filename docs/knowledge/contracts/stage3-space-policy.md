@@ -439,6 +439,18 @@ durable, positive fact. Barge writes one small record per root:
 - Written on root creation (`last_release_ms = 0`, `releases = 0`) and on every
   release (`last_release_ms = now`, `releases += 1`, `generation += 1`), while
   holding the root lock (rank 3).
+- **Order, and what an interruption means** (design freezes' decision `c9d30b41`,
+  resolving Q-011). A release durably publishes the fact **first** and removes the
+  hold file **second**, and remove-first is rejected: it would leave an absent hold
+  beside an older record, so a released root would be idle and ordered on a
+  release older than the one that removed its hold. A release interrupted between
+  the two leaves the published fact plus a hold; while the holder is positively
+  live the hold keeps the root non-idle, and once the holder is positively gone the
+  stale hold no longer blocks idleness and the published release time determines
+  the LRU order. An activity write that fails refuses with the hold intact; a hold
+  removal that fails restores the previous record byte for byte. `barge.activity/1`
+  stays frozen under this decision: no pending phase and no separate pending
+  record.
 - **Missing is not idle.** A root with no activity record — an older root from
   before this stage, or a state directory that was lost — is reported as
   `activity_unknown` and never pressure-pruned. Losing account state must not
@@ -594,8 +606,10 @@ test.
 ### 1. A hold is taken before a write, and prune respects it
 
 `hold(root)` takes the root lock, writes the hold record, releases the lock.
-`release(hold)` takes the root lock, removes the hold record, writes the activity
-record, releases the lock. A prune takes the root lock of each candidate and
+`release(hold)` takes the root lock, writes the activity record, removes the hold
+record, releases the lock (the design freezes' decision `c9d30b41` fixes this
+order and supersedes the removal-first phrasing here; see [activity
+records](#activity-records)). A prune takes the root lock of each candidate and
 holds it across that candidate's plan → intent → rename → delete sequence. There
 are exactly two orderings, and both are safe:
 
@@ -1393,15 +1407,16 @@ T6, and no native proof exists or is claimed.
   and atomically, at most 4 KiB, with no unknown fields. Root creation writes
   generation `0` with `last_release_ms: 0` and `releases: 0`, on both the area and
   the feature-folder creation routes.
-- **A release writes its fact first and removes the hold second, and a release
-  that fails records nothing.** `barge area release` takes the root lock the hold
-  was written under, reads and validates the hold, reads the activity record and
-  that record's exact bytes, writes `last_release_ms: now` with `releases` and
-  `generation` incremented, and then removes the hold file. One invariant decides
-  the order: **an absent hold file always implies a recorded release**, so no root
-  is ever idle and ordered on a release older than the one that removed its hold.
-  The other order — remove, then write — leaves exactly that window, which is the
-  "unknown is never idle" ruling's own case.
+- **A release publishes its fact first and removes the hold second, and a release
+  that fails records nothing.** This order is the design freezes' decision
+  (`c9d30b41`, resolving Q-011), and `barge.activity/1` stays frozen with it: no
+  pending phase and no separate pending record. `barge area release` takes the root
+  lock the hold was written under, reads and validates the hold, reads the activity
+  record and that record's exact bytes, durably publishes `last_release_ms: now`
+  with `releases` and `generation` incremented, and then removes the hold file.
+  Inversion — remove, then write — is rejected, because it leaves an absent hold
+  beside an *older* record: a root would be idle and ordered on a release older
+  than the one that removed its hold.
 - **What each failure does.** An activity write that fails refuses before the
   effect (`unknown_state`, exit `3`), leaves the hold in place, and records
   nothing, which is the failure matrix's "refuse before the effect" row. A hold
@@ -1409,20 +1424,21 @@ T6, and no native proof exists or is claimed.
   `io` with `detail.restored: true`, so a failed release changes nothing. If that
   restore also fails, the report is `unknown_state` naming the record path and the
   hold, with `detail.restored: false`, and the hold is still there.
-- **The interruption window this slice cannot close (Q-011).** A release that is
-  interrupted between its fact and its hold removal leaves the published fact plus
-  a hold file. While that hold is live or undecidable the matrix keeps the root.
-  Once the holder is positively gone the hold is **stale**, and stage 1 defines a
-  stale hold as not blocking idleness, so the published fact decides and the root
-  reads idle on a release whose hold removal never happened; a failed restore
-  leaves the same pair. No ordering and no use of the frozen `barge.activity/1`
-  fields can distinguish that pair from a completed release, so this contract
-  records it as an open question for the design delegate
-  ([Q-011](../questions.md), "What makes an interrupted release unknown?")
-  rather than claiming the leftover hold keeps the root, which it does not. The
-  slice's own regressions pin the current outcome so the delegate's answer is a
-  visible change: `an_interrupted_release_leaves_a_hold_never_an_older_release`
-  and `a_failed_restore_is_reported_and_leaves_the_hold_standing`.
+- **What an interruption means, and why it is not unknown.** A release interrupted
+  between its fact and its hold removal leaves the published fact plus a hold file,
+  and that pair means exactly this (`c9d30b41`): while the holder is **positively
+  live**, its hold keeps the root non-idle, so a published-but-still-held root is
+  never a candidate; once the holder is **positively gone** the stale hold no
+  longer blocks idleness (stage 1 defines a stale hold that way) and the published
+  release time determines the LRU order. A failed restore leaves the same pair and
+  the same meaning. This is not an unknown: the consumer published a release, and
+  the leftover hold is a stale record of a holder that is proven gone, so no fact
+  is missing. What the order rules out is the other outcome — an absent hold beside
+  an older release time — because a released root would then be ordered on a
+  release that did not remove its hold. Both cases are pinned by
+  `an_interrupted_release_leaves_a_hold_never_an_older_release` and
+  `a_failed_restore_is_reported_and_leaves_the_hold_standing`, each for a live and
+  an exited holder.
 - **A release never invents a record.** A root with no record, or with one that
   does not verify, gets no new record from a release: the release report says so
   (`data.activity.state` is `missing` or `unverified`), the root stays kept, and
@@ -1487,9 +1503,8 @@ Two readings this slice fixes for later ones. First, an operator's idle baseline
 is a release *time* without a release *count*, so `last_release_ms > 0` is what
 makes a record `released` and `releases` counts only the consumer's own releases;
 a record that counts releases but records no release time is `unverified`, not
-idle. Second, the release ordering above is the fact-then-effect order, while the
-activity section's prose lists the removal first. Both cannot hold: removal first
-lets an interrupted release leave the root idle on an older record, and the
-failure matrix's own "refuse before the effect" row for an activity write requires
-the fact first. The implementation takes the order that satisfies the ruling and
-the matrix row, and this paragraph records the reading for the design's owner.
+idle. Second, the release ordering above is fact-then-effect: the activity
+section's prose lists the removal first, and the design freezes' decision
+`c9d30b41` resolves that against the prose in favour of the fact first, which is
+also what the failure matrix's "refuse before the effect" row needs. Q-011 records
+the answer; this contract is the behaviour.
