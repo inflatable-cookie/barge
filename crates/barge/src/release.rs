@@ -2321,6 +2321,32 @@ mod tests {
     }
 
     #[test]
+    fn an_uninspectable_receipt_census_keeps_the_whole_covered_batch() {
+        // A control directory whose `outputs` exists but is not a directory cannot
+        // be inspected, so the census is unknown rather than absent: no root of the
+        // plan may be released on "nothing names it".
+        let fixture = Fixture::new("release-outputs-not-a-directory");
+        let first = fixture.root();
+        let second = fixture.root();
+        let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
+        if let Some(parent) = outputs.parent() {
+            std::fs::create_dir_all(parent).expect("the control directory");
+        }
+        std::fs::write(&outputs, b"not a directory").expect("the outputs file");
+
+        let report = fixture.plan();
+        for root in [&first, &second] {
+            let kept = row(&report, root);
+            assert!(!kept.eligible, "{kept:?}");
+            assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+            assert!(!kept.references_complete);
+        }
+        assert_eq!(report.plan.eligible_count, 0);
+        assert!(!report.oxide.complete);
+        assert!(report.needs_human());
+    }
+
+    #[test]
     fn an_unreadable_pools_record_never_reads_as_no_oxide_records() {
         // Oxide's pools record can name the only pool that holds its outputs, so
         // an unreadable one leaves the reference set unknown. It is never read as

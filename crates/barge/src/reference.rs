@@ -1164,8 +1164,55 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
 }
 
 /// Read every receipt present in Oxide's outputs folder.
+///
+/// Three outcomes are kept apart, because only one of them authorises "no receipt
+/// names this root":
+///
+/// - the folder is **established absent** (`ENOENT`): Oxide has never written a
+///   receipt here, so there is nothing to read;
+/// - every listed receipt was **read completely**: the census is a complete look;
+/// - anything else is **unknown** — a folder that exists and is not a directory,
+///   a folder or entry that cannot be inspected, a receipt that vanished after it
+///   was listed, a receipt that cannot be read, and a bound that stopped the walk.
+///   A metadata error is never collapsed into "absent", and a listed name that is
+///   gone by the time it is read means the census changed under the observation
+///   rather than that it holds nothing.
 fn read_receipts(outputs: &Path, deadline: Deadline) -> OxideReceipts {
-    if !outputs.is_dir() {
+    read_receipts_with(outputs, deadline, &read_receipt)
+}
+
+/// [`read_receipts`] with its per-receipt read injected, so a test can prove what a
+/// receipt that disappears after it was listed does.
+fn read_receipts_with(
+    outputs: &Path,
+    deadline: Deadline,
+    read_one: &dyn Fn(
+        &Path,
+        &str,
+        Deadline,
+    ) -> std::result::Result<Option<OxideReceiptReference>, String>,
+) -> OxideReceipts {
+    let outputs_state = match std::fs::metadata(outputs) {
+        Ok(metadata) if metadata.is_dir() => true,
+        Ok(_) => {
+            return OxideReceipts::Unknown {
+                reason: format!(
+                    "{} exists and is not a directory, so Oxide's receipts cannot be read",
+                    outputs.display()
+                ),
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return OxideReceipts::Unknown {
+                reason: format!(
+                    "{} cannot be inspected, so whether Oxide's receipts live there is unknown: {error}",
+                    outputs.display()
+                ),
+            }
+        }
+    };
+    if !outputs_state {
         return OxideReceipts::Absent;
     }
     let listing = match std::fs::read_dir(outputs) {
@@ -1210,9 +1257,18 @@ fn read_receipts(outputs: &Path, deadline: Deadline) -> OxideReceipts {
                 ),
             };
         }
-        match read_receipt(&path, checkout_id, deadline) {
+        match read_one(&path, checkout_id, deadline) {
             Ok(Some(receipt)) => receipts.push(receipt),
-            Ok(None) => continue,
+            // The name was listed and is no longer there: the folder changed while
+            // it was being read, so this is not a complete look.
+            Ok(None) => {
+                return OxideReceipts::Unknown {
+                    reason: format!(
+                        "{} was listed and is no longer there, so the receipt census changed while it was read",
+                        path.display()
+                    ),
+                }
+            }
             Err(reason) => return OxideReceipts::Unknown { reason },
         }
     }
@@ -1226,6 +1282,8 @@ fn read_receipt(
 ) -> std::result::Result<Option<OxideReceiptReference>, String> {
     let bounds = Bounds::new(RECEIPT_CAP_BYTES, 1, deadline);
     let bytes = match state::read_bounded(path, &bounds) {
+        // A listed receipt that is gone by the time it is read is the caller's
+        // "changed under the observation", never "absent".
         ReadOutcome::Absent => return Ok(None),
         ReadOutcome::Refused(error) => {
             return Err(format!("{}: {error}", path.display()));
@@ -2426,6 +2484,62 @@ mod tests {
             let found = read_oxide_marker(&platform, &handle);
             assert_eq!(found.is_ok(), readable, "kind `{kind}`: {found:?}");
         }
+    }
+
+    #[test]
+    fn an_uninspectable_or_changed_receipt_census_is_unknown() {
+        // A folder that exists and is not a directory is unknown, never absent.
+        let fixture = crate::testkit::TempDir::new("receipt-census");
+        let file = fixture.write("outputs", b"not a directory");
+        let deadline = Deadline::after(REFERENCE_WALL);
+        assert!(matches!(
+            read_receipts(&file, deadline),
+            OxideReceipts::Unknown { .. }
+        ));
+        // A folder that is not there is established absence: nothing to read.
+        assert!(matches!(
+            read_receipts(&fixture.join("absent"), deadline),
+            OxideReceipts::Absent
+        ));
+        // Nothing listed reads as a complete, empty census.
+        let empty = fixture.join("empty");
+        std::fs::create_dir(&empty).expect("the empty folder");
+        assert!(matches!(
+            read_receipts(&empty, deadline),
+            OxideReceipts::Read(receipts) if receipts.is_empty()
+        ));
+        // A receipt that was listed and is gone by the time it is read changed the
+        // census under the observation: unknown, never an empty complete one.
+        let listed = fixture.join("listed");
+        std::fs::create_dir(&listed).expect("the folder");
+        let valid = serde_json::to_vec(&serde_json::json!({
+            "version": OXIDE_RECEIPT_V2,
+            "checkout": "/c",
+            "checkout_id": "checkout-1",
+            "generation": 1,
+            "state": "committed",
+            "links": [{"member": "target"}],
+            "roots": [],
+            "updated_ms": 9
+        }))
+        .expect("the fixture encodes");
+        std::fs::write(listed.join("checkout-1.json"), &valid).expect("the receipt");
+        assert!(matches!(
+            read_receipts(&listed, deadline),
+            OxideReceipts::Read(receipts) if receipts.len() == 1
+        ));
+        let vanished =
+            |_path: &Path,
+             _id: &str,
+             _deadline: Deadline|
+             -> std::result::Result<Option<OxideReceiptReference>, String> { Ok(None) };
+        assert!(
+            matches!(
+                read_receipts_with(&listed, deadline, &vanished),
+                OxideReceipts::Unknown { .. }
+            ),
+            "a listed receipt that vanished was read as an empty complete census"
+        );
     }
 
     #[test]

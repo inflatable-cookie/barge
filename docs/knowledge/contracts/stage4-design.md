@@ -1132,12 +1132,17 @@ contradicts the marker, so which checkout owns the root is unknown and the root 
 kept. A root that carries only an Oxide marker and no still-selecting record is
 **not** releasable on the marker's own word: the marker is ownership, not a
 selection, so its row is not current and its consumer path needs an `Absent`
-proof of its own. So does an uncertain *discovery*: Oxide's own pools record can
-name the only pool that holds its `outputs/`, so an unreadable or divergent pools
-record, a candidate `outputs/` that exists and cannot be inspected, and two
-control directories that both hold outputs all make the snapshot unknown rather
-than empty. "No Oxide record names this root" is only ever concluded from a
-complete look, never from a look that failed. A complete snapshot is reported on
+proof of its own. So does an uncertain *discovery* or an interrupted
+*census*: Oxide's own pools record can name the only pool that holds its
+`outputs/`, so an unreadable or divergent pools record, a candidate `outputs/`
+that exists and cannot be inspected, and two control directories that both hold
+outputs all make the snapshot unknown rather than empty. The same holds inside the
+receipt folder: a metadata error is never collapsed into "absent" (only `ENOENT`
+is), a folder that exists and is not a directory is unknown, and a receipt that
+was listed and is gone by the time it is read changed the census under the
+observation, which is unknown too rather than an empty complete census. "No Oxide
+record names this root" is only ever concluded from a complete look, never from a
+look that failed or that watched the source change. A complete snapshot is reported on
 the command document, and an incomplete one forces exit `3`. More than one distinct consumer path for one root, or two records that
 disagree about one path's volume, is also unknown and keeps that root: the plan
 proves what it can name exactly once.
