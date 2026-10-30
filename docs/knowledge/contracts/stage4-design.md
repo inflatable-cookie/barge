@@ -1210,10 +1210,14 @@ proves what it can name exactly once.
 The last-activity clock. `OldestIdleAfter` compares `now - last_activity_ms`,
 and `last_activity_ms` is now the newest modification time found by a bounded,
 descriptor-relative scan of the root's subtree, with the root directory's own
-modification time as its floor. **The floor must exist**: a root directory that
-reports no modification time leaves the age unknown, because its entries' times
-can be decades old while the directory itself changed recently, so a child's time
-is never used in its place. The scan never follows a symbolic link, and a
+modification time as its floor. ****The floor must exist**, and it is the root directory's own
+modification time **read now**, through the descriptor the scan holds: an earlier
+observation of the same directory — a listing taken before a hold was released, or
+the plan-time reading an effect-time revalidation follows — is never used in its
+place, so a root that changed since is not reported as old while a fresh time is
+never masked by an older one. A root directory that reports no such time leaves the
+age unknown, because its entries' times can be decades old while the directory
+itself changed recently, so a child's time is never used in its place. The scan never follows a symbolic link, and a
 modification time ahead of this run's clock, an entry that reports no modification
 time at all, an unreadable subtree, a name that exceeds one listing's bound, a
 depth past 64 levels, or its deadline leaves the age unknown too, which keeps the

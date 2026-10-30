@@ -623,6 +623,10 @@ pub struct Faults {
     /// A one-shot pause immediately before a directory listing, so a scan's own
     /// deadline can expire while it is listing.
     pub sleep_before_listing: RefCell<Option<std::time::Duration>>,
+    /// A modification time every *listing* reports instead of the real one, so an
+    /// earlier observation can be stale while the directory's own descriptor facts
+    /// stay current.
+    pub stale_listing_modified_ms: Cell<Option<u64>>,
     /// Every child name this wrapper opened, in order. A caller that must not
     /// read an entry before its own lock uses it to prove nothing was opened.
     pub opened_child_names: RefCell<Vec<String>>,
@@ -776,6 +780,17 @@ impl Faults {
     /// Pause once, immediately before the next directory listing.
     pub fn sleeping_before_listing(&self, pause: std::time::Duration) {
         *self.sleep_before_listing.borrow_mut() = Some(pause);
+    }
+
+    /// Report this modification time in every listing, leaving each directory's own
+    /// facts alone: an earlier observation, not the current one.
+    pub fn listing_the_modified_time_as(&self, modified_ms: u64) {
+        self.stale_listing_modified_ms.set(Some(modified_ms));
+    }
+
+    /// Stop reporting a stale listing time.
+    pub fn listing_the_real_modified_time(&self) {
+        self.stale_listing_modified_ms.set(None);
     }
 
     pub fn failing_remove(&self, name: &str, times: usize) {
@@ -1202,6 +1217,9 @@ impl DirOps for Faults {
         if self.no_modified_times.get() {
             facts.modified_ms = None;
         }
+        if let Some(stale) = self.stale_listing_modified_ms.get() {
+            facts.modified_ms = Some(stale);
+        }
         // The racer replaces the entry after the check that just read these
         // facts, so the returned observation describes an object that is no
         // longer at the name: the exact window a check-then-unlink by name loses.
@@ -1282,6 +1300,9 @@ impl DirOps for Faults {
                     && entry.facts.kind == crate::os::EntryKind::Directory)
             {
                 entry.facts.modified_ms = None;
+            }
+            if let Some(stale) = self.stale_listing_modified_ms.get() {
+                entry.facts.modified_ms = Some(stale);
             }
         }
         Ok(listing)

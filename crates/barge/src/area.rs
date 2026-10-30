@@ -3569,13 +3569,8 @@ impl ActivityBudget {
 /// or open, a symlink (which is never followed, so what is behind it is not
 /// activity Barge can see), a reached bound and a deadline all make the age
 /// unknown: this function never guesses.
-pub fn scan_activity(
-    dirs: &dyn DirOps,
-    root: &DirHandle,
-    own_modified_ms: Option<u64>,
-    now_ms: u64,
-) -> RootActivity {
-    scan_activity_within(dirs, root, own_modified_ms, now_ms, ACTIVITY_WALL)
+pub fn scan_activity(dirs: &dyn DirOps, root: &DirHandle, now_ms: u64) -> RootActivity {
+    scan_activity_within(dirs, root, now_ms, ACTIVITY_WALL)
 }
 
 /// [`scan_activity`] with an explicit wall clock, so a test can prove what a scan
@@ -3583,7 +3578,6 @@ pub fn scan_activity(
 pub fn scan_activity_within(
     dirs: &dyn DirOps,
     root: &DirHandle,
-    own_modified_ms: Option<u64>,
     now_ms: u64,
     wall: Duration,
 ) -> RootActivity {
@@ -3595,14 +3589,17 @@ pub fn scan_activity_within(
             ))
         }
     };
-    // The floor is the root directory's own modification time, and without it
-    // there is no age at all: a child's timestamp can be arbitrarily old while
-    // the directory itself was changed recently, so a missing root time is never
-    // replaced by its entries' times and never read as "very old". Both would
-    // make a live root eligible.
-    let Some(floor) = own_modified_ms.or(own.modified_ms) else {
+    // The floor is the root directory's own modification time, read **now** through
+    // the descriptor this scan holds. An earlier observation of the same directory —
+    // a listing taken before a hold was released, an effect-time re-read — is never
+    // used in its place: an older timestamp would make a root that changed since look
+    // old enough to delete, and a fresh one must not be masked by it. Without the
+    // fresh time there is no age at all, and a child's timestamp can be arbitrarily
+    // old while the directory itself was changed recently, so a missing root time is
+    // never replaced by its entries' times and never read as "very old".
+    let Some(floor) = own.modified_ms else {
         return RootActivity::unknown(
-            "the root directory reports no modification time, so its age cannot be floored",
+            "the root directory's own modification time cannot be read now, so its age cannot be floored",
         );
     };
     let mut activity = RootActivity {
@@ -3766,7 +3763,7 @@ fn observe_root(
         }
     }
     if activity == ActivityMode::Scan {
-        let scanned = scan_activity(dirs, root, directory_modified_ms, state::now_ms());
+        let scanned = scan_activity(dirs, root, state::now_ms());
         row.last_activity_ms = scanned.last_activity_ms;
         row.activity = Some(scanned);
     }
@@ -6015,6 +6012,50 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_listing_time_never_stands_in_for_the_roots_own() {
+        // The floor is the freshly opened descriptor's modification time. An earlier
+        // listing of the same directory says ten days ago while the directory itself
+        // says now: the scan must use now, so a root that changed since that listing
+        // is not reported as old.
+        let fixture = Fixture::new("activity-stale-listing");
+        fixture.register(&fixture.record);
+        let declaration = fixture.declaration("pool");
+        let (root, _) = fixture.create_root(&fixture.record, &declaration);
+        let dirs = crate::testkit::Faults::default();
+        let now = crate::state::now_ms();
+        dirs.listing_the_modified_time_as(now.saturating_sub(10 * 86_400_000));
+        let handle = dirs.open_path(&root.path).expect("the root opens");
+        let scanned = scan_activity(&dirs, &handle, now);
+        let last = scanned.last_activity_ms.expect("the fresh time floors it");
+        assert!(
+            last > now.saturating_sub(60_000),
+            "the scan used the stale listing time {last}, not the directory's own"
+        );
+        assert!(scanned.complete);
+
+        // Through the listing a deciding caller uses, the same root is not idle past
+        // the declared 86 400 s even though the listing says ten days have passed.
+        let resolved = fixture.resolved(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        let listing = list_roots_with(
+            &dirs,
+            &observer,
+            &fixture.state,
+            &resolved,
+            4096,
+            ActivityMode::Scan,
+        )
+        .expect("the area lists");
+        let row = listing
+            .roots
+            .iter()
+            .find(|row| row.root_id.as_deref() == Some(root.root_id.as_str()))
+            .expect("the root is listed");
+        let last = row.last_activity_ms.expect("a fresh activity time");
+        assert!(last > now.saturating_sub(60_000), "{row:?}");
+    }
+
+    #[test]
     fn a_scan_that_reaches_its_bound_is_never_complete() {
         // An empty listing can consume the whole bound: the scan must then report
         // that it did not finish, never a complete observation with an old time.
@@ -6029,7 +6070,6 @@ mod tests {
         let scanned = scan_activity_within(
             &dirs,
             &handle,
-            None,
             crate::state::now_ms(),
             Duration::from_millis(100),
         );
@@ -6049,7 +6089,7 @@ mod tests {
         // The same root with a bound it can meet is complete.
         let dirs = crate::testkit::Faults::default();
         let handle = dirs.open_path(&root.path).expect("the root opens");
-        let scanned = scan_activity(&dirs, &handle, None, crate::state::now_ms());
+        let scanned = scan_activity(&dirs, &handle, crate::state::now_ms());
         assert!(scanned.complete, "{scanned:?}");
         assert!(scanned.last_activity_ms.is_some());
     }

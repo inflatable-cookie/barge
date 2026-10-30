@@ -925,7 +925,7 @@ fn decide_root(
     // adopt.
     // The root was opened, so it is a real directory; a symbolic link never
     // reaches this point, because opening it no-follow would have been refused.
-    let activity = area::scan_activity(dirs, &handle, None, state::now_ms());
+    let activity = area::scan_activity(dirs, &handle, state::now_ms());
     let root_facts = match dirs.dir_facts(&handle) {
         Ok(facts) => facts,
         Err(error) => {
