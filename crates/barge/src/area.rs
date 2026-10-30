@@ -2059,50 +2059,121 @@ pub fn read_remounted_marker(
     read_marker_inner(dirs, root, expectation, Some((verified, recorded_mount)))
 }
 
+/// What reading one root's marker bytes found, before any verdict about the path
+/// the directory sits at.
+enum MarkerRead {
+    /// No marker file at all.
+    Absent,
+    /// The bytes, already proved to be a private regular file of this user inside
+    /// its cap and unchanged by the read.
+    Bytes(Vec<u8>),
+    /// A marker that is there and could not be read: a foreign owner, a link or
+    /// another object, a private-mode failure, an oversized file, or a read that
+    /// failed or found the marker gone.
+    Unreadable(String),
+}
+
+/// Read the bounded bytes of one marker file, with the file's own facts checked.
+fn read_marker_bytes(dirs: &dyn DirOps, root: &DirHandle, effective_uid: u32) -> MarkerRead {
+    let facts = match dirs.child_facts(root, ROOT_MARKER_FILE) {
+        Ok(Some(facts)) => facts,
+        Ok(None) => return MarkerRead::Absent,
+        Err(error) => return MarkerRead::Unreadable(error.to_string()),
+    };
+    if facts.kind != EntryKind::File {
+        return MarkerRead::Unreadable(format!(
+            "the marker is a {}, and Barge only owns a regular file",
+            facts.kind.as_str()
+        ));
+    }
+    if facts.uid != effective_uid {
+        return MarkerRead::Unreadable(format!(
+            "the marker is owned by uid {}, not this account's {effective_uid}",
+            facts.uid
+        ));
+    }
+    if !facts.is_private() {
+        return MarkerRead::Unreadable(format!(
+            "the marker's mode {:o} is not private",
+            facts.mode
+        ));
+    }
+    if facts.size > MARKER_CAP_BYTES as u64 {
+        return MarkerRead::Unreadable(format!(
+            "the marker is {} bytes, over the {MARKER_CAP_BYTES}-byte cap",
+            facts.size
+        ));
+    }
+    match dirs.read_child_file(root, ROOT_MARKER_FILE, MARKER_CAP_BYTES) {
+        Ok(Some(bytes)) => MarkerRead::Bytes(bytes),
+        Ok(None) => MarkerRead::Unreadable("the marker disappeared while it was read".to_owned()),
+        Err(error) => MarkerRead::Unreadable(error.to_string()),
+    }
+}
+
+/// A marker document as its own bytes state it, with no verdict about where it
+/// was found.
+///
+/// Custody and replay need a captured object's marker identity after it has been
+/// renamed under its private capture name, where the recorded path can never
+/// match; they compare the root id, nonce, volume and the SHA-256 themselves. This
+/// reader makes no ownership claim: an absent marker, a failed read and an
+/// unparseable document are each a distinct answer, and the caller's own refusal
+/// is what decides.
+#[derive(Debug)]
+pub enum MarkerDocument {
+    /// No marker file, which is a positive observation.
+    Absent,
+    /// The document and the SHA-256 of the exact bytes read.
+    Read {
+        /// The parsed document, unvalidated against any path.
+        marker: Box<RootMarker>,
+        /// The SHA-256 of the bytes it was parsed from.
+        digest: String,
+    },
+    /// A marker that is there and could not be read.
+    Unreadable {
+        /// Why, for a human.
+        reason: String,
+    },
+}
+
+/// Read one marker's own document without deciding whether its path is the one it
+/// records.
+pub fn read_marker_document(
+    dirs: &dyn DirOps,
+    root: &DirHandle,
+    effective_uid: u32,
+) -> MarkerDocument {
+    match read_marker_bytes(dirs, root, effective_uid) {
+        MarkerRead::Absent => MarkerDocument::Absent,
+        MarkerRead::Unreadable(reason) => MarkerDocument::Unreadable { reason },
+        MarkerRead::Bytes(bytes) => {
+            let digest = sha256_hex(&bytes);
+            match serde_json::from_slice::<RootMarker>(&bytes) {
+                Ok(marker) => MarkerDocument::Read {
+                    marker: Box::new(marker),
+                    digest,
+                },
+                Err(error) => MarkerDocument::Unreadable {
+                    reason: format!("the marker is not a root marker document: {error}"),
+                },
+            }
+        }
+    }
+}
+
 fn read_marker_inner(
     dirs: &dyn DirOps,
     root: &DirHandle,
     expectation: &MarkerExpectation<'_>,
     remounted: Option<(&os::LocatedVolume, &Path)>,
 ) -> (MarkerState, Option<String>) {
-    let facts = match dirs.child_facts(root, ROOT_MARKER_FILE) {
-        Ok(Some(facts)) => facts,
-        Ok(None) => return (MarkerState::Absent, None),
-        Err(error) => {
-            return (
-                MarkerState::Unknown {
-                    reason: error.to_string(),
-                },
-                None,
-            )
-        }
-    };
     let unknown = |reason: String| (MarkerState::Unknown { reason }, None);
-    if facts.kind != EntryKind::File {
-        return unknown(format!(
-            "the marker is a {}, and Barge only owns a regular file",
-            facts.kind.as_str()
-        ));
-    }
-    if facts.uid != expectation.effective_uid {
-        return unknown(format!(
-            "the marker is owned by uid {}, not this account's {}",
-            facts.uid, expectation.effective_uid
-        ));
-    }
-    if !facts.is_private() {
-        return unknown(format!("the marker's mode {:o} is not private", facts.mode));
-    }
-    if facts.size > MARKER_CAP_BYTES as u64 {
-        return unknown(format!(
-            "the marker is {} bytes, over the {MARKER_CAP_BYTES}-byte cap",
-            facts.size
-        ));
-    }
-    let bytes = match dirs.read_child_file(root, ROOT_MARKER_FILE, MARKER_CAP_BYTES) {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => return unknown("the marker disappeared while it was read".to_owned()),
-        Err(error) => return unknown(error.to_string()),
+    let bytes = match read_marker_bytes(dirs, root, expectation.effective_uid) {
+        MarkerRead::Absent => return (MarkerState::Absent, None),
+        MarkerRead::Unreadable(reason) => return unknown(reason),
+        MarkerRead::Bytes(bytes) => bytes,
     };
     let digest = sha256_hex(&bytes);
     let marker: RootMarker = match serde_json::from_slice(&bytes) {

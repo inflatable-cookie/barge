@@ -1450,11 +1450,19 @@ fn scratch_claim(mut options: Options) -> Result<Report, Error> {
 fn expire_summary(report: &ExpireReport) -> String {
     let plan = &report.plan;
     let replay = report.replay.as_ref().map_or_else(String::new, |replay| {
+        // A replayed intent whose volume reconnected on a new device number is
+        // named, so a reboot does not look like a run that changed nothing.
+        let remounted = if replay.remounted == 0 {
+            String::new()
+        } else {
+            format!(", {} remounted", replay.remounted)
+        };
         format!(
-            "replay: {} settled, {} resumed, {} pending; ",
+            "replay: {} settled, {} resumed, {} pending{}; ",
             replay.settled,
             replay.resumed,
-            replay.pending.len()
+            replay.pending.len(),
+            remounted
         )
     });
     format!(

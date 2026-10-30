@@ -24,7 +24,10 @@
 //!   unit. Slice S5 writes every phase before the effect it authorises, so a
 //!   crash leaves a pending intent that replay resolves from the recorded unit
 //!   identity and never from an inference; `barge.intent/1` stays readable and
-//!   maps to a Barge-marked directory unit.
+//!   maps to a Barge-marked directory unit. Stage 4 F4 adds two optional
+//!   documents - the plan's identity evidence and the consumer path's
+//!   `barge.absence/1` proof - so a replay says what was proved and
+//!   re-establishes it instead of trusting a past verdict.
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind as IoErrorKind, Read, Write};
@@ -1206,6 +1209,44 @@ pub struct IntentRecord {
     /// unlinks. It is written before their put-back.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub foreign_captures: Vec<ForeignCapture>,
+    /// The plan's condition 2 evidence, when the deletion came through a release
+    /// gate that proved a durable identity (stage 4 F4).
+    ///
+    /// It holds what the plan proved, never a permission: the replay re-establishes
+    /// the identity from the durable record and the marker bytes, and a device
+    /// number that changed with a remount is tolerated rather than trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::evidence::IdentityEvidence>,
+    /// The plan's condition 6 evidence: the `barge.absence/1` proof of the consumer
+    /// path whose absence the release rested on (stage 4 F4).
+    ///
+    /// It is the proof as the plan established it, with its own `proved_ms`. A
+    /// replay re-establishes it before it lets any further effect happen, because a
+    /// path can reappear and a proof is never a cached permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absence: Option<crate::evidence::AbsenceEvidence>,
+}
+
+/// The plan's proved evidence a deletion carries into its intent.
+///
+/// Both halves are optional because a delete path that is not the release gate has
+/// neither: a scratch sweep or a space prune deletes a unit the area already
+/// declared expendable, and it carries no consumer reference to prove absent. A
+/// release run supplies what its row proved, and the record keeps it so a replay
+/// after a reboot can say what was proved and re-establish it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IntentEvidence {
+    /// Condition 2's evidence, when a release gate proved a durable identity.
+    pub identity: Option<crate::evidence::IdentityEvidence>,
+    /// Condition 6's evidence, when a reference required the path's absence.
+    pub absence: Option<crate::evidence::AbsenceEvidence>,
+}
+
+impl IntentEvidence {
+    /// No evidence: the form a delete path that is not the release gate carries.
+    pub fn none() -> Self {
+        Self::default()
+    }
 }
 
 impl IntentRecord {
@@ -1240,6 +1281,20 @@ impl IntentRecord {
             grant: self.unit.grant.clone(),
             plan_digest: self.plan_digest.clone(),
         }
+    }
+
+    /// The deletion unit a replay acts on: the recorded unit, carrying the device
+    /// the live volume reports now.
+    ///
+    /// The recorded device is the plan's within-run observation, so it is never
+    /// durable identity and a replay never compares it to a live one. The unit's
+    /// identity is its inode and its marker bytes, both of which this keeps
+    /// unchanged; only the device - which the walk needs to prove it stays on one
+    /// filesystem - is the one the replay verified.
+    pub fn replay_unit(&self, device: crate::os::DeviceId) -> crate::unit::DeletionUnit {
+        let mut unit = self.deletion_unit();
+        unit.device = device;
+        unit
     }
 
     /// Validate every recorded fact strictly. A record that does not validate is
@@ -1306,6 +1361,66 @@ impl IntentRecord {
         }
         for foreign in &self.foreign_captures {
             foreign.validate()?;
+        }
+        self.validate_evidence()
+    }
+
+    /// Validate the two plan-and-intent evidence documents, and that they agree
+    /// with the unit they were proved for.
+    ///
+    /// An intent is written only after every condition of its gate held, so a
+    /// recorded identity is `verified` and a recorded absence is `absent`: a
+    /// document that says otherwise is not one this reader understands. The
+    /// identity evidence must also name this unit — its inode and the exact marker
+    /// bytes the record carries — and a unit that carries identity evidence is a
+    /// Barge-marked directory, because that is the only shape a durable root
+    /// identity describes.
+    fn validate_evidence(&self) -> Result<()> {
+        let evidence = |message: &str| {
+            Error::new(ErrorKind::UnknownState, message.to_owned())
+                .with_detail("intent_id", self.intent_id.clone().into())
+        };
+        if let Some(identity) = &self.identity {
+            identity.validate()?;
+            if identity.verdict != "verified" {
+                return Err(evidence(
+                    "an intent records identity evidence only for a verified root",
+                ));
+            }
+            if self.unit.kind != crate::unit::UnitKind::Directory
+                || self
+                    .unit
+                    .marker
+                    .as_ref()
+                    .is_none_or(|marker| marker.family != crate::unit::MarkerFamily::Barge)
+            {
+                return Err(evidence(
+                    "identity evidence describes a Barge-marked directory unit",
+                ));
+            }
+            if identity.inode != Some(self.unit.inode) {
+                return Err(evidence(
+                    "the intent's identity evidence names another inode",
+                ));
+            }
+            let marker_digest = self
+                .unit
+                .marker
+                .as_ref()
+                .map(|marker| marker.digest.as_str());
+            if identity.marker_digest.as_deref() != marker_digest {
+                return Err(evidence(
+                    "the intent's identity evidence names other marker bytes",
+                ));
+            }
+        }
+        if let Some(absence) = &self.absence {
+            absence.validate()?;
+            if absence.verdict != "absent" {
+                return Err(evidence(
+                    "an intent records an absence proof only for an absent path",
+                ));
+            }
         }
         Ok(())
     }
@@ -1398,6 +1513,10 @@ impl IntentV1 {
             phase_ms: self.phase_ms,
             captures: self.captures,
             foreign_captures: self.foreign_captures,
+            // A v1 record was written before either document existed, and it
+            // records nothing about identity or absence to map.
+            identity: None,
+            absence: None,
         })
     }
 }
@@ -2526,6 +2645,8 @@ mod intent_tests {
             phase_ms: now,
             captures: Vec::new(),
             foreign_captures: Vec::new(),
+            identity: None,
+            absence: None,
         }
     }
 
@@ -2570,6 +2691,185 @@ mod intent_tests {
             set.pending().next().is_none(),
             "a settled intent is not pending work"
         );
+    }
+
+    /// The identity evidence an intent for the fixture unit carries.
+    fn identity_evidence(intent: &IntentRecord) -> crate::evidence::IdentityEvidence {
+        crate::evidence::IdentityEvidence {
+            verdict: "verified".to_owned(),
+            reason: None,
+            inode: Some(intent.unit.inode),
+            device_at_record: Some(intent.unit.device),
+            device_live: Some(intent.unit.device.saturating_add(1)),
+            remount: Some(crate::evidence::RemountEvidenceRow {
+                device_changed: true,
+            }),
+            mount_moved: Some(false),
+            marker_digest: intent
+                .unit
+                .marker
+                .as_ref()
+                .map(|marker| marker.digest.clone()),
+        }
+    }
+
+    /// The absence proof an intent for the fixture unit carries.
+    fn absence_evidence() -> crate::evidence::AbsenceEvidence {
+        crate::evidence::AbsenceEvidence {
+            schema: crate::evidence::ABSENCE_SCHEMA.to_owned(),
+            path: PathBuf::from("/Users/tom/Dev/projects/example"),
+            verdict: "absent".to_owned(),
+            anchor: crate::evidence::AbsenceAnchor {
+                kind: "root".to_owned(),
+                path: PathBuf::from("/"),
+            },
+            ancestor: Some(crate::evidence::AbsenceAncestor {
+                path: PathBuf::from("/Users/tom/Dev/projects"),
+                inode: 4_242,
+                device: 16_777_220,
+                volume: crate::evidence::AbsenceVolumeRow {
+                    kind: "boot_data".to_owned(),
+                    volume_uuid: UUID.to_owned(),
+                    file_system: "apfs".to_owned(),
+                },
+            }),
+            leaf: Some(crate::evidence::AbsenceLeaf {
+                name: "example".to_owned(),
+                result: "enoent".to_owned(),
+            }),
+            components_walked: 4,
+            proved_ms: 7,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn an_intent_carries_the_plan_s_identity_and_absence_evidence() {
+        // Stage 4 F4: the plan's two documents are optional additions inside the
+        // v2 major, so a record that carries them reads back exactly and a record
+        // that does not - including every v1 record - still reads.
+        let (_dir, state, uuid) = fixture("intent-evidence");
+        let mut intent = record(&uuid);
+        intent.identity = Some(identity_evidence(&intent));
+        intent.absence = Some(absence_evidence());
+        let mut locks = LockSet::new(state.clone());
+        let _volume = locks.lock_volume(&uuid).expect("the volume lock");
+        let _root = locks.lock_root(&intent.unit.name).expect("the root lock");
+        let write = locks.begin_intent_write().expect("the intent step");
+        publish_intent(&write, &state, &intent).expect("the intent publishes");
+
+        let read = read_intent(&state, &intent.intent_id).expect("the intent reads back");
+        assert_eq!(read.identity, intent.identity);
+        assert_eq!(read.absence, intent.absence);
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(super::intent_path(&state, &intent.intent_id).unwrap()).unwrap(),
+        )
+        .expect("the document decodes");
+        assert_eq!(document["identity"]["verdict"], "verified");
+        assert_eq!(document["absence"]["schema"], "barge.absence/1");
+
+        // A record written before F4 carries neither, and still reads.
+        let plain = record(&uuid);
+        publish_intent(&write, &state, &plain).expect("the plain intent publishes");
+        let read = read_intent(&state, &plain.intent_id).expect("the plain intent reads");
+        assert!(read.identity.is_none() && read.absence.is_none());
+    }
+
+    #[test]
+    fn evidence_that_does_not_describe_this_unit_is_refused() {
+        let (_dir, state, uuid) = fixture("intent-evidence-refused");
+        let intent = record(&uuid);
+        let mut locks = LockSet::new(state.clone());
+        let _volume = locks.lock_volume(&uuid).expect("the volume lock");
+        let _root = locks.lock_root(&intent.unit.name).expect("the root lock");
+        let write = locks.begin_intent_write().expect("the intent step");
+
+        let mut anonymous = intent.clone();
+        let mut evidence = identity_evidence(&anonymous);
+        evidence.verdict = "unknown".to_owned();
+        anonymous.identity = Some(evidence);
+        let error = publish_intent(&write, &state, &anonymous)
+            .expect_err("an intent is written only under a verified identity");
+        assert!(
+            error.message().contains("verified root"),
+            "{}",
+            error.message()
+        );
+
+        let mut other_inode = intent.clone();
+        let mut evidence = identity_evidence(&other_inode);
+        evidence.inode = Some(other_inode.unit.inode.saturating_add(1));
+        other_inode.identity = Some(evidence);
+        let error = publish_intent(&write, &state, &other_inode)
+            .expect_err("the evidence must name this unit's inode");
+        assert!(
+            error.message().contains("another inode"),
+            "{}",
+            error.message()
+        );
+
+        let mut other_bytes = intent.clone();
+        let mut evidence = identity_evidence(&other_bytes);
+        evidence.marker_digest = Some("c".repeat(64));
+        other_bytes.identity = Some(evidence);
+        let error = publish_intent(&write, &state, &other_bytes)
+            .expect_err("the evidence must name this unit's marker bytes");
+        assert!(
+            error.message().contains("marker bytes"),
+            "{}",
+            error.message()
+        );
+
+        let mut present = intent.clone();
+        present.absence = Some(crate::evidence::AbsenceEvidence {
+            verdict: "present".to_owned(),
+            ancestor: None,
+            leaf: None,
+            ..absence_evidence()
+        });
+        let error = publish_intent(&write, &state, &present)
+            .expect_err("an intent records only an absent path");
+        assert!(
+            error.message().contains("absent path"),
+            "{}",
+            error.message()
+        );
+
+        // A document whose nested field set is not this one is unknown state, not
+        // a guess: the evidence denies unknown fields like every record Barge reads.
+        let path = super::intent_path(&state, &intent.intent_id).expect("the path");
+        let value = serde_json::json!({
+            "schema": crate::contract::INTENT_SCHEMA,
+            "intent_id": intent.intent_id,
+            "volume_uuid": uuid.as_str(),
+            "mount_hint": intent.mount_hint,
+            "root_dir": intent.root_dir,
+            "folder": intent.folder,
+            "unit": serde_json::to_value(&intent.unit).expect("the unit encodes"),
+            "plan_digest": intent.plan_digest,
+            "phase": "intent",
+            "generation": 1,
+            "recorded_ms": 1,
+            "phase_ms": 1,
+            "identity": {
+                "verdict": "verified",
+                "inode": intent.unit.inode,
+                "device_at_record": intent.unit.device,
+                "device_live": intent.unit.device,
+                "remount": {"device_changed": false},
+                "mount_moved": false,
+                "marker_digest": "a".repeat(64),
+                "a_later_field": true,
+            },
+        });
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&value).expect("the document encodes"),
+        )
+        .expect("the document is written");
+        let error = read_intent(&state, &intent.intent_id)
+            .expect_err("an unknown evidence field is refused");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
 
     #[test]

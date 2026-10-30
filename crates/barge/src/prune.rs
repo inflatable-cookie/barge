@@ -34,7 +34,7 @@ use crate::contract::{
 use crate::delete::{self, DeleteBounds, PendingRow};
 use crate::digest::sha256_hex;
 use crate::error::{Error, ErrorKind, Result};
-use crate::os::{DeviceId, DirOps, MountRoot, ProcessObserver, VolumeFacts};
+use crate::os::{AbsenceVolume, DeviceId, DirOps, MountRoot, ProcessObserver, VolumeFacts};
 use crate::registry::{self, Availability, Durability, VolumeRecord};
 use crate::scratch::{self, SweepBounds, SweepPlan, SweepPolicy, SweepRequest};
 use crate::state::{self, StatePaths};
@@ -464,7 +464,7 @@ pub struct MaintainRequest<'a> {
 pub fn maintain(
     state_paths: &StatePaths,
     dirs: &dyn DirOps,
-    facts: &dyn VolumeFacts,
+    facts: &dyn AbsenceVolume,
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
     request: &MaintainRequest<'_>,
@@ -613,7 +613,7 @@ pub fn canonical_plan_bytes(plan: &MaintainPlan) -> Result<Vec<u8>> {
 fn build_plan(
     state_paths: &StatePaths,
     dirs: &dyn DirOps,
-    facts: &dyn VolumeFacts,
+    facts: &dyn AbsenceVolume,
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
     records: &[VolumeRecord],
@@ -647,7 +647,7 @@ fn build_plan(
 struct Builder<'a> {
     state_paths: &'a StatePaths,
     dirs: &'a dyn DirOps,
-    facts: &'a dyn VolumeFacts,
+    facts: &'a dyn AbsenceVolume,
     mounts: &'a dyn MountRoot,
     observer: &'a dyn ProcessObserver,
     declarations: &'a area::DeclarationSet,
@@ -938,7 +938,7 @@ pub fn read_maintain_plan(bytes: &[u8]) -> Result<MaintainPlan> {
 fn run(
     state_paths: &StatePaths,
     dirs: &dyn DirOps,
-    facts: &dyn VolumeFacts,
+    facts: &dyn AbsenceVolume,
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
     declarations: &area::DeclarationSet,
@@ -1343,6 +1343,7 @@ fn run(
                     &unit,
                     bounds,
                     Some(&authorize),
+                    &crate::state::IntentEvidence::none(),
                 ) {
                     Ok(report) => {
                         if report.is_deleted() {
