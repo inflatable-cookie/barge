@@ -1097,6 +1097,16 @@ did not reach in `unreached_count`, and gives every one of them a kept row with
 exit `3`, and every unreached root stays unverified and kept — the bound never
 reports the part it did not see as eligible.
 
+Reference matching is remount-aware, for the same reason root identity is: a
+reference recorded before a mount-point change carries the old absolute path, so a
+record names this root when its path is the same path **or** when it sits below a
+`/Volumes/<mount>` prefix and the components below that prefix are exactly this
+root's mount-relative path. The mount-relative path is the identity and the absolute
+path is only an observation, so a current Oxide registry row, receipt, prune intent
+or Barge placement recorded at the drive's earlier mount name still keeps the root;
+matching it is the safe direction, and a path with a different relative path, or one
+outside the mount parent, names no root here.
+
 What the reference readers read, and where. Barge's own: every placement record
 (the whole census, so a truncated one is `Unknown`), the area declaration the
 plan is built under (current when its policy never releases a root), and the

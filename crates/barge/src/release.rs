@@ -1052,6 +1052,7 @@ fn decide_root(
         declared_age.is_some(),
         &root_id,
         &root.path,
+        &mount_relative_path,
         &locked.holds,
         locked.holds_error.as_deref(),
     );
@@ -1060,7 +1061,12 @@ fn decide_root(
         Ok(None) => (None, None),
         Err(reason) => (None, Some(reason)),
     };
-    references.absorb(oxide.references_for(&root.path, marker.as_ref(), marker_unknown.as_deref()));
+    references.absorb(oxide.references_for(
+        &root.path,
+        &mount_relative_path,
+        marker.as_ref(),
+        marker_unknown.as_deref(),
+    ));
     let references_truncated = references.rows.len() > REFERENCE_ROWS;
     let mut reference_rows = references.rows.clone();
     if references_truncated {
@@ -2841,6 +2847,37 @@ mod tests {
         );
         assert!(report.oxide.detail.is_some());
         assert!(report.needs_human());
+    }
+
+    #[test]
+    fn a_current_reference_recorded_before_a_remount_keeps_the_root() {
+        // The registry row still selects this root but records it at the mount name
+        // the drive had before it was reattached. The reference match is
+        // remount-aware, so the stale old-mount path still names this root and the
+        // root is kept - without the fix the row matched nothing and the root was
+        // eligible.
+        let fixture = Fixture::new("release-remounted-reference");
+        let root = fixture.root();
+        let relative = row(&fixture.plan(), &root).mount_relative_path.clone();
+        assert_eq!(relative, format!("pool/{}", root.root_id));
+        let stale = format!("/Volumes/Builds 1/{relative}");
+        let registry_row = format!(
+            r#"{{"checkout_id":"checkout-1","checkout":"{}","receipt":"{}","member":"target","root":"{stale}","root_kind":"external","recipe":"target-debug-v1","generation":1,"selected":true,"pending":false}}"#,
+            fixture.account.home.join("checkout").display(),
+            fixture.account.home.join("receipt.json").display(),
+        );
+        oxide_registry(&fixture, &registry_row, true);
+        let report = fixture.plan();
+        let kept = row(&report, &root);
+        assert!(!kept.eligible, "{kept:?}");
+        assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+        assert!(
+            kept.references.iter().any(|reference| {
+                reference.source == reference::OXIDE_REGISTRY && reference.current
+            }),
+            "{kept:?}"
+        );
+        assert_eq!(report.plan.eligible_count, 0)
     }
 
     #[test]

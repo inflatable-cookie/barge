@@ -254,6 +254,7 @@ impl BargeReferences {
         policy_permits_release: bool,
         root_id: &str,
         root_path: &Path,
+        mount_relative_path: &str,
         holds: &area::HoldReading,
         holds_error: Option<&str>,
     ) -> ReferenceSet {
@@ -262,7 +263,7 @@ impl BargeReferences {
             set.absorb(ReferenceSet::unknown(detail.clone()));
         }
         for record in &self.placements.records {
-            if !placement_names_root(record, root_id, root_path) {
+            if !placement_names_root(record, root_id, root_path, mount_relative_path) {
                 continue;
             }
             set.rows.push(
@@ -302,9 +303,18 @@ impl BargeReferences {
 /// `setting` placement names the consumer directory the setting points at. In
 /// every form the recorded path is compared, and the recorded root ids are
 /// compared when the form carries one.
-fn placement_names_root(record: &cache::PlacementRecord, root_id: &str, root_path: &Path) -> bool {
+fn placement_names_root(
+    record: &cache::PlacementRecord,
+    root_id: &str,
+    root_path: &Path,
+    mount_relative_path: &str,
+) -> bool {
     let recorded = &record.recorded_path;
-    if recorded == root_path || recorded.starts_with(root_path) || root_path.starts_with(recorded) {
+    if recorded == root_path
+        || recorded.starts_with(root_path)
+        || root_path.starts_with(recorded)
+        || records_root(recorded, root_path, mount_relative_path)
+    {
         return true;
     }
     match &record.form {
@@ -574,6 +584,7 @@ impl OxideSnapshot {
     pub fn references_for(
         &self,
         root_path: &Path,
+        mount_relative_path: &str,
         marker: Option<&OxideMarker>,
         marker_unknown: Option<&str>,
     ) -> ReferenceSet {
@@ -607,7 +618,10 @@ impl OxideSnapshot {
                         "Oxide's outputs registry reports itself incomplete",
                     ));
                 }
-                for row in rows.iter().filter(|row| row_names_root(row, root_path)) {
+                for row in rows
+                    .iter()
+                    .filter(|row| row_names_root(row, root_path, mount_relative_path))
+                {
                     let row_volume = row.checkout_volume.clone();
                     let reference =
                         ReferenceRow::new(OXIDE_REGISTRY, row.live()).with_detail(format!(
@@ -626,7 +640,10 @@ impl OxideSnapshot {
                         });
                     }
                 }
-                for intent in intents.iter().filter(|intent| intent.root == root_path) {
+                for intent in intents
+                    .iter()
+                    .filter(|intent| records_root(&intent.root, root_path, mount_relative_path))
+                {
                     set.rows
                         .push(ReferenceRow::new(OXIDE_REGISTRY, true).with_detail(format!(
                             "an unfinished prune intent (phase `{}`) names this root",
@@ -644,10 +661,17 @@ impl OxideSnapshot {
             }
             OxideReceipts::Read(receipts) => {
                 for receipt in receipts {
-                    if !receipt.roots.iter().any(|root| root == root_path) {
+                    if !receipt
+                        .roots
+                        .iter()
+                        .any(|root| records_root(root, root_path, mount_relative_path))
+                    {
                         continue;
                     }
-                    let current = receipt.current.iter().any(|root| root == root_path);
+                    let current = receipt
+                        .current
+                        .iter()
+                        .any(|root| records_root(root, root_path, mount_relative_path));
                     if current {
                         selecting.push(receipt.checkout.clone());
                     }
@@ -757,15 +781,46 @@ impl OxideSnapshot {
     }
 }
 
+/// Whether one recorded root path names one planned root.
+///
+/// A reference recorded before a mount-point change carries the *old* absolute path,
+/// while the root itself is remount-stable: the mount-relative path is the identity
+/// and the absolute path is only an observation (stage 4, "Root identity"). So a
+/// record names this root when its path is the same path, or when it sits below a
+/// `/Volumes/<mount>` prefix and the components below that prefix are exactly the
+/// planned root's mount-relative path. The second form is what makes a current
+/// Oxide reference survive a reconnect at another mount name; matching it keeps the
+/// root, which is the safe direction. A path outside the mount parent, or one whose
+/// relative path differs, names no root here.
+pub fn records_root(recorded: &Path, root_path: &Path, mount_relative_path: &str) -> bool {
+    if recorded == root_path {
+        return true;
+    }
+    let Some(relative) = recorded.strip_prefix("/Volumes").ok().and_then(|below| {
+        // `/Volumes/<mount>/…`: the mount name is one component.
+        let mut components = below.components();
+        components.next()?;
+        let rest: PathBuf = components.collect();
+        Some(rest)
+    }) else {
+        return false;
+    };
+    let planned: PathBuf = mount_relative_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    !planned.as_os_str().is_empty() && relative == planned
+}
+
 /// Whether one registry row names one root.
 ///
-/// The recorded root path is the key. The row's nonce is carried as evidence and
-/// is never compared: a Barge-owned root's nonce is Barge's, an Oxide marker's is
-/// Oxide's, so comparing them would decide a fact neither record states. Path
-/// equality authorises nothing on its own either — it only makes a reference row
-/// current, which keeps the root.
-fn row_names_root(row: &OxideRow, root_path: &Path) -> bool {
-    row.root == root_path
+/// The recorded root path is the key, read remount-aware (see [`records_root`]). The
+/// row's nonce is carried as evidence and is never compared: a Barge-owned root's
+/// nonce is Barge's, an Oxide marker's is Oxide's, so comparing them would decide a
+/// fact neither record states. Path matching authorises nothing on its own either —
+/// it only makes a reference row current, which keeps the root.
+fn row_names_root(row: &OxideRow, root_path: &Path, mount_relative_path: &str) -> bool {
+    records_root(&row.root, root_path, mount_relative_path)
 }
 
 /// Find Oxide's control directory: the one whose `outputs/` folder exists.
@@ -2747,6 +2802,40 @@ mod tests {
         assert!(read.complete(), "{read:?}");
         assert!(matches!(read.registry, OxideRegistry::Absent));
         assert!(matches!(read.receipts, OxideReceipts::Read(_)));
+    }
+
+    #[test]
+    fn a_record_at_another_mount_names_the_same_root() {
+        // A reference recorded before a mount-point change carries the old absolute
+        // path, while the root is remount-stable: the mount-relative path is the
+        // identity, so the record still names this root.
+        let live = Path::new("/Volumes/Builds/pool/0123456789abcdef0123456789abcdef");
+        let relative = "pool/0123456789abcdef0123456789abcdef";
+        // The same path.
+        assert!(records_root(live, live, relative));
+        // The old mount of the same relative root.
+        assert!(records_root(
+            Path::new("/Volumes/Builds 1/pool/0123456789abcdef0123456789abcdef"),
+            live,
+            relative
+        ));
+        // Another relative root, or a path outside the mount parent, names no root
+        // here.
+        assert!(!records_root(
+            Path::new("/Volumes/Builds 1/pool/ffffffffffffffffffffffffffffffff"),
+            live,
+            relative
+        ));
+        assert!(!records_root(
+            Path::new("/Users/tom/Dev/example/pool/0123456789abcdef0123456789abcdef"),
+            live,
+            relative
+        ));
+        assert!(!records_root(
+            Path::new("/Volumes/Builds 1"),
+            live,
+            relative
+        ));
     }
 
     #[test]
