@@ -1139,12 +1139,19 @@ incomplete set keeps every root it covers — the batch, not one row. The regist
 explicit `rows: []` is a complete reading that says there are no rows, while a
 registry that omits the array is divergent — an incomplete registry
 must carry Oxide's own `incomplete` record (and a complete one must not), each
-registry row must state Oxide's selection flags (`selected`, `pending`) and its
-required identity fields, and every root kind any of these records states — a
+registry row must state Oxide's selection flags (`selected`, `pending`) and pass
+Oxide's own `Row::validate` — a lowercase 64-hex checkout id, bounded `member` and
+`recipe` text, absolute `root`, `checkout` and `receipt` paths, and a pruning row
+never also selected or pending — and every root kind any of these records states — a
 registry row's, a prune intent's, a receipt selection's, a history entry's, a
 prepared placement's, a reservation's or a migration journal root's — must be one
 of the two Oxide writes (`external` or `local`). Each unfinished prune intent must
-also carry the root identity Oxide pins and one of Oxide's six phases. A document
+also carry the root identity Oxide pins, pass Oxide's own intent validation (a
+lowercase 32-hex id, a lowercase 64-hex checkout id, absolute receipt and quarantine
+paths, a 64-hex plan digest, an empty-or-64-hex preimage and a sorted unique group)
+and state one of Oxide's six phases. Every path a receipt names is absolute too: a
+relative selection, history entry, prepared destination, reservation or journal root
+names nothing this reader could match. A document
 that omits any of these, or states a root kind this build does not know, is a
 schema divergence — never a settled row, an empty registry or "no references" —
 and a root marker that omits a field Oxide always writes — or states a root kind

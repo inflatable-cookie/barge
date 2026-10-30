@@ -66,6 +66,30 @@ pub const OXIDE_MARKER_V2: &str = "oxide.outputs.root/2";
 pub const OXIDE_MARKER_V1: &str = "oxide.outputs.root/1";
 /// One unfinished prune journal entry's format.
 pub const OXIDE_INTENT_V1: &str = "oxide.outputs.prune-intent/1";
+/// Oxide's own text bound for a member or a recipe name.
+pub const MAX_TEXT_BYTES: usize = 1024;
+
+/// Whether a value is one of Oxide's 128-bit lowercase hex ids.
+fn is_hex32(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Whether a value is one of Oxide's 256-bit lowercase hex digests.
+fn is_hex64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Whether a value is usable identifying text: non-empty, bounded and free of NUL.
+fn is_text(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_TEXT_BYTES && !value.contains('\0')
+}
+
 /// The two root kinds Oxide's own document accepts. A value outside this set is a
 /// document this build does not understand, never a root of an unknown kind.
 pub const OXIDE_ROOT_KINDS: [&str; 2] = ["external", "local"];
@@ -1218,6 +1242,22 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
             None => None,
         };
         check_root_kind("a registry row", &row.root_kind)?;
+        // Oxide's own `Row::validate`: a row names a lowercase 64-hex checkout id, a
+        // bounded member and recipe, three absolute paths, and never a pruning row
+        // that is also selected or pending. A row that fails any of these is a
+        // divergent document, not a reference that happens to match nothing.
+        if !is_hex64(&row.checkout_id)
+            || !is_text(&row.member)
+            || !is_text(&row.recipe)
+            || !row.root.is_absolute()
+            || !row.checkout.is_absolute()
+            || !row.receipt.is_absolute()
+        {
+            return Err("the output registry has an unusable row".to_owned());
+        }
+        if row.pruning.is_some() && (row.selected || row.pending) {
+            return Err("the output registry row is pruning and still referenced".to_owned());
+        }
         rows.push(OxideRow {
             checkout_id: row.checkout_id,
             checkout: row.checkout,
@@ -1264,7 +1304,36 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
             ));
         }
         check_root_kind("a prune intent", &intent.identity.root_kind)?;
-        if intent.id.is_empty() || !intent.quarantine.is_absolute() {
+        // Oxide's own `Intent::validate`, for the facts a reference depends on: a
+        // lowercase 32-hex id, a lowercase 64-hex checkout id, absolute receipt and
+        // quarantine paths, a 64-hex plan digest, an empty-or-64-hex preimage, a
+        // terminal image only with its time, and a sorted unique usable group.
+        let mut members: Vec<&str> = intent.group.iter().map(|row| row.member.as_str()).collect();
+        let unsorted = {
+            let sorted = {
+                let mut sorted = members.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                sorted
+            };
+            sorted != members
+        };
+        if !is_hex32(&intent.id)
+            || !is_hex64(&intent.identity.checkout_id)
+            || !intent.identity.receipt.is_absolute()
+            || !is_hex64(&intent.preview_sha256)
+            || (!intent.prior_receipt_sha.is_empty() && !is_hex64(&intent.prior_receipt_sha))
+            || intent
+                .expected_terminal_sha
+                .as_deref()
+                .is_some_and(|sha| !is_hex64(sha) || intent.terminal_ms.is_none())
+            || unsorted
+            || intent.group.iter().any(|row| !is_text(&row.member))
+        {
+            return Err("the output registry has an unusable prune intent".to_owned());
+        }
+        members.clear();
+        if !intent.quarantine.is_absolute() {
             return Err("a prune intent names no usable quarantine leaf".to_owned());
         }
         if intent.preview_sha256.len() != 64
@@ -1834,6 +1903,45 @@ fn parse_receipt(
     if let Some(journal) = &raw.transition {
         validate_migration(journal, &raw.checkout, raw.generation)?;
     }
+    // Every path a receipt names is absolute, as Oxide's own receipt validation
+    // requires: a selection, a history entry, a prepared destination, a reservation and
+    // a migration journal root all name real roots, and a relative one names nothing
+    // this reader could ever match.
+    for placement in &raw.links {
+        if placement
+            .selected
+            .as_ref()
+            .is_some_and(|selected| !selected.root.is_absolute())
+            || placement
+                .prepared
+                .as_ref()
+                .is_some_and(|prepared| !prepared.to.root.is_absolute())
+            || placement
+                .reserved
+                .as_ref()
+                .is_some_and(|reserved| !reserved.root.is_absolute())
+        {
+            return Err("a receipt names a relative root".to_owned());
+        }
+    }
+    for selected in raw
+        .selected
+        .iter()
+        .chain(raw.prepared.as_ref().map(|prepared| &prepared.to))
+        .chain(raw.roots.iter())
+        .chain(raw.transition.as_ref().map(|journal| &journal.root))
+    {
+        if !selected.root.is_absolute() {
+            return Err("a receipt names a relative root".to_owned());
+        }
+    }
+    if raw
+        .reserved
+        .as_ref()
+        .is_some_and(|reserved| !reserved.root.is_absolute())
+    {
+        return Err("a receipt names a relative root".to_owned());
+    }
     // Every root a receipt names states its kind, and only Oxide's two kinds are
     // understood. A selection, a history entry, a reservation or a journal root
     // of an unknown kind is a divergence rather than a root of no kind.
@@ -2027,7 +2135,8 @@ mod tests {
     #[test]
     fn a_registry_row_that_is_not_settled_names_its_root() {
         let row = OxideRow {
-            checkout_id: "checkout-1".to_owned(),
+            checkout_id: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .to_owned(),
             checkout: PathBuf::from("/Users/fixture/Dev/example"),
             checkout_volume: None,
             root: PathBuf::from("/Volumes/Builds/oxide/outputs/root"),
@@ -2052,7 +2161,7 @@ mod tests {
 
     #[test]
     fn both_registry_majors_read_and_an_unknown_one_is_unknown() {
-        let v2 = br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":3,"complete":true,"created_by":"oxide","rows":[{"checkout_id":"c1","checkout":"/Users/fixture/Dev/example","receipt":"/pool/receipt.json","member":"target","root":"/Volumes/Builds/oxide/outputs/root","root_kind":"external","recipe":"target-debug-v1","nonce":"00112233445566778899aabbccddeeff","generation":1,"root_dev":7,"root_ino":42,"marker_digest":"aa","selected":false,"pending":false}]}"#;
+        let v2 = br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":3,"complete":true,"created_by":"oxide","rows":[{"checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","checkout":"/Users/fixture/Dev/example","receipt":"/pool/receipt.json","member":"target","root":"/Volumes/Builds/oxide/outputs/root","root_kind":"external","recipe":"target-debug-v1","nonce":"00112233445566778899aabbccddeeff","generation":1,"root_dev":7,"root_ino":42,"marker_digest":"aa","selected":false,"pending":false}]}"#;
         let OxideRegistry::Read { rows, complete, .. } = parse_registry(v2).expect("v2 reads")
         else {
             panic!("a registry that reads is a Read");
@@ -2078,7 +2187,7 @@ mod tests {
 
     #[test]
     fn an_unfinished_intent_names_its_root() {
-        let bytes = br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":2,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"i1","identity":{"checkout_id":"c1","checkout":"/Users/fixture/Dev/example","receipt":"/pool/outputs/c1.json","member":"target","root":"/Volumes/Builds/oxide/outputs/root","root_kind":"external","generation":1,"dev":7,"ino":42,"marker_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"phase":"renamed","quarantine":"/pool/outputs/.prune-i1","preview_sha256":"0000000000000000000000000000000000000000000000000000000000000000","created_ms":1,"updated_ms":2}]}"#;
+        let bytes = br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":2,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"11111111111111111111111111111111","identity":{"checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","checkout":"/Users/fixture/Dev/example","receipt":"/pool/outputs/c1.json","member":"target","root":"/Volumes/Builds/oxide/outputs/root","root_kind":"external","generation":1,"dev":7,"ino":42,"marker_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"phase":"renamed","quarantine":"/pool/outputs/.prune-11111111111111111111111111111111","preview_sha256":"0000000000000000000000000000000000000000000000000000000000000000","created_ms":1,"updated_ms":2}]}"#;
         let OxideRegistry::Read { intents, .. } =
             parse_registry(bytes).expect("the registry reads")
         else {
@@ -2090,6 +2199,75 @@ mod tests {
             intents[0].root,
             PathBuf::from("/Volumes/Builds/oxide/outputs/root")
         );
+    }
+
+    #[test]
+    fn a_registry_row_with_an_unusable_identity_is_divergent() {
+        // Oxide's own `Row::validate`: a lowercase 64-hex checkout id, bounded member
+        // and recipe text, three absolute paths, and never a pruning row that is also
+        // selected or pending. Each document below breaks exactly one rule.
+        let id = "c".repeat(64);
+        let row = |overrides: &str| {
+            format!(
+                r#"{{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[{{"checkout_id":"{id}","checkout":"/c","receipt":"/r","member":"target","root":"/o","root_kind":"external","recipe":"target-debug-v1","generation":1,"selected":false,"pending":false{overrides}}}]}}"#
+            )
+        };
+        let readable = serde_json::to_vec(&serde_json::json!({
+            "version": OXIDE_REGISTRY_V2,
+            "schema": 2,
+            "revision": 1,
+            "complete": true,
+            "created_by": "oxide",
+            "rows": [{
+                "checkout_id": id,
+                "checkout": "/c",
+                "receipt": "/r",
+                "member": "target",
+                "root": "/o",
+                "root_kind": "external",
+                "recipe": "target-debug-v1",
+                "generation": 1,
+                "selected": false,
+                "pending": false,
+            }],
+        }))
+        .expect("the fixture encodes");
+        assert!(parse_registry(&readable).is_ok(), "the valid row reads");
+
+        let divergent = [
+            // A relative root.
+            row("").replace(r#""root":"/o""#, r#""root":"relative""#),
+            // A relative checkout.
+            row("").replace(r#""checkout":"/c""#, r#""checkout":"example""#),
+            // A relative receipt.
+            row("").replace(r#""receipt":"/r""#, r#""receipt":"receipt.json""#),
+            // An empty member.
+            row("").replace(r#""member":"target""#, r#""member":"""#),
+            // An empty recipe.
+            row("").replace(r#""recipe":"target-debug-v1""#, r#""recipe":"""#),
+            // A checkout id that is not a 64-hex digest, and one in uppercase.
+            row("").replace(&id, "checkout-1"),
+            row("").replace(&id, &"C".repeat(64)),
+            // A pruning row that is still selected.
+            row(r#","pruning":"intent-1""#).replace(r#""selected":false"#, r#""selected":true"#),
+        ];
+        for (index, document) in divergent.iter().enumerate() {
+            assert!(
+                parse_registry(document.as_bytes()).is_err(),
+                "divergent registry row {index} was accepted: {document}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_receipt_that_names_a_relative_root_is_divergent() {
+        // Every root a receipt names is absolute: a relative one names nothing this
+        // reader could match, so the receipt is divergent rather than a reference to
+        // no root.
+        let receipt = br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","links":[{"member":"target"}],"roots":[{"kind":"external","root":"relative","generation":1}],"updated_ms":9}"#;
+        assert!(parse_receipt(receipt, &"c".repeat(64)).is_err());
+        let reserved = br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","layout":"profile","links":[{"member":"target"}],"reserved":{"id":"r1","nonce":"00112233445566778899aabbccddeeff","kind":"external","root":"future","generation":2,"created_ms":1},"updated_ms":9}"#;
+        assert!(parse_receipt(reserved, &"c".repeat(64)).is_err());
     }
 
     #[test]
@@ -2123,9 +2301,9 @@ mod tests {
             // Complete with an incomplete record.
             br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"incomplete":{"reason":"x","since_ms":1,"transaction":"t"},"created_by":"oxide","rows":[]}"#,
             // An intent phase Oxide never writes.
-            br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"i1","identity":{"checkout_id":"c1","checkout":"/c","receipt":"/r","member":"target","root":"/o","root_kind":"external","generation":1,"dev":7,"ino":42,"marker_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"phase":"bogus","quarantine":"/q","preview_sha256":"0000000000000000000000000000000000000000000000000000000000000000","created_ms":1,"updated_ms":2}]}"#,
+            br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"11111111111111111111111111111111","identity":{"checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","checkout":"/c","receipt":"/r","member":"target","root":"/o","root_kind":"external","generation":1,"dev":7,"ino":42,"marker_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"phase":"bogus","quarantine":"/q","preview_sha256":"0000000000000000000000000000000000000000000000000000000000000000","created_ms":1,"updated_ms":2}]}"#,
             // An intent without its root identity.
-            br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"i1","identity":{"root":"/o"},"phase":"renamed","quarantine":"/q","preview_sha256":"0000000000000000000000000000000000000000000000000000000000000000","created_ms":1,"updated_ms":2}]}"#,
+            br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[],"intents":[{"version":"oxide.outputs.prune-intent/1","id":"11111111111111111111111111111111","identity":{"root":"/o"},"phase":"renamed","quarantine":"/q","preview_sha256":"0000000000000000000000000000000000000000000000000000000000000000","created_ms":1,"updated_ms":2}]}"#,
         ];
         for (index, case) in divergent.iter().enumerate() {
             assert!(
@@ -2149,8 +2327,12 @@ mod tests {
     #[test]
     fn a_receipt_reads_each_versions_own_selection_site() {
         // A version-2 receipt states its selection inside its placement.
-        let v2 = br#"{"version":"oxide.outputs.transition/2","checkout":"/Users/fixture/Dev/example","checkout_id":"c1","generation":2,"state":"committed","links":[{"member":"target","selected":{"kind":"external","root":"/Volumes/Builds/oxide/outputs/current","generation":2}}],"roots":[{"kind":"external","root":"/Volumes/Builds/oxide/outputs/old","generation":1}],"updated_ms":9}"#;
-        let receipt = parse_receipt(v2, "c1").expect("v2 reads");
+        let v2 = br#"{"version":"oxide.outputs.transition/2","checkout":"/Users/fixture/Dev/example","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":2,"state":"committed","links":[{"member":"target","selected":{"kind":"external","root":"/Volumes/Builds/oxide/outputs/current","generation":2}}],"roots":[{"kind":"external","root":"/Volumes/Builds/oxide/outputs/old","generation":1}],"updated_ms":9}"#;
+        let receipt = parse_receipt(
+            v2,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        )
+        .expect("v2 reads");
         assert_eq!(
             receipt.current,
             vec![PathBuf::from("/Volumes/Builds/oxide/outputs/current")]
@@ -2158,20 +2340,32 @@ mod tests {
         assert_eq!(receipt.roots.len(), 2, "history is named but not current");
 
         // A version-1 receipt states its one whole-target selection at the top.
-        let v1 = br#"{"version":"oxide.outputs.transition/1","checkout":"/Users/fixture/Dev/example","checkout_id":"c1","generation":1,"state":"committed","selected":{"kind":"external","root":"/Volumes/Builds/oxide/outputs/current","generation":1},"updated_ms":9}"#;
-        let legacy = parse_receipt(v1, "c1").expect("v1 reads");
+        let v1 = br#"{"version":"oxide.outputs.transition/1","checkout":"/Users/fixture/Dev/example","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","selected":{"kind":"external","root":"/Volumes/Builds/oxide/outputs/current","generation":1},"updated_ms":9}"#;
+        let legacy = parse_receipt(
+            v1,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        )
+        .expect("v1 reads");
         assert_eq!(legacy.current, legacy.roots);
 
         // A version-3 receipt reserves its next root at the root level.
-        let v3 = br#"{"version":"oxide.outputs.transition/3","checkout":"/Users/fixture/Dev/example","checkout_id":"c1","generation":3,"state":"committed","layout":"profile","links":[{"member":"target"}],"reserved":{"id":"r1","nonce":"0011","kind":"external","root":"/Volumes/Builds/oxide/outputs/reserved","generation":4,"created_ms":1},"updated_ms":9}"#;
-        let reserved = parse_receipt(v3, "c1").expect("v3 reads");
+        let v3 = br#"{"version":"oxide.outputs.transition/3","checkout":"/Users/fixture/Dev/example","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":3,"state":"committed","layout":"profile","links":[{"member":"target"}],"reserved":{"id":"r1","nonce":"0011","kind":"external","root":"/Volumes/Builds/oxide/outputs/reserved","generation":4,"created_ms":1},"updated_ms":9}"#;
+        let reserved = parse_receipt(
+            v3,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        )
+        .expect("v3 reads");
         assert_eq!(
             reserved.current,
             vec![PathBuf::from("/Volumes/Builds/oxide/outputs/reserved")]
         );
 
-        let unknown = br#"{"version":"oxide.outputs.transition/9","checkout":"/Users/fixture/Dev/example","checkout_id":"c1","generation":1,"state":"committed","links":[],"roots":[],"updated_ms":9}"#;
-        assert!(parse_receipt(unknown, "c1").is_err());
+        let unknown = br#"{"version":"oxide.outputs.transition/9","checkout":"/Users/fixture/Dev/example","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","links":[],"roots":[],"updated_ms":9}"#;
+        assert!(parse_receipt(
+            unknown,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        )
+        .is_err());
         // A receipt whose own id disagrees with its file name is not followed.
         assert!(parse_receipt(v2, "other").is_err());
     }
@@ -2184,43 +2378,55 @@ mod tests {
         // that a reference set is complete.
         let cases: [&[u8]; 9] = [
             // No `state`.
-            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"links":[],"roots":[],"updated_ms":9}"#,
+            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"links":[],"roots":[],"updated_ms":9}"#,
             // A state Oxide never writes.
-            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"state":"finished","links":[],"roots":[],"updated_ms":9}"#,
+            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"finished","links":[],"roots":[],"updated_ms":9}"#,
             // No `updated_ms`.
-            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","links":[],"roots":[]}"#,
+            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","links":[],"roots":[]}"#,
             // A version-3 receipt without its layout.
-            br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","links":[],"roots":[],"updated_ms":9}"#,
+            br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","links":[],"roots":[],"updated_ms":9}"#,
             // A version-2 receipt with a successor layout.
-            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","layout":"profile","links":[],"roots":[],"updated_ms":9}"#,
+            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","layout":"profile","links":[],"roots":[],"updated_ms":9}"#,
             // A version-2 receipt with a top-level reference.
-            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","selected":{"kind":"external","root":"/r","generation":1},"links":[],"roots":[],"updated_ms":9}"#,
+            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","selected":{"kind":"external","root":"/r","generation":1},"links":[],"roots":[],"updated_ms":9}"#,
             // A version-1 receipt with placements.
-            br#"{"version":"oxide.outputs.transition/1","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","links":[{"member":"target"}],"roots":[],"updated_ms":9}"#,
+            br#"{"version":"oxide.outputs.transition/1","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","links":[{"member":"target"}],"roots":[],"updated_ms":9}"#,
             // A whole-target version-3 receipt without its migration journal.
-            br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","layout":"whole_target","links":[],"roots":[],"updated_ms":9}"#,
+            br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","layout":"whole_target","links":[],"roots":[],"updated_ms":9}"#,
             // A placement without its member.
-            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","links":[{"selected":{"kind":"external","root":"/r","generation":1}}],"roots":[],"updated_ms":9}"#,
+            br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","links":[{"selected":{"kind":"external","root":"/r","generation":1}}],"roots":[],"updated_ms":9}"#,
         ];
         for (index, case) in cases.iter().enumerate() {
             assert!(
-                parse_receipt(case, "c1").is_err(),
+                parse_receipt(
+                    case,
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                )
+                .is_err(),
                 "case {index} was accepted as a receipt: {}",
                 String::from_utf8_lossy(case)
             );
         }
         // A version-3 receipt whose history entry omits its generation is
         // divergent too: Oxide always records it.
-        let history = br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","links":[],"roots":[{"kind":"external","root":"/r"}],"updated_ms":9}"#;
-        assert!(parse_receipt(history, "c1").is_err());
+        let history = br#"{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","links":[],"roots":[{"kind":"external","root":"/r"}],"updated_ms":9}"#;
+        assert!(parse_receipt(
+            history,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        )
+        .is_err());
     }
 
     #[test]
     fn a_migration_journal_is_read_strictly_and_names_the_root_it_keeps() {
         // A whole-target version-3 receipt carries the journal of the move in
         // progress, and the root that journal names is the one the checkout keeps.
-        let good = br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"c1","generation":3,"state":"committed","layout":"whole_target","links":[{"member":"target"}],"transition":{"generation":4,"phase":"staged","root":{"kind":"external","root":"/r","nonce":"00112233445566778899aabbccddeeff","generation":3},"members":["debug","release"],"link":"/c/target","link_text":"/r","link_dev":1,"link_ino":2,"parent_dev":1,"parent_ino":2,"stage":"/c/.target.oxide-new-4","backup":"/c/.target.oxide-old-4","prior_receipt_sha":"0000000000000000000000000000000000000000000000000000000000000000","registry_revision":3,"created_ms":1,"updated_ms":2},"updated_ms":9}"#;
-        let receipt = parse_receipt(good, "c1").expect("a valid journal reads");
+        let good = br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":3,"state":"committed","layout":"whole_target","links":[{"member":"target"}],"transition":{"generation":4,"phase":"staged","root":{"kind":"external","root":"/r","nonce":"00112233445566778899aabbccddeeff","generation":3},"members":["debug","release"],"link":"/c/target","link_text":"/r","link_dev":1,"link_ino":2,"parent_dev":1,"parent_ino":2,"stage":"/c/.target.oxide-new-4","backup":"/c/.target.oxide-old-4","prior_receipt_sha":"0000000000000000000000000000000000000000000000000000000000000000","registry_revision":3,"created_ms":1,"updated_ms":2},"updated_ms":9}"#;
+        let receipt = parse_receipt(
+            good,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        )
+        .expect("a valid journal reads");
         assert_eq!(
             receipt.current,
             vec![PathBuf::from("/r")],
@@ -2244,10 +2450,14 @@ mod tests {
         ];
         for (index, journal) in malformed.iter().enumerate() {
             let document = format!(
-                r#"{{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"c1","generation":3,"state":"committed","layout":"whole_target","links":[{{"member":"target"}}],"transition":{journal},"updated_ms":9}}"#
+                r#"{{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":3,"state":"committed","layout":"whole_target","links":[{{"member":"target"}}],"transition":{journal},"updated_ms":9}}"#
             );
             assert!(
-                parse_receipt(document.as_bytes(), "c1").is_err(),
+                parse_receipt(
+                    document.as_bytes(),
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                )
+                .is_err(),
                 "malformed journal {index} was accepted: {document}"
             );
         }
@@ -2271,7 +2481,7 @@ mod tests {
         let valid = serde_json::json!({
             "version": "oxide.outputs.transition/3",
             "checkout": "/c",
-            "checkout_id": "c1",
+            "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "generation": 3,
             "state": "committed",
             "layout": "whole_target",
@@ -2297,7 +2507,11 @@ mod tests {
             "updated_ms": 9
         });
         let bytes = serde_json::to_vec(&valid).expect("the fixture encodes");
-        let receipt = parse_receipt(&bytes, "c1").expect("the complete journal reads");
+        let receipt = parse_receipt(
+            &bytes,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        )
+        .expect("the complete journal reads");
         assert_eq!(receipt.current, vec![PathBuf::from("/r")]);
         let _ = pinned;
         for field in [
@@ -2317,7 +2531,11 @@ mod tests {
                 .remove(field);
             let bytes = serde_json::to_vec(&document).expect("the fixture encodes");
             assert!(
-                parse_receipt(&bytes, "c1").is_err(),
+                parse_receipt(
+                    &bytes,
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                )
+                .is_err(),
                 "a journal without `{field}` was accepted as complete"
             );
         }
@@ -2339,7 +2557,11 @@ mod tests {
             document["transition"][field] = value;
             let bytes = serde_json::to_vec(&document).expect("the fixture encodes");
             assert!(
-                parse_receipt(&bytes, "c1").is_err(),
+                parse_receipt(
+                    &bytes,
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                )
+                .is_err(),
                 "a journal with an unusable `{field}` was accepted"
             );
         }
@@ -2358,9 +2580,9 @@ mod tests {
             "rows": [],
             "intents": [{
                 "version": "oxide.outputs.prune-intent/1",
-                "id": "i1",
+                "id": "11111111111111111111111111111111",
                 "identity": {
-                    "checkout_id": "c1",
+                    "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                     "checkout": "/c",
                     "receipt": "/r",
                     "member": "target",
@@ -2421,9 +2643,9 @@ mod tests {
         let intent = |version: &str| {
             serde_json::json!({
                 "version": version,
-                "id": "i1",
+                "id": "11111111111111111111111111111111",
                 "identity": {
-                    "checkout_id": "c1",
+                    "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                     "checkout": "/c",
                     "receipt": "/r",
                     "member": "target",
@@ -2481,7 +2703,7 @@ mod tests {
                 "complete": true,
                 "created_by": "oxide",
                 "rows": [{
-                    "checkout_id": "c1",
+                    "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                     "checkout": "/c",
                     "receipt": "/r",
                     "member": "target",
@@ -2512,9 +2734,9 @@ mod tests {
                 "rows": [],
                 "intents": [{
                     "version": OXIDE_INTENT_V1,
-                    "id": "i1",
+                    "id": "11111111111111111111111111111111",
                     "identity": {
-                        "checkout_id": "c1",
+                        "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                         "checkout": "/c",
                         "receipt": "/r",
                         "member": "target",
@@ -2552,7 +2774,7 @@ mod tests {
             let mut document = serde_json::json!({
                 "version": "oxide.outputs.transition/2",
                 "checkout": "/c",
-                "checkout_id": "c1",
+                "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 "generation": 2,
                 "state": "committed",
                 "links": [{"member": "target", "selected": selected}],
@@ -2596,12 +2818,20 @@ mod tests {
         for what in ["selection", "history", "prepared", "reservation"] {
             let known = receipt(what, "external");
             assert!(
-                parse_receipt(&known, "c1").is_ok(),
+                parse_receipt(
+                    &known,
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                )
+                .is_ok(),
                 "a valid `{what}` did not read"
             );
             let unknown = receipt(what, "future_kind");
             assert!(
-                parse_receipt(&unknown, "c1").is_err(),
+                parse_receipt(
+                    &unknown,
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                )
+                .is_err(),
                 "a receipt `{what}` of an unknown root kind was accepted"
             );
         }
@@ -2611,7 +2841,7 @@ mod tests {
             serde_json::json!({
                 "version": "oxide.outputs.transition/3",
                 "checkout": "/c",
-                "checkout_id": "c1",
+                "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 "generation": 3,
                 "state": "committed",
                 "layout": "whole_target",
@@ -2638,10 +2868,18 @@ mod tests {
             })
         };
         let known = serde_json::to_vec(&journal("external")).expect("encodes");
-        assert!(parse_receipt(&known, "c1").is_ok());
+        assert!(parse_receipt(
+            &known,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        )
+        .is_ok());
         let unknown = serde_json::to_vec(&journal("future_kind")).expect("encodes");
         assert!(
-            parse_receipt(&unknown, "c1").is_err(),
+            parse_receipt(
+                &unknown,
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            )
+            .is_err(),
             "a migration journal root of an unknown kind was accepted"
         );
     }
@@ -2658,7 +2896,7 @@ mod tests {
             serde_json::json!({
                 "version": OXIDE_MARKER_V2,
                 "checkout": "/Users/fixture/Dev/example",
-                "checkout_id": "checkout-1",
+                "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 "label": "example",
                 "recipe": "target-debug-v1",
                 "kind": kind,
@@ -2718,7 +2956,7 @@ mod tests {
         let valid = serde_json::to_vec(&serde_json::json!({
             "version": OXIDE_RECEIPT_V2,
             "checkout": "/c",
-            "checkout_id": "checkout-1",
+            "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "generation": 1,
             "state": "committed",
             "links": [{"member": "target"}],
@@ -2726,7 +2964,11 @@ mod tests {
             "updated_ms": 9
         }))
         .expect("the fixture encodes");
-        std::fs::write(listed.join("checkout-1.json"), &valid).expect("the receipt");
+        std::fs::write(
+            listed.join("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.json"),
+            &valid,
+        )
+        .expect("the receipt");
         assert!(matches!(
             read_receipts(&listed, deadline),
             OxideReceipts::Read(receipts) if receipts.len() == 1
@@ -2774,7 +3016,7 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "version": OXIDE_MARKER_V2,
                 "checkout": "/c",
-                "checkout_id": "checkout-1",
+                "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 "label": "example",
                 "recipe": "target-debug-v1",
                 "kind": "external",
@@ -2898,10 +3140,14 @@ mod tests {
         // Whole target: exactly one `target` placement (a version-2 receipt).
         for placements in ["[]", r#"[{"member":"debug"}]"#] {
             let document = format!(
-                r#"{{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","links":{placements},"roots":[],"updated_ms":9}}"#
+                r#"{{"version":"oxide.outputs.transition/2","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","links":{placements},"roots":[],"updated_ms":9}}"#
             );
             assert!(
-                parse_receipt(document.as_bytes(), "c1").is_err(),
+                parse_receipt(
+                    document.as_bytes(),
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                )
+                .is_err(),
                 "a whole-target receipt without its `target` placement was accepted"
             );
         }
@@ -2912,15 +3158,23 @@ mod tests {
             r#"[{"member":"debug"},{"member":"debug"}]"#,
         ] {
             let document = format!(
-                r#"{{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","layout":"profile","links":{placements},"roots":[],"updated_ms":9}}"#
+                r#"{{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","layout":"profile","links":{placements},"roots":[],"updated_ms":9}}"#
             );
             assert!(
-                parse_receipt(document.as_bytes(), "c1").is_err(),
+                parse_receipt(
+                    document.as_bytes(),
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                )
+                .is_err(),
                 "a profile receipt with an unusable placement set was accepted"
             );
         }
         // The sorted, unique profile set reads.
-        let good = br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"c1","generation":1,"state":"committed","layout":"profile","links":[{"member":"debug"},{"member":"release"}],"roots":[],"updated_ms":9}"#;
-        assert!(parse_receipt(good, "c1").is_ok());
+        let good = br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","layout":"profile","links":[{"member":"debug"},{"member":"release"}],"roots":[],"updated_ms":9}"#;
+        assert!(parse_receipt(
+            good,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        )
+        .is_ok());
     }
 }

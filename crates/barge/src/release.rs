@@ -2577,8 +2577,8 @@ mod tests {
         std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
         // The journal omits every field Oxide pins on a migration journal.
         std::fs::write(
-            outputs.join("checkout-1.json"),
-            br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"checkout-1","generation":3,"state":"committed","layout":"whole_target","links":[{"member":"target"}],"transition":{},"updated_ms":9}"#,
+            outputs.join("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.json"),
+            br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":3,"state":"committed","layout":"whole_target","links":[{"member":"target"}],"transition":{},"updated_ms":9}"#,
         )
         .expect("the divergent receipt is written");
 
@@ -2607,9 +2607,9 @@ mod tests {
         std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
         let intent = serde_json::json!({
             "version": "oxide.outputs.prune-intent/99",
-            "id": "i1",
+            "id": "11111111111111111111111111111111",
             "identity": {
-                "checkout_id": "checkout-1",
+                "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 "checkout": fixture.account.home.join("checkout").display().to_string(),
                 "receipt": fixture.account.home.join("receipt.json").display().to_string(),
                 "member": "target",
@@ -2662,7 +2662,7 @@ mod tests {
         let first = fixture.root();
         let second = fixture.root();
         let registry_row = format!(
-            r#"{{"checkout_id":"checkout-1","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"future_kind","recipe":"target-debug-v1","generation":1,"selected":false,"pending":false}}"#,
+            r#"{{"checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"future_kind","recipe":"target-debug-v1","generation":1,"selected":false,"pending":false}}"#,
             fixture.account.home.join("checkout").display(),
             fixture.account.home.join("receipt.json").display(),
             first.path.display(),
@@ -2714,6 +2714,34 @@ mod tests {
             assert_eq!(report.plan.eligible_count, if eligible { 2 } else { 0 });
             assert_eq!(report.oxide.complete, eligible);
         }
+    }
+
+    #[test]
+    fn a_registry_row_with_an_unusable_identity_keeps_the_whole_covered_batch() {
+        // A selected row whose root is relative names nothing this plan could match.
+        // It is a divergent registry, so the snapshot is unknown and both otherwise
+        // eligible roots are kept.
+        let fixture = Fixture::new("release-relative-row");
+        let first = fixture.root();
+        let second = fixture.root();
+        let registry_row = format!(
+            r#"{{"checkout_id":"{}","checkout":"{}","receipt":"{}","member":"target","root":"relative","root_kind":"external","recipe":"target-debug-v1","generation":1,"selected":true,"pending":false}}"#,
+            "c".repeat(64),
+            fixture.account.home.join("checkout").display(),
+            fixture.account.home.join("receipt.json").display(),
+        );
+        oxide_registry(&fixture, &registry_row, true);
+
+        let report = fixture.plan();
+        for root in [&first, &second] {
+            let kept = row(&report, root);
+            assert!(!kept.eligible, "{kept:?}");
+            assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+            assert!(!kept.references_complete);
+        }
+        assert_eq!(report.plan.eligible_count, 0);
+        assert!(!report.oxide.complete);
+        assert!(report.needs_human());
     }
 
     #[test]
@@ -2818,7 +2846,7 @@ mod tests {
             .join(reference::OXIDE_OUTPUTS_DIR);
         std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
         let registry_row = format!(
-            r#"{{"checkout_id":"checkout-1","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"external","recipe":"target-debug-v1","generation":1,"selected":true,"pending":false}}"#,
+            r#"{{"checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"external","recipe":"target-debug-v1","generation":1,"selected":true,"pending":false}}"#,
             fixture.account.home.join("checkout").display(),
             fixture.account.home.join("receipt.json").display(),
             root.path.display(),
@@ -3093,7 +3121,7 @@ mod tests {
         assert_eq!(relative, format!("pool/{}", root.root_id));
         let stale = format!("/Volumes/Builds 1/{relative}");
         let registry_row = format!(
-            r#"{{"checkout_id":"checkout-1","checkout":"{}","receipt":"{}","member":"target","root":"{stale}","root_kind":"external","recipe":"target-debug-v1","generation":1,"selected":true,"pending":false}}"#,
+            r#"{{"checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","checkout":"{}","receipt":"{}","member":"target","root":"{stale}","root_kind":"external","recipe":"target-debug-v1","generation":1,"selected":true,"pending":false}}"#,
             fixture.account.home.join("checkout").display(),
             fixture.account.home.join("receipt.json").display(),
         );
@@ -3471,7 +3499,7 @@ mod tests {
         let marker = serde_json::json!({
             "version": reference::OXIDE_MARKER_V2,
             "checkout": checkout.display().to_string(),
-            "checkout_id": "checkout-1",
+            "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "label": "example",
             "recipe": "target-debug-v1",
             "kind": "external",
@@ -3494,9 +3522,9 @@ mod tests {
         let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
         std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
         std::fs::write(
-            outputs.join("checkout-1.json"),
+            outputs.join("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.json"),
             format!(
-                r#"{{"version":"{}","checkout":"{}","checkout_id":"checkout-1","generation":2,"state":"committed","links":[{{"member":"target"}}],"roots":[],"updated_ms":1}}"#,
+                r#"{{"version":"{}","checkout":"{}","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":2,"state":"committed","links":[{{"member":"target"}}],"roots":[],"updated_ms":1}}"#,
                 reference::OXIDE_RECEIPT_V2,
                 checkout.display()
             ),
@@ -3535,7 +3563,7 @@ mod tests {
 
     #[test]
     fn a_receipt_that_names_another_checkout_for_the_markers_id_keeps_the_root() {
-        // The marker names checkout A for id checkout-1; the receipt for that id
+        // The marker names checkout A for id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc; the receipt for that id
         // names checkout B. Which checkout owns the root is then unknown, so the
         // reference set is incomplete and the root is kept — even though A's path
         // is gone, which would otherwise satisfy the marker's absence requirement.
@@ -3546,7 +3574,7 @@ mod tests {
         let marker = serde_json::json!({
             "version": reference::OXIDE_MARKER_V2,
             "checkout": marked.display().to_string(),
-            "checkout_id": "checkout-1",
+            "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "label": "example",
             "recipe": "target-debug-v1",
             "kind": "external",
@@ -3565,9 +3593,9 @@ mod tests {
         let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
         std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
         std::fs::write(
-            outputs.join("checkout-1.json"),
+            outputs.join("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.json"),
             format!(
-                r#"{{"version":"{}","checkout":"{}","checkout_id":"checkout-1","generation":2,"state":"committed","links":[{{"member":"target"}}],"roots":[],"updated_ms":1}}"#,
+                r#"{{"version":"{}","checkout":"{}","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":2,"state":"committed","links":[{{"member":"target"}}],"roots":[],"updated_ms":1}}"#,
                 reference::OXIDE_RECEIPT_V2,
                 other.display()
             ),
@@ -3599,7 +3627,7 @@ mod tests {
         let marker = serde_json::json!({
             "version": reference::OXIDE_MARKER_V2,
             "checkout": fixture.account.home.join("gone-checkout").display().to_string(),
-            "checkout_id": "checkout-1",
+            "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "label": "example",
             "recipe": "target-debug-v1",
             "kind": "future_kind",
@@ -3618,9 +3646,9 @@ mod tests {
         let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
         std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
         std::fs::write(
-            outputs.join("checkout-1.json"),
+            outputs.join("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.json"),
             format!(
-                r#"{{"version":"{}","checkout":"{}","checkout_id":"checkout-1","generation":2,"state":"committed","links":[{{"member":"target"}}],"roots":[],"updated_ms":1}}"#,
+                r#"{{"version":"{}","checkout":"{}","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":2,"state":"committed","links":[{{"member":"target"}}],"roots":[],"updated_ms":1}}"#,
                 reference::OXIDE_RECEIPT_V2,
                 fixture.account.home.join("gone-checkout").display()
             ),
@@ -3642,7 +3670,7 @@ mod tests {
         let marker = serde_json::json!({
             "version": reference::OXIDE_MARKER_V2,
             "checkout": fixture.account.home.join("gone-checkout").display().to_string(),
-            "checkout_id": "checkout-1",
+            "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "label": "example",
             "recipe": "target-debug-v1",
             "kind": "external",
@@ -3676,7 +3704,7 @@ mod tests {
         let mut marker = serde_json::json!({
             "version": reference::OXIDE_MARKER_V2,
             "checkout": fixture.account.home.join("checkout").display().to_string(),
-            "checkout_id": "checkout-1",
+            "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "label": "example",
             "recipe": "target-debug-v1",
             "kind": "external",
@@ -3736,7 +3764,7 @@ mod tests {
         let fixture = Fixture::new("release-row-flags");
         let root = fixture.root();
         let row_without_flags = format!(
-            r#"{{"checkout_id":"checkout-1","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"external","recipe":"target-debug-v1","generation":1}}"#,
+            r#"{{"checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"external","recipe":"target-debug-v1","generation":1}}"#,
             fixture.account.home.join("checkout").display(),
             fixture.account.home.join("receipt.json").display(),
             root.path.display(),
@@ -3825,7 +3853,7 @@ mod tests {
             let fixture = Fixture::new("release-oxide-live");
             let root = fixture.root();
             let registry_row = format!(
-                r#"{{"checkout_id":"checkout-1","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"external","recipe":"target-debug-v1","generation":1,{flags}}}"#,
+                r#"{{"checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"external","recipe":"target-debug-v1","generation":1,{flags}}}"#,
                 fixture.account.home.join("checkout").display(),
                 fixture.account.home.join("receipt.json").display(),
                 root.path.display(),
@@ -3850,7 +3878,7 @@ mod tests {
         let checkout = fixture.account.home.join("checkout");
         std::fs::create_dir_all(&checkout).expect("the checkout exists");
         let registry_row = format!(
-            r#"{{"checkout_id":"checkout-1","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"external","recipe":"target-debug-v1","generation":1,"selected":false,"pending":false}}"#,
+            r#"{{"checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"external","recipe":"target-debug-v1","generation":1,"selected":false,"pending":false}}"#,
             checkout.display(),
             fixture.account.home.join("receipt.json").display(),
             root.path.display(),
@@ -3890,7 +3918,7 @@ mod tests {
         let fixture = Fixture::new("release-oxide-incomplete");
         let root = fixture.root();
         let registry_row = format!(
-            r#"{{"checkout_id":"checkout-1","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"external","recipe":"target-debug-v1","generation":1,"selected":false,"pending":false}}"#,
+            r#"{{"checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"external","recipe":"target-debug-v1","generation":1,"selected":false,"pending":false}}"#,
             fixture.account.home.join("checkout").display(),
             fixture.account.home.join("receipt.json").display(),
             root.path.display(),
@@ -3910,8 +3938,8 @@ mod tests {
         let outputs = oxide_control(&other).join(reference::OXIDE_OUTPUTS_DIR);
         std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
         std::fs::write(
-            outputs.join("checkout-1.json"),
-            br#"{"version":"oxide.outputs.transition/9","checkout":"/fixture/checkout","checkout_id":"checkout-1","generation":1,"state":"committed","links":[],"roots":[],"updated_ms":1}"#,
+            outputs.join("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.json"),
+            br#"{"version":"oxide.outputs.transition/9","checkout":"/fixture/checkout","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","links":[],"roots":[],"updated_ms":1}"#,
         )
         .expect("the receipt is written");
         let report = other.plan();
