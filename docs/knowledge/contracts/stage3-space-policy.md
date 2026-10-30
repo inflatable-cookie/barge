@@ -439,6 +439,17 @@ durable, positive fact. Barge writes one small record per root:
 - Written on root creation (`last_release_ms = 0`, `releases = 0`) and on every
   release (`last_release_ms = now`, `releases += 1`, `generation += 1`), while
   holding the root lock (rank 3).
+- **Creation accounts for a failed record.** Both creation routes — a declared
+  area's root and Barge's own feature folders (scratch, caches) — write the marker
+  and the durable identity record before the activity record, and creation never
+  deletes a root it created. A failed activity publication therefore leaves a real
+  root whose activity is unsettled, and the command says so: the failure carries
+  `detail.created_root: true` with the root's `root_id`, `path` and `volume_uuid`,
+  a `next` step naming `barge area idle-baseline --root <id>` (or the operator's
+  removal of the root), and the recovery of an unconfirmed record below. The root
+  reads `activity_unknown` — absent or invalid — and is never idle until that
+  baseline records it, so a created root can be neither an unreported orphan nor a
+  prune candidate.
 - **Order, and what an interruption means** (design freezes' decision `c9d30b41`,
   resolving Q-011). A release durably publishes the fact **first** and removes the
   hold file **second**, and remove-first is rejected: it would leave an absent hold

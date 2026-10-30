@@ -1158,6 +1158,29 @@ pub fn create_root_in_feature(
     kind: RootKind,
     area: MarkerArea,
 ) -> Result<OwnedRoot> {
+    create_root_in_feature_with(
+        state,
+        dirs,
+        observer,
+        folder,
+        kind,
+        area,
+        ActivityIo::real(),
+    )
+}
+
+/// [`create_root_in_feature`] with the activity record's writes as seams, so a
+/// test can prove what a failed activity publication leaves behind.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_root_in_feature_with(
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    folder: &FeatureFolder,
+    kind: RootKind,
+    area: MarkerArea,
+    io: ActivityIo,
+) -> Result<OwnedRoot> {
     let effective_uid = observer.effective_uid()?;
     state.initialize()?;
     let folder_handle = ensure_folder(dirs, &folder.dirs, effective_uid)?;
@@ -1213,7 +1236,9 @@ pub fn create_root_in_feature(
                     &folder.volume_uuid,
                     &owned.root_id,
                     owned.created_ms,
-                )?;
+                    io,
+                )
+                .map_err(|error| creation_unsettled(&owned, error))?;
                 return Ok(owned);
             }
             Err(error) => {
@@ -1422,6 +1447,19 @@ pub fn create_root(
     resolved: &ResolvedArea,
     spec: RootSpec,
 ) -> Result<OwnedRoot> {
+    create_root_with(state, dirs, observer, resolved, spec, ActivityIo::real())
+}
+
+/// [`create_root`] with the activity record's writes as seams, so a test can prove
+/// what a failed activity publication leaves behind.
+pub(crate) fn create_root_with(
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    resolved: &ResolvedArea,
+    spec: RootSpec,
+    io: ActivityIo,
+) -> Result<OwnedRoot> {
     let effective_uid = observer.effective_uid()?;
     state.initialize()?;
     let area_handle = ensure_area_folder(dirs, resolved, effective_uid)?;
@@ -1452,7 +1490,14 @@ pub fn create_root(
                 // release: a root that was never released is never idle, so a
                 // consumer that dies holding it keeps it (stage 3 design,
                 // "Activity records").
-                record_activity_creation(state, &resolved.volume_uuid, &root_id, owned.created_ms)?;
+                record_activity_creation(
+                    state,
+                    &resolved.volume_uuid,
+                    &root_id,
+                    owned.created_ms,
+                    io,
+                )
+                .map_err(|error| creation_unsettled(&owned, error))?;
                 return Ok(owned);
             }
             Err(error) => {
@@ -3643,15 +3688,10 @@ pub fn read_activity(
     })
 }
 
-/// Publish one activity record atomically and privately.
-fn publish_activity(state: &StatePaths, record: &ActivityRecord) -> Result<PathBuf> {
-    publish_activity_with(state, record, &state::publish_atomic)
-}
-
-/// [`publish_activity`] through a publisher seam, so a test can prove what a
-/// publish that fails *after* its rename does. [`state::publish_atomic`] renames
-/// and then syncs the directory, so its failure does not always mean the new bytes
-/// are absent.
+/// Publish one activity record atomically and privately, through a publisher seam
+/// so a test can prove what a publish that fails *after* its rename does.
+/// [`state::publish_atomic`] renames and then syncs the directory, so its failure
+/// does not always mean the new bytes are absent.
 fn publish_activity_with(
     state: &StatePaths,
     record: &ActivityRecord,
@@ -3691,6 +3731,7 @@ fn record_activity_creation(
     volume_uuid: &VolumeUuid,
     root_id: &str,
     created_ms: u64,
+    io: ActivityIo,
 ) -> Result<ActivityRecord> {
     let now = state::now_ms();
     let record = ActivityRecord {
@@ -3703,8 +3744,41 @@ fn record_activity_creation(
         generation: 0,
         recorded_ms: now,
     };
-    publish_activity(state, &record)?;
+    publish_fact(
+        state,
+        &record,
+        None,
+        io,
+        &format!("the creation of root `{root_id}`"),
+    )?;
     Ok(record)
+}
+
+/// Account for the one step that runs after a root, its marker and its identity
+/// record exist: publishing its activity record.
+///
+/// Creation never deletes a root it created, so a failure here is a created root
+/// whose activity is unsettled. The report names the root, its path and its
+/// volume, and says the root is kept — never idle, because its activity is absent
+/// or invalid — until an operator removes it or records a baseline.
+fn creation_unsettled(owned: &OwnedRoot, error: Error) -> Error {
+    error
+        .prefixed(&format!(
+            "root {} was created and kept, but its activity record could not be recorded",
+            owned.root_id
+        ))
+        .with_detail("created_root", true.into())
+        .with_detail("root_id", owned.root_id.clone().into())
+        .with_detail("path", owned.path.display().to_string().into())
+        .with_detail("volume_uuid", owned.volume_uuid.as_str().into())
+        .with_detail(
+            "next",
+            format!(
+                "the root is kept and never idle until `barge area idle-baseline --root {}` records its activity, or an operator removes the root",
+                owned.root_id
+            )
+            .into(),
+        )
 }
 
 /// The record one release writes, from the record it read.
@@ -6722,6 +6796,260 @@ mod tests {
     fn assert_blocked(row: IdleRow, reason: IdleReason) {
         assert_eq!(row.state, IdleState::NotIdle);
         assert_eq!(row.reason, Some(reason));
+    }
+
+    /// The identity record a created root must leave behind, whatever the activity
+    /// record's fate.
+    fn assert_created_root_kept(fixture: &Fixture, path: &Path, root_id: &str, error: &Error) {
+        assert_eq!(error.detail()["created_root"], true);
+        assert_eq!(error.detail()["root_id"], root_id);
+        assert_eq!(error.detail()["path"], path.display().to_string().as_str());
+        assert!(error.message().contains("was created and kept"));
+        assert!(
+            path.join(ROOT_MARKER_FILE).is_file(),
+            "the created root keeps its marker"
+        );
+        let platform = fixture.platform();
+        let uid = fixture.observer().effective_uid().expect("the uid");
+        assert!(
+            crate::identity::read(&fixture.state, &platform, root_id, uid)
+                .expect("the identity reads")
+                .is_some(),
+            "the created root keeps its identity record"
+        );
+    }
+
+    #[test]
+    fn an_area_root_whose_activity_cannot_be_recorded_is_reported_and_kept() {
+        // Creation writes the marker and the identity record before the activity
+        // record. A failed publication therefore leaves a root Barge created, and
+        // the report must name it: creation never deletes a root, and the root is
+        // kept — never idle, because its activity is missing — until an operator
+        // records a baseline or removes it.
+        let fixture = Fixture::new("create-activity-prefail");
+        fixture.register(&fixture.record);
+        let declaration = fixture.declaration("example/pool");
+        let resolved = fixture.resolved(&fixture.record, &declaration);
+        let platform = fixture.platform();
+        let observer = fixture.observer();
+        fn refuses(_target: &Path, _bytes: &[u8]) -> Result<()> {
+            Err(Error::new(
+                ErrorKind::Io,
+                "injected: the activity record cannot be written",
+            ))
+        }
+        let error = super::create_root_with(
+            &fixture.state,
+            &platform,
+            &observer,
+            &resolved,
+            RootSpec {
+                kind: RootKind::AreaRoot,
+            },
+            super::ActivityIo {
+                write: refuses,
+                ..super::ActivityIo::real()
+            },
+        )
+        .expect_err("the activity record cannot be recorded");
+        let root_id = error.detail()["root_id"]
+            .as_str()
+            .expect("the report names the root")
+            .to_owned();
+        let path = resolved.path.join(&root_id);
+        assert_created_root_kept(&fixture, &path, &root_id, &error);
+
+        // The creation made the area folder, so the listing resolves it again.
+        let resolved = fixture.resolved(&fixture.record, &declaration);
+        let listed = fixture.list(&resolved);
+        let row = listed
+            .roots
+            .iter()
+            .find(|row| row.root_id.as_deref() == Some(root_id.as_str()))
+            .expect("the created root is listed");
+        assert_eq!(row.activity.state, ActivityStateName::Missing);
+        assert!(
+            !row.space_idle.is_idle(),
+            "a root with no activity record is never idle"
+        );
+
+        // The explicit baseline is the repair, and then the root is idle.
+        idle_baseline(
+            &fixture.state,
+            &platform,
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &IdleBaselineRequest {
+                root_id: root_id.clone(),
+                volume_uuid: None,
+                mount_relative_path: None,
+            },
+        )
+        .expect("the baseline records the root's activity");
+        let listed = fixture.list(&resolved);
+        let row = listed
+            .roots
+            .iter()
+            .find(|row| row.root_id.as_deref() == Some(root_id.as_str()))
+            .expect("the created root is listed");
+        assert_eq!(row.space_idle.state, IdleState::Idle);
+    }
+
+    #[test]
+    fn an_area_root_whose_activity_publish_fails_after_its_rename_is_kept_unknown() {
+        let fixture = Fixture::new("create-activity-postfail");
+        fixture.register(&fixture.record);
+        let declaration = fixture.declaration("example/pool");
+        let resolved = fixture.resolved(&fixture.record, &declaration);
+        let platform = fixture.platform();
+        let observer = fixture.observer();
+        fn after_rename(target: &Path, bytes: &[u8]) -> Result<()> {
+            crate::state::publish_atomic(target, bytes)?;
+            Err(Error::new(
+                ErrorKind::Io,
+                "injected: the activity directory sync failed after the rename",
+            ))
+        }
+        let error = super::create_root_with(
+            &fixture.state,
+            &platform,
+            &observer,
+            &resolved,
+            RootSpec {
+                kind: RootKind::AreaRoot,
+            },
+            super::ActivityIo {
+                write: after_rename,
+                ..super::ActivityIo::real()
+            },
+        )
+        .expect_err("the activity publish fails after its rename");
+        let root_id = error.detail()["root_id"]
+            .as_str()
+            .expect("the report names the root")
+            .to_owned();
+        let path = resolved.path.join(&root_id);
+        assert_created_root_kept(&fixture, &path, &root_id, &error);
+        assert_eq!(
+            error.detail()["removed"],
+            true,
+            "the unconfirmed record is removed, not left readable"
+        );
+        assert_eq!(
+            read_activity(&fixture.state, &observer, &root_id)
+                .expect("the record reads")
+                .state,
+            ActivityStateName::Missing
+        );
+        let resolved = fixture.resolved(&fixture.record, &declaration);
+        let listed = fixture.list(&resolved);
+        let row = listed
+            .roots
+            .iter()
+            .find(|row| row.root_id.as_deref() == Some(root_id.as_str()))
+            .expect("the created root is listed");
+        assert!(!row.space_idle.is_idle());
+    }
+
+    #[test]
+    fn a_feature_root_whose_activity_cannot_be_recorded_is_reported_and_kept() {
+        // The second creation route: Barge's own feature folders (scratch and
+        // caches). It has the same account of a failed activity publication.
+        let fixture = Fixture::new("create-feature-prefail");
+        fixture.register(&fixture.record);
+        let platform = fixture.platform();
+        let observer = fixture.observer();
+        let folder = super::resolve_feature(
+            &platform,
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &fixture.record,
+            super::Feature::Scratch,
+        )
+        .expect("the scratch feature resolves");
+        fn refuses(_target: &Path, _bytes: &[u8]) -> Result<()> {
+            Err(Error::new(
+                ErrorKind::Io,
+                "injected: the activity record cannot be written",
+            ))
+        }
+        let error = super::create_root_in_feature_with(
+            &fixture.state,
+            &platform,
+            &observer,
+            &folder,
+            RootKind::ScratchRun,
+            super::MarkerArea::identity("scratch", "run"),
+            super::ActivityIo {
+                write: refuses,
+                ..super::ActivityIo::real()
+            },
+        )
+        .expect_err("the activity record cannot be recorded");
+        let root_id = error.detail()["root_id"]
+            .as_str()
+            .expect("the report names the root")
+            .to_owned();
+        let path = folder.path.join(&root_id);
+        assert_created_root_kept(&fixture, &path, &root_id, &error);
+        assert_eq!(
+            read_activity(&fixture.state, &observer, &root_id)
+                .expect("the record reads")
+                .state,
+            ActivityStateName::Missing
+        );
+    }
+
+    #[test]
+    fn a_feature_root_whose_activity_publish_fails_after_its_rename_is_kept_unknown() {
+        let fixture = Fixture::new("create-feature-postfail");
+        fixture.register(&fixture.record);
+        let platform = fixture.platform();
+        let observer = fixture.observer();
+        let folder = super::resolve_feature(
+            &platform,
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &fixture.record,
+            super::Feature::Scratch,
+        )
+        .expect("the scratch feature resolves");
+        fn after_rename(target: &Path, bytes: &[u8]) -> Result<()> {
+            crate::state::publish_atomic(target, bytes)?;
+            Err(Error::new(
+                ErrorKind::Io,
+                "injected: the activity directory sync failed after the rename",
+            ))
+        }
+        let error = super::create_root_in_feature_with(
+            &fixture.state,
+            &platform,
+            &observer,
+            &folder,
+            RootKind::ScratchRun,
+            super::MarkerArea::identity("scratch", "run"),
+            super::ActivityIo {
+                write: after_rename,
+                ..super::ActivityIo::real()
+            },
+        )
+        .expect_err("the activity publish fails after its rename");
+        let root_id = error.detail()["root_id"]
+            .as_str()
+            .expect("the report names the root")
+            .to_owned();
+        let path = folder.path.join(&root_id);
+        assert_created_root_kept(&fixture, &path, &root_id, &error);
+        assert_eq!(error.detail()["removed"], true);
+        assert_eq!(
+            read_activity(&fixture.state, &observer, &root_id)
+                .expect("the record reads")
+                .state,
+            ActivityStateName::Missing
+        );
     }
 
     #[test]
