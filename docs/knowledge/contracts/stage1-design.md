@@ -952,7 +952,13 @@ bound and empty for this unit; the unit's device, inode and kind equal to the
 observation the caller was given; its marker, when it records one, still holding
 exactly the bytes the caller observed at its family's own filename, and a unit
 that records no marker carrying none of the three recognised families; the
-volume verified; and no pending intent naming another unit. The scan classifies every candidate from the kernel's own process table by
+volume verified; and no pending intent on the unit's own path. A pending
+intent's scope is its path, not the whole state directory: an intent for the unit
+itself, for an ancestor of it, or for anything inside it means a deletion is in
+flight over the same bytes and makes custody `Unknown`, while an intent for an
+unrelated unit on the same volume (or any unit on another volume or under another
+`root_dir`) never blocks this one (Supervisor decision `698d9ba3`, barge#025). The
+scan classifies every candidate from the kernel's own process table by
 its effective uid **before** it inspects any descriptor: a process of another
 effective uid is counted and reported in the evidence as not observed, which is
 the named blind spot and does not block `Safe`; only this account's processes

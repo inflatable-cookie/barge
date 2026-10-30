@@ -837,13 +837,20 @@ fn decide_root(
         },
         None => (area::HoldReading::empty(), None),
     };
-    let stored = match &owned_root_id {
-        Some(id) => identity::read(state_paths, dirs, id, uid).ok().flatten(),
-        None => None,
+    // The record is the one this listed root's id names: the marker's id when the
+    // marker is owned (an adopted root's folder is not its id), otherwise the
+    // directory's own name when that is a root id. Either way the record is then
+    // bound to this path, never to whatever path the record itself names.
+    let stored = match (&owned_root_id, state::is_identifier(&root.name)) {
+        (Some(id), _) => identity::read(state_paths, dirs, id, uid).ok().flatten(),
+        (None, true) => identity::read(state_paths, dirs, &root.name, uid)
+            .ok()
+            .flatten(),
+        (None, false) => None,
     };
-    let mount_relative_path = stored.as_ref().map_or(mount_relative_path, |record| {
-        record.mount_relative_path.clone()
-    });
+    // The row reports the path this plan observed, never the record's stored one:
+    // a record that names another path is a mismatch to report, not a path to
+    // adopt.
     // The root was opened, so it is a real directory; a symbolic link never
     // reaches this point, because opening it no-follow would have been refused.
     let activity = area::scan_activity(dirs, &handle, None, state::now_ms());
@@ -858,16 +865,7 @@ fn decide_root(
     let mut blockers: Vec<(&'static str, String)> = Vec::new();
 
     // Condition 2: the durable identity.
-    let identity = identity_evidence(
-        state_paths,
-        dirs,
-        facts,
-        mounts,
-        uid,
-        &root_id,
-        &locked,
-        stored.as_ref(),
-    );
+    let identity = identity_evidence(facts, uid, root, resolved, &locked, stored.as_ref());
     if identity.verdict != "verified" {
         blockers.push((
             "identity",
@@ -1089,12 +1087,10 @@ impl LockedObservation {
 /// The identity evidence for one root, from the durable record and the walk.
 #[allow(clippy::too_many_arguments)]
 fn identity_evidence(
-    state_paths: &StatePaths,
-    dirs: &dyn DirOps,
     facts: &dyn AbsenceVolume,
-    mounts: &dyn MountRoot,
     uid: u32,
-    root_id: &str,
+    root: &area::RootName,
+    resolved: &area::ResolvedArea,
     locked: &LockedObservation,
     stored: Option<&crate::identity::RootIdentity>,
 ) -> IdentityEvidence {
@@ -1102,7 +1098,82 @@ fn identity_evidence(
     let inode = stored.map_or(Some(locked.identity.inode), |record| Some(record.inode));
     let device_at_record = stored.map(|record| record.device_at_record);
     let device_live = Some(locked.identity.device.get());
-    match identity::verify(state_paths, dirs, facts, mounts, uid, root_id) {
+    // The verdict is this listed root's, bound to its durable record: the record's
+    // path below the mount, its inode, and its marker's root id, nonce, kind and
+    // area are all compared against what was just observed **at this path**. It is
+    // never the verdict for whatever path the record happens to name — a copied
+    // root that reuses an original's id in another area is kept, not verified.
+    let listed_relative = relative_to_mount(&root.path, &resolved.mount_point);
+    let verdict = match (stored, &locked.marker_state) {
+        // A record whose path is not this listed path describes another directory:
+        // a copied root that reuses an original's id in another folder is exactly
+        // this case, and it is kept on its own path rather than verified on the
+        // original's.
+        (Some(record), _) if record.mount_relative_path != listed_relative => {
+            IdentityVerdict::Unknown {
+                reason: IdentityReason::PathChanged,
+            }
+        }
+        (Some(record), area::MarkerState::Owned(marker)) => {
+            let Ok(record_uuid) = crate::os::VolumeUuid::parse(&record.volume_uuid) else {
+                return IdentityEvidence {
+                    verdict: "unknown".to_owned(),
+                    reason: Some(identity_reason(IdentityReason::IdentityRecordInvalid).to_owned()),
+                    inode,
+                    device_at_record,
+                    device_live,
+                    remount: None,
+                    mount_moved: None,
+                    marker_digest,
+                };
+            };
+            let matching_mounts = match facts.mount_census(&record_uuid) {
+                Ok(mounts) => mounts.len(),
+                // An unavailable census is unknown, never "no mount".
+                Err(_) => {
+                    return IdentityEvidence {
+                        verdict: "unknown".to_owned(),
+                        reason: Some(identity_reason(IdentityReason::VolumeUnverified).to_owned()),
+                        inode,
+                        device_at_record,
+                        device_live,
+                        remount: None,
+                        mount_moved: None,
+                        marker_digest,
+                    }
+                }
+            };
+            identity::compare(
+                record,
+                &crate::identity::RootObservation {
+                    matching_mounts,
+                    volume_uuid: record_uuid.as_str().to_owned(),
+                    mount: resolved.mount_point.clone(),
+                    device: locked.identity.device.get(),
+                    inode: locked.identity.inode,
+                    root_uid: uid,
+                    effective_uid: uid,
+                    root_id: marker.root_id.clone(),
+                    nonce: marker.nonce.clone(),
+                    mount_relative_path: relative_to_mount(&root.path, &resolved.mount_point),
+                    kind: marker.kind,
+                    area: marker.area.clone(),
+                },
+            )
+        }
+        // The record exists, but this path's marker is not an owned marker: there is
+        // nothing at this path that says it is that root.
+        (Some(_), area::MarkerState::Absent) => IdentityVerdict::Unknown {
+            reason: IdentityReason::MarkerAbsent,
+        },
+        (Some(_), area::MarkerState::Unknown { .. }) => IdentityVerdict::Unknown {
+            reason: IdentityReason::MarkerUnreadable,
+        },
+        (None, _) => IdentityVerdict::Unknown {
+            reason: IdentityReason::IdentityRecordMissing,
+        },
+    };
+    match verdict {
         IdentityVerdict::Verified {
             remount,
             mount_moved,
@@ -2517,6 +2588,150 @@ mod tests {
             observed.borrow()
         );
         drop(held);
+    }
+
+    /// Publish one pending intent for a unit in this fixture's area.
+    fn publish_pending_intent(
+        fixture: &Fixture,
+        folder: &str,
+        name: &str,
+        root_id: &str,
+    ) -> state::IntentRecord {
+        let mut locks = state::LockSet::with_deadline(
+            fixture.volume.state.clone(),
+            Deadline::after(Duration::from_secs(5)),
+        );
+        let write = locks.begin_intent_write().expect("the intent step");
+        let now = crate::state::now_ms();
+        let intent = state::IntentRecord {
+            schema: crate::contract::INTENT_SCHEMA.to_owned(),
+            intent_id: "9".repeat(32),
+            volume_uuid: fixture.volume.uuid.clone(),
+            mount_hint: fixture.volume.root.clone(),
+            root_dir: String::new(),
+            folder: folder.to_owned(),
+            unit: state::IntentUnit {
+                parent: String::new(),
+                name: name.to_owned(),
+                kind: crate::unit::UnitKind::Directory,
+                device: fixture.volume.device.get(),
+                inode: 1,
+                marker: Some(crate::unit::UnitMarker::new(
+                    crate::unit::MarkerFamily::Barge,
+                    "0".repeat(64),
+                )),
+                capture_name: format!(".barge-prune-{}", "9".repeat(32)),
+                grant: crate::unit::UnitGrant::native_root(root_id.to_owned()),
+            },
+            plan_digest: "0".repeat(64),
+            phase: state::IntentPhase::Intent,
+            generation: 1,
+            recorded_ms: now,
+            phase_ms: now,
+            captures: Vec::new(),
+            foreign_captures: Vec::new(),
+        };
+        state::publish_intent(&write, &fixture.volume.state, &intent)
+            .expect("the intent publishes");
+        intent
+    }
+
+    #[test]
+    fn a_pending_intent_only_affects_its_own_path() {
+        // Supervisor decision 698d9ba3: another unit's pending intent is that
+        // unit's business, so an unrelated root of the same area still plans; an
+        // intent inside a root's own path keeps that root alone.
+        let fixture = Fixture::new("release-intent-scope");
+        let first = fixture.root();
+        let second = fixture.root();
+        publish_pending_intent(&fixture, "pool", &second.root_id, &second.root_id);
+        let report = fixture.plan();
+        let released = row(&report, &first);
+        assert!(released.eligible, "{released:?}");
+        let waiting = row(&report, &second);
+        assert!(!waiting.eligible);
+        assert_eq!(waiting.blocked_by.as_deref(), Some("custody"));
+        assert_eq!(report.plan.eligible_count, 1);
+
+        // An intent whose unit sits inside the first root's path: that root waits,
+        // and the unrelated second root's own intent still keeps only itself.
+        let fixture = Fixture::new("release-intent-nested");
+        let outer = fixture.root();
+        let other = fixture.root();
+        publish_pending_intent(
+            &fixture,
+            &format!("pool/{}", outer.root_id),
+            "nested",
+            "nested",
+        );
+        let report = fixture.plan();
+        let kept = row(&report, &outer);
+        assert!(!kept.eligible, "{kept:?}");
+        assert_eq!(kept.blocked_by.as_deref(), Some("custody"));
+        assert!(row(&report, &other).eligible);
+    }
+
+    #[test]
+    fn a_copied_root_id_in_another_area_is_not_verified() {
+        // The counterfactual: copy a root — marker and durable record included —
+        // into another area under the same directory name. The record names the
+        // original path, so the copied root must be kept by its own path and inode,
+        // never reported as verified on the original's record. The original area
+        // still releases its root, which proves the difference is the binding.
+        let fixture = Fixture::new("release-copied-id");
+        let original = fixture.root();
+        let mut other = fixture.declaration.clone();
+        other.area = "second".to_owned();
+        other.folder = "second".to_owned();
+        area::declare(&fixture.volume.state, &other, 2_000).expect("the second area");
+        let second_folder = fixture.volume.root.join(&other.folder);
+        std::fs::create_dir_all(&second_folder).expect("the second folder");
+        let copy = second_folder.join(&original.root_id);
+        std::fs::create_dir(&copy).expect("the copied root");
+        for entry in std::fs::read_dir(&original.path).expect("the original lists") {
+            let entry = entry.expect("an entry");
+            std::fs::copy(entry.path(), copy.join(entry.file_name())).expect("the entry is copied");
+        }
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o700))
+            .expect("the copy is private");
+        let marker = copy.join(area::ROOT_MARKER_FILE);
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600))
+            .expect("the copied marker is private");
+
+        // The original area releases its root.
+        let report = fixture.plan();
+        assert!(row(&report, &original).eligible);
+
+        // The second area's plan sees the copy under the same id and keeps it.
+        let request = ReleaseRequest {
+            namespace: "example",
+            area: "second",
+            ..fixture.request(fixture.overdue())
+        };
+        let mounts = fixture.volume.mounts();
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let report = plan(
+            &fixture.volume.state,
+            &fixture.volume.platform(),
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.account,
+            &request,
+        )
+        .expect("the second area plans");
+        assert_eq!(report.plan.rows.count, 1);
+        let kept = &report.plan.rows.rows[0];
+        assert_eq!(kept.root_id, original.root_id, "the same id is listed");
+        assert!(!kept.eligible, "{kept:?}");
+        assert_eq!(kept.blocked_by.as_deref(), Some("identity"));
+        assert_eq!(kept.identity.reason.as_deref(), Some("path_changed"));
+        assert_eq!(
+            kept.mount_relative_path,
+            format!("second/{}", original.root_id)
+        );
+        assert_eq!(report.plan.eligible_count, 0);
     }
 
     /// Rename a created root's directory and rewrite its marker so the marker is

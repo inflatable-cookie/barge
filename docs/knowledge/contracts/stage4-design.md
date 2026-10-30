@@ -1050,6 +1050,21 @@ only for a volume that verified, the command document's `volume.state` records
 that it did, and an attached volume that fails to verify is a refused command
 rather than a plan whose rows all say "kept".
 
+Condition 3's pending intents are scoped to the unit's own path, as the custody
+protocol now says: an intent for this unit, an ancestor of it or something inside
+it makes custody `Unknown`, while an unrelated unit's intent — on the same volume
+or another — never blocks this row (Supervisor decision `698d9ba3`). One
+undecidable object never blocks an unrelated one here either.
+
+The row's identity is the **listed** root's, bound to its durable record: the
+record is looked up by this root's id (the marker's for an adopted root, else the
+directory's own name when that is a root id), and then its `mount_relative_path`,
+its inode and its marker's root id, nonce, kind and area are compared against what
+was just observed at this path under this root's lock. A record that names another
+path is a `path_changed` mismatch — a copied root that reuses an original's id in
+a second area is kept, never verified on the original's record — and the row
+always reports the path it observed rather than the record's stored one.
+
 What the rows carry. Each row is one root the area listing found, in listing
 order, and it carries conditions 2 to 6 whether or not it is eligible:
 `root_id`, `mount_relative_path`, `identity` (the durable verdict, its reason
