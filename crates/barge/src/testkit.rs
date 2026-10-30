@@ -623,6 +623,10 @@ pub struct Faults {
     /// A one-shot pause immediately before a directory listing, so a scan's own
     /// deadline can expire while it is listing.
     pub sleep_before_listing: RefCell<Option<std::time::Duration>>,
+    /// A one-shot pause immediately before a directory *children* listing only:
+    /// `list_names` is left alone, so a caller that enumerates names first can
+    /// place the pause inside a nested walk instead.
+    pub sleep_before_children_listing: RefCell<Option<std::time::Duration>>,
     /// A modification time every *listing* reports instead of the real one, so an
     /// earlier observation can be stale while the directory's own descriptor facts
     /// stay current.
@@ -780,6 +784,11 @@ impl Faults {
     /// Pause once, immediately before the next directory listing.
     pub fn sleeping_before_listing(&self, pause: std::time::Duration) {
         *self.sleep_before_listing.borrow_mut() = Some(pause);
+    }
+
+    /// Pause once, immediately before the next directory *children* listing.
+    pub fn sleeping_before_children_listing(&self, pause: std::time::Duration) {
+        *self.sleep_before_children_listing.borrow_mut() = Some(pause);
     }
 
     /// Report this modification time in every listing, leaving each directory's own
@@ -1283,6 +1292,9 @@ impl DirOps for Faults {
     }
 
     fn list_children(&self, parent: &DirHandle, max_names: usize) -> Result<ChildListing> {
+        if let Some(pause) = self.sleep_before_children_listing.borrow_mut().take() {
+            std::thread::sleep(pause);
+        }
         if self.arm_after_mode.get() && self.fail_listing_after_mode.get() {
             self.arm_after_mode.set(false);
             return Err(Error::new(

@@ -1659,8 +1659,11 @@ and T6, and this slice claims no native proof.
   and scopes index only: every entry it names is observed again under its own
   lock, and a native entry is a candidate only when the sweep's own expiry
   predicate also accepted it, so a nested-marker veto cannot be bypassed. Every
-  shared wait is bounded by the plan's own lock budget (`lock_wait`, the state
-  directory's own `LOCK_WAIT` by default). A busy root is a kept row in state
+  shared wait is bounded by **both** the plan's own lock budget (`lock_wait`, the
+  state directory's own `LOCK_WAIT` by default) and what is left of the plan's
+  wall clock: a lock taken near the deadline is refused at the deadline rather
+  than extending the plan, and an adopted root's second wait shares the same
+  remaining budget. A busy root is a kept row in state
   `locked` with no observation, and every other root still plans. A volume lock a
   live owner holds past that budget refuses the plan with `locked`, names the
   volume and its lock file, and changes nothing. A lock file that does not exist
@@ -1713,9 +1716,14 @@ and T6, and this slice claims no native proof.
   never drop an older root in favour of a younger one. The kept list is bounded
   too, and each participation row counts every decision it made even after that
   output bound was reached; the report's `truncated` covers candidate, kept and
-  listing overflow, and every count reports the volume's real total. The lock
-  budget is the plan's own per-lock wait, so a busy root never consumes the
-  whole wall clock. A bound reached sets `truncated`, records `truncated_reason`, counts
+  listing overflow, and every count reports the volume's real total. Every nested
+  bounded step receives **what remains of the wall**, never a fresh allowance:
+  each shared lock wait, the scratch sweep and the per-root bytes scan all stop at
+  the plan's own deadline, so one busy root, one large scan or one long scratch
+  walk cannot extend the plan past its 10 s. Only a single uninterruptible
+  platform call can overrun the deadline by its own duration; the step then
+  reports itself incomplete and its object is kept. A bound reached sets
+  `truncated`, records `truncated_reason`, counts
   `unreached` root rows, and turns the areas it never reached into `unreached`
   participation rows. A truncated plan says what it did not reach; it never
   presents a short plan as a whole one.
@@ -1736,8 +1744,11 @@ and T6, and this slice claims no native proof.
   bytes cannot be counted kept while other roots still plan; a failed area
   reported as `unknown` while another area still plans; a busy root kept in state
   `locked` while the other roots still plan, a shared observer's root lock not
-  blocking the plan, and a busy volume lock refusing the plan while a shared one
-  does not; an undeclared policy, an undeclared durability, a `kept` volume and
+  blocking the plan, a busy volume lock refusing the plan while a shared one does
+  not, a busy root whose lock budget exceeds the plan's wall being refused at
+  that wall rather than extending it, and a bytes scan that outlives the
+  remaining wall being reported incomplete with its root kept; an undeclared
+  policy, an undeclared durability, a `kept` volume and
   an absent volume each refused; and
   scratch's concluded-and-released root planned while the expiry sweep's own age
   still keeps it, an unconcluded root kept, a symbolic link and a foreign family

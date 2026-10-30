@@ -34,6 +34,18 @@ pub const SPACE_PRUNE_PLAN_SCHEMA: &str = "barge.space.prune.plan/1";
 /// How long one candidate plan may take (stage 3 design, "Bounded resources").
 pub const SPACE_PLAN_WALL: Duration = Duration::from_secs(10);
 
+/// One shared-lock wait, bounded by both the plan's own lock budget and what is
+/// left of the plan's wall clock.
+///
+/// A fresh `lock_wait` per call would let a lock taken near the end of the wall
+/// extend the preview past its advertised bound; carrying ruling `6ac32f24`
+/// requires every shared wait inside the run's deadline. A zero remaining budget
+/// is already expired, so a busy object at the wall boundary is refused at once.
+fn lock_deadline(deadline: Instant, lock_wait: Duration) -> Deadline {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    Deadline::after(remaining.min(lock_wait))
+}
+
 /// Measurements at the time of the report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceReport {
@@ -443,7 +455,10 @@ pub fn plan(
     // registration write is never blocked by a preview, and a real prune of this
     // volume cannot interleave with it.
     let (record, declarations) = {
-        let mut locks = LockSet::with_deadline(paths.clone(), Deadline::after(request.lock_wait));
+        let mut locks = LockSet::with_deadline(
+            paths.clone(),
+            lock_deadline(started + request.wall, request.lock_wait),
+        );
         let _registry_lock = locks.observe_registry()?;
         let record = area::registered_volume(paths, request.volume_uuid)?;
         let declarations = area::read_declarations(paths)?;
@@ -478,7 +493,10 @@ pub fn plan(
     // wait refuses the plan with `locked` and names the volume's lock file. A
     // root that is busy is a different answer: it keeps that root alone.
     let volume_lock = {
-        let mut locks = LockSet::with_deadline(paths.clone(), Deadline::after(request.lock_wait));
+        let mut locks = LockSet::with_deadline(
+            paths.clone(),
+            lock_deadline(started + request.wall, request.lock_wait),
+        );
         match locks.observe_volume(&record.volume_uuid) {
             Ok(lock) => lock,
             Err(error) => {
@@ -838,6 +856,12 @@ impl Planner<'_> {
         false
     }
 
+    /// One shared-lock wait, bounded by the plan's deadline as well as its own
+    /// lock budget.
+    fn lock_deadline(&self) -> Deadline {
+        lock_deadline(self.deadline, self.lock_wait)
+    }
+
     /// Record one candidate, keeping only the oldest `ROOT_ROWS` in delete order
     /// while still counting every candidate the volume held.
     fn add_candidate(&mut self, candidate: Candidate) {
@@ -897,8 +921,7 @@ impl Planner<'_> {
         path: &Path,
     ) -> std::result::Result<ObservedEntry, EvidenceError> {
         let name_lock = {
-            let mut locks =
-                LockSet::with_deadline(self.paths.clone(), Deadline::after(self.lock_wait));
+            let mut locks = LockSet::with_deadline(self.paths.clone(), self.lock_deadline());
             if state::is_identifier(name) {
                 locks.observe_root(name)
             } else {
@@ -943,8 +966,7 @@ impl Planner<'_> {
         let first_id = marker_root_id(&marker);
         if let Some(id) = first_id.as_deref() {
             if id != name && state::is_identifier(id) {
-                let mut locks =
-                    LockSet::with_deadline(self.paths.clone(), Deadline::after(self.lock_wait));
+                let mut locks = LockSet::with_deadline(self.paths.clone(), self.lock_deadline());
                 match locks.observe_root(id) {
                     Ok(lock) => root_id_lock = lock,
                     Err(error) => {
@@ -981,7 +1003,16 @@ impl Planner<'_> {
     /// handle whose own lock is held. An incomplete scan keeps the root: unknown
     /// bytes are never taken as zero.
     fn scan_bytes(&self, handle: &DirHandle) -> std::result::Result<u64, String> {
-        let scan = area::scan_activity(self.dirs, handle, self.now_ms);
+        // The scan gets what is left of the plan's wall, never its own fixed
+        // five-second allowance: a plan that is nearly out of time must not spend
+        // it on one root's subtree.
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        let scan = area::scan_activity_within(
+            self.dirs,
+            handle,
+            self.now_ms,
+            remaining.min(area::ACTIVITY_WALL),
+        );
         if !scan.complete {
             return Err(format!(
                 "the root's bytes could not be counted completely: {}",
@@ -1340,9 +1371,11 @@ impl Planner<'_> {
             });
             return;
         }
+        // The sweep is a nested walk too, so it gets the remaining wall rather
+        // than a fresh copy of the plan's full window.
         let bounds = SweepBounds {
             examine: scratch::SWEEP_EXAMINE,
-            timeout: self.wall,
+            timeout: self.deadline.saturating_duration_since(Instant::now()),
         };
         let plan = match scratch::pressure_plan(
             self.paths,
@@ -1880,11 +1913,22 @@ mod tests {
     }
 
     fn plan_request(volume: &VolumeUuid, now_ms: u64) -> SpacePruneRequest<'_> {
+        plan_request_with(volume, now_ms, SPACE_PLAN_WALL, crate::state::LOCK_WAIT)
+    }
+
+    /// A request with an explicit wall and lock budget, so a test can put the
+    /// plan's deadline next to a busy lock or a slow nested walk.
+    fn plan_request_with<'a>(
+        volume: &'a VolumeUuid,
+        now_ms: u64,
+        wall: std::time::Duration,
+        lock_wait: std::time::Duration,
+    ) -> SpacePruneRequest<'a> {
         SpacePruneRequest {
             volume_uuid: volume,
             now_ms,
-            wall: SPACE_PLAN_WALL,
-            lock_wait: crate::state::LOCK_WAIT,
+            wall,
+            lock_wait,
         }
     }
 
@@ -1894,12 +1938,7 @@ mod tests {
         now_ms: u64,
         lock_wait: std::time::Duration,
     ) -> SpacePruneRequest<'a> {
-        SpacePruneRequest {
-            volume_uuid: volume,
-            now_ms,
-            wall: SPACE_PLAN_WALL,
-            lock_wait,
-        }
+        plan_request_with(volume, now_ms, SPACE_PLAN_WALL, lock_wait)
     }
 
     #[test]
@@ -2627,6 +2666,131 @@ mod tests {
         drop(shared);
         assert_eq!(report.plan.candidates.rows.len(), 1);
         assert_eq!(report.plan.candidates.rows[0].root_id, root.root_id);
+    }
+
+    #[test]
+    fn a_shared_wait_is_bounded_by_the_plan_wall_as_well_as_the_lock_budget() {
+        let past = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("a monotonic instant a second ago");
+        assert!(
+            lock_deadline(past, std::time::Duration::from_secs(30)).expired(),
+            "a wait that starts after the plan deadline is already over"
+        );
+        let future = Instant::now() + std::time::Duration::from_millis(50);
+        let bounded = lock_deadline(future, std::time::Duration::from_secs(30));
+        assert!(
+            bounded.remaining() <= std::time::Duration::from_millis(50),
+            "the wait may not outlast the plan's wall"
+        );
+        let budget = lock_deadline(
+            Instant::now() + std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(20),
+        );
+        assert!(
+            budget.remaining() <= std::time::Duration::from_millis(20),
+            "the wait may not outlast its own lock budget either"
+        );
+    }
+
+    #[test]
+    fn a_busy_root_near_the_plan_deadline_does_not_extend_the_wall() {
+        let fixture = VolumeFixture::new("space-plan-deadline-lock");
+        let record = policy_record(&fixture, 16, 4);
+        let observer = fixture.observer();
+        let pool = declaration("pool", "example/pool", ReserveParticipation::Counts);
+        area::declare(&fixture.state, &pool, 1).expect("the area declares");
+        let (root, _) = fixture.create_root(&record, &pool, RootKind::AreaRoot);
+        release_at(&fixture, &observer, &root.root_id, 1_000, 500);
+
+        let mut locks = LockSet::new(fixture.state.clone());
+        let held = locks
+            .lock_root(&root.root_id)
+            .expect("the fixture holds the root lock");
+        // A huge lock budget must not become the wait: only what is left of the
+        // plan's wall bounds it, so the busy root is refused at the deadline.
+        let started = Instant::now();
+        let report = plan(
+            &fixture.state,
+            &fixture.platform(),
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &Injected(true),
+            &plan_request_with(
+                &fixture.uuid,
+                test_now(),
+                std::time::Duration::from_millis(150),
+                std::time::Duration::from_secs(30),
+            ),
+        )
+        .expect("the plan is built");
+        let elapsed = started.elapsed();
+        drop(held);
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the busy root's wait is bounded by the remaining wall, not by the lock budget: {elapsed:?}"
+        );
+        assert_eq!(report.candidates, 0);
+        let row = report
+            .kept
+            .rows
+            .iter()
+            .find(|row| row.name == root.root_id)
+            .expect("the busy root is kept");
+        assert_eq!(row.state, "locked");
+        assert!(row.reason.contains("own lock"), "{}", row.reason);
+    }
+
+    #[test]
+    fn a_bytes_scan_is_bounded_by_the_plan_remaining_wall() {
+        let fixture = VolumeFixture::new("space-plan-deadline-scan");
+        let record = policy_record(&fixture, 16, 4);
+        let observer = fixture.observer();
+        let pool = declaration("pool", "example/pool", ReserveParticipation::Counts);
+        area::declare(&fixture.state, &pool, 1).expect("the area declares");
+        let (root, _) = fixture.create_root(&record, &pool, RootKind::AreaRoot);
+        release_at(&fixture, &observer, &root.root_id, 1_000, 500);
+
+        // The scan's first listing takes far longer than the plan's wall, so a
+        // scan that were given its own five-second allowance would finish and
+        // plan the root. The remaining budget is what it gets, so the scan is
+        // incomplete and the root is kept.
+        let faults = Faults::new();
+        faults.sleeping_before_children_listing(std::time::Duration::from_millis(1_500));
+        let started = Instant::now();
+        let report = plan(
+            &fixture.state,
+            &faults,
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &Injected(true),
+            &plan_request_with(
+                &fixture.uuid,
+                test_now(),
+                std::time::Duration::from_millis(500),
+                crate::state::LOCK_WAIT,
+            ),
+        )
+        .expect("the plan is built");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "the nested scan does not add its own five-second allowance: {elapsed:?}"
+        );
+        assert_eq!(report.candidates, 0);
+        let row = report
+            .kept
+            .rows
+            .iter()
+            .find(|row| row.name == root.root_id)
+            .expect("the root is kept");
+        assert!(
+            row.reason.contains("bytes could not be counted"),
+            "the scan's own bound is the plan's remaining wall: {}",
+            row.reason
+        );
     }
 
     #[test]
