@@ -1657,8 +1657,8 @@ and T6, and this slice claims no native proof.
   marker, then takes the marker's root-id lock too and re-reads the marker; an id
   that changed between the two reads keeps the root. The scratch sweep is a names
   and scopes index only: every entry it names is observed again under its own
-  lock, and a native entry is a candidate only when the sweep's own expiry
-  predicate also accepted it, so a nested-marker veto cannot be bypassed. Every
+  lock, and the expiry predicate — including its nested-marker walk — is
+  re-evaluated there rather than carried over from the sweep. Every
   shared wait is bounded by **both** the plan's own lock budget (`lock_wait`, the
   state directory's own `LOCK_WAIT` by default) and what is left of the plan's
   wall clock: a lock taken near the deadline is refused at the deadline rather
@@ -1694,9 +1694,13 @@ and T6, and this slice claims no native proof.
   `nested_scope: exclusive`, `kept_reason: evidence` — with the age requirement
   relaxed to "idle now" (O-015). An unconcluded, negative, retained, unclosed,
   hosting, non-exclusive or nested-marker root is kept whatever its age, and a
-  live or undecidable hold keeps it too. `scratch::pressure_plan` is that plan:
-  the expiry classification with only the native age relaxed. A foreign family is
-  never a candidate, so it can never consume the candidate capacity a native root
+  live or undecidable hold keeps it too. `scratch::pressure_plan` supplies the
+  entry names, their scopes and the walk's bounds; its own eligibility is **not**
+  used. Every entry is observed under its own root lock, and
+  `scratch::pressure_eligible` re-decides the marker, the four conclusion facts
+  and the nested-marker walk there, so a marker that appears in the tree between
+  the sweep and the locked observation keeps the root. A foreign family is never
+  a candidate, so it can never consume the candidate capacity a native root
   needs, and every entry the sweep cannot classify — a foreign family, a
   symbolic link, a quarantine leaf, an unreadable project folder, an unmarked
   entry — is reported as a kept row with its reason instead of disappearing from
@@ -1746,9 +1750,10 @@ and T6, and this slice claims no native proof.
   `locked` while the other roots still plan, a shared observer's root lock not
   blocking the plan, a busy volume lock refusing the plan while a shared one does
   not, a busy root whose lock budget exceeds the plan's wall being refused at
-  that wall rather than extending it, and a bytes scan that outlives the
-  remaining wall being reported incomplete with its root kept; an undeclared
-  policy, an undeclared durability, a `kept` volume and
+  that wall rather than extending it, a bytes scan that outlives the remaining
+  wall being reported incomplete with its root kept, and a nested marker that
+  appears between the scratch sweep and the locked observation keeping the root;
+  an undeclared policy, an undeclared durability, a `kept` volume and
   an absent volume each refused; and
   scratch's concluded-and-released root planned while the expiry sweep's own age
   still keeps it, an unconcluded root kept, a symbolic link and a foreign family

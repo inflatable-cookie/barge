@@ -1733,9 +1733,11 @@ pub fn sweep(
 /// candidate capacity a native root needs, but they are still reported as kept
 /// rows: an entry this plan cannot classify must not disappear from it.
 ///
-/// The pressure idleness matrix still decides each root against its activity
-/// record and holds; that step belongs to the caller, which is why this plan
-/// alone authorizes nothing.
+/// This plan is an index, not evidence: its eligibility is not carried into the
+/// pressure decision. The caller observes each row under its own root lock and
+/// calls [`pressure_eligible`] there, which re-decides the marker, the four
+/// conclusion facts and the nested-marker walk, so a fact that changed between
+/// the sweep and the lock cannot authorize a candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PressurePlan {
     /// The native runs that passed the expiry predicate with its age relaxed.
@@ -1754,7 +1756,8 @@ pub struct PressurePlan {
 /// Plan the native scratch runs the pressure predicate may yield.
 ///
 /// It creates and deletes nothing, and it never deletes: the caller turns a row
-/// into a candidate only after its own idleness and identity checks.
+/// into a candidate only after observing it under its own root lock and
+/// re-deciding the expiry predicate there with [`pressure_eligible`].
 #[allow(clippy::too_many_arguments)]
 pub fn pressure_plan(
     state_paths: &StatePaths,
@@ -1796,6 +1799,103 @@ pub fn pressure_plan(
         kept: plan.kept,
         examined: plan.examined,
     })
+}
+
+/// Whether one already-opened native scratch root satisfies the expiry
+/// predicate with its age relaxed to "idle now".
+///
+/// The caller holds the root's own shared lock, so the marker, the conclusion
+/// facts and the nested-marker walk all describe one moment. This is what keeps
+/// the pressure plan from deciding a root on a sweep that ran before the lock: a
+/// marker that appeared in the tree in between is found here and keeps the root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeEligibility {
+    /// Whether every fact the expiry predicate needs positively holds.
+    pub eligible: bool,
+    /// Why it does not, when it does not.
+    pub reason: String,
+    /// The marker digest the predicate read, when the marker verified. A caller
+    /// that already read a digest under the same lock compares this with its own.
+    pub marker_digest: Option<String>,
+}
+
+impl NativeEligibility {
+    /// A root the expiry predicate keeps.
+    fn kept(reason: String) -> Self {
+        Self {
+            eligible: false,
+            reason,
+            marker_digest: None,
+        }
+    }
+}
+
+/// Decide one native scratch root against the expiry predicate, age relaxed,
+/// under the caller's root lock.
+#[allow(clippy::too_many_arguments)]
+pub fn pressure_eligible(
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    state_paths: &StatePaths,
+    record: &VolumeRecord,
+    name: &str,
+    path: &Path,
+    unit: &DirHandle,
+    expected_device: DeviceId,
+    now_ms: u64,
+) -> Result<NativeEligibility> {
+    let facts = dirs.dir_facts(unit)?;
+    let uid = observer.effective_uid()?;
+    if facts.uid != uid {
+        return Ok(NativeEligibility::kept(format!(
+            "the unit is owned by uid {}, not this account's {uid}",
+            facts.uid
+        )));
+    }
+    if facts.device != expected_device {
+        return Ok(NativeEligibility::kept(
+            "the unit is on another device".to_owned(),
+        ));
+    }
+    let ctx = SweepContext {
+        dirs,
+        observer,
+        state_paths,
+        record,
+        device: facts.device,
+        now_ms,
+        grants: &record.scratch_grants,
+        policy: SweepPolicy {
+            native_age_seconds: 0,
+            ..SweepPolicy::design()
+        },
+        native_only: true,
+    };
+    let mut budget = Budget::new(SweepBounds::default());
+    let scope = UnitScope::TopLevel;
+    match assess_native(&ctx, unit, path, name, &scope)? {
+        Assessed::Kept { reason, .. } => Ok(NativeEligibility::kept(reason)),
+        Assessed::Eligible(row, _) => {
+            // The nested-marker walk is the expiry predicate's evidence that the
+            // conclusion's exclusive scope is true of the tree, and it is read
+            // here, under the root lock, not carried over from the sweep.
+            if let Some(reason) = nested_marker_in_tree(
+                dirs,
+                unit,
+                area::ROOT_MARKER_FILE,
+                0,
+                Path::new(""),
+                &mut budget,
+            )? {
+                return Ok(NativeEligibility::kept(reason));
+            }
+            Ok(NativeEligibility {
+                eligible: true,
+                reason: String::new(),
+                marker_digest: Some(row.marker_digest),
+            })
+        }
+    }
 }
 
 /// Apply one `barge.scratch.plan/1` exactly as it stands, re-verifying each unit.

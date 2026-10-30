@@ -531,6 +531,7 @@ pub fn plan(
         mounts,
         observer,
         record: &record,
+        device: verified.identity().device,
         now_ms: request.now_ms,
         wall: request.wall,
         lock_wait: request.lock_wait,
@@ -819,6 +820,8 @@ struct Planner<'a> {
     mounts: &'a dyn MountRoot,
     observer: &'a dyn ProcessObserver,
     record: &'a VolumeRecord,
+    /// The verified volume's device, so an entry on another device is kept.
+    device: crate::os::DeviceId,
     now_ms: u64,
     wall: Duration,
     lock_wait: Duration,
@@ -1169,6 +1172,18 @@ impl Planner<'_> {
     /// Decide one area root from facts read under its own lock.
     fn decide_area(&mut self, label: &str, name: &str, observed: &ObservedEntry) {
         let path = Some(observed.path());
+        if observed.handle.identity().device != self.device {
+            let row = self.kept_row(
+                label,
+                name,
+                path,
+                observed.root_id.clone(),
+                "owned",
+                "the root is on another device than the verified volume".to_owned(),
+            );
+            self.keep(row);
+            return;
+        }
         if !matches!(observed.marker, MarkerState::Owned(_)) {
             let row = self.kept_row(
                 label,
@@ -1412,7 +1427,6 @@ impl Planner<'_> {
                 path: Some(row.path.clone()),
                 state: "native".to_owned(),
                 reason: None,
-                eligible: true,
             });
         }
         for row in &plan.kept.rows {
@@ -1421,7 +1435,6 @@ impl Planner<'_> {
                 path: row.path.clone(),
                 state: row.state.clone(),
                 reason: Some(row.reason.clone()),
-                eligible: false,
             });
         }
         let mut examined = 0u64;
@@ -1481,6 +1494,18 @@ impl Planner<'_> {
                 return;
             }
         };
+        if observed.handle.identity().device != self.device {
+            let row = self.kept_row(
+                label,
+                &entry.name,
+                Some(path),
+                observed.root_id.clone(),
+                "owned",
+                "the root is on another device than the verified volume".to_owned(),
+            );
+            self.keep(row);
+            return;
+        }
         let Some(owned) = observed.owned() else {
             let (state, reason) = match self.scratch_family(&observed.handle) {
                 Ok(family) => (
@@ -1592,18 +1617,55 @@ impl Planner<'_> {
             self.keep(row);
             return;
         }
-        if !entry.eligible {
-            let reason = entry.reason.clone().unwrap_or_else(|| {
-                "the expiry predicate keeps this run, so the pressure predicate never takes it"
-                    .to_owned()
-            });
+        // The sweep ran before this root's lock, so its eligibility is only a
+        // hint: the expiry predicate, its conclusion facts and its nested-marker
+        // walk are all re-evaluated here, under the lock, and a marker that
+        // appeared in the tree in between keeps the root.
+        let eligibility = match scratch::pressure_eligible(
+            self.dirs,
+            self.observer,
+            self.paths,
+            self.record,
+            &entry.name,
+            &path,
+            &observed.handle,
+            self.device,
+            self.now_ms,
+        ) {
+            Ok(eligibility) => eligibility,
+            Err(error) => {
+                let row = self.kept_row(
+                    label,
+                    &entry.name,
+                    Some(path),
+                    Some(root_id),
+                    "owned",
+                    format!("the root's expiry predicate could not be re-checked: {error}"),
+                );
+                self.keep(row);
+                return;
+            }
+        };
+        if !eligibility.eligible {
             let row = self.kept_row(
                 label,
                 &entry.name,
                 Some(path),
                 Some(root_id),
                 "owned",
-                reason,
+                eligibility.reason,
+            );
+            self.keep(row);
+            return;
+        }
+        if eligibility.marker_digest.as_deref() != Some(marker_digest.as_str()) {
+            let row = self.kept_row(
+                label,
+                &entry.name,
+                Some(path),
+                Some(root_id),
+                "owned",
+                "the root's marker changed while the expiry predicate was re-checked".to_owned(),
             );
             self.keep(row);
             return;
@@ -1685,7 +1747,6 @@ struct ScratchEntry {
     path: Option<PathBuf>,
     state: String,
     reason: Option<String>,
-    eligible: bool,
 }
 
 impl ObservedEntry {
@@ -2666,6 +2727,61 @@ mod tests {
         drop(shared);
         assert_eq!(report.plan.candidates.rows.len(), 1);
         assert_eq!(report.plan.candidates.rows[0].root_id, root.root_id);
+    }
+
+    #[test]
+    fn a_nested_marker_appearing_after_the_sweep_keeps_the_scratch_root() {
+        let fixture = VolumeFixture::new("space-plan-scratch-nested-race");
+        policy_record(&fixture, 16, 4);
+        let observer = fixture.observer();
+        let concluded = alloc_scratch(&fixture, &observer, "proj");
+        conclude_scratch(&fixture, &observer, "proj", &concluded.root_id);
+        area::release(&fixture.state, &observer, &concluded.root_id, "prover")
+            .expect("the owner hold releases");
+
+        // The sweep runs first and accepts the root. The nested marker then appears
+        // in the window between that sweep and the locked observation: it is planted
+        // when the planner opens the root under its own lock. A plan that trusted
+        // the sweep's earlier eligibility would still name the root.
+        let faults = Faults::new();
+        let run_path = concluded.path.clone();
+        let planted = std::cell::Cell::new(false);
+        faults.probing_open(move |path| {
+            if path == run_path.as_path() && !planted.replace(true) {
+                let nested = run_path.join("nested");
+                std::fs::create_dir(&nested).expect("the nested directory is made");
+                std::fs::write(
+                    nested.join(area::ROOT_MARKER_FILE),
+                    b"a marker that appeared after the sweep",
+                )
+                .expect("the nested marker is written");
+            }
+        });
+        let report = plan(
+            &fixture.state,
+            &faults,
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &Injected(true),
+            &plan_request(&fixture.uuid, test_now()),
+        )
+        .expect("the plan is built");
+        assert_eq!(
+            report.candidates, 0,
+            "a nested marker keeps the run even when the sweep accepted it first"
+        );
+        let row = report
+            .kept
+            .rows
+            .iter()
+            .find(|row| row.name == concluded.root_id)
+            .expect("the root is kept");
+        assert!(
+            row.reason.contains("recognised marker"),
+            "the nested marker is what keeps it: {}",
+            row.reason
+        );
     }
 
     #[test]
