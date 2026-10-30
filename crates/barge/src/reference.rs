@@ -511,24 +511,24 @@ impl OxideSnapshot {
     /// pool whose control directory holds an `outputs/` folder is the one this
     /// snapshot reads; nothing is created or repaired.
     pub fn read(account: &dyn AccountFacts) -> Self {
-        let control = match control_directory(account) {
+        Self::read_within(account, REFERENCE_WALL)
+    }
+
+    /// [`OxideSnapshot::read`] with an explicit wall clock, so a test can prove what
+    /// an observation that reached its own bound reports.
+    ///
+    /// The one deadline covers discovery *and* the registry and receipts: finding
+    /// Oxide's control directory is part of the observation, so time spent there is
+    /// time the bound has already spent. Nothing is concluded outside it — not even
+    /// "there is no control directory" or "the receipts folder is absent", because a
+    /// look that ran out of time did not see the whole world.
+    pub fn read_within(account: &dyn AccountFacts, wall: Duration) -> Self {
+        let deadline = Deadline::after(wall);
+        let control = match control_directory(account, deadline) {
             Ok(Some(control)) => control,
             Ok(None) => return Self::none(),
-            Err(reason) => {
-                let reason = reason.to_string();
-                return Self {
-                    control: None,
-                    registry: OxideRegistry::Unknown {
-                        reason: reason.clone(),
-                    },
-                    receipts: OxideReceipts::Unknown {
-                        reason: reason.clone(),
-                    },
-                    detail: Some(reason),
-                };
-            }
+            Err(reason) => return Self::unread(reason.to_string()),
         };
-        let deadline = Deadline::after(REFERENCE_WALL);
         let outputs = control.join(OXIDE_OUTPUTS_DIR);
         let registry = read_registry(&outputs.join(OXIDE_REGISTRY_FILE), deadline);
         let receipts = read_receipts(&outputs, deadline);
@@ -542,6 +542,26 @@ impl OxideSnapshot {
             registry,
             receipts,
             detail,
+        }
+    }
+
+    /// A snapshot the caller did not read, because the run's own wall clock was
+    /// already spent: unknown, never empty.
+    pub fn skipped(reason: String) -> Self {
+        Self::unread(reason)
+    }
+
+    /// A snapshot that could not be read at all: unknown, never empty.
+    fn unread(reason: String) -> Self {
+        Self {
+            control: None,
+            registry: OxideRegistry::Unknown {
+                reason: reason.clone(),
+            },
+            receipts: OxideReceipts::Unknown {
+                reason: reason.clone(),
+            },
+            detail: Some(reason),
         }
     }
 
@@ -757,10 +777,26 @@ fn row_names_root(row: &OxideRow, root_path: &Path) -> bool {
 /// reading an unreadable record as "no pools" would licence a release it should
 /// keep. Two control directories that both hold outputs are ambiguous for the
 /// same reason and are refused rather than picked between.
-fn control_directory(account: &dyn AccountFacts) -> Result<Option<PathBuf>> {
+fn control_directory(account: &dyn AccountFacts, deadline: Deadline) -> Result<Option<PathBuf>> {
+    if deadline.expired() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "finding Oxide's control directory did not finish inside its {REFERENCE_WALL:?} bound"
+            ),
+        ));
+    }
     let state_dir = account.tool_state_dir(crate::inspect::OXIDE_TOOL)?;
     let cache_dir = account.tool_cache_dir(crate::inspect::OXIDE_TOOL)?;
     let observations = crate::inspect::observe_oxide_at(&state_dir, &cache_dir);
+    if deadline.expired() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "finding Oxide's control directory did not finish inside its {REFERENCE_WALL:?} bound"
+            ),
+        ));
+    }
     if let crate::inspect::Observation::Unknown {
         path,
         detail,
@@ -1214,6 +1250,15 @@ fn read_receipts_with(
         }
     };
     if !outputs_state {
+        // "There is no receipts folder" is a complete look's conclusion: a look that
+        // ran out of time did not establish it.
+        if deadline.expired() {
+            return OxideReceipts::Unknown {
+                reason: format!(
+                    "deciding whether Oxide's receipts folder exists did not finish inside its {REFERENCE_WALL:?} bound"
+                ),
+            };
+        }
         return OxideReceipts::Absent;
     }
     // The bound is checked before anything is concluded, including an empty folder:
@@ -2628,6 +2673,41 @@ mod tests {
             found.is_err(),
             "a marker that vanished between observation and read was read as absent: {found:?}"
         );
+    }
+
+    #[test]
+    fn a_reference_observation_outside_its_bound_is_unknown() {
+        // The bound covers discovery and the registry and receipts alike, and nothing
+        // is concluded outside it — not even "there is no control directory" or "the
+        // receipts folder is absent", because a look that ran out of time did not see
+        // the whole world.
+        let fixture = crate::testkit::TempDir::new("reference-bound");
+        let account = crate::testkit::FakeAccount {
+            home: fixture.path().to_path_buf(),
+        };
+        let expired = OxideSnapshot::read_within(&account, Duration::ZERO);
+        assert!(!expired.complete(), "{expired:?}");
+        assert!(expired.detail.is_some());
+        assert!(expired.control.is_none(), "nothing was discovered");
+
+        // With a control directory and an `outputs/` folder present, an expired bound
+        // still leaves both readings unknown rather than absent or empty.
+        let outputs = fixture
+            .path()
+            .join("Library/Caches/oxide/build-pool")
+            .join(crate::inspect::OXIDE_CONTROL_DIR)
+            .join(OXIDE_OUTPUTS_DIR);
+        std::fs::create_dir_all(&outputs).expect("the outputs folder");
+        let expired = OxideSnapshot::read_within(&account, Duration::ZERO);
+        assert!(!expired.complete(), "{expired:?}");
+        assert!(matches!(expired.registry, OxideRegistry::Unknown { .. }));
+        assert!(matches!(expired.receipts, OxideReceipts::Unknown { .. }));
+
+        // The same account inside a real bound reads completely.
+        let read = OxideSnapshot::read_within(&account, REFERENCE_WALL);
+        assert!(read.complete(), "{read:?}");
+        assert!(matches!(read.registry, OxideRegistry::Absent));
+        assert!(matches!(read.receipts, OxideReceipts::Read(_)));
     }
 
     #[test]

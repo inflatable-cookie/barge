@@ -450,6 +450,17 @@ pub fn plan(
     account: &dyn crate::os::AccountFacts,
     request: &ReleaseRequest<'_>,
 ) -> Result<PruneReport> {
+    // The run's wall clock starts with the plan's own first work, not with the row
+    // loop: setup — the registry, the volume, the resolve, the enumeration and the
+    // reference snapshot — is part of the run the bound covers. No row is attempted
+    // inside the stop margin, so reaching the deadline reports the roots the plan did
+    // not reach instead of being killed in the middle of one.
+    let started = Instant::now();
+    let deadline = started
+        + request
+            .bounds
+            .wall
+            .saturating_sub(request.bounds.stop_margin);
     let records = read_registry(state_paths)?;
     let Some(record) = records
         .iter()
@@ -591,25 +602,27 @@ pub fn plan(
     // be changing, and the age decision is the stage 4 rule taken there too.
     let listing = area::list_names(dirs, &resolved, PLAN_ROOTS)?;
     let placements = BargeReferences::read(state_paths);
-    let oxide = OxideSnapshot::read(account);
+    // Setup has already spent part of the wall. If it spent all of it, the snapshot
+    // is not read at all — an observation that cannot finish inside its bound is
+    // unknown, not a complete empty one — and no root is attempted.
+    let setup_spent = Instant::now() >= deadline;
+    let oxide = if setup_spent {
+        OxideSnapshot::skipped(format!(
+            "the plan's {:?} wall clock was reached during its setup, so Oxide's records were not read",
+            request.bounds.wall
+        ))
+    } else {
+        OxideSnapshot::read(account)
+    };
     let pending = pending_intents(state_paths)?;
     let uid = observer.effective_uid()?;
 
-    // The run's own wall clock, from the moment its bounded work starts. No row is
-    // attempted inside the stop margin, so reaching it reports the roots the plan
-    // did not reach instead of being killed in the middle of one.
-    let started = Instant::now();
-    let deadline = started
-        + request
-            .bounds
-            .wall
-            .saturating_sub(request.bounds.stop_margin);
     let mut rows = Vec::new();
     let truncated = listing.truncated;
     let mut timed_out = false;
     let mut unreached = 0usize;
     for root in &listing.names {
-        if Instant::now() >= deadline {
+        if setup_spent || Instant::now() >= deadline {
             // Every listed root the wall clock stopped the plan before stays
             // unverified and kept, and the plan says how many there were.
             timed_out = true;
@@ -2775,6 +2788,55 @@ mod tests {
         assert!(!report.plan.timed_out);
         assert_eq!(report.plan.unreached_count, 0);
         assert_eq!(report.plan.eligible_count, 2);
+    }
+
+    #[test]
+    fn the_plans_wall_clock_covers_its_own_setup() {
+        // Setup is part of the run the wall covers: an enumeration that consumes the
+        // whole wall leaves no root attempted, and the Oxide snapshot is not read at
+        // all (so it is unknown, never a complete empty one).
+        let fixture = Fixture::new("release-wall-setup");
+        let first = fixture.root();
+        let second = fixture.root();
+        let dirs = crate::testkit::Faults::default();
+        // The plan's enumeration is the first listing it makes, and it takes longer
+        // than the wall the plan is given.
+        dirs.sleeping_before_listing(Duration::from_millis(120));
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let mounts = fixture.volume.mounts();
+        let request = ReleaseRequest {
+            bounds: ReleaseBounds {
+                wall: Duration::from_millis(40),
+                stop_margin: Duration::ZERO,
+                ..ReleaseBounds::design()
+            },
+            ..fixture.request(fixture.overdue())
+        };
+        let report = plan(
+            &fixture.volume.state,
+            &dirs,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.account,
+            &request,
+        )
+        .expect("a spent wall is a report, not a refusal");
+        assert!(report.plan.timed_out);
+        assert_eq!(report.plan.unreached_count, 2);
+        assert_eq!(report.plan.eligible_count, 0);
+        for root in [&first, &second] {
+            let kept = row(&report, root);
+            assert_eq!(kept.blocked_by.as_deref(), Some("timeout"), "{kept:?}");
+            assert!(kept.bytes.is_none());
+        }
+        assert!(
+            !report.oxide.complete,
+            "a snapshot the spent wall never reached is unknown, not complete"
+        );
+        assert!(report.oxide.detail.is_some());
+        assert!(report.needs_human());
     }
 
     #[test]

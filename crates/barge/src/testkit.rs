@@ -1258,6 +1258,9 @@ impl DirOps for Faults {
     }
 
     fn list_names(&self, parent: &DirHandle, max_names: usize) -> Result<crate::os::DirNames> {
+        if let Some(pause) = self.sleep_before_listing.borrow_mut().take() {
+            std::thread::sleep(pause);
+        }
         self.inner.list_names(parent, max_names)
     }
 
