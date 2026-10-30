@@ -1185,8 +1185,13 @@ is part of that: a folder that is empty, or whose entries all read, is only a
 complete look while the observation is still inside its bound, so an overdue census
 is unknown rather than a complete empty one. The one reference deadline covers
 discovery too: finding Oxide's control directory is part of the observation, so an
-expired bound there — and on the absence of a receipts folder as much as on its
-contents — is unknown, never "no Oxide records". More than one distinct consumer path for one root, or two records that
+expired bound there — after a candidate's own metadata lookup as much as before it,
+and on the absence of a receipts folder as much as on its contents — is unknown,
+never "no Oxide records". "There is no control directory" is a complete look's
+conclusion: the time each candidate takes is charged to the same bound, and the
+empty answer is drawn only while the observation is still inside it. The plan passes
+this bound as `ReleaseBounds.reference_wall` (the design's 10 s), so an expired one
+leaves every root of the area with an incomplete reference set. More than one distinct consumer path for one root, or two records that
 disagree about one path's volume, is also unknown and keeps that root: the plan
 proves what it can name exactly once.
 

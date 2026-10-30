@@ -93,6 +93,9 @@ pub struct ReleaseBounds {
     pub lock_wait: Duration,
     /// The whole plan's wall clock, which the design fixes at 600 s.
     pub wall: Duration,
+    /// How long the plan's one Oxide reference observation may take, which the design
+    /// fixes at 10 s (`REFERENCE_WALL`).
+    pub reference_wall: Duration,
     /// The window at the end of that wall in which no new root is attempted, so a
     /// plan reports what it did not reach instead of being killed mid-row.
     pub stop_margin: Duration,
@@ -106,6 +109,7 @@ impl ReleaseBounds {
             custody: CustodyBounds::default(),
             lock_wait: state::LOCK_WAIT,
             wall: PLAN_WALL,
+            reference_wall: reference::REFERENCE_WALL,
             stop_margin: PLAN_STOP_MARGIN,
         }
     }
@@ -612,7 +616,7 @@ pub fn plan(
             request.bounds.wall
         ))
     } else {
-        OxideSnapshot::read(account)
+        OxideSnapshot::read_within(account, request.bounds.reference_wall)
     };
     let pending = pending_intents(state_paths)?;
     let uid = observer.effective_uid()?;
@@ -2836,6 +2840,45 @@ mod tests {
             "a snapshot the spent wall never reached is unknown, not complete"
         );
         assert!(report.oxide.detail.is_some());
+        assert!(report.needs_human());
+    }
+
+    #[test]
+    fn an_expired_reference_wall_keeps_the_whole_covered_batch() {
+        // The plan's one Oxide observation carries the design's 10 s bound, and a
+        // bound that is already spent leaves the snapshot unknown rather than "no
+        // records": no root of the area may be released on it.
+        let fixture = Fixture::new("release-reference-wall");
+        let first = fixture.root();
+        let second = fixture.root();
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let mounts = fixture.volume.mounts();
+        let request = ReleaseRequest {
+            bounds: ReleaseBounds {
+                reference_wall: Duration::ZERO,
+                ..ReleaseBounds::design()
+            },
+            ..fixture.request(fixture.overdue())
+        };
+        let report = plan(
+            &fixture.volume.state,
+            &fixture.volume.platform(),
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.account,
+            &request,
+        )
+        .expect("an expired reference bound is a report, not a refusal");
+        for root in [&first, &second] {
+            let kept = row(&report, root);
+            assert!(!kept.eligible, "{kept:?}");
+            assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+            assert!(!kept.references_complete);
+        }
+        assert_eq!(report.plan.eligible_count, 0);
+        assert!(!report.oxide.complete);
         assert!(report.needs_human());
     }
 

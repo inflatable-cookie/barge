@@ -778,6 +778,24 @@ fn row_names_root(row: &OxideRow, root_path: &Path) -> bool {
 /// keep. Two control directories that both hold outputs are ambiguous for the
 /// same reason and are refused rather than picked between.
 fn control_directory(account: &dyn AccountFacts, deadline: Deadline) -> Result<Option<PathBuf>> {
+    control_directory_with(account, deadline, &inspect_outputs)
+}
+
+/// One candidate's `outputs` path, as the platform reports it.
+fn inspect_outputs(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    std::fs::metadata(path)
+}
+
+/// How a candidate's `outputs` path is inspected; it is a parameter so a test can
+/// make one lookup consume the bound.
+type OutputsInspect<'a> = &'a dyn Fn(&Path) -> std::io::Result<std::fs::Metadata>;
+
+/// [`control_directory`] with its candidate lookup injected.
+fn control_directory_with(
+    account: &dyn AccountFacts,
+    deadline: Deadline,
+    inspect: OutputsInspect<'_>,
+) -> Result<Option<PathBuf>> {
     if deadline.expired() {
         return Err(Error::new(
             ErrorKind::UnknownState,
@@ -820,7 +838,18 @@ fn control_directory(account: &dyn AccountFacts, deadline: Deadline) -> Result<O
             continue;
         };
         let outputs = control.join(OXIDE_OUTPUTS_DIR);
-        match std::fs::metadata(&outputs) {
+        let found_here = inspect(&outputs);
+        // A candidate lookup can consume the bound by itself: an expired observation
+        // never concludes "no control directory exists", it is unknown.
+        if deadline.expired() {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "inspecting a candidate control directory did not finish inside the {REFERENCE_WALL:?} bound"
+                ),
+            ));
+        }
+        match found_here {
             Ok(metadata) if metadata.is_dir() => {
                 if !found.iter().any(|seen| seen == control) {
                     found.push(control.to_path_buf());
@@ -848,6 +877,16 @@ fn control_directory(account: &dyn AccountFacts, deadline: Deadline) -> Result<O
                 .with_detail("path", outputs.display().to_string().into()))
             }
         }
+    }
+    // The last lookup can also have consumed the bound, so the "nothing was found"
+    // conclusion is drawn only inside it.
+    if deadline.expired() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "finding Oxide's control directory did not finish inside its {REFERENCE_WALL:?} bound"
+            ),
+        ));
     }
     match found.len() {
         0 => Ok(None),
@@ -2708,6 +2747,35 @@ mod tests {
         assert!(read.complete(), "{read:?}");
         assert!(matches!(read.registry, OxideRegistry::Absent));
         assert!(matches!(read.receipts, OxideReceipts::Read(_)));
+    }
+
+    #[test]
+    fn a_candidate_lookup_that_consumes_the_bound_is_unknown() {
+        // A single candidate metadata lookup can consume the whole reference bound.
+        // The discovery must then be unknown — never the complete "no control
+        // directory" answer a finished look may give.
+        let fixture = crate::testkit::TempDir::new("discovery-bound");
+        let account = crate::testkit::FakeAccount {
+            home: fixture.path().to_path_buf(),
+        };
+        let slow = |_path: &Path| {
+            std::thread::sleep(Duration::from_millis(80));
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        let deadline = Deadline::after(Duration::from_millis(30));
+        let found = control_directory_with(&account, deadline, &slow);
+        assert!(
+            found.is_err(),
+            "an overdue candidate lookup concluded no control directory: {found:?}"
+        );
+
+        // The same lookup inside a bound that can meet it is the ordinary answer.
+        let quick = |_path: &Path| Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let deadline = Deadline::after(REFERENCE_WALL);
+        match control_directory_with(&account, deadline, &quick) {
+            Ok(None) => {}
+            other => panic!("a complete look with no outputs concluded {other:?}"),
+        }
     }
 
     #[test]
