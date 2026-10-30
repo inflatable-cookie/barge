@@ -1359,7 +1359,10 @@ Every step of a replay keeps stage 1's mode order: the modes a stopped run
 recorded are restored first, before any marker is read — the changed-device proof
 reads one — so an intent whose identity cannot be re-established still leaves the
 captured object with the mode the record proves, never with the widened permissions
-the deletion needed.
+the deletion needed. The object the restore chmods is matched on its recorded inode
+and the volume's live device, never on the device a capture recorded before the
+remount: that number belongs to the mount the record was written under, so
+comparing to it would refuse the restoration exactly when it is needed.
 
 What a changed device is re-proved from depends on the phase, because each phase
 acts on a different object and `marker_last` has already removed the marker the

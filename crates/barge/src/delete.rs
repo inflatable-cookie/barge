@@ -3623,6 +3623,11 @@ fn marker_absent(digest: &Option<MarkerBytes>, intent: &IntentRecord) -> bool {
 /// name is resolved under the one before it: a chain link that is gone ends the
 /// walk (nothing deeper can be reached), and a link whose identity no longer
 /// matches is unknown, never something to chmod or delete.
+///
+/// `device` is the volume's **live** device, which is what every opened object is
+/// checked against: a record written before a reboot carries the number that mount
+/// had then, and the inode is the durable half of the identity. A capture recorded
+/// on another device is not a reason to leave its recorded mode in place.
 fn restore_recorded_modes(
     dirs: &dyn DirOps,
     parent: &DirHandle,
@@ -3690,12 +3695,15 @@ fn restore_recorded_modes(
         }
         let child = dirs.open_child_dir(holder, &record.private)?;
         // The descriptor that will be chmod'd must be the recorded object: the name
-        // can be swapped between the read above and this open.
+        // can be swapped between the read above and this open. The inode is durable;
+        // the device is the volume's live one, because a record written before a
+        // remount carries a number this mount does not have and comparing to it would
+        // refuse to restore the very modes this step exists for.
         let opened = child.identity();
-        if opened.device.get() != record.device || opened.inode != record.inode {
+        if opened.device != device || opened.inode != record.inode {
             return Ok(Some(format!(
-                "`{}` opened as device {} inode {}, not the recorded {} / {}, so its recorded mode is not restored and nothing else is done",
-                record.private, opened.device, opened.inode, record.device, record.inode
+                "`{}` opened as device {} inode {}, not the recorded inode {} on this volume's device {}, so its recorded mode is not restored and nothing else is done",
+                record.private, opened.device, opened.inode, record.inode, device
             )));
         }
         if let Some(mode) = record.mode {
@@ -7550,7 +7558,13 @@ mod tests {
             // releases them, so the replay below is the next owner.
             let pending = prepared.pending_intents();
             let mut intent = pending.first().expect("the intent is pending").clone();
+            // The run that stopped wrote both the unit and its captures before the
+            // remount, so every recorded device is the number this mount no longer
+            // has; the leaf's own device is the live one.
             intent.unit.device = intent.unit.device.saturating_add(9);
+            for capture in &mut intent.captures {
+                capture.device = capture.device.saturating_add(9);
+            }
             let mut locks = LockSet::new(prepared.fixture.state.clone());
             let _volume = locks
                 .lock_volume(&prepared.fixture.uuid)

@@ -1916,7 +1916,9 @@ Choices S5 made where this design left the mechanic to the slice:
   and a record written before F4, `/2` or `/1`, still reads with neither. The
   replay restores the recorded modes before it reads any marker, as the order above
   requires, so an intent it cannot re-establish still leaves the mode the record
-  proves. It finds the volume by the recorded UUID (refusing a duplicated mount
+  proves; the object it chmods is matched on its inode and the volume's live
+  device, not on a capture's pre-remount number. It finds the volume by the
+  recorded UUID (refusing a duplicated mount
   and locating a moved one) rather than through the registry's hint, and tolerates
   a device that changed with a remount only from what the phase still proves: the
   acted-on unit's or capture's inode and kind on the verified volume, its exact
