@@ -1699,7 +1699,10 @@ and T6, and this slice claims no native proof.
   used. Every entry is observed under its own root lock, and
   `scratch::pressure_eligible` re-decides the marker, the four conclusion facts
   and the nested-marker walk there, so a marker that appears in the tree between
-  the sweep and the locked observation keeps the root. A foreign family is never
+  the sweep and the locked observation keeps the root. The recheck's walk gets
+  the plan's **remaining wall** as its budget, never a fresh default window: a
+  walk that cannot finish inside what is left reports itself incomplete and keeps
+  the root. A foreign family is never
   a candidate, so it can never consume the candidate capacity a native root
   needs, and every entry the sweep cannot classify — a foreign family, a
   symbolic link, a quarantine leaf, an unreadable project folder, an unmarked
@@ -1722,9 +1725,10 @@ and T6, and this slice claims no native proof.
   output bound was reached; the report's `truncated` covers candidate, kept and
   listing overflow, and every count reports the volume's real total. Every nested
   bounded step receives **what remains of the wall**, never a fresh allowance:
-  each shared lock wait, the scratch sweep and the per-root bytes scan all stop at
-  the plan's own deadline, so one busy root, one large scan or one long scratch
-  walk cannot extend the plan past its 10 s. Only a single uninterruptible
+  each shared lock wait, the scratch sweep, the scratch eligibility recheck's
+  nested-marker walk and the per-root bytes scan all stop at the plan's own
+  deadline, so one busy root, one large scan or one long scratch walk cannot
+  extend the plan past its 10 s. Only a single uninterruptible
   platform call can overrun the deadline by its own duration; the step then
   reports itself incomplete and its object is kept. A bound reached sets
   `truncated`, records `truncated_reason`, counts
@@ -1751,9 +1755,12 @@ and T6, and this slice claims no native proof.
   blocking the plan, a busy volume lock refusing the plan while a shared one does
   not, a busy root whose lock budget exceeds the plan's wall being refused at
   that wall rather than extending it, a bytes scan that outlives the remaining
-  wall being reported incomplete with its root kept, and a nested marker that
-  appears between the scratch sweep and the locked observation keeping the root;
-  an undeclared policy, an undeclared durability, a `kept` volume and
+  wall being reported incomplete with its root kept, the scratch recheck's walk
+  being given the remaining wall rather than a fresh one-second window, a recheck
+  that starts at the deadline keeping the root because its walk cannot finish,
+  and a nested marker that appears between the scratch sweep and the locked
+  observation keeping the root; an undeclared policy, an undeclared durability, a
+  `kept` volume and
   an absent volume each refused; and
   scratch's concluded-and-released root planned while the expiry sweep's own age
   still keeps it, an unconcluded root kept, a symbolic link and a foreign family

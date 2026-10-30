@@ -1843,6 +1843,7 @@ pub fn pressure_eligible(
     unit: &DirHandle,
     expected_device: DeviceId,
     now_ms: u64,
+    wall: Duration,
 ) -> Result<NativeEligibility> {
     let facts = dirs.dir_facts(unit)?;
     let uid = observer.effective_uid()?;
@@ -1871,7 +1872,13 @@ pub fn pressure_eligible(
         },
         native_only: true,
     };
-    let mut budget = Budget::new(SweepBounds::default());
+    // The nested-marker walk is bounded by the caller's remaining plan wall,
+    // never by a fresh default window: a recheck that starts near the deadline
+    // must stop at it and keep the root.
+    let mut budget = Budget::new(SweepBounds {
+        examine: SWEEP_EXAMINE,
+        timeout: wall,
+    });
     let scope = UnitScope::TopLevel;
     match assess_native(&ctx, unit, path, name, &scope)? {
         Assessed::Kept { reason, .. } => Ok(NativeEligibility::kept(reason)),

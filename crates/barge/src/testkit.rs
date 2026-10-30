@@ -635,6 +635,9 @@ pub struct Faults {
     /// fixture in the window between an index or sweep and the open that reads it
     /// under its own lock.
     pub open_probe: RefCell<Option<OpenProbe>>,
+    /// One-shot pauses immediately before a child directory with a matching name
+    /// prefix is opened, so a test can put a pause inside a specific nested walk.
+    pub sleeping_child_opens: RefCell<Vec<(String, std::time::Duration)>>,
     /// A modification time every *listing* reports instead of the real one, so an
     /// earlier observation can be stale while the directory's own descriptor facts
     /// stay current.
@@ -802,6 +805,14 @@ impl Faults {
     /// Run `probe` immediately before every path open.
     pub fn probing_open(&self, probe: impl Fn(&Path) + 'static) {
         *self.open_probe.borrow_mut() = Some(Box::new(probe));
+    }
+
+    /// Pause once, immediately before opening a child directory whose name starts
+    /// with `prefix`.
+    pub fn sleeping_child_open_prefix(&self, prefix: &str, pause: std::time::Duration) {
+        self.sleeping_child_opens
+            .borrow_mut()
+            .push((prefix.to_owned(), pause));
     }
 
     /// Report this modification time in every listing, leaving each directory's own
@@ -1161,6 +1172,17 @@ impl DirOps for Faults {
 
     fn open_child_dir(&self, parent: &DirHandle, name: &str) -> Result<DirHandle> {
         self.opened_child_names.borrow_mut().push(name.to_owned());
+        {
+            let mut pauses = self.sleeping_child_opens.borrow_mut();
+            if let Some(index) = pauses
+                .iter()
+                .position(|(prefix, _)| name.starts_with(prefix.as_str()))
+            {
+                let (_, pause) = pauses.remove(index);
+                drop(pauses);
+                std::thread::sleep(pause);
+            }
+        }
         let swap = self
             .swap_on_dir_open
             .borrow_mut()

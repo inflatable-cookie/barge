@@ -1631,6 +1631,7 @@ impl Planner<'_> {
             &observed.handle,
             self.device,
             self.now_ms,
+            self.deadline.saturating_duration_since(Instant::now()),
         ) {
             Ok(eligibility) => eligibility,
             Err(error) => {
@@ -2781,6 +2782,104 @@ mod tests {
             row.reason.contains("recognised marker"),
             "the nested marker is what keeps it: {}",
             row.reason
+        );
+    }
+
+    #[test]
+    fn the_scratch_recheck_walk_is_bounded_by_the_wall_it_is_given() {
+        let fixture = VolumeFixture::new("space-plan-recheck-budget");
+        let record = policy_record(&fixture, 16, 4);
+        let observer = fixture.observer();
+        let concluded = alloc_scratch(&fixture, &observer, "proj");
+        conclude_scratch(&fixture, &observer, "proj", &concluded.root_id);
+        area::release(&fixture.state, &observer, &concluded.root_id, "prover")
+            .expect("the owner hold releases");
+        let platform = fixture.platform();
+        let handle = platform
+            .open_path(&concluded.path)
+            .expect("the concluded root opens");
+        let recheck = |wall: std::time::Duration| {
+            scratch::pressure_eligible(
+                &platform,
+                &observer,
+                &fixture.state,
+                &record,
+                &concluded.root_id,
+                &concluded.path,
+                &handle,
+                fixture.device,
+                test_now(),
+                wall,
+            )
+            .expect("the recheck runs")
+        };
+        // A recheck that starts at the deadline gets no room for its nested walk,
+        // and a walk that could not finish keeps the root.
+        let expired = recheck(std::time::Duration::ZERO);
+        assert!(!expired.eligible);
+        assert!(
+            expired.reason.contains("marker walk"),
+            "a wall-bounded walk that could not finish keeps the root: {}",
+            expired.reason
+        );
+        let bounded = recheck(std::time::Duration::from_secs(5));
+        assert!(bounded.eligible, "{}", bounded.reason);
+        assert!(bounded.marker_digest.is_some());
+    }
+
+    #[test]
+    fn a_scratch_recheck_walk_uses_the_remaining_plan_wall_not_a_fresh_window() {
+        let fixture = VolumeFixture::new("space-plan-recheck-remaining");
+        policy_record(&fixture, 16, 4);
+        let observer = fixture.observer();
+        let concluded = alloc_scratch(&fixture, &observer, "proj");
+        conclude_scratch(&fixture, &observer, "proj", &concluded.root_id);
+        area::release(&fixture.state, &observer, &concluded.root_id, "prover")
+            .expect("the owner hold releases");
+
+        // The nested directory appears after the sweep, so only the recheck walks
+        // it. Its open pauses longer than a fresh one-second sweep window and well
+        // inside the plan's three-second wall: a recheck given the remaining wall
+        // finishes and plans the root, while a fresh one-second budget would stop
+        // the walk and keep it.
+        let faults = Faults::new();
+        let run_path = concluded.path.clone();
+        let planted = std::cell::Cell::new(false);
+        faults.probing_open(move |path| {
+            if path == run_path.as_path() && !planted.replace(true) {
+                std::fs::create_dir(run_path.join("aa-nested"))
+                    .expect("the nested directory is made");
+            }
+        });
+        faults.sleeping_child_open_prefix("aa-nested", std::time::Duration::from_millis(1_500));
+        let started = Instant::now();
+        let report = plan(
+            &fixture.state,
+            &faults,
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &Injected(true),
+            &plan_request_with(
+                &fixture.uuid,
+                test_now(),
+                std::time::Duration::from_secs(3),
+                crate::state::LOCK_WAIT,
+            ),
+        )
+        .expect("the plan is built");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            report.candidates, 1,
+            "the recheck's walk budget is the remaining plan wall, not one second"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1_500),
+            "the nested open really paused: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "the walk stayed inside the plan's wall: {elapsed:?}"
         );
     }
 
