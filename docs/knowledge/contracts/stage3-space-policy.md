@@ -1568,19 +1568,30 @@ T6, and no native proof exists or is claimed.
   a root whose creation time was never recorded is ordered after every known one
   rather than being treated as the oldest. T4 orders candidates with it; nothing
   in T3 orders or prunes anything.
+- **The row's reason surface, and the CLI's coverage of it.** A
+  `barge.area.root.list/1` row's `space_idle.reason` can be one of
+  `marker_unverified`, `identity_mismatch`, `participation_excluded`,
+  `hold_live`, `hold_unknown`, `activity_unknown`, `activity_unreleased`,
+  `activity_future` and `unconcluded_scratch`, or absent with
+  `space_idle.state: idle`. `participation_undeclared` is defined by the matrix but
+  **no T3 document produces it**: a listing resolves each root through its area's
+  declaration, so an undeclared area never reaches a row, and the reason is left to
+  the later slices that resolve roots some other way.
 - **The CLI prints these documents against a verified volume.** The suite's CLI
-  case registers the `/Volumes/<name>` mount its checkout is on inside its own
-  throwaway state directory, keeps every write inside one scratch directory it
-  creates with `mktemp -d` under that volume's `scratch/barge/` and removes (its
-  parent is the operator's scratch root and is never created, renamed or removed,
-  and no self-named sibling is made), and asserts end to end: the successful
-  `barge.area.idle-baseline/1` document; and all five `barge.area.root.list/1`
-  decisions — `activity_unreleased` for a root created and never released,
-  `hold_live` for a held root (with stage 1's `idle` false and the live hold row),
-  `hold_unknown` for a hold whose recorded process start identity no longer
-  matches its live pid (kept, with the hold's own reason reported),
-  `activity_unknown` for a root whose record was lost (kept, with
-  `activity.state: missing`), and `idle` once the root's activity is recorded. A
+  cases register the `/Volumes/<name>` mount their checkout is on inside their own
+  throwaway state directory, keep every write inside one `mktemp -d` directory
+  under that volume's `scratch/barge/` and remove only that directory (its parent is
+  the operator's scratch root and is never created, renamed or removed, and no
+  self-named sibling is made), and assert end to end: the successful
+  `barge.area.idle-baseline/1` document, and every reason the row can carry —
+  `activity_unreleased`, `hold_live` (with stage 1's `idle` false and the live hold
+  row), `hold_unknown` (a hold whose recorded process start identity no longer
+  matches its live pid, with the hold's own reason reported), `activity_unknown` (a
+  lost record, kept with `activity.state: missing`), `identity_mismatch` (a record
+  naming another volume, kept), `activity_future` (a release recorded ahead of the
+  clock, kept), `unconcluded_scratch` (a scratch-kind root with no conclusion,
+  kept), `marker_unverified` (a directory with no marker), `participation_excluded`
+  (a root in an `excluded` area), and `idle` once the root's activity is recorded. A
   checkout that is not under a `/Volumes` mount has no non-boot volume the OS layer
   can verify; the case reports that it skipped, and the library tests own the
   semantics there.

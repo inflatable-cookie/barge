@@ -1418,38 +1418,29 @@ fn volumes_mount(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from("/Volumes").join(name))
 }
 
-/// The CLI documents only a volume-backed command can print.
+/// The volume this checkout runs on and the one `mktemp -d` directory this case
+/// may write in, or `None` with a stated reason when the checkout has no non-boot
+/// `/Volumes` mount to verify.
 ///
-/// `barge.area.idle-baseline/1`'s success document and `barge.area.root.list/1`'s
-/// `activity` and `space_idle` rows need a verified volume and a real root, so this
-/// case registers the volume this checkout runs on inside its own throwaway state
-/// directory, keeps every write inside one scratch directory it creates and
-/// removes, and asserts the documents the CLI prints. A checkout that is not on a
-/// `/Volumes` mount has no non-boot volume the OS layer can verify; the library's
-/// tests own the semantics in that case and this case says so rather than
-/// pretending.
-#[test]
-fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
+/// The directory is made by `mktemp` under the volume's own `scratch/barge`; the
+/// test never names it, never creates or removes that scratch root, and removes
+/// only the directory `mktemp` returned.
+fn volume_scratch() -> Option<(PathBuf, MountScratch)> {
     let cwd = std::env::current_dir().expect("the working directory");
     let Some(mount) = volumes_mount(&cwd) else {
         eprintln!(
             "skipped: {} is not under a /Volumes mount, so there is no non-boot volume to verify",
             cwd.display()
         );
-        return;
+        return None;
     };
-    // The volume-backed fixture is one fresh `mktemp -d` directory under the
-    // volume's own scratch root. Its parent is the operator's scratch directory
-    // and is never created, renamed or removed here, and no self-named sibling is
-    // made: `mktemp` owns the name, this test owns only the directory it returns
-    // and removes it afterwards.
     let scratch_root = mount.join("scratch/barge");
     if !scratch_root.is_dir() {
         eprintln!(
             "skipped: {} is not a directory, so there is no scratch root to make a fixture in",
             scratch_root.display()
         );
-        return;
+        return None;
     }
     let template = scratch_root.join("barge-cli-volume.XXXXXX");
     let made = Command::new("mktemp")
@@ -1462,27 +1453,25 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
         "mktemp -d makes the fixture directory: {}",
         String::from_utf8_lossy(&made.stderr)
     );
-    let made_path = String::from_utf8(made.stdout).expect("mktemp prints a path");
-    let scratch = MountScratch {
-        path: PathBuf::from(made_path.trim_end()),
-    };
-    assert!(
-        scratch.path.is_dir(),
-        "mktemp -d made {}",
-        scratch.path.display()
+    let path = PathBuf::from(
+        String::from_utf8(made.stdout)
+            .expect("mktemp prints a path")
+            .trim_end(),
     );
-    let root_dir = scratch
-        .path
-        .strip_prefix(&mount)
-        .expect("the scratch directory is inside the mount")
-        .to_str()
-        .expect("the scratch path is UTF-8")
-        .to_owned();
+    assert!(path.is_dir(), "mktemp -d made {}", path.display());
+    Some((mount, MountScratch { path }))
+}
 
-    let (fixture, state_dir) = absent_state_dir("area-volume-documents");
+/// Preview and publish a registration of `mount`, with `root_dir` as its Barge
+/// folder and `plan_file` as the preview's saved bytes, in the fixture's own
+/// throwaway state directory. Returns the registered volume's UUID.
+fn register_fixture_volume(
+    mount: &Path,
+    root_dir: &str,
+    state_dir: &Path,
+    plan_file: &Path,
+) -> String {
     let mount_text = mount.to_str().expect("the mount path is UTF-8").to_owned();
-
-    // Preview the registration, then publish exactly those bytes and digest.
     let preview = run_in(
         &[
             "volume",
@@ -1494,7 +1483,7 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
             "--durability",
             "expendable",
             "--root-dir",
-            &root_dir,
+            root_dir,
             "--reserve",
             "64MiB",
             "--declared-by",
@@ -1502,7 +1491,7 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
             "--plan",
             "--json",
         ],
-        &state_dir,
+        state_dir,
     );
     assert_eq!(
         preview.status.code(),
@@ -1520,8 +1509,7 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
         .as_str()
         .expect("the preview carries its digest")
         .to_owned();
-    let plan_file = fixture.join("register.plan.json");
-    std::fs::write(&plan_file, plan.as_bytes()).expect("the plan bytes are saved");
+    std::fs::write(plan_file, plan.as_bytes()).expect("the plan bytes are saved");
     let applied = run_in(
         &[
             "volume",
@@ -1532,7 +1520,7 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
             &digest,
             "--json",
         ],
-        &state_dir,
+        state_dir,
     );
     assert_eq!(
         applied.status.code(),
@@ -1540,38 +1528,41 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
         "the registration publishes: {}",
         String::from_utf8_lossy(&applied.stdout)
     );
-    let applied = stdout_document(&applied);
-    let volume = applied["data"]["volume_uuid"]
+    stdout_document(&applied)["data"]["volume_uuid"]
         .as_str()
         .expect("the registration names the volume")
-        .to_owned();
+        .to_owned()
+}
 
+fn declare_area(state_dir: &Path, area: &str, reserve: &str) {
     let declared = run_area(
         &[
             "declare",
             "--namespace",
             "fixture",
             "--area",
-            "pool",
+            area,
             "--folder",
-            "example/pool",
+            &format!("example/{area}"),
             "--absent",
             "fail:drive",
             "--prune",
             "none",
             "--reserve",
-            "counts",
+            reserve,
             "--json",
         ],
-        &state_dir,
+        state_dir,
     );
     assert_eq!(
         declared.status.code(),
         Some(0),
-        "the area declares: {}",
+        "the {area} area declares: {}",
         String::from_utf8_lossy(&declared.stdout)
     );
+}
 
+fn create_root(state_dir: &Path, area: &str, volume: &str, kind: &str) -> String {
     let created = run_area(
         &[
             "root",
@@ -1579,28 +1570,66 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
             "--namespace",
             "fixture",
             "--area",
-            "pool",
+            area,
             "--volume",
-            &volume,
+            volume,
             "--kind",
-            "area_root",
+            kind,
             "--json",
         ],
-        &state_dir,
+        state_dir,
     );
     assert_eq!(
         created.status.code(),
         Some(0),
-        "the root is created: {}",
+        "the {area} root is created: {}",
         String::from_utf8_lossy(&created.stdout)
     );
-    let created = stdout_document(&created);
-    let root = created["data"]["root"]["root_id"]
+    stdout_document(&created)["data"]["root"]["root_id"]
         .as_str()
         .expect("the creation names the root")
-        .to_owned();
+        .to_owned()
+}
 
-    // A created root that was never released is reported, and is not idle.
+fn hold_root(state_dir: &Path, root: &str) {
+    let held = run_area(
+        &[
+            "hold",
+            "--root",
+            root,
+            "--holder",
+            "prover",
+            "--pid",
+            &std::process::id().to_string(),
+            "--scope",
+            "write",
+            "--purpose",
+            "a fixture CLI holder",
+        ],
+        state_dir,
+    );
+    assert_eq!(
+        held.status.code(),
+        Some(0),
+        "the hold succeeds: {}",
+        String::from_utf8_lossy(&held.stdout)
+    );
+}
+
+fn release_root(state_dir: &Path, root: &str) {
+    let released = run_area(
+        &["release", "--root", root, "--holder", "prover"],
+        state_dir,
+    );
+    assert_eq!(
+        released.status.code(),
+        Some(0),
+        "the release succeeds: {}",
+        String::from_utf8_lossy(&released.stdout)
+    );
+}
+
+fn list_rows(state_dir: &Path, area: &str, volume: &str) -> Vec<Value> {
     let listed = run_area(
         &[
             "root",
@@ -1608,46 +1637,93 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
             "--namespace",
             "fixture",
             "--area",
-            "pool",
+            area,
             "--volume",
-            &volume,
+            volume,
             "--json",
         ],
-        &state_dir,
+        state_dir,
     );
-    assert_eq!(listed.status.code(), Some(0));
-    let listed = stdout_document(&listed);
-    assert_eq!(listed["schema"], "barge.area.root.list/1");
-    let row = listed["data"]["roots"]["rows"]
+    assert_eq!(
+        listed.status.code(),
+        Some(0),
+        "the listing succeeds: {}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+    stdout_document(&listed)["data"]["roots"]["rows"]
         .as_array()
         .expect("the listing carries rows")
-        .iter()
-        .find(|row| row["root_id"] == Value::String(root.clone()))
-        .expect("the created root is listed");
+        .clone()
+}
+
+fn row_for<'a>(rows: &'a [Value], root: &str) -> &'a Value {
+    rows.iter()
+        .find(|row| row["root_id"] == Value::String(root.to_owned()))
+        .unwrap_or_else(|| panic!("root {root} is listed"))
+}
+
+fn row_named<'a>(rows: &'a [Value], name: &str) -> &'a Value {
+    rows.iter()
+        .find(|row| row["name"] == Value::String(name.to_owned()))
+        .unwrap_or_else(|| panic!("the entry {name} is listed"))
+}
+
+fn record_path(state_dir: &Path, root: &str) -> PathBuf {
+    state_dir.join(format!("activity/{root}.json"))
+}
+
+fn rewrite_record(state_dir: &Path, root: &str, edit: impl FnOnce(&mut Value)) {
+    let path = record_path(state_dir, root);
+    let mut document: Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("the record reads"))
+            .expect("the record parses");
+    edit(&mut document);
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&document).expect("the record encodes"),
+    )
+    .expect("the record is written");
+}
+
+/// The CLI documents only a volume-backed command can print.
+///
+/// `barge.area.idle-baseline/1`'s success document and `barge.area.root.list/1`'s
+/// `activity` and `space_idle` rows need a verified volume and a real root, so this
+/// case registers the volume this checkout runs on inside its own throwaway state
+/// directory and keeps every write inside one `mktemp -d` directory it removes.
+#[test]
+fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
+    let Some((mount, scratch)) = volume_scratch() else {
+        return;
+    };
+    let root_dir = scratch
+        .path
+        .strip_prefix(&mount)
+        .expect("the scratch directory is inside the mount")
+        .to_str()
+        .expect("the scratch path is UTF-8")
+        .to_owned();
+    let (fixture, state_dir) = absent_state_dir("area-volume-documents");
+    let volume = register_fixture_volume(
+        &mount,
+        &root_dir,
+        &state_dir,
+        &fixture.join("register.plan.json"),
+    );
+    declare_area(&state_dir, "pool", "counts");
+
+    let root = create_root(&state_dir, "pool", &volume, "area_root");
+
+    // A created root that was never released is reported, and is not idle.
+    let rows = list_rows(&state_dir, "pool", &volume);
+    let row = row_for(&rows, &root);
     assert_eq!(row["activity"]["state"], "unreleased");
     assert_eq!(row["activity"]["releases"], 0);
     assert_eq!(row["space_idle"]["state"], "not_idle");
     assert_eq!(row["space_idle"]["reason"], "activity_unreleased");
     assert_eq!(row["idle"], true);
 
-    let pid = std::process::id().to_string();
-    let held = run_area(
-        &[
-            "hold",
-            "--root",
-            &root,
-            "--holder",
-            "prover",
-            "--pid",
-            &pid,
-            "--scope",
-            "write",
-            "--purpose",
-            "a fixture CLI holder",
-        ],
-        &state_dir,
-    );
-    assert_eq!(held.status.code(), Some(0), "the hold succeeds");
+    hold_root(&state_dir, &root);
     let released = run_area(
         &["release", "--root", &root, "--holder", "prover"],
         &state_dir,
@@ -1678,20 +1754,11 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
     assert_eq!(baseline["ok"], true);
     assert_eq!(baseline["data"]["root_id"], root.as_str());
     assert_eq!(baseline["data"]["volume_uuid"], volume.as_str());
-    assert_eq!(
-        baseline["data"]["activity"]["state"], "released",
-        "the baseline records a release as of now"
-    );
+    assert_eq!(baseline["data"]["activity"]["state"], "released");
     assert_eq!(baseline["data"]["activity"]["releases"], 1);
-    assert_eq!(
-        baseline["data"]["activity"]["generation"], 2,
-        "the baseline is one write after the release"
-    );
+    assert_eq!(baseline["data"]["activity"]["generation"], 2);
     assert!(baseline["data"]["activity"]["last_release_ms"].is_number());
-    assert!(
-        baseline["data"]["custody"].is_string(),
-        "the baseline names the custody capability it was gated on"
-    );
+    assert!(baseline["data"]["custody"].is_string());
     assert!(Path::new(
         baseline["data"]["path"]
             .as_str()
@@ -1699,29 +1766,9 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
     )
     .is_dir());
 
-    // The listing now reports the recorded release and the pressure verdict.
-    let listed = run_area(
-        &[
-            "root",
-            "list",
-            "--namespace",
-            "fixture",
-            "--area",
-            "pool",
-            "--volume",
-            &volume,
-            "--json",
-        ],
-        &state_dir,
-    );
-    assert_eq!(listed.status.code(), Some(0));
-    let listed = stdout_document(&listed);
-    let row = listed["data"]["roots"]["rows"]
-        .as_array()
-        .expect("the listing carries rows")
-        .iter()
-        .find(|row| row["root_id"] == Value::String(root.clone()))
-        .expect("the root is listed");
+    // The listing now reports the recorded release and the idle verdict.
+    let rows = list_rows(&state_dir, "pool", &volume);
+    let row = row_for(&rows, &root);
     assert_eq!(row["activity"]["state"], "released");
     assert_eq!(
         row["activity"]["last_release_ms"],
@@ -1729,159 +1776,161 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
     );
     assert_eq!(row["space_idle"]["state"], "idle");
     assert!(row["space_idle"].get("reason").is_none());
-    assert_eq!(
-        row["idle"], true,
-        "stage 1's hold-only idleness is unchanged"
-    );
+}
 
-    // The other two decision rows: a held root is kept because of its hold, and a
-    // root whose activity record is lost is kept as unknown.
-    let created = run_area(
-        &[
-            "root",
-            "create",
-            "--namespace",
-            "fixture",
-            "--area",
-            "pool",
-            "--volume",
-            &volume,
-            "--kind",
-            "area_root",
-            "--json",
-        ],
-        &state_dir,
-    );
-    assert_eq!(created.status.code(), Some(0), "the second root is created");
-    let second = stdout_document(&created)["data"]["root"]["root_id"]
-        .as_str()
-        .expect("the creation names the root")
+/// Every decision reason a `barge.area.root.list/1` row can carry, and the idle
+/// result, printed by the CLI.
+///
+/// The row can report `marker_unverified`, `identity_mismatch`,
+/// `participation_excluded`, `hold_live`, `hold_unknown`, `activity_unknown`,
+/// `activity_unreleased`, `activity_future`, `unconcluded_scratch` and `idle`.
+/// `participation_undeclared` is defined by the matrix but no T3 document produces
+/// it: a listing always resolves the root through its area's declaration, so the
+/// row can never see an undeclared area.
+#[test]
+fn the_cli_names_every_reachable_decision_reason() {
+    let Some((mount, scratch)) = volume_scratch() else {
+        return;
+    };
+    let root_dir = scratch
+        .path
+        .strip_prefix(&mount)
+        .expect("the scratch directory is inside the mount")
+        .to_str()
+        .expect("the scratch path is UTF-8")
         .to_owned();
-    let held = run_area(
-        &[
-            "hold",
-            "--root",
-            &second,
-            "--holder",
-            "prover",
-            "--pid",
-            &pid,
-            "--scope",
-            "write",
-            "--purpose",
-            "a fixture CLI holder",
-        ],
+    let (fixture, state_dir) = absent_state_dir("area-decision-reasons");
+    let volume = register_fixture_volume(
+        &mount,
+        &root_dir,
         &state_dir,
+        &fixture.join("register.plan.json"),
     );
-    assert_eq!(held.status.code(), Some(0), "the second hold succeeds");
-    let listed = run_area(
-        &[
-            "root",
-            "list",
-            "--namespace",
-            "fixture",
-            "--area",
-            "pool",
-            "--volume",
-            &volume,
-            "--json",
-        ],
-        &state_dir,
-    );
-    assert_eq!(listed.status.code(), Some(0));
-    let listed = stdout_document(&listed);
-    let row = listed["data"]["roots"]["rows"]
-        .as_array()
-        .expect("the listing carries rows")
-        .iter()
-        .find(|row| row["root_id"] == Value::String(second.clone()))
-        .expect("the held root is listed");
-    assert_eq!(row["idle"], false, "a live hold is not stage 1's idle");
-    assert_eq!(row["holds"][0]["state"], "live");
-    assert_eq!(row["activity"]["state"], "unreleased");
-    assert_eq!(row["space_idle"]["state"], "not_idle");
-    assert_eq!(row["space_idle"]["reason"], "hold_live");
+    declare_area(&state_dir, "pool", "counts");
+    declare_area(&state_dir, "excluded", "excluded");
+    let pool_path = scratch.path.join("example/pool");
 
-    // An undecidable hold: its recorded process start identity no longer matches
-    // the live pid, so it is neither live nor stale and the root is kept.
-    let hold_path = state_dir.join(format!("holds/{second}/prover.json"));
-    let bytes = std::fs::read(&hold_path).expect("the hold reads");
-    let mut document: Value = serde_json::from_slice(&bytes).expect("the hold parses");
-    let recorded = document["process_start"]
+    // activity_unreleased: created and never released.
+    let unreleased = create_root(&state_dir, "pool", &volume, "area_root");
+
+    // hold_live: a live hold.
+    let live = create_root(&state_dir, "pool", &volume, "area_root");
+    hold_root(&state_dir, &live);
+
+    // hold_unknown: the recorded process start identity no longer matches the pid.
+    let undecidable = create_root(&state_dir, "pool", &volume, "area_root");
+    hold_root(&state_dir, &undecidable);
+    let hold_path = state_dir.join(format!("holds/{undecidable}/prover.json"));
+    let mut hold: Value =
+        serde_json::from_slice(&std::fs::read(&hold_path).expect("the hold reads"))
+            .expect("the hold parses");
+    let recorded = hold["process_start"]
         .as_u64()
         .expect("the hold records a process start");
-    document["process_start"] = Value::from(recorded.wrapping_add(1));
+    hold["process_start"] = Value::from(recorded.wrapping_add(1));
     std::fs::write(
         &hold_path,
-        serde_json::to_vec_pretty(&document).expect("the hold encodes"),
+        serde_json::to_vec_pretty(&hold).expect("the hold encodes"),
     )
     .expect("the undecidable hold is written");
-    let listed = run_area(
-        &[
-            "root",
-            "list",
-            "--namespace",
-            "fixture",
-            "--area",
-            "pool",
-            "--volume",
-            &volume,
-            "--json",
-        ],
-        &state_dir,
-    );
-    assert_eq!(listed.status.code(), Some(0));
-    let listed = stdout_document(&listed);
-    let row = listed["data"]["roots"]["rows"]
-        .as_array()
-        .expect("the listing carries rows")
-        .iter()
-        .find(|row| row["root_id"] == Value::String(second.clone()))
-        .expect("the root is listed");
-    assert_eq!(row["idle"], false, "an undecidable hold is not idle");
-    assert_eq!(row["holds"][0]["state"], "unknown");
-    assert!(
-        row["holds"][0]["reason"].is_string(),
-        "an unknown hold reports why it could not be decided"
-    );
+
+    // activity_unknown: a released root whose record was lost.
+    let missing = create_root(&state_dir, "pool", &volume, "area_root");
+    hold_root(&state_dir, &missing);
+    release_root(&state_dir, &missing);
+    std::fs::remove_file(record_path(&state_dir, &missing)).expect("the record is removed");
+
+    // identity_mismatch: a record that names another volume.
+    let mismatched = create_root(&state_dir, "pool", &volume, "area_root");
+    hold_root(&state_dir, &mismatched);
+    release_root(&state_dir, &mismatched);
+    rewrite_record(&state_dir, &mismatched, |record| {
+        record["volume_uuid"] = "A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C5D".into();
+    });
+
+    // activity_future: a release recorded ahead of the clock.
+    let future = create_root(&state_dir, "pool", &volume, "area_root");
+    hold_root(&state_dir, &future);
+    release_root(&state_dir, &future);
+    rewrite_record(&state_dir, &future, |record| {
+        record["last_release_ms"] = Value::from(4_000_000_000_000_u64);
+        record["recorded_ms"] = Value::from(4_000_000_000_000_u64);
+    });
+
+    // unconcluded_scratch: a scratch-kind root with no conclusion, released.
+    let unconcluded = create_root(&state_dir, "pool", &volume, "scratch_run");
+    hold_root(&state_dir, &unconcluded);
+    release_root(&state_dir, &unconcluded);
+
+    // marker_unverified: a directory inside the area that carries no marker.
+    std::fs::create_dir(pool_path.join("plain-directory")).expect("the unmarked directory is made");
+
+    // participation_excluded: a root in an area whose reserve is excluded.
+    let excluded = create_root(&state_dir, "excluded", &volume, "area_root");
+
+    // idle: released and then recorded by the baseline.
+    let idle = create_root(&state_dir, "pool", &volume, "area_root");
+    hold_root(&state_dir, &idle);
+    release_root(&state_dir, &idle);
+    let baseline = run_area(&["idle-baseline", "--root", &idle, "--json"], &state_dir);
+    assert_eq!(baseline.status.code(), Some(0), "the baseline succeeds");
+
+    let rows = list_rows(&state_dir, "pool", &volume);
+
+    let row = row_for(&rows, &unreleased);
+    assert_eq!(row["idle"], true, "no hold covers it");
     assert_eq!(row["activity"]["state"], "unreleased");
     assert_eq!(row["space_idle"]["state"], "not_idle");
+    assert_eq!(row["space_idle"]["reason"], "activity_unreleased");
+
+    let row = row_for(&rows, &live);
+    assert_eq!(row["idle"], false, "a live hold is not stage 1's idle");
+    assert_eq!(row["holds"][0]["state"], "live");
+    assert_eq!(row["space_idle"]["reason"], "hold_live");
+
+    let row = row_for(&rows, &undecidable);
+    assert_eq!(row["idle"], false, "an undecidable hold is not idle");
+    assert_eq!(row["holds"][0]["state"], "unknown");
+    assert!(row["holds"][0]["reason"].is_string());
     assert_eq!(row["space_idle"]["reason"], "hold_unknown");
 
-    let released = run_area(
-        &["release", "--root", &second, "--holder", "prover"],
-        &state_dir,
-    );
-    assert_eq!(released.status.code(), Some(0));
-
-    // A lost activity record is kept as unknown, never idle.
-    std::fs::remove_file(state_dir.join(format!("activity/{second}.json")))
-        .expect("the second root's activity record is removed");
-    let listed = run_area(
-        &[
-            "root",
-            "list",
-            "--namespace",
-            "fixture",
-            "--area",
-            "pool",
-            "--volume",
-            &volume,
-            "--json",
-        ],
-        &state_dir,
-    );
-    assert_eq!(listed.status.code(), Some(0));
-    let listed = stdout_document(&listed);
-    let row = listed["data"]["roots"]["rows"]
-        .as_array()
-        .expect("the listing carries rows")
-        .iter()
-        .find(|row| row["root_id"] == Value::String(second.clone()))
-        .expect("the root is listed");
-    assert_eq!(row["idle"], true, "no hold covers it");
+    let row = row_for(&rows, &missing);
+    assert_eq!(row["idle"], true);
     assert_eq!(row["activity"]["state"], "missing");
-    assert_eq!(row["space_idle"]["state"], "not_idle");
     assert_eq!(row["space_idle"]["reason"], "activity_unknown");
-    drop(fixture);
+
+    let row = row_for(&rows, &mismatched);
+    assert_eq!(
+        row["idle"], true,
+        "the record is readable and no hold covers it"
+    );
+    assert_eq!(row["activity"]["state"], "released");
+    assert_eq!(row["space_idle"]["state"], "not_idle");
+    assert_eq!(row["space_idle"]["reason"], "identity_mismatch");
+
+    let row = row_for(&rows, &future);
+    assert_eq!(row["idle"], true);
+    assert_eq!(row["activity"]["state"], "released");
+    assert_eq!(row["space_idle"]["reason"], "activity_future");
+
+    let row = row_for(&rows, &unconcluded);
+    assert_eq!(row["idle"], true);
+    assert_eq!(row["activity"]["state"], "released");
+    assert_eq!(row["space_idle"]["reason"], "unconcluded_scratch");
+
+    let row = row_named(&rows, "plain-directory");
+    assert_eq!(row["state"], "absent", "the directory carries no marker");
+    assert_eq!(row["idle"], true, "no hold covers it");
+    assert_eq!(row["space_idle"]["state"], "not_idle");
+    assert_eq!(row["space_idle"]["reason"], "marker_unverified");
+
+    let row = row_for(&rows, &idle);
+    assert_eq!(row["space_idle"]["state"], "idle");
+    assert!(row["space_idle"].get("reason").is_none());
+
+    let excluded_rows = list_rows(&state_dir, "excluded", &volume);
+    let row = row_for(&excluded_rows, &excluded);
+    assert_eq!(row["space_idle"]["state"], "not_idle");
+    assert_eq!(row["space_idle"]["reason"], "participation_excluded");
+    assert_eq!(row["space_idle"]["state"], "not_idle");
 }
