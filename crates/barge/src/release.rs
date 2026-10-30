@@ -2518,9 +2518,10 @@ mod tests {
             "the child's old time never becomes the root's age"
         );
         assert!(
-            kept.idle.reason.as_deref().is_some_and(
-                |reason| reason.contains("root directory reports no modification time")
-            ),
+            kept.idle
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("own modification time cannot be read now")),
             "{kept:?}"
         );
     }

@@ -6004,9 +6004,10 @@ mod tests {
             .expect("the scan reports its evidence");
         assert!(!activity.complete);
         assert!(
-            activity.reason.as_deref().is_some_and(
-                |reason| reason.contains("root directory reports no modification time")
-            ),
+            activity
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("own modification time cannot be read now")),
             "{activity:?}"
         );
     }
