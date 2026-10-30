@@ -1267,6 +1267,15 @@ no eligibility, while every other root of the area still plans. A lock file that
 does not exist is nothing to wait for: a read-only command creates no lock, no
 file and no directory, and the observation is a `None` rather than a new file.
 
+The record's three outcomes stay apart in every row: a record that was **read**, one
+that is **positively absent** (no `identity.json` where the id says it should be), and
+one whose read **failed** — an unreadable or symlinked file, one over its cap, one that
+changed while it was read, and a schema-divergent or non-canonical document. Only the
+second is `identity_record_missing`; a failed read is `identity_record_invalid`, as the
+[identity section](#where-identity-is-written-and-what-happens-when-it-is-missing)
+requires, and both keep the root. Another root of the same area is unaffected by
+either: one undecidable record never blocks an unrelated row.
+
 [O4-001](#open-design-issues) leaves one decision to the implementation brief:
 whether any additional unprivileged fact — a per-volume registration receipt
 written at registration time, for instance — is worth the coupling it buys

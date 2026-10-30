@@ -911,12 +911,14 @@ fn decide_root(
     // marker is owned (an adopted root's folder is not its id), otherwise the
     // directory's own name when that is a root id. Either way the record is then
     // bound to this path, never to whatever path the record itself names.
-    let stored = match (&owned_root_id, state::is_identifier(&root.name)) {
-        (Some(id), _) => identity::read(state_paths, dirs, id, uid).ok().flatten(),
-        (None, true) => identity::read(state_paths, dirs, &root.name, uid)
-            .ok()
-            .flatten(),
-        (None, false) => None,
+    // The record's three outcomes stay apart: read, positively absent, or unreadable.
+    // An unreadable record — a reader refusal, an oversized or schema-divergent file, a
+    // changed one — is `identity_record_invalid`, never `identity_record_missing`: only
+    // a look that found no record may say the record is missing.
+    let (stored, record_unreadable) = match (&owned_root_id, state::is_identifier(&root.name)) {
+        (Some(id), _) => read_record(state_paths, dirs, id, uid),
+        (None, true) => read_record(state_paths, dirs, &root.name, uid),
+        (None, false) => (None, false),
     };
     // The row reports the path this plan observed, never the record's stored one:
     // a record that names another path is a mismatch to report, not a path to
@@ -947,7 +949,16 @@ fn decide_root(
     let mut blockers: Vec<(&'static str, String)> = Vec::new();
 
     // Condition 2: the durable identity.
-    let identity = identity_evidence(dirs, facts, uid, root, resolved, &locked, stored.as_ref());
+    let identity = identity_evidence(
+        dirs,
+        facts,
+        uid,
+        root,
+        resolved,
+        &locked,
+        stored.as_ref(),
+        record_unreadable,
+    );
     if identity.verdict != "verified" {
         blockers.push((
             "identity",
@@ -1192,6 +1203,24 @@ impl LockedObservation {
     }
 }
 
+/// One root's durable record, as this plan read it.
+///
+/// The tuple is the record when one was read, and whether the read *failed* (rather
+/// than finding nothing): a failure is `identity_record_invalid`, an empty directory is
+/// `identity_record_missing`.
+fn read_record(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    root_id: &str,
+    uid: u32,
+) -> (Option<crate::identity::RootIdentity>, bool) {
+    match identity::read(state_paths, dirs, root_id, uid) {
+        Ok(Some(record)) => (Some(record), false),
+        Ok(None) => (None, false),
+        Err(_) => (None, true),
+    }
+}
+
 /// The identity evidence for one root, from the durable record and the walk.
 #[allow(clippy::too_many_arguments)]
 fn identity_evidence(
@@ -1202,6 +1231,7 @@ fn identity_evidence(
     resolved: &area::ResolvedArea,
     locked: &LockedObservation,
     stored: Option<&crate::identity::RootIdentity>,
+    record_unreadable: bool,
 ) -> IdentityEvidence {
     let marker_digest = locked.marker_digest.clone();
     let inode = stored.map_or(Some(locked.identity.inode), |record| Some(record.inode));
@@ -1224,6 +1254,10 @@ fn identity_evidence(
     let verdict = if !same_volume || owner != uid {
         IdentityVerdict::Unknown {
             reason: IdentityReason::NotARealDirectory,
+        }
+    } else if record_unreadable {
+        IdentityVerdict::Unknown {
+            reason: IdentityReason::IdentityRecordInvalid,
         }
     } else {
         match (stored, &locked.marker_state) {
@@ -2337,6 +2371,73 @@ mod tests {
             "{kept:?}"
         );
         assert!(kept.bytes.is_some_and(|bytes| !bytes.complete));
+    }
+
+    #[test]
+    fn an_invalid_identity_record_is_invalid_not_missing() {
+        // Three roots of one area: one whose record is unreadable, one whose record is
+        // schema-divergent, and one whose record is positively absent. The first two are
+        // `identity_record_invalid` and only the third is `identity_record_missing`, and
+        // every one of them is kept while an unrelated root of the same area still
+        // plans.
+        let fixture = Fixture::new("release-record-states");
+        let unreadable = fixture.root();
+        let divergent = fixture.root();
+        let absent = fixture.root();
+        let mut clean = fixture.declaration.clone();
+        clean.folder = "clean".to_owned();
+        clean.area = "clean".to_owned();
+        // The unchanged declaration's roots stay in `pool`; a fourth root in that same
+        // folder proves the per-object rule.
+        let other = fixture.root();
+
+        // An unreadable record: a regular file the reader refuses (a symlink here, so
+        // the refusal comes from the reader rather than its content).
+        let unreadable_path = identity_path(&fixture, &unreadable);
+        let aside = unreadable_path.with_extension("aside");
+        std::fs::rename(&unreadable_path, &aside).expect("the record is moved aside");
+        std::os::unix::fs::symlink(&aside, &unreadable_path).expect("a symlink takes its name");
+
+        // A divergent record: valid JSON, wrong schema.
+        let divergent_path = identity_path(&fixture, &divergent);
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&divergent_path).expect("the record is read"))
+                .expect("the record is JSON");
+        record["schema"] = serde_json::Value::String("barge.root.identity/2".to_owned());
+        std::fs::write(
+            &divergent_path,
+            serde_json::to_vec(&record).expect("the record encodes"),
+        )
+        .expect("the record is rewritten");
+        std::fs::set_permissions(&divergent_path, std::fs::Permissions::from_mode(0o600))
+            .expect("the record is private");
+
+        // A positively absent record.
+        std::fs::remove_file(identity_path(&fixture, &absent)).expect("the record is removed");
+
+        let report = fixture.plan();
+        let kept_unreadable = row(&report, &unreadable);
+        assert!(!kept_unreadable.eligible);
+        assert_eq!(
+            kept_unreadable.identity.reason.as_deref(),
+            Some("identity_record_invalid"),
+            "{kept_unreadable:?}"
+        );
+        let kept_divergent = row(&report, &divergent);
+        assert!(!kept_divergent.eligible);
+        assert_eq!(
+            kept_divergent.identity.reason.as_deref(),
+            Some("identity_record_invalid"),
+            "{kept_divergent:?}"
+        );
+        let kept_absent = row(&report, &absent);
+        assert!(!kept_absent.eligible);
+        assert_eq!(
+            kept_absent.identity.reason.as_deref(),
+            Some("identity_record_missing")
+        );
+        // The unrelated root of the same area is unaffected.
+        assert!(row(&report, &other).eligible, "{:?}", row(&report, &other));
     }
 
     #[test]
