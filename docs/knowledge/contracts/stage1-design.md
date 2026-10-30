@@ -956,8 +956,13 @@ volume verified; and no pending intent on the unit's own path. A pending
 intent's scope is its path, not the whole state directory: an intent for the unit
 itself, for an ancestor of it, or for anything inside it means a deletion is in
 flight over the same bytes and makes custody `Unknown`, while an intent for an
-unrelated unit on the same volume (or any unit on another volume or under another
-`root_dir`) never blocks this one (Supervisor decision `698d9ba3`, barge#025). The
+unrelated unit on the same volume (or any unit on another volume) never blocks this
+one (Supervisor decision `698d9ba3`, barge#025). The comparison is the whole path
+**below the volume**: `root_dir`, the area folder, the parent and the name are
+joined and split again, so two records that spell one physical path with a different
+split — the same folder carried in `root_dir` by one and in `folder` by the other —
+still overlap. Only a different volume, or a genuinely different path below it, is
+no overlap. The
 scan classifies every candidate from the kernel's own process table by
 its effective uid **before** it inspects any descriptor: a process of another
 effective uid is counted and reported in the evidence as not observed, which is

@@ -149,40 +149,41 @@ impl PendingIntent {
     /// Whether this pending intent names exactly `unit`.
     pub fn names(&self, unit: &DeletionUnit) -> bool {
         self.volume_uuid == unit.volume_uuid
-            && self.root_dir == unit.root_dir
-            && self.folder == unit.folder
-            && self.parent == unit.parent
-            && self.name == unit.name
+            && components(&self.root_dir, &self.folder, &self.parent, &self.name)
+                == components(&unit.root_dir, &unit.folder, &unit.parent, &unit.name)
     }
 
     /// Whether this pending intent's unit and `unit` are on one path: the same
     /// unit, an ancestor of it, or something inside it.
     ///
-    /// Paths are compared component by component below the volume's `root_dir`, so
-    /// `a/b` contains `a/b/c` and is contained by `a`, and a sibling never
-    /// overlaps. A unit on another volume or under another `root_dir` never
-    /// overlaps either.
+    /// The comparison is the whole path **below the volume**, component by
+    /// component: `root_dir`, the area folder, the parent and the name are joined
+    /// and split again, so two records that spell one physical path with a different
+    /// split — the same folder carried in `root_dir` by one and in `folder` by the
+    /// other — still overlap, and `a/b` contains `a/b/c` and is contained by `a`
+    /// while a sibling never overlaps. Only a unit on another volume, or on a
+    /// genuinely different path below it, does not overlap (barge#025, Supervisor
+    /// decision `698d9ba3`).
     pub fn overlaps(&self, unit: &DeletionUnit) -> bool {
-        if self.volume_uuid != unit.volume_uuid || self.root_dir != unit.root_dir {
+        if self.volume_uuid != unit.volume_uuid {
             return false;
         }
-        let mut intent = components(&self.folder, &self.parent, &self.name);
-        let mut planned = components(&unit.folder, &unit.parent, &unit.name);
+        let intent = components(&self.root_dir, &self.folder, &self.parent, &self.name);
+        let planned = components(&unit.root_dir, &unit.folder, &unit.parent, &unit.name);
         let shared = intent.len().min(planned.len());
-        if intent[..shared] != planned[..shared] {
-            return false;
-        }
-        // One path is a prefix of the other: the unit, an ancestor or a
-        // descendant. Equal lengths with equal components is the unit itself.
-        intent.truncate(shared);
-        planned.truncate(shared);
-        true
+        intent[..shared] == planned[..shared]
     }
 }
 
-/// One unit's path components below its volume's `root_dir`.
-fn components<'a>(folder: &'a str, parent: &'a str, name: &'a str) -> Vec<&'a str> {
-    [folder, parent, name]
+/// One unit's path components below its volume's mount, whatever split of
+/// `root_dir`, folder, parent and name spelled it.
+fn components<'a>(
+    root_dir: &'a str,
+    folder: &'a str,
+    parent: &'a str,
+    name: &'a str,
+) -> Vec<&'a str> {
+    [root_dir, folder, parent, name]
         .iter()
         .flat_map(|part| part.split('/'))
         .filter(|part| !part.is_empty())
@@ -2161,6 +2162,57 @@ mod tests {
         // The intent names this unit exactly, which is the first branch.
         assert_eq!(verdict.name(), "unknown");
         assert!(verdict.reason().unwrap_or_default().contains("already"));
+    }
+
+    #[test]
+    fn a_pending_intent_spelled_under_another_root_dir_still_overlaps() {
+        // One physical path, two splits: the same folder is carried in `root_dir` by the
+        // intent and in `folder` by the unit. The comparison is the whole path below the
+        // volume, so the intent still names this unit and custody is unknown - before the
+        // fix the differing `root_dir` made it invisible and custody came back safe.
+        let holder = holder("custody-aliased-intent");
+        let unit = holder.unit.clone();
+        let aliased = PendingIntent {
+            intent_id: "a".repeat(32),
+            volume_uuid: unit.volume_uuid.clone(),
+            root_dir: format!("{}/{}", unit.root_dir, unit.folder),
+            folder: unit.parent.clone(),
+            parent: String::new(),
+            name: unit.name.clone(),
+        };
+        assert_ne!(aliased.root_dir, unit.root_dir, "the splits differ");
+        assert!(aliased.overlaps(&unit), "the aliased path still overlaps");
+        let verdict = holder.take(&[aliased], &holder.fixture.observer());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+
+        // An ancestor spelled through the other split is still an ancestor.
+        let ancestor = PendingIntent {
+            intent_id: "b".repeat(32),
+            volume_uuid: unit.volume_uuid.clone(),
+            root_dir: unit.root_dir.clone(),
+            folder: unit.folder.clone(),
+            parent: String::new(),
+            name: format!("{}/{}", "x", "y")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_owned(),
+        };
+        let inside = DeletionUnit {
+            parent: "x/y".to_owned(),
+            folder: unit.folder.clone(),
+            ..unit.clone()
+        };
+        assert!(ancestor.overlaps(&inside), "an ancestor still overlaps");
+        // A genuinely different path below the same volume does not.
+        let elsewhere = DeletionUnit {
+            folder: format!("{}-other", unit.folder),
+            ..unit
+        };
+        assert!(
+            !ancestor.overlaps(&elsewhere),
+            "another folder is no overlap"
+        );
     }
 
     #[test]
