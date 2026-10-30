@@ -37,8 +37,8 @@ use crate::delete::{self, DeleteBounds, PendingRow};
 use crate::digest::sha256_hex;
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
-    DeviceId, DirHandle, DirOps, EntryFacts, EntryKind, MountRoot, ProcessObserver, VolumeFacts,
-    VolumeUuid,
+    AbsenceVolume, DeviceId, DirHandle, DirOps, EntryFacts, EntryKind, MountRoot, ProcessObserver,
+    VolumeFacts, VolumeUuid,
 };
 use crate::registry::{
     self, ClaimScope, ClaimUnit, MarkerFamily, ScratchClaim, ScratchDelegation, ScratchGrants,
@@ -1598,7 +1598,7 @@ pub struct SweepRequest<'a> {
 pub fn sweep(
     state_paths: &StatePaths,
     dirs: &dyn DirOps,
-    facts: &dyn VolumeFacts,
+    facts: &dyn AbsenceVolume,
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
     request: &SweepRequest<'_>,
@@ -1746,7 +1746,7 @@ pub fn sweep(
 pub fn expire_plan(
     state_paths: &StatePaths,
     dirs: &dyn DirOps,
-    facts: &dyn VolumeFacts,
+    facts: &dyn AbsenceVolume,
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
     record: &VolumeRecord,
@@ -1846,7 +1846,6 @@ pub fn expire_plan(
             state_paths,
             dirs,
             facts,
-            mounts,
             observer,
             delete_bounds,
             deadline,
@@ -2026,6 +2025,7 @@ pub fn expire_plan(
             &unit,
             delete_bounds,
             Some(&authorization),
+            &crate::state::IntentEvidence::none(),
         ) {
             Ok(report) => {
                 if report.is_deleted() {
@@ -4257,6 +4257,7 @@ mod tests {
                         device,
                         present: std::cell::Cell::new(true),
                         shifted: std::cell::Cell::new(false),
+                        duplicate: std::cell::Cell::new(false),
                     };
                     let mounts = crate::testkit::FakeMounts { root: root.clone() };
                     let observer = crate::testkit::FakeObserver::new();
@@ -6604,6 +6605,7 @@ mod tests {
             &unit,
             bounds,
             Some(&refuse),
+            &crate::state::IntentEvidence::none(),
         )
         .expect_err("withdrawn grant refuses");
         assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
@@ -6632,6 +6634,7 @@ mod tests {
             &unit,
             bounds,
             Some(&current),
+            &crate::state::IntentEvidence::none(),
         )
         .expect("delete reports");
         assert!(report.is_deleted(), "{report:?}");
@@ -6931,6 +6934,8 @@ mod tests {
                 },
                 captures: Vec::new(),
                 foreign_captures: Vec::new(),
+                identity: None,
+                absence: None,
                 plan_digest: "ab".repeat(32),
                 phase: IntentPhase::Intent,
                 generation: 1,
@@ -6959,13 +6964,11 @@ mod tests {
 
             let observer = harness.fixture.observer();
             let facts = harness.fixture.facts();
-            let mounts = harness.fixture.mounts();
             let platform = harness.fixture.platform();
             let report = crate::delete::replay_pending(
                 &harness.fixture.state,
                 &platform,
                 &facts,
-                &mounts,
                 &observer,
                 DeleteBounds {
                     retry_pause: std::time::Duration::ZERO,
@@ -6996,6 +6999,7 @@ mod tests {
             settled: 0,
             rolled_back: 0,
             resumed: 0,
+            remounted: 0,
             pending: vec![crate::delete::PendingRow {
                 intent_id: "0123456789abcdef0123456789abcdef".to_owned(),
                 unit_name: "leftover".to_owned(),

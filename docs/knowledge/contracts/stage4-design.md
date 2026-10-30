@@ -1312,6 +1312,114 @@ contract, and because a receipt on the drive is copied by the clone too. Treatin
 a clone as unknown would be an operator scope decision, not an implementation
 detail.
 
+### F4 landed surface
+
+`barge.intent/2` gained the two optional documents this contract gives it, and the
+reader, the writer seam and the replay know them. It did **not** gain an effect
+verb: `barge prune` still refuses every form that is not the plan, because a real
+release needs its own authorization, and this slice authorizes no delete of any
+root (`F3`'s refusal text is unchanged).
+
+What a record can now carry. `identity` is condition 2's evidence exactly as a plan
+row prints it — verdict, optional reason code, inode, both devices, the remount and
+mount-moved facts, the marker digest — and `absence` is the `barge.absence/1`
+document itself, with its own `proved_ms`. Both live in `evidence`, which the plan
+and the intent now share, so one reader decides both documents: a verdict outside
+the design's set, a reason outside its table, a `verified` identity that does not
+carry its inode, both devices, the remount and mount-moved facts and the marker
+digest, an `absent` proof without the ancestor and leaf that prove it, an
+`unknown` **absence** without a reason, a `present` walk that carries an ancestor or
+leaf, a path that is not absolute with named components only, or a document over
+4 KiB is unknown state. An `unknown` **identity** needs no reason, because a plan row
+that could not observe a root reports exactly that: it says nothing was decided, and
+it keeps the root. `read_prune_plan` reads them through the same validator, which is
+a stricter reading of the plan than F3 left and not a change to its field set.
+
+What an intent may state. An intent names a unit only when every condition of its
+gate held, so a recorded identity is `verified` and a recorded absence is `absent`; a
+record that says otherwise is refused on read. The identity evidence must also
+describe this unit — its inode and the exact marker bytes the record carries — and a
+unit that carries it is a Barge-marked directory. Both documents are optional:
+every `/2` record written before this slice, and every `/1` record, still reads
+with neither, and `barge.intent/1` maps to no evidence because it recorded none.
+The writer seam is `state::IntentEvidence`; `delete_unit_authorized` publishes it
+with the intent before the first effect, and `delete_unit_on_volume` passes none, so
+the scratch sweep and the space prune are unchanged. The release effect, when its
+own brief authorizes it, supplies the plan row's two documents there and nowhere
+else.
+
+Replay under a changed device. A replay never finds its volume through the
+registry's mount hint and never compares a durable fact to the device the intent
+recorded. It asks the platform which live mounts carry the recorded UUID (F2's
+locator): none is `Unknown` — an absent drive is not a deleted root — and more than
+one is `duplicate_volume_uuid`, refused for that intent before any mount is chosen,
+because a decision between two mounts is never made. The one candidate is verified
+as the volume and as a real mount root, and the area folder is walked from *that*
+live mount through the same containment walk, so a reconnect that moved the mount
+point settles on the UUID and the components below it while the stale hint is only a
+stale observation.
+
+Every step of a replay keeps stage 1's mode order: the modes a stopped run
+recorded are restored first, before any marker is read — the changed-device proof
+reads one — so an intent whose identity cannot be re-established still leaves the
+captured object with the mode the record proves, never with the widened permissions
+the deletion needed. The object the restore chmods is matched on its recorded inode
+and the volume's live device, never on the device a capture recorded before the
+remount: that number belongs to the mount the record was written under, so
+comparing to it would refuse the restoration exactly when it is needed.
+
+What a changed device is re-proved from depends on the phase, because each phase
+acts on a different object and `marker_last` has already removed the marker the
+earlier ones compare. `removed` and `deleted` rest on the durable phase — Barge's own
+recorded final unlink — and not on an object's identity at all. `intent` acts on
+whichever name holds the unit: the unit itself, where the rename never happened and
+the intent rolls back, or its capture, where it resumes. `renamed` acts on the
+capture with its marker in place, and `marker_last` on the capture whose marker must
+be *positively absent*, which is that phase's own proof. In every case the object
+must be the recorded kind and inode on the volume this run verified; below
+`marker_last` its marker must be the exact recorded bytes (which pin the root id,
+nonce and volume); at `marker_last` the marker must be gone and the inode and kind
+are the identity. A markerless unit therefore settles on its inode, its kind, the
+verified volume and the intent's own 128-bit private capture name — stage 1's own
+leaf rule minus the device. An intent that carries identity evidence must also have
+its durable record agree: root id, nonce, mount-relative path, inode and kind, and
+the generation the record was written at; at `marker_last` the marker's own facts are
+gone by design, so the evidence's inode and the acted-on inode are what remain. An
+object that is anything else — a different inode, a leaf that cannot be read, a
+marker that is not the recorded bytes — keeps stage 1's within-run device, so the
+change is `Unknown` and the intent stays pending with the reason. The replayed
+intents report how many resumed deletions were re-established this way, and a settled
+intent's record keeps its evidence as the diagnostic a later run reads.
+
+The `barge.root/1`-to-`/2` settlement. A pending intent written by an older reader
+records a `barge.root/1` root — S3-era, so no durable identity record — and the
+marker writer has since moved to `/2`. F4 settles that intent without rewriting
+anything: the marker is read by its own version's rule (F2's prefix relaxation
+included), the recorded inode and the exact recorded marker bytes are the proof, and
+no code writes a v1 marker, demands a v2 one, or invents the identity record O4-002
+keeps explicit. The same rule settles a `/2` record that predates the evidence, so
+the carried finding's own scenario — a reboot between the intent and its replay —
+no longer strands a correct intent inside Barge.
+
+Absence is re-established, never reused. At the `intent` phase, when the rename
+already happened and the replay is about to resume the effect, the recorded
+`barge.absence/1` proof is proved again from the anchor: a path under a registered
+volume is re-prefixed with the live mount located by the recorded UUID (the
+components below it unchanged, as the reference matcher already does), the ancestor
+is proved on that volume, and only a fresh `absent` lets the deletion resume. A path
+that reappeared keeps the intent pending and unlinks nothing; a volume that cannot
+be located is unknown, not absent. A phase past `renamed` has already begun the
+effect, so the proof is not a gate there and is not consulted.
+
+What the release effect's own brief still owns: the verb, its authorization
+(the plan's exact bytes and digest), the effect-time re-establishment of every
+predicate in order, and the operator gate that precedes a real run. Nothing in F4
+changes what may be deleted, and no CLI verb changed. The documents that did gain
+fields are the intent's two optional ones and, additively, the replay report's
+`remounted` count inside `barge.scratch.expire/1`, whose human summary names it only
+when it is not zero; the CLI's only other edit is the absence seam the replay's
+platform object already supplies.
+
 ## Proposed validation
 
 Design-only validation for this contract is `effigy docs:check` once per changed

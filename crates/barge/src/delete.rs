@@ -76,6 +76,16 @@
 //!   first - before it reads the marker or decides the phase;
 //! - the `removed` phase is published after Barge's own final unlink and before the
 //!   intent settles, and an absent leaf without it stays unknown and pending.
+//!
+//! Stage 4 F4 adds the evidence a replay needs after a reboot, and the two rules
+//! that make it usable. A pending intent may carry the plan's `identity` evidence
+//! and its consumer path's `barge.absence/1` proof; neither is a permission. The
+//! replay re-establishes both: the absence proof is proved again before any
+//! further effect, and the identity is re-proved from a fact that is not a device
+//! number, so a volume that reconnects with a different `st_dev` does not strand a
+//! correct intent. A `barge.root/1` root (and a `/2` one) settles the same way: the
+//! marker is read by its own version's rule, and no code writes a v1 marker or
+//! demands a v2 one to finish a deletion.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -89,8 +99,9 @@ use crate::contract::{INTENT_ROWS, LISTING_NAME_ROWS};
 use crate::custody::{self, CustodyBounds, CustodyEvidence, PendingIntent};
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
-    ChildRemoval, DeviceId, DirHandle, DirOps, EntryFacts, EntryKind, MountRoot, ProcessObserver,
-    RemoveKind, RenameOutcome, RetryEvidence, VolumeFacts, VolumeUuid,
+    AbsenceVolume, AncestorExpected, ChildRemoval, DeviceId, DirHandle, DirId, DirOps, EntryFacts,
+    EntryKind, MountRoot, ProcessObserver, RemoveKind, RenameOutcome, RetryEvidence, VolumeFacts,
+    VolumeUuid,
 };
 use crate::registry;
 use crate::state::{
@@ -277,6 +288,11 @@ pub struct ReplayReport {
     pub pending: Vec<PendingRow>,
     /// How many entries the resumed deletions removed.
     pub entries_removed: usize,
+    /// How many resumed deletions ran on a volume whose device number differs from
+    /// the one the intent recorded, which is what a reboot or a reconnect does to an
+    /// unchanged filesystem. Each one was re-established from a fact that is not a
+    /// device before anything was unlinked.
+    pub remounted: usize,
 }
 
 impl ReplayReport {
@@ -340,6 +356,7 @@ pub fn delete_unit_on_volume(
         unit,
         bounds,
         None,
+        &state::IntentEvidence::none(),
     )
 }
 
@@ -357,6 +374,7 @@ pub(crate) fn delete_unit_authorized(
     unit: &DeletionUnit,
     bounds: DeleteBounds,
     authorize: Option<&EligibilityCheck<'_>>,
+    intent_evidence: &state::IntentEvidence,
 ) -> Result<DeleteReport> {
     // The unit's own record is validated first: its parent, name, kind, marker,
     // grant and plan digest each have one well-formed shape, and the grant must
@@ -544,6 +562,8 @@ pub(crate) fn delete_unit_authorized(
         phase_ms: now,
         captures: Vec::new(),
         foreign_captures: Vec::new(),
+        identity: intent_evidence.identity.clone(),
+        absence: intent_evidence.absence.clone(),
     };
     let write = locks.begin_intent_write()?;
     // The first durable step is this intent record, and the lock waits above (and
@@ -627,7 +647,13 @@ pub(crate) fn delete_unit_authorized(
             ))
         }
     }
-    if let Some(reason) = renamed_leaf_mismatch(dirs, &parent_handle, &intent) {
+    // The volume this deletion walks under: the one the preflight verified, and the
+    // unit's own recorded device, which custody re-read against that volume above.
+    let volume = WalkVolume {
+        mount: resolved.mount_point.clone(),
+        device: unit.device,
+    };
+    if let Some(reason) = renamed_leaf_mismatch(dirs, &parent_handle, &intent, &volume) {
         return Ok(pending_report(
             &intent,
             quarantine,
@@ -648,9 +674,27 @@ pub(crate) fn delete_unit_authorized(
         &parent_path,
         &parent_handle,
         bounds,
+        &volume,
     );
     report.custody = Some(evidence);
     Ok(report)
+}
+
+/// The volume one deletion walks under: the verified mount and the device its
+/// facts are compared against.
+///
+/// A live deletion takes both from the volume it opened. A replay re-establishes
+/// them from the live volume it read through the area folder, because a device
+/// number identifies the mounted filesystem instance and not the data: a reboot,
+/// a power cycle or a reconnect gives the same volume a different one. Every
+/// comparison in the walk and in the unit's own identity is made against this
+/// value, so no durable fact is ever compared to a stale device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WalkVolume {
+    /// The verified live mount root.
+    mount: PathBuf,
+    /// The live device of that mount.
+    device: DeviceId,
 }
 
 /// Take the lock of the unit being deleted: the root lock for a Barge root id,
@@ -673,18 +717,19 @@ fn renamed_leaf_mismatch(
     dirs: &dyn DirOps,
     parent: &DirHandle,
     intent: &IntentRecord,
+    volume: &WalkVolume,
 ) -> Option<String> {
     let name = intent.capture_name();
     match intent.unit.kind {
         UnitKind::Directory => match dirs.open_child_dir(parent, name) {
             Ok(leaf) => {
                 let opened = leaf.identity();
-                if opened.device.get() == intent.unit.device && opened.inode == intent.unit.inode {
+                if opened.device == volume.device && opened.inode == intent.unit.inode {
                     None
                 } else {
                     Some(format!(
-                        "the renamed leaf is device {} inode {}, not the recorded {} / {}",
-                        opened.device, opened.inode, intent.unit.device, intent.unit.inode
+                        "the renamed leaf is device {} inode {}, not the recorded device {} inode {}",
+                        opened.device, opened.inode, volume.device, intent.unit.inode
                     ))
                 }
             }
@@ -693,7 +738,7 @@ fn renamed_leaf_mismatch(
         UnitKind::File => match dirs.child_facts(parent, name) {
             Ok(Some(facts))
                 if facts.kind == EntryKind::File
-                    && facts.device.get() == intent.unit.device
+                    && facts.device == volume.device
                     && facts.inode == intent.unit.inode =>
             {
                 None
@@ -703,7 +748,7 @@ fn renamed_leaf_mismatch(
                 facts.kind.as_str(),
                 facts.device,
                 facts.inode,
-                intent.unit.device,
+                volume.device,
                 intent.unit.inode
             )),
             Ok(None) => Some("the renamed leaf is not there".to_owned()),
@@ -724,6 +769,7 @@ fn finish_deletion(
     parent_path: &Path,
     parent: &DirHandle,
     bounds: DeleteBounds,
+    volume: &WalkVolume,
 ) -> DeleteReport {
     let quarantine = parent_path.join(intent.capture_name());
     let uid = match observer.effective_uid() {
@@ -760,7 +806,7 @@ fn finish_deletion(
         }
     };
     if leaf_facts.kind != intent.unit.kind.entry_kind()
-        || leaf_facts.device.get() != intent.unit.device
+        || leaf_facts.device != volume.device
         || leaf_facts.inode != intent.unit.inode
     {
         return pending_report(
@@ -773,7 +819,7 @@ fn finish_deletion(
                 leaf_facts.device,
                 leaf_facts.inode,
                 intent.unit.kind.as_str(),
-                intent.unit.device,
+                volume.device,
                 intent.unit.inode
             ),
             None,
@@ -797,14 +843,14 @@ fn finish_deletion(
         match dirs.open_child_dir(parent, intent.capture_name()) {
             Ok(leaf) => {
                 let opened = leaf.identity();
-                if opened.device.get() != intent.unit.device || opened.inode != intent.unit.inode {
+                if opened.device != volume.device || opened.inode != intent.unit.inode {
                     return pending_report(
                         intent,
                         quarantine,
                         Counts::default(),
                         format!(
-                            "the captured leaf opened as device {} inode {}, not the recorded {} / {}",
-                            opened.device, opened.inode, intent.unit.device, intent.unit.inode
+                            "the captured leaf opened as device {} inode {}, not the recorded device {} inode {}",
+                            opened.device, opened.inode, volume.device, intent.unit.inode
                         ),
                         None,
                     );
@@ -908,7 +954,7 @@ fn finish_deletion(
                     CaptureRecord {
                         private: intent.capture_name().to_owned(),
                         original: intent.capture_name().to_owned(),
-                        device: intent.unit.device,
+                        device: volume.device.get(),
                         inode: intent.unit.inode,
                         kind: "directory".to_owned(),
                         verdict: CaptureVerdict::Observed,
@@ -955,8 +1001,8 @@ fn finish_deletion(
         facts,
         observer,
         intent.volume_uuid.clone(),
-        DeviceId::new(intent.unit.device),
-        intent.mount_hint.clone(),
+        volume.device,
+        volume.mount.clone(),
         bounds,
         &journal,
         base_chain,
@@ -1345,6 +1391,16 @@ impl<'a> CaptureJournal<'a> {
     }
 }
 
+/// Whether `facts` is the object one recorded capture names.
+///
+/// A record's inode and kind are durable; its device is the within-run observation
+/// it was taken under, so a capture recorded before a remount is matched on the
+/// volume this walk verified now - which is what proves it is on the right
+/// filesystem - rather than on the old number.
+fn capture_matches(record: &CaptureRecord, facts: &EntryFacts, device: DeviceId) -> bool {
+    facts.device == device && facts.inode == record.inode && facts.kind.as_str() == record.kind
+}
+
 /// One deletion walk: the bounds, the accumulated facts and the volume
 /// re-verification that a long walk needs.
 struct WalkState<'a> {
@@ -1440,13 +1496,6 @@ impl<'a> WalkState<'a> {
     /// must be in before anything unlinks it.
     fn publish_chain(&self) -> Result<()> {
         self.journal.record_captures(&self.chain)
-    }
-
-    /// Whether `facts` is the object one recorded capture names.
-    fn matches_capture(record: &CaptureRecord, facts: &EntryFacts) -> bool {
-        facts.device.get() == record.device
-            && facts.inode == record.inode
-            && facts.kind.as_str() == record.kind
     }
 
     /// The stop for a private name this operation did not record and verify.
@@ -1649,7 +1698,8 @@ impl<'a> WalkState<'a> {
                     .captures
                     .iter()
                     .find(|capture| {
-                        capture.private == entry.name && Self::matches_capture(capture, &facts)
+                        capture.private == entry.name
+                            && capture_matches(capture, &facts, self.device)
                     })
                     .cloned();
                 let Some(capture) = ours else {
@@ -1664,10 +1714,10 @@ impl<'a> WalkState<'a> {
                     // The recursion is into the recorded capture and nothing else: a
                     // name swapped between the read and the open stops the walk.
                     let opened = child.identity();
-                    if opened.device.get() != capture.device || opened.inode != capture.inode {
+                    if opened.device != self.device || opened.inode != capture.inode {
                         return Ok(Walk::Stop(format!(
-                            "`{}` opened as device {} inode {}, not the recorded capture on device {} inode {}, so it is not classified",
-                            entry.name, opened.device, opened.inode, capture.device, capture.inode
+                            "`{}` opened as device {} inode {}, not the recorded capture on this volume inode {}, so it is not classified",
+                            entry.name, opened.device, opened.inode, capture.inode
                         )));
                     }
                     if let Walk::Stop(reason) = self.classify(&child, depth + 1, &original)? {
@@ -1981,7 +2031,7 @@ impl<'a> WalkState<'a> {
         let still_recorded = self
             .dirs
             .child_facts(parent, &record.private)?
-            .is_some_and(|facts| Self::matches_capture(record, &facts));
+            .is_some_and(|facts| capture_matches(record, &facts, self.device));
         if !still_recorded {
             return Ok(Walk::Stop(format!(
                 "`{}` is no longer the recorded capture of `{}`, so it is not unlinked and the intent stays pending",
@@ -2032,10 +2082,10 @@ impl<'a> WalkState<'a> {
             }
         };
         let opened = child.identity();
-        if opened.device.get() != record.device || opened.inode != record.inode {
+        if opened.device != self.device || opened.inode != record.inode {
             return Ok(Walk::Stop(format!(
-                "`{}` opened as device {} inode {}, not the recorded {} / {}",
-                record.private, opened.device, opened.inode, record.device, record.inode
+                "`{}` opened as device {} inode {}, not the recorded device {} inode {}",
+                record.private, opened.device, opened.inode, self.device, record.inode
             )));
         }
         // The recorded mode was published before this change; the guard puts it
@@ -2062,7 +2112,7 @@ impl<'a> WalkState<'a> {
         let still_recorded = self
             .dirs
             .child_facts(parent, &record.private)?
-            .is_some_and(|facts| Self::matches_capture(record, &facts));
+            .is_some_and(|facts| capture_matches(record, &facts, self.device));
         if !still_recorded {
             return Ok(Walk::Stop(restore_custody(
                 custody,
@@ -2125,7 +2175,7 @@ impl<'a> WalkState<'a> {
         };
         let expected_kind = intent.unit.kind.entry_kind();
         if facts.kind != expected_kind
-            || facts.device.get() != intent.unit.device
+            || facts.device != self.device
             || facts.inode != intent.unit.inode
         {
             // It is not the recorded leaf: a foreign object at the private name.
@@ -2137,13 +2187,13 @@ impl<'a> WalkState<'a> {
                 facts.device,
                 facts.inode,
                 intent.unit.kind.as_str(),
-                intent.unit.device,
+                self.device,
                 intent.unit.inode
             );
             let mut foreign = ForeignCapture {
                 private: private.clone(),
                 original: intent.capture_name().to_owned(),
-                device: intent.unit.device,
+                device: self.device.get(),
                 inode: intent.unit.inode,
                 kind: intent.unit.kind.as_str().to_owned(),
                 captured: Some(CapturedObject {
@@ -2182,7 +2232,7 @@ impl<'a> WalkState<'a> {
         let record = CaptureRecord {
             private,
             original: intent.capture_name().to_owned(),
-            device: intent.unit.device,
+            device: self.device.get(),
             inode: intent.unit.inode,
             kind: intent.unit.kind.as_str().to_owned(),
             verdict: CaptureVerdict::Observed,
@@ -2360,7 +2410,8 @@ impl<'a> WalkState<'a> {
                     .captures
                     .iter()
                     .find(|capture| {
-                        capture.private == entry.name && Self::matches_capture(capture, &facts)
+                        capture.private == entry.name
+                            && capture_matches(capture, &facts, self.device)
                     })
                     .cloned()
                 else {
@@ -2611,8 +2662,7 @@ fn is_finder_metadata(name: &str) -> bool {
 pub fn replay_pending(
     state_paths: &StatePaths,
     dirs: &dyn DirOps,
-    facts: &dyn VolumeFacts,
-    mounts: &dyn MountRoot,
+    volumes: &dyn AbsenceVolume,
     observer: &dyn ProcessObserver,
     bounds: DeleteBounds,
     deadline: Option<Instant>,
@@ -2625,6 +2675,7 @@ pub fn replay_pending(
         resumed: 0,
         pending: Vec::new(),
         entries_removed: 0,
+        remounted: 0,
     };
     let pending: Vec<IntentRecord> = intents.pending().cloned().collect();
     if pending.is_empty() {
@@ -2660,8 +2711,7 @@ pub fn replay_pending(
         match replay_one(
             state_paths,
             dirs,
-            facts,
-            mounts,
+            volumes,
             observer,
             &record,
             &intent,
@@ -2670,9 +2720,12 @@ pub fn replay_pending(
             Ok(outcome) => match outcome {
                 ReplayOutcome::Settled => report.settled += 1,
                 ReplayOutcome::RolledBack => report.rolled_back += 1,
-                ReplayOutcome::Resumed(entries) => {
+                ReplayOutcome::Resumed { entries, remounted } => {
                     report.resumed += 1;
                     report.entries_removed = report.entries_removed.saturating_add(entries);
+                    if remounted {
+                        report.remounted += 1;
+                    }
                 }
                 ReplayOutcome::Pending(reason) => report.pending.push(PendingRow {
                     intent_id: intent.intent_id.clone(),
@@ -2719,18 +2772,434 @@ enum ReplayOutcome {
     Settled,
     /// The unit was still in place, so the intent was rolled back.
     RolledBack,
-    /// The deletion resumed and completed.
-    Resumed(usize),
+    /// The deletion resumed and completed, removing this many entries, and whether
+    /// it ran on a volume whose device number differs from the intent's record.
+    Resumed {
+        /// How many entries the resumed deletion removed.
+        entries: usize,
+        /// Whether the volume's live device differs from the one the intent
+        /// recorded.
+        remounted: bool,
+    },
     /// It stays pending, with the reason.
     Pending(String),
+}
+
+/// The live volume a replay walks under, located by its recorded UUID.
+///
+/// The registry's mount hint is an observation, so it is never how a replay finds a
+/// volume: a reconnect can move the mount and the hint then names a stale path. The
+/// replay asks the platform which live mounts carry the recorded UUID and accepts
+/// exactly one. None is `Unknown` (an absent drive is not a deleted root), and more
+/// than one is a decision the design never makes — picking one silently is how a
+/// delete lands on the wrong copy — so a duplicate refuses that intent before any
+/// mount is chosen and nothing is unlinked. The one candidate is then verified as a
+/// volume and as a real mount root, which is what the walk's own comparisons use.
+fn locate_walk_volume(
+    volumes: &dyn AbsenceVolume,
+    intent: &IntentRecord,
+) -> std::result::Result<WalkVolume, String> {
+    let candidates = volumes
+        .mounts_for_uuid(&intent.volume_uuid)
+        .map_err(|error| format!("the live mounts cannot be read: {error}"))?;
+    let mount = match candidates.as_slice() {
+        [] => {
+            return Err(format!(
+                "volume {} has no live mount, so the intent stays pending and nothing is unlinked",
+                intent.volume_uuid
+            ))
+        }
+        [mount] => mount.as_path().to_path_buf(),
+        _ => {
+            return Err(format!(
+                "duplicate_volume_uuid: {} live mounts carry volume {}'s UUID, so no mount is chosen and nothing is unlinked",
+                candidates.len(),
+                intent.volume_uuid
+            ))
+        }
+    };
+    let verified = crate::os::verify_volume(
+        volumes,
+        volumes,
+        &mount,
+        &crate::os::ExpectedVolume {
+            volume_uuid: &intent.volume_uuid,
+            mount_hint: Some(&mount),
+        },
+    )
+    .map_err(|error| {
+        format!(
+            "the live mount {} is not a verified volume {}: {error}",
+            mount.display(),
+            intent.volume_uuid
+        )
+    })?;
+    Ok(WalkVolume {
+        mount: verified.identity().mount_point.clone(),
+        device: verified.identity().device,
+    })
+}
+
+/// Re-establish a pending unit's identity when the live device differs from the one
+/// the intent recorded.
+///
+/// A changed device number is normal across a reboot, a reconnect or a dock power
+/// cycle, so it is never a refusal on its own; it is also never the thing that
+/// identifies a unit. What proves the unit depends on the phase, because each phase
+/// acts on a different object and `marker_last` has already removed the marker the
+/// earlier phases compare:
+///
+/// - `removed` and `deleted` rest on the durable phase — Barge's own recorded final
+///   unlink — and not on an object's identity at all, so nothing is re-proved here
+///   and the phase's own arm decides whether the leaf is positively absent;
+/// - `intent` acts on whichever name holds the unit: the unit itself (a rollback,
+///   because the rename never happened) or its capture (a resume);
+/// - `renamed` acts on the capture with its marker still in place;
+/// - `marker_last` acts on the capture whose marker is *positively absent*, which is
+///   what that phase records, so the inode and kind are the identity there.
+///
+/// The proof is everything but the device: the acted-on name is the recorded kind
+/// and inode on the volume this run verified; its marker is the exact bytes the
+/// intent recorded (the SHA-256 pins the whole document, including the root id and
+/// nonce), its owner is Barge and its volume UUID is the intent's — so a
+/// `barge.root/1` or `barge.root/2` marker is read by its own version's rule and
+/// neither is demanded or rewritten. For an intent that carries the plan's
+/// `identity` evidence, the durable `barge.root.identity/1` record must also agree:
+/// the same root id and nonce, the same mount-relative path, the same inode and kind.
+/// A missing or invalid record is unknown and keeps the intent pending, because that
+/// evidence is what the plan proved; at `marker_last` the marker's own facts are gone
+/// by design, so the evidence's inode and the acted-on object's inode are what remain.
+///
+/// An intent written before this slice carried identity evidence has no record to
+/// require: its own recorded inode and marker bytes are stage 1's within-run
+/// observation, and they are what settles it.
+fn reestablish_identity(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    intent: &IntentRecord,
+    parent: &DirHandle,
+    volume: &WalkVolume,
+) -> std::result::Result<(), String> {
+    let changed = "the volume's device changed and";
+    // A durable completion is not re-proved from an object: the phase arm decides
+    // whether the leaf is positively absent.
+    if matches!(intent.phase, IntentPhase::Removed | IntentPhase::Deleted) {
+        return Ok(());
+    }
+    // What this phase acts on. At `intent` the rename may not have happened, so the
+    // unit itself is a valid object to re-establish: its own identity is what a
+    // rollback needs, and nothing is deleted.
+    let name = match intent.phase {
+        IntentPhase::Intent => {
+            let unit_there = dirs
+                .child_facts(parent, intent.unit_name())
+                .map_err(|error| format!("{changed} the unit cannot be read: {error}"))?
+                .is_some();
+            if unit_there {
+                intent.unit_name()
+            } else {
+                intent.capture_name()
+            }
+        }
+        _ => intent.capture_name(),
+    };
+    let Some(facts) = dirs
+        .child_facts(parent, name)
+        .map_err(|error| format!("{changed} `{name}` cannot be read: {error}"))?
+    else {
+        return Err(format!(
+            "{changed} neither the unit nor its capture is there, so this phase's identity cannot be re-established"
+        ));
+    };
+    if facts.kind != intent.unit.kind.entry_kind()
+        || facts.inode != intent.unit.inode
+        || facts.device != volume.device
+    {
+        return Err(format!(
+            "{changed} `{name}` is a {} on device {} inode {}, not the recorded {} on this volume's device {} inode {}",
+            facts.kind.as_str(),
+            facts.device,
+            facts.inode,
+            intent.unit.kind.as_str(),
+            volume.device,
+            intent.unit.inode
+        ));
+    }
+    let Some(marker) = &intent.unit.marker else {
+        // A unit with no marker records no bytes to compare, so its inode, kind and
+        // this volume are its whole recorded identity. An intent that carries
+        // identity evidence for such a unit is refused below, because that evidence
+        // describes a Barge-marked directory.
+        if intent.identity.is_some() {
+            return Err(format!(
+                "{changed} this unit carries no marker, so its identity evidence cannot be re-established"
+            ));
+        }
+        return Ok(());
+    };
+    if marker.family != MarkerFamily::Barge || intent.unit.kind != UnitKind::Directory {
+        return Err(format!(
+            "{changed} the unit's `{}` marker does not carry an identity Barge can re-establish",
+            marker.family.as_str()
+        ));
+    }
+    let directory = dirs
+        .open_child_dir(parent, name)
+        .map_err(|error| format!("{changed} `{name}` cannot be opened: {error}"))?;
+    if directory.identity()
+        != (DirId {
+            device: facts.device,
+            inode: facts.inode,
+        })
+    {
+        return Err(format!(
+            "{changed} `{name}` changed between its reading and its open"
+        ));
+    }
+    let uid = observer
+        .effective_uid()
+        .map_err(|error| format!("the account uid is unreadable: {error}"))?;
+    let document = area::read_marker_document(dirs, &directory, uid);
+    // `marker_last` is the phase whose proof is the marker's positive absence; it is
+    // the one phase that must not find the recorded bytes.
+    if intent.phase == IntentPhase::MarkerLast {
+        if !matches!(document, area::MarkerDocument::Absent) {
+            return Err(format!(
+                "{changed} the unit's marker is still there, so the marker-last phase is not proved"
+            ));
+        }
+        if let Some(evidence) = &intent.identity {
+            if evidence.inode != Some(facts.inode) {
+                return Err(format!(
+                    "{changed} the intent's identity evidence names inode {:?}, not this unit's {inode}",
+                    evidence.inode,
+                    inode = facts.inode
+                ));
+            }
+        }
+        return Ok(());
+    }
+    let (marker_document, digest) = match document {
+        area::MarkerDocument::Read { marker, digest } => (*marker, digest),
+        area::MarkerDocument::Absent => {
+            return Err(format!("{changed} `{name}` carries no marker"))
+        }
+        area::MarkerDocument::Unreadable { reason } => {
+            return Err(format!(
+                "{changed} `{name}`'s marker is unreadable: {reason}"
+            ))
+        }
+    };
+    if digest != marker.digest {
+        return Err(format!(
+            "{changed} `{name}`'s marker is not the recorded bytes"
+        ));
+    }
+    if marker_document.owner != "barge" {
+        return Err(format!(
+            "{changed} `{name}`'s marker names the owner `{}`, not Barge",
+            marker_document.owner
+        ));
+    }
+    if marker_document.volume_uuid != intent.volume_uuid {
+        return Err(format!(
+            "{changed} `{name}`'s marker names volume {}, not {}",
+            marker_document.volume_uuid, intent.volume_uuid
+        ));
+    }
+    // The marker's own version and generation rule, which the design fixes: a v1 or
+    // v2 document, and `1` with no conclusion or a scratch run's `2` with one. A
+    // marker outside that rule is unknown, never re-established by its bytes alone.
+    if !matches!(
+        marker_document.schema.as_str(),
+        "barge.root/1" | "barge.root/2"
+    ) || !matches!(
+        (
+            marker_document.kind,
+            marker_document.generation,
+            marker_document.conclusion.is_some()
+        ),
+        (_, 1, false) | (crate::area::RootKind::ScratchRun, 2, true)
+    ) {
+        return Err(format!(
+            "{changed} `{name}`'s marker version or generation is not one this build reads"
+        ));
+    }
+    let record = match crate::identity::read(state_paths, dirs, &marker_document.root_id, uid) {
+        Ok(found) => found,
+        Err(error) => {
+            return Err(format!(
+                "{changed} the unit's identity record is unreadable: {error}"
+            ))
+        }
+    };
+    match (&intent.identity, record) {
+        // The plan proved a durable identity, so the record is what must agree.
+        (Some(evidence), Some(record)) => {
+            let relative = unit_relative_path(intent);
+            if record.root_id != marker_document.root_id
+                || record.nonce != marker_document.nonce
+                || record.inode != facts.inode
+                || record.volume_uuid != intent.volume_uuid.as_str()
+                || record.mount_relative_path != relative
+                || record.kind != marker_document.kind
+                || record.area.namespace != marker_document.area.namespace
+                || record.area.area != marker_document.area.area
+                || marker_document.generation < record.marker_generation_at_record
+            {
+                return Err(format!(
+                    "{changed} the durable identity record does not describe this unit at `{relative}`"
+                ));
+            }
+            if evidence.inode != Some(record.inode) {
+                return Err(format!(
+                    "{changed} the intent's identity evidence names another inode"
+                ));
+            }
+            Ok(())
+        }
+        (Some(_), None) => Err(format!(
+            "{changed} the unit's identity record is missing, so its identity is unknown"
+        )),
+        // An intent written before this slice carried the evidence: its recorded
+        // inode and marker bytes are what it was authorized by. A record that exists
+        // is still checked, so such a root is never settled on weaker facts than its
+        // own record.
+        (None, Some(record)) => {
+            let relative = unit_relative_path(intent);
+            if record.nonce != marker_document.nonce
+                || record.inode != facts.inode
+                || record.volume_uuid != intent.volume_uuid.as_str()
+                || record.mount_relative_path != relative
+                || record.kind != marker_document.kind
+                || record.area.namespace != marker_document.area.namespace
+                || record.area.area != marker_document.area.area
+                || marker_document.generation < record.marker_generation_at_record
+            {
+                return Err(format!(
+                    "{changed} the unit's identity record does not describe it at `{relative}`"
+                ));
+            }
+            Ok(())
+        }
+        (None, None) => Ok(()),
+    }
+}
+
+/// One unit's path below its volume's mount root, as the identity record spells it.
+fn unit_relative_path(intent: &IntentRecord) -> String {
+    [
+        intent.root_dir.as_str(),
+        intent.folder.as_str(),
+        intent.unit.parent.as_str(),
+        intent.unit.name.as_str(),
+    ]
+    .iter()
+    .filter(|part| !part.is_empty())
+    .copied()
+    .collect::<Vec<&str>>()
+    .join("/")
+}
+
+/// Re-establish the absence proof a release plan recorded, before an effect resumes.
+///
+/// The proof is never reused: it is proved again now, from the anchor, on the volume
+/// its own ancestor names. A consumer path under a registered volume that
+/// reconnected at another mount point is re-prefixed with the live mount located by
+/// the recorded UUID — every component below it unchanged — because the absolute
+/// path is an observation and the components are the identity. `Some(reason)` means
+/// the path is not proved absent and the effect must not resume.
+fn reestablish_absence(
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    intent: &IntentRecord,
+) -> Option<String> {
+    let evidence = intent.absence.as_ref()?;
+    let path = evidence.path.clone();
+    let expected = evidence
+        .ancestor
+        .as_ref()
+        .map(|ancestor| ancestor.volume.kind.as_str());
+    match expected {
+        Some("registered") => {
+            let Some(ancestor) = evidence.ancestor.as_ref() else {
+                return Some(format!(
+                    "the proof of `{}` names no ancestor to re-prove",
+                    path.display()
+                ));
+            };
+            let Ok(uuid) = VolumeUuid::parse(&ancestor.volume.volume_uuid) else {
+                return Some(format!(
+                    "the proof of `{}` names a volume UUID this build cannot read",
+                    path.display()
+                ));
+            };
+            let live = match crate::os::locate_volume(volumes, volumes, volumes, &uuid) {
+                Ok(volume) => volume,
+                Err(error) => {
+                    return Some(format!(
+                        "the volume {} the proof of `{}` names cannot be located: {error}",
+                        uuid,
+                        path.display()
+                    ))
+                }
+            };
+            // The recorded anchor is the mount the plan proved the path under; a
+            // reconnect can move the mount, so the components below it are what is
+            // carried across and the live mount is the new prefix.
+            let Ok(relative) = path.strip_prefix(&evidence.anchor.path) else {
+                return Some(format!(
+                    "the proof of `{}` is not below its recorded anchor `{}`",
+                    path.display(),
+                    evidence.anchor.path.display()
+                ));
+            };
+            let relabelled = live.path().join(relative);
+            prove_again(
+                dirs,
+                volumes,
+                &relabelled,
+                AncestorExpected::Registered {
+                    uuid: &uuid,
+                    recorded_mount: live.path(),
+                },
+            )
+        }
+        // A path the plan proved against the boot Data volume is proved again the
+        // same way; a proof that names no ancestor was never absent, and its own
+        // verdict has already kept the root.
+        _ => prove_again(dirs, volumes, &path, AncestorExpected::BootData),
+    }
+}
+
+/// Prove one path again and answer `None` only for a fresh `absent` verdict.
+fn prove_again(
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    path: &Path,
+    expected: AncestorExpected<'_>,
+) -> Option<String> {
+    match crate::os::prove_absence(dirs, volumes, path, expected) {
+        Ok(proof) if proof.verdict() == "absent" => None,
+        Ok(proof) => Some(format!(
+            "the consumer path `{}` is now {}: {}",
+            path.display(),
+            proof.verdict(),
+            proof.reason().unwrap_or("no reason reported")
+        )),
+        Err(error) => Some(format!(
+            "the consumer path `{}` cannot be proved again: {error}",
+            path.display()
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn replay_one(
     state_paths: &StatePaths,
     dirs: &dyn DirOps,
-    facts: &dyn VolumeFacts,
-    mounts: &dyn MountRoot,
+    volumes: &dyn AbsenceVolume,
     observer: &dyn ProcessObserver,
     record: &registry::VolumeRecord,
     intent: &IntentRecord,
@@ -2742,12 +3211,22 @@ fn replay_one(
     if expired(bounds.deadline) {
         return Ok(ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned()));
     }
-    let opened = area::open_folder(
+    // The record must still declare a durability at all, which is what the folder's
+    // own resolution checked while it used the registry's hint.
+    record.declared_durability()?;
+    // The volume is found by the UUID the intent recorded — refusing a duplicated
+    // mount rather than choosing one — and the area folder is then walked from that
+    // live mount, so a reconnect that moved the mount point does not strand the
+    // intent on a stale registry hint.
+    let volume = match locate_walk_volume(volumes, intent) {
+        Ok(volume) => volume,
+        Err(reason) => return Ok(ReplayOutcome::Pending(reason)),
+    };
+    let opened = area::open_folder_on_mount(
         dirs,
-        facts,
-        mounts,
         observer,
-        record,
+        &volume.mount,
+        volume.device,
         &intent.root_dir,
         &intent.folder,
     )?;
@@ -2773,7 +3252,10 @@ fn replay_one(
                 .to_owned(),
         ));
     };
-    let unit = intent.deletion_unit();
+    // The unit is the recorded one, with the device this run verified: the parent
+    // walk proves containment on the live filesystem, and the unit's own identity is
+    // its inode and marker bytes.
+    let unit = intent.replay_unit(volume.device);
     let parent_path = if intent.unit.parent.is_empty() {
         area_path.clone()
     } else {
@@ -2811,33 +3293,40 @@ fn replay_one(
     let write = locks.begin_intent_write()?;
 
     let leaf_facts = dirs.child_facts(&parent, intent.capture_name())?;
-    let leaf_matches = leaf_facts.as_ref().is_some_and(|facts| {
-        facts.kind == intent.unit.kind.entry_kind()
-            && facts.device.get() == intent.unit.device
-            && facts.inode == intent.unit.inode
-    });
+    // The kind and the inode are the durable half of the unit's identity; the
+    // device is compared once the volume's live value is known below.
+    let leaf_kind_matches = leaf_facts
+        .as_ref()
+        .is_some_and(|facts| facts.kind == intent.unit.kind.entry_kind());
+    let leaf_inode_matches = leaf_facts
+        .as_ref()
+        .is_some_and(|facts| facts.inode == intent.unit.inode);
     // One handle to the leaf serves the marker proof and the leaf removal, so the
     // retry that empties it deletes through the descriptor that was verified. A
     // file leaf has no contents to walk, so it has no handle.
-    let leaf_handle = if leaf_matches && intent.unit.kind == UnitKind::Directory {
-        match dirs.open_child_dir(&parent, intent.capture_name()) {
-            Ok(leaf) => Some(leaf),
-            Err(error) => {
-                return Ok(ReplayOutcome::Pending(format!(
-                    "the captured leaf cannot be opened: {error}"
-                )))
+    let leaf_handle =
+        if leaf_kind_matches && leaf_inode_matches && intent.unit.kind == UnitKind::Directory {
+            match dirs.open_child_dir(&parent, intent.capture_name()) {
+                Ok(leaf) => Some(leaf),
+                Err(error) => {
+                    return Ok(ReplayOutcome::Pending(format!(
+                        "the captured leaf cannot be opened: {error}"
+                    )))
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     // The modes this deletion recorded come back first, before any other deletion
-    // or reconciliation action - before the marker is even read - so no object is
-    // left with a changed mode while a replay decides what to do next. A leaf
-    // captured under its own private name is reached from the unit's parent, so its
-    // recorded mode is restored even when the visible name is empty.
+    // or reconciliation action - before the marker is even read, and therefore
+    // before a changed device is re-established, which reads it. A replay that
+    // cannot re-establish the unit's identity still restores what the stopped
+    // deletion recorded, so an undecidable intent never leaves a captured object
+    // with the widened mode the deletion needed. A leaf captured under its own
+    // private name is reached from the unit's parent, so its recorded mode is
+    // restored even when the visible name is empty.
     if intent.phase != IntentPhase::Deleted {
-        match restore_recorded_modes(dirs, &parent, leaf_handle.as_ref(), intent) {
+        match restore_recorded_modes(dirs, &parent, leaf_handle.as_ref(), intent, volume.device) {
             Ok(None) => {}
             Ok(Some(reason)) => return Ok(ReplayOutcome::Pending(reason)),
             Err(error) => {
@@ -2847,7 +3336,26 @@ fn replay_one(
             }
         }
     }
-
+    // A changed device number is tolerated only when something that is not a device
+    // proves the unit: the durable identity record for a release-gated intent, or -
+    // for an intent written before this slice carried one, over a `barge.root/1` or
+    // `/2` root - the inode and exact marker bytes the intent recorded. Anything
+    // else keeps stage 1's within-run observation, so a change is unknown and the
+    // intent stays pending.
+    let mut remounted = false;
+    if volume.device.get() != intent.unit.device {
+        if let Err(reason) =
+            reestablish_identity(state_paths, dirs, observer, intent, &parent, &volume)
+        {
+            return Ok(ReplayOutcome::Pending(reason));
+        }
+        remounted = true;
+    }
+    let leaf_matches = leaf_kind_matches
+        && leaf_inode_matches
+        && leaf_facts
+            .as_ref()
+            .is_some_and(|facts| facts.device == volume.device);
     let marker_digest = match (&intent.unit.marker, &leaf_handle) {
         (Some(marker), Some(leaf)) => Some(leaf_marker_digest(
             dirs,
@@ -2872,7 +3380,7 @@ fn replay_one(
         IntentPhase::Intent => {
             // The rename may not have happened: if the unit is still in place
             // with its recorded identity, the intent is rolled back.
-            if unit_still_in_place(dirs, observer, intent, &parent)? {
+            if unit_still_in_place(dirs, observer, intent, &parent, volume.device)? {
                 if let Some(outcome) = journal_clock_spent(bounds.deadline) {
                     return Ok(outcome);
                 }
@@ -2882,6 +3390,16 @@ fn replay_one(
             if leaf_matches && marker_matches(&marker_digest, intent) {
                 if let Some(reason) = recorded_mismatch(&intent.foreign_captures) {
                     return Ok(ReplayOutcome::Pending(reason));
+                }
+                // The rename happened before its phase was recorded, so the intent
+                // is about to resume an effect. The absence the release rested on is
+                // re-established first: a consumer path that is back is the ordinary
+                // case for a checkout being recreated, and a proof is never a cached
+                // permission (stage 4 design, "Plan and intent").
+                if let Some(reason) = reestablish_absence(dirs, volumes, intent) {
+                    return Ok(ReplayOutcome::Pending(format!(
+                        "the release's absence proof was not re-established, so the deletion does not resume and the intent stays pending: {reason}"
+                    )));
                 }
                 // The rename happened before its phase was recorded: resume.
                 if let Some(outcome) = journal_clock_spent(bounds.deadline) {
@@ -2893,15 +3411,19 @@ fn replay_one(
                     &write,
                     state_paths,
                     dirs,
-                    facts,
+                    volumes,
                     observer,
                     &renamed,
                     &parent_path,
                     &parent,
                     bounds,
+                    &volume,
                 );
                 return Ok(match report.outcome {
-                    DeleteOutcome::Deleted => ReplayOutcome::Resumed(report.entries_removed),
+                    DeleteOutcome::Deleted => ReplayOutcome::Resumed {
+                        entries: report.entries_removed,
+                        remounted,
+                    },
                     _ => ReplayOutcome::Pending(
                         report
                             .reason
@@ -2922,15 +3444,19 @@ fn replay_one(
                     &write,
                     state_paths,
                     dirs,
-                    facts,
+                    volumes,
                     observer,
                     intent,
                     &parent_path,
                     &parent,
                     bounds,
+                    &volume,
                 );
                 return Ok(match report.outcome {
-                    DeleteOutcome::Deleted => ReplayOutcome::Resumed(report.entries_removed),
+                    DeleteOutcome::Deleted => ReplayOutcome::Resumed {
+                        entries: report.entries_removed,
+                        remounted,
+                    },
                     _ => ReplayOutcome::Pending(
                         report
                             .reason
@@ -2989,11 +3515,11 @@ fn replay_one(
                 .and_then(|capture| capture.mode);
             let mut walk = WalkState::new(
                 dirs,
-                facts,
+                volumes,
                 observer,
                 intent.volume_uuid.clone(),
-                DeviceId::new(intent.unit.device),
-                intent.mount_hint.clone(),
+                volume.device,
+                volume.mount.clone(),
                 bounds,
                 &journal,
                 Vec::new(),
@@ -3036,12 +3562,13 @@ fn unit_still_in_place(
     observer: &dyn ProcessObserver,
     intent: &IntentRecord,
     parent: &DirHandle,
+    device: DeviceId,
 ) -> Result<bool> {
     let Some(facts) = dirs.child_facts(parent, intent.unit_name())? else {
         return Ok(false);
     };
     if facts.kind != intent.unit.kind.entry_kind()
-        || facts.device.get() != intent.unit.device
+        || facts.device != device
         || facts.inode != intent.unit.inode
     {
         return Ok(false);
@@ -3096,11 +3623,17 @@ fn marker_absent(digest: &Option<MarkerBytes>, intent: &IntentRecord) -> bool {
 /// name is resolved under the one before it: a chain link that is gone ends the
 /// walk (nothing deeper can be reached), and a link whose identity no longer
 /// matches is unknown, never something to chmod or delete.
+///
+/// `device` is the volume's **live** device, which is what every opened object is
+/// checked against: a record written before a reboot carries the number that mount
+/// had then, and the inode is the durable half of the identity. A capture recorded
+/// on another device is not a reason to leave its recorded mode in place.
 fn restore_recorded_modes(
     dirs: &dyn DirOps,
     parent: &DirHandle,
     leaf: Option<&DirHandle>,
     intent: &IntentRecord,
+    device: DeviceId,
 ) -> Result<Option<String>> {
     let mut current: Option<DirHandle> = None;
     for record in &intent.captures {
@@ -3139,7 +3672,7 @@ fn restore_recorded_modes(
                 record.private, record.original
             )));
         };
-        if !WalkState::matches_capture(record, &facts) {
+        if !capture_matches(record, &facts, device) {
             return Ok(Some(format!(
                 "`{}` is no longer the recorded capture of `{}`, so its recorded mode is not restored and nothing else is done",
                 record.private, record.original
@@ -3162,12 +3695,15 @@ fn restore_recorded_modes(
         }
         let child = dirs.open_child_dir(holder, &record.private)?;
         // The descriptor that will be chmod'd must be the recorded object: the name
-        // can be swapped between the read above and this open.
+        // can be swapped between the read above and this open. The inode is durable;
+        // the device is the volume's live one, because a record written before a
+        // remount carries a number this mount does not have and comparing to it would
+        // refuse to restore the very modes this step exists for.
         let opened = child.identity();
-        if opened.device.get() != record.device || opened.inode != record.inode {
+        if opened.device != device || opened.inode != record.inode {
             return Ok(Some(format!(
-                "`{}` opened as device {} inode {}, not the recorded {} / {}, so its recorded mode is not restored and nothing else is done",
-                record.private, opened.device, opened.inode, record.device, record.inode
+                "`{}` opened as device {} inode {}, not the recorded inode {} on this volume's device {}, so its recorded mode is not restored and nothing else is done",
+                record.private, opened.device, opened.inode, record.inode, device
             )));
         }
         if let Some(mode) = record.mode {
@@ -3542,13 +4078,11 @@ mod tests {
         fn replay(&self) -> ReplayReport {
             let faults = Faults::new();
             let facts = self.fixture.facts();
-            let mounts = self.fixture.mounts();
             let observer = self.fixture.observer();
             replay_pending(
                 &self.fixture.state,
                 &faults,
                 &facts,
-                &mounts,
                 &observer,
                 self.bounds(),
                 None,
@@ -3658,24 +4192,59 @@ mod tests {
 
     /// Publish one intent for the prepared root, advancing it through `phases`.
     fn publish(prepared: &Prepared, phases: &[IntentPhase]) -> IntentRecord {
-        let intent_id = format!("{:032x}", 1);
+        publish_with(
+            prepared,
+            phases,
+            &state::IntentEvidence::none(),
+            prepared.unit.device.get(),
+        )
+    }
+
+    /// Publish one intent that records a device other than the live one and the
+    /// plan's evidence, which is the shape a pending intent has after a reboot.
+    fn publish_with(
+        prepared: &Prepared,
+        phases: &[IntentPhase],
+        evidence: &state::IntentEvidence,
+        device: u64,
+    ) -> IntentRecord {
+        publish_unit(
+            &prepared.fixture,
+            &prepared.unit,
+            &format!("{:032x}", 1),
+            phases,
+            evidence,
+            device,
+        )
+    }
+
+    /// Publish one intent for an explicit unit, which a test may build from a
+    /// second root in the same area.
+    fn publish_unit(
+        fixture: &VolumeFixture,
+        unit: &DeletionUnit,
+        intent_id: &str,
+        phases: &[IntentPhase],
+        evidence: &state::IntentEvidence,
+        device: u64,
+    ) -> IntentRecord {
         let now = state::now_ms();
         let mut intent = IntentRecord {
             schema: crate::contract::INTENT_SCHEMA.to_owned(),
-            intent_id: intent_id.clone(),
-            volume_uuid: prepared.unit.volume_uuid.clone(),
-            mount_hint: prepared.fixture.root.clone(),
-            root_dir: prepared.unit.root_dir.clone(),
-            folder: prepared.unit.folder.clone(),
+            intent_id: intent_id.to_owned(),
+            volume_uuid: unit.volume_uuid.clone(),
+            mount_hint: fixture.root.clone(),
+            root_dir: unit.root_dir.clone(),
+            folder: unit.folder.clone(),
             unit: IntentUnit {
-                parent: prepared.unit.parent.clone(),
-                name: prepared.unit.name.clone(),
-                kind: prepared.unit.kind,
-                device: prepared.unit.device.get(),
-                inode: prepared.unit.inode,
-                marker: prepared.unit.marker.clone(),
+                parent: unit.parent.clone(),
+                name: unit.name.clone(),
+                kind: unit.kind,
+                device,
+                inode: unit.inode,
+                marker: unit.marker.clone(),
                 capture_name: format!("{QUARANTINE_PREFIX}{intent_id}"),
-                grant: prepared.unit.grant.clone(),
+                grant: unit.grant.clone(),
             },
             plan_digest: PLAN.to_owned(),
             phase: IntentPhase::Intent,
@@ -3684,17 +4253,18 @@ mod tests {
             phase_ms: now,
             captures: Vec::new(),
             foreign_captures: Vec::new(),
+            identity: evidence.identity.clone(),
+            absence: evidence.absence.clone(),
         };
-        let mut locks = LockSet::new(prepared.fixture.state.clone());
+        let mut locks = LockSet::new(fixture.state.clone());
         let _volume = locks
-            .lock_volume(&prepared.fixture.uuid)
+            .lock_volume(&unit.volume_uuid)
             .expect("the volume lock");
-        let _root = super::lock_deletion_unit(&mut locks, &prepared.unit).expect("the unit lock");
+        let _root = super::lock_deletion_unit(&mut locks, unit).expect("the unit lock");
         let write = locks.begin_intent_write().expect("the intent step");
-        state::publish_intent(&write, &prepared.fixture.state, &intent)
-            .expect("the intent publishes");
+        state::publish_intent(&write, &fixture.state, &intent).expect("the intent publishes");
         for phase in phases {
-            intent = state::advance_intent(&write, &prepared.fixture.state, &intent, *phase)
+            intent = state::advance_intent(&write, &fixture.state, &intent, *phase)
                 .expect("the phase advances");
         }
         intent
@@ -3706,12 +4276,11 @@ mod tests {
         state_paths: &crate::state::StatePaths,
         dirs: &Faults,
         facts: &crate::testkit::FakeVolume,
-        mounts: &crate::testkit::FakeMounts,
         observer: &dyn ProcessObserver,
         bounds: DeleteBounds,
         deadline: Option<Instant>,
     ) -> crate::error::Result<ReplayReport> {
-        replay_pending(state_paths, dirs, facts, mounts, observer, bounds, deadline)
+        replay_pending(state_paths, dirs, facts, observer, bounds, deadline)
     }
 
     /// Record one capture on the prepared intent, after its phases are published.
@@ -3995,13 +4564,11 @@ mod tests {
         // rolled back, resumed or removed.
         let faults = Faults::new();
         let facts = prepared.fixture.facts();
-        let mounts = prepared.fixture.mounts();
         let observer = prepared.fixture.observer();
         let report = replay_with(
             &prepared.fixture.state,
             &faults,
             &facts,
-            &mounts,
             &observer,
             prepared.bounds(),
             Some(Instant::now()),
@@ -4035,8 +4602,8 @@ mod tests {
         // it likes, but nothing durable may be written and the unit stays.
         let faults = Faults::new();
         let facts = prepared.fixture.facts();
-        let mounts = prepared.fixture.mounts();
         let observer = prepared.fixture.observer();
+        let mounts = prepared.fixture.mounts();
         let mut bounds = prepared.bounds();
         bounds.deadline = Some(Instant::now());
         let error = super::delete_unit_authorized(
@@ -4050,6 +4617,7 @@ mod tests {
             &prepared.unit,
             bounds,
             None,
+            &state::IntentEvidence::none(),
         )
         .expect_err("a spent clock refuses before the first durable step");
         assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
@@ -4181,13 +4749,11 @@ mod tests {
 
         let faults = Faults::new();
         let facts = prepared.fixture.facts();
-        let mounts = prepared.fixture.mounts();
         let observer = prepared.fixture.observer();
         let report = replay_with(
             &prepared.fixture.state,
             &faults,
             &facts,
-            &mounts,
             &observer,
             prepared.bounds(),
             Some(Instant::now()),
@@ -4242,7 +4808,6 @@ mod tests {
             .to_owned();
         faults.sleeping_observation_prefix(&first_component, Duration::from_millis(2_300));
         let facts = prepared.fixture.facts();
-        let mounts = prepared.fixture.mounts();
         let observer = prepared.fixture.observer();
         let mut bounds = prepared.bounds();
         bounds.deadline = Some(Instant::now() + Duration::from_secs(2));
@@ -4250,7 +4815,6 @@ mod tests {
             &prepared.fixture.state,
             &faults,
             &facts,
-            &mounts,
             &observer,
             bounds,
             bounds.deadline,
@@ -4325,7 +4889,6 @@ mod tests {
         let faults = Faults::new();
         faults.sleeping_observation_prefix(QUARANTINE_PREFIX, Duration::from_millis(2_300));
         let facts = prepared.fixture.facts();
-        let mounts = prepared.fixture.mounts();
         let observer = prepared.fixture.observer();
         let mut bounds = prepared.bounds();
         bounds.deadline = Some(Instant::now() + Duration::from_secs(2));
@@ -4333,7 +4896,6 @@ mod tests {
             &prepared.fixture.state,
             &faults,
             &facts,
-            &mounts,
             &observer,
             bounds,
             bounds.deadline,
@@ -4374,7 +4936,6 @@ mod tests {
         let faults = Faults::new();
         faults.sleeping_remove_prefix(CAPTURE_PREFIX, Duration::from_millis(2_300));
         let facts = prepared.fixture.facts();
-        let mounts = prepared.fixture.mounts();
         let observer = prepared.fixture.observer();
         let mut bounds = prepared.bounds();
         bounds.deadline = Some(Instant::now() + Duration::from_secs(2));
@@ -4382,7 +4943,6 @@ mod tests {
             &prepared.fixture.state,
             &faults,
             &facts,
-            &mounts,
             &observer,
             bounds,
             bounds.deadline,
@@ -4421,7 +4981,6 @@ mod tests {
         let faults = Faults::new();
         faults.sleeping_remove_prefix(CAPTURE_PREFIX, Duration::from_millis(2_300));
         let facts = prepared.fixture.facts();
-        let mounts = prepared.fixture.mounts();
         let observer = prepared.fixture.observer();
         let mut bounds = prepared.bounds();
         bounds.deadline = Some(Instant::now() + Duration::from_secs(2));
@@ -4429,7 +4988,6 @@ mod tests {
             &prepared.fixture.state,
             &faults,
             &facts,
-            &mounts,
             &observer,
             bounds,
             bounds.deadline,
@@ -4470,7 +5028,6 @@ mod tests {
         let faults = Faults::new();
         faults.sleeping_remove_prefix(CAPTURE_PREFIX, Duration::from_millis(2_300));
         let facts = prepared.fixture.facts();
-        let mounts = prepared.fixture.mounts();
         let observer = prepared.fixture.observer();
         let mut bounds = prepared.bounds();
         bounds.deadline = Some(Instant::now() + Duration::from_secs(2));
@@ -4478,7 +5035,6 @@ mod tests {
             &prepared.fixture.state,
             &faults,
             &facts,
-            &mounts,
             &observer,
             bounds,
             bounds.deadline,
@@ -4620,8 +5176,8 @@ mod tests {
         let prepared = prepared("delete-plan-digest");
         let faults = Faults::new();
         let facts = prepared.fixture.facts();
-        let mounts = prepared.fixture.mounts();
         let observer = prepared.fixture.observer();
+        let mounts = prepared.fixture.mounts();
         let mut unit = prepared.unit.clone();
         unit.plan_digest = "not-a-digest".to_owned();
         let error = delete_unit_on_volume(
@@ -4656,8 +5212,8 @@ mod tests {
         std::fs::remove_dir_all(prepared.unit_path()).expect("the root is removed");
         let faults = Faults::new();
         let facts = prepared.fixture.facts();
-        let mounts = prepared.fixture.mounts();
         let observer = prepared.fixture.observer();
+        let mounts = prepared.fixture.mounts();
         let error = delete_unit_on_volume(
             &prepared.fixture.state,
             &faults,
@@ -4700,8 +5256,8 @@ mod tests {
 
         let faults = Faults::new();
         let facts = prepared.fixture.facts();
-        let mounts = prepared.fixture.mounts();
         let observer = prepared.fixture.observer();
+        let mounts = prepared.fixture.mounts();
         let error = delete_unit_on_volume(
             &prepared.fixture.state,
             &faults,
@@ -5386,13 +5942,11 @@ mod tests {
 
         let replay_faults = Faults::new();
         replay_faults.swapping_capture_on_open();
-        let mounts = prepared.fixture.mounts();
         let observer = prepared.fixture.observer();
         let replay = replay_with(
             &prepared.fixture.state,
             &replay_faults,
             &prepared.fixture.facts(),
-            &mounts,
             &observer,
             prepared.bounds(),
             None,
@@ -5489,13 +6043,11 @@ mod tests {
 
         let faults = Faults::new();
         faults.swapping_leaf(&area, QUARANTINE_PREFIX);
-        let mounts = prepared.fixture.mounts();
         let observer = prepared.fixture.observer();
         let replay = replay_with(
             &prepared.fixture.state,
             &faults,
             &prepared.fixture.facts(),
-            &mounts,
             &observer,
             prepared.bounds(),
             None,
@@ -5585,13 +6137,11 @@ mod tests {
         // The private-name reads in order: the mode-restoration walk, the
         // classification, then the delete pass's own read - which vanishes.
         replay_faults.vanishing_capture_at(3);
-        let mounts = prepared.fixture.mounts();
         let observer = prepared.fixture.observer();
         let replay = replay_with(
             &prepared.fixture.state,
             &replay_faults,
             &prepared.fixture.facts(),
-            &mounts,
             &observer,
             prepared.bounds(),
             None,
@@ -6970,6 +7520,81 @@ mod tests {
     }
 
     #[test]
+    fn an_undecidable_changed_device_still_restores_the_recorded_mode_first() {
+        // A process killed between the recorded chmod and its guard leaves a captured
+        // leaf wider than it was. The replay restores recorded modes before it reads
+        // any marker, so a changed device whose marker identity cannot be
+        // re-established leaves the intent pending with the mode the record proves -
+        // never a captured object with the deletion's widened permissions.
+        use std::os::unix::fs::PermissionsExt;
+        let prepared = prepared("delete-remount-mode-restore");
+        plant_unit_contents(&prepared);
+        std::fs::set_permissions(prepared.unit_path(), std::fs::Permissions::from_mode(0o500))
+            .expect("the unit is made read-only");
+        let faults = Faults::new();
+        faults.failing_listing_after_mode();
+        let report = prepared.delete(&faults, &prepared.fixture.facts());
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(report.phase, IntentPhase::Renamed);
+        let leaf = report.quarantine.clone();
+        assert_eq!(mode_of(&leaf), 0o500, "the abort guard put the mode back");
+
+        // What a kill would have left: the widened mode, an intent recorded on
+        // another device, and marker bytes that are not the recorded ones.
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o700))
+            .expect("the leaf is left widened");
+        let marker_path = leaf.join(ROOT_MARKER_FILE);
+        let mut marker: crate::area::RootMarker =
+            serde_json::from_slice(&std::fs::read(&marker_path).expect("the marker reads"))
+                .expect("the marker decodes");
+        marker.created_ms = marker.created_ms.saturating_add(1);
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&marker).expect("the altered marker encodes"),
+        )
+        .expect("the altered marker is written");
+        {
+            // The rewrite publishes under the same locks a deletion takes and then
+            // releases them, so the replay below is the next owner.
+            let pending = prepared.pending_intents();
+            let mut intent = pending.first().expect("the intent is pending").clone();
+            // The run that stopped wrote both the unit and its captures before the
+            // remount, so every recorded device is the number this mount no longer
+            // has; the leaf's own device is the live one.
+            intent.unit.device = intent.unit.device.saturating_add(9);
+            for capture in &mut intent.captures {
+                capture.device = capture.device.saturating_add(9);
+            }
+            let mut locks = LockSet::new(prepared.fixture.state.clone());
+            let _volume = locks
+                .lock_volume(&prepared.fixture.uuid)
+                .expect("the volume lock");
+            let _root =
+                super::lock_deletion_unit(&mut locks, &prepared.unit).expect("the unit lock");
+            let write = locks.begin_intent_write().expect("the intent step");
+            state::publish_intent(&write, &prepared.fixture.state, &intent)
+                .expect("the rewritten intent publishes");
+        }
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0]
+                .reason
+                .contains("marker is not the recorded bytes"),
+            "{}",
+            replay.pending[0].reason
+        );
+        assert_eq!(
+            mode_of(&leaf),
+            0o500,
+            "the recorded mode is restored even though the identity is undecidable"
+        );
+        assert!(leaf.join("payload.txt").is_file(), "nothing is unlinked");
+    }
+
+    #[test]
     fn every_successive_entry_a_racer_replaces_is_kept_for_every_directory_kind() {
         // The Barge-root proof runs over all three depths above. Every other
         // directory kind goes through the same walk, so the same racer must leave
@@ -7340,7 +7965,6 @@ mod tests {
             &prepared.fixture.state,
             &faults,
             &prepared.fixture.facts(),
-            &prepared.fixture.mounts(),
             &prepared.fixture.observer(),
             prepared.bounds(),
             None,
@@ -7496,7 +8120,6 @@ mod tests {
             &prepared.fixture.state,
             &Faults::new(),
             &prepared.fixture.facts(),
-            &prepared.fixture.mounts(),
             &prepared.fixture.observer(),
             prepared.bounds(),
             None,
@@ -7580,6 +8203,532 @@ mod tests {
         assert!(prepared.pending_intents().is_empty());
     }
 
+    /// The plan's evidence for the prepared root: its durable identity record and
+    /// the marker bytes this deletion observed.
+    fn evidence_for(prepared: &Prepared) -> state::IntentEvidence {
+        let uid = prepared
+            .fixture
+            .observer()
+            .effective_uid()
+            .expect("the fixture uid");
+        let record = crate::identity::read(
+            &prepared.fixture.state,
+            &Faults::new(),
+            &prepared.unit.name,
+            uid,
+        )
+        .expect("the identity record reads")
+        .expect("the created root has a durable identity record");
+        state::IntentEvidence {
+            identity: Some(crate::evidence::IdentityEvidence {
+                verdict: "verified".to_owned(),
+                reason: None,
+                inode: Some(record.inode),
+                device_at_record: Some(record.device_at_record),
+                device_live: Some(prepared.unit.device.get()),
+                remount: Some(crate::evidence::RemountEvidenceRow {
+                    device_changed: false,
+                }),
+                mount_moved: Some(false),
+                marker_digest: prepared
+                    .unit
+                    .marker
+                    .as_ref()
+                    .map(|marker| marker.digest.clone()),
+            }),
+            absence: None,
+        }
+    }
+
+    /// A real `barge.absence/1` proof of one consumer path on the fixture volume.
+    fn absent_evidence(prepared: &Prepared, path: &Path) -> crate::evidence::AbsenceEvidence {
+        let facts = prepared.fixture.facts();
+        let proof = crate::os::prove_absence(
+            &Faults::new(),
+            &facts,
+            path,
+            crate::os::AncestorExpected::Registered {
+                uuid: &prepared.fixture.uuid,
+                recorded_mount: &prepared.fixture.root,
+            },
+        )
+        .expect("the fixture path is provable");
+        assert_eq!(proof.verdict(), "absent", "the fixture path is gone");
+        serde_json::from_value(serde_json::to_value(&proof).expect("the proof encodes"))
+            .expect("the proof is the document an intent carries")
+    }
+
+    #[test]
+    fn an_authorised_release_writes_its_evidence_into_the_intent() {
+        // The release gate's effect is not part of this slice, so the writer seam is
+        // proved directly: a deletion handed the plan's two documents records them
+        // before the first effect, and the settled record keeps them as the evidence
+        // a later diagnostic reads.
+        let prepared = prepared("delete-writer-evidence");
+        plant_unit_contents(&prepared);
+        let consumer = prepared.fixture.root.join("consumer/project");
+        std::fs::create_dir_all(consumer.parent().expect("the consumer parent"))
+            .expect("the consumer parent is created");
+        let evidence = state::IntentEvidence {
+            identity: evidence_for(&prepared).identity,
+            absence: Some(absent_evidence(&prepared, &consumer)),
+        };
+        let faults = Faults::new();
+        let facts = prepared.fixture.facts();
+        let mounts = prepared.fixture.mounts();
+        let report = super::delete_unit_authorized(
+            &prepared.fixture.state,
+            &faults,
+            &facts,
+            &mounts,
+            &prepared.fixture.observer(),
+            &prepared.declaration,
+            None,
+            &prepared.unit,
+            prepared.bounds(),
+            None,
+            &evidence,
+        )
+        .expect("the deletion reports");
+        assert!(report.is_deleted(), "{report:?}");
+
+        let settled = crate::state::read_intent(&prepared.fixture.state, &report.intent_id)
+            .expect("the settled intent reads");
+        assert_eq!(settled.identity, evidence.identity);
+        assert_eq!(settled.absence, evidence.absence);
+    }
+
+    #[test]
+    fn a_pending_intent_settles_across_a_changed_device_from_its_identity_evidence() {
+        // A reboot gives the same volume a different `st_dev`, so the device the
+        // intent recorded is not the live one. The identity the plan proved is
+        // re-established from the durable record and the exact marker bytes, and the
+        // deletion resumes instead of stranding a correct intent.
+        let prepared = prepared("delete-remount-evidence");
+        plant_unit_contents(&prepared);
+        rename_to_quarantine(&prepared);
+        let before = prepared.unit.device.get();
+        publish_with(
+            &prepared,
+            &[IntentPhase::Renamed],
+            &evidence_for(&prepared),
+            before.saturating_add(9),
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 1, "{replay:?}");
+        assert!(replay.is_settled(), "{replay:?}");
+        assert_eq!(replay.remounted, 1, "the remount is reported");
+        assert!(!prepared.unit_path().exists(), "the root is deleted");
+        assert!(prepared.quarantine().symlink_metadata().is_err());
+        assert!(prepared.pending_intents().is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_mount_refuses_a_pending_intent_and_unlinks_nothing() {
+        // Two live mounts carry the volume's UUID, so which one is "the volume" is
+        // undecidable. The design never picks one: the intent stays pending with the
+        // duplicate named, and the captured leaf is untouched.
+        let prepared = prepared("delete-replay-duplicate");
+        plant_unit_contents(&prepared);
+        rename_to_quarantine(&prepared);
+        publish(&prepared, &[IntentPhase::Renamed]);
+        let facts = prepared.fixture.facts();
+        facts.duplicate_mounts();
+
+        let replay = replay_with(
+            &prepared.fixture.state,
+            &Faults::new(),
+            &facts,
+            &prepared.fixture.observer(),
+            prepared.bounds(),
+            None,
+        )
+        .expect("the replay reports");
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0].reason.contains("duplicate_volume_uuid"),
+            "{}",
+            replay.pending[0].reason
+        );
+        assert!(
+            prepared.quarantine().join("payload.txt").is_file(),
+            "nothing is unlinked"
+        );
+        assert_eq!(prepared.pending_intents().len(), 1);
+    }
+
+    #[test]
+    fn a_moved_mount_is_found_by_its_uuid_not_the_stale_hint() {
+        // The registry's mount hint is an observation: after a reconnect the mount is
+        // somewhere else while the UUID and every component below the mount are
+        // unchanged. The replay locates the live mount by that UUID and settles.
+        let prepared = prepared("delete-replay-moved-mount");
+        plant_unit_contents(&prepared);
+        rename_to_quarantine(&prepared);
+        publish(&prepared, &[IntentPhase::Renamed]);
+        let stale = prepared.fixture.root.join("stale-mount");
+        std::fs::create_dir(&stale).expect("the stale mount point exists");
+        let mut record = prepared.fixture.record.clone();
+        record.mount_hint = Some(stale.clone());
+        prepared.fixture.register_record(&record);
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 1, "{replay:?}");
+        assert!(replay.is_settled(), "{replay:?}");
+        assert!(!prepared.unit_path().exists(), "the root is deleted");
+        assert!(
+            stale.is_dir(),
+            "the stale mount point is never written to or treated as the volume"
+        );
+    }
+
+    #[test]
+    fn a_changed_device_rolls_back_a_pre_rename_intent() {
+        // The rename never happened: the unit is still at its own name, so the
+        // changed device is tolerated on that unit's identity and the intent rolls
+        // back instead of staying pending forever.
+        let prepared = prepared("delete-remount-pre-rename");
+        plant_unit_contents(&prepared);
+        publish_with(
+            &prepared,
+            &[],
+            &evidence_for(&prepared),
+            prepared.unit.device.get().saturating_add(9),
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.rolled_back, 1, "{replay:?}");
+        assert!(replay.is_settled(), "{replay:?}");
+        assert!(prepared.unit_path().join("payload.txt").is_file());
+        assert!(prepared.pending_intents().is_empty());
+    }
+
+    #[test]
+    fn a_changed_device_settles_a_marker_last_intent() {
+        // `marker_last` is the phase that records the marker's positive absence, so
+        // the marker is already gone by design; the leaf's recorded inode and kind on
+        // the verified volume are the identity that a changed device leaves.
+        let prepared = prepared("delete-remount-marker-last");
+        plant_unit_contents(&prepared);
+        rename_to_quarantine(&prepared);
+        settle_leaf_contents(&prepared, &prepared.quarantine());
+        publish_with(
+            &prepared,
+            &[IntentPhase::Renamed, IntentPhase::MarkerLast],
+            &evidence_for(&prepared),
+            prepared.unit.device.get().saturating_add(9),
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.settled, 1, "{replay:?}");
+        assert!(replay.is_settled(), "{replay:?}");
+        assert_eq!(replay.remounted, 0, "a settle is not a resumed deletion");
+        assert!(!prepared.quarantine().exists(), "the leaf is removed");
+        assert!(prepared.pending_intents().is_empty());
+    }
+
+    #[test]
+    fn a_changed_device_settles_a_removed_intent_from_the_durable_phase() {
+        // The `removed` phase recorded Barge's own final unlink before the reboot, so
+        // completion rests on that phase and a changed device adds nothing to prove.
+        let prepared = prepared("delete-remount-removed");
+        plant_unit_contents(&prepared);
+        rename_to_quarantine(&prepared);
+        remove_leaf_whole(&prepared, &prepared.quarantine());
+        publish_with(
+            &prepared,
+            &[
+                IntentPhase::Renamed,
+                IntentPhase::MarkerLast,
+                IntentPhase::Removed,
+            ],
+            &evidence_for(&prepared),
+            prepared.unit.device.get().saturating_add(9),
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.settled, 1, "{replay:?}");
+        assert!(replay.is_settled(), "{replay:?}");
+        assert!(!prepared.quarantine().exists());
+        assert!(prepared.pending_intents().is_empty());
+    }
+
+    #[test]
+    fn a_markerless_unit_settles_across_a_changed_device_on_its_inode_and_volume() {
+        // An unmarked claimed unit has no marker bytes, so the identity a changed
+        // device leaves is its inode, its kind and the volume this run verified -
+        // plus the intent's own 128-bit private capture name. That is stage 1's own
+        // leaf rule minus the device, and it is what lets the deletion finish.
+        let prepared = prepared_unmarked("delete-remount-unmarked");
+        plant_unit_contents(&prepared);
+        rename_to_quarantine(&prepared);
+        publish_with(
+            &prepared,
+            &[IntentPhase::Renamed],
+            &state::IntentEvidence::none(),
+            prepared.unit.device.get().saturating_add(9),
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 1, "{replay:?}");
+        assert!(replay.is_settled(), "{replay:?}");
+        assert_eq!(replay.remounted, 1);
+        assert!(!prepared.unit_path().exists(), "the unit is deleted");
+    }
+
+    #[test]
+    fn a_changed_device_with_a_swapped_leaf_keeps_the_intent_pending() {
+        // The private name holding a different object is not this unit: its inode is
+        // not the recorded one, so the changed device is not tolerated and nothing
+        // is unlinked.
+        let prepared = prepared_unmarked("delete-remount-swapped");
+        plant_unit_contents(&prepared);
+        let captured = format!("{QUARANTINE_PREFIX}{:032x}", 1);
+        let parent = prepared.parent_path();
+        std::fs::rename(prepared.unit_path(), parent.join(&captured))
+            .expect("the unit is captured");
+        // The captured name now holds another object: the original is moved aside and
+        // a fresh directory takes its private name.
+        std::fs::rename(parent.join(&captured), parent.join("swapped-away"))
+            .expect("the original is moved aside");
+        std::fs::create_dir(parent.join(&captured)).expect("a foreign directory is put there");
+        publish_with(
+            &prepared,
+            &[IntentPhase::Renamed],
+            &state::IntentEvidence::none(),
+            prepared.unit.device.get().saturating_add(9),
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert_eq!(replay.remounted, 0);
+        assert!(
+            parent.join(&captured).is_dir(),
+            "the foreign object at the private name is never unlinked"
+        );
+        assert!(
+            parent.join("swapped-away").join("payload.txt").is_file(),
+            "the captured unit is untouched"
+        );
+    }
+
+    #[test]
+    fn a_pending_intent_written_by_an_older_reader_settles_over_a_v1_marker() {
+        // S5 wrote `barge.intent/1` over an S3-era root: a `barge.root/1` marker and
+        // no durable identity record. The settlement reads the v1 marker by its own
+        // rule, pins the inode and the exact bytes, and does not demand a v2 marker
+        // or invent an identity record.
+        let prepared = prepared("delete-v1-settlement");
+        plant_unit_contents(&prepared);
+        let marker_path = prepared.unit_path().join(ROOT_MARKER_FILE);
+        let mut marker: crate::area::RootMarker =
+            serde_json::from_slice(&std::fs::read(&marker_path).expect("the marker reads"))
+                .expect("the marker decodes");
+        marker.schema = "barge.root/1".to_owned();
+        marker.resolved_path = Some(prepared.unit_path());
+        marker.mount_relative_path = None;
+        marker.mount_at_record = None;
+        let mut bytes = serde_json::to_vec_pretty(&marker).expect("the v1 marker encodes");
+        bytes.push(b'\n');
+        std::fs::write(&marker_path, &bytes).expect("the v1 marker is written");
+        let digest = crate::digest::sha256_hex(&bytes);
+        let identity_path = prepared
+            .fixture
+            .state
+            .root()
+            .join("roots")
+            .join(&prepared.unit.name)
+            .join("identity.json");
+        std::fs::remove_file(&identity_path)
+            .expect("the S3-era root has no durable identity record");
+
+        let intent_id = format!("{:032x}", 1);
+        let value = serde_json::json!({
+            "schema": "barge.intent/1",
+            "intent_id": intent_id,
+            "root_id": prepared.unit.name,
+            "volume_uuid": prepared.fixture.uuid.to_string(),
+            "mount_hint": prepared.fixture.root,
+            "root_dir": prepared.unit.root_dir,
+            "folder": prepared.unit.folder,
+            "root_name": prepared.unit.name,
+            "quarantine_name": format!("{QUARANTINE_PREFIX}{intent_id}"),
+            "device": prepared.unit.device.get().saturating_add(9),
+            "inode": prepared.unit.inode,
+            "marker_digest": digest,
+            "plan_digest": PLAN,
+            "phase": "renamed",
+            "generation": 2,
+            "recorded_ms": 1,
+            "phase_ms": 2,
+        });
+        let path = crate::state::intent_path(&prepared.fixture.state, &intent_id)
+            .expect("the intent path");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&value).expect("the v1 record encodes"),
+        )
+        .expect("the v1 record is written");
+        rename_to_quarantine(&prepared);
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 1, "{replay:?}");
+        assert!(replay.is_settled(), "{replay:?}");
+        assert_eq!(
+            replay.remounted, 1,
+            "the changed device was tolerated through the v1 marker"
+        );
+        assert!(!prepared.unit_path().exists(), "the root is deleted");
+    }
+
+    #[test]
+    fn one_intent_that_cannot_be_reestablished_never_blocks_another() {
+        // Two roots of one area, both captured before a reboot. The first intent's
+        // unit is re-established from its identity evidence; the second one's marker
+        // bytes are not the ones it recorded, so its identity is unknown. The second
+        // stays pending and the first still settles: one undecidable object never
+        // blocks another.
+        let prepared = prepared("delete-replay-per-object");
+        plant_unit_contents(&prepared);
+        let (other, resolved) = prepared.fixture.create_root(
+            &prepared.fixture.record,
+            &prepared.declaration,
+            RootKind::AreaRoot,
+        );
+        let other_unit =
+            DeletionUnit::from_owned(&other, &resolved.root_dir, &resolved.folder, PLAN);
+        VolumeFixture::payload(&other_unit.path_in(&prepared.area), "payload.txt", b"mine");
+
+        let shifted = prepared.unit.device.get().saturating_add(9);
+        let first = format!("{:032x}", 21);
+        let second = format!("{:032x}", 22);
+        publish_unit(
+            &prepared.fixture,
+            &prepared.unit,
+            &first,
+            &[IntentPhase::Renamed],
+            &evidence_for(&prepared),
+            shifted,
+        );
+        publish_unit(
+            &prepared.fixture,
+            &other_unit,
+            &second,
+            &[IntentPhase::Renamed],
+            &state::IntentEvidence::none(),
+            shifted,
+        );
+
+        std::fs::rename(
+            prepared.unit_path(),
+            prepared
+                .parent_path()
+                .join(format!("{QUARANTINE_PREFIX}{first}")),
+        )
+        .expect("the first root is captured");
+        let other_quarantine = prepared
+            .parent_path()
+            .join(format!("{QUARANTINE_PREFIX}{second}"));
+        std::fs::rename(other_unit.path_in(&prepared.area), &other_quarantine)
+            .expect("the second root is captured");
+        let marker_path = other_quarantine.join(ROOT_MARKER_FILE);
+        let mut marker: crate::area::RootMarker =
+            serde_json::from_slice(&std::fs::read(&marker_path).expect("the marker reads"))
+                .expect("the marker decodes");
+        marker.created_ms = marker.created_ms.saturating_add(1);
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&marker).expect("the altered marker encodes"),
+        )
+        .expect("the altered marker is written");
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 1, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert_eq!(replay.pending[0].intent_id, second, "{replay:?}");
+        assert!(
+            replay.pending[0]
+                .reason
+                .contains("marker is not the recorded bytes"),
+            "{}",
+            replay.pending[0].reason
+        );
+        assert!(!prepared.unit_path().exists(), "the first root is deleted");
+        assert!(
+            other_quarantine.join("payload.txt").is_file(),
+            "the second root is untouched"
+        );
+    }
+
+    #[test]
+    fn a_reappeared_consumer_path_keeps_the_pending_intent_and_unlinks_nothing() {
+        let prepared = prepared("delete-absence-reappeared");
+        plant_unit_contents(&prepared);
+        let consumer = prepared.fixture.root.join("consumer/project");
+        std::fs::create_dir_all(consumer.parent().expect("the consumer parent"))
+            .expect("the consumer parent is created");
+        let absence = absent_evidence(&prepared, &consumer);
+        // The checkout is recreated between the plan and the replay, which is the
+        // ordinary case; the recorded proof is never reused.
+        std::fs::create_dir(&consumer).expect("the consumer path is recreated");
+        rename_to_quarantine(&prepared);
+        publish_with(
+            &prepared,
+            &[],
+            &state::IntentEvidence {
+                identity: evidence_for(&prepared).identity,
+                absence: Some(absence),
+            },
+            prepared.unit.device.get(),
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0].reason.contains("is now present"),
+            "{}",
+            replay.pending[0].reason
+        );
+        assert!(
+            prepared.quarantine().join("payload.txt").is_file(),
+            "the captured leaf is untouched"
+        );
+        assert_eq!(
+            prepared.pending_intents().len(),
+            1,
+            "the intent stays pending"
+        );
+    }
+
+    #[test]
+    fn a_reestablished_absent_consumer_path_lets_the_pending_intent_resume() {
+        let prepared = prepared("delete-absence-reproved");
+        plant_unit_contents(&prepared);
+        let consumer = prepared.fixture.root.join("consumer/project");
+        std::fs::create_dir_all(consumer.parent().expect("the consumer parent"))
+            .expect("the consumer parent is created");
+        let absence = absent_evidence(&prepared, &consumer);
+        rename_to_quarantine(&prepared);
+        publish_with(
+            &prepared,
+            &[],
+            &state::IntentEvidence {
+                identity: evidence_for(&prepared).identity,
+                absence: Some(absence),
+            },
+            prepared.unit.device.get(),
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 1, "{replay:?}");
+        assert!(replay.is_settled(), "{replay:?}");
+        assert!(!prepared.unit_path().exists(), "the root is deleted");
+    }
+
     #[test]
     fn an_unknown_intent_major_refuses_before_any_unlink() {
         let prepared = prepared("delete-unknown-major");
@@ -7599,13 +8748,11 @@ mod tests {
         .expect("the altered intent is written");
 
         let faults = Faults::new();
-        let mounts = prepared.fixture.mounts();
         let observer = prepared.fixture.observer();
         let error = replay_with(
             &prepared.fixture.state,
             &faults,
             &prepared.fixture.facts(),
-            &mounts,
             &observer,
             prepared.bounds(),
             None,

@@ -54,6 +54,10 @@ use crate::contract::{RowSet, DOCUMENT_SIZE_CAP_BYTES, PRUNE_PLAN_SCHEMA};
 use crate::custody::{self, CustodyBounds, PendingIntent};
 use crate::digest::sha256_hex;
 use crate::error::{Error, ErrorKind, Result};
+pub use crate::evidence::{
+    AbsenceAncestor, AbsenceAnchor, AbsenceEvidence, AbsenceLeaf, AbsenceVolumeRow,
+    IdentityEvidence, RemountEvidenceRow,
+};
 use crate::identity::{self, IdentityReason, IdentityVerdict};
 use crate::os::{
     AbsenceVolume, AncestorExpected, DeviceId, DirOps, MountRoot, ProcessObserver, VolumeUuid,
@@ -132,44 +136,6 @@ pub struct AreaRef {
     pub area: String,
 }
 
-/// The identity evidence one row carries.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IdentityEvidence {
-    /// `verified`, `unknown` or `gone`.
-    pub verdict: String,
-    /// The reason code, when the verdict is not `verified`. It is one of the
-    /// stage 4 design's codes, spelled in snake case.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    /// The inode the durable record holds, when the record was read.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inode: Option<u64>,
-    /// The device the record was written at. It is diagnostic only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_at_record: Option<u64>,
-    /// The device the root was observed at in this run.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_live: Option<u64>,
-    /// What the remount changed, which is never a refusal on its own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remount: Option<RemountEvidenceRow>,
-    /// Whether the live mount differs from the recorded one. Also not a refusal.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mount_moved: Option<bool>,
-    /// The SHA-256 of the marker bytes this plan read.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub marker_digest: Option<String>,
-}
-
-/// The remount evidence a verified identity reports.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RemountEvidenceRow {
-    /// Whether the device at the record differs from the live device.
-    pub device_changed: bool,
-}
-
 /// The age evidence one row carries. It is evidence, never a permission: a real
 /// run re-reads the root's activity before it acts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,85 +165,6 @@ pub struct BytesEvidence {
     pub allocated: u64,
     /// Whether the scan reached the whole subtree inside its bounds.
     pub complete: bool,
-}
-
-/// One `barge.absence/1` proof, embedded in a plan row.
-///
-/// It is the proof's own field set, so a reader of the plan reads the same
-/// document a diagnostic would print. It authorises nothing: the effect
-/// re-establishes it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AbsenceEvidence {
-    /// Always `barge.absence/1`.
-    pub schema: String,
-    /// The consumer path the proof is about.
-    pub path: PathBuf,
-    /// `absent`, `present` or `unknown`.
-    pub verdict: String,
-    /// Where the walk started.
-    pub anchor: AbsenceAnchor,
-    /// The nearest existing ancestor, when the walk reached one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ancestor: Option<AbsenceAncestor>,
-    /// The leaf, when it was reached.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub leaf: Option<AbsenceLeaf>,
-    /// How many components the walk crossed.
-    #[serde(default)]
-    pub components_walked: usize,
-    /// When the proof was established.
-    #[serde(default)]
-    pub proved_ms: u64,
-    /// The reason code, when the verdict is `unknown`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-/// Where one absence proof walked from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AbsenceAnchor {
-    /// `root` or `registered`.
-    pub kind: String,
-    /// The anchor's path.
-    pub path: PathBuf,
-}
-
-/// The nearest existing ancestor one absence proof verified.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AbsenceAncestor {
-    /// The ancestor's path.
-    pub path: PathBuf,
-    /// Its inode.
-    pub inode: u64,
-    /// Its device.
-    pub device: u64,
-    /// The volume it was proved on.
-    pub volume: AbsenceVolumeRow,
-}
-
-/// The volume an ancestor was proved on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AbsenceVolumeRow {
-    /// `boot_data` or `registered`.
-    pub kind: String,
-    /// The APFS volume UUID.
-    pub volume_uuid: String,
-    /// The filesystem the platform reported.
-    pub file_system: String,
-}
-
-/// The leaf one absence proof decided.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AbsenceLeaf {
-    /// The leaf's name.
-    pub name: String,
-    /// What the walk found: `enoent`.
-    pub result: String,
 }
 
 /// One root's row in the release plan.
@@ -1656,6 +1543,15 @@ pub fn read_prune_plan(bytes: &[u8]) -> Result<PrunePlan> {
         )
     })?;
     plan.rows.validate()?;
+    // The two evidence documents are read strictly here too: a row's condition 2
+    // and condition 6 evidence is what a later effect re-establishes, so a
+    // document whose verdict and shape disagree is not one this reader understands.
+    for row in &plan.rows.rows {
+        row.identity.validate()?;
+        if let Some(absence) = &row.absence {
+            absence.validate()?;
+        }
+    }
     if plan.unreached_count > plan.rows.count {
         return Err(Error::new(
             ErrorKind::UnknownState,
@@ -2128,6 +2024,56 @@ mod tests {
             read_prune_plan(&serde_json::to_vec(&document).expect("it encodes")).is_err(),
             "a row that omits its references was read as an empty list"
         );
+        assert!(root.path.is_dir());
+    }
+
+    #[test]
+    fn a_row_s_evidence_is_read_with_the_document_it_claims_to_be() {
+        // The identity and absence documents are shared with `barge.intent/2`, so one
+        // reader decides both. A row whose evidence states a verdict its shape cannot
+        // support is unknown state, not a row whose evidence is taken on trust.
+        let fixture = Fixture::new("release-row-evidence");
+        let root = fixture.root();
+        let report = fixture.plan();
+        let bytes = canonical_plan_bytes(&report.plan).expect("the plan encodes");
+        let document: serde_json::Value = serde_json::from_slice(&bytes).expect("the plan is JSON");
+
+        let mut present = document.clone();
+        present["rows"]["rows"][0]["absence"] = serde_json::json!({
+            "schema": "barge.absence/1",
+            "path": "/Users/tom/Dev/projects/example",
+            "verdict": "absent",
+            "anchor": {"kind": "root", "path": "/"},
+            "components_walked": 4,
+            "proved_ms": 0,
+        });
+        assert!(
+            read_prune_plan(&serde_json::to_vec(&present).expect("it encodes")).is_err(),
+            "an `absent` verdict without its ancestor and leaf proves nothing"
+        );
+
+        let mut unknown_major = document.clone();
+        unknown_major["rows"]["rows"][0]["absence"] = serde_json::json!({
+            "schema": "barge.absence/2",
+            "path": "/Users/tom/Dev/projects/example",
+            "verdict": "unknown",
+            "anchor": {"kind": "root", "path": "/"},
+            "components_walked": 4,
+            "proved_ms": 0,
+            "reason": "ancestor_missing",
+        });
+        assert!(
+            read_prune_plan(&serde_json::to_vec(&unknown_major).expect("it encodes")).is_err(),
+            "an unknown absence major is refused"
+        );
+
+        // The unobserved row's own `unknown` identity evidence, with no reason and
+        // no inode, is what this reader accepts: it says nothing was decided.
+        let mut unobserved = document.clone();
+        unobserved["rows"]["rows"][0]["identity"] = serde_json::json!({"verdict": "unknown"});
+        let read = read_prune_plan(&serde_json::to_vec(&unobserved).expect("it encodes"))
+            .expect("an unobserved identity reads");
+        assert_eq!(read.rows.rows[0].identity.verdict, "unknown");
         assert!(root.path.is_dir());
     }
 
@@ -3347,6 +3293,8 @@ mod tests {
             phase_ms: now,
             captures: Vec::new(),
             foreign_captures: Vec::new(),
+            identity: None,
+            absence: None,
         };
         state::publish_intent(&write, &fixture.volume.state, &intent)
             .expect("the intent publishes");

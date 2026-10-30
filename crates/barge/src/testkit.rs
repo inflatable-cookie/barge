@@ -270,12 +270,20 @@ pub struct FakeVolume {
     /// When set, the next identification reports another device, which is how a
     /// device change is injected at an exact step.
     pub shifted: Cell<bool>,
+    /// When set, the volume's UUID is reported by two live mounts, which is the
+    /// duplicate the design refuses to choose between.
+    pub duplicate: Cell<bool>,
 }
 
 impl FakeVolume {
     /// The same volume, reporting a different device from now on.
     pub fn shift_device(&self) {
         self.shifted.set(true);
+    }
+
+    /// The same volume, reported by a second live mount as well.
+    pub fn duplicate_mounts(&self) {
+        self.duplicate.set(true);
     }
 }
 
@@ -309,11 +317,19 @@ impl VolumeFacts for FakeVolume {
     }
 }
 
-/// The volume locator's seam over the fixture volume: its one mount.
+/// The volume locator's seam over the fixture volume: its one mount, or two when a
+/// test asks for the duplicate the design refuses.
 impl crate::os::VolumeLocator for FakeVolume {
     fn mounts_for_uuid(&self, uuid: &VolumeUuid) -> Result<Vec<MountPoint>> {
         Ok(if self.present.get() && &self.uuid == uuid {
-            vec![MountPoint::new(self.root.clone())]
+            if self.duplicate.get() {
+                vec![
+                    MountPoint::new(self.root.clone()),
+                    MountPoint::new(self.root.join("reconnected")),
+                ]
+            } else {
+                vec![MountPoint::new(self.root.clone())]
+            }
         } else {
             Vec::new()
         })
@@ -1541,6 +1557,7 @@ impl VolumeFixture {
             device: self.device,
             present: Cell::new(true),
             shifted: Cell::new(false),
+            duplicate: Cell::new(false),
         })
     }
 
@@ -1552,6 +1569,7 @@ impl VolumeFixture {
             device: self.device,
             present: Cell::new(true),
             shifted: Cell::new(false),
+            duplicate: Cell::new(false),
         }
     }
 

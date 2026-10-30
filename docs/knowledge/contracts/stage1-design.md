@@ -1907,7 +1907,27 @@ Choices S5 made where this design left the mechanic to the slice:
   and the deletion stops on it, so no phase advances from a record it has not
   read back. The journal read is bounded at 4096 records; a stray name, an
   unreadable record or a truncated journal is `unknown_state`, never a skipped
-  intent.
+  intent. Stage 4 F4 adds two further optional fields inside the major:
+  `identity` (the release plan's condition 2 evidence, byte-identical to a plan
+  row's `identity` object) and `absence` (the `barge.absence/1` proof of the
+  consumer path, condition 6). Both are evidence, never permissions: the replay
+  re-establishes them, an intent is written only when its gate held — so a
+  recorded identity is `verified` and its inode and marker digest name this unit —
+  and a record written before F4, `/2` or `/1`, still reads with neither. The
+  replay restores the recorded modes before it reads any marker, as the order above
+  requires, so an intent it cannot re-establish still leaves the mode the record
+  proves; the object it chmods is matched on its inode and the volume's live
+  device, not on a capture's pre-remount number. It finds the volume by the
+  recorded UUID (refusing a duplicated mount
+  and locating a moved one) rather than through the registry's hint, and tolerates
+  a device that changed with a remount only from what the phase still proves: the
+  acted-on unit's or capture's inode and kind on the verified volume, its exact
+  recorded marker bytes below `marker_last`, the marker's positive absence at
+  `marker_last`, the durable phase at `removed`, and the durable identity record
+  when the intent carries that evidence. A pending `barge.intent/1` record over a
+  `barge.root/1` root settles the same way, without rewriting the marker or
+  inventing an identity record. The design's own owner for those rules is
+  [stage 4](stage4-design.md#f4-landed-surface).
 - **Deletion order.** The intent is durable, custody is re-decided, the unit is
   renamed inside its parent, `renamed` is durable, the volume and the leaf's
   identity are re-verified, a directory's tree is classified once without
