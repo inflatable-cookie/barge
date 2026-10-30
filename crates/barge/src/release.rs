@@ -2488,6 +2488,40 @@ mod tests {
     }
 
     #[test]
+    fn a_registry_without_its_rows_keeps_the_whole_covered_batch() {
+        // Two otherwise eligible roots: a registry that omits its row array is unknown
+        // and keeps both, while the same registry with an explicit empty array is a
+        // complete reading and releases both.
+        for (document, eligible) in [
+            (
+                r#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide"}"#,
+                false,
+            ),
+            (
+                r#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[]}"#,
+                true,
+            ),
+        ] {
+            let fixture = Fixture::new("release-rows");
+            let first = fixture.root();
+            let second = fixture.root();
+            let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
+            std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
+            std::fs::write(outputs.join(reference::OXIDE_REGISTRY_FILE), document)
+                .expect("the registry is written");
+
+            let report = fixture.plan();
+            for root in [&first, &second] {
+                let decided = row(&report, root);
+                assert_eq!(decided.eligible, eligible, "{document}: {decided:?}");
+                assert_eq!(decided.references_complete, eligible, "{document}");
+            }
+            assert_eq!(report.plan.eligible_count, if eligible { 2 } else { 0 });
+            assert_eq!(report.oxide.complete, eligible);
+        }
+    }
+
+    #[test]
     fn a_registry_without_its_required_facts_keeps_the_root() {
         // A registry that omits a field Oxide always writes (its revision here, its
         // creator in the next case) is a divergence, not an empty registry: reading

@@ -1008,7 +1008,10 @@ struct RawRegistry {
     incomplete: Option<RawIncomplete>,
     #[allow(dead_code)]
     created_by: String,
-    #[serde(default)]
+    // Oxide always writes its row array, even when it is empty, so a registry that
+    // omits it is a document this build does not understand. Defaulting it would read
+    // a missing reference set as "no references", which is exactly the unknown that
+    // must keep every root it covers.
     rows: Vec<RawRow>,
     #[serde(default)]
     intents: Vec<RawIntent>,
@@ -2087,6 +2090,22 @@ mod tests {
             intents[0].root,
             PathBuf::from("/Volumes/Builds/oxide/outputs/root")
         );
+    }
+
+    #[test]
+    fn a_registry_must_state_its_rows_even_when_they_are_empty() {
+        // An omitted row array is a divergence; an explicit empty array is a complete
+        // reading that says there are no rows.
+        let without_rows = br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide"}"#;
+        assert!(
+            parse_registry(without_rows).is_err(),
+            "a registry without its rows was accepted as complete and empty"
+        );
+        let empty_rows = br#"{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[]}"#;
+        assert!(matches!(
+            parse_registry(empty_rows),
+            Ok(OxideRegistry::Read { rows, .. }) if rows.is_empty()
+        ));
     }
 
     #[test]

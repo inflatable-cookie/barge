@@ -1128,7 +1128,9 @@ Oxide's registration (`<pool>/oxide-managed`), and only a pool that holds an
 What "unknown" costs. An unreadable, oversized, schema-divergent or
 unknown-version registry or receipt makes the reference set incomplete, and an
 incomplete set keeps every root it covers — the batch, not one row. The registry itself is read at its own field set: its
-`revision`, `complete` flag and `created_by` are required, an incomplete registry
+`revision`, `complete` flag, `created_by` and its `rows` array are required — an
+explicit `rows: []` is a complete reading that says there are no rows, while a
+registry that omits the array is divergent — an incomplete registry
 must carry Oxide's own `incomplete` record (and a complete one must not), each
 registry row must state Oxide's selection flags (`selected`, `pending`) and its
 required identity fields, and every root kind any of these records states — a
