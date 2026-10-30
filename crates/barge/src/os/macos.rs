@@ -355,11 +355,19 @@ fn check_mount_count(before: i32, count: usize, after: i32) -> Result<()> {
     Ok(())
 }
 
-impl super::AbsenceVolume for MacOs {
-    fn volume_prefix(&self, path: &Path) -> Option<PathBuf> {
+impl super::MountPrefix for MacOs {
+    /// The mount parent is `/Volumes`, and a managed volume is one directory
+    /// directly under it: the prefix is exactly those two components.
+    fn mount_prefix(&self, path: &Path) -> Option<PathBuf> {
         let rest = path.strip_prefix(VOLUMES_PARENT).ok()?;
         let name = rest.components().next()?;
         Some(Path::new(VOLUMES_PARENT).join(name.as_os_str()))
+    }
+}
+
+impl super::AbsenceVolume for MacOs {
+    fn volume_prefix(&self, path: &Path) -> Option<PathBuf> {
+        super::MountPrefix::mount_prefix(self, path)
     }
 
     fn identify_directory(&self, handle: &DirHandle) -> Result<VolumeIdentity> {

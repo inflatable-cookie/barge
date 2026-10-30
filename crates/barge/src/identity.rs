@@ -543,7 +543,7 @@ pub struct RootObservation {
 }
 
 /// Device observations from the recorded and live mount instances.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemountEvidence {
     pub device_at_record: u64,
     pub device_live: u64,
@@ -565,7 +565,7 @@ pub enum IdentityVerdict {
 }
 
 /// The reason an observation cannot establish the recorded identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityReason {
     IdentityRecordMissing,

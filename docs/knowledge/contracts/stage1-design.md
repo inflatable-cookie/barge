@@ -1346,7 +1346,8 @@ data, marker and record are left unchanged and reported.
 | Oxide `removable.json` v1/v2 | yes, strict, read-only | never | only when Oxide moves registration to Barge (stage 3) and both sides agree |
 | Oxide `pools.json` | yes, informational | never | with Oxide's stage 3 adoption |
 | Oxide `oxide-outputs` root markers `root/1`, `root/2` | yes, identify and report only | never | with Oxide's stage 4 area adoption |
-| Oxide receipts, registry, prune journals, tombstones | presence and version only | never | with Oxide's stage 4 |
+| Oxide output-registry rows (`oxide.outputs.registry/2`, `/1`) | yes, strict, bounded, read-only census (stage 4 F5) | never | with Oxide's stage 4 area adoption |
+| Oxide receipts, prune journals, tombstones | presence and version only | never | with Oxide's stage 4 |
 | Oxide `oxide-pool` payload and slots | not interpreted | never | stage 3/4 |
 | Oxide `.oxide-scratch.json` and validation temp | yes, strict; with a recorded delegation, its own expiry rule, otherwise keep and report | never | with Oxide's scratch adoption |
 | Effigy `.effigy-scratch.json` | yes, strict against the pinned field set; with a recorded delegation, its own expiry rule, otherwise keep and report | never | with Effigy's own adoption |
@@ -1481,7 +1482,10 @@ Choices S2 made where this design left the mechanic to the slice:
   `mode`, durability `undeclared`). That observed volume is a separate type with
   no conversion into a registry record. `barge.inspect/1` is named by its own
   `schema`; it is not added to the `formats` list, so S2 leaves
-  `barge.describe/1`'s field set unchanged.
+  `barge.describe/1`'s field set unchanged. Stage 4's slice F5 adds the optional
+  `oxide_census` field inside the same major: Oxide's output-registry rows,
+  each with Barge's read-only identity verdict, and the drift summary (stage 4
+  design, "F5 output-registry census").
 
 - **S3** landed on `main` with this note: path containment and the
   descriptor walk from a verified volume root; `barge.area/1` declaration

@@ -222,6 +222,43 @@ fn inspect_json_reports_the_state_the_registry_and_the_oxide_observations() {
     );
     assert!(data["oxide"]["pools"]["state"].is_string());
 
+    // The output-registry census is shaped the same way on every host: its
+    // state names what was found, and its rows and drift agree with each other.
+    let census = &data["oxide_census"];
+    let census_state = census["state"]
+        .as_str()
+        .expect("the census state is a string");
+    assert!(
+        ["reported", "absent", "unknown_state"].contains(&census_state),
+        "{census}"
+    );
+    assert!(census["path"].is_string(), "{census}");
+    let searched = census["searched"]
+        .as_array()
+        .expect("the census names where it looked");
+    assert!(
+        searched.iter().all(|path| path
+            .as_str()
+            .is_some_and(|path| path.ends_with("outputs/registry.json"))),
+        "every searched path is an Oxide output registry: {census}"
+    );
+    assert!(
+        !searched.is_empty() || census_state == "unknown_state",
+        "a census that looked at no registry at all is unknown, never absent: {census}"
+    );
+    let rows = &census["rows"];
+    assert_eq!(rows["count"], rows["rows"].as_array().unwrap().len());
+    if census_state == "reported" {
+        assert!(census["document"].is_object(), "{census}");
+        let drift = &census["drift"];
+        assert!(drift.is_object(), "{census}");
+        assert!(drift["examined"].as_u64().is_some(), "{census}");
+        assert!(drift["device_moved"].as_u64().is_some(), "{census}");
+        assert!(drift["inode_changed"].as_u64().is_some(), "{census}");
+    } else {
+        assert!(census.get("drift").is_none(), "{census}");
+    }
+
     assert!(
         !state_dir.exists(),
         "inspect must not create the state directory"
@@ -398,6 +435,7 @@ fn a_human_inspect_run_names_the_registry_and_the_oxide_observations() {
     assert!(text.contains("barge 0.1.0 (barge.inspect/1)"), "{text}");
     assert!(text.contains("registry:"), "{text}");
     assert!(text.contains("oxide registration:"), "{text}");
+    assert!(text.contains("oxide outputs census:"), "{text}");
     assert!(text.contains("not initialized"), "{text}");
     assert!(serde_json::from_str::<Value>(&text).is_err(), "not JSON");
     assert!(!state_dir.exists());

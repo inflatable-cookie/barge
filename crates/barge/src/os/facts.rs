@@ -222,6 +222,21 @@ pub trait MountRoot {
     fn mount_root(&self, path: &Path) -> Result<MountPoint>;
 }
 
+/// The platform's managed mount-parent rule over a recorded absolute path.
+///
+/// A record written while a volume was mounted at one mount point keeps that
+/// prefix for good, and the volume is later found by UUID rather than by the
+/// path text (stage 4 design, "Finding the volume after a remount"). This is the
+/// one platform fact that lets a recorded path's components be walked from the
+/// verified live mount: the prefix is replaced, and nothing below it is.
+///
+/// It is never identity. A path outside the platform's mount parent has no
+/// prefix, and a caller must report that as unknown rather than guessing one.
+pub trait MountPrefix {
+    /// The mount prefix `path` was recorded under, when the platform has one.
+    fn mount_prefix(&self, path: &Path) -> Option<PathBuf>;
+}
+
 /// The account facts Barge resolves state from.
 ///
 /// The account home comes from the password database for the effective uid,

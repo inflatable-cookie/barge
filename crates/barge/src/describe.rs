@@ -9,10 +9,11 @@
 //! volumes".
 //!
 //! `inspect` is the read-only diagnostic over the same facts: it reports the
-//! state directory, the registry as absent, valid or invalid with the reason, and
-//! Oxide's observations in full, including the volume an import would describe.
-//! It creates no file, directory or lock, so it is safe against a host whose
-//! authority is not initialized.
+//! state directory, the registry as absent, valid or invalid with the reason,
+//! Oxide's observations in full, including the volume an import would describe,
+//! and the read-only census of Oxide's output registry with its drift report
+//! (stage 4 design, slice F5). It creates no file, directory or lock, so it is
+//! safe against a host whose authority is not initialized.
 //!
 //! Both readers refuse an unknown major, a document over the size cap, an
 //! unknown command and any missing or mistyped required field. An extra field is
@@ -26,11 +27,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::census::{OxideCensusReport, OxideCensusRow};
 pub use crate::inspect::{ObservationRow, ObservationState};
 pub use crate::registry::{Availability, Durability, FolderOverrides, RecordOrigin};
 pub use crate::state::StateDirSource;
 
 use crate::area::{self, AreaDocument, RootObservation};
+use crate::census::{self, OXIDE_CENSUS_DEADLINE};
 use crate::contract::{
     parse_document, FormatVersions, RowSet, AREA_ROWS, DESCRIBE_SCHEMA, DESCRIBE_SCHEMA_PREFIX,
     INSPECT_SCHEMA, INSPECT_SCHEMA_PREFIX, OBSERVATION_ROWS, ROOT_ROWS, VOLUME_ROWS,
@@ -39,9 +42,9 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::inspect::{
     self, Observation, ObservedVolume, OxideObservations, OxideRegistration, OXIDE_POOL_ROWS,
 };
-use crate::os::{AccountFacts, DirOps, MountRoot, ProcessObserver, VolumeFacts};
+use crate::os::{AccountFacts, DirOps, MountPrefix, MountRoot, ProcessObserver, VolumeFacts};
 use crate::registry::{self, Registry, VolumeRecord};
-use crate::state::{LockSet, StatePaths};
+use crate::state::{Deadline, LockSet, StatePaths};
 
 /// The command name the describe document belongs to.
 pub const DESCRIBE_COMMAND: &str = "describe";
@@ -92,8 +95,10 @@ impl fmt::Debug for DescribeRequest<'_> {
     }
 }
 
-/// What `inspect` reads: the same account facts and environment, and nothing
-/// else.
+/// What `inspect` reads: the same account facts and environment, and the
+/// platform facts the read-only Oxide output-registry census needs. It takes
+/// only read paths: no lock, no state write and no volume write is reachable
+/// from here.
 pub struct InspectRequest<'a> {
     /// The platform's account facts.
     pub account: &'a dyn AccountFacts,
@@ -103,6 +108,18 @@ pub struct InspectRequest<'a> {
     pub state_dir_override: Option<&'a Path>,
     /// The tool version the document reports.
     pub tool_version: &'a str,
+    /// The platform's directory operations, used for the census's descriptor
+    /// walk.
+    pub dirs: &'a dyn DirOps,
+    /// The platform's volume facts, used to find the recorded volume by UUID.
+    pub facts: &'a dyn VolumeFacts,
+    /// The platform's mount-root proof.
+    pub mounts: &'a dyn MountRoot,
+    /// The platform's recorded mount-prefix rule.
+    pub prefixes: &'a dyn MountPrefix,
+    /// The platform's process facts, for the effective uid the census checks an
+    /// owned root against.
+    pub observer: &'a dyn ProcessObserver,
 }
 
 impl fmt::Debug for InspectRequest<'_> {
@@ -202,6 +219,12 @@ pub struct InspectData {
     pub observations: RowSet<ObservationRow>,
     /// Oxide's observations in full.
     pub oxide: OxideReport,
+    /// Oxide's output-registry census: every recorded row with Barge's identity
+    /// verdict for it, and the drift the carried finding needs (slice F5). It
+    /// is read-only evidence and never authority. A document written before
+    /// this field existed reads as "no census reported".
+    #[serde(default)]
+    pub oxide_census: OxideCensusReport,
 }
 
 /// The tool that produced a document.
@@ -581,12 +604,29 @@ fn collect_roots(
 ///
 /// Like `describe` it creates nothing and takes only a shared lock. Unlike
 /// `describe` an invalid registry is not a failure here: diagnosing it is the
-/// point, so the report says `invalid` and names the file.
+/// point, so the report says `invalid` and names the file. The Oxide output
+/// registry is censused read-only under one deadline; a registry that is absent
+/// or unreadable is reported as such, never as one with no rows.
 pub fn inspect(request: &InspectRequest<'_>) -> Result<InspectData> {
     let paths = StatePaths::resolve(request.account, request.state_dir_override)?;
     let state = state_report(request.account, request.environment_home, &paths)?;
     let registry = registry_report(&paths)?;
     let observations = inspect::observe_oxide(request.account)?;
+    let deadline = Deadline::after(OXIDE_CENSUS_DEADLINE);
+    let census_registry = census::observe_oxide_registry(
+        &observations.pools,
+        observations.known_pools.as_deref(),
+        deadline,
+    );
+    let oxide_census = census::report(
+        &census_registry,
+        request.dirs,
+        request.facts,
+        request.mounts,
+        request.prefixes,
+        request.observer.effective_uid()?,
+        deadline,
+    );
     let rows = observations.rows().to_vec();
     let total = rows.len();
     Ok(InspectData {
@@ -599,6 +639,7 @@ pub fn inspect(request: &InspectRequest<'_>) -> Result<InspectData> {
         registry,
         observations: RowSet::bounded(rows, total, OBSERVATION_ROWS),
         oxide: oxide_report(&observations),
+        oxide_census,
     })
 }
 
@@ -765,6 +806,7 @@ pub fn read_inspect_document(bytes: &[u8]) -> Result<InspectData> {
     data.registry.volumes.validate()?;
     data.observations.validate()?;
     data.oxide.pools.paths.validate()?;
+    data.oxide_census.validate()?;
     Ok(data)
 }
 
@@ -820,6 +862,7 @@ mod tests {
         DescribeData, DescribeRequest, InspectData, InspectRequest, LinkState, ObservationRow,
         ObservationState, PlacementKind, RegistryReportState, StateDirSource,
     };
+    use crate::census::CensusVerdict;
     use crate::contract::{success_bytes, RowSet, DESCRIBE_SCHEMA, INSPECT_SCHEMA};
     use crate::error::{Error, ErrorKind, Result};
     use crate::os::{AccountFacts, DirOps};
@@ -910,6 +953,11 @@ mod tests {
                 environment_home: None,
                 state_dir_override: Some(self.state_override()),
                 tool_version: "0.1.0",
+                dirs: &self.platform,
+                facts: &self.platform,
+                mounts: &self.platform,
+                prefixes: &self.platform,
+                observer: &self.platform,
             }
         }
 
@@ -953,6 +1001,60 @@ mod tests {
                 registration_v2().as_bytes(),
             );
         }
+
+        /// Write one Oxide output registry into the pool the pools record names.
+        fn write_oxide_registry(&self, document: &serde_json::Value) -> PathBuf {
+            self.observe_oxide();
+            self.dir.write(
+                "pool/outputs/registry.json",
+                &serde_json::to_vec(document).expect("the registry encodes"),
+            )
+        }
+
+        /// Write one Oxide output registry into Oxide's default cache pool, which
+        /// is all a reader can search when the pools record names no pool.
+        fn write_default_pool_registry(&self, document: &serde_json::Value) -> PathBuf {
+            self.dir.write(
+                "Library/Caches/oxide/build-pool/outputs/registry.json",
+                &serde_json::to_vec(document).expect("the registry encodes"),
+            )
+        }
+
+        /// Write an Oxide pools record that cannot be read.
+        fn write_unreadable_pools(&self) -> PathBuf {
+            self.dir.write(
+                "Library/Application Support/oxide/state/pools.json",
+                b"{ not a pools record",
+            )
+        }
+    }
+
+    /// One Oxide output-registry document with one recorded row.
+    fn oxide_registry() -> serde_json::Value {
+        serde_json::json!({
+            "version": "oxide.outputs.registry/2",
+            "schema": 2,
+            "revision": 12,
+            "complete": true,
+            "created_by": "fixture-transaction",
+            "rows": [{
+                "checkout_id": "1111111111111111111111111111111111111111111111111111111111111111",
+                "checkout": "/Users/fixture/Dev/project",
+                "receipt": "/Users/fixture/Dev/project/.oxide/receipt.json",
+                "member": "target",
+                "root": "/Volumes/Nowhere/oxide-outputs/2026-10-26T08-15-00Z-3f9c",
+                "root_kind": "external",
+                "volume_uuid": UUID,
+                "recipe": "target-debug",
+                "nonce": "22222222222222222222222222222222",
+                "generation": 1,
+                "root_dev": 16777234,
+                "root_ino": 1234567,
+                "marker_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+                "selected": true,
+                "pending": false,
+            }],
+        })
     }
 
     fn document(data: &DescribeData) -> Vec<u8> {
@@ -1211,6 +1313,194 @@ mod tests {
     }
 
     #[test]
+    fn inspect_censuses_oxide_output_registry_rows_without_writing_anything() {
+        let fixture = Fixture::new("inspect-census");
+        let path = fixture.write_oxide_registry(&oxide_registry());
+        let data = inspect(&fixture.inspect_request()).expect("inspect reads");
+        let census = &data.oxide_census;
+        assert_eq!(census.state, ObservationState::Reported);
+        assert_eq!(census.path, path);
+        assert_eq!(
+            census.searched,
+            vec![fixture.dir.join("pool").join("outputs/registry.json")],
+            "the pool the tool's own record names is where it looked"
+        );
+        let facts = census.document.as_ref().expect("the document was read");
+        assert_eq!(facts.version, "oxide.outputs.registry/2");
+        assert_eq!(facts.schema, 2);
+        assert_eq!(facts.revision, 12);
+        assert_eq!(facts.created_by, "fixture-transaction");
+        assert!(facts.complete);
+        assert_eq!(census.rows.count, 1);
+        let row = &census.rows.rows[0];
+        assert_eq!(row.member, "target");
+        assert_eq!(row.volume_uuid.as_deref(), Some(UUID));
+        assert_eq!(row.root_ino, Some(1_234_567));
+        assert_eq!(row.root_dev, Some(16_777_234));
+        assert!(row.selected);
+        // The fixture root is not a directory on any mounted volume here, so it
+        // is never verified. Whether the row is `unknown` (the volume is away,
+        // or the recorded path cannot be anchored) or `gone` (a volume with this
+        // UUID happened to be mounted and the path is not under it) depends on
+        // the host's mount table, and both are honest: neither is a verdict the
+        // census may invent.
+        assert_ne!(
+            row.identity.verdict,
+            CensusVerdict::Verified,
+            "a root that is not there is never verified: {row:#?}"
+        );
+        assert_eq!(
+            row.identity.inode_equal, None,
+            "an unavailable comparison is absent, never false"
+        );
+        assert_eq!(row.identity.device_equal, None);
+        let drift = census.drift.as_ref().expect("the drift report");
+        assert_eq!(drift.examined, 1);
+        assert_eq!(drift.unexamined, 0);
+        assert_eq!(drift.verified, 0);
+        assert_eq!(drift.unknown + drift.gone, 1);
+        assert!(
+            !fixture.state_override().exists(),
+            "inspect creates no state directory"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the registry is unchanged"),
+            serde_json::to_vec(&oxide_registry()).expect("the fixture encodes"),
+            "the census changed nothing on the recorded file"
+        );
+    }
+
+    #[test]
+    fn an_unknown_pools_record_makes_the_census_unknown_never_absent() {
+        // Oxide's pools record cannot be read, so Barge cannot know which pools
+        // exist. A registry in the default pool may not be the one Oxide uses:
+        // the census reports its source as unknown instead of pronouncing the
+        // registry absent or reporting the wrong one.
+        let fixture = Fixture::new("inspect-census-pools-unknown");
+        let pools = fixture.write_unreadable_pools();
+        let default_registry = fixture.write_default_pool_registry(&oxide_registry());
+        let data = inspect(&fixture.inspect_request()).expect("inspect reads");
+        let census = &data.oxide_census;
+        assert_eq!(census.state, ObservationState::UnknownState);
+        assert_eq!(
+            census.path, pools,
+            "the report names the record that made the pool list unknown"
+        );
+        assert_ne!(census.path, default_registry);
+        assert!(
+            census.searched.is_empty(),
+            "nothing was looked for, so nothing is reported absent"
+        );
+        assert!(census.document.is_none());
+        assert!(census.drift.is_none(), "an unknown source has no drift");
+        assert_eq!(census.rows.count, 0);
+        let detail = census.detail.as_ref().expect("the reason is named");
+        assert!(detail.contains("pools record"), "{detail}");
+        assert!(
+            !fixture.state_override().exists(),
+            "inspect creates no state directory"
+        );
+    }
+
+    #[test]
+    fn an_absent_pools_record_searches_the_default_pools_and_reports_what_it_finds() {
+        // An absent record is a fact: Oxide recorded no pool, so only its
+        // defaults can be in use. A registry there is reported with its rows.
+        let fixture = Fixture::new("inspect-census-pools-absent");
+        let path = fixture.write_default_pool_registry(&oxide_registry());
+        let data = inspect(&fixture.inspect_request()).expect("inspect reads");
+        let census = &data.oxide_census;
+        assert_eq!(census.state, ObservationState::Reported);
+        assert_eq!(census.path, path);
+        assert_eq!(census.searched, vec![path.clone()]);
+        assert_eq!(census.rows.count, 1);
+        assert!(census.drift.is_some());
+    }
+
+    #[test]
+    fn a_registry_document_without_rows_is_unknown_state_in_the_inspect_document() {
+        let fixture = Fixture::new("inspect-census-no-rows");
+        let mut document = oxide_registry();
+        document
+            .as_object_mut()
+            .expect("a registry object")
+            .remove("rows");
+        let path = fixture.write_oxide_registry(&document);
+        let data = inspect(&fixture.inspect_request()).expect("inspect reads");
+        let census = &data.oxide_census;
+        assert_eq!(census.state, ObservationState::UnknownState);
+        assert_eq!(census.path, path);
+        assert!(census.document.is_none());
+        assert_eq!(census.rows.count, 0);
+        assert_eq!(census.rows.total, 0);
+        let detail = census.detail.as_ref().expect("the reason is named");
+        assert!(detail.contains("rows"), "{detail}");
+    }
+
+    #[test]
+    fn an_absent_oxide_output_registry_has_no_rows_and_no_drift() {
+        let fixture = Fixture::new("inspect-census-absent");
+        fixture.observe_oxide();
+        let data = inspect(&fixture.inspect_request()).expect("inspect reads");
+        let census = &data.oxide_census;
+        assert_eq!(census.state, ObservationState::Absent);
+        assert!(census.document.is_none());
+        assert!(
+            census.drift.is_none(),
+            "an absent registry has no drift to report"
+        );
+        assert_eq!(census.rows.count, 0);
+        assert_eq!(census.rows.total, 0);
+        let detail = census.detail.as_ref().expect("absence says why");
+        assert!(detail.contains("known internal pool"), "{detail}");
+        assert_eq!(
+            census.searched.len(),
+            3,
+            "the recorded pool plus the current and retired defaults"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_oxide_output_registry_is_unknown_state_naming_the_file() {
+        let fixture = Fixture::new("inspect-census-unknown");
+        fixture.observe_oxide();
+        let path = fixture.dir.write("pool/outputs/registry.json", b"{ broken");
+        let data = inspect(&fixture.inspect_request()).expect("inspect reads");
+        let census = &data.oxide_census;
+        assert_eq!(census.state, ObservationState::UnknownState);
+        assert_eq!(census.path, path);
+        assert!(census.rows.count == 0);
+        assert!(census.drift.is_none());
+        let detail = census.detail.as_ref().expect("the reason is named");
+        assert!(detail.contains("registry.json"), "{detail}");
+    }
+
+    #[test]
+    fn the_inspect_reader_accepts_the_census_and_refuses_disagreeing_counts() {
+        let fixture = Fixture::new("inspect-census-reader");
+        fixture.write_oxide_registry(&oxide_registry());
+        let data = inspect(&fixture.inspect_request()).expect("inspect reads");
+        let document = inspect_document(&data);
+        let read = read_inspect_document(&document).expect("the document reads");
+        assert_eq!(read.oxide_census, data.oxide_census);
+
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&document).expect("the document decodes");
+        value["data"]["oxide_census"]["rows"]["count"] = serde_json::json!(2);
+        let bytes = serde_json::to_vec(&value).expect("the doctored document encodes");
+        assert!(
+            read_inspect_document(&bytes).is_err(),
+            "a census whose counts disagree with its rows is refused"
+        );
+
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&document).expect("the document decodes");
+        value["data"]["oxide_census"]["drift"]["unknown_reasons"]["count"] = serde_json::json!(9);
+        let bytes = serde_json::to_vec(&value).expect("the doctored document encodes");
+        assert!(read_inspect_document(&bytes).is_err());
+    }
+
+    #[test]
     fn inspect_reports_an_unreadable_registration_as_unknown_state_naming_the_file() {
         let fixture = Fixture::new("inspect-unknown-registration");
         fixture
@@ -1460,11 +1750,17 @@ mod tests {
         .expect_err("an unreadable account home refuses");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
 
+        let platform = crate::os::platform();
         let error = inspect(&InspectRequest {
             account: &FailingAccount,
             environment_home: None,
             state_dir_override: None,
             tool_version: "0.1.0",
+            dirs: &platform,
+            facts: &platform,
+            mounts: &platform,
+            prefixes: &platform,
+            observer: &platform,
         })
         .expect_err("an unreadable account home refuses");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
@@ -1541,11 +1837,17 @@ mod tests {
             "relative/state",
             "the refusal names the path"
         );
+        let platform = crate::os::platform();
         assert!(inspect(&InspectRequest {
             account: &fixture.account,
             environment_home: None,
             state_dir_override: Some(Path::new("relative/state")),
             tool_version: "0.1.0",
+            dirs: &platform,
+            facts: &platform,
+            mounts: &platform,
+            prefixes: &platform,
+            observer: &platform,
         })
         .is_err());
     }
