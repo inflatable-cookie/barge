@@ -111,3 +111,45 @@ terminal pty-host held descriptor 33, whose `PROC_PIDFDVNODEPATHINFO` and
 `PROC_PIDFDVNODEINFO` both answered `ENOENT` persistently and from every context
 while its descriptor listing succeeded, which made the product-custody census of
 a full-scan proof unreachable.
+
+## Q-011 — What makes an interrupted release unknown?
+
+Status: answered 2026-10-29
+Answer: nothing does, by decision. `barge.activity/1` stays frozen, with no pending
+phase and no separate record: a release durably publishes its activity fact
+**first** and removes the hold file second, and remove-first is rejected. While the
+holder is positively live, its hold keeps a published-but-still-held root non-idle;
+once the holder is positively gone the stale hold no longer blocks idleness and the
+published release time determines the LRU order. An interrupted release is
+therefore a recorded release with a leftover stale hold, not an unknown, and a
+release that fails records nothing: a failed hold removal restores the previous
+record byte for byte, a publish the platform does not confirm durable after its
+rename is rolled back the same way and, if it cannot be rolled back, removed and
+then invalidated in place, so the root reads as activity unknown rather than idle,
+and a failed restore is reported as unsettled with the hold standing (Oxide
+Supervisor, decision `c9d30b41`, implemented by barge#024); see the [stage 3
+design](contracts/stage3-space-policy.md#activity-records).
+
+## Q-012 — How is an unconfirmed activity record marked as unknown when the state volume refuses every write?
+
+Status: answered 2026-10-29
+Answer: it is not marked, and that limit is accepted: `barge.activity/1` keeps its
+frozen field set, with no confirmed-publication marker and no separate pending
+record. A release and an idle baseline publish their fact through one shared
+fail-closed recovery — restore the previous record byte for byte, else remove the
+unconfirmed record, else invalidate it in place by truncation (both absences and
+invalid records are `activity_unknown` under O-013, never idle). Every failed
+publish is verified by reading the record back, and a verification read that cannot
+complete is treated as an unconfirmed publication rather than as "nothing happened",
+so a read error never skips recovery. Creation accounts for the same failure the
+same way: a root, its marker and its identity record are written before its
+activity record, creation never deletes a root, and a failed publication reports
+the created root's identity with a `next` step (baseline or operator removal), so a
+created root is never an unreported orphan; and a state
+volume that refuses **every** write touching the record is the one case no step can
+mark. It is reported as `unknown_state` with `detail.restored`,
+`detail.removed` and `detail.invalidated` all false, and the operator repairs the
+state volume and runs `barge area idle-baseline`. The contract states that residual
+as an accepted limit and does not claim an unconfirmed record can never be read as
+a release (Oxide Supervisor, decision `7684287e`, implemented by barge#024); see the
+[stage 3 design](contracts/stage3-space-policy.md#activity-records).

@@ -21,18 +21,18 @@ use std::process::ExitCode;
 
 use barge::area::{
     self, AbsentPolicy, AreaDeclaration, DeclareReport, HoldReport, HoldRequest, HoldScope,
-    ListReport, PrunePolicy, ReleaseReport, ReserveParticipation, RootCreateReport, RootKind,
-    RootListReport, RootSpec, ShowReport,
+    IdleBaselineRequest, ListReport, PrunePolicy, ReleaseReport, ReserveParticipation,
+    RootCreateReport, RootKind, RootListReport, RootSpec, ShowReport,
 };
 use barge::cache::{self, AdoptRequest, CacheKind, FormRequest, UndoRequest};
 use barge::census::OxideCensusReport;
 use barge::contract::{
-    self, AREA_DECLARE_SCHEMA, AREA_HOLD_SCHEMA, AREA_LIST_SCHEMA, AREA_RELEASE_SCHEMA,
-    AREA_ROOT_CREATE_SCHEMA, AREA_ROOT_LIST_SCHEMA, AREA_SHOW_SCHEMA, CACHE_ADOPT_SCHEMA,
-    CACHE_LIST_SCHEMA, CACHE_UNDO_SCHEMA, DESCRIBE_SCHEMA, DOCUMENT_SIZE_CAP_BYTES, INSPECT_SCHEMA,
-    MAINTAIN_SCHEMA, ROOT_ROWS, SCRATCH_ALLOC_SCHEMA, SCRATCH_CLAIM_SCHEMA,
-    SCRATCH_CONCLUDE_SCHEMA, SCRATCH_DELEGATE_SCHEMA, SCRATCH_EXPIRE_SCHEMA, SCRATCH_GRANTS_SCHEMA,
-    SCRATCH_REVOKE_SCHEMA,
+    self, AREA_DECLARE_SCHEMA, AREA_HOLD_SCHEMA, AREA_IDLE_BASELINE_SCHEMA, AREA_LIST_SCHEMA,
+    AREA_RELEASE_SCHEMA, AREA_ROOT_CREATE_SCHEMA, AREA_ROOT_LIST_SCHEMA, AREA_SHOW_SCHEMA,
+    CACHE_ADOPT_SCHEMA, CACHE_LIST_SCHEMA, CACHE_UNDO_SCHEMA, DESCRIBE_SCHEMA,
+    DOCUMENT_SIZE_CAP_BYTES, INSPECT_SCHEMA, MAINTAIN_SCHEMA, ROOT_ROWS, SCRATCH_ALLOC_SCHEMA,
+    SCRATCH_CLAIM_SCHEMA, SCRATCH_CONCLUDE_SCHEMA, SCRATCH_DELEGATE_SCHEMA, SCRATCH_EXPIRE_SCHEMA,
+    SCRATCH_GRANTS_SCHEMA, SCRATCH_REVOKE_SCHEMA,
 };
 use barge::describe::{
     self, DescribeData, DescribeRequest, InspectData, InspectRequest, StateDirSource,
@@ -63,6 +63,7 @@ const USAGE: &str = "usage: barge <describe|inspect|space|volume|maintain|prune|
        barge area root identify --volume <uuid> --path <mount-relative-path>
        barge area hold --root <root-id> --holder <id> --pid <pid> --scope <read|write> --purpose <text>
        barge area release --root <root-id> --holder <id>
+       barge area idle-baseline --root <root-id> [--volume <uuid> --path <mount-relative-path>]
        barge cache adopt --kind <npm-cache|bun-cache|cargo-registry|cargo-git> --volume <uuid> [--form <setting|held-root|link>] [--write-setting] [--adopt-existing-root] [--plan]
        barge cache undo (--placement <id> | --kind <kind>) [--plan]
        barge cache list
@@ -543,6 +544,7 @@ fn area(args: &[String]) -> Result<Report, Error> {
         Some("root") => area_root(&words[1..], options),
         Some("hold") if words.len() == 1 => area_hold(options),
         Some("release") if words.len() == 1 => area_release(options),
+        Some("idle-baseline") if words.len() == 1 => area_idle_baseline(options),
         _ => Err(usage(format!("unknown area verb: {}", words.join(" ")))),
     }
 }
@@ -806,13 +808,9 @@ fn area_release(mut options: Options) -> Result<Report, Error> {
     let holder = required(&mut options, "holder")?;
     refuse_unknown(options)?;
     let state = state_paths()?;
-    let path = state
-        .holds_dir()
-        .join(&root_id)
-        .join(format!("{holder}.json"));
-    let released = path.is_file();
-    let path = area::release(&state, &root_id, &holder)?;
-    let human = if released {
+    let platform = os::platform();
+    let released = area::release(&state, &platform, &root_id, &holder)?;
+    let human = if released.released {
         format!("released {holder} on root {root_id}\n")
     } else {
         format!("{holder} held nothing on root {root_id}\n")
@@ -821,11 +819,56 @@ fn area_release(mut options: Options) -> Result<Report, Error> {
         AREA_RELEASE_SCHEMA,
         "area.release",
         &ReleaseReport {
-            path,
-            released,
+            path: released.path,
+            released: released.released,
             root_id,
             holder,
+            activity: released.activity.row(),
         },
+        human,
+    )
+}
+
+/// Record a fresh activity record asserting a root is idle as of now.
+///
+/// This is the only repair for a lost or invalid activity record: Barge never
+/// infers idleness from an absent one. The library re-verifies the volume and the
+/// root's marker, refuses a live or undecidable hold, takes custody, and writes
+/// the record; this verb only parses and reports it.
+fn area_idle_baseline(mut options: Options) -> Result<Report, Error> {
+    let root_id = required(&mut options, "root")?;
+    let volume = one_option(&mut options, "volume")?
+        .map(|value| VolumeUuid::parse(&value))
+        .transpose()?;
+    let path = one_option(&mut options, "path")?;
+    refuse_unknown(options)?;
+    let state = state_paths()?;
+    let platform = os::platform();
+    let report = area::idle_baseline(
+        &state,
+        &platform,
+        &platform,
+        &platform,
+        &platform,
+        &IdleBaselineRequest {
+            root_id,
+            volume_uuid: volume,
+            mount_relative_path: path,
+        },
+    )?;
+    let human = format!(
+        "root {} is idle as of {} on {}\n",
+        report.root_id,
+        report
+            .activity
+            .last_release_ms
+            .map_or_else(|| "now".to_owned(), |value| value.to_string()),
+        report.volume_uuid
+    );
+    Report::verb(
+        AREA_IDLE_BASELINE_SCHEMA,
+        "area.idle-baseline",
+        &report,
         human,
     )
 }

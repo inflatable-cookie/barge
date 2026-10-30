@@ -439,6 +439,30 @@ durable, positive fact. Barge writes one small record per root:
 - Written on root creation (`last_release_ms = 0`, `releases = 0`) and on every
   release (`last_release_ms = now`, `releases += 1`, `generation += 1`), while
   holding the root lock (rank 3).
+- **Creation accounts for a failed record.** Both creation routes — a declared
+  area's root and Barge's own feature folders (scratch, caches) — write the marker
+  and the durable identity record before the activity record, and creation never
+  deletes a root it created. A failed activity publication therefore leaves a real
+  root whose activity is unsettled, and the command says so: the failure carries
+  `detail.created_root: true` with the root's `root_id`, `path` and `volume_uuid`,
+  a `next` step naming `barge area idle-baseline --root <id>` (or the operator's
+  removal of the root), and the recovery of an unconfirmed record below. The root
+  reads `activity_unknown` — absent or invalid — and is never idle until that
+  baseline records it, so a created root can be neither an unreported orphan nor a
+  prune candidate.
+- **Order, and what an interruption means** (design freezes' decision `c9d30b41`,
+  resolving Q-011). A release durably publishes the fact **first** and removes the
+  hold file **second**, and remove-first is rejected: it would leave an absent hold
+  beside an older record, so a released root would be idle and ordered on a
+  release older than the one that removed its hold. A release interrupted between
+  the two leaves the published fact plus a hold; while the holder is positively
+  live the hold keeps the root non-idle, and once the holder is positively gone the
+  stale hold no longer blocks idleness and the published release time determines
+  the LRU order. An activity write that fails refuses with the hold intact; a hold
+  removal that fails restores the previous record byte for byte, and a publish the
+  platform does not confirm durable after its rename is rolled back the same way
+  (or reported as unsettled when the rollback fails). `barge.activity/1` stays
+  frozen under this decision: no pending phase and no separate pending record.
 - **Missing is not idle.** A root with no activity record — an older root from
   before this stage, or a state directory that was lost — is reported as
   `activity_unknown` and never pressure-pruned. Losing account state must not
@@ -594,8 +618,10 @@ test.
 ### 1. A hold is taken before a write, and prune respects it
 
 `hold(root)` takes the root lock, writes the hold record, releases the lock.
-`release(hold)` takes the root lock, removes the hold record, writes the activity
-record, releases the lock. A prune takes the root lock of each candidate and
+`release(hold)` takes the root lock, writes the activity record, removes the hold
+record, releases the lock (the design freezes' decision `c9d30b41` fixes this
+order and supersedes the removal-first phrasing here; see [activity
+records](#activity-records)). A prune takes the root lock of each candidate and
 holds it across that candidate's plan → intent → rename → delete sequence. There
 are exactly two orderings, and both are safe:
 
@@ -1381,3 +1407,207 @@ creating files. Its rows and the space rows in `barge describe` report the
 declared policy, or `policy_undeclared` when absent, and identify a floor below
 the default with `floor_below_default`. An absent registered volume is reported
 as absent. Area attribution and policy decisions belong to their later slices.
+
+### Implemented activity, idleness and least-recently-used surface
+
+Slice T3 implements this contract's activity record, the pressure idleness matrix
+and the volume-wide least-recently-used order. It plans no candidate, prunes
+nothing and decides nothing: `barge.space.prune/1` and the guard belong to T4 to
+T6, and no native proof exists or is claimed.
+
+- **`barge.activity/1`** is written at `state/activity/<root-id>.json`, privately
+  and atomically, at most 4 KiB, with no unknown fields. Root creation writes
+  generation `0` with `last_release_ms: 0` and `releases: 0`, on both the area and
+  the feature-folder creation routes.
+- **A release publishes its fact first and removes the hold second, and a release
+  that fails records nothing.** This order is the design freezes' decision
+  (`c9d30b41`, resolving Q-011), and `barge.activity/1` stays frozen with it: no
+  pending phase and no separate pending record. `barge area release` takes the root
+  lock the hold was written under, reads and validates the hold, reads the activity
+  record and that record's exact bytes, durably publishes `last_release_ms: now`
+  with `releases` and `generation` incremented, and then removes the hold file.
+  Inversion — remove, then write — is rejected, because it leaves an absent hold
+  beside an *older* record: a root would be idle and ordered on a release older
+  than the one that removed its hold.
+- **What each failure does.** The record's own publish renames and then syncs the
+  directory, so its failure does not always mean the new bytes are absent, and the
+  report never claims "nothing changed" while an advanced record is visible. The
+  verification read is part of that rule: only a record whose bytes are **provably
+  unchanged** counts as "nothing happened", and a read that cannot complete proves
+  nothing, so it is treated as an unconfirmed publication and recovered — unknown
+  is never taken as "no effect". A removal or invalidation that errors but leaves
+  the record positively absent, or present but no longer a readable record, is
+  settled the same way, so a misleading error on a step that did its job cannot
+  leave an unconfirmed fact trusted:
+  - a publish that fails **before** its rename leaves the record exactly as it was;
+    the release refuses with the publish's own kind (`io`, exit `3`), the hold in
+    place, and `detail.restored: true`, which is the failure matrix's "refuse
+    before the effect" row;
+  - a publish that fails **after** its rename (the directory sync) has left the new
+    bytes visible, so the release restores the previous record **byte for byte**
+    and reports the same refusal with `detail.restored: true`; the hold is
+    untouched in both cases;
+  - if the publish landed **unconfirmed** and the previous record cannot be
+    restored, the unconfirmed record is **removed** and the report is
+    `unknown_state` (exit `3`) with `detail.restored: false` and
+    `detail.removed: true`: an absent record is `activity_unknown`, which is never
+    idle, so no root is ever made idle by a fact the platform did not confirm
+    durable, and the explicit baseline is the repair;
+  - if that removal fails too, the unconfirmed record is **invalidated in place** —
+    truncated, so it can never be read as a release. Truncation needs only the
+    file's own write permission and not the directory's, so it is available
+    exactly where a restore and a removal are not, and a crash part-way through
+    leaves an invalid record too. The report is `unknown_state` with
+    `detail.restored: false`, `detail.removed: false` and
+    `detail.invalidated: true`, and an invalid record is `activity_unknown` under
+    O-013: it is never idle and offers no release time to the LRU order, so the
+    root cannot become a candidate until the baseline records a fresh fact;
+  - a failed hold removal that can be undone reports `io` with
+    `detail.restored: true`, and one that cannot is `unknown_state` with
+    `detail.restored: false` — but its publish *was* confirmed, so the visible
+    record is a real release and the hold is what keeps the root while its holder
+    is live;
+  - the accepted limit no step in the frozen format can close (`7684287e`,
+    answering [Q-012](../questions.md), "How is an unconfirmed activity record
+    marked as unknown when the state volume refuses every write?"): a state volume
+    that refuses **every** write, so the unconfirmed record can be neither
+    restored, removed nor invalidated. `barge.activity/1` keeps its frozen field
+    set — no confirmed-publication marker and no separate pending record — so the
+    unconfirmed record can stay readable, and once its leftover hold is stale the
+    matrix has nothing left to gate on and reads it as a release. The release
+    reports `unknown_state` with `detail.restored: false`, `detail.removed: false`
+    and `detail.invalidated: false`, saying the store that refuses every write
+    cannot be marked; the operator repairs the state volume and runs the baseline.
+    This is a broken-store limit stated plainly, **not** a claimed safety property:
+    the contract does not claim an unconfirmed record can never be read as a
+    release, and `a_state_volume_that_refuses_every_write_cannot_be_marked` pins
+    the limit so a later decision to close it is a visible change.
+
+  A release therefore never reports that it changed nothing when it changed
+  something, and never leaves an unconfirmed record readable as a release while any
+  of the three recovery steps can still run: it is restored, else removed, else
+  invalidated in place. `barge area idle-baseline` publishes its own fact through
+  the same recovery, so a baseline whose publication fails after its rename cannot
+  leave a readable idle fact either. Only a store that refuses every write leaves an
+  unconfirmed record; that limit is accepted above, reported as `unknown_state`, and
+  never assumed durable.
+- **What an interruption means, and why it is not unknown.** A release interrupted
+  between its fact and its hold removal leaves the published fact plus a hold file,
+  and that pair means exactly this (`c9d30b41`): while the holder is **positively
+  live**, its hold keeps the root non-idle, so a published-but-still-held root is
+  never a candidate; once the holder is **positively gone** the stale hold no
+  longer blocks idleness (stage 1 defines a stale hold that way) and the published
+  release time determines the LRU order. "Published" means the record's publish
+  returned success; a publish the platform did not confirm durable is not a
+  release and is handled by the failure rules above, which remove it rather than
+  let it decide. This is not an unknown: the consumer published a release, and the
+  leftover hold is a stale record of a holder that is proven gone, so no fact is
+  missing. What the order rules out is the other outcome — an absent hold beside
+  an older release time — because a released root would then be ordered on a
+  release that did not remove its hold. Both cases are pinned by
+  `an_interrupted_release_leaves_a_hold_never_an_older_release` and
+  `a_failed_restore_is_reported_and_leaves_the_hold_standing`, each for a live and
+  an exited holder.
+- **A release never invents a record.** A root with no record, or with one that
+  does not verify, gets no new record from a release: the release report says so
+  (`data.activity.state` is `missing` or `unverified`), the root stays kept, and
+  the repair is the explicit command below. This is O-013's resolution: losing
+  account state makes roots kept until an operator acts. `barge.area.release/1`
+  therefore carries an `activity` row; it is the release's own account of what it
+  recorded, not a second authority.
+- **`barge area idle-baseline --root <root-id> [--volume <uuid> --path
+  <mount-relative-path>]`** is that repair. Without the two location options it
+  resolves the root from its durable `barge.root.identity/1` record; the explicit
+  pair exists for a root that predates that record. Containment is decided before
+  any record is compared, an explicit pair that disagrees with the durable record
+  is refused as `unknown_state` rather than resolved in either direction, and the
+  marker must still name the requested root. It re-verifies the volume and the
+  marker and refuses while **any** hold is recorded, as the design's activity
+  section says: a live *or* stale hold is `refused_boundary` naming the holder and
+  its state (stage 1 treats a stale hold as not blocking idleness, but a baseline
+  is an operator's assertion, so the hold is released first), an undecidable or
+  over-bound hold is `custody_not_proven`, and the root lock it takes is what a
+  racing `hold` takes too. It then takes the stage 1 custody verdict for the root
+  and writes `last_release_ms: now` while holding the root lock. It preserves the
+  recorded release count and creation time, fills an unrecorded creation time from
+  the verified marker, bumps the generation, and refuses a record whose volume
+  disagrees with the root rather than resolving the disagreement. It creates no
+  state layout until the root is located and verified, so a refusal for a root
+  Barge cannot find leaves nothing behind. Its own fact is published through the
+  same fail-closed recovery as a release, so a baseline whose publication fails
+  after its rename is restored, removed or invalidated rather than left readable.
+  Its document is `barge.area.idle-baseline/1`.
+- **The idleness matrix** is `area::assess_idleness`, over the marker, the
+  activity record, the holds and the area's `reserve` participation, with the
+  first blocking input reported as the reason: `marker_unverified`,
+  `identity_mismatch`, `participation_excluded`, `participation_undeclared`,
+  `hold_live`, `hold_unknown`, `activity_unknown` (missing or invalid),
+  `activity_unreleased`,
+  `activity_future` (this stage's own name for the failure matrix's clock-skew row:
+  the report says the release is in the future and the root is not idle), and
+  `unconcluded_scratch` for a scratch root that is not positively concluded
+  (outcome `closed`, closure `positive`, nested scope `exclusive`, kept reason
+  `evidence`; the pressure predicate relaxes only the age). A hold list cut by its
+  per-root bound is `hold_unknown`, and nothing else is idle. Evidence is bound
+  to the verified root identity and never merely associated with a directory: the
+  activity record and the holds are read under the root id the marker proves (not
+  the directory's name, which an adopted root may differ from), `identity_mismatch`
+  is reported when that key is not the marker's root id or when the record names
+  another root or another volume's uuid, and a record or hold belonging to another
+  root therefore never makes this root idle.
+- **`barge.area.root.list/1`** rows carry two additions: `activity_record`, the
+  record as read (`released`, `unreleased`, `missing` or `unverified`, with its
+  fields when it verified), and `space_idle`, the matrix's verdict. The record's
+  field is `activity_record` rather than `activity` because the merged stage 4
+  work already gives a row an `activity` object: the bounded last-activity scan a
+  `maintain` age decision reads. The two are different facts — the record is the
+  release evidence the pressure matrix reads, the scan is an observed age — so they
+  have different names and neither is derived from the other. The existing `idle`
+  field is unchanged and remains stage 1's hold-only idleness that `maintain`'s age
+  policy reads; it is deliberately not the pressure verdict, because an age policy
+  and "may this yield now" are different questions. A row from a build before this
+  slice reports neither addition, and absence is never idleness.
+- **The least-recently-used order** is `area::LruKey` over the released records:
+  older `last_release_ms`, then older `first_created_ms`, then `root_id`
+  ascending. It carries no area, so the order is volume-wide by construction, and
+  a root whose creation time was never recorded is ordered after every known one
+  rather than being treated as the oldest. T4 orders candidates with it; nothing
+  in T3 orders or prunes anything.
+- **The row's reason surface, and the CLI's coverage of it.** A
+  `barge.area.root.list/1` row's `space_idle.reason` can be one of
+  `marker_unverified`, `identity_mismatch`, `participation_excluded`,
+  `hold_live`, `hold_unknown`, `activity_unknown`, `activity_unreleased`,
+  `activity_future` and `unconcluded_scratch`, or absent with
+  `space_idle.state: idle`. `participation_undeclared` is defined by the matrix but
+  **no T3 document produces it**: a listing resolves each root through its area's
+  declaration, so an undeclared area never reaches a row, and the reason is left to
+  the later slices that resolve roots some other way.
+- **The CLI prints these documents against a verified volume.** The suite's CLI
+  cases register the `/Volumes/<name>` mount their checkout is on inside their own
+  throwaway state directory, keep every write inside one `mktemp -d` directory
+  under that volume's `scratch/barge/` and remove only that directory (its parent is
+  the operator's scratch root and is never created, renamed or removed, and no
+  self-named sibling is made), and assert end to end: the successful
+  `barge.area.idle-baseline/1` document, and every reason the row can carry —
+  `activity_unreleased`, `hold_live` (with stage 1's `idle` false and the live hold
+  row), `hold_unknown` (a hold whose recorded process start identity no longer
+  matches its live pid, with the hold's own reason reported), `activity_unknown` (a
+  lost record, kept with `activity.state: missing`), `identity_mismatch` (a record
+  naming another volume, kept), `activity_future` (a release recorded ahead of the
+  clock, kept), `unconcluded_scratch` (a scratch-kind root with no conclusion,
+  kept), `marker_unverified` (a directory with no marker), `participation_excluded`
+  (a root in an `excluded` area), and `idle` once the root's activity is recorded. A
+  checkout that is not under a `/Volumes` mount has no non-boot volume the OS layer
+  can verify; the case reports that it skipped, and the library tests own the
+  semantics there.
+- `barge describe`'s `formats` names `barge.activity/1`.
+
+Two readings this slice fixes for later ones. First, an operator's idle baseline
+is a release *time* without a release *count*, so `last_release_ms > 0` is what
+makes a record `released` and `releases` counts only the consumer's own releases;
+a record that counts releases but records no release time is `unverified`, not
+idle. Second, the release ordering above is fact-then-effect: the activity
+section's prose lists the removal first, and the design freezes' decision
+`c9d30b41` resolves that against the prose in favour of the fact first, which is
+also what the failure matrix's "refuse before the effect" row needs. Q-011 records
+the answer; this contract is the behaviour.

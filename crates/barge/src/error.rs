@@ -118,6 +118,16 @@ impl Error {
         self
     }
 
+    /// The same failure, with `prefix` in front of its message.
+    ///
+    /// A step that fails after a caller-visible effect uses this so the report
+    /// names both the effect and the failure.
+    #[must_use]
+    pub fn prefixed(mut self, prefix: &str) -> Self {
+        self.message = format!("{prefix}: {}", self.message);
+        self
+    }
+
     /// The closed kind this failure is.
     pub fn kind(&self) -> ErrorKind {
         self.kind

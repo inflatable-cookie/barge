@@ -41,6 +41,8 @@ pub const AREA_DECLARATION_CAP_BYTES: usize = 64 * 1024;
 pub const MARKER_CAP_BYTES: usize = 4 * 1024;
 /// The largest hold record. Every authoritative record is private and small.
 pub const HOLD_CAP_BYTES: usize = 4 * 1024;
+/// The largest activity record (stage 3, "Activity records").
+pub const ACTIVITY_CAP_BYTES: usize = 4 * 1024;
 /// The largest intent journal record. It is one bounded record, like a marker.
 pub const INTENT_CAP_BYTES: usize = 4 * 1024;
 /// The row cap for intents read in one pass. A journal over this is unbounded
@@ -78,6 +80,8 @@ pub const AREA_ROOT_LIST_SCHEMA: &str = "barge.area.root.list/1";
 pub const AREA_HOLD_SCHEMA: &str = "barge.area.hold/1";
 /// The hold release command document.
 pub const AREA_RELEASE_SCHEMA: &str = "barge.area.release/1";
+/// The explicit idle-baseline repair command document (stage 3).
+pub const AREA_IDLE_BASELINE_SCHEMA: &str = "barge.area.idle-baseline/1";
 /// The cache adopt command document (slice S6).
 pub const CACHE_ADOPT_SCHEMA: &str = "barge.cache.adopt/1";
 /// The cache undo command document.
@@ -123,6 +127,8 @@ pub const ROOT_SCHEMA: &str = "barge.root/2";
 pub const ROOT_IDENTITY_SCHEMA: &str = "barge.root.identity/1";
 /// One hold file's format.
 pub const HOLD_SCHEMA: &str = "barge.hold/1";
+/// One owned root's activity record (stage 3).
+pub const ACTIVITY_SCHEMA: &str = "barge.activity/1";
 /// One intent journal record's format.
 ///
 /// The major moved to `/2` when custody and deletion were generalised from
@@ -155,6 +161,9 @@ pub struct FormatVersions {
     pub root_identity: String,
     /// `barge.hold/<major>`.
     pub hold: String,
+    /// `barge.activity/<major>`.
+    #[serde(default)]
+    pub activity: String,
     /// `barge.intent/<major>`.
     pub intent: String,
     /// `barge.space/<major>`.
@@ -186,6 +195,7 @@ impl FormatVersions {
             root: ROOT_SCHEMA.to_owned(),
             root_identity: ROOT_IDENTITY_SCHEMA.to_owned(),
             hold: HOLD_SCHEMA.to_owned(),
+            activity: ACTIVITY_SCHEMA.to_owned(),
             intent: INTENT_SCHEMA.to_owned(),
             space: crate::space::SPACE_SCHEMA.to_owned(),
             prune_plan: PRUNE_PLAN_SCHEMA.to_owned(),
@@ -388,6 +398,7 @@ mod tests {
         assert_eq!(formats.placement, "barge.placement/1");
         assert_eq!(formats.root, "barge.root/2");
         assert_eq!(formats.hold, "barge.hold/1");
+        assert_eq!(formats.activity, "barge.activity/1");
         assert_eq!(formats.intent, "barge.intent/2");
     }
 

@@ -157,6 +157,18 @@ impl StatePaths {
         self.root.join("holds")
     }
 
+    /// The activity records, one file per root (stage 3).
+    pub fn activity_dir(&self) -> PathBuf {
+        self.root.join("activity")
+    }
+
+    /// One root's activity record path. A malformed root id is refused: a record
+    /// file is never named from an unvalidated string.
+    pub fn activity_path(&self, root_id: &str) -> Result<PathBuf> {
+        validate_identifier("root_id", root_id)?;
+        Ok(self.activity_dir().join(format!("{root_id}.json")))
+    }
+
     /// The intent journal.
     pub fn intents_dir(&self) -> PathBuf {
         self.root.join("intents")
@@ -243,6 +255,7 @@ impl StatePaths {
             self.areas_dir(),
             self.placements_dir(),
             self.holds_dir(),
+            self.activity_dir(),
             self.intents_dir(),
             self.journal_dir(),
             self.locks_dir(),
@@ -2180,6 +2193,7 @@ mod tests {
             state.areas_dir(),
             state.placements_dir(),
             state.holds_dir(),
+            state.activity_dir(),
             state.intents_dir(),
             state.journal_dir(),
             state.locks_dir(),
