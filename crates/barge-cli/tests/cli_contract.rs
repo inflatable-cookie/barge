@@ -2502,6 +2502,83 @@ fn space_prune_refuses_the_effect_form_and_a_missing_plan() {
         .expect("the refusal states its reason")
         .contains("T5"));
 
+    // The same effect-shaped option *before* the verb is refused too: the whole
+    // line is parsed once, so it can never be silently discarded.
+    let output = run_in(
+        &[
+            "space",
+            "--plan-sha256",
+            &digest,
+            "prune",
+            "--volume",
+            volume,
+            "--plan",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an effect option before the verb is still refused"
+    );
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.error/1");
+    assert_eq!(document["error"]["kind"], "usage");
+    assert!(document["error"]["message"]
+        .as_str()
+        .expect("the refusal states its reason")
+        .contains("T5"));
+
+    // An unknown option before the verb is named, not discarded in favour of a
+    // value error it came with.
+    let output = run_in(
+        &[
+            "space",
+            "--bogus",
+            "x",
+            "prune",
+            "--volume",
+            "not-a-uuid",
+            "--plan",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "usage");
+    assert!(
+        document["error"]["message"]
+            .as_str()
+            .expect("the refusal states its reason")
+            .contains("--bogus"),
+        "the unknown option is the refusal: {document}"
+    );
+
+    // A known option before the verb reaches the verb: the unregistered volume is
+    // then the answer, not a missing `--volume` usage refusal.
+    let output = run_in(
+        &["space", "--volume", volume, "prune", "--plan", "--json"],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        stdout_document(&output)["error"]["kind"],
+        "unknown_state",
+        "the volume option reached the prune verb"
+    );
+
+    // The report form refuses an option rather than ignoring it.
+    let output = run_in(&["space", "--volume", volume, "--json"], &state_dir);
+    assert_eq!(output.status.code(), Some(2));
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "usage");
+    assert!(document["error"]["message"]
+        .as_str()
+        .expect("the refusal states its reason")
+        .contains("--volume"));
+
     let output = run_in(
         &[
             "space",

@@ -1625,7 +1625,11 @@ and T6, and this slice claims no native proof.
   bounded `barge.space.prune/1` document. `--plan-out <file>` writes the exact
   canonical plan bytes a later slice's real run will present. The effect form
   (`--plan <file> --plan-sha256 <hex>`) is refused as a usage error naming T5;
-  this build never implies an effect it does not have.
+  this build never implies an effect it does not have. The whole command line is
+  parsed once, before the verb is chosen: an option that appears before `prune`
+  is validated by that verb, so an effect-shaped option is refused wherever it
+  sits and an unknown option is named rather than silently discarded. Without a
+  verb, any option is a usage refusal too, never ignored.
 - **The plan and its digest.** `barge.space.prune.plan/1` is the canonical plan:
   the volume, the registry `policy_generation`, the declared `policy`, the
   `target_bytes` (`max(reserve, floor)`) and the ordered candidates. Each

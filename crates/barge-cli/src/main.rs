@@ -1048,26 +1048,27 @@ fn maintain_summary(report: &MaintainReport) -> String {
 ///
 /// Without a verb it is the read-only report. `prune` is the effect-free
 /// candidate plan (stage 3, slice T4); the effect form belongs to T5 and is
-/// refused here rather than implied.
+/// refused here rather than implied. The line is parsed once so an option before
+/// the verb is validated by it, never discarded by the dispatch.
 fn space(args: &[String]) -> Result<Report, Error> {
-    let mut positional = args
-        .iter()
-        .filter(|argument| !argument.starts_with('-') && *argument != "--json");
-    match positional.next().map(String::as_str) {
+    // The whole command line is parsed once, before the verb is chosen, so an
+    // option that appears before `prune` is validated by the verb rather than
+    // discarded: `barge space --plan-sha256 <hex> prune ...` is the same
+    // effect-form refusal, and an unknown option is named rather than ignored.
+    let Parsed { words, options } = parse_taking(args, &["volume", "plan-out", "plan-sha256"])?;
+    match words.first().map(String::as_str) {
         None => {
-            no_extra_arguments(args)?;
+            refuse_unknown(options)?;
             let platform = os::platform();
             let report = barge::space::report(&state_paths()?, &platform, &platform, &platform)?;
             let human = format!("space: {} registered volumes\n", report.volumes.count);
             Report::verb(barge::space::SPACE_SCHEMA, "space", &report, human)
         }
-        Some("prune") => {
-            let verb = match args.iter().position(|argument| argument == "prune") {
-                Some(index) => index + 1,
-                None => args.len(),
-            };
-            space_prune(&args[verb..])
-        }
+        Some("prune") if words.len() == 1 => space_prune(options),
+        Some("prune") => Err(usage(format!(
+            "unexpected argument after prune: {}",
+            words[1]
+        ))),
         Some(other) => Err(usage(format!("unknown space verb: {other}"))),
     }
 }
@@ -1080,20 +1081,22 @@ fn space(args: &[String]) -> Result<Report, Error> {
 /// present. There is no effect in this build: the real run, its custody and its
 /// replay are slice T5, so every effect-shaped argument is refused rather than
 /// ignored.
-fn space_prune(args: &[String]) -> Result<Report, Error> {
-    let Parsed { words, mut options } = parse_taking(args, &["plan-out"])?;
-    if let Some(word) = words.first() {
-        return Err(usage(format!("unexpected argument: {word}")));
-    }
+fn space_prune(mut options: Options) -> Result<Report, Error> {
     let plan = flag(&mut options, "plan")?;
     let plan_out = one_option(&mut options, "plan-out")?.map(PathBuf::from);
-    let volume = required(&mut options, "volume")?;
+    let volume = one_option(&mut options, "volume")?;
+    // The effect-shaped argument is refused wherever it sits on the line, and an
+    // unknown option is named before any value it could have come with is
+    // interpreted.
     if let Some(_digest) = one_option(&mut options, "plan-sha256")? {
         return Err(usage(
             "barge space prune previews only in this build: a real run, its plan bytes and its digest are stage 3 T5, so nothing was planned",
         ));
     }
     refuse_unknown(options)?;
+    let Some(volume) = volume else {
+        return Err(usage("--volume is required"));
+    };
     if !plan {
         return Err(usage(
             "barge space prune previews only with --plan; the effect form belongs to a later slice and was not run",
