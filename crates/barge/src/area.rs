@@ -3503,7 +3503,9 @@ pub struct RootActivity {
     /// decide.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_ms: Option<u64>,
-    /// The logical bytes the scan counted: every regular file's size.
+    /// The logical bytes the scan counted: the sum of every regular file's own size.
+    /// Directories and symbolic links contribute nothing here, and the root directory
+    /// itself contributes no logical bytes either — only allocation.
     pub logical_bytes: u64,
     /// The bytes allocated to the entries the scan counted.
     pub allocated_bytes: u64,
@@ -3604,7 +3606,9 @@ pub fn scan_activity_within(
     };
     let mut activity = RootActivity {
         last_activity_ms: Some(floor),
-        logical_bytes: own.allocated_bytes,
+        // The root directory itself has allocation but no logical bytes: logical size
+        // is a regular file's own length, and a directory or a link has none.
+        logical_bytes: 0,
         allocated_bytes: own.allocated_bytes,
         entries: 1,
         complete: true,
@@ -3665,7 +3669,12 @@ fn walk_activity(
     for entry in &listing.entries {
         budget.spend()?;
         activity.entries = activity.entries.saturating_add(1);
-        activity.logical_bytes = activity.logical_bytes.saturating_add(entry.facts.size);
+        // Logical size counts a regular file's own length only; a directory's or a
+        // symbolic link's `size` is not data and never goes in. Allocation is counted
+        // separately, for everything the scan reaches.
+        if entry.facts.kind == EntryKind::File {
+            activity.logical_bytes = activity.logical_bytes.saturating_add(entry.facts.size);
+        }
         activity.allocated_bytes = activity
             .allocated_bytes
             .saturating_add(entry.facts.allocated_bytes);
@@ -6009,6 +6018,38 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("own modification time cannot be read now")),
             "{activity:?}"
+        );
+    }
+
+    #[test]
+    fn logical_bytes_are_regular_file_sizes_only() {
+        // Logical size is a regular file's own length. A plain directory has allocation
+        // but no logical bytes, a nested file adds exactly its own size, and a symbolic
+        // link adds nothing.
+        let fixture = crate::testkit::TempDir::new("activity-bytes");
+        let dirs = crate::testkit::Faults::default();
+        let handle = dirs.open_path(fixture.path()).expect("the directory opens");
+        let empty = scan_activity(&dirs, &handle, crate::state::now_ms());
+        assert!(empty.complete, "{empty:?}");
+        assert_eq!(
+            empty.logical_bytes, 0,
+            "an empty directory has no logical bytes"
+        );
+
+        let nested = fixture.join("target/debug");
+        std::fs::create_dir_all(&nested).expect("the nested folders");
+        std::fs::write(nested.join("artifact"), vec![0u8; 1234]).expect("the file is written");
+        std::os::unix::fs::symlink(nested.join("artifact"), fixture.join("link"))
+            .expect("the link is created");
+        let scanned = scan_activity(&dirs, &handle, crate::state::now_ms());
+        assert!(scanned.complete, "{scanned:?}");
+        assert_eq!(
+            scanned.logical_bytes, 1234,
+            "only the regular file's own size is logical: {scanned:?}"
+        );
+        assert!(
+            scanned.allocated_bytes > empty.allocated_bytes,
+            "the directories and the file add allocation: {scanned:?}"
         );
     }
 

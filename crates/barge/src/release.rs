@@ -299,7 +299,10 @@ pub struct PrunePlanRow {
     /// Condition 4's evidence.
     pub idle: IdleEvidence,
     /// Condition 5's evidence: one row per reference that names the root.
-    #[serde(default)]
+    ///
+    /// The field is required: an explicit empty list is a complete reading that says
+    /// nothing names the root, while a row that omits it is not a document this reader
+    /// understands.
     pub references: Vec<ReferenceRow>,
     /// Whether every source that could name the root was read completely.
     pub references_complete: bool,
@@ -2091,6 +2094,41 @@ mod tests {
         assert_eq!(kept.blocked_by.as_deref(), Some("policy"));
         assert!(kept.idle.last_activity_ms.is_none());
         assert!(kept.bytes.is_some_and(|bytes| !bytes.complete));
+    }
+
+    #[test]
+    fn a_row_must_state_its_references() {
+        // A row's reference list is required: an explicit empty list is a complete
+        // reading, while a row that omits it is not a document this reader understands.
+        let fixture = Fixture::new("release-row-references");
+        let root = fixture.root();
+        let report = fixture.plan();
+        let bytes = canonical_plan_bytes(&report.plan).expect("the plan encodes");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("the plan is JSON");
+        let stated = document["rows"]["rows"][0]["references"]
+            .as_array()
+            .expect("the row states its references")
+            .len();
+        assert!(stated > 0, "the fixture row names the area declaration");
+
+        // An explicit empty list is a complete reading that says nothing names it.
+        let mut empty_list = document.clone();
+        empty_list["rows"]["rows"][0]["references"] = serde_json::json!([]);
+        let read = read_prune_plan(&serde_json::to_vec(&empty_list).expect("it encodes"))
+            .expect("an explicit empty list reads");
+        assert_eq!(read.rows.rows[0].references.len(), 0);
+
+        // A row that omits the field is not a document this reader understands.
+        document["rows"]["rows"][0]
+            .as_object_mut()
+            .expect("a row object")
+            .remove("references");
+        assert!(
+            read_prune_plan(&serde_json::to_vec(&document).expect("it encodes")).is_err(),
+            "a row that omits its references was read as an empty list"
+        );
+        assert!(root.path.is_dir());
     }
 
     #[test]

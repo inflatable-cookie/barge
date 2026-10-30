@@ -1083,7 +1083,14 @@ allocated totals and whether it reached the whole subtree), and then `eligible`
 with the first blocking condition and its reason. Lists inside the plan are the
 contract's bounded `RowSet`s, so a list whose counts disagree with its rows is
 refused on read. A root with more than 64 references is kept: a set the plan
-cannot report in full is never a short set.
+cannot report in full is never a short set. A row's `references` list is
+**required**, not defaulted: a row that omits it is not a document this reader
+understands, while an explicit empty list is a complete reading that says nothing
+names the root. The scan's byte evidence keeps two facts apart: `bytes.logical` is
+the sum of **regular files' own sizes only** — a directory or a symbolic link
+contributes nothing, and the root directory itself contributes no logical bytes —
+while `bytes.allocated` is the allocation the scan counted for everything it
+reached, the root directory included.
 
 The plan carries stage 1's 600 s run wall (`PLAN_WALL`, with a 30 s stop margin):
 the clock starts with the plan's own first work, so its setup — the registry, the
