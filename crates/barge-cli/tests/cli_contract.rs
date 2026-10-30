@@ -129,6 +129,12 @@ fn describe_json_prints_one_document_and_creates_nothing() {
     assert_eq!(data["formats"]["error"], "barge.error/1");
     assert_eq!(data["formats"]["registry"], "barge.registry/1");
     assert_eq!(data["formats"]["activity"], "barge.activity/1");
+    assert_eq!(data["formats"]["space"], "barge.space/1");
+    assert_eq!(data["formats"]["space_prune"], "barge.space.prune/1");
+    assert_eq!(
+        data["formats"]["space_prune_plan"],
+        "barge.space.prune.plan/1"
+    );
     assert_eq!(data["state"]["dir"], state_dir.display().to_string());
     assert_eq!(data["state"]["initialized"], false);
     assert_eq!(data["state"]["source"], "environment_override");
@@ -2226,4 +2232,179 @@ fn prune_refuses_the_effect_form_missing_arguments_and_an_unregistered_volume() 
     );
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+}
+
+// ---- space candidate planning (stage 3, slice T4) ------------------------
+
+/// The CLI prints one canonical space-prune plan, writes only the plan file it
+/// was given, and never plans an excluded area's root.
+///
+/// A candidate needs a verified volume, a real root and a recorded release, so
+/// this case registers the volume this checkout runs on inside its own throwaway
+/// state directory and keeps every write inside one `mktemp -d` directory it
+/// removes.
+#[test]
+fn space_prune_previews_a_canonical_plan_and_writes_only_the_file_it_was_given() {
+    let Some((mount, scratch)) = volume_scratch() else {
+        return;
+    };
+    let root_dir = scratch
+        .path
+        .strip_prefix(&mount)
+        .expect("the scratch directory is inside the mount")
+        .to_str()
+        .expect("the scratch path is UTF-8")
+        .to_owned();
+    let (fixture, state_dir) = absent_state_dir("space-prune-plan");
+    let volume = register_fixture_volume(
+        &mount,
+        &root_dir,
+        &state_dir,
+        &fixture.join("register.plan.json"),
+    );
+    declare_area(&state_dir, "pool", "counts");
+    declare_area(&state_dir, "excluded", "excluded");
+
+    // One idle root in a participating area, one idle root in an excluded area.
+    let idle = create_root(&state_dir, "pool", &volume, "area_root");
+    hold_root(&state_dir, &idle);
+    release_root(&state_dir, &idle);
+    let excluded = create_root(&state_dir, "excluded", &volume, "area_root");
+    hold_root(&state_dir, &excluded);
+    release_root(&state_dir, &excluded);
+
+    let plan_out = fixture.join("space-prune.plan.json");
+    let output = run_in(
+        &[
+            "space",
+            "prune",
+            "--volume",
+            &volume,
+            "--plan",
+            "--plan-out",
+            plan_out.to_str().expect("the plan path is UTF-8"),
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the preview succeeds: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.space.prune/1");
+    assert_eq!(document["command"], "space.prune");
+    assert_eq!(document["ok"], true);
+    assert_eq!(document["data"]["preview"], true);
+    assert_eq!(document["data"]["volume_uuid"], volume.as_str());
+    assert_eq!(
+        document["data"]["plan"]["schema"],
+        "barge.space.prune.plan/1"
+    );
+    assert_eq!(document["data"]["candidates"], 1);
+    let rows = document["data"]["plan"]["candidates"]["rows"]
+        .as_array()
+        .expect("the plan carries candidate rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["root_id"], idle.as_str());
+    assert_eq!(rows[0]["area"], "fixture/pool");
+    assert!(rows[0]["bytes"].is_u64());
+    assert_eq!(rows[0]["identity_digest"].as_str().map(str::len), Some(64));
+    assert!(
+        rows.iter().all(|row| row["root_id"] != excluded.as_str()),
+        "an excluded area's root is never a candidate"
+    );
+    let excluded_row = document["data"]["participation"]["rows"]
+        .as_array()
+        .expect("participation rows")
+        .iter()
+        .find(|row| row["area"] == "fixture/excluded")
+        .expect("the excluded area is reported");
+    assert_eq!(excluded_row["state"], "excluded");
+    assert_eq!(excluded_row["roots"], Value::Null);
+
+    // The saved file is exactly the bytes the digest covers, and the library's
+    // reader accepts them.
+    let saved = std::fs::read(&plan_out).expect("the plan file was written");
+    let digest = document["data"]["plan_sha256"]
+        .as_str()
+        .expect("the plan carries its digest");
+    assert_eq!(barge::digest::sha256_hex(&saved), digest);
+    let plan = barge::space::read_plan(&saved).expect("the saved plan reads back");
+    assert_eq!(plan.schema, "barge.space.prune.plan/1");
+    assert_eq!(plan.candidates.rows[0].root_id, idle);
+    assert_eq!(
+        plan.policy_generation,
+        document["data"]["policy_generation"]
+            .as_u64()
+            .expect("the report names its policy generation")
+    );
+
+    // Nothing else was created beside the plan file the caller named.
+    assert!(!fixture.join("space-prune-other.json").exists());
+}
+
+/// The space-prune effect form, a missing `--plan` and a bad volume are refusals
+/// that plan nothing.
+#[test]
+fn space_prune_refuses_the_effect_form_and_a_missing_plan() {
+    let (_fixture, state_dir) = absent_state_dir("space-prune-refusals");
+    let volume = "A6AC3ED7-33EA-46B4-8082-7254CF291ED2";
+
+    let output = run_in(
+        &["space", "prune", "--volume", volume, "--json"],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2), "a preview needs --plan");
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.error/1");
+    assert_eq!(document["error"]["kind"], "usage");
+    assert!(document["error"]["message"]
+        .as_str()
+        .expect("the refusal states its reason")
+        .contains("--plan"));
+
+    let digest = "a".repeat(64);
+    let output = run_in(
+        &[
+            "space",
+            "prune",
+            "--volume",
+            volume,
+            "--plan",
+            "--plan-sha256",
+            &digest,
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2), "the effect form is not ours");
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.error/1");
+    assert_eq!(document["error"]["kind"], "usage");
+    assert!(document["error"]["message"]
+        .as_str()
+        .expect("the refusal states its reason")
+        .contains("T5"));
+
+    let output = run_in(
+        &[
+            "space",
+            "prune",
+            "--volume",
+            "not-a-uuid",
+            "--plan",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+
+    let output = run_in(&["space", "elsewhere", "--json"], &state_dir);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+    assert!(!state_dir.exists(), "a refusal creates no state");
 }

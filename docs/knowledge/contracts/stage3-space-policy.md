@@ -1413,7 +1413,8 @@ as absent. Area attribution and policy decisions belong to their later slices.
 Slice T3 implements this contract's activity record, the pressure idleness matrix
 and the volume-wide least-recently-used order. It plans no candidate, prunes
 nothing and decides nothing: `barge.space.prune/1` and the guard belong to T4 to
-T6, and no native proof exists or is claimed.
+T6, and no native proof exists or is claimed. T4's candidate planning is recorded
+below.
 
 - **`barge.activity/1`** is written at `state/activity/<root-id>.json`, privately
   and atomically, at most 4 KiB, with no unknown fields. Root creation writes
@@ -1611,3 +1612,100 @@ section's prose lists the removal first, and the design freezes' decision
 `c9d30b41` resolves that against the prose in favour of the fact first, which is
 also what the failure matrix's "refuse before the effect" row needs. Q-011 records
 the answer; this contract is the behaviour.
+
+### Implemented space candidate planning surface (slice T4)
+
+Slice T4 implements the first half of the space prune: the effect-free candidate
+plan, the area `reserve` participation rules and the scratch pressure predicate.
+It deletes nothing, flushes nothing, takes no exclusive lock and makes no
+admission decision; the per-root delete, its custody and the guard belong to T5
+and T6, and this slice claims no native proof.
+
+- **The command.** `barge space prune --volume <uuid> --plan --json` prints one
+  bounded `barge.space.prune/1` document. `--plan-out <file>` writes the exact
+  canonical plan bytes a later slice's real run will present. The effect form
+  (`--plan <file> --plan-sha256 <hex>`) is refused as a usage error naming T5;
+  this build never implies an effect it does not have.
+- **The plan and its digest.** `barge.space.prune.plan/1` is the canonical plan:
+  the volume, the registry `policy_generation`, the declared `policy`, the
+  `target_bytes` (`max(reserve, floor)`) and the ordered candidates. Each
+  candidate carries `root_id`, `area`, `name`, `path`, `bytes`,
+  `last_release_ms`, `first_created_ms`, `device`, `inode`, `marker_digest` and
+  `identity_digest`. The identity digest is the SHA-256 over
+  `<device>:<inode>:<marker_digest>`, and the plan reader recomputes it: a row
+  whose digest does not describe its own identity is refused rather than
+  resolved, as are a zero policy threshold, a policy with no declarer and a
+  `target_bytes` that is not `max(reserve_bytes, floor_bytes)`. The measurement, the plan clock, the participation accounting and
+  the kept rows sit beside the plan in `barge.space.prune/1`, never inside its
+  bytes, so a fresh measurement does not invalidate a plan whose candidates are
+  still valid. The plan's SHA-256 covers exactly its canonical bytes.
+- **Order.** Candidates are one volume-wide least-recently-used list, built with
+  T3's `LruKey`: older `last_release_ms`, then older `first_created_ms`, then
+  `root_id`. The order crosses areas by construction.
+- **Participation.** Every declared area is reported in `participation`. An area
+  whose `reserve` is `counts` is listed and its idle roots may be candidates; an
+  area whose `reserve` is `excluded` is never enumerated, so its roots never
+  enter the list and its counts are `null` rather than `0`. Barge's scratch
+  folder participates by construction (`reserve: by_construction`). Barge's
+  `caches/` is never enumerated by this plan, and a `cache_root`-kind root inside
+  a participating area is kept rather than planned, because a cache root is a
+  link target.
+- **Unknown is never idle.** A root is a candidate only when the T3 pressure
+  idleness matrix is `idle` with no reason, its identity (device, inode and
+  marker digest) is readable, its kind is not `cache_root`, it records a release,
+  and a **complete** bounded scan counted its whole-tree allocated bytes under
+  that identity. Anything else is a kept row with the reason: `hold_live`,
+  `hold_unknown`, `activity_unknown`, `activity_unreleased`, `activity_future`,
+  `identity_mismatch`, `marker_unverified`, `unconcluded_scratch`,
+  `participation_excluded`, a cache root, or "the root's bytes could not be
+  counted completely". An incomplete scan, a changed identity and an unreadable
+  record keep the root; none of them becomes zero bytes.
+- **Scratch's relaxed expiry predicate.** A scratch run is pressure-eligible only
+  when the stage 1 expiry predicate holds — outcome `closed`, closure `positive`,
+  `nested_scope: exclusive`, `kept_reason: evidence` — with the age requirement
+  relaxed to "idle now" (O-015). An unconcluded, negative, retained, unclosed,
+  hosting, non-exclusive or nested-marker root is kept whatever its age, and a
+  live or undecidable hold keeps it too. `scratch::pressure_plan` is that plan:
+  the expiry classification with only the native age relaxed, filtered to
+  Barge's own native units so a foreign family can never consume the plan's row
+  bound. A root reaching it still has to pass the pressure idleness matrix in
+  this slice; the sweep alone authorizes nothing.
+- **Fail per object.** One root, area or scratch folder that cannot be decided
+  never stops the rest. An area that cannot be resolved or listed is a
+  `participation` row in state `unknown` with the reason and `null` counts; a
+  scratch folder that cannot be planned is the same; a root that cannot be read
+  is a kept row. A root that is unmarked, a symlink, a foreign family or an
+  unreadable entry is reported, never guessed at.
+- **Bounds.** The plan's wall clock is 10 s. It reads at most the contract's 4096
+  roots per listing and 4096 candidate rows, and the scratch sweep's own 4096
+  entries. The candidate bound keeps the **oldest** 4096 in LRU order, so it can
+  never drop an older root in favour of a younger one, and every count reports
+  the volume's real total. A bound reached sets `truncated`, records `truncated_reason`, counts
+  `unreached` root rows, and turns the areas it never reached into `unreached`
+  participation rows. A truncated plan says what it did not reach; it never
+  presents a short plan as a whole one.
+- **Refusals.** An absent volume is `volume_absent`; an undeclared policy is
+  `unknown_state` naming `space_undeclared`; an undeclared durability is
+  `unknown_state`; a `kept` durability is `refused_boundary`; an unregistered
+  volume is `unknown_state`. All of them happen before any listing, so a refused
+  plan creates nothing.
+- **What it does not do.** It does not delete, flush, take the exclusive volume
+  lock, write an intent, or decide admission. The volume lock is taken shared
+  only when the lock file already exists, exactly as `barge space` does, and the
+  plan writes no state at all.
+- **Tests.** The library suite pins: the cross-area LRU order and every candidate
+  field; the canonical bytes, their digest and the reader's refusal of a forged
+  identity, an unknown major and a candidate with no release; an excluded area's
+  root never planned and never counted; a live hold, an unreleased record, a
+  cache root and an unmarked directory each kept with its reason; a root whose
+  bytes cannot be counted kept while other roots still plan; a failed area
+  reported as `unknown` while another area still plans; an undeclared policy, an
+  undeclared durability, a `kept` volume and an absent volume each refused; and
+  scratch's concluded-and-released root planned while the expiry sweep's own age
+  still keeps it, an unconcluded root kept, and an absent scratch folder reported
+  as absent. The CLI suite prints the document against a verified volume, checks
+  the saved plan file's bytes against the digest and the library reader, asserts
+  the excluded root is absent from the plan, and pins the effect-form, missing
+  `--plan`, bad-uuid and unknown-verb refusals.
+- `barge describe`'s `formats` names `barge.space.prune/1` and
+  `barge.space.prune.plan/1`.

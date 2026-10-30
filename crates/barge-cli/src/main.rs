@@ -116,7 +116,7 @@ fn command_name(args: &[String]) -> String {
         .take(2);
     let first = words.next().map(String::as_str);
     match first {
-        Some(command @ ("area" | "scratch" | "volume")) => match words.next() {
+        Some(command @ ("area" | "scratch" | "volume" | "space")) => match words.next() {
             Some(verb) => format!("{command}.{verb}"),
             None => command.to_owned(),
         },
@@ -248,13 +248,7 @@ fn dispatch(args: &[String]) -> Result<Report, Error> {
             no_extra_arguments(rest)?;
             inspect().map(Box::new).map(Report::Inspect)
         }
-        "space" => {
-            no_extra_arguments(rest)?;
-            let platform = os::platform();
-            let report = barge::space::report(&state_paths()?, &platform, &platform, &platform)?;
-            let human = format!("space: {} registered volumes\n", report.volumes.count);
-            Report::verb(barge::space::SPACE_SCHEMA, "space", &report, human)
-        }
+        "space" => space(rest),
         "volume" => volume(rest),
         "maintain" => maintain(rest),
         "prune" => prune_plan(rest),
@@ -1050,15 +1044,106 @@ fn maintain_summary(report: &MaintainReport) -> String {
     text
 }
 
-/// Plan one area's release on one volume: `barge prune --plan`.
+/// Run one `space` verb.
+///
+/// Without a verb it is the read-only report. `prune` is the effect-free
+/// candidate plan (stage 3, slice T4); the effect form belongs to T5 and is
+/// refused here rather than implied.
+fn space(args: &[String]) -> Result<Report, Error> {
+    let mut positional = args
+        .iter()
+        .filter(|argument| !argument.starts_with('-') && *argument != "--json");
+    match positional.next().map(String::as_str) {
+        None => {
+            no_extra_arguments(args)?;
+            let platform = os::platform();
+            let report = barge::space::report(&state_paths()?, &platform, &platform, &platform)?;
+            let human = format!("space: {} registered volumes\n", report.volumes.count);
+            Report::verb(barge::space::SPACE_SCHEMA, "space", &report, human)
+        }
+        Some("prune") => {
+            let verb = match args.iter().position(|argument| argument == "prune") {
+                Some(index) => index + 1,
+                None => args.len(),
+            };
+            space_prune(&args[verb..])
+        }
+        Some(other) => Err(usage(format!("unknown space verb: {other}"))),
+    }
+}
+
+/// Plan one volume's space candidates: `barge space prune --volume <uuid> --plan`.
 ///
 /// The plan is effect-free and prints one bounded canonical
-/// `barge.prune.plan/1` inside `barge.prune/1` with its SHA-256. Every row
-/// carries the stage 4 release gate's six conditions whether or not it is
-/// eligible, so one plan is a diagnostic as well as a permission. The effect
-/// that will present this plan's exact bytes and digest is stage 4 F4; this
-/// build refuses anything but the plan form rather than implying an effect it
-/// does not have.
+/// `barge.space.prune.plan/1` inside `barge.space.prune/1` with its SHA-256.
+/// `--plan-out` writes the exact plan bytes a later slice's real run will
+/// present. There is no effect in this build: the real run, its custody and its
+/// replay are slice T5, so every effect-shaped argument is refused rather than
+/// ignored.
+fn space_prune(args: &[String]) -> Result<Report, Error> {
+    let Parsed { words, mut options } = parse_taking(args, &["plan-out"])?;
+    if let Some(word) = words.first() {
+        return Err(usage(format!("unexpected argument: {word}")));
+    }
+    let plan = flag(&mut options, "plan")?;
+    let plan_out = one_option(&mut options, "plan-out")?.map(PathBuf::from);
+    let volume = required(&mut options, "volume")?;
+    if let Some(_digest) = one_option(&mut options, "plan-sha256")? {
+        return Err(usage(
+            "barge space prune previews only in this build: a real run, its plan bytes and its digest are stage 3 T5, so nothing was planned",
+        ));
+    }
+    refuse_unknown(options)?;
+    if !plan {
+        return Err(usage(
+            "barge space prune previews only with --plan; the effect form belongs to a later slice and was not run",
+        ));
+    }
+    let volume_uuid = volume_arg(&volume)?;
+    let state = state_paths()?;
+    let platform = os::platform();
+    let report = barge::space::plan(
+        &state,
+        &platform,
+        &platform,
+        &platform,
+        &platform,
+        &platform,
+        &barge::space::SpacePruneRequest {
+            volume_uuid: &volume_uuid,
+            now_ms: state::now_ms(),
+            wall: barge::space::SPACE_PLAN_WALL,
+        },
+    )?;
+    if let Some(path) = &plan_out {
+        let bytes = barge::space::canonical_plan_bytes(&report.plan)?;
+        write_plan_file(path, &bytes)?;
+    }
+    let human = space_prune_summary(&report);
+    Report::verb(
+        barge::space::SPACE_PRUNE_SCHEMA,
+        "space.prune",
+        &report,
+        human,
+    )
+}
+
+/// The human summary of `barge.space.prune/1`.
+fn space_prune_summary(report: &barge::space::SpacePruneReport) -> String {
+    format!(
+        "previewed space-prune plan {} for {}: {} candidate(s), {} kept, {} free of {} floor and {} reserve ({}); nothing was changed\n",
+        report.plan_sha256,
+        report.volume_uuid,
+        report.candidates,
+        report.kept.count,
+        report.measurement.free_bytes,
+        report.policy.floor_bytes,
+        report.policy.reserve_bytes,
+        report.state
+    )
+}
+
+/// Run one `prune` verb (the release plan).
 fn prune_plan(args: &[String]) -> Result<Report, Error> {
     let Parsed { words, mut options } = parse_taking(args, &["area", "volume", "plan-out"])?;
     if let Some(word) = words.first() {
