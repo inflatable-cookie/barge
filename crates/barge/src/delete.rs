@@ -3317,6 +3317,25 @@ fn replay_one(
         } else {
             None
         };
+    // The modes this deletion recorded come back first, before any other deletion
+    // or reconciliation action - before the marker is even read, and therefore
+    // before a changed device is re-established, which reads it. A replay that
+    // cannot re-establish the unit's identity still restores what the stopped
+    // deletion recorded, so an undecidable intent never leaves a captured object
+    // with the widened mode the deletion needed. A leaf captured under its own
+    // private name is reached from the unit's parent, so its recorded mode is
+    // restored even when the visible name is empty.
+    if intent.phase != IntentPhase::Deleted {
+        match restore_recorded_modes(dirs, &parent, leaf_handle.as_ref(), intent, volume.device) {
+            Ok(None) => {}
+            Ok(Some(reason)) => return Ok(ReplayOutcome::Pending(reason)),
+            Err(error) => {
+                return Ok(ReplayOutcome::Pending(format!(
+                    "the recorded modes could not be restored: {error}"
+                )))
+            }
+        }
+    }
     // A changed device number is tolerated only when something that is not a device
     // proves the unit: the durable identity record for a release-gated intent, or -
     // for an intent written before this slice carried one, over a `barge.root/1` or
@@ -3337,23 +3356,6 @@ fn replay_one(
         && leaf_facts
             .as_ref()
             .is_some_and(|facts| facts.device == volume.device);
-    // The modes this deletion recorded come back first, before any other deletion
-    // or reconciliation action - before the marker is even read - so no object is
-    // left with a changed mode while a replay decides what to do next. A leaf
-    // captured under its own private name is reached from the unit's parent, so its
-    // recorded mode is restored even when the visible name is empty.
-    if intent.phase != IntentPhase::Deleted {
-        match restore_recorded_modes(dirs, &parent, leaf_handle.as_ref(), intent, volume.device) {
-            Ok(None) => {}
-            Ok(Some(reason)) => return Ok(ReplayOutcome::Pending(reason)),
-            Err(error) => {
-                return Ok(ReplayOutcome::Pending(format!(
-                    "the recorded modes could not be restored: {error}"
-                )))
-            }
-        }
-    }
-
     let marker_digest = match (&intent.unit.marker, &leaf_handle) {
         (Some(marker), Some(leaf)) => Some(leaf_marker_digest(
             dirs,
@@ -7507,6 +7509,75 @@ mod tests {
                 "{label}: the unit is deleted whole"
             );
         }
+    }
+
+    #[test]
+    fn an_undecidable_changed_device_still_restores_the_recorded_mode_first() {
+        // A process killed between the recorded chmod and its guard leaves a captured
+        // leaf wider than it was. The replay restores recorded modes before it reads
+        // any marker, so a changed device whose marker identity cannot be
+        // re-established leaves the intent pending with the mode the record proves -
+        // never a captured object with the deletion's widened permissions.
+        use std::os::unix::fs::PermissionsExt;
+        let prepared = prepared("delete-remount-mode-restore");
+        plant_unit_contents(&prepared);
+        std::fs::set_permissions(prepared.unit_path(), std::fs::Permissions::from_mode(0o500))
+            .expect("the unit is made read-only");
+        let faults = Faults::new();
+        faults.failing_listing_after_mode();
+        let report = prepared.delete(&faults, &prepared.fixture.facts());
+        assert!(report.is_pending(), "{report:?}");
+        assert_eq!(report.phase, IntentPhase::Renamed);
+        let leaf = report.quarantine.clone();
+        assert_eq!(mode_of(&leaf), 0o500, "the abort guard put the mode back");
+
+        // What a kill would have left: the widened mode, an intent recorded on
+        // another device, and marker bytes that are not the recorded ones.
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o700))
+            .expect("the leaf is left widened");
+        let marker_path = leaf.join(ROOT_MARKER_FILE);
+        let mut marker: crate::area::RootMarker =
+            serde_json::from_slice(&std::fs::read(&marker_path).expect("the marker reads"))
+                .expect("the marker decodes");
+        marker.created_ms = marker.created_ms.saturating_add(1);
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&marker).expect("the altered marker encodes"),
+        )
+        .expect("the altered marker is written");
+        {
+            // The rewrite publishes under the same locks a deletion takes and then
+            // releases them, so the replay below is the next owner.
+            let pending = prepared.pending_intents();
+            let mut intent = pending.first().expect("the intent is pending").clone();
+            intent.unit.device = intent.unit.device.saturating_add(9);
+            let mut locks = LockSet::new(prepared.fixture.state.clone());
+            let _volume = locks
+                .lock_volume(&prepared.fixture.uuid)
+                .expect("the volume lock");
+            let _root =
+                super::lock_deletion_unit(&mut locks, &prepared.unit).expect("the unit lock");
+            let write = locks.begin_intent_write().expect("the intent step");
+            state::publish_intent(&write, &prepared.fixture.state, &intent)
+                .expect("the rewritten intent publishes");
+        }
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0]
+                .reason
+                .contains("marker is not the recorded bytes"),
+            "{}",
+            replay.pending[0].reason
+        );
+        assert_eq!(
+            mode_of(&leaf),
+            0o500,
+            "the recorded mode is restored even though the identity is undecidable"
+        );
+        assert!(leaf.join("payload.txt").is_file(), "nothing is unlinked");
     }
 
     #[test]

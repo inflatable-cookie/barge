@@ -1914,9 +1914,11 @@ Choices S5 made where this design left the mechanic to the slice:
   re-establishes them, an intent is written only when its gate held — so a
   recorded identity is `verified` and its inode and marker digest name this unit —
   and a record written before F4, `/2` or `/1`, still reads with neither. The
-  replay finds the volume by the recorded UUID (refusing a duplicated mount and
-  locating a moved one) rather than through the registry's hint, and tolerates a
-  device that changed with a remount only from what the phase still proves: the
+  replay restores the recorded modes before it reads any marker, as the order above
+  requires, so an intent it cannot re-establish still leaves the mode the record
+  proves. It finds the volume by the recorded UUID (refusing a duplicated mount
+  and locating a moved one) rather than through the registry's hint, and tolerates
+  a device that changed with a remount only from what the phase still proves: the
   acted-on unit's or capture's inode and kind on the verified volume, its exact
   recorded marker bytes below `marker_last`, the marker's positive absence at
   `marker_last`, the durable phase at `removed`, and the durable identity record

@@ -1355,6 +1355,12 @@ live mount through the same containment walk, so a reconnect that moved the moun
 point settles on the UUID and the components below it while the stale hint is only a
 stale observation.
 
+Every step of a replay keeps stage 1's mode order: the modes a stopped run
+recorded are restored first, before any marker is read — the changed-device proof
+reads one — so an intent whose identity cannot be re-established still leaves the
+captured object with the mode the record proves, never with the widened permissions
+the deletion needed.
+
 What a changed device is re-proved from depends on the phase, because each phase
 acts on a different object and `marker_last` has already removed the marker the
 earlier ones compare. `removed` and `deleted` rest on the durable phase — Barge's own
