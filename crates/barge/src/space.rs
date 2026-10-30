@@ -1082,6 +1082,23 @@ impl Planner<'_> {
                 return;
             }
         };
+        // A declared area whose folder is not there was not enumerated, so its
+        // counts are unknown, not zero: an absent area is not an empty one.
+        if !resolved.exists() {
+            self.participation.push(SpaceParticipationRow {
+                area: label,
+                reserve: "counts".to_owned(),
+                state: "absent".to_owned(),
+                roots: None,
+                candidates: None,
+                kept: None,
+                reason: Some(
+                    "the area's folder does not exist on this volume, so nothing was enumerated; an absent area is not an empty one"
+                        .to_owned(),
+                ),
+            });
+            return;
+        }
         // The enumeration reads the folder's names and nothing else: no child is
         // opened, no marker or hold is read and no fact is stated before a row's
         // own shared lock. Everything that decides a row is read under that lock.
@@ -2015,7 +2032,9 @@ mod tests {
             "example/excluded",
             ReserveParticipation::Excluded,
         );
-        for document in [&pool, &other, &excluded] {
+        // Declared but its folder is never created: it was not enumerated.
+        let missing = declaration("missing", "example/missing", ReserveParticipation::Counts);
+        for document in [&pool, &other, &excluded, &missing] {
             area::declare(&fixture.state, document, 1).expect("the area declares");
         }
 
@@ -2138,6 +2157,23 @@ mod tests {
             .expect("the pool area is reported");
         assert_eq!(pool_row.state, "participating");
         assert_eq!(pool_row.candidates, Some(1));
+        let missing_row = report
+            .participation
+            .rows
+            .iter()
+            .find(|row| row.area == "example/missing")
+            .expect("the missing area is reported");
+        assert_eq!(
+            missing_row.state, "absent",
+            "an area whose folder is not there was not enumerated"
+        );
+        assert_eq!(missing_row.roots, None, "an absent area has no count");
+        assert_eq!(missing_row.candidates, None);
+        assert_eq!(missing_row.kept, None);
+        assert!(missing_row
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("does not exist")));
 
         // The plan is canonical, its digest covers exactly its bytes, and the
         // reader accepts it and refuses a candidate that does not describe itself.

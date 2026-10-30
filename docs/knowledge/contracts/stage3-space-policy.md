@@ -1628,8 +1628,10 @@ and T6, and this slice claims no native proof.
   this build never implies an effect it does not have. The whole command line is
   parsed once, before the verb is chosen: an option that appears before `prune`
   is validated by that verb, so an effect-shaped option is refused wherever it
-  sits and an unknown option is named rather than silently discarded. Without a
-  verb, any option is a usage refusal too, never ignored.
+  sits and an unknown option is named rather than silently discarded. The error
+  document names the verb the line selected (`space.prune`), never an option's
+  value, however the options are ordered. Without a verb, any option is a usage
+  refusal too, never ignored.
 - **The plan and its digest.** `barge.space.prune.plan/1` is the canonical plan:
   the volume, the registry `policy_generation`, the declared `policy`, the
   `target_bytes` (`max(reserve, floor)`) and the ordered candidates. Each
@@ -1677,7 +1679,9 @@ and T6, and this slice claims no native proof.
   area whose `reserve` is `excluded` is never enumerated, so its roots never
   enter the list and its three counts are explicit `null` rather than `0` or a
   missing key. The same holds for an area that is absent, unknown or unreached:
-  unknown is never absent, empty or zero. Barge's scratch
+  a `counts` area whose folder does not exist is state `absent` with null counts,
+  never `participating` with zeros, because unknown is never absent, empty or
+  zero. Barge's scratch
   folder participates by construction (`reserve: by_construction`). Barge's
   `caches/` is never enumerated by this plan, and a `cache_root`-kind root inside
   a participating area is kept rather than planned, because a cache root is a

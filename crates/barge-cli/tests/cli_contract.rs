@@ -2264,6 +2264,9 @@ fn space_prune_previews_a_canonical_plan_and_writes_only_the_file_it_was_given()
     );
     declare_area(&state_dir, "pool", "counts");
     declare_area(&state_dir, "excluded", "excluded");
+    // Declared but its folder is never created: it was not enumerated, so its
+    // counts must be unknown rather than zero.
+    declare_area(&state_dir, "missing", "counts");
 
     // One idle root in a participating area, one idle root in an excluded area.
     let idle = create_root(&state_dir, "pool", &volume, "area_root");
@@ -2334,6 +2337,23 @@ fn space_prune_previews_a_canonical_plan_and_writes_only_the_file_it_was_given()
             "{field} is present"
         );
         assert_eq!(excluded_row[field], Value::Null, "{field} is explicit null");
+    }
+    let missing_row = document["data"]["participation"]["rows"]
+        .as_array()
+        .expect("participation rows")
+        .iter()
+        .find(|row| row["area"] == "fixture/missing")
+        .expect("the missing area is reported");
+    assert_eq!(
+        missing_row["state"], "absent",
+        "an area whose folder is not there was not enumerated"
+    );
+    for field in ["roots", "candidates", "kept"] {
+        assert_eq!(
+            missing_row[field],
+            Value::Null,
+            "an absent area's {field} count is unknown, not zero"
+        );
     }
 
     // The saved file is exactly the bytes the digest covers, and the library's
@@ -2525,6 +2545,10 @@ fn space_prune_refuses_the_effect_form_and_a_missing_plan() {
     let document = stdout_document(&output);
     assert_eq!(document["schema"], "barge.error/1");
     assert_eq!(document["error"]["kind"], "usage");
+    assert_eq!(
+        document["command"], "space.prune",
+        "the error names the verb, not an option's value"
+    );
     assert!(document["error"]["message"]
         .as_str()
         .expect("the refusal states its reason")
@@ -2548,6 +2572,10 @@ fn space_prune_refuses_the_effect_form_and_a_missing_plan() {
     assert_eq!(output.status.code(), Some(2));
     let document = stdout_document(&output);
     assert_eq!(document["error"]["kind"], "usage");
+    assert_eq!(
+        document["command"], "space.prune",
+        "an option's value before the verb never becomes the command name"
+    );
     assert!(
         document["error"]["message"]
             .as_str()

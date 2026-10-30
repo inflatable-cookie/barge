@@ -109,24 +109,53 @@ fn main() -> ExitCode {
 }
 
 /// The command as an error document names it.
+/// The verbs each nested command accepts, as an error document names them.
+///
+/// The verb is selected from these known words rather than from the next bare
+/// argument: an option that takes a value before the verb would otherwise make
+/// its value look like the verb, so `barge space --bogus x prune ...` would name
+/// `space.x` in its error document instead of `space.prune`.
+const COMMAND_VERBS: &[(&str, &[&str])] = &[
+    (
+        "area",
+        &[
+            "declare",
+            "show",
+            "list",
+            "root",
+            "hold",
+            "release",
+            "idle-baseline",
+        ],
+    ),
+    (
+        "scratch",
+        &["alloc", "conclude", "expire", "grants", "delegate", "claim"],
+    ),
+    ("volume", &["register", "update", "describe"]),
+    ("space", &["prune"]),
+    ("cache", &["adopt", "undo", "list"]),
+];
+
 fn command_name(args: &[String]) -> String {
-    let mut words = args
+    let mut words = args.iter().filter(|argument| !argument.starts_with('-'));
+    let Some(command) = words.next() else {
+        return "barge".to_owned();
+    };
+    let Some(verbs) = COMMAND_VERBS
         .iter()
-        .filter(|argument| !argument.starts_with('-'))
-        .take(2);
-    let first = words.next().map(String::as_str);
-    match first {
-        Some(command @ ("area" | "scratch" | "volume" | "space")) => match words.next() {
-            Some(verb) => format!("{command}.{verb}"),
-            None => command.to_owned(),
-        },
-        Some("cache") => match words.next() {
-            Some(verb) => format!("cache.{verb}"),
-            None => "cache".to_owned(),
-        },
-        Some("diagnostic") => "diagnostic.descriptor-census".to_owned(),
-        Some(other) => other.to_owned(),
-        None => "barge".to_owned(),
+        .find(|(name, _)| name == &command.as_str())
+        .map(|(_, verbs)| *verbs)
+    else {
+        return if command == "diagnostic" {
+            "diagnostic.descriptor-census".to_owned()
+        } else {
+            command.clone()
+        };
+    };
+    match words.find(|word| verbs.contains(&word.as_str())) {
+        Some(verb) => format!("{command}.{verb}"),
+        None => command.clone(),
     }
 }
 
