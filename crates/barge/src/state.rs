@@ -957,6 +957,40 @@ impl LockSet {
         self.acquire_shared(LockRank::Registry, &path)
     }
 
+    /// Observe one volume: a shared lock, and only when the lock file exists.
+    ///
+    /// A preview takes it after the registry's observation lock and holds it
+    /// while it walks, so no real prune of that volume can act under it; the
+    /// wait is this set's own deadline, and a lock a live owner holds past it is
+    /// refused rather than taken over. A lock file that does not exist is
+    /// nothing to wait for: the read-only command creates no file.
+    pub fn observe_volume(&mut self, volume_uuid: &VolumeUuid) -> Result<Option<StateLock>> {
+        let path = self.state.volume_lock_path(volume_uuid);
+        self.acquire_shared(LockRank::Volume, &path)
+    }
+
+    /// Observe one deletion unit by its [`unit_lock_key`]: a shared lock, and
+    /// only when the lock file exists.
+    ///
+    /// It is the third rank, like the root lock, and it is the lock a delete or a
+    /// hold of a unit whose name is not a Barge root id takes. A preview of such a
+    /// unit holds it shared so it cannot read one mid-delete.
+    pub fn observe_unit(&mut self, key: &str) -> Result<Option<StateLock>> {
+        let path = self.state.unit_lock_path(key)?;
+        self.acquire_shared(LockRank::Root, &path)
+    }
+
+    /// Observe one root: a shared lock, and only when the lock file exists.
+    ///
+    /// It is the third rank, so a caller may take one root at a time under the
+    /// volume's observation lock and must release it before the next: a consumer's
+    /// hold and a delete both take the root lock exclusively, and neither may
+    /// interleave with a plan that is reading that root.
+    pub fn observe_root(&mut self, root_id: &str) -> Result<Option<StateLock>> {
+        let path = self.state.root_lock_path(root_id)?;
+        self.acquire_shared(LockRank::Root, &path)
+    }
+
     /// Enter the intent-write step: the last rank, ordered after the root lock.
     pub fn begin_intent_write(&mut self) -> Result<IntentWrite> {
         self.check(LockRank::IntentWrite)?;

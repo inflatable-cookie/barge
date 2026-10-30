@@ -25,6 +25,7 @@ use barge::area::{
     RootCreateReport, RootKind, RootListReport, RootSpec, ShowReport,
 };
 use barge::cache::{self, AdoptRequest, CacheKind, FormRequest, UndoRequest};
+use barge::census::OxideCensusReport;
 use barge::contract::{
     self, AREA_DECLARE_SCHEMA, AREA_HOLD_SCHEMA, AREA_IDLE_BASELINE_SCHEMA, AREA_LIST_SCHEMA,
     AREA_RELEASE_SCHEMA, AREA_ROOT_CREATE_SCHEMA, AREA_ROOT_LIST_SCHEMA, AREA_SHOW_SCHEMA,
@@ -39,18 +40,20 @@ use barge::describe::{
 use barge::error::{Error, ErrorKind};
 use barge::os::{self, VolumeUuid};
 use barge::prune::{self, MaintainBounds, MaintainReport, MaintainRequest};
+use barge::release::{self, PruneReport, ReleaseBounds, ReleaseRequest};
 use barge::scratch::{
     self, AllocRequest, ConcludeRequest, ExpireReport, SweepBounds, SweepRequest,
 };
 use barge::state::{self, StatePaths};
 
-const USAGE: &str = "usage: barge <describe|inspect|space|volume|maintain|area|cache|diagnostic|scratch> [--json]
+const USAGE: &str = "usage: barge <describe|inspect|space|volume|maintain|prune|area|cache|diagnostic|scratch> [--json]
        barge volume register --mount <root> --availability <permanent|ephemeral> --durability <expendable|kept> --root-dir <folder> --reserve <bytes> [--floor <bytes>] --declared-by <name> --plan
        barge volume update <uuid> [--reserve <bytes>] [--floor <bytes>] --declared-by <name> --plan
        barge volume <register|update> --plan-file <file> --plan-sha256 <digest>
        barge volume describe <uuid>
        barge maintain [--plan-out <file>]
        barge maintain --plan <file> --plan-sha256 <hex>
+       barge prune --plan --area <namespace>/<area> --volume <uuid> [--plan-out <file>]
        barge diagnostic descriptor-census --root <existing-directory>
        barge area declare --namespace <ns> --area <name> --folder <folder> [--override <uuid>=<folder>]... --absent <fail:drive|wait|fallback:path> --prune <none|oldest-idle:seconds> --reserve <counts|excluded>
        barge area show --namespace <ns> --area <name>
@@ -254,6 +257,7 @@ fn dispatch(args: &[String]) -> Result<Report, Error> {
         }
         "volume" => volume(rest),
         "maintain" => maintain(rest),
+        "prune" => prune_plan(rest),
         "area" => area(rest),
         "cache" => cache(rest),
         "diagnostic" => descriptor_census(rest),
@@ -1046,6 +1050,106 @@ fn maintain_summary(report: &MaintainReport) -> String {
     text
 }
 
+/// Plan one area's release on one volume: `barge prune --plan`.
+///
+/// The plan is effect-free and prints one bounded canonical
+/// `barge.prune.plan/1` inside `barge.prune/1` with its SHA-256. Every row
+/// carries the stage 4 release gate's six conditions whether or not it is
+/// eligible, so one plan is a diagnostic as well as a permission. The effect
+/// that will present this plan's exact bytes and digest is stage 4 F4; this
+/// build refuses anything but the plan form rather than implying an effect it
+/// does not have.
+fn prune_plan(args: &[String]) -> Result<Report, Error> {
+    let Parsed { words, mut options } = parse_taking(args, &["area", "volume", "plan-out"])?;
+    if let Some(word) = words.first() {
+        return Err(usage(format!("unexpected argument: {word}")));
+    }
+    let requested = one_option(&mut options, "plan")?;
+    let area_ref = required(&mut options, "area")?;
+    let volume = required(&mut options, "volume")?;
+    let plan_out = one_option(&mut options, "plan-out")?.map(PathBuf::from);
+    refuse_unknown(options)?;
+    if requested.is_none() {
+        return Err(usage(
+            "barge prune is the release plan only in this build: give --plan. The real release run, its intent evidence and its replay are stage 4 F4; nothing was planned",
+        ));
+    }
+    let (namespace, area) = match area_ref.split_once('/') {
+        Some((namespace, area)) => (namespace.to_owned(), area.to_owned()),
+        None => {
+            return Err(usage(
+                "--area takes the area as <namespace>/<area>, for example oxide/outputs",
+            ))
+        }
+    };
+    // A name the area contract refuses is a usage error here: it came from this
+    // command line, not from a record Barge is uncertain about.
+    for (field, name) in [("namespace", &namespace), ("area", &area)] {
+        area::validate_name(field, name)
+            .map_err(|error| usage(format!("--area {field}: {}", error.message())))?;
+    }
+    let volume_uuid = VolumeUuid::parse(&volume)?;
+    let state = state_paths()?;
+    let platform = os::platform();
+    let report = release::plan(
+        &state,
+        &platform,
+        &platform,
+        &platform,
+        &platform,
+        &platform,
+        &ReleaseRequest {
+            namespace: &namespace,
+            area: &area,
+            volume_uuid: &volume_uuid,
+            now_ms: state::now_ms(),
+            bounds: ReleaseBounds::design(),
+        },
+    )?;
+    if let Some(path) = &plan_out {
+        let bytes = release::canonical_plan_bytes(&report.plan)?;
+        write_plan_file(path, &bytes)?;
+    }
+    let human = release_summary(&report);
+    let exit = if report.needs_human() { 3 } else { 0 };
+    Report::outcome(contract::PRUNE_SCHEMA, "prune", &report, human, exit)
+}
+
+/// The human summary of `barge.prune/1`.
+fn release_summary(report: &PruneReport) -> String {
+    let mut lines = Vec::new();
+    if let Some(detail) = &report.volume.detail {
+        if report.volume.loud {
+            lines.push(format!("warning: {detail}"));
+        }
+    }
+    if !report.oxide.complete {
+        if let Some(detail) = &report.oxide.detail {
+            lines.push(format!("warning: {detail}"));
+        }
+    }
+    let kept = report
+        .plan
+        .rows
+        .rows
+        .iter()
+        .filter(|row| !row.eligible)
+        .count();
+    lines.push(format!(
+        "previewed release plan {} for {}/{} on {}: {} eligible, {} kept of {} examined; nothing was changed",
+        report.plan_digest,
+        report.plan.area.namespace,
+        report.plan.area.area,
+        report.plan.volume_uuid,
+        report.plan.eligible_count,
+        kept,
+        report.plan.examined_count
+    ));
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text
+}
+
 /// Run one `scratch` verb.
 fn scratch(args: &[String]) -> Result<Report, Error> {
     let Parsed { words, options } = parse(args)?;
@@ -1627,6 +1731,11 @@ fn inspect() -> Result<InspectData, Error> {
         environment_home: environment_home.as_deref(),
         state_dir_override: state_dir_override.as_deref(),
         tool_version: env!("CARGO_PKG_VERSION"),
+        dirs: &platform,
+        facts: &platform,
+        mounts: &platform,
+        prefixes: &platform,
+        observer: &platform,
     })
 }
 
@@ -1746,8 +1855,9 @@ fn inspect_summary(data: &InspectData) -> String {
         describe::RegistryReportState::Invalid => "invalid".to_owned(),
     };
     let oxide = &data.oxide;
+    let census = &data.oxide_census;
     format!(
-        "barge {} ({INSPECT_SCHEMA})\nstate directory: {} ({state}, from {})\nhome: {}\nregistry: {} ({registry})\noxide registration: {} ({})\noxide pools: {} ({})\n",
+        "barge {} ({INSPECT_SCHEMA})\nstate directory: {} ({state}, from {})\nhome: {}\nregistry: {} ({registry})\noxide registration: {} ({})\noxide pools: {} ({})\noxide outputs census: {} ({})\n",
         data.tool.version,
         data.state.dir.display(),
         source_name(data.state.source),
@@ -1757,6 +1867,33 @@ fn inspect_summary(data: &InspectData) -> String {
         observation_name(oxide.registration.state),
         oxide.pools.path.display(),
         observation_name(oxide.pools.state),
+        census.path.display(),
+        census_line(census),
+    )
+}
+
+/// The census line: the registry's state, then what the census counted. An
+/// absent or unknown registry says so and never reads as a drift of zero.
+fn census_line(census: &OxideCensusReport) -> String {
+    let Some(drift) = &census.drift else {
+        return observation_name(census.state).to_owned();
+    };
+    format!(
+        "{}, {} of {} rows examined, {} verified, {} device moved, {} inode changed, {} marker changed, {} gone, {} unknown{}",
+        observation_name(census.state),
+        drift.examined,
+        census.rows.total,
+        drift.verified,
+        drift.device_moved,
+        drift.inode_changed,
+        drift.marker_changed,
+        drift.gone,
+        drift.unknown,
+        if drift.unexamined == 0 {
+            String::new()
+        } else {
+            format!(", {} not reached", drift.unexamined)
+        },
     )
 }
 

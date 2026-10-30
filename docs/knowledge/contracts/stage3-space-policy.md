@@ -1555,10 +1555,15 @@ T6, and no native proof exists or is claimed.
   is reported when that key is not the marker's root id or when the record names
   another root or another volume's uuid, and a record or hold belonging to another
   root therefore never makes this root idle.
-- **`barge.area.root.list/1`** rows carry two additions: `activity`, the record as
-  read (`released`, `unreleased`, `missing` or `unverified`, with its fields when
-  it verified), and `space_idle`, the matrix's verdict. The existing `idle` field
-  is unchanged and remains stage 1's hold-only idleness that `maintain`'s age
+- **`barge.area.root.list/1`** rows carry two additions: `activity_record`, the
+  record as read (`released`, `unreleased`, `missing` or `unverified`, with its
+  fields when it verified), and `space_idle`, the matrix's verdict. The record's
+  field is `activity_record` rather than `activity` because the merged stage 4
+  work already gives a row an `activity` object: the bounded last-activity scan a
+  `maintain` age decision reads. The two are different facts — the record is the
+  release evidence the pressure matrix reads, the scan is an observed age — so they
+  have different names and neither is derived from the other. The existing `idle`
+  field is unchanged and remains stage 1's hold-only idleness that `maintain`'s age
   policy reads; it is deliberately not the pressure verdict, because an age policy
   and "may this yield now" are different questions. A row from a build before this
   slice reports neither addition, and absence is never idleness.

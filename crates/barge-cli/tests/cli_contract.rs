@@ -76,7 +76,7 @@ fn stdout_document(output: &Output) -> Value {
 
 /// The usage's first line; the full text names every area verb too.
 const USAGE: &str =
-    "usage: barge <describe|inspect|space|volume|maintain|area|cache|diagnostic|scratch> [--json]";
+    "usage: barge <describe|inspect|space|volume|maintain|prune|area|cache|diagnostic|scratch> [--json]";
 
 #[test]
 fn descriptor_census_refuses_bad_arguments_and_missing_roots_without_scanning() {
@@ -222,6 +222,43 @@ fn inspect_json_reports_the_state_the_registry_and_the_oxide_observations() {
         "the report names where it looked"
     );
     assert!(data["oxide"]["pools"]["state"].is_string());
+
+    // The output-registry census is shaped the same way on every host: its
+    // state names what was found, and its rows and drift agree with each other.
+    let census = &data["oxide_census"];
+    let census_state = census["state"]
+        .as_str()
+        .expect("the census state is a string");
+    assert!(
+        ["reported", "absent", "unknown_state"].contains(&census_state),
+        "{census}"
+    );
+    assert!(census["path"].is_string(), "{census}");
+    let searched = census["searched"]
+        .as_array()
+        .expect("the census names where it looked");
+    assert!(
+        searched.iter().all(|path| path
+            .as_str()
+            .is_some_and(|path| path.ends_with("outputs/registry.json"))),
+        "every searched path is an Oxide output registry: {census}"
+    );
+    assert!(
+        !searched.is_empty() || census_state == "unknown_state",
+        "a census that looked at no registry at all is unknown, never absent: {census}"
+    );
+    let rows = &census["rows"];
+    assert_eq!(rows["count"], rows["rows"].as_array().unwrap().len());
+    if census_state == "reported" {
+        assert!(census["document"].is_object(), "{census}");
+        let drift = &census["drift"];
+        assert!(drift.is_object(), "{census}");
+        assert!(drift["examined"].as_u64().is_some(), "{census}");
+        assert!(drift["device_moved"].as_u64().is_some(), "{census}");
+        assert!(drift["inode_changed"].as_u64().is_some(), "{census}");
+    } else {
+        assert!(census.get("drift").is_none(), "{census}");
+    }
 
     assert!(
         !state_dir.exists(),
@@ -399,6 +436,7 @@ fn a_human_inspect_run_names_the_registry_and_the_oxide_observations() {
     assert!(text.contains("barge 0.1.0 (barge.inspect/1)"), "{text}");
     assert!(text.contains("registry:"), "{text}");
     assert!(text.contains("oxide registration:"), "{text}");
+    assert!(text.contains("oxide outputs census:"), "{text}");
     assert!(text.contains("not initialized"), "{text}");
     assert!(serde_json::from_str::<Value>(&text).is_err(), "not JSON");
     assert!(!state_dir.exists());
@@ -1717,8 +1755,8 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
     // A created root that was never released is reported, and is not idle.
     let rows = list_rows(&state_dir, "pool", &volume);
     let row = row_for(&rows, &root);
-    assert_eq!(row["activity"]["state"], "unreleased");
-    assert_eq!(row["activity"]["releases"], 0);
+    assert_eq!(row["activity_record"]["state"], "unreleased");
+    assert_eq!(row["activity_record"]["releases"], 0);
     assert_eq!(row["space_idle"]["state"], "not_idle");
     assert_eq!(row["space_idle"]["reason"], "activity_unreleased");
     assert_eq!(row["idle"], true);
@@ -1769,9 +1807,9 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
     // The listing now reports the recorded release and the idle verdict.
     let rows = list_rows(&state_dir, "pool", &volume);
     let row = row_for(&rows, &root);
-    assert_eq!(row["activity"]["state"], "released");
+    assert_eq!(row["activity_record"]["state"], "released");
     assert_eq!(
-        row["activity"]["last_release_ms"],
+        row["activity_record"]["last_release_ms"],
         baseline["data"]["activity"]["last_release_ms"]
     );
     assert_eq!(row["space_idle"]["state"], "idle");
@@ -1879,7 +1917,7 @@ fn the_cli_names_every_reachable_decision_reason() {
 
     let row = row_for(&rows, &unreleased);
     assert_eq!(row["idle"], true, "no hold covers it");
-    assert_eq!(row["activity"]["state"], "unreleased");
+    assert_eq!(row["activity_record"]["state"], "unreleased");
     assert_eq!(row["space_idle"]["state"], "not_idle");
     assert_eq!(row["space_idle"]["reason"], "activity_unreleased");
 
@@ -1896,7 +1934,7 @@ fn the_cli_names_every_reachable_decision_reason() {
 
     let row = row_for(&rows, &missing);
     assert_eq!(row["idle"], true);
-    assert_eq!(row["activity"]["state"], "missing");
+    assert_eq!(row["activity_record"]["state"], "missing");
     assert_eq!(row["space_idle"]["reason"], "activity_unknown");
 
     let row = row_for(&rows, &mismatched);
@@ -1904,18 +1942,18 @@ fn the_cli_names_every_reachable_decision_reason() {
         row["idle"], true,
         "the record is readable and no hold covers it"
     );
-    assert_eq!(row["activity"]["state"], "released");
+    assert_eq!(row["activity_record"]["state"], "released");
     assert_eq!(row["space_idle"]["state"], "not_idle");
     assert_eq!(row["space_idle"]["reason"], "identity_mismatch");
 
     let row = row_for(&rows, &future);
     assert_eq!(row["idle"], true);
-    assert_eq!(row["activity"]["state"], "released");
+    assert_eq!(row["activity_record"]["state"], "released");
     assert_eq!(row["space_idle"]["reason"], "activity_future");
 
     let row = row_for(&rows, &unconcluded);
     assert_eq!(row["idle"], true);
-    assert_eq!(row["activity"]["state"], "released");
+    assert_eq!(row["activity_record"]["state"], "released");
     assert_eq!(row["space_idle"]["reason"], "unconcluded_scratch");
 
     let row = row_named(&rows, "plain-directory");
@@ -1933,4 +1971,259 @@ fn the_cli_names_every_reachable_decision_reason() {
     assert_eq!(row["space_idle"]["state"], "not_idle");
     assert_eq!(row["space_idle"]["reason"], "participation_excluded");
     assert_eq!(row["space_idle"]["state"], "not_idle");
+}
+
+/// Write the state a `prune --plan` fixture needs: one registered volume whose
+/// mount point is not attached, and one declared area.
+fn write_prune_state(state_dir: &Path, availability: &str) {
+    use barge::os::VolumeUuid;
+    use barge::registry::{
+        Availability, Durability, FolderOverrides, RecordOrigin, RegistryDocument, ScratchGrants,
+        VolumeRecord,
+    };
+
+    std::fs::create_dir_all(state_dir.join("areas/example")).expect("the area folder");
+    let availability = match availability {
+        "permanent" => Availability::Permanent,
+        _ => Availability::Ephemeral,
+    };
+    let record = VolumeRecord {
+        volume_uuid: VolumeUuid::parse("A6AC3ED7-33EA-46B4-8082-7254CF291ED2").expect("a UUID"),
+        // A mount point nothing is attached at: the plan must report the volume
+        // absent rather than recreate or read through the stale path.
+        mount_hint: Some(PathBuf::from("/Volumes/Barge-Cli-Fixture-Absent-A6AC3ED7")),
+        availability,
+        durability: Durability::Expendable,
+        root_dir: String::new(),
+        folders: FolderOverrides::none(),
+        origin: RecordOrigin::Declared,
+        scratch_grants: ScratchGrants::none(),
+        space: None,
+        generation: 1,
+        registered_ms: 1_792_525_019_847,
+    };
+    let document = RegistryDocument::new(vec![record]);
+    let bytes = serde_json::to_vec(&document).expect("the registry encodes");
+    std::fs::write(state_dir.join("registry.json"), bytes).expect("the registry is written");
+    let declaration = serde_json::json!({
+        "schema": "barge.area/1",
+        "namespace": "example",
+        "area": "pool",
+        "folder": "pool",
+        "overrides": {},
+        "absent": {"kind": "fail", "attach": "the build volume"},
+        "prune": {"kind": "oldest_idle_after", "age_seconds": 86_400},
+        "reserve": "counts",
+        "declared_ms": 1_000,
+        "generation": 1,
+    });
+    std::fs::write(
+        state_dir.join("areas/example/pool.json"),
+        serde_json::to_vec(&declaration).expect("the declaration encodes"),
+    )
+    .expect("the declaration is written");
+}
+
+#[test]
+fn prune_plans_one_area_and_only_writes_the_file_it_was_given() {
+    let (fixture, state_dir) = absent_state_dir("prune-plan");
+    write_prune_state(&state_dir, "ephemeral");
+    let plan_out = fixture.join("release-plan.json");
+    let output = run_in(
+        &[
+            "prune",
+            "--plan",
+            "--area",
+            "example/pool",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "--plan-out",
+            plan_out.to_str().unwrap(),
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an ephemeral absence is a skip"
+    );
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.prune/1");
+    assert_eq!(document["command"], "prune");
+    assert_eq!(document["data"]["preview"], true);
+    assert_eq!(document["data"]["plan"]["schema"], "barge.prune.plan/1");
+    assert_eq!(document["data"]["plan"]["area"]["namespace"], "example");
+    assert_eq!(document["data"]["plan"]["area"]["area"], "pool");
+    assert_eq!(document["data"]["plan"]["rows"]["count"], 0);
+    assert_eq!(document["data"]["plan"]["eligible_count"], 0);
+    // The plan carries its own wall clock's outcome: a plan that finished says so,
+    // and names no unreached root.
+    assert_eq!(document["data"]["plan"]["timed_out"], false);
+    assert_eq!(document["data"]["plan"]["unreached_count"], 0);
+    assert_eq!(document["data"]["volume"]["state"], "absent");
+    assert_eq!(document["data"]["volume"]["loud"], false);
+    let digest = document["data"]["plan_digest"]
+        .as_str()
+        .expect("the plan digest is a string");
+    assert_eq!(digest.len(), 64);
+
+    // The file the caller asked for holds exactly the plan bytes the digest
+    // covers.
+    let saved = std::fs::read(&plan_out).expect("the plan file was written");
+    let plan: Value = serde_json::from_slice(&saved).expect("the plan file parses");
+    assert_eq!(plan["schema"], "barge.prune.plan/1");
+    assert_eq!(barge::digest::sha256_hex(&saved), digest);
+
+    // A permanent volume that is away is reported loudly and exits 3.
+    let (other_fixture, other_state) = absent_state_dir("prune-plan-permanent");
+    write_prune_state(&other_state, "permanent");
+    let output = run_in(
+        &[
+            "prune",
+            "--plan",
+            "--area",
+            "example/pool",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "--json",
+        ],
+        &other_state,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a permanent absence needs a human"
+    );
+    let document = stdout_document(&output);
+    assert_eq!(document["data"]["volume"]["loud"], true);
+    assert!(!other_fixture.join("plan.json").exists());
+}
+
+#[test]
+fn prune_refuses_the_effect_form_missing_arguments_and_an_unregistered_volume() {
+    let (fixture, state_dir) = absent_state_dir("prune-refusals");
+
+    // The effect form is not this build's: it refuses instead of implying one.
+    let output = run_in(
+        &[
+            "prune",
+            "--area",
+            "example/pool",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+    assert!(!state_dir.exists(), "a refusal creates nothing");
+
+    for args in [
+        vec![
+            "prune",
+            "--plan",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+        ],
+        vec!["prune", "--plan", "--area", "example/pool"],
+        vec![
+            "prune",
+            "--plan",
+            "--area",
+            "nodivider",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+        ],
+        vec![
+            "prune",
+            "--plan",
+            "--area",
+            "Example/Pool",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+        ],
+        vec![
+            "prune",
+            "--plan",
+            "--area",
+            "example/pool",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "--unknown",
+        ],
+        vec![
+            "prune",
+            "--plan",
+            "--area",
+            "example/pool",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "stray",
+        ],
+    ] {
+        let mut args = args;
+        args.push("--json");
+        let output = run_in(&args, &state_dir);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert_eq!(
+            stdout_document(&output)["error"]["kind"],
+            "usage",
+            "{args:?}"
+        );
+    }
+    assert!(!state_dir.exists());
+
+    // A malformed UUID is the library's unknown state, exactly as `volume
+    // describe` reports one; it changes nothing.
+    let output = run_in(
+        &[
+            "prune",
+            "--plan",
+            "--area",
+            "example/pool",
+            "--volume",
+            "not-a-uuid",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "unknown_state");
+    assert!(!state_dir.exists());
+
+    // A registered volume that is not the one asked for is unknown state.
+    write_prune_state(&state_dir, "ephemeral");
+    let output = run_in(
+        &[
+            "prune",
+            "--plan",
+            "--area",
+            "example/pool",
+            "--volume",
+            "A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C5D",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "unknown_state");
+    assert!(!fixture.join("plan.json").exists());
+
+    // An undeclared area on a registered volume is a usage refusal.
+    let output = run_in(
+        &[
+            "prune",
+            "--plan",
+            "--area",
+            "example/elsewhere",
+            "--volume",
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
 }

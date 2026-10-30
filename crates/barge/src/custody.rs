@@ -103,14 +103,25 @@ pub const SCAN_DESCRIPTORS: usize = 65_536;
 /// How long one descriptor scan may take before it is bounded.
 pub const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// One pending intent, as custody needs to know it: an intent for any other unit
-/// means a deletion is already in flight, so this one must not start, and an
-/// intent for this unit means it is already mid-delete.
+/// One pending intent, as custody needs to know it.
+///
+/// A pending intent makes custody `Unknown` only for its own unit and for a unit
+/// whose path contains it or is contained by it: a deletion in flight inside this
+/// unit's own path (or above it) must make this unit wait, while a deletion
+/// somewhere else on the volume is a different object's business and never blocks
+/// an unrelated unit (Supervisor decision `698d9ba3`). The whole path is therefore
+/// carried, not just the name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingIntent {
     /// The intent's id.
     pub intent_id: String,
+    /// The volume the unit's intent acts on.
+    pub volume_uuid: VolumeUuid,
+    /// The volume's `root_dir` the unit was resolved under.
+    pub root_dir: String,
+    /// The area folder the unit lives in.
+    pub folder: String,
     /// The parent directory the unit's intent recorded, relative to its area
     /// folder.
     pub parent: String,
@@ -126,16 +137,57 @@ impl PendingIntent {
             .filter(|record| record.is_pending())
             .map(|record| Self {
                 intent_id: record.intent_id.clone(),
+                volume_uuid: record.volume_uuid.clone(),
+                root_dir: record.root_dir.clone(),
+                folder: record.folder.clone(),
                 parent: record.unit.parent.clone(),
                 name: record.unit.name.clone(),
             })
             .collect()
     }
 
-    /// Whether this pending intent names `unit`.
+    /// Whether this pending intent names exactly `unit`.
     pub fn names(&self, unit: &DeletionUnit) -> bool {
-        self.parent == unit.parent && self.name == unit.name
+        self.volume_uuid == unit.volume_uuid
+            && components(&self.root_dir, &self.folder, &self.parent, &self.name)
+                == components(&unit.root_dir, &unit.folder, &unit.parent, &unit.name)
     }
+
+    /// Whether this pending intent's unit and `unit` are on one path: the same
+    /// unit, an ancestor of it, or something inside it.
+    ///
+    /// The comparison is the whole path **below the volume**, component by
+    /// component: `root_dir`, the area folder, the parent and the name are joined
+    /// and split again, so two records that spell one physical path with a different
+    /// split — the same folder carried in `root_dir` by one and in `folder` by the
+    /// other — still overlap, and `a/b` contains `a/b/c` and is contained by `a`
+    /// while a sibling never overlaps. Only a unit on another volume, or on a
+    /// genuinely different path below it, does not overlap (barge#025, Supervisor
+    /// decision `698d9ba3`).
+    pub fn overlaps(&self, unit: &DeletionUnit) -> bool {
+        if self.volume_uuid != unit.volume_uuid {
+            return false;
+        }
+        let intent = components(&self.root_dir, &self.folder, &self.parent, &self.name);
+        let planned = components(&unit.root_dir, &unit.folder, &unit.parent, &unit.name);
+        let shared = intent.len().min(planned.len());
+        intent[..shared] == planned[..shared]
+    }
+}
+
+/// One unit's path components below its volume's mount, whatever split of
+/// `root_dir`, folder, parent and name spelled it.
+fn components<'a>(
+    root_dir: &'a str,
+    folder: &'a str,
+    parent: &'a str,
+    name: &'a str,
+) -> Vec<&'a str> {
+    [root_dir, folder, parent, name]
+        .iter()
+        .flat_map(|part| part.split('/'))
+        .filter(|part| !part.is_empty())
+        .collect()
 }
 
 /// The bounds one custody decision runs within.
@@ -496,18 +548,22 @@ fn decide(
         }
     }
 
-    // 2. No pending intent may name another unit, and this unit must not already
-    //    be mid-delete.
-    if let Some(intent) = pending.first() {
-        if intent.names(unit) {
-            return Err(Refusal::refuse_unknown(format!(
-                "the pending intent {} already names this unit",
-                intent.intent_id
-            )));
-        }
+    // 2. This unit must not already be mid-delete, and no pending intent may sit on
+    //    this unit's own path: an intent for the unit itself, for an ancestor of it
+    //    or for something inside it means a deletion is in flight over the same
+    //    bytes, so this one waits. An intent elsewhere on the volume is another
+    //    object's business and never blocks this unit (Supervisor decision
+    //    698d9ba3).
+    if let Some(intent) = pending.iter().find(|intent| intent.names(unit)) {
         return Err(Refusal::refuse_unknown(format!(
-            "the pending intent {} names `{}`, so this deletion must wait",
-            intent.intent_id, intent.name
+            "the pending intent {} already names this unit",
+            intent.intent_id
+        )));
+    }
+    if let Some(intent) = pending.iter().find(|intent| intent.overlaps(unit)) {
+        return Err(Refusal::refuse_unknown(format!(
+            "the pending intent {} names `{}/{}/{}`, which contains or is contained by this unit, so this deletion must wait",
+            intent.intent_id, intent.folder, intent.parent, intent.name
         )));
     }
 
@@ -2044,10 +2100,13 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_intent_naming_another_root_is_unknown() {
+    fn a_pending_intent_inside_this_units_path_is_unknown() {
         let holder = holder("custody-other-intent");
         let pending = [PendingIntent {
             intent_id: "a".repeat(32),
+            volume_uuid: holder.unit.volume_uuid.clone(),
+            root_dir: holder.unit.root_dir.clone(),
+            folder: format!("{}/{}", holder.unit.folder, holder.unit.name),
             parent: String::new(),
             name: "b".repeat(32),
         }];
@@ -2057,10 +2116,113 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_intent_for_an_unrelated_unit_does_not_refuse() {
+        // Supervisor decision 698d9ba3: another unit's pending intent is that
+        // unit's business. Only an intent on this unit's own path — the unit
+        // itself, an ancestor or something inside it — makes custody unknown.
+        let holder = holder("custody-unrelated-intent");
+        let pending = [PendingIntent {
+            intent_id: "a".repeat(32),
+            volume_uuid: holder.unit.volume_uuid.clone(),
+            root_dir: holder.unit.root_dir.clone(),
+            folder: holder.unit.folder.clone(),
+            parent: String::new(),
+            name: "c".repeat(32),
+        }];
+        let verdict = holder.take(&pending, &holder.fixture.observer());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+
+        // A unit on another volume never overlaps either.
+        let other = PendingIntent {
+            intent_id: "a".repeat(32),
+            volume_uuid: crate::os::VolumeUuid::parse(crate::testkit::OTHER_UUID).expect("a UUID"),
+            root_dir: holder.unit.root_dir.clone(),
+            folder: holder.unit.folder.clone(),
+            parent: String::new(),
+            name: "c".repeat(32),
+        };
+        let verdict = holder.take(&[other], &holder.fixture.observer());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+    }
+
+    #[test]
+    fn a_pending_intent_above_this_unit_makes_it_wait() {
+        // An intent for an ancestor path contains this unit, so its deletion is in
+        // flight over the same bytes.
+        let holder = holder("custody-ancestor-intent");
+        let pending = [PendingIntent {
+            intent_id: "a".repeat(32),
+            volume_uuid: holder.unit.volume_uuid.clone(),
+            root_dir: holder.unit.root_dir.clone(),
+            folder: holder.unit.folder.clone(),
+            parent: String::new(),
+            name: holder.unit.name.clone(),
+        }];
+        let verdict = holder.take(&pending, &holder.fixture.observer());
+        // The intent names this unit exactly, which is the first branch.
+        assert_eq!(verdict.name(), "unknown");
+        assert!(verdict.reason().unwrap_or_default().contains("already"));
+    }
+
+    #[test]
+    fn a_pending_intent_spelled_under_another_root_dir_still_overlaps() {
+        // One physical path, two splits: the same folder is carried in `root_dir` by the
+        // intent and in `folder` by the unit. The comparison is the whole path below the
+        // volume, so the intent still names this unit and custody is unknown - before the
+        // fix the differing `root_dir` made it invisible and custody came back safe.
+        let holder = holder("custody-aliased-intent");
+        let unit = holder.unit.clone();
+        let aliased = PendingIntent {
+            intent_id: "a".repeat(32),
+            volume_uuid: unit.volume_uuid.clone(),
+            root_dir: format!("{}/{}", unit.root_dir, unit.folder),
+            folder: unit.parent.clone(),
+            parent: String::new(),
+            name: unit.name.clone(),
+        };
+        assert_ne!(aliased.root_dir, unit.root_dir, "the splits differ");
+        assert!(aliased.overlaps(&unit), "the aliased path still overlaps");
+        let verdict = holder.take(&[aliased], &holder.fixture.observer());
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+
+        // An ancestor spelled through the other split is still an ancestor.
+        let ancestor = PendingIntent {
+            intent_id: "b".repeat(32),
+            volume_uuid: unit.volume_uuid.clone(),
+            root_dir: unit.root_dir.clone(),
+            folder: unit.folder.clone(),
+            parent: String::new(),
+            name: format!("{}/{}", "x", "y")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_owned(),
+        };
+        let inside = DeletionUnit {
+            parent: "x/y".to_owned(),
+            folder: unit.folder.clone(),
+            ..unit.clone()
+        };
+        assert!(ancestor.overlaps(&inside), "an ancestor still overlaps");
+        // A genuinely different path below the same volume does not.
+        let elsewhere = DeletionUnit {
+            folder: format!("{}-other", unit.folder),
+            ..unit
+        };
+        assert!(
+            !ancestor.overlaps(&elsewhere),
+            "another folder is no overlap"
+        );
+    }
+
+    #[test]
     fn a_pending_intent_naming_this_root_is_unknown() {
         let holder = holder("custody-own-intent");
         let pending = [PendingIntent {
             intent_id: "a".repeat(32),
+            volume_uuid: holder.unit.volume_uuid.clone(),
+            root_dir: holder.unit.root_dir.clone(),
+            folder: holder.unit.folder.clone(),
             parent: holder.unit.parent.clone(),
             name: holder.unit.name.clone(),
         }];

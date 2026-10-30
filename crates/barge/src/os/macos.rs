@@ -21,11 +21,11 @@ use std::time::{Duration, Instant};
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::facts::{
     AccountFacts, BlindSpotEvidence, ChildEntry, ChildListing, ChildRemoval, DeadHandle,
-    DeadHandleEvidence, DescriptorScan, DescriptorScanRequest, DeviceId, DirHandle, DirId, DirOps,
-    EntryFacts, EntryKind, FileSystem, MountPoint, MountRoot, OpenDescriptor, PlatformBlindSpot,
-    PlatformStatus, ProcessIdentity, ProcessObserver, RemoveKind, RenameOutcome, RetriedUnreadable,
-    RetryEvidence, RetryResolution, VerifiedVolume, VolumeFacts, VolumeIdentity, VolumeLocator,
-    VolumeUuid, BLIND_SPOT_RECORDS, DEAD_HANDLE_RECORDS,
+    DeadHandleEvidence, DescriptorScan, DescriptorScanRequest, DeviceId, DirHandle, DirId,
+    DirNames, DirOps, EntryFacts, EntryKind, FileSystem, MountPoint, MountRoot, OpenDescriptor,
+    PlatformBlindSpot, PlatformStatus, ProcessIdentity, ProcessObserver, RemoveKind, RenameOutcome,
+    RetriedUnreadable, RetryEvidence, RetryResolution, VerifiedVolume, VolumeFacts, VolumeIdentity,
+    VolumeLocator, VolumeUuid, BLIND_SPOT_RECORDS, DEAD_HANDLE_RECORDS,
 };
 
 /// The largest symbolic-link text Barge reads, so a link cannot make a record
@@ -355,11 +355,19 @@ fn check_mount_count(before: i32, count: usize, after: i32) -> Result<()> {
     Ok(())
 }
 
-impl super::AbsenceVolume for MacOs {
-    fn volume_prefix(&self, path: &Path) -> Option<PathBuf> {
+impl super::MountPrefix for MacOs {
+    /// The mount parent is `/Volumes`, and a managed volume is one directory
+    /// directly under it: the prefix is exactly those two components.
+    fn mount_prefix(&self, path: &Path) -> Option<PathBuf> {
         let rest = path.strip_prefix(VOLUMES_PARENT).ok()?;
         let name = rest.components().next()?;
         Some(Path::new(VOLUMES_PARENT).join(name.as_os_str()))
+    }
+}
+
+impl super::AbsenceVolume for MacOs {
+    fn volume_prefix(&self, path: &Path) -> Option<PathBuf> {
+        super::MountPrefix::mount_prefix(self, path)
     }
 
     fn identify_directory(&self, handle: &DirHandle) -> Result<VolumeIdentity> {
@@ -3382,6 +3390,86 @@ impl DirOps for MacOs {
         }
         Ok(ChildListing {
             entries,
+            total,
+            truncated,
+        })
+    }
+
+    fn list_names(&self, parent: &DirHandle, max_names: usize) -> Result<DirNames> {
+        let directory = parent_descriptor(parent, "listing")?;
+        // `fdopendir` takes ownership of the descriptor it is given, so the
+        // caller's handle is duplicated rather than closed under it.
+        // SAFETY: `directory` is open for this call.
+        let duplicate = unsafe { libc::dup(directory) };
+        if duplicate < 0 {
+            return Err(listing_error(io::Error::last_os_error()));
+        }
+        // SAFETY: `duplicate` is a fresh descriptor this function owns and
+        // `fdopendir` returns either null or a directory stream that owns it.
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            // SAFETY: the stream was not created, so the descriptor is still
+            // this function's to close.
+            unsafe {
+                libc::close(duplicate);
+            }
+            return Err(listing_error(io::Error::last_os_error()));
+        }
+        let mut names = Vec::new();
+        let mut total = 0usize;
+        let mut truncated = false;
+        // The stream shares the caller's directory offset, so it is rewound: a
+        // listing is always the directory's names from the first one.
+        // SAFETY: `stream` is the directory stream created above.
+        unsafe {
+            libc::rewinddir(stream);
+        }
+        loop {
+            // SAFETY: `__error` returns this thread's errno location.
+            unsafe {
+                *libc::__error() = 0;
+            }
+            // SAFETY: `stream` is the directory stream created above.
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                // SAFETY: `__error` returns this thread's errno location.
+                let errno = unsafe { *libc::__error() };
+                if errno != 0 {
+                    // SAFETY: `stream` is owned by this function.
+                    unsafe {
+                        libc::closedir(stream);
+                    }
+                    return Err(listing_error(io::Error::from_raw_os_error(errno)));
+                }
+                break;
+            }
+            // SAFETY: `entry` points at the live directory entry `readdir`
+            // returned, and is read before the next call changes it.
+            let Some(name) = entry_name(entry) else {
+                continue;
+            };
+            if name == "." || name == ".." {
+                continue;
+            }
+            total = total.saturating_add(1);
+            // No child is stated here: its own facts are read by the caller that
+            // has taken its lock, never by the enumeration.
+            if names.len() < max_names && total <= LIST_ENTRY_LIMIT {
+                names.push(name);
+            } else {
+                truncated = true;
+            }
+            if total >= LIST_ENTRY_LIMIT {
+                truncated = true;
+                break;
+            }
+        }
+        // SAFETY: `stream` is owned by this function and is not used again.
+        unsafe {
+            libc::closedir(stream);
+        }
+        Ok(DirNames {
+            names,
             total,
             truncated,
         })

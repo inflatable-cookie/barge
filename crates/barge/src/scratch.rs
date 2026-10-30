@@ -6112,6 +6112,14 @@ mod tests {
             self.inner.list_children(parent, max_names)
         }
 
+        fn list_names(
+            &self,
+            parent: &DirHandle,
+            max_names: usize,
+        ) -> crate::error::Result<crate::os::DirNames> {
+            self.inner.list_names(parent, max_names)
+        }
+
         fn remove_child(
             &self,
             parent: &DirHandle,

@@ -19,12 +19,12 @@ mod macos;
 
 pub use facts::{
     AccountFacts, BlindSpotEvidence, ChildEntry, ChildListing, ChildRemoval, DeadHandle,
-    DeadHandleEvidence, DescriptorScan, DescriptorScanRequest, DeviceId, DirHandle, DirId, DirOps,
-    EntryFacts, EntryKind, ExpectedVolume, FileSystem, MountPoint, MountRoot, OpenDescriptor,
-    PlatformBlindSpot, PlatformStatus, ProcessIdentity, ProcessObserver, RemoveKind, RenameOutcome,
-    RetriedUnreadable, RetryEvidence, RetryResolution, SelfExclusion, VerifiedVolume, VolumeFacts,
-    VolumeIdentity, VolumeLocator, VolumeUuid, BLIND_SPOT_RECORDS, DEAD_HANDLE_RECORDS,
-    RETRY_RECORDS,
+    DeadHandleEvidence, DescriptorScan, DescriptorScanRequest, DeviceId, DirHandle, DirId,
+    DirNames, DirOps, EntryFacts, EntryKind, ExpectedVolume, FileSystem, MountPoint, MountPrefix,
+    MountRoot, OpenDescriptor, PlatformBlindSpot, PlatformStatus, ProcessIdentity, ProcessObserver,
+    RemoveKind, RenameOutcome, RetriedUnreadable, RetryEvidence, RetryResolution, SelfExclusion,
+    VerifiedVolume, VolumeFacts, VolumeIdentity, VolumeLocator, VolumeUuid, BLIND_SPOT_RECORDS,
+    DEAD_HANDLE_RECORDS, RETRY_RECORDS,
 };
 
 pub use space::{Flush, SpaceFacts, SpaceMeasurement};
