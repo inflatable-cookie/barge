@@ -1050,9 +1050,11 @@ fn decide_root(
     let mut references = placements.references_for(
         document,
         declared_age.is_some(),
-        &root_id,
-        &root.path,
-        &mount_relative_path,
+        reference::RootRef {
+            id: &root_id,
+            path: &root.path,
+            mount_relative_path: &mount_relative_path,
+        },
         &locked.holds,
         locked.holds_error.as_deref(),
     );

@@ -252,9 +252,7 @@ impl BargeReferences {
         &self,
         declaration: &AreaDocument,
         policy_permits_release: bool,
-        root_id: &str,
-        root_path: &Path,
-        mount_relative_path: &str,
+        root: RootRef<'_>,
         holds: &area::HoldReading,
         holds_error: Option<&str>,
     ) -> ReferenceSet {
@@ -263,7 +261,7 @@ impl BargeReferences {
             set.absorb(ReferenceSet::unknown(detail.clone()));
         }
         for record in &self.placements.records {
-            if !placement_names_root(record, root_id, root_path, mount_relative_path) {
+            if !placement_names_root(record, root) {
                 continue;
             }
             set.rows.push(
@@ -303,24 +301,19 @@ impl BargeReferences {
 /// `setting` placement names the consumer directory the setting points at. In
 /// every form the recorded path is compared, and the recorded root ids are
 /// compared when the form carries one.
-fn placement_names_root(
-    record: &cache::PlacementRecord,
-    root_id: &str,
-    root_path: &Path,
-    mount_relative_path: &str,
-) -> bool {
+fn placement_names_root(record: &cache::PlacementRecord, root: RootRef<'_>) -> bool {
     let recorded = &record.recorded_path;
-    if recorded == root_path
-        || recorded.starts_with(root_path)
-        || root_path.starts_with(recorded)
-        || records_root(recorded, root_path, mount_relative_path)
+    if recorded == root.path
+        || recorded.starts_with(root.path)
+        || root.path.starts_with(recorded)
+        || records_root(recorded, root.path, root.mount_relative_path)
     {
         return true;
     }
     match &record.form {
-        PlacementForm::HeldRoot(form) => form.held_root.root_id == root_id,
-        PlacementForm::Link(form) => form.root_id == root_id,
-        PlacementForm::Setting(form) => form.data_path == root_path,
+        PlacementForm::HeldRoot(form) => form.held_root.root_id == root.id,
+        PlacementForm::Link(form) => form.root_id == root.id,
+        PlacementForm::Setting(form) => form.data_path == root.path,
     }
 }
 
@@ -779,6 +772,20 @@ impl OxideSnapshot {
         }
         set
     }
+}
+
+/// The facts that identify one planned root to the reference readers.
+///
+/// They are the root's id and its two paths: the absolute one this plan observed and
+/// the mount-relative one that survives a remount (stage 4, "Root identity").
+#[derive(Debug, Clone, Copy)]
+pub struct RootRef<'a> {
+    /// The root's id, which is its marker's id or its directory's name.
+    pub id: &'a str,
+    /// The absolute path this plan observed.
+    pub path: &'a Path,
+    /// The path below the verified mount root.
+    pub mount_relative_path: &'a str,
 }
 
 /// Whether one recorded root path names one planned root.
