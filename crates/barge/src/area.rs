@@ -4006,12 +4006,13 @@ pub struct IdleBaselineRequest {
     pub mount_relative_path: Option<String>,
 }
 
-/// The four record writes a fact publication performs: the publish itself and its
-/// three fail-closed recovery steps.
+/// The record operations a fact publication performs: the publish itself, the read
+/// that verifies what it left behind, and its three fail-closed recovery steps.
 ///
 /// They are seams (the shape [`state::publish_atomic_with`] already uses) so a test
-/// can prove what a publish that fails *after* its rename does, and what each
-/// recovery step does when it fails too.
+/// can prove what a publish that fails *after* its rename does, what a verification
+/// read that cannot complete does, and what each recovery step does when it fails
+/// too.
 #[derive(Clone, Copy)]
 pub(crate) struct ActivityIo {
     /// The fact's own publish.
@@ -4022,16 +4023,19 @@ pub(crate) struct ActivityIo {
     pub remove: fn(&Path) -> Result<()>,
     /// Make the unconfirmed record invalid in place.
     pub invalidate: fn(&Path) -> Result<()>,
+    /// Read the record's exact bytes back, bounded, to verify a failed publish.
+    pub read: fn(&StatePaths, &str) -> Result<Option<Vec<u8>>>,
 }
 
 impl ActivityIo {
-    /// The real writes.
+    /// The real operations.
     pub(crate) const fn real() -> Self {
         Self {
             write: state::publish_atomic,
             restore: state::publish_atomic,
             remove: remove_state_file,
             invalidate: invalidate_state_file,
+            read: activity_record_bytes,
         }
     }
 }
@@ -4039,13 +4043,16 @@ impl ActivityIo {
 /// Publish one activity fact, with the fail-closed recovery every fact write needs.
 ///
 /// [`state::publish_atomic`] renames and then syncs the directory, so a failure
-/// does not always mean the new bytes are absent. The record is re-read after a
+/// does not always mean the new bytes are absent. The record is read back after a
 /// failure and only bytes identical to the previous record count as "nothing
 /// changed"; anything else is recovered in three steps — restore the previous
 /// bytes, else remove the unconfirmed record, else invalidate it in place — so an
-/// unconfirmed fact is never left readable as a release. The only state this
-/// cannot mark is one whose volume refuses every write, and that is reported as a
-/// limit rather than assumed durable (Q-012).
+/// unconfirmed fact is never left readable as a release. A verification read that
+/// itself cannot complete is **not** evidence that nothing changed: unknown is
+/// never taken as "no effect", so the recovery runs and the record is restored,
+/// removed or invalidated even though the read failed. The only state this cannot
+/// mark is one whose volume refuses every write, and that is reported as a limit
+/// rather than assumed durable (Q-012).
 fn publish_fact(
     state: &StatePaths,
     record: &ActivityRecord,
@@ -4055,70 +4062,101 @@ fn publish_fact(
 ) -> Result<()> {
     let root_id = record.root_id.as_str();
     let path = state.activity_path(root_id)?;
-    if let Err(error) = publish_activity_with(state, record, &io.write) {
-        let landed = match (previous_bytes, activity_record_bytes(state, root_id)?) {
-            (Some(before), Some(now)) => now != before,
-            (_, Some(_)) => true,
-            (_, None) => false,
-        };
-        let record_path = path.display().to_string();
-        let failed_kind = error.kind();
-        if !landed {
-            return Err(Error::new(
-                failed_kind,
-                format!("{context} was refused and the activity record is unchanged: {error}"),
-            )
-            .with_detail("activity_path", record_path.into())
-            .with_detail("restored", true.into())
-            .with_detail("cause", error.to_string().into()));
-        }
-        let restore_error = match previous_bytes {
-            Some(bytes) => (io.restore)(&path, bytes).err(),
-            None => Some(Error::new(
-                ErrorKind::UnknownState,
-                "there was no previous record to restore",
-            )),
-        };
-        return Err(match restore_error {
-            None => Error::new(
-                failed_kind,
-                format!(
+    let error = match publish_activity_with(state, record, &io.write) {
+        Ok(_) => return Ok(()),
+        Err(error) => error,
+    };
+    let record_path = path.display().to_string();
+    let failed_kind = error.kind();
+    // Only a record whose bytes are provably unchanged settles this as "nothing
+    // happened". A read that cannot complete proves nothing, so it is treated as
+    // an unconfirmed publication and recovered.
+    let landed = match (io.read)(state, root_id) {
+        Ok(None) => false,
+        Ok(Some(now)) => previous_bytes.is_none_or(|before| now != before),
+        Err(_) => true,
+    };
+    if !landed {
+        return Err(Error::new(
+            failed_kind,
+            format!("{context} was refused and the activity record is unchanged: {error}"),
+        )
+        .with_detail("activity_path", record_path.into())
+        .with_detail("restored", true.into())
+        .with_detail("cause", error.to_string().into()));
+    }
+    let restore_error = match previous_bytes {
+        Some(bytes) => match (io.restore)(&path, bytes) {
+            Ok(()) => {
+                return Err(Error::new(
+                    failed_kind,
+                    format!(
                     "{context} was refused and the advanced activity record was restored: {error}"
                 ),
-            )
-            .with_detail("activity_path", record_path.into())
-            .with_detail("restored", true.into())
-            .with_detail("cause", error.to_string().into()),
-            Some(restore_error) => match (io.remove)(&path) {
-                Ok(()) => Error::new(
-                    ErrorKind::UnknownState,
-                    format!(
-                        "{context} could not be recorded: its publish was not confirmed durable ({error}) and the previous record could not be restored ({restore_error}), so the unconfirmed record for root `{root_id}` was removed. The root reads as activity unknown and is never idle until `barge area idle-baseline` records it"
-                    ),
                 )
                 .with_detail("activity_path", record_path.into())
-                .with_detail("restored", false.into())
-                .with_detail("removed", true.into())
-                .with_detail("cause", error.to_string().into())
-                .with_detail("restore_error", restore_error.to_string().into()),
-                Err(remove_error) => match (io.invalidate)(&path) {
-                    Ok(()) => Error::new(
+                .with_detail("restored", true.into())
+                .with_detail("cause", error.to_string().into()))
+            }
+            Err(restore_error) => restore_error,
+        },
+        None => Error::new(
+            ErrorKind::UnknownState,
+            "there was no previous record to restore",
+        ),
+    };
+    let removed = |cause: Error, restore_error: Error| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "{context} could not be recorded: its publish was not confirmed durable ({cause}) and the previous record could not be restored ({restore_error}), so the unconfirmed record for root `{root_id}` was removed. The root reads as activity unknown and is never idle until `barge area idle-baseline` records it"
+            ),
+        )
+        .with_detail("activity_path", record_path.clone().into())
+        .with_detail("restored", false.into())
+        .with_detail("removed", true.into())
+        .with_detail("cause", cause.to_string().into())
+        .with_detail("restore_error", restore_error.to_string().into())
+    };
+    let invalidated = |cause: Error, restore_error: Error, remove_error: Error| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "{context} could not be recorded: its publish was not confirmed durable ({cause}), the previous record could not be restored ({restore_error}) and the unconfirmed record for root `{root_id}` could not be removed ({remove_error}), so it was invalidated in place. The root reads as activity unknown and is never idle until `barge area idle-baseline` records it"
+            ),
+        )
+        .with_detail("activity_path", record_path.clone().into())
+        .with_detail("restored", false.into())
+        .with_detail("removed", false.into())
+        .with_detail("invalidated", true.into())
+        .with_detail("cause", cause.to_string().into())
+        .with_detail("restore_error", restore_error.to_string().into())
+        .with_detail("remove_error", remove_error.to_string().into())
+    };
+    match (io.remove)(&path) {
+        Ok(()) => Err(removed(error, restore_error)),
+        Err(remove_error) => {
+            // A removal that errored but left the record positively absent is
+            // settled: the record is gone, which is all the removal had to achieve.
+            if matches!((io.read)(state, root_id), Ok(None)) {
+                return Err(removed(error, restore_error));
+            }
+            match (io.invalidate)(&path) {
+                Ok(()) => Err(invalidated(error, restore_error, remove_error)),
+                Err(invalidate_error) => match (io.read)(state, root_id) {
+                    // A removal or invalidation that errored but left the record
+                    // positively absent, or present but no longer a readable
+                    // record, has done its job as well.
+                    Ok(None) => Err(removed(error, restore_error)),
+                    Ok(Some(bytes))
+                        if serde_json::from_slice::<ActivityRecord>(&bytes).is_err() =>
+                    {
+                        Err(invalidated(error, restore_error, remove_error))
+                    }
+                    _ => Err(Error::new(
                         ErrorKind::UnknownState,
                         format!(
-                            "{context} could not be recorded: its publish was not confirmed durable ({error}), the previous record could not be restored ({restore_error}) and the unconfirmed record for root `{root_id}` could not be removed ({remove_error}), so it was invalidated in place. The root reads as activity unknown and is never idle until `barge area idle-baseline` records it"
-                        ),
-                    )
-                    .with_detail("activity_path", record_path.into())
-                    .with_detail("restored", false.into())
-                    .with_detail("removed", false.into())
-                    .with_detail("invalidated", true.into())
-                    .with_detail("cause", error.to_string().into())
-                    .with_detail("restore_error", restore_error.to_string().into())
-                    .with_detail("remove_error", remove_error.to_string().into()),
-                    Err(invalidate_error) => Error::new(
-                        ErrorKind::UnknownState,
-                        format!(
-                            "{context} could not be recorded: its publish was not confirmed durable ({error}), the previous record could not be restored ({restore_error}), the unconfirmed record for root `{root_id}` could not be removed ({remove_error}) and it could not be invalidated ({invalidate_error}). A state volume that refuses every write cannot be marked, so the record may still be readable until an operator repairs the state volume and runs `barge area idle-baseline`"
+                            "{context} could not be recorded: its publish was not confirmed durable ({error}), the previous record could not be restored ({restore_error}), the unconfirmed record for root {root_id} could not be removed ({remove_error}) and it could not be invalidated ({invalidate_error}). A state volume that refuses every write cannot be marked, so the record may still be readable until an operator repairs the state volume and runs `barge area idle-baseline`"
                         ),
                     )
                     .with_detail("activity_path", record_path.into())
@@ -4128,12 +4166,11 @@ fn publish_fact(
                     .with_detail("cause", error.to_string().into())
                     .with_detail("restore_error", restore_error.to_string().into())
                     .with_detail("remove_error", remove_error.to_string().into())
-                    .with_detail("invalidate_error", invalidate_error.to_string().into()),
+                    .with_detail("invalidate_error", invalidate_error.to_string().into())),
                 },
-            },
-        });
+            }
+        }
     }
-    Ok(())
 }
 
 /// The `barge.area.idle-baseline/1` document's data.
@@ -7438,6 +7475,143 @@ mod tests {
     }
 
     #[test]
+    fn a_verification_read_that_fails_does_not_skip_recovery() {
+        // The publish lands unconfirmed and the read that would verify it cannot
+        // complete. Unknown is never taken as "nothing happened", so the previous
+        // record is restored even though the verification read failed.
+        let fixture = Fixture::new("release-read-fails");
+        fixture.register(&fixture.record);
+        let declaration = fixture.declaration("example/pool");
+        let (root, resolved) = fixture.create_root(&fixture.record, &declaration);
+        let observer = fixture.observer();
+        let request = HoldRequest {
+            root_id: root.root_id.clone(),
+            holder: "prover".to_owned(),
+            pid: std::process::id(),
+            scope: HoldScope::Write,
+            purpose: "a fixture holder".to_owned(),
+        };
+        hold(&fixture.state, &observer, &request).expect("the first hold is written");
+        release(&fixture.state, &observer, &root.root_id, "prover").expect("the first release");
+        let path = fixture
+            .state
+            .activity_path(&root.root_id)
+            .expect("the activity path");
+        let earlier = std::fs::read(&path).expect("the record reads");
+        hold(&fixture.state, &observer, &request).expect("the second hold is written");
+
+        fn after_rename(target: &Path, bytes: &[u8]) -> Result<()> {
+            crate::state::publish_atomic(target, bytes)?;
+            Err(Error::new(
+                ErrorKind::Io,
+                "injected: the activity directory sync failed after the rename",
+            ))
+        }
+        fn unreadable(
+            _state: &crate::state::StatePaths,
+            _root_id: &str,
+        ) -> Result<Option<Vec<u8>>> {
+            Err(Error::new(
+                ErrorKind::Io,
+                "injected: the verification read fails",
+            ))
+        }
+        let error = super::release_with(
+            &fixture.state,
+            &observer,
+            &root.root_id,
+            "prover",
+            super::ActivityIo {
+                write: after_rename,
+                read: unreadable,
+                ..super::ActivityIo::real()
+            },
+        )
+        .expect_err("the publish fails after its rename");
+        assert_eq!(error.detail()["restored"], true);
+        assert!(
+            error.message().contains("was restored"),
+            "the recovery ran even though the verification read failed: {}",
+            error.message()
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the record reads"),
+            earlier,
+            "the previous record was restored byte for byte"
+        );
+        assert!(
+            fixture
+                .state
+                .holds_dir()
+                .join(&root.root_id)
+                .join("prover.json")
+                .is_file(),
+            "the hold was not removed"
+        );
+        assert_blocked(
+            fixture.list(&resolved).roots[0].space_idle,
+            IdleReason::HoldLive,
+        );
+
+        // The same failed read with a failing restore removes the unconfirmed
+        // record, so it cannot decide idleness either.
+        fn fails_to_restore(_target: &Path, _bytes: &[u8]) -> Result<()> {
+            Err(Error::new(ErrorKind::Io, "injected: rollback fails"))
+        }
+        let error = super::release_with(
+            &fixture.state,
+            &observer,
+            &root.root_id,
+            "prover",
+            super::ActivityIo {
+                write: after_rename,
+                restore: fails_to_restore,
+                read: unreadable,
+                ..super::ActivityIo::real()
+            },
+        )
+        .expect_err("the publish and its rollback fail");
+        assert_eq!(error.detail()["restored"], false);
+        assert_eq!(error.detail()["removed"], true);
+        assert_eq!(
+            read_activity(&fixture.state, &observer, &root.root_id)
+                .expect("the record reads")
+                .state,
+            ActivityStateName::Missing
+        );
+        let listed = fixture.list(&resolved);
+        assert!(!listed.roots[0].space_idle.is_idle());
+        assert!(
+            listed.roots[0].activity.last_release_ms.is_none(),
+            "a removed record offers no release time to the order"
+        );
+
+        // The leftover hold releases (recording nothing, because the record is
+        // absent) and the explicit baseline repairs it.
+        release(&fixture.state, &observer, &root.root_id, "prover").expect("the hold releases");
+        let platform = fixture.platform();
+        let facts = fixture.facts();
+        let mounts = fixture.mounts();
+        idle_baseline(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &IdleBaselineRequest {
+                root_id: root.root_id.clone(),
+                volume_uuid: None,
+                mount_relative_path: None,
+            },
+        )
+        .expect("the baseline repairs the record");
+        assert_eq!(
+            fixture.list(&resolved).roots[0].space_idle.state,
+            IdleState::Idle
+        );
+    }
+
+    #[test]
     fn a_state_volume_that_refuses_every_write_cannot_be_marked() {
         // The residual no frozen-format step can close: the publish landed
         // unconfirmed and the record can be neither restored, removed nor
@@ -7486,6 +7660,7 @@ mod tests {
                 restore: always_fails,
                 remove: always_fails_too,
                 invalidate: always_fails_too,
+                ..super::ActivityIo::real()
             },
         )
         .expect_err("nothing can be written");

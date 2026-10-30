@@ -138,7 +138,10 @@ frozen field set, with no confirmed-publication marker and no separate pending
 record. A release and an idle baseline publish their fact through one shared
 fail-closed recovery — restore the previous record byte for byte, else remove the
 unconfirmed record, else invalidate it in place by truncation (both absences and
-invalid records are `activity_unknown` under O-013, never idle) — and a state
+invalid records are `activity_unknown` under O-013, never idle). Every failed
+publish is verified by reading the record back, and a verification read that cannot
+complete is treated as an unconfirmed publication rather than as "nothing happened",
+so a read error never skips recovery — and a state
 volume that refuses **every** write touching the record is the one case no step can
 mark. It is reported as `unknown_state` with `detail.restored`,
 `detail.removed` and `detail.invalidated` all false, and the operator repairs the

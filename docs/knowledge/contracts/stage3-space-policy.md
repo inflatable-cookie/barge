@@ -1420,7 +1420,14 @@ T6, and no native proof exists or is claimed.
   than the one that removed its hold.
 - **What each failure does.** The record's own publish renames and then syncs the
   directory, so its failure does not always mean the new bytes are absent, and the
-  report never claims "nothing changed" while an advanced record is visible:
+  report never claims "nothing changed" while an advanced record is visible. The
+  verification read is part of that rule: only a record whose bytes are **provably
+  unchanged** counts as "nothing happened", and a read that cannot complete proves
+  nothing, so it is treated as an unconfirmed publication and recovered — unknown
+  is never taken as "no effect". A removal or invalidation that errors but leaves
+  the record positively absent, or present but no longer a readable record, is
+  settled the same way, so a misleading error on a step that did its job cannot
+  leave an unconfirmed fact trusted:
   - a publish that fails **before** its rename leaves the record exactly as it was;
     the release refuses with the publish's own kind (`io`, exit `3`), the hold in
     place, and `detail.restored: true`, which is the failure matrix's "refuse
