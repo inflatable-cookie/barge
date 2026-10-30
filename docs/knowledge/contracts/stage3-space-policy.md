@@ -1645,6 +1645,26 @@ and T6, and this slice claims no native proof.
 - **Order.** Candidates are one volume-wide least-recently-used list, built with
   T3's `LruKey`: older `last_release_ms`, then older `first_created_ms`, then
   `root_id`. The order crosses areas by construction.
+- **Lock order and busy roots.** Carried ruling `6ac32f24`: the registry's shared
+  observation lock is taken first and released before any walk, then the volume's
+  shared lock for the rest of the pass, then **one root's shared lock at a
+  time**, released before the next root. Every fact that decides a row — the
+  marker and its digest, the root id, the root's identity, its holds, its
+  activity record and the bytes scan — is read under that root's lock. The
+  enumeration is names-only (`area::list_names`): no child is opened and no entry
+  is stated before its row's own lock. An adopted root whose marker proves a root
+  id other than its directory name takes the name/unit lock first, reads the
+  marker, then takes the marker's root-id lock too and re-reads the marker; an id
+  that changed between the two reads keeps the root. The scratch sweep is a names
+  and scopes index only: every entry it names is observed again under its own
+  lock, and a native entry is a candidate only when the sweep's own expiry
+  predicate also accepted it, so a nested-marker veto cannot be bypassed. Every
+  shared wait is bounded by the plan's own lock budget (`lock_wait`, the state
+  directory's own `LOCK_WAIT` by default). A busy root is a kept row in state
+  `locked` with no observation, and every other root still plans. A volume lock a
+  live owner holds past that budget refuses the plan with `locked`, names the
+  volume and its lock file, and changes nothing. A lock file that does not exist
+  is nothing to wait for: the preview creates no lock, file or directory.
 - **Participation.** Every declared area is reported in `participation`. An area
   whose `reserve` is `counts` is listed and its idle roots may be candidates; an
   area whose `reserve` is `excluded` is never enumerated, so its roots never
@@ -1662,9 +1682,10 @@ and T6, and this slice claims no native proof.
   that identity. Anything else is a kept row with the reason: `hold_live`,
   `hold_unknown`, `activity_unknown`, `activity_unreleased`, `activity_future`,
   `identity_mismatch`, `marker_unverified`, `unconcluded_scratch`,
-  `participation_excluded`, a cache root, or "the root's bytes could not be
-  counted completely". An incomplete scan, a changed identity and an unreadable
-  record keep the root; none of them becomes zero bytes.
+  `participation_excluded`, a cache root, "the root's bytes could not be counted
+  completely", or a root lock that could not be observed (`state: locked`). An
+  incomplete scan, a changed identity, an unreadable record and a busy root keep
+  the root; none of them becomes zero bytes and none of them blocks the volume.
 - **Scratch's relaxed expiry predicate.** A scratch run is pressure-eligible only
   when the stage 1 expiry predicate holds — outcome `closed`, closure `positive`,
   `nested_scope: exclusive`, `kept_reason: evidence` — with the age requirement
@@ -1682,15 +1703,19 @@ and T6, and this slice claims no native proof.
   never stops the rest. An area that cannot be resolved or listed is a
   `participation` row in state `unknown` with the reason and `null` counts; a
   scratch folder that cannot be planned is the same; a root that cannot be read
-  is a kept row. A root that is unmarked, a symlink, a foreign family or an
-  unreadable entry is reported, never guessed at.
+  is a kept row, and a root whose own lock a live owner holds past the budget is
+  a kept row in state `locked` while the rest of its area still plans. A root
+  that is unmarked, a symlink, a foreign family or an unreadable entry is
+  reported, never guessed at.
 - **Bounds.** The plan's wall clock is 10 s. It reads at most the contract's 4096
   roots per listing and 4096 candidate rows, and the scratch sweep's own 4096
   entries. The candidate bound keeps the **oldest** 4096 in LRU order, so it can
   never drop an older root in favour of a younger one. The kept list is bounded
   too, and each participation row counts every decision it made even after that
   output bound was reached; the report's `truncated` covers candidate, kept and
-  listing overflow, and every count reports the volume's real total. A bound reached sets `truncated`, records `truncated_reason`, counts
+  listing overflow, and every count reports the volume's real total. The lock
+  budget is the plan's own per-lock wait, so a busy root never consumes the
+  whole wall clock. A bound reached sets `truncated`, records `truncated_reason`, counts
   `unreached` root rows, and turns the areas it never reached into `unreached`
   participation rows. A truncated plan says what it did not reach; it never
   presents a short plan as a whole one.
@@ -1699,18 +1724,21 @@ and T6, and this slice claims no native proof.
   `unknown_state`; a `kept` durability is `refused_boundary`; an unregistered
   volume is `unknown_state`. All of them happen before any listing, so a refused
   plan creates nothing.
-- **What it does not do.** It does not delete, flush, take the exclusive volume
-  lock, write an intent, or decide admission. The volume lock is taken shared
-  only when the lock file already exists, exactly as `barge space` does, and the
-  plan writes no state at all.
+- **What it does not do.** It does not delete, flush, take an exclusive volume or
+  root lock, write an intent, or decide admission. It takes only shared locks, in
+  the order above, only when their files already exist, and it writes no state at
+  all.
 - **Tests.** The library suite pins: the cross-area LRU order and every candidate
   field; the canonical bytes, their digest and the reader's refusal of a forged
   identity, an unknown major and a candidate with no release; an excluded area's
   root never planned and never counted; a live hold, an unreleased record, a
   cache root and an unmarked directory each kept with its reason; a root whose
   bytes cannot be counted kept while other roots still plan; a failed area
-  reported as `unknown` while another area still plans; an undeclared policy, an
-  undeclared durability, a `kept` volume and an absent volume each refused; and
+  reported as `unknown` while another area still plans; a busy root kept in state
+  `locked` while the other roots still plan, a shared observer's root lock not
+  blocking the plan, and a busy volume lock refusing the plan while a shared one
+  does not; an undeclared policy, an undeclared durability, a `kept` volume and
+  an absent volume each refused; and
   scratch's concluded-and-released root planned while the expiry sweep's own age
   still keeps it, an unconcluded root kept, a symbolic link and a foreign family
   entry reported as kept and never candidates, an absent scratch folder reported

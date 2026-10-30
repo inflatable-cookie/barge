@@ -1113,6 +1113,7 @@ fn space_prune(args: &[String]) -> Result<Report, Error> {
             volume_uuid: &volume_uuid,
             now_ms: state::now_ms(),
             wall: barge::space::SPACE_PLAN_WALL,
+            lock_wait: state::LOCK_WAIT,
         },
     )?;
     if let Some(path) = &plan_out {

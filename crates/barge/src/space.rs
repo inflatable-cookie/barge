@@ -7,14 +7,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::area::{
-    self, AreaDocument, IdleParticipation, LruKey, MarkerExpectation, MarkerStateName,
-    ReserveParticipation, RootKind, RootObservation,
+    self, AreaDocument, IdleParticipation, LruKey, MarkerExpectation, MarkerState, MarkerStateName,
+    ReserveParticipation, RootKind,
 };
 use crate::contract::{RowSet, AREA_ROWS, DOCUMENT_SIZE_CAP_BYTES, ROOT_ROWS, VOLUME_ROWS};
 use crate::digest::sha256_hex;
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
-    self, DirOps, MountRoot, ProcessObserver, SpaceFacts, SpaceMeasurement, VolumeFacts, VolumeUuid,
+    self, DirHandle, DirOps, MountRoot, ProcessObserver, SpaceFacts, SpaceMeasurement, VolumeFacts,
+    VolumeUuid,
 };
 use crate::registry::{self, VolumeRecord};
 use crate::scratch::{self, SweepBounds};
@@ -265,6 +266,10 @@ pub struct SpacePruneRequest<'a> {
     pub now_ms: u64,
     /// The plan's wall clock (stage 3 design, "Bounded resources").
     pub wall: Duration,
+    /// How long one shared lock may wait for a live owner. It is the plan's own
+    /// budget for a lock: a holder past it is refused, never waited out twice
+    /// (carried ruling `6ac32f24`).
+    pub lock_wait: Duration,
 }
 
 /// One candidate the plan would delete, in delete order.
@@ -431,7 +436,19 @@ pub fn plan(
     space: &dyn SpaceFacts,
     request: &SpacePruneRequest<'_>,
 ) -> Result<SpacePruneReport> {
-    let record = area::registered_volume(paths, request.volume_uuid)?;
+    let started = Instant::now();
+    // The lock order the carried ruling `6ac32f24` fixes: the registry's shared
+    // observation lock first, released before any walk, then the volume's shared
+    // lock for the rest of the pass, then one root's shared lock at a time. A
+    // registration write is never blocked by a preview, and a real prune of this
+    // volume cannot interleave with it.
+    let (record, declarations) = {
+        let mut locks = LockSet::with_deadline(paths.clone(), Deadline::after(request.lock_wait));
+        let _registry_lock = locks.observe_registry()?;
+        let record = area::registered_volume(paths, request.volume_uuid)?;
+        let declarations = area::read_declarations(paths)?;
+        (record, declarations)
+    };
     let durability = record.declared_durability()?;
     if !durability.permits_pruning() {
         return Err(Error::new(
@@ -455,14 +472,39 @@ pub fn plan(
     let measurement = space.measure_space(&verified)?;
     let state = state_name(&measurement, &policy).to_owned();
     let target_bytes = policy.reserve_bytes.max(policy.floor_bytes);
-    // A preview is a report: it takes the shared volume lock only when the lock
-    // file already exists, exactly as `barge space` does, and creates nothing.
-    let _volume_lock = StateLock::shared_if_present(
-        &paths.volume_lock_path(&record.volume_uuid),
-        LockRank::Volume,
-        Deadline::after(READ_DEADLINE),
-    )?;
-    let declarations = area::read_declarations(paths)?;
+    // A preview takes the volume's shared lock only when the lock file already
+    // exists, and creates nothing. A real prune holds the same file exclusively,
+    // so it can never be read mid-prune; a holder that outlives this plan's own
+    // wait refuses the plan with `locked` and names the volume's lock file. A
+    // root that is busy is a different answer: it keeps that root alone.
+    let volume_lock = {
+        let mut locks = LockSet::with_deadline(paths.clone(), Deadline::after(request.lock_wait));
+        match locks.observe_volume(&record.volume_uuid) {
+            Ok(lock) => lock,
+            Err(error) => {
+                return Err(Error::new(
+                    ErrorKind::Locked,
+                    format!(
+                        "volume {}'s lock could not be observed, so this volume's space plan was refused: {}; nothing was changed",
+                        record.volume_uuid,
+                        error.message()
+                    ),
+                )
+                .with_detail(
+                    "volume_uuid",
+                    record.volume_uuid.as_str().into(),
+                )
+                .with_detail(
+                    "lock",
+                    paths
+                        .volume_lock_path(&record.volume_uuid)
+                        .display()
+                        .to_string()
+                        .into(),
+                ));
+            }
+        }
+    };
     let declarations_truncated = declarations.truncated;
     let mut planner = Planner {
         paths,
@@ -473,7 +515,8 @@ pub fn plan(
         record: &record,
         now_ms: request.now_ms,
         wall: request.wall,
-        deadline: Instant::now() + request.wall,
+        lock_wait: request.lock_wait,
+        deadline: started + request.wall,
         stopped: None,
         truncated: declarations_truncated,
         examined: 0,
@@ -488,6 +531,9 @@ pub fn plan(
         planner.area(document);
     }
     planner.scratch();
+    // One root's shared lock at a time: every entry took and released its own, so
+    // the volume's observation lock is the only one still held here.
+    drop(volume_lock);
     let Planner {
         stopped,
         truncated,
@@ -708,6 +754,45 @@ struct Candidate {
     row: SpaceCandidateRow,
 }
 
+/// Why one entry's evidence could not be observed under its own lock.
+enum EvidenceError {
+    /// The entry's own lock is held past this plan's wait, so nothing about the
+    /// entry was read and it is kept as a busy row.
+    Locked(String),
+    /// The entry could not be opened, or its marker would not settle, so nothing
+    /// about it is reported as a candidate.
+    Unreadable(String),
+}
+
+/// One entry's facts, read while its own shared lock or locks were held.
+///
+/// The locks stay alive inside this value until the decision is made, so the
+/// marker, its digest, the root id, the holds, the activity record and the bytes
+/// scan all describe one moment that no consumer's hold and no delete could
+/// interleave with.
+struct ObservedEntry {
+    handle: DirHandle,
+    /// The path that was opened, for the row.
+    path: PathBuf,
+    marker: MarkerState,
+    marker_digest: Option<String>,
+    root_id: Option<String>,
+    /// The lock a hold or a delete of this entry takes: the root lock when the
+    /// name is the root id, else the deletion unit's own key.
+    _name_lock: Option<StateLock>,
+    /// The marker's own root-id lock, when an adopted entry's name differs from
+    /// its root id. A hold is keyed by the root id, so both locks are needed.
+    _root_id_lock: Option<StateLock>,
+}
+
+/// The root id a marker state proves, when it proves one.
+fn marker_root_id(marker: &MarkerState) -> Option<String> {
+    match marker {
+        MarkerState::Owned(marker) => Some(marker.root_id.clone()),
+        MarkerState::Absent | MarkerState::Unknown { .. } => None,
+    }
+}
+
 /// Everything one plan reads, and what it has decided so far.
 struct Planner<'a> {
     paths: &'a StatePaths,
@@ -718,6 +803,7 @@ struct Planner<'a> {
     record: &'a VolumeRecord,
     now_ms: u64,
     wall: Duration,
+    lock_wait: Duration,
     deadline: Instant,
     stopped: Option<String>,
     truncated: bool,
@@ -777,6 +863,135 @@ impl Planner<'_> {
         }
     }
 
+    /// One kept row.
+    fn kept_row(
+        &self,
+        label: &str,
+        name: &str,
+        path: Option<PathBuf>,
+        root_id: Option<String>,
+        state: &str,
+        reason: String,
+    ) -> SpaceKeptRow {
+        SpaceKeptRow {
+            area: label.to_owned(),
+            name: name.to_owned(),
+            path,
+            root_id,
+            state: state.to_owned(),
+            reason,
+        }
+    }
+
+    /// Observe one entry under its own shared lock or locks.
+    ///
+    /// The lock a hold or a delete takes comes first: the root lock when the
+    /// entry's name is its Barge root id, else the deletion unit's own key, which
+    /// is the lock a delete of that unit takes. The marker is read under it, and
+    /// an adopted root whose marker proves another root id takes that root id's
+    /// lock too and re-reads the marker, so no fact from before the second lock
+    /// is used and a marker whose id changed keeps the root.
+    fn observe_entry(
+        &self,
+        name: &str,
+        path: &Path,
+    ) -> std::result::Result<ObservedEntry, EvidenceError> {
+        let name_lock = {
+            let mut locks =
+                LockSet::with_deadline(self.paths.clone(), Deadline::after(self.lock_wait));
+            if state::is_identifier(name) {
+                locks.observe_root(name)
+            } else {
+                locks.observe_unit(&state::unit_lock_key(&self.record.volume_uuid, "", name))
+            }
+        };
+        let name_lock = match name_lock {
+            Ok(lock) => lock,
+            Err(error) => {
+                return Err(EvidenceError::Locked(format!(
+                    "the entry's own lock could not be observed, so nothing about it was read: {}",
+                    error.message()
+                )))
+            }
+        };
+        let handle = match self.dirs.open_path(path) {
+            Ok(handle) => handle,
+            Err(error) => {
+                return Err(EvidenceError::Unreadable(format!(
+                    "the entry could not be opened under its own lock: {error}"
+                )))
+            }
+        };
+        let effective_uid = match self.observer.effective_uid() {
+            Ok(uid) => uid,
+            Err(error) => {
+                return Err(EvidenceError::Unreadable(format!(
+                    "this account's uid is unreadable: {error}"
+                )))
+            }
+        };
+        let expectation = MarkerExpectation {
+            volume_uuid: &self.record.volume_uuid,
+            resolved_path: path,
+            mount_point: self.record.mount_hint.as_deref(),
+            effective_uid,
+            now_ms: self.now_ms,
+        };
+        let (mut marker, mut marker_digest) =
+            area::read_marker_with_digest(self.dirs, &handle, &expectation);
+        let mut root_id_lock = None;
+        let first_id = marker_root_id(&marker);
+        if let Some(id) = first_id.as_deref() {
+            if id != name && state::is_identifier(id) {
+                let mut locks =
+                    LockSet::with_deadline(self.paths.clone(), Deadline::after(self.lock_wait));
+                match locks.observe_root(id) {
+                    Ok(lock) => root_id_lock = lock,
+                    Err(error) => {
+                        return Err(EvidenceError::Locked(format!(
+                            "the root's root-id lock could not be observed, so nothing about it was read: {}",
+                            error.message()
+                        )))
+                    }
+                }
+                let (again, again_digest) =
+                    area::read_marker_with_digest(self.dirs, &handle, &expectation);
+                if marker_root_id(&again) != first_id {
+                    return Err(EvidenceError::Unreadable(
+                        "the root's marker names another root after its root-id lock was taken, so it is kept"
+                            .to_owned(),
+                    ));
+                }
+                marker = again;
+                marker_digest = again_digest;
+            }
+        }
+        Ok(ObservedEntry {
+            root_id: marker_root_id(&marker),
+            path: path.to_path_buf(),
+            handle,
+            marker,
+            marker_digest,
+            _name_lock: name_lock,
+            _root_id_lock: root_id_lock,
+        })
+    }
+
+    /// A root's whole-tree allocated bytes, from a complete bounded scan of the
+    /// handle whose own lock is held. An incomplete scan keeps the root: unknown
+    /// bytes are never taken as zero.
+    fn scan_bytes(&self, handle: &DirHandle) -> std::result::Result<u64, String> {
+        let scan = area::scan_activity(self.dirs, handle, self.now_ms);
+        if !scan.complete {
+            return Err(format!(
+                "the root's bytes could not be counted completely: {}",
+                scan.reason
+                    .unwrap_or_else(|| "the scan did not reach the whole subtree".to_owned())
+            ));
+        }
+        Ok(scan.allocated_bytes)
+    }
+
     /// One declared area. An `excluded` area is never listed; an area that cannot
     /// be resolved or listed is reported and the plan continues, so one
     /// undecidable area never blocks the rest.
@@ -833,17 +1048,10 @@ impl Planner<'_> {
                 return;
             }
         };
-        // `ActivityMode::Floor` is enough to decide idleness: the pressure matrix
-        // needs the activity record, not the last-activity scan, and a candidate's
-        // bytes are scanned only after it is otherwise eligible.
-        let listing = match area::list_roots_with(
-            self.dirs,
-            self.observer,
-            self.paths,
-            &resolved,
-            ROOT_ROWS,
-            area::ActivityMode::Floor,
-        ) {
+        // The enumeration reads the folder's names and nothing else: no child is
+        // opened, no marker or hold is read and no fact is stated before a row's
+        // own shared lock. Everything that decides a row is read under that lock.
+        let listing = match area::list_names(self.dirs, &resolved, ROOT_ROWS) {
             Ok(listing) => listing,
             Err(error) => {
                 self.participation.push(SpaceParticipationRow {
@@ -865,19 +1073,20 @@ impl Planner<'_> {
         let mut examined = 0u64;
         let mut candidates = 0u64;
         let mut kept = 0u64;
-        for root in &listing.roots {
+        for name in &listing.names {
             if !self.has_time() {
                 self.unreached = self
                     .unreached
-                    .saturating_add(listing.roots.len().saturating_sub(examined as usize));
+                    .saturating_add(listing.names.len().saturating_sub(examined as usize));
                 break;
             }
             examined = examined.saturating_add(1);
-            let before = self.kept_total;
-            if self.area_root(&label, root) {
+            let before_candidates = self.candidate_total;
+            let before_kept = self.kept_total;
+            self.area_entry(&label, name);
+            if self.candidate_total > before_candidates {
                 candidates = candidates.saturating_add(1);
-            }
-            if self.kept_total > before {
+            } else if self.kept_total > before_kept {
                 kept = kept.saturating_add(1);
             }
         }
@@ -894,146 +1103,193 @@ impl Planner<'_> {
         });
     }
 
-    /// Consider one root row of a participating area. Answers whether it became
-    /// a candidate; a root that is kept is recorded here and never fails the
-    /// plan.
-    fn area_root(&mut self, label: &str, root: &RootObservation) -> bool {
-        fn kept_row(
-            label: &str,
-            root: &RootObservation,
-            state: &str,
-            reason: String,
-        ) -> SpaceKeptRow {
-            SpaceKeptRow {
-                area: label.to_owned(),
-                name: root.name.clone(),
-                path: Some(root.configured_path.clone()),
-                root_id: root.root_id.clone(),
-                state: state.to_owned(),
-                reason,
+    /// One entry of a participating area, decided under its own shared lock.
+    fn area_entry(&mut self, label: &str, name: &area::RootName) {
+        let observed = match self.observe_entry(&name.name, &name.path) {
+            Ok(observed) => observed,
+            Err(EvidenceError::Locked(reason)) => {
+                let row = self.kept_row(
+                    label,
+                    &name.name,
+                    Some(name.path.clone()),
+                    None,
+                    "locked",
+                    reason,
+                );
+                self.keep(row);
+                return;
             }
-        }
-        if root.state != MarkerStateName::Owned {
-            let reason = root.space_idle.reason.map_or_else(
-                || "the entry's marker is not an owned root".to_owned(),
-                |reason| reason.as_str().to_owned(),
-            );
-            let row = kept_row(label, root, marker_state_name(root.state), reason);
-            self.keep(row);
-            return false;
-        }
-        if !root.space_idle.is_idle() {
-            let reason = root.space_idle.reason.map_or_else(
-                || "the root is not idle under the pressure matrix".to_owned(),
-                |reason| reason.as_str().to_owned(),
-            );
-            let row = kept_row(label, root, "owned", reason);
-            self.keep(row);
-            return false;
-        }
-        let (Some(root_id), Some(device), Some(inode), Some(marker_digest), Some(kind)) = (
-            root.root_id.clone(),
-            root.device,
-            root.inode,
-            root.marker_digest.clone(),
-            root.kind,
-        ) else {
-            let row = kept_row(
-                label,
-                root,
-                "owned",
-                "the root's identity or kind is unreadable".to_owned(),
-            );
-            self.keep(row);
-            return false;
+            Err(EvidenceError::Unreadable(reason)) => {
+                let row = self.kept_row(
+                    label,
+                    &name.name,
+                    Some(name.path.clone()),
+                    None,
+                    "unreadable",
+                    reason,
+                );
+                self.keep(row);
+                return;
+            }
         };
-        if kind == RootKind::CacheRoot {
-            let row = kept_row(
+        self.decide_area(label, &name.name, &observed);
+    }
+
+    /// Decide one area root from facts read under its own lock.
+    fn decide_area(&mut self, label: &str, name: &str, observed: &ObservedEntry) {
+        let path = Some(observed.path());
+        if !matches!(observed.marker, MarkerState::Owned(_)) {
+            let row = self.kept_row(
                 label,
-                root,
+                name,
+                path,
+                observed.root_id.clone(),
+                marker_state_name(observed.marker.name()),
+                "marker_unverified".to_owned(),
+            );
+            self.keep(row);
+            return;
+        }
+        let Some(owned) = observed.owned() else {
+            return;
+        };
+        let Some(root_id) = observed.root_id.clone() else {
+            let row = self.kept_row(
+                label,
+                name,
+                path,
+                None,
+                "owned",
+                "the root's marker proves no root id".to_owned(),
+            );
+            self.keep(row);
+            return;
+        };
+        let Some(marker_digest) = observed.marker_digest.clone() else {
+            let row = self.kept_row(
+                label,
+                name,
+                path,
+                Some(root_id),
+                "owned",
+                "the root's marker digest is unreadable".to_owned(),
+            );
+            self.keep(row);
+            return;
+        };
+        if owned.kind == RootKind::CacheRoot {
+            let row = self.kept_row(
+                label,
+                name,
+                path,
+                Some(root_id),
                 "owned",
                 "a cache placement's root is never pruned for space".to_owned(),
             );
             self.keep(row);
-            return false;
+            return;
         }
-        let Some(last_release_ms) = root.activity_record.last_release_ms else {
-            let row = kept_row(
-                label,
-                root,
-                "owned",
-                "the activity record's release time is unreadable".to_owned(),
-            );
-            self.keep(row);
-            return false;
-        };
-        if last_release_ms == 0 {
-            let row = kept_row(
-                label,
-                root,
-                "owned",
-                "the activity record records no release".to_owned(),
-            );
-            self.keep(row);
-            return false;
-        }
-        let first_created_ms = root.activity_record.first_created_ms.unwrap_or(0);
-        let bytes = match self.root_bytes(&root.configured_path, device, inode) {
-            Ok(bytes) => bytes,
-            Err(reason) => {
-                let row = kept_row(label, root, "owned", reason);
+        let holds = match area::read_holds(self.paths, self.observer, &root_id) {
+            Ok(holds) => holds,
+            Err(error) => {
+                let row = self.kept_row(
+                    label,
+                    name,
+                    path,
+                    Some(root_id),
+                    "owned",
+                    format!("the root's holds are unreadable: {error}"),
+                );
                 self.keep(row);
-                return false;
+                return;
             }
         };
+        let activity = match area::read_activity(self.paths, self.observer, &root_id) {
+            Ok(activity) => activity,
+            Err(error) => {
+                let row = self.kept_row(
+                    label,
+                    name,
+                    path,
+                    Some(root_id),
+                    "owned",
+                    format!("the root's activity record is unreadable: {error}"),
+                );
+                self.keep(row);
+                return;
+            }
+        };
+        let idle = area::assess_idleness(&area::IdleInputs {
+            marker: &observed.marker,
+            root_id: &root_id,
+            volume_uuid: self.record.volume_uuid.as_str(),
+            activity: &activity,
+            holds: &holds,
+            participation: IdleParticipation::Counts,
+            now_ms: self.now_ms,
+        });
+        if !idle.is_idle() {
+            let reason = idle.reason.map_or_else(
+                || "the root is not idle under the pressure matrix".to_owned(),
+                |reason| reason.as_str().to_owned(),
+            );
+            let row = self.kept_row(label, name, path, Some(root_id), "owned", reason);
+            self.keep(row);
+            return;
+        }
+        let bytes = match self.scan_bytes(&observed.handle) {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                let row = self.kept_row(label, name, path, Some(root_id), "owned", reason);
+                self.keep(row);
+                return;
+            }
+        };
+        let Some(record) = activity.record.as_ref() else {
+            let row = self.kept_row(
+                label,
+                name,
+                path,
+                Some(root_id),
+                "owned",
+                "the activity record is unreadable".to_owned(),
+            );
+            self.keep(row);
+            return;
+        };
+        let device = observed.handle.identity().device.get();
+        let inode = observed.handle.identity().inode;
         self.add_candidate(Candidate {
             key: LruKey {
-                last_release_ms,
-                first_created_ms,
+                last_release_ms: record.last_release_ms,
+                first_created_ms: record.first_created_ms,
                 root_id: root_id.clone(),
             },
             row: SpaceCandidateRow {
                 root_id,
                 area: label.to_owned(),
-                name: root.name.clone(),
-                path: root.configured_path.clone(),
+                name: name.to_owned(),
+                path: observed.path(),
                 bytes,
-                last_release_ms,
-                first_created_ms,
+                last_release_ms: record.last_release_ms,
+                first_created_ms: record.first_created_ms,
                 device,
                 inode,
                 marker_digest: marker_digest.clone(),
                 identity_digest: identity_digest(device, inode, &marker_digest),
             },
         });
-        true
-    }
-
-    /// A root's whole-tree allocated bytes, from a complete bounded scan under
-    /// the identity the listing observed. An incomplete scan, a changed identity
-    /// or an unreadable root keeps it: unknown bytes are never taken as zero.
-    fn root_bytes(&self, path: &Path, device: u64, inode: u64) -> std::result::Result<u64, String> {
-        let handle = self
-            .dirs
-            .open_path(path)
-            .map_err(|error| format!("the root cannot be opened to count its bytes: {error}"))?;
-        if handle.identity().device.get() != device || handle.identity().inode != inode {
-            return Err("the root's identity changed while the plan was built".to_owned());
-        }
-        let scan = area::scan_activity(self.dirs, &handle, self.now_ms);
-        if !scan.complete {
-            return Err(format!(
-                "the root's bytes could not be counted completely: {}",
-                scan.reason
-                    .unwrap_or_else(|| "the scan did not reach the whole subtree".to_owned())
-            ));
-        }
-        Ok(scan.allocated_bytes)
     }
 
     /// Barge's own scratch folder. It participates by construction, and a root is
     /// pressure-eligible only when the expiry predicate holds with its age
     /// relaxed to "idle now" and the pressure idleness matrix is idle.
+    ///
+    /// The sweep that finds the entries is a names and scopes index only: no
+    /// fact it read decides a row. Every entry is observed again under its own
+    /// shared lock, and a native entry is a candidate only when the sweep's own
+    /// expiry predicate also accepted it, so a root it vetoed (a nested marker,
+    /// for instance) stays kept even if this plan's narrower check would pass.
     fn scratch(&mut self) {
         let label = format!("{}/{}", scratch::SCRATCH_NAMESPACE, scratch::SCRATCH_AREA);
         if !self.has_time() {
@@ -1116,46 +1372,44 @@ impl Planner<'_> {
         if plan.truncated {
             self.truncated = true;
         }
+        let mut entries = Vec::new();
+        for row in &plan.candidates.rows {
+            entries.push(ScratchEntry {
+                name: row.name.clone(),
+                path: Some(row.path.clone()),
+                state: "native".to_owned(),
+                reason: None,
+                eligible: true,
+            });
+        }
+        for row in &plan.kept.rows {
+            entries.push(ScratchEntry {
+                name: row.name.clone(),
+                path: row.path.clone(),
+                state: row.state.clone(),
+                reason: Some(row.reason.clone()),
+                eligible: false,
+            });
+        }
         let mut examined = 0u64;
         let mut candidates = 0u64;
         let mut kept = 0u64;
-        for row in &plan.candidates.rows {
+        for entry in &entries {
             if !self.has_time() {
                 self.unreached = self
                     .unreached
-                    .saturating_add(plan.candidates.rows.len().saturating_sub(examined as usize));
+                    .saturating_add(entries.len().saturating_sub(examined as usize));
                 break;
             }
             examined = examined.saturating_add(1);
-            match self.scratch_root(row) {
-                Ok(candidate) => {
-                    self.add_candidate(candidate);
-                    candidates = candidates.saturating_add(1);
-                }
-                Err(reason) => {
-                    self.keep(SpaceKeptRow {
-                        area: label.clone(),
-                        name: row.name.clone(),
-                        path: Some(row.path.clone()),
-                        root_id: state::is_identifier(&row.name).then(|| row.name.clone()),
-                        state: "owned".to_owned(),
-                        reason,
-                    });
-                    kept = kept.saturating_add(1);
-                }
+            let before_candidates = self.candidate_total;
+            let before_kept = self.kept_total;
+            self.scratch_entry(&label, entry);
+            if self.candidate_total > before_candidates {
+                candidates = candidates.saturating_add(1);
+            } else if self.kept_total > before_kept {
+                kept = kept.saturating_add(1);
             }
-        }
-        for row in &plan.kept.rows {
-            examined = examined.saturating_add(1);
-            kept = kept.saturating_add(1);
-            self.keep(SpaceKeptRow {
-                area: label.clone(),
-                name: row.name.clone(),
-                path: row.path.clone(),
-                root_id: state::is_identifier(&row.name).then(|| row.name.clone()),
-                state: row.state.clone(),
-                reason: row.reason.clone(),
-            });
         }
         self.participation.push(SpaceParticipationRow {
             area: label,
@@ -1170,38 +1424,119 @@ impl Planner<'_> {
         });
     }
 
-    /// Re-verify one native scratch run and, when the pressure matrix is idle,
-    /// count its bytes. A row is only a candidate when its marker still matches,
-    /// its evidence belongs to this root and volume, and every input concluded.
-    fn scratch_root(&self, row: &scratch::PlanRow) -> std::result::Result<Candidate, String> {
-        let handle = self
-            .dirs
-            .open_path(&row.path)
-            .map_err(|error| format!("the root cannot be opened: {error}"))?;
-        if handle.identity().device.get() != row.device || handle.identity().inode != row.inode {
-            return Err("the root's identity changed while the plan was built".to_owned());
-        }
-        let expectation = MarkerExpectation {
-            volume_uuid: &self.record.volume_uuid,
-            resolved_path: &row.path,
-            mount_point: self.record.mount_hint.as_deref(),
-            effective_uid: self
-                .observer
-                .effective_uid()
-                .map_err(|error| format!("this account's uid is unreadable: {error}"))?,
-            now_ms: self.now_ms,
+    /// One scratch entry, decided under its own shared lock.
+    fn scratch_entry(&mut self, label: &str, entry: &ScratchEntry) {
+        let Some(path) = entry.path.clone() else {
+            let reason = entry.reason.clone().unwrap_or_else(|| {
+                "the entry could not be located, so nothing about it was read".to_owned()
+            });
+            let row = self.kept_row(label, &entry.name, None, None, &entry.state, reason);
+            self.keep(row);
+            return;
         };
-        let (marker, digest) = area::read_marker_with_digest(self.dirs, &handle, &expectation);
-        if digest.as_deref() != Some(row.marker_digest.as_str()) {
-            return Err("the root's marker changed while the plan was built".to_owned());
+        let observed = match self.observe_entry(&entry.name, &path) {
+            Ok(observed) => observed,
+            Err(EvidenceError::Locked(reason)) => {
+                let row = self.kept_row(label, &entry.name, Some(path), None, "locked", reason);
+                self.keep(row);
+                return;
+            }
+            Err(EvidenceError::Unreadable(reason)) => {
+                let reason = entry.reason.clone().unwrap_or(reason);
+                let row = self.kept_row(label, &entry.name, Some(path), None, &entry.state, reason);
+                self.keep(row);
+                return;
+            }
+        };
+        let Some(owned) = observed.owned() else {
+            let (state, reason) = match self.scratch_family(&observed.handle) {
+                Ok(family) => (
+                    family.to_owned(),
+                    "the entry is not Barge-owned data, so it never yields under the reserve"
+                        .to_owned(),
+                ),
+                Err(reason) => (entry.state.clone(), reason),
+            };
+            let row = self.kept_row(
+                label,
+                &entry.name,
+                Some(path),
+                observed.root_id.clone(),
+                &state,
+                reason,
+            );
+            self.keep(row);
+            return;
+        };
+        if owned.kind != RootKind::ScratchRun {
+            let row = self.kept_row(
+                label,
+                &entry.name,
+                Some(path),
+                observed.root_id.clone(),
+                "owned",
+                "the owned root is not a scratch run".to_owned(),
+            );
+            self.keep(row);
+            return;
         }
-        let holds = area::read_holds(self.paths, self.observer, &row.name)
-            .map_err(|error| format!("the root's holds are unreadable: {error}"))?;
-        let activity = area::read_activity(self.paths, self.observer, &row.name)
-            .map_err(|error| format!("the root's activity record is unreadable: {error}"))?;
+        let Some(root_id) = observed.root_id.clone() else {
+            let row = self.kept_row(
+                label,
+                &entry.name,
+                Some(path),
+                None,
+                "owned",
+                "the root's marker proves no root id".to_owned(),
+            );
+            self.keep(row);
+            return;
+        };
+        let Some(marker_digest) = observed.marker_digest.clone() else {
+            let row = self.kept_row(
+                label,
+                &entry.name,
+                Some(path),
+                Some(root_id),
+                "owned",
+                "the root's marker digest is unreadable".to_owned(),
+            );
+            self.keep(row);
+            return;
+        };
+        let holds = match area::read_holds(self.paths, self.observer, &root_id) {
+            Ok(holds) => holds,
+            Err(error) => {
+                let row = self.kept_row(
+                    label,
+                    &entry.name,
+                    Some(path),
+                    Some(root_id),
+                    "owned",
+                    format!("the root's holds are unreadable: {error}"),
+                );
+                self.keep(row);
+                return;
+            }
+        };
+        let activity = match area::read_activity(self.paths, self.observer, &root_id) {
+            Ok(activity) => activity,
+            Err(error) => {
+                let row = self.kept_row(
+                    label,
+                    &entry.name,
+                    Some(path),
+                    Some(root_id),
+                    "owned",
+                    format!("the root's activity record is unreadable: {error}"),
+                );
+                self.keep(row);
+                return;
+            }
+        };
         let idle = area::assess_idleness(&area::IdleInputs {
-            marker: &marker,
-            root_id: &row.name,
+            marker: &observed.marker,
+            root_id: &root_id,
             volume_uuid: self.record.volume_uuid.as_str(),
             activity: &activity,
             holds: &holds,
@@ -1209,46 +1544,129 @@ impl Planner<'_> {
             now_ms: self.now_ms,
         });
         if !idle.is_idle() {
-            return Err(idle.reason.map_or_else(
+            let reason = idle.reason.map_or_else(
                 || "the root is not idle under the pressure matrix".to_owned(),
                 |reason| reason.as_str().to_owned(),
-            ));
+            );
+            let row = self.kept_row(
+                label,
+                &entry.name,
+                Some(path),
+                Some(root_id),
+                "owned",
+                reason,
+            );
+            self.keep(row);
+            return;
         }
-        let Some(record) = activity.record.as_ref() else {
-            return Err("the root's activity record is unreadable".to_owned());
+        if !entry.eligible {
+            let reason = entry.reason.clone().unwrap_or_else(|| {
+                "the expiry predicate keeps this run, so the pressure predicate never takes it"
+                    .to_owned()
+            });
+            let row = self.kept_row(
+                label,
+                &entry.name,
+                Some(path),
+                Some(root_id),
+                "owned",
+                reason,
+            );
+            self.keep(row);
+            return;
+        }
+        let bytes = match self.scan_bytes(&observed.handle) {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                let row = self.kept_row(
+                    label,
+                    &entry.name,
+                    Some(path),
+                    Some(root_id),
+                    "owned",
+                    reason,
+                );
+                self.keep(row);
+                return;
+            }
         };
-        if record.last_release_ms == 0 {
-            return Err("the activity record records no release".to_owned());
-        }
-        let scan = area::scan_activity(self.dirs, &handle, self.now_ms);
-        if !scan.complete {
-            return Err(format!(
-                "the root's bytes could not be counted completely: {}",
-                scan.reason
-                    .unwrap_or_else(|| "the scan did not reach the whole subtree".to_owned())
-            ));
-        }
-        let marker_digest = row.marker_digest.clone();
-        Ok(Candidate {
+        let Some(record) = activity.record.as_ref() else {
+            let row = self.kept_row(
+                label,
+                &entry.name,
+                Some(path),
+                Some(root_id),
+                "owned",
+                "the activity record is unreadable".to_owned(),
+            );
+            self.keep(row);
+            return;
+        };
+        let device = observed.handle.identity().device.get();
+        let inode = observed.handle.identity().inode;
+        self.add_candidate(Candidate {
             key: LruKey {
                 last_release_ms: record.last_release_ms,
                 first_created_ms: record.first_created_ms,
-                root_id: row.name.clone(),
+                root_id: root_id.clone(),
             },
             row: SpaceCandidateRow {
-                root_id: row.name.clone(),
+                root_id,
                 area: format!("{}/{}", scratch::SCRATCH_NAMESPACE, scratch::SCRATCH_AREA),
-                name: row.name.clone(),
-                path: row.path.clone(),
-                bytes: scan.allocated_bytes,
+                name: entry.name.clone(),
+                path,
+                bytes,
                 last_release_ms: record.last_release_ms,
                 first_created_ms: record.first_created_ms,
-                device: row.device,
-                inode: row.inode,
+                device,
+                inode,
                 marker_digest: marker_digest.clone(),
-                identity_digest: identity_digest(row.device, row.inode, &marker_digest),
+                identity_digest: identity_digest(device, inode, &marker_digest),
             },
-        })
+        });
+    }
+
+    /// The foreign family one entry carries, read under its own lock.
+    fn scratch_family(&self, handle: &DirHandle) -> std::result::Result<&'static str, String> {
+        let present = |file: &str| {
+            self.dirs.child_facts(handle, file).map_err(|error| {
+                format!("the entry's foreign marker `{file}` could not be read: {error}")
+            })
+        };
+        if present(scratch::OXIDE_MARKER_FILE)?.is_some() {
+            return Ok("oxide_scratch");
+        }
+        if present(scratch::EFFIGY_MARKER_FILE)?.is_some() {
+            return Ok("effigy_scratch");
+        }
+        Ok("unmarked")
+    }
+}
+
+/// One scratch entry as the sweep's index names it.
+///
+/// The index supplies the name, where it lives and whether the expiry predicate
+/// accepted it; every fact that decides the row is read again under its own lock.
+struct ScratchEntry {
+    name: String,
+    path: Option<PathBuf>,
+    state: String,
+    reason: Option<String>,
+    eligible: bool,
+}
+
+impl ObservedEntry {
+    /// The root directory's path, as it was opened.
+    fn path(&self) -> PathBuf {
+        self.path.clone()
+    }
+
+    /// The marker, when it verifies as an owned root.
+    fn owned(&self) -> Option<&area::RootMarker> {
+        match &self.marker {
+            MarkerState::Owned(marker) => Some(marker),
+            MarkerState::Absent | MarkerState::Unknown { .. } => None,
+        }
     }
 }
 
@@ -1466,6 +1884,21 @@ mod tests {
             volume_uuid: volume,
             now_ms,
             wall: SPACE_PLAN_WALL,
+            lock_wait: crate::state::LOCK_WAIT,
+        }
+    }
+
+    /// A request with a short lock wait, so a busy root is refused quickly.
+    fn plan_request_with_lock_wait<'a>(
+        volume: &'a VolumeUuid,
+        now_ms: u64,
+        lock_wait: std::time::Duration,
+    ) -> SpacePruneRequest<'a> {
+        SpacePruneRequest {
+            volume_uuid: volume,
+            now_ms,
+            wall: SPACE_PLAN_WALL,
+            lock_wait,
         }
     }
 
@@ -2039,6 +2472,161 @@ mod tests {
         for name in ["", ".", "..", "a/b", "a\0b"] {
             assert!(!is_safe_component(name), "{name} is not one component");
         }
+    }
+
+    #[test]
+    fn a_busy_root_is_kept_while_the_other_roots_still_plan() {
+        let fixture = VolumeFixture::new("space-plan-busy-root");
+        let record = policy_record(&fixture, 16, 4);
+        let observer = fixture.observer();
+        let pool = declaration("pool", "example/pool", ReserveParticipation::Counts);
+        area::declare(&fixture.state, &pool, 1).expect("the area declares");
+        let (busy, _) = fixture.create_root(&record, &pool, RootKind::AreaRoot);
+        release_at(&fixture, &observer, &busy.root_id, 1_000, 500);
+        let (free, _) = fixture.create_root(&record, &pool, RootKind::AreaRoot);
+        release_at(&fixture, &observer, &free.root_id, 2_000, 1_500);
+
+        // A delete or a hold takes this root's own lock exclusively. The plan may
+        // not read that root's evidence, so it keeps that root alone and the rest
+        // of the area still plans.
+        let mut locks = LockSet::new(fixture.state.clone());
+        let held = locks
+            .lock_root(&busy.root_id)
+            .expect("the fixture holds the root lock");
+        let report = plan(
+            &fixture.state,
+            &fixture.platform(),
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &Injected(true),
+            &plan_request_with_lock_wait(
+                &fixture.uuid,
+                test_now(),
+                std::time::Duration::from_millis(30),
+            ),
+        )
+        .expect("the plan is built");
+        drop(held);
+        assert_eq!(report.plan.candidates.rows.len(), 1);
+        assert_eq!(report.plan.candidates.rows[0].root_id, free.root_id);
+        let busy_row = report
+            .kept
+            .rows
+            .iter()
+            .find(|row| row.name == busy.root_id)
+            .expect("the busy root is kept");
+        assert_eq!(busy_row.state, "locked");
+        assert!(
+            busy_row.reason.contains("own lock"),
+            "the busy root is kept because its own lock could not be observed: {}",
+            busy_row.reason
+        );
+        let pool_row = report
+            .participation
+            .rows
+            .iter()
+            .find(|row| row.area == "example/pool")
+            .expect("the area is reported");
+        assert_eq!(pool_row.candidates, Some(1));
+        assert_eq!(pool_row.kept, Some(1));
+
+        // A shared observer holds a compatible lock: the plan takes each root's
+        // lock shared, so it never refuses a root another read-only observation
+        // is holding, and the root still plans.
+        let lock_path = fixture
+            .state
+            .root_lock_path(&free.root_id)
+            .expect("the root lock path");
+        let shared = StateLock::shared_if_present(
+            &lock_path,
+            LockRank::Root,
+            Deadline::after(std::time::Duration::from_millis(500)),
+        )
+        .expect("the shared lock is taken")
+        .expect("the root lock file exists");
+        let report = plan(
+            &fixture.state,
+            &fixture.platform(),
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &Injected(true),
+            &plan_request(&fixture.uuid, test_now()),
+        )
+        .expect("a shared observer does not block the plan");
+        drop(shared);
+        assert_eq!(report.plan.candidates.rows.len(), 2);
+        assert!(report
+            .plan
+            .candidates
+            .rows
+            .iter()
+            .any(|row| row.root_id == free.root_id));
+    }
+
+    #[test]
+    fn a_busy_volume_lock_refuses_the_plan_and_a_shared_one_does_not() {
+        let fixture = VolumeFixture::new("space-plan-busy-volume");
+        let record = policy_record(&fixture, 16, 4);
+        let observer = fixture.observer();
+        let pool = declaration("pool", "example/pool", ReserveParticipation::Counts);
+        area::declare(&fixture.state, &pool, 1).expect("the area declares");
+        let (root, _) = fixture.create_root(&record, &pool, RootKind::AreaRoot);
+        release_at(&fixture, &observer, &root.root_id, 1_000, 500);
+
+        let mut locks = LockSet::new(fixture.state.clone());
+        let held = locks
+            .lock_volume(&fixture.uuid)
+            .expect("the fixture holds the volume lock");
+        let error = plan(
+            &fixture.state,
+            &fixture.platform(),
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &Injected(true),
+            &plan_request_with_lock_wait(
+                &fixture.uuid,
+                test_now(),
+                std::time::Duration::from_millis(30),
+            ),
+        )
+        .expect_err("a busy volume refuses the plan");
+        assert_eq!(error.kind(), ErrorKind::Locked);
+        assert_eq!(
+            error.detail()["lock"],
+            fixture
+                .state
+                .volume_lock_path(&fixture.uuid)
+                .display()
+                .to_string()
+        );
+        drop(held);
+
+        // The lock file exists now; a second observer is compatible, so the plan
+        // proceeds and still names the root.
+        let lock_path = fixture.state.volume_lock_path(&fixture.uuid);
+        let shared = StateLock::shared_if_present(
+            &lock_path,
+            LockRank::Volume,
+            Deadline::after(std::time::Duration::from_millis(500)),
+        )
+        .expect("the shared volume lock is taken")
+        .expect("the volume lock file exists");
+        let report = plan(
+            &fixture.state,
+            &fixture.platform(),
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &Injected(true),
+            &plan_request(&fixture.uuid, test_now()),
+        )
+        .expect("a shared observer does not block the plan");
+        drop(shared);
+        assert_eq!(report.plan.candidates.rows.len(), 1);
+        assert_eq!(report.plan.candidates.rows[0].root_id, root.root_id);
     }
 
     #[test]
