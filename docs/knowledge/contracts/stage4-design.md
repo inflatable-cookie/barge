@@ -1220,7 +1220,10 @@ depth past 64 levels, or its deadline leaves the age unknown too, which keeps th
 root. The deadline is checked before the scan, before every listing and again
 before the scan reports a complete observation, so a listing — including one that
 answers empty — cannot consume the bound and still leave a complete, old-looking
-age behind. A missing modification time is never read as zero: zero would make a
+age behind. The age is measured against **this plan's** clock, and an activity time
+ahead of that clock is unknown even when the scan (which compares against the clock
+it read, a moment later) did not see it as future: a timestamp that falls between
+the plan clock and the scan clock is not a known age of zero. A missing modification time is never read as zero: zero would make a
 live root look decades idle on both delete paths, which is why the scan treats it
 as unknown rather than as an old timestamp. The same scan counts the row's bytes. The
 bounds are `ACTIVITY_ENTRIES` (200 000 entries), `ACTIVITY_DEPTH` (64) and

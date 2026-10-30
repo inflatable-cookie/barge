@@ -998,35 +998,49 @@ fn decide_root(
         PrunePolicy::OldestIdleAfter { age_seconds } => Some(*age_seconds),
     };
     let scan = locked.activity.clone();
-    let idle =
-        match (declared_age, scan.last_activity_ms) {
-            (None, _) => IdleEvidence {
-                last_activity_ms: scan.last_activity_ms,
-                age_seconds: None,
-                declared_age_seconds: None,
-                reason: Some("the area declares no prune age, so no root is released".to_owned()),
-            },
-            (Some(declared), Some(last)) => IdleEvidence {
-                last_activity_ms: Some(last),
-                age_seconds: Some(request.now_ms.saturating_sub(last) / 1000),
-                declared_age_seconds: Some(declared),
-                reason: scan.reason.clone(),
-            },
-            (Some(declared), None) => IdleEvidence {
-                last_activity_ms: None,
-                age_seconds: None,
-                declared_age_seconds: Some(declared),
-                reason: Some(scan.reason.clone().unwrap_or_else(|| {
-                    "the root's last activity could not be observed".to_owned()
-                })),
-            },
-        };
+    // The age is measured against *this plan's* clock, so an activity time ahead of it
+    // is unknown here even when the later scan — which compares against the clock it
+    // read — did not see it as future. A timestamp that falls between the two clocks
+    // is exactly the case: it is not a known age of zero.
+    let measured = scan.last_activity_ms.filter(|last| *last <= request.now_ms);
+    let ahead_of_the_plan = scan.last_activity_ms.filter(|last| *last > request.now_ms);
+    let idle = match (declared_age, measured, ahead_of_the_plan) {
+        (None, _, last) => IdleEvidence {
+            last_activity_ms: last.or(scan.last_activity_ms),
+            age_seconds: None,
+            declared_age_seconds: None,
+            reason: Some("the area declares no prune age, so no root is released".to_owned()),
+        },
+        (Some(declared), Some(last), _) => IdleEvidence {
+            last_activity_ms: Some(last),
+            age_seconds: Some(request.now_ms.saturating_sub(last) / 1000),
+            declared_age_seconds: Some(declared),
+            reason: scan.reason.clone(),
+        },
+        (Some(declared), None, Some(last)) => IdleEvidence {
+            last_activity_ms: Some(last),
+            age_seconds: None,
+            declared_age_seconds: Some(declared),
+            reason: Some(format!(
+                "the newest activity {last} is ahead of this plan's clock {}, so the age is unknown",
+                request.now_ms
+            )),
+        },
+        (Some(declared), None, None) => IdleEvidence {
+            last_activity_ms: None,
+            age_seconds: None,
+            declared_age_seconds: Some(declared),
+            reason: Some(scan.reason.clone().unwrap_or_else(|| {
+                "the root's last activity could not be observed".to_owned()
+            })),
+        },
+    };
     match declared_age {
         None => blockers.push((
             "policy",
             "the area declares no prune age, so its roots are never released".to_owned(),
         )),
-        Some(declared) => match scan.last_activity_ms {
+        Some(declared) => match measured {
             None => blockers.push((
                 "policy",
                 format!(
@@ -2323,6 +2337,47 @@ mod tests {
             "{kept:?}"
         );
         assert!(kept.bytes.is_some_and(|bytes| !bytes.complete));
+    }
+
+    #[test]
+    fn an_activity_time_ahead_of_the_plans_clock_is_unknown() {
+        // The age is measured against the plan's own clock, so an activity timestamp
+        // that falls between the plan clock and the later scan clock is unknown, not a
+        // known age of zero. The payload is written now, while the plan's clock is a
+        // minute behind, which is exactly that interval.
+        let fixture = Fixture::new("release-clock-interval");
+        let root = fixture.root();
+        VolumeFixture::payload(&root.path, "target/debug/artifact", b"bytes");
+        let scan_clock = crate::state::now_ms();
+        let plan_clock = scan_clock.saturating_sub(60_000);
+        let report = fixture.plan_at(plan_clock);
+        let kept = row(&report, &root);
+        assert!(!kept.eligible, "{kept:?}");
+        assert_eq!(kept.blocked_by.as_deref(), Some("policy"));
+        let last = kept
+            .idle
+            .last_activity_ms
+            .expect("the observation is still reported");
+        assert!(last > plan_clock, "the fixture is in the interval");
+        assert!(
+            kept.idle.age_seconds.is_none(),
+            "an activity ahead of the plan clock was reported as a known age: {kept:?}"
+        );
+        assert!(
+            kept.idle
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("ahead of this plan's clock")),
+            "{kept:?}"
+        );
+
+        // The same root measured against a clock after its activity has an age.
+        let report = fixture.plan();
+        let released = row(&report, &root);
+        assert!(
+            released.idle.age_seconds.is_some(),
+            "a measured age is reported: {released:?}"
+        );
     }
 
     #[test]
