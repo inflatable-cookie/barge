@@ -1449,22 +1449,10 @@ fn scratch_claim(mut options: Options) -> Result<Report, Error> {
 
 fn expire_summary(report: &ExpireReport) -> String {
     let plan = &report.plan;
-    let replay = report.replay.as_ref().map_or_else(String::new, |replay| {
-        // A replayed intent whose volume reconnected on a new device number is
-        // named, so a reboot does not look like a run that changed nothing.
-        let remounted = if replay.remounted == 0 {
-            String::new()
-        } else {
-            format!(", {} remounted", replay.remounted)
-        };
-        format!(
-            "replay: {} settled, {} resumed, {} pending{}; ",
-            replay.settled,
-            replay.resumed,
-            replay.pending.len(),
-            remounted
-        )
-    });
+    let replay = report
+        .replay
+        .as_ref()
+        .map_or_else(String::new, replay_summary);
     format!(
         "{}scratch plan {}: {} candidate(s), {} kept, {} examined{}, deleted {}, pending {}; {replay}{}\n",
         if report.preview { "previewed " } else { "" },
@@ -1476,6 +1464,26 @@ fn expire_summary(report: &ExpireReport) -> String {
         report.deleted.count,
         report.pending.count,
         if report.volume_present { "volume attached" } else { "volume absent" },
+    )
+}
+
+/// One replay report's line of the expiry summary.
+///
+/// A replayed intent whose volume reconnected on a new device number is named, so a
+/// reboot does not look like a run that changed nothing; a replay that re-established
+/// nothing says nothing extra, and a preview has no replay at all.
+fn replay_summary(replay: &barge::delete::ReplayReport) -> String {
+    let remounted = if replay.remounted == 0 {
+        String::new()
+    } else {
+        format!(", {} remounted", replay.remounted)
+    };
+    format!(
+        "replay: {} settled, {} resumed, {} pending{}; ",
+        replay.settled,
+        replay.resumed,
+        replay.pending.len(),
+        remounted
     )
 }
 
@@ -1933,4 +1941,58 @@ fn observation_name(state: describe::ObservationState) -> &'static str {
 
 fn usage(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Usage, message).with_detail("usage", USAGE.into())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::replay_summary;
+    use barge::delete::{PendingRow, ReplayReport};
+    use barge::state::IntentPhase;
+
+    /// One replay report with `remounted` resumed deletions and no pending rows.
+    fn report(remounted: usize) -> ReplayReport {
+        ReplayReport {
+            examined: 1,
+            settled: 0,
+            rolled_back: 0,
+            resumed: 1,
+            pending: Vec::new(),
+            entries_removed: 3,
+            remounted,
+        }
+    }
+
+    #[test]
+    fn the_replay_summary_names_a_remount_only_when_one_happened() {
+        // The two decision rows of the summary's remounting branch: a replay that
+        // re-established nothing keeps the line the earlier slices printed, and one
+        // that ran on a volume with a new device number says so.
+        let unchanged = replay_summary(&report(0));
+        assert_eq!(unchanged, "replay: 0 settled, 1 resumed, 0 pending; ");
+        assert!(!unchanged.contains("remounted"));
+
+        let remounted = replay_summary(&report(2));
+        assert_eq!(
+            remounted,
+            "replay: 0 settled, 1 resumed, 0 pending, 2 remounted; "
+        );
+    }
+
+    #[test]
+    fn the_replay_summary_still_counts_the_intents_that_stay_pending() {
+        let mut held = report(1);
+        held.pending.push(PendingRow {
+            intent_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            unit_name: "leftover".to_owned(),
+            unit_kind: "directory".to_owned(),
+            phase: IntentPhase::Renamed,
+            reason: "the volume's device changed and the captured leaf is another object"
+                .to_owned(),
+        });
+        assert_eq!(
+            replay_summary(&held),
+            "replay: 0 settled, 1 resumed, 1 pending, 1 remounted; "
+        );
+    }
 }

@@ -1325,11 +1325,15 @@ row prints it — verdict, optional reason code, inode, both devices, the remoun
 mount-moved facts, the marker digest — and `absence` is the `barge.absence/1`
 document itself, with its own `proved_ms`. Both live in `evidence`, which the plan
 and the intent now share, so one reader decides both documents: a verdict outside
-the design's set, a reason outside its table, an `absent` proof without the
-ancestor and leaf that prove it, an unknown verdict without a reason, a path that is
-not absolute with named components only, or a document over 4 KiB is unknown state.
-`read_prune_plan` reads them through the same validator, which is a stricter reading
-of the plan than F3 left and not a change to its field set.
+the design's set, a reason outside its table, a `verified` identity that does not
+carry its inode, both devices, the remount and mount-moved facts and the marker
+digest, an `absent` proof without the ancestor and leaf that prove it, an
+`unknown` **absence** without a reason, a `present` walk that carries an ancestor or
+leaf, a path that is not absolute with named components only, or a document over
+4 KiB is unknown state. An `unknown` **identity** needs no reason, because a plan row
+that could not observe a root reports exactly that: it says nothing was decided, and
+it keeps the root. `read_prune_plan` reads them through the same validator, which is
+a stricter reading of the plan than F3 left and not a change to its field set.
 
 What an intent may state. An intent names a unit only when every condition of its
 gate held, so a recorded identity is `verified` and a recorded absence is `absent`; a
