@@ -1438,15 +1438,39 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
         );
         return;
     };
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    // The volume-backed fixture is one fresh `mktemp -d` directory under the
+    // volume's own scratch root. Its parent is the operator's scratch directory
+    // and is never created, renamed or removed here, and no self-named sibling is
+    // made: `mktemp` owns the name, this test owns only the directory it returns
+    // and removes it afterwards.
+    let scratch_root = mount.join("scratch/barge");
+    if !scratch_root.is_dir() {
+        eprintln!(
+            "skipped: {} is not a directory, so there is no scratch root to make a fixture in",
+            scratch_root.display()
+        );
+        return;
+    }
+    let template = scratch_root.join("barge-cli-volume.XXXXXX");
+    let made = Command::new("mktemp")
+        .arg("-d")
+        .arg(template.as_os_str())
+        .output()
+        .expect("mktemp starts");
+    assert!(
+        made.status.success(),
+        "mktemp -d makes the fixture directory: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let made_path = String::from_utf8(made.stdout).expect("mktemp prints a path");
     let scratch = MountScratch {
-        path: mount
-            .join("scratch/barge")
-            .join(format!("cli-volume-{}-{nanos}", std::process::id())),
+        path: PathBuf::from(made_path.trim_end()),
     };
-    std::fs::create_dir_all(&scratch.path).expect("the scratch directory is created");
+    assert!(
+        scratch.path.is_dir(),
+        "mktemp -d made {}",
+        scratch.path.display()
+    );
     let root_dir = scratch
         .path
         .strip_prefix(&mount)
@@ -1777,6 +1801,52 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
     assert_eq!(row["activity"]["state"], "unreleased");
     assert_eq!(row["space_idle"]["state"], "not_idle");
     assert_eq!(row["space_idle"]["reason"], "hold_live");
+
+    // An undecidable hold: its recorded process start identity no longer matches
+    // the live pid, so it is neither live nor stale and the root is kept.
+    let hold_path = state_dir.join(format!("holds/{second}/prover.json"));
+    let bytes = std::fs::read(&hold_path).expect("the hold reads");
+    let mut document: Value = serde_json::from_slice(&bytes).expect("the hold parses");
+    let recorded = document["process_start"]
+        .as_u64()
+        .expect("the hold records a process start");
+    document["process_start"] = Value::from(recorded.wrapping_add(1));
+    std::fs::write(
+        &hold_path,
+        serde_json::to_vec_pretty(&document).expect("the hold encodes"),
+    )
+    .expect("the undecidable hold is written");
+    let listed = run_area(
+        &[
+            "root",
+            "list",
+            "--namespace",
+            "fixture",
+            "--area",
+            "pool",
+            "--volume",
+            &volume,
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(listed.status.code(), Some(0));
+    let listed = stdout_document(&listed);
+    let row = listed["data"]["roots"]["rows"]
+        .as_array()
+        .expect("the listing carries rows")
+        .iter()
+        .find(|row| row["root_id"] == Value::String(second.clone()))
+        .expect("the root is listed");
+    assert_eq!(row["idle"], false, "an undecidable hold is not idle");
+    assert_eq!(row["holds"][0]["state"], "unknown");
+    assert!(
+        row["holds"][0]["reason"].is_string(),
+        "an unknown hold reports why it could not be decided"
+    );
+    assert_eq!(row["activity"]["state"], "unreleased");
+    assert_eq!(row["space_idle"]["state"], "not_idle");
+    assert_eq!(row["space_idle"]["reason"], "hold_unknown");
 
     let released = run_area(
         &["release", "--root", &second, "--holder", "prover"],

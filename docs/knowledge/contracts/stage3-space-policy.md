@@ -1571,11 +1571,15 @@ T6, and no native proof exists or is claimed.
 - **The CLI prints these documents against a verified volume.** The suite's CLI
   case registers the `/Volumes/<name>` mount its checkout is on inside its own
   throwaway state directory, keeps every write inside one scratch directory it
-  creates under that volume's `scratch/barge/` and removes, and asserts end to end:
-  the successful `barge.area.idle-baseline/1` document; and all four
-  `barge.area.root.list/1` decisions — `activity_unreleased` for a root created and
-  never released, `hold_live` for a held root (with stage 1's `idle` false and the
-  live hold row), `activity_unknown` for a root whose record was lost (kept, with
+  creates with `mktemp -d` under that volume's `scratch/barge/` and removes (its
+  parent is the operator's scratch root and is never created, renamed or removed,
+  and no self-named sibling is made), and asserts end to end: the successful
+  `barge.area.idle-baseline/1` document; and all five `barge.area.root.list/1`
+  decisions — `activity_unreleased` for a root created and never released,
+  `hold_live` for a held root (with stage 1's `idle` false and the live hold row),
+  `hold_unknown` for a hold whose recorded process start identity no longer
+  matches its live pid (kept, with the hold's own reason reported),
+  `activity_unknown` for a root whose record was lost (kept, with
   `activity.state: missing`), and `idle` once the root's activity is recorded. A
   checkout that is not under a `/Volumes` mount has no non-boot volume the OS layer
   can verify; the case reports that it skipped, and the library tests own the
