@@ -1766,11 +1766,29 @@ pub fn read_oxide_marker(
     if facts.kind != crate::os::EntryKind::File {
         return Err("the Oxide marker is not a regular file".to_owned());
     }
-    let bytes = match dirs.read_child_file(root, OXIDE_MARKER_FILE, MARKER_CAP_BYTES) {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => return Ok(None),
+    let bytes =
+        match dirs.read_child_file(root, OXIDE_MARKER_FILE, MARKER_CAP_BYTES) {
+            Ok(Some(bytes)) => bytes,
+            // The marker was observed a moment ago; a read that finds nothing is a
+            // change under the observation, never "this root has no Oxide marker".
+            Ok(None) => return Err(
+                "the Oxide marker was observed and is no longer there, so the observation changed"
+                    .to_owned(),
+            ),
+            Err(error) => return Err(format!("the marker cannot be read: {error}")),
+        };
+    // The bytes are evidence only if the same entry is still the one that was
+    // observed before the read.
+    match dirs.child_facts(root, OXIDE_MARKER_FILE) {
+        Ok(Some(after)) if after == facts => {}
+        Ok(_) => {
+            return Err(
+                "the Oxide marker changed while it was read, so the observation is not stable"
+                    .to_owned(),
+            )
+        }
         Err(error) => return Err(format!("the marker cannot be read: {error}")),
-    };
+    }
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("the marker is not one JSON document: {error}"))?;
     let version = value
@@ -2540,6 +2558,38 @@ mod tests {
                 OxideReceipts::Unknown { .. }
             ),
             "a listed receipt that vanished was read as an empty complete census"
+        );
+    }
+
+    #[test]
+    fn a_marker_that_disappears_after_it_was_observed_is_unknown() {
+        // The marker is observed, then removed before its bytes are read: a change
+        // under the observation, never "this root carries no Oxide marker".
+        let fixture = crate::testkit::TempDir::new("marker-vanishes");
+        let dirs = crate::testkit::Faults::default();
+        std::fs::write(
+            fixture.join(OXIDE_MARKER_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "version": OXIDE_MARKER_V2,
+                "checkout": "/c",
+                "checkout_id": "checkout-1",
+                "label": "example",
+                "recipe": "target-debug-v1",
+                "kind": "external",
+                "generation": 1,
+                "created_ms": 1_000,
+            }))
+            .expect("the marker encodes"),
+        )
+        .expect("the marker is written");
+        let handle = dirs.open_path(fixture.path()).expect("the root opens");
+        // Readable while nothing races it.
+        assert!(matches!(read_oxide_marker(&dirs, &handle), Ok(Some(_))));
+        dirs.vanishing_on_read(OXIDE_MARKER_FILE);
+        let found = read_oxide_marker(&dirs, &handle);
+        assert!(
+            found.is_err(),
+            "a marker that vanished between observation and read was read as absent: {found:?}"
         );
     }
 

@@ -617,6 +617,12 @@ pub struct Faults {
     /// When set, every directory's own facts report another owner, which is how a
     /// root that belongs to a different account is simulated.
     pub foreign_directory_owner: Cell<bool>,
+    /// A name whose file is removed between its observation and its read, so the
+    /// reader meets a marker that was there and is gone.
+    pub vanish_on_read_name: RefCell<Option<String>>,
+    /// A one-shot pause immediately before a directory listing, so a scan's own
+    /// deadline can expire while it is listing.
+    pub sleep_before_listing: RefCell<Option<std::time::Duration>>,
     /// Every child name this wrapper opened, in order. A caller that must not
     /// read an entry before its own lock uses it to prove nothing was opened.
     pub opened_child_names: RefCell<Vec<String>>,
@@ -759,6 +765,17 @@ impl Faults {
     /// different account would.
     pub fn with_foreign_directory_owner(&self) {
         self.foreign_directory_owner.set(true);
+    }
+
+    /// Remove this child between the observation that listed it and the read that
+    /// follows, as a racer would.
+    pub fn vanishing_on_read(&self, name: &str) {
+        *self.vanish_on_read_name.borrow_mut() = Some(name.to_owned());
+    }
+
+    /// Pause once, immediately before the next directory listing.
+    pub fn sleeping_before_listing(&self, pause: std::time::Duration) {
+        *self.sleep_before_listing.borrow_mut() = Some(pause);
     }
 
     pub fn failing_remove(&self, name: &str, times: usize) {
@@ -1231,6 +1248,12 @@ impl DirOps for Faults {
                 "injected interrupted settings readback",
             ));
         }
+        let vanish = self.vanish_on_read_name.borrow().clone();
+        if vanish.as_deref() == Some(name) {
+            *self.vanish_on_read_name.borrow_mut() = None;
+            let _ = self.inner.remove_child(parent, name, RemoveKind::File);
+            return Ok(None);
+        }
         self.inner.read_child_file(parent, name, cap)
     }
 
@@ -1245,6 +1268,9 @@ impl DirOps for Faults {
                 ErrorKind::Io,
                 "the listing after the mode change did not happen",
             ));
+        }
+        if let Some(pause) = self.sleep_before_listing.borrow_mut().take() {
+            std::thread::sleep(pause);
         }
         let mut listing = self.inner.list_children(parent, max_names)?;
         for entry in &mut listing.entries {

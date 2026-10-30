@@ -3541,17 +3541,22 @@ struct ActivityBudget {
 }
 
 impl ActivityBudget {
+    /// The deadline's own check, so a scan that spent all its time inside one
+    /// listing cannot report a complete observation afterwards.
+    fn check(&self) -> std::result::Result<(), String> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err("scanning the root did not finish inside its wall-clock bound".to_owned());
+        }
+        Ok(())
+    }
+
     fn spend(&mut self) -> std::result::Result<(), String> {
         if self.entries >= ACTIVITY_ENTRIES {
             return Err(format!(
                 "the root holds more than the {ACTIVITY_ENTRIES} entries this scan examines"
             ));
         }
-        if std::time::Instant::now() >= self.deadline {
-            return Err(format!(
-                "scanning the root did not finish inside its {ACTIVITY_WALL:?} bound"
-            ));
-        }
+        self.check()?;
         self.entries = self.entries.saturating_add(1);
         Ok(())
     }
@@ -3569,6 +3574,18 @@ pub fn scan_activity(
     root: &DirHandle,
     own_modified_ms: Option<u64>,
     now_ms: u64,
+) -> RootActivity {
+    scan_activity_within(dirs, root, own_modified_ms, now_ms, ACTIVITY_WALL)
+}
+
+/// [`scan_activity`] with an explicit wall clock, so a test can prove what a scan
+/// that reaches its own bound reports.
+pub fn scan_activity_within(
+    dirs: &dyn DirOps,
+    root: &DirHandle,
+    own_modified_ms: Option<u64>,
+    now_ms: u64,
+    wall: Duration,
 ) -> RootActivity {
     let own = match dirs.dir_facts(root) {
         Ok(facts) => facts,
@@ -3598,7 +3615,7 @@ pub fn scan_activity(
     };
     let mut budget = ActivityBudget {
         entries: 1,
-        deadline: std::time::Instant::now() + ACTIVITY_WALL,
+        deadline: std::time::Instant::now() + wall,
     };
     if let Err(reason) = walk_activity(dirs, root, 0, &mut budget, &mut activity) {
         activity.complete = false;
@@ -3640,6 +3657,9 @@ fn walk_activity(
     let listing = dirs
         .list_children(handle, LISTING_NAME_ROWS)
         .map_err(|error| format!("the root's subtree cannot be listed: {error}"))?;
+    // A listing can consume the whole bound, including one that answers empty: the
+    // deadline is checked again before anything is concluded from it.
+    budget.check()?;
     if listing.truncated {
         return Err(format!(
             "a directory in the root holds more than the {LISTING_NAME_ROWS} names one listing reads"
@@ -3681,6 +3701,7 @@ fn walk_activity(
         }
         walk_activity(dirs, &child, depth + 1, budget, activity)?;
     }
+    budget.check()?;
     Ok(())
 }
 
@@ -3887,10 +3908,10 @@ mod tests {
 
     use super::{
         declare, folder_components, hold, list_roots, list_roots_with, read_declarations,
-        read_holds, read_marker, release, resolve, show, validate_name, ActivityMode,
-        AreaDeclaration, HoldRequest, HoldScope, HoldState, MarkerExpectation, MarkerState,
-        MarkerStateName, RootKind, RootSpec, AREA_DIRECTORY_MODE, ROOT_DIRECTORY_MODE,
-        ROOT_MARKER_FILE,
+        read_holds, read_marker, release, resolve, scan_activity, scan_activity_within, show,
+        validate_name, ActivityMode, AreaDeclaration, HoldRequest, HoldScope, HoldState,
+        MarkerExpectation, MarkerState, MarkerStateName, RootKind, RootSpec, AREA_DIRECTORY_MODE,
+        ROOT_DIRECTORY_MODE, ROOT_MARKER_FILE,
     };
     use crate::digest::sha256_hex;
     use crate::error::{Error, ErrorKind, Result};
@@ -5991,6 +6012,46 @@ mod tests {
             ),
             "{activity:?}"
         );
+    }
+
+    #[test]
+    fn a_scan_that_reaches_its_bound_is_never_complete() {
+        // An empty listing can consume the whole bound: the scan must then report
+        // that it did not finish, never a complete observation with an old time.
+        let fixture = Fixture::new("activity-bound");
+        fixture.register(&fixture.record);
+        let declaration = fixture.declaration("pool");
+        let (root, _) = fixture.create_root(&fixture.record, &declaration);
+        let dirs = crate::testkit::Faults::default();
+        // The pause is longer than the wall clock this scan is given.
+        dirs.sleeping_before_listing(Duration::from_millis(250));
+        let handle = dirs.open_path(&root.path).expect("the root opens");
+        let scanned = scan_activity_within(
+            &dirs,
+            &handle,
+            None,
+            crate::state::now_ms(),
+            Duration::from_millis(100),
+        );
+        assert_eq!(
+            scanned.last_activity_ms, None,
+            "a scan past its bound reported an activity time"
+        );
+        assert!(!scanned.complete);
+        assert!(
+            scanned
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("wall-clock bound")),
+            "{scanned:?}"
+        );
+
+        // The same root with a bound it can meet is complete.
+        let dirs = crate::testkit::Faults::default();
+        let handle = dirs.open_path(&root.path).expect("the root opens");
+        let scanned = scan_activity(&dirs, &handle, None, crate::state::now_ms());
+        assert!(scanned.complete, "{scanned:?}");
+        assert!(scanned.last_activity_ms.is_some());
     }
 
     #[test]

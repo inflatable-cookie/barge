@@ -1119,7 +1119,11 @@ schema divergence — never a settled row, an empty registry or "no references" 
 and a root marker that omits a field Oxide always writes — or states a root kind
 outside `external` and `local` — is unreadable for the same reason: a divergent
 marker is not understood ownership, so the reference set it belongs to is
-incomplete and its root is kept rather than qualified by its own absence proof. A receipt is read at its own version's shape: each of
+incomplete and its root is kept rather than qualified by its own absence proof. A
+marker that was observed and is gone when its bytes are read — or whose own facts
+changed across that read — changed under the observation and is unknown for the
+same reason: a marker's absence is only ever concluded from one look that found
+none. A receipt is read at its own version's shape: each of
 `oxide.outputs.transition/1`, `/2` and `/3` must carry exactly the fields and the
 shape that version writes, `state` must be one of Oxide's five states, and a
 document that carries another version's shape or omits a required field
@@ -1178,9 +1182,12 @@ is never used in its place. The scan never follows a symbolic link, and a
 modification time ahead of this run's clock, an entry that reports no modification
 time at all, an unreadable subtree, a name that exceeds one listing's bound, a
 depth past 64 levels, or its deadline leaves the age unknown too, which keeps the
-root. A missing modification time is never read as zero: zero would make a live
-root look decades idle on both delete paths, which is why the scan treats it as
-unknown rather than as an old timestamp. The same scan counts the row's bytes. The
+root. The deadline is checked before the scan, before every listing and again
+before the scan reports a complete observation, so a listing — including one that
+answers empty — cannot consume the bound and still leave a complete, old-looking
+age behind. A missing modification time is never read as zero: zero would make a
+live root look decades idle on both delete paths, which is why the scan treats it
+as unknown rather than as an old timestamp. The same scan counts the row's bytes. The
 bounds are `ACTIVITY_ENTRIES` (200 000 entries), `ACTIVITY_DEPTH` (64) and
 `ACTIVITY_WALL` (5 s) per root in `area`. Both delete paths now use this clock:
 `barge maintain`'s area policy asks the listing for the scan, and the release
