@@ -1671,6 +1671,8 @@ pub fn sweep(
         &record,
         request.now_ms,
         request.bounds,
+        SweepPolicy::design(),
+        false,
     )?;
     let digest = plan_digest(&plan)?;
     if request.preview {
@@ -1717,6 +1719,190 @@ pub fn sweep(
         request.now_ms,
         None,
     )
+}
+
+/// Barge's own scratch runs a space-pressure prune may yield, and the ones it
+/// may not.
+///
+/// It is the expiry sweep's classification with the native age relaxed to "idle
+/// now", which is the predicate the stage 3 design fixes for scratch under the
+/// reserve (O-015): the four facts a positive conclusion records — closed,
+/// positive, exclusive and kept as evidence — are never relaxed, and neither is
+/// the hold, device, uid or nested-marker rule. Foreign families and entries the
+/// sweep cannot classify are not space candidates, so they never consume the
+/// candidate capacity a native root needs, but they are still reported as kept
+/// rows: an entry this plan cannot classify must not disappear from it.
+///
+/// This plan is an index, not evidence: its eligibility is not carried into the
+/// pressure decision. The caller observes each row under its own root lock and
+/// calls [`pressure_eligible`] there, which re-decides the marker, the four
+/// conclusion facts and the nested-marker walk, so a fact that changed between
+/// the sweep and the lock cannot authorize a candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PressurePlan {
+    /// The native runs that passed the expiry predicate with its age relaxed.
+    pub candidates: RowSet<PlanRow>,
+    /// The entries kept, with the reason. It carries every decision the sweep
+    /// made, including a foreign family, a symbolic link, a quarantine leaf, an
+    /// unreadable project folder and a native run kept by the expiry predicate;
+    /// age alone is never a reason.
+    pub kept: RowSet<KeptRow>,
+    /// How many entries the sweep examined.
+    pub examined: usize,
+    /// Whether a bound stopped the sweep before the folder was exhausted.
+    pub truncated: bool,
+}
+
+/// Plan the native scratch runs the pressure predicate may yield.
+///
+/// It creates and deletes nothing, and it never deletes: the caller turns a row
+/// into a candidate only after observing it under its own root lock and
+/// re-deciding the expiry predicate there with [`pressure_eligible`].
+#[allow(clippy::too_many_arguments)]
+pub fn pressure_plan(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    volume_uuid: &VolumeUuid,
+    now_ms: u64,
+    bounds: SweepBounds,
+) -> Result<PressurePlan> {
+    let record = area::registered_volume(state_paths, volume_uuid)?;
+    record.declared_durability()?;
+    // Only the native age is relaxed. Every other family's age is untouched
+    // because its rows are not recorded at all.
+    let policy = SweepPolicy {
+        native_age_seconds: 0,
+        ..SweepPolicy::design()
+    };
+    let plan = build_plan(
+        dirs,
+        facts,
+        mounts,
+        observer,
+        state_paths,
+        &record,
+        now_ms,
+        bounds,
+        policy,
+        true,
+    )?;
+    // Every kept row the sweep decided is reported, including a symlink, a
+    // quarantine leaf, an unreadable project folder, a foreign family and an
+    // unmarked entry: an entry this plan cannot classify must not vanish from it,
+    // and only native rows were ever in `candidates`.
+    Ok(PressurePlan {
+        truncated: plan.truncated || plan.candidates.truncated || plan.kept.truncated,
+        candidates: plan.candidates,
+        kept: plan.kept,
+        examined: plan.examined,
+    })
+}
+
+/// Whether one already-opened native scratch root satisfies the expiry
+/// predicate with its age relaxed to "idle now".
+///
+/// The caller holds the root's own shared lock, so the marker, the conclusion
+/// facts and the nested-marker walk all describe one moment. This is what keeps
+/// the pressure plan from deciding a root on a sweep that ran before the lock: a
+/// marker that appeared in the tree in between is found here and keeps the root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeEligibility {
+    /// Whether every fact the expiry predicate needs positively holds.
+    pub eligible: bool,
+    /// Why it does not, when it does not.
+    pub reason: String,
+    /// The marker digest the predicate read, when the marker verified. A caller
+    /// that already read a digest under the same lock compares this with its own.
+    pub marker_digest: Option<String>,
+}
+
+impl NativeEligibility {
+    /// A root the expiry predicate keeps.
+    fn kept(reason: String) -> Self {
+        Self {
+            eligible: false,
+            reason,
+            marker_digest: None,
+        }
+    }
+}
+
+/// Decide one native scratch root against the expiry predicate, age relaxed,
+/// under the caller's root lock.
+#[allow(clippy::too_many_arguments)]
+pub fn pressure_eligible(
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    state_paths: &StatePaths,
+    record: &VolumeRecord,
+    name: &str,
+    path: &Path,
+    unit: &DirHandle,
+    expected_device: DeviceId,
+    now_ms: u64,
+    wall: Duration,
+) -> Result<NativeEligibility> {
+    let facts = dirs.dir_facts(unit)?;
+    let uid = observer.effective_uid()?;
+    if facts.uid != uid {
+        return Ok(NativeEligibility::kept(format!(
+            "the unit is owned by uid {}, not this account's {uid}",
+            facts.uid
+        )));
+    }
+    if facts.device != expected_device {
+        return Ok(NativeEligibility::kept(
+            "the unit is on another device".to_owned(),
+        ));
+    }
+    let ctx = SweepContext {
+        dirs,
+        observer,
+        state_paths,
+        record,
+        device: facts.device,
+        now_ms,
+        grants: &record.scratch_grants,
+        policy: SweepPolicy {
+            native_age_seconds: 0,
+            ..SweepPolicy::design()
+        },
+        native_only: true,
+    };
+    // The nested-marker walk is bounded by the caller's remaining plan wall,
+    // never by a fresh default window: a recheck that starts near the deadline
+    // must stop at it and keep the root.
+    let mut budget = Budget::new(SweepBounds {
+        examine: SWEEP_EXAMINE,
+        timeout: wall,
+    });
+    let scope = UnitScope::TopLevel;
+    match assess_native(&ctx, unit, path, name, &scope)? {
+        Assessed::Kept { reason, .. } => Ok(NativeEligibility::kept(reason)),
+        Assessed::Eligible(row, _) => {
+            // The nested-marker walk is the expiry predicate's evidence that the
+            // conclusion's exclusive scope is true of the tree, and it is read
+            // here, under the root lock, not carried over from the sweep.
+            if let Some(reason) = nested_marker_in_tree(
+                dirs,
+                unit,
+                area::ROOT_MARKER_FILE,
+                0,
+                Path::new(""),
+                &mut budget,
+            )? {
+                return Ok(NativeEligibility::kept(reason));
+            }
+            Ok(NativeEligibility {
+                eligible: true,
+                reason: String::new(),
+                marker_digest: Some(row.marker_digest),
+            })
+        }
+    }
 }
 
 /// Apply one `barge.scratch.plan/1` exactly as it stands, re-verifying each unit.
@@ -2263,6 +2449,10 @@ struct SweepContext<'a> {
     now_ms: u64,
     grants: &'a ScratchGrants,
     policy: SweepPolicy,
+    /// Record Barge's own native units only. The pressure plan uses it: a foreign
+    /// family is never a space candidate, so its rows must not consume the plan's
+    /// row bound and hide a native root.
+    native_only: bool,
 }
 
 impl SweepContext<'_> {
@@ -2399,9 +2589,10 @@ fn build_plan(
     record: &VolumeRecord,
     now_ms: u64,
     bounds: SweepBounds,
+    policy: SweepPolicy,
+    native_only: bool,
 ) -> Result<SweepPlan> {
     let scratch = scratch_folder(record);
-    let policy = SweepPolicy::design();
     let mut plan = SweepPlan {
         schema: PLAN_SCHEMA.to_owned(),
         volume_uuid: record.volume_uuid.clone(),
@@ -2439,6 +2630,7 @@ fn build_plan(
         now_ms,
         grants: &record.scratch_grants,
         policy,
+        native_only,
     };
     let listing = dirs.list_children(&handle, LISTING_NAME_ROWS)?;
     let mut entries = listing.entries.clone();
@@ -2854,6 +3046,21 @@ fn classify_unit(
             Some(path.to_path_buf()),
             family.as_str(),
             "the unit's name is over the state key cap, so it is never acted on",
+        ));
+        return Ok(());
+    }
+    // A caller that plans only Barge's own native units (the stage 3 pressure
+    // plan) never makes a foreign family a candidate, because it is not
+    // Barge-owned data. It is still reported as kept: an entry the plan cannot
+    // classify must not disappear from it, and a kept row cannot consume the
+    // candidate capacity a native root needs.
+    if ctx.native_only && family != UnitFamily::Native {
+        kept.push(kept_row(
+            name,
+            &scope.key(),
+            Some(path.to_path_buf()),
+            family.as_str(),
+            "the entry is not Barge-owned data, so it never yields under the reserve",
         ));
         return Ok(());
     }
@@ -3818,6 +4025,7 @@ fn reassess_under(
         now_ms,
         grants: &record.scratch_grants,
         policy: SweepPolicy::design(),
+        native_only: false,
     };
     let family = unit_family(&ctx, &handle, name, &unit_path)?;
     let mut budget = Budget::new(SweepBounds::default());

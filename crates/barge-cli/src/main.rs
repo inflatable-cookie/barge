@@ -109,24 +109,53 @@ fn main() -> ExitCode {
 }
 
 /// The command as an error document names it.
+/// The verbs each nested command accepts, as an error document names them.
+///
+/// The verb is selected from these known words rather than from the next bare
+/// argument: an option that takes a value before the verb would otherwise make
+/// its value look like the verb, so `barge space --bogus x prune ...` would name
+/// `space.x` in its error document instead of `space.prune`.
+const COMMAND_VERBS: &[(&str, &[&str])] = &[
+    (
+        "area",
+        &[
+            "declare",
+            "show",
+            "list",
+            "root",
+            "hold",
+            "release",
+            "idle-baseline",
+        ],
+    ),
+    (
+        "scratch",
+        &["alloc", "conclude", "expire", "grants", "delegate", "claim"],
+    ),
+    ("volume", &["register", "update", "describe"]),
+    ("space", &["prune"]),
+    ("cache", &["adopt", "undo", "list"]),
+];
+
 fn command_name(args: &[String]) -> String {
-    let mut words = args
+    let mut words = args.iter().filter(|argument| !argument.starts_with('-'));
+    let Some(command) = words.next() else {
+        return "barge".to_owned();
+    };
+    let Some(verbs) = COMMAND_VERBS
         .iter()
-        .filter(|argument| !argument.starts_with('-'))
-        .take(2);
-    let first = words.next().map(String::as_str);
-    match first {
-        Some(command @ ("area" | "scratch" | "volume")) => match words.next() {
-            Some(verb) => format!("{command}.{verb}"),
-            None => command.to_owned(),
-        },
-        Some("cache") => match words.next() {
-            Some(verb) => format!("cache.{verb}"),
-            None => "cache".to_owned(),
-        },
-        Some("diagnostic") => "diagnostic.descriptor-census".to_owned(),
-        Some(other) => other.to_owned(),
-        None => "barge".to_owned(),
+        .find(|(name, _)| name == &command.as_str())
+        .map(|(_, verbs)| *verbs)
+    else {
+        return if command == "diagnostic" {
+            "diagnostic.descriptor-census".to_owned()
+        } else {
+            command.clone()
+        };
+    };
+    match words.find(|word| verbs.contains(&word.as_str())) {
+        Some(verb) => format!("{command}.{verb}"),
+        None => command.clone(),
     }
 }
 
@@ -248,13 +277,7 @@ fn dispatch(args: &[String]) -> Result<Report, Error> {
             no_extra_arguments(rest)?;
             inspect().map(Box::new).map(Report::Inspect)
         }
-        "space" => {
-            no_extra_arguments(rest)?;
-            let platform = os::platform();
-            let report = barge::space::report(&state_paths()?, &platform, &platform, &platform)?;
-            let human = format!("space: {} registered volumes\n", report.volumes.count);
-            Report::verb(barge::space::SPACE_SCHEMA, "space", &report, human)
-        }
+        "space" => space(rest),
         "volume" => volume(rest),
         "maintain" => maintain(rest),
         "prune" => prune_plan(rest),
@@ -1050,15 +1073,110 @@ fn maintain_summary(report: &MaintainReport) -> String {
     text
 }
 
-/// Plan one area's release on one volume: `barge prune --plan`.
+/// Run one `space` verb.
+///
+/// Without a verb it is the read-only report. `prune` is the effect-free
+/// candidate plan (stage 3, slice T4); the effect form belongs to T5 and is
+/// refused here rather than implied. The line is parsed once so an option before
+/// the verb is validated by it, never discarded by the dispatch.
+fn space(args: &[String]) -> Result<Report, Error> {
+    // The whole command line is parsed once, before the verb is chosen, so an
+    // option that appears before `prune` is validated by the verb rather than
+    // discarded: `barge space --plan-sha256 <hex> prune ...` is the same
+    // effect-form refusal, and an unknown option is named rather than ignored.
+    let Parsed { words, options } = parse_taking(args, &["volume", "plan-out", "plan-sha256"])?;
+    match words.first().map(String::as_str) {
+        None => {
+            refuse_unknown(options)?;
+            let platform = os::platform();
+            let report = barge::space::report(&state_paths()?, &platform, &platform, &platform)?;
+            let human = format!("space: {} registered volumes\n", report.volumes.count);
+            Report::verb(barge::space::SPACE_SCHEMA, "space", &report, human)
+        }
+        Some("prune") if words.len() == 1 => space_prune(options),
+        Some("prune") => Err(usage(format!(
+            "unexpected argument after prune: {}",
+            words[1]
+        ))),
+        Some(other) => Err(usage(format!("unknown space verb: {other}"))),
+    }
+}
+
+/// Plan one volume's space candidates: `barge space prune --volume <uuid> --plan`.
 ///
 /// The plan is effect-free and prints one bounded canonical
-/// `barge.prune.plan/1` inside `barge.prune/1` with its SHA-256. Every row
-/// carries the stage 4 release gate's six conditions whether or not it is
-/// eligible, so one plan is a diagnostic as well as a permission. The effect
-/// that will present this plan's exact bytes and digest is stage 4 F4; this
-/// build refuses anything but the plan form rather than implying an effect it
-/// does not have.
+/// `barge.space.prune.plan/1` inside `barge.space.prune/1` with its SHA-256.
+/// `--plan-out` writes the exact plan bytes a later slice's real run will
+/// present. There is no effect in this build: the real run, its custody and its
+/// replay are slice T5, so every effect-shaped argument is refused rather than
+/// ignored.
+fn space_prune(mut options: Options) -> Result<Report, Error> {
+    let plan = flag(&mut options, "plan")?;
+    let plan_out = one_option(&mut options, "plan-out")?.map(PathBuf::from);
+    let volume = one_option(&mut options, "volume")?;
+    // The effect-shaped argument is refused wherever it sits on the line, and an
+    // unknown option is named before any value it could have come with is
+    // interpreted.
+    if let Some(_digest) = one_option(&mut options, "plan-sha256")? {
+        return Err(usage(
+            "barge space prune previews only in this build: a real run, its plan bytes and its digest are stage 3 T5, so nothing was planned",
+        ));
+    }
+    refuse_unknown(options)?;
+    let Some(volume) = volume else {
+        return Err(usage("--volume is required"));
+    };
+    if !plan {
+        return Err(usage(
+            "barge space prune previews only with --plan; the effect form belongs to a later slice and was not run",
+        ));
+    }
+    let volume_uuid = volume_arg(&volume)?;
+    let state = state_paths()?;
+    let platform = os::platform();
+    let report = barge::space::plan(
+        &state,
+        &platform,
+        &platform,
+        &platform,
+        &platform,
+        &platform,
+        &barge::space::SpacePruneRequest {
+            volume_uuid: &volume_uuid,
+            now_ms: state::now_ms(),
+            wall: barge::space::SPACE_PLAN_WALL,
+            lock_wait: state::LOCK_WAIT,
+        },
+    )?;
+    if let Some(path) = &plan_out {
+        let bytes = barge::space::canonical_plan_bytes(&report.plan)?;
+        write_plan_file(path, &bytes)?;
+    }
+    let human = space_prune_summary(&report);
+    Report::verb(
+        barge::space::SPACE_PRUNE_SCHEMA,
+        "space.prune",
+        &report,
+        human,
+    )
+}
+
+/// The human summary of `barge.space.prune/1`.
+fn space_prune_summary(report: &barge::space::SpacePruneReport) -> String {
+    format!(
+        "previewed space-prune plan {} for {}: {} candidate(s), {} kept, {} free of {} floor and {} reserve ({}); nothing was changed\n",
+        report.plan_sha256,
+        report.volume_uuid,
+        report.candidates,
+        report.kept.count,
+        report.measurement.free_bytes,
+        report.policy.floor_bytes,
+        report.policy.reserve_bytes,
+        report.state
+    )
+}
+
+/// Run one `prune` verb (the release plan).
 fn prune_plan(args: &[String]) -> Result<Report, Error> {
     let Parsed { words, mut options } = parse_taking(args, &["area", "volume", "plan-out"])?;
     if let Some(word) = words.first() {

@@ -129,6 +129,12 @@ fn describe_json_prints_one_document_and_creates_nothing() {
     assert_eq!(data["formats"]["error"], "barge.error/1");
     assert_eq!(data["formats"]["registry"], "barge.registry/1");
     assert_eq!(data["formats"]["activity"], "barge.activity/1");
+    assert_eq!(data["formats"]["space"], "barge.space/1");
+    assert_eq!(data["formats"]["space_prune"], "barge.space.prune/1");
+    assert_eq!(
+        data["formats"]["space_prune_plan"],
+        "barge.space.prune.plan/1"
+    );
     assert_eq!(data["state"]["dir"], state_dir.display().to_string());
     assert_eq!(data["state"]["initialized"], false);
     assert_eq!(data["state"]["source"], "environment_override");
@@ -2226,4 +2232,397 @@ fn prune_refuses_the_effect_form_missing_arguments_and_an_unregistered_volume() 
     );
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+}
+
+// ---- space candidate planning (stage 3, slice T4) ------------------------
+
+/// The CLI prints one canonical space-prune plan, writes only the plan file it
+/// was given, and never plans an excluded area's root.
+///
+/// A candidate needs a verified volume, a real root and a recorded release, so
+/// this case registers the volume this checkout runs on inside its own throwaway
+/// state directory and keeps every write inside one `mktemp -d` directory it
+/// removes.
+#[test]
+fn space_prune_previews_a_canonical_plan_and_writes_only_the_file_it_was_given() {
+    let Some((mount, scratch)) = volume_scratch() else {
+        return;
+    };
+    let root_dir = scratch
+        .path
+        .strip_prefix(&mount)
+        .expect("the scratch directory is inside the mount")
+        .to_str()
+        .expect("the scratch path is UTF-8")
+        .to_owned();
+    let (fixture, state_dir) = absent_state_dir("space-prune-plan");
+    let volume = register_fixture_volume(
+        &mount,
+        &root_dir,
+        &state_dir,
+        &fixture.join("register.plan.json"),
+    );
+    declare_area(&state_dir, "pool", "counts");
+    declare_area(&state_dir, "excluded", "excluded");
+    // Declared but its folder is never created: it was not enumerated, so its
+    // counts must be unknown rather than zero.
+    declare_area(&state_dir, "missing", "counts");
+
+    // One idle root in a participating area, one idle root in an excluded area.
+    let idle = create_root(&state_dir, "pool", &volume, "area_root");
+    hold_root(&state_dir, &idle);
+    release_root(&state_dir, &idle);
+    let excluded = create_root(&state_dir, "excluded", &volume, "area_root");
+    hold_root(&state_dir, &excluded);
+    release_root(&state_dir, &excluded);
+
+    let plan_out = fixture.join("space-prune.plan.json");
+    let output = run_in(
+        &[
+            "space",
+            "prune",
+            "--volume",
+            &volume,
+            "--plan",
+            "--plan-out",
+            plan_out.to_str().expect("the plan path is UTF-8"),
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the preview succeeds: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.space.prune/1");
+    assert_eq!(document["command"], "space.prune");
+    assert_eq!(document["ok"], true);
+    assert_eq!(document["data"]["preview"], true);
+    assert_eq!(document["data"]["volume_uuid"], volume.as_str());
+    assert_eq!(
+        document["data"]["plan"]["schema"],
+        "barge.space.prune.plan/1"
+    );
+    assert_eq!(document["data"]["candidates"], 1);
+    let rows = document["data"]["plan"]["candidates"]["rows"]
+        .as_array()
+        .expect("the plan carries candidate rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["root_id"], idle.as_str());
+    assert_eq!(rows[0]["area"], "fixture/pool");
+    assert!(rows[0]["bytes"].is_u64());
+    assert_eq!(rows[0]["identity_digest"].as_str().map(str::len), Some(64));
+    assert!(
+        rows.iter().all(|row| row["root_id"] != excluded.as_str()),
+        "an excluded area's root is never a candidate"
+    );
+    let excluded_row = document["data"]["participation"]["rows"]
+        .as_array()
+        .expect("participation rows")
+        .iter()
+        .find(|row| row["area"] == "fixture/excluded")
+        .expect("the excluded area is reported");
+    assert_eq!(excluded_row["state"], "excluded");
+    // A count the plan did not observe is an explicit null, never a missing key
+    // and never zero: an unlisted area is not an empty one.
+    for field in ["roots", "candidates", "kept"] {
+        assert!(
+            excluded_row
+                .as_object()
+                .expect("the participation row is an object")
+                .contains_key(field),
+            "{field} is present"
+        );
+        assert_eq!(excluded_row[field], Value::Null, "{field} is explicit null");
+    }
+    let missing_row = document["data"]["participation"]["rows"]
+        .as_array()
+        .expect("participation rows")
+        .iter()
+        .find(|row| row["area"] == "fixture/missing")
+        .expect("the missing area is reported");
+    assert_eq!(
+        missing_row["state"], "absent",
+        "an area whose folder is not there was not enumerated"
+    );
+    for field in ["roots", "candidates", "kept"] {
+        assert_eq!(
+            missing_row[field],
+            Value::Null,
+            "an absent area's {field} count is unknown, not zero"
+        );
+    }
+
+    // The saved file is exactly the bytes the digest covers, and the library's
+    // reader accepts them.
+    let saved = std::fs::read(&plan_out).expect("the plan file was written");
+    let digest = document["data"]["plan_sha256"]
+        .as_str()
+        .expect("the plan carries its digest");
+    assert_eq!(barge::digest::sha256_hex(&saved), digest);
+    let plan = barge::space::read_plan(&saved).expect("the saved plan reads back");
+    assert_eq!(plan.schema, "barge.space.prune.plan/1");
+    assert_eq!(plan.candidates.rows[0].root_id, idle);
+    assert_eq!(
+        plan.policy_generation,
+        document["data"]["policy_generation"]
+            .as_u64()
+            .expect("the report names its policy generation")
+    );
+
+    // An adopted root keeps the directory name it already had, which need not
+    // be a root id. The plan names it, and its canonical bytes read back.
+    use barge::area::{MarkerArea, MarkerWrite, RootKind, RootOrigin};
+    use barge::os::VolumeUuid;
+    use barge::os::{DirOps, ProcessObserver};
+
+    let adopted_path = scratch.path.join("example/pool/adopted-cache-run");
+    std::fs::create_dir_all(&adopted_path).expect("the adopted root directory is made");
+    let platform = barge::os::platform();
+    let handle = platform
+        .open_path(&adopted_path)
+        .expect("the adopted root opens");
+    let volume_uuid = VolumeUuid::parse(&volume).expect("the fixture volume uuid");
+    let marker = barge::area::write_marker(
+        &platform,
+        &handle,
+        &MarkerWrite {
+            root_id: None,
+            volume_uuid: &volume_uuid,
+            resolved_path: &adopted_path,
+            mount_point: &mount,
+            area: MarkerArea::identity("fixture", "pool"),
+            kind: RootKind::AreaRoot,
+            origin: RootOrigin::AdoptedExisting,
+        },
+        platform
+            .effective_uid()
+            .expect("this account's effective uid"),
+    )
+    .expect("the adopted root's marker is written");
+    // An activity record is written by the tests as account state, exactly as a
+    // release would leave it, because an adopted root's directory name differs
+    // from its root id and the idle-baseline verb's custody unit addresses the
+    // directory name. That verb's refusal is outside this slice; the plan and its
+    // reader are what this case proves.
+    let activity_dir = state_dir.join("activity");
+    std::fs::create_dir_all(&activity_dir).expect("the activity directory is made");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_millis() as u64;
+    let released_ms = now.saturating_sub(1_000);
+    let record = serde_json::json!({
+        "schema": "barge.activity/1",
+        "root_id": marker.root_id,
+        "volume_uuid": volume,
+        "last_release_ms": released_ms,
+        "first_created_ms": now.saturating_sub(2_000),
+        "releases": 1,
+        "generation": 1,
+        "recorded_ms": released_ms,
+    });
+    let record_path = activity_dir.join(format!("{}.json", marker.root_id));
+    std::fs::write(
+        &record_path,
+        serde_json::to_vec_pretty(&record).expect("the activity record encodes"),
+    )
+    .expect("the activity record is written");
+    std::fs::set_permissions(
+        &record_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("the activity record is private");
+
+    let adopted_plan_out = fixture.join("space-prune-adopted.plan.json");
+    let output = run_in(
+        &[
+            "space",
+            "prune",
+            "--volume",
+            &volume,
+            "--plan",
+            "--plan-out",
+            adopted_plan_out.to_str().expect("the plan path is UTF-8"),
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(0), "the second preview succeeds");
+    let document = stdout_document(&output);
+    assert_eq!(document["data"]["candidates"], 2);
+    let rows = document["data"]["plan"]["candidates"]["rows"]
+        .as_array()
+        .expect("the plan carries candidate rows");
+    let adopted = rows
+        .iter()
+        .find(|row| row["root_id"] == marker.root_id.as_str())
+        .expect("the adopted root is a candidate");
+    assert_eq!(adopted["name"], "adopted-cache-run");
+    assert_ne!(
+        adopted["name"], adopted["root_id"],
+        "an adopted root's directory name is not its root id"
+    );
+    let saved = std::fs::read(&adopted_plan_out).expect("the adopted plan file was written");
+    assert_eq!(
+        barge::digest::sha256_hex(&saved),
+        document["data"]["plan_sha256"]
+            .as_str()
+            .expect("the report carries its digest")
+    );
+    barge::space::read_plan(&saved).expect("a plan naming an adopted root reads back");
+
+    // Nothing else was created beside the plan files the caller named.
+    assert!(!fixture.join("space-prune-other.json").exists());
+}
+
+/// The space-prune effect form, a missing `--plan` and a bad volume are refusals
+/// that plan nothing.
+#[test]
+fn space_prune_refuses_the_effect_form_and_a_missing_plan() {
+    let (_fixture, state_dir) = absent_state_dir("space-prune-refusals");
+    let volume = "A6AC3ED7-33EA-46B4-8082-7254CF291ED2";
+
+    let output = run_in(
+        &["space", "prune", "--volume", volume, "--json"],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2), "a preview needs --plan");
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.error/1");
+    assert_eq!(document["error"]["kind"], "usage");
+    assert!(document["error"]["message"]
+        .as_str()
+        .expect("the refusal states its reason")
+        .contains("--plan"));
+
+    let digest = "a".repeat(64);
+    let output = run_in(
+        &[
+            "space",
+            "prune",
+            "--volume",
+            volume,
+            "--plan",
+            "--plan-sha256",
+            &digest,
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2), "the effect form is not ours");
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.error/1");
+    assert_eq!(document["error"]["kind"], "usage");
+    assert!(document["error"]["message"]
+        .as_str()
+        .expect("the refusal states its reason")
+        .contains("T5"));
+
+    // The same effect-shaped option *before* the verb is refused too: the whole
+    // line is parsed once, so it can never be silently discarded.
+    let output = run_in(
+        &[
+            "space",
+            "--plan-sha256",
+            &digest,
+            "prune",
+            "--volume",
+            volume,
+            "--plan",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an effect option before the verb is still refused"
+    );
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.error/1");
+    assert_eq!(document["error"]["kind"], "usage");
+    assert_eq!(
+        document["command"], "space.prune",
+        "the error names the verb, not an option's value"
+    );
+    assert!(document["error"]["message"]
+        .as_str()
+        .expect("the refusal states its reason")
+        .contains("T5"));
+
+    // An unknown option before the verb is named, not discarded in favour of a
+    // value error it came with.
+    let output = run_in(
+        &[
+            "space",
+            "--bogus",
+            "x",
+            "prune",
+            "--volume",
+            "not-a-uuid",
+            "--plan",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "usage");
+    assert_eq!(
+        document["command"], "space.prune",
+        "an option's value before the verb never becomes the command name"
+    );
+    assert!(
+        document["error"]["message"]
+            .as_str()
+            .expect("the refusal states its reason")
+            .contains("--bogus"),
+        "the unknown option is the refusal: {document}"
+    );
+
+    // A known option before the verb reaches the verb: the unregistered volume is
+    // then the answer, not a missing `--volume` usage refusal.
+    let output = run_in(
+        &["space", "--volume", volume, "prune", "--plan", "--json"],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        stdout_document(&output)["error"]["kind"],
+        "unknown_state",
+        "the volume option reached the prune verb"
+    );
+
+    // The report form refuses an option rather than ignoring it.
+    let output = run_in(&["space", "--volume", volume, "--json"], &state_dir);
+    assert_eq!(output.status.code(), Some(2));
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "usage");
+    assert!(document["error"]["message"]
+        .as_str()
+        .expect("the refusal states its reason")
+        .contains("--volume"));
+
+    let output = run_in(
+        &[
+            "space",
+            "prune",
+            "--volume",
+            "not-a-uuid",
+            "--plan",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+
+    let output = run_in(&["space", "elsewhere", "--json"], &state_dir);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+    assert!(!state_dir.exists(), "a refusal creates no state");
 }

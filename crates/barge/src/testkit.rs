@@ -532,6 +532,10 @@ impl ProcessObserver for FakeObserver {
 /// name and may change the fixture in that window.
 pub type ObserveProbe = Box<dyn Fn(&str)>;
 
+/// A probe the test installs immediately before a path is opened: it is handed
+/// the path and may change the fixture in that window.
+pub type OpenProbe = Box<dyn Fn(&Path)>;
+
 /// A probe the test installs at a put-back: it is handed the private name and
 /// answers one fact about the state at that moment.
 pub type PutBackProbe = Box<dyn Fn(&str) -> bool>;
@@ -639,6 +643,17 @@ pub struct Faults {
     /// A one-shot pause immediately before a directory listing, so a scan's own
     /// deadline can expire while it is listing.
     pub sleep_before_listing: RefCell<Option<std::time::Duration>>,
+    /// A one-shot pause immediately before a directory *children* listing only:
+    /// `list_names` is left alone, so a caller that enumerates names first can
+    /// place the pause inside a nested walk instead.
+    pub sleep_before_children_listing: RefCell<Option<std::time::Duration>>,
+    /// A probe run immediately before a path is opened, so a test can change the
+    /// fixture in the window between an index or sweep and the open that reads it
+    /// under its own lock.
+    pub open_probe: RefCell<Option<OpenProbe>>,
+    /// One-shot pauses immediately before a child directory with a matching name
+    /// prefix is opened, so a test can put a pause inside a specific nested walk.
+    pub sleeping_child_opens: RefCell<Vec<(String, std::time::Duration)>>,
     /// A modification time every *listing* reports instead of the real one, so an
     /// earlier observation can be stale while the directory's own descriptor facts
     /// stay current.
@@ -796,6 +811,24 @@ impl Faults {
     /// Pause once, immediately before the next directory listing.
     pub fn sleeping_before_listing(&self, pause: std::time::Duration) {
         *self.sleep_before_listing.borrow_mut() = Some(pause);
+    }
+
+    /// Pause once, immediately before the next directory *children* listing.
+    pub fn sleeping_before_children_listing(&self, pause: std::time::Duration) {
+        *self.sleep_before_children_listing.borrow_mut() = Some(pause);
+    }
+
+    /// Run `probe` immediately before every path open.
+    pub fn probing_open(&self, probe: impl Fn(&Path) + 'static) {
+        *self.open_probe.borrow_mut() = Some(Box::new(probe));
+    }
+
+    /// Pause once, immediately before opening a child directory whose name starts
+    /// with `prefix`.
+    pub fn sleeping_child_open_prefix(&self, prefix: &str, pause: std::time::Duration) {
+        self.sleeping_child_opens
+            .borrow_mut()
+            .push((prefix.to_owned(), pause));
     }
 
     /// Report this modification time in every listing, leaving each directory's own
@@ -1143,6 +1176,9 @@ fn raced_path(holder: &Path, relative: &Path) -> PathBuf {
 
 impl DirOps for Faults {
     fn open_path(&self, path: &Path) -> Result<DirHandle> {
+        if let Some(probe) = self.open_probe.borrow().as_ref() {
+            probe(path);
+        }
         self.inner.open_path(path)
     }
 
@@ -1152,6 +1188,17 @@ impl DirOps for Faults {
 
     fn open_child_dir(&self, parent: &DirHandle, name: &str) -> Result<DirHandle> {
         self.opened_child_names.borrow_mut().push(name.to_owned());
+        {
+            let mut pauses = self.sleeping_child_opens.borrow_mut();
+            if let Some(index) = pauses
+                .iter()
+                .position(|(prefix, _)| name.starts_with(prefix.as_str()))
+            {
+                let (_, pause) = pauses.remove(index);
+                drop(pauses);
+                std::thread::sleep(pause);
+            }
+        }
         let swap = self
             .swap_on_dir_open
             .borrow_mut()
@@ -1299,6 +1346,9 @@ impl DirOps for Faults {
     }
 
     fn list_children(&self, parent: &DirHandle, max_names: usize) -> Result<ChildListing> {
+        if let Some(pause) = self.sleep_before_children_listing.borrow_mut().take() {
+            std::thread::sleep(pause);
+        }
         if self.arm_after_mode.get() && self.fail_listing_after_mode.get() {
             self.arm_after_mode.set(false);
             return Err(Error::new(

@@ -169,6 +169,12 @@ pub struct FormatVersions {
     /// `barge.space/<major>`.
     #[serde(default)]
     pub space: String,
+    /// `barge.space.prune/<major>`: the space candidate plan and its preview.
+    #[serde(default)]
+    pub space_prune: String,
+    /// `barge.space.prune.plan/<major>`: the canonical plan the digest covers.
+    #[serde(default)]
+    pub space_prune_plan: String,
     /// `barge.prune.plan/<major>`: the release plan `barge prune --plan` writes.
     #[serde(default)]
     pub prune_plan: String,
@@ -198,6 +204,8 @@ impl FormatVersions {
             activity: ACTIVITY_SCHEMA.to_owned(),
             intent: INTENT_SCHEMA.to_owned(),
             space: crate::space::SPACE_SCHEMA.to_owned(),
+            space_prune: crate::space::SPACE_PRUNE_SCHEMA.to_owned(),
+            space_prune_plan: crate::space::SPACE_PRUNE_PLAN_SCHEMA.to_owned(),
             prune_plan: PRUNE_PLAN_SCHEMA.to_owned(),
             volume_register: "barge.volume.register/1".to_owned(),
             volume_update: "barge.volume.update/1".to_owned(),
@@ -400,6 +408,9 @@ mod tests {
         assert_eq!(formats.hold, "barge.hold/1");
         assert_eq!(formats.activity, "barge.activity/1");
         assert_eq!(formats.intent, "barge.intent/2");
+        assert_eq!(formats.space, "barge.space/1");
+        assert_eq!(formats.space_prune, "barge.space.prune/1");
+        assert_eq!(formats.space_prune_plan, "barge.space.prune.plan/1");
     }
 
     #[test]
