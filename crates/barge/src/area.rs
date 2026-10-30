@@ -1449,6 +1449,43 @@ pub fn open_folder(
     Ok(Some((walked.path, walked.handle)))
 }
 
+/// Open one area folder through a mount the caller located and verified itself.
+///
+/// [`open_folder`] finds the volume through the record's mount hint, which is an
+/// observation and can be stale after a reconnect. A replay locates the live mount
+/// by the recorded UUID instead - refusing a duplicated one - and then needs the
+/// same containment walk from *that* mount: `root_dir`'s components and then the
+/// area folder's, each a real directory of this user on the verified volume. A
+/// missing component answers `None`, exactly as [`open_folder`] does; nothing is
+/// created.
+pub fn open_folder_on_mount(
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    mount: &Path,
+    device: DeviceId,
+    root_dir: &str,
+    folder: &str,
+) -> Result<Option<(PathBuf, DirHandle)>> {
+    let effective_uid = observer.effective_uid()?;
+    let handle = dirs.open_path(mount)?;
+    if handle.identity().device != device {
+        return Err(containment(
+            "mount",
+            &mount.display().to_string(),
+            &format!(
+                "the mount root opened on device {}, not the verified {}",
+                handle.identity().device,
+                device
+            ),
+        ));
+    }
+    let walked = walk_folder_chain(dirs, handle, mount, device, effective_uid, root_dir, folder)?;
+    if !walked.exists() {
+        return Ok(None);
+    }
+    Ok(Some((walked.path, walked.handle)))
+}
+
 /// Create one owned root inside the resolved area.
 ///
 /// The area folder (and any missing component of it) is created as a plain

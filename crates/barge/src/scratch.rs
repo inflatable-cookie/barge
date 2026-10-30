@@ -4257,6 +4257,7 @@ mod tests {
                         device,
                         present: std::cell::Cell::new(true),
                         shifted: std::cell::Cell::new(false),
+                        duplicate: std::cell::Cell::new(false),
                     };
                     let mounts = crate::testkit::FakeMounts { root: root.clone() };
                     let observer = crate::testkit::FakeObserver::new();

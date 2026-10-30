@@ -99,7 +99,7 @@ use crate::contract::{INTENT_ROWS, LISTING_NAME_ROWS};
 use crate::custody::{self, CustodyBounds, CustodyEvidence, PendingIntent};
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
-    AbsenceVolume, AncestorExpected, ChildRemoval, DeviceId, DirHandle, DirOps, EntryFacts,
+    AbsenceVolume, AncestorExpected, ChildRemoval, DeviceId, DirHandle, DirId, DirOps, EntryFacts,
     EntryKind, MountRoot, ProcessObserver, RemoveKind, RenameOutcome, RetryEvidence, VolumeFacts,
     VolumeUuid,
 };
@@ -2785,53 +2785,58 @@ enum ReplayOutcome {
     Pending(String),
 }
 
-/// The live volume a replay walks under, read through the area folder's own
-/// descriptor.
+/// The live volume a replay walks under, located by its recorded UUID.
 ///
-/// Three facts are proved before any comparison uses the result: the volume the
-/// folder's filesystem reports is the recorded UUID, the descriptor the folder was
-/// opened through is on that same device, and the reported mount is the live one. A
-/// failure is a reason the intent stays pending, never a refusal that changes the
-/// journal.
-fn live_walk_volume(
+/// The registry's mount hint is an observation, so it is never how a replay finds a
+/// volume: a reconnect can move the mount and the hint then names a stale path. The
+/// replay asks the platform which live mounts carry the recorded UUID and accepts
+/// exactly one. None is `Unknown` (an absent drive is not a deleted root), and more
+/// than one is a decision the design never makes — picking one silently is how a
+/// delete lands on the wrong copy — so a duplicate refuses that intent before any
+/// mount is chosen and nothing is unlinked. The one candidate is then verified as a
+/// volume and as a real mount root, which is what the walk's own comparisons use.
+fn locate_walk_volume(
     volumes: &dyn AbsenceVolume,
-    area_path: &Path,
-    area_handle: &DirHandle,
     intent: &IntentRecord,
 ) -> std::result::Result<WalkVolume, String> {
-    let observed = volumes
-        .identify(area_path)
-        .map_err(|error| format!("the area folder's volume cannot be read: {error}"))?;
-    // The platform's own verification, with the mount it reports as the proof: the
-    // UUID is the recorded one, the volume is not the boot volume, its filesystem is
-    // supported, and the path it reports is a real mount root.
+    let candidates = volumes
+        .mounts_for_uuid(&intent.volume_uuid)
+        .map_err(|error| format!("the live mounts cannot be read: {error}"))?;
+    let mount = match candidates.as_slice() {
+        [] => {
+            return Err(format!(
+                "volume {} has no live mount, so the intent stays pending and nothing is unlinked",
+                intent.volume_uuid
+            ))
+        }
+        [mount] => mount.as_path().to_path_buf(),
+        _ => {
+            return Err(format!(
+                "duplicate_volume_uuid: {} live mounts carry volume {}'s UUID, so no mount is chosen and nothing is unlinked",
+                candidates.len(),
+                intent.volume_uuid
+            ))
+        }
+    };
     let verified = crate::os::verify_volume(
         volumes,
         volumes,
-        area_path,
+        &mount,
         &crate::os::ExpectedVolume {
             volume_uuid: &intent.volume_uuid,
-            mount_hint: Some(&observed.mount_point),
+            mount_hint: Some(&mount),
         },
     )
     .map_err(|error| {
         format!(
-            "the area folder at {} is not on a verified volume {}: {error}",
-            area_path.display(),
+            "the live mount {} is not a verified volume {}: {error}",
+            mount.display(),
             intent.volume_uuid
         )
     })?;
-    let identity = verified.identity();
-    if identity.device != area_handle.identity().device {
-        return Err(format!(
-            "the area folder opened on device {}, but its volume reports {}",
-            area_handle.identity().device,
-            identity.device
-        ));
-    }
     Ok(WalkVolume {
-        mount: identity.mount_point.clone(),
-        device: identity.device,
+        mount: verified.identity().mount_point.clone(),
+        device: verified.identity().device,
     })
 }
 
@@ -2840,102 +2845,167 @@ fn live_walk_volume(
 ///
 /// A changed device number is normal across a reboot, a reconnect or a dock power
 /// cycle, so it is never a refusal on its own; it is also never the thing that
-/// identifies a unit. The proof here is everything *but* the device:
+/// identifies a unit. What proves the unit depends on the phase, because each phase
+/// acts on a different object and `marker_last` has already removed the marker the
+/// earlier phases compare:
 ///
-/// - the captured leaf's inode is the recorded one, and the leaf is a directory on
-///   the volume this run verified;
-/// - its marker is the exact bytes the intent recorded (the SHA-256 pins the whole
-///   document, including the root id and nonce), its owner is Barge and its volume
-///   UUID is the intent's — so a `barge.root/1` or `barge.root/2` marker is read by
-///   its own version's rule and neither is demanded or rewritten;
-/// - for an intent that carries the plan's `identity` evidence, the durable
-///   `barge.root.identity/1` record must also agree: the same root id and nonce, the
-///   same mount-relative path, and the same inode. A missing or invalid record is
-///   unknown and keeps the intent pending, because that evidence is what the plan
-///   proved.
+/// - `removed` and `deleted` rest on the durable phase — Barge's own recorded final
+///   unlink — and not on an object's identity at all, so nothing is re-proved here
+///   and the phase's own arm decides whether the leaf is positively absent;
+/// - `intent` acts on whichever name holds the unit: the unit itself (a rollback,
+///   because the rename never happened) or its capture (a resume);
+/// - `renamed` acts on the capture with its marker still in place;
+/// - `marker_last` acts on the capture whose marker is *positively absent*, which is
+///   what that phase records, so the inode and kind are the identity there.
+///
+/// The proof is everything but the device: the acted-on name is the recorded kind
+/// and inode on the volume this run verified; its marker is the exact bytes the
+/// intent recorded (the SHA-256 pins the whole document, including the root id and
+/// nonce), its owner is Barge and its volume UUID is the intent's — so a
+/// `barge.root/1` or `barge.root/2` marker is read by its own version's rule and
+/// neither is demanded or rewritten. For an intent that carries the plan's
+/// `identity` evidence, the durable `barge.root.identity/1` record must also agree:
+/// the same root id and nonce, the same mount-relative path, the same inode and kind.
+/// A missing or invalid record is unknown and keeps the intent pending, because that
+/// evidence is what the plan proved; at `marker_last` the marker's own facts are gone
+/// by design, so the evidence's inode and the acted-on object's inode are what remain.
 ///
 /// An intent written before this slice carried identity evidence has no record to
-/// require: its own recorded inode and marker digest are stage 1's within-run
-/// observation, and they are what settles it. A unit that is not Barge-marked has
-/// nothing durable at all, so its recorded device stays the whole proof and the
-/// change is unknown.
+/// require: its own recorded inode and marker bytes are stage 1's within-run
+/// observation, and they are what settles it.
 fn reestablish_identity(
     state_paths: &StatePaths,
     dirs: &dyn DirOps,
     observer: &dyn ProcessObserver,
     intent: &IntentRecord,
-    leaf: Option<&DirHandle>,
+    parent: &DirHandle,
     volume: &WalkVolume,
 ) -> std::result::Result<(), String> {
-    let Some(marker) = &intent.unit.marker else {
-        return Err(
-            "the volume's device changed and this unit carries no marker, so only the recorded device identified it"
-                .to_owned(),
-        );
+    let changed = "the volume's device changed and";
+    // A durable completion is not re-proved from an object: the phase arm decides
+    // whether the leaf is positively absent.
+    if matches!(intent.phase, IntentPhase::Removed | IntentPhase::Deleted) {
+        return Ok(());
+    }
+    // What this phase acts on. At `intent` the rename may not have happened, so the
+    // unit itself is a valid object to re-establish: its own identity is what a
+    // rollback needs, and nothing is deleted.
+    let name = match intent.phase {
+        IntentPhase::Intent => {
+            let unit_there = dirs
+                .child_facts(parent, intent.unit_name())
+                .map_err(|error| format!("{changed} the unit cannot be read: {error}"))?
+                .is_some();
+            if unit_there {
+                intent.unit_name()
+            } else {
+                intent.capture_name()
+            }
+        }
+        _ => intent.capture_name(),
     };
-    if marker.family != MarkerFamily::Barge {
+    let Some(facts) = dirs
+        .child_facts(parent, name)
+        .map_err(|error| format!("{changed} `{name}` cannot be read: {error}"))?
+    else {
         return Err(format!(
-            "the volume's device changed and the unit's `{}` marker does not carry an identity Barge can re-establish",
+            "{changed} neither the unit nor its capture is there, so this phase's identity cannot be re-established"
+        ));
+    };
+    if facts.kind != intent.unit.kind.entry_kind()
+        || facts.inode != intent.unit.inode
+        || facts.device != volume.device
+    {
+        return Err(format!(
+            "{changed} `{name}` is a {} on device {} inode {}, not the recorded {} on this volume's device {} inode {}",
+            facts.kind.as_str(),
+            facts.device,
+            facts.inode,
+            intent.unit.kind.as_str(),
+            volume.device,
+            intent.unit.inode
+        ));
+    }
+    let Some(marker) = &intent.unit.marker else {
+        // A unit with no marker records no bytes to compare, so its inode, kind and
+        // this volume are its whole recorded identity. An intent that carries
+        // identity evidence for such a unit is refused below, because that evidence
+        // describes a Barge-marked directory.
+        if intent.identity.is_some() {
+            return Err(format!(
+                "{changed} this unit carries no marker, so its identity evidence cannot be re-established"
+            ));
+        }
+        return Ok(());
+    };
+    if marker.family != MarkerFamily::Barge || intent.unit.kind != UnitKind::Directory {
+        return Err(format!(
+            "{changed} the unit's `{}` marker does not carry an identity Barge can re-establish",
             marker.family.as_str()
         ));
     }
-    if intent.unit.kind != UnitKind::Directory {
-        return Err(
-            "the volume's device changed and a Barge marker's identity is a directory's".to_owned(),
-        );
+    let directory = dirs
+        .open_child_dir(parent, name)
+        .map_err(|error| format!("{changed} `{name}` cannot be opened: {error}"))?;
+    if directory.identity()
+        != (DirId {
+            device: facts.device,
+            inode: facts.inode,
+        })
+    {
+        return Err(format!(
+            "{changed} `{name}` changed between its reading and its open"
+        ));
     }
-    let Some(leaf) = leaf else {
-        return Err(
-            "the volume's device changed and the captured leaf's own identity cannot be read"
-                .to_owned(),
-        );
-    };
     let uid = observer
         .effective_uid()
         .map_err(|error| format!("the account uid is unreadable: {error}"))?;
-    let document = match area::read_marker_document(dirs, leaf, uid) {
+    let document = area::read_marker_document(dirs, &directory, uid);
+    // `marker_last` is the phase whose proof is the marker's positive absence; it is
+    // the one phase that must not find the recorded bytes.
+    if intent.phase == IntentPhase::MarkerLast {
+        if !matches!(document, area::MarkerDocument::Absent) {
+            return Err(format!(
+                "{changed} the unit's marker is still there, so the marker-last phase is not proved"
+            ));
+        }
+        if let Some(evidence) = &intent.identity {
+            if evidence.inode != Some(facts.inode) {
+                return Err(format!(
+                    "{changed} the intent's identity evidence names inode {:?}, not this unit's {inode}",
+                    evidence.inode,
+                    inode = facts.inode
+                ));
+            }
+        }
+        return Ok(());
+    }
+    let (marker_document, digest) = match document {
         area::MarkerDocument::Read { marker, digest } => (*marker, digest),
         area::MarkerDocument::Absent => {
-            return Err(
-                "the volume's device changed and the captured leaf carries no marker".to_owned(),
-            )
+            return Err(format!("{changed} `{name}` carries no marker"))
         }
         area::MarkerDocument::Unreadable { reason } => {
             return Err(format!(
-                "the volume's device changed and the captured leaf's marker is unreadable: {reason}"
+                "{changed} `{name}`'s marker is unreadable: {reason}"
             ))
         }
     };
-    let (marker_document, digest) = document;
     if digest != marker.digest {
-        return Err(
-            "the volume's device changed and the captured leaf's marker is not the recorded bytes"
-                .to_owned(),
-        );
+        return Err(format!(
+            "{changed} `{name}`'s marker is not the recorded bytes"
+        ));
     }
     if marker_document.owner != "barge" {
         return Err(format!(
-            "the volume's device changed and the captured leaf's marker names the owner `{}`, not Barge",
+            "{changed} `{name}`'s marker names the owner `{}`, not Barge",
             marker_document.owner
         ));
     }
     if marker_document.volume_uuid != intent.volume_uuid {
         return Err(format!(
-            "the volume's device changed and the captured leaf's marker names volume {}, not {}",
+            "{changed} `{name}`'s marker names volume {}, not {}",
             marker_document.volume_uuid, intent.volume_uuid
-        ));
-    }
-    let opened = leaf.identity();
-    if opened.device != volume.device {
-        return Err(
-            "the volume's device changed and the captured leaf is not on the volume this run verified"
-                .to_owned(),
-        );
-    }
-    if opened.inode != intent.unit.inode {
-        return Err(format!(
-            "the volume's device changed and the captured leaf is inode {}, not the recorded {}",
-            opened.inode, intent.unit.inode
         ));
     }
     // The marker's own version and generation rule, which the design fixes: a v1 or
@@ -2952,32 +3022,25 @@ fn reestablish_identity(
         ),
         (_, 1, false) | (crate::area::RootKind::ScratchRun, 2, true)
     ) {
-        return Err(
-            "the volume's device changed and the captured leaf's marker version or generation is not one this build reads"
-                .to_owned(),
-        );
+        return Err(format!(
+            "{changed} `{name}`'s marker version or generation is not one this build reads"
+        ));
     }
-    match &intent.identity {
-        Some(evidence) => {
-            let record = match crate::identity::read(state_paths, dirs, &marker_document.root_id, uid)
-            {
-                Ok(Some(record)) => record,
-                Ok(None) => {
-                    return Err(
-                        "the volume's device changed and the unit's identity record is missing, so its identity is unknown"
-                            .to_owned(),
-                    )
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "the volume's device changed and the unit's identity record is invalid: {error}"
-                    ))
-                }
-            };
+    let record = match crate::identity::read(state_paths, dirs, &marker_document.root_id, uid) {
+        Ok(found) => found,
+        Err(error) => {
+            return Err(format!(
+                "{changed} the unit's identity record is unreadable: {error}"
+            ))
+        }
+    };
+    match (&intent.identity, record) {
+        // The plan proved a durable identity, so the record is what must agree.
+        (Some(evidence), Some(record)) => {
             let relative = unit_relative_path(intent);
             if record.root_id != marker_document.root_id
                 || record.nonce != marker_document.nonce
-                || record.inode != opened.inode
+                || record.inode != facts.inode
                 || record.volume_uuid != intent.volume_uuid.as_str()
                 || record.mount_relative_path != relative
                 || record.kind != marker_document.kind
@@ -2986,44 +3049,41 @@ fn reestablish_identity(
                 || marker_document.generation < record.marker_generation_at_record
             {
                 return Err(format!(
-                    "the volume's device changed and the durable identity record does not describe this unit at `{relative}`"
+                    "{changed} the durable identity record does not describe this unit at `{relative}`"
                 ));
             }
             if evidence.inode != Some(record.inode) {
-                return Err(
-                    "the volume's device changed and the intent's identity evidence names another inode"
-                        .to_owned(),
-                );
+                return Err(format!(
+                    "{changed} the intent's identity evidence names another inode"
+                ));
             }
             Ok(())
         }
-        // The intent predates the identity evidence: its recorded inode and marker
-        // bytes are what it was authorized by, and they are what settles it. A
-        // durable record, when one exists, is still checked so a root that has one
-        // cannot be settled on weaker facts than the record.
-        None => match crate::identity::read(state_paths, dirs, &marker_document.root_id, uid) {
-            Ok(Some(record)) => {
-                let relative = unit_relative_path(intent);
-                if record.nonce != marker_document.nonce
-                    || record.inode != opened.inode
-                    || record.volume_uuid != intent.volume_uuid.as_str()
-                    || record.mount_relative_path != relative
-                    || record.kind != marker_document.kind
-                    || record.area.namespace != marker_document.area.namespace
-                    || record.area.area != marker_document.area.area
-                    || marker_document.generation < record.marker_generation_at_record
-                {
-                    return Err(format!(
-                        "the volume's device changed and the unit's identity record does not describe it at `{relative}`"
-                    ));
-                }
-                Ok(())
+        (Some(_), None) => Err(format!(
+            "{changed} the unit's identity record is missing, so its identity is unknown"
+        )),
+        // An intent written before this slice carried the evidence: its recorded
+        // inode and marker bytes are what it was authorized by. A record that exists
+        // is still checked, so such a root is never settled on weaker facts than its
+        // own record.
+        (None, Some(record)) => {
+            let relative = unit_relative_path(intent);
+            if record.nonce != marker_document.nonce
+                || record.inode != facts.inode
+                || record.volume_uuid != intent.volume_uuid.as_str()
+                || record.mount_relative_path != relative
+                || record.kind != marker_document.kind
+                || record.area.namespace != marker_document.area.namespace
+                || record.area.area != marker_document.area.area
+                || marker_document.generation < record.marker_generation_at_record
+            {
+                return Err(format!(
+                    "{changed} the unit's identity record does not describe it at `{relative}`"
+                ));
             }
-            Ok(None) => Ok(()),
-            Err(error) => Err(format!(
-                "the volume's device changed and the unit's identity record is unreadable: {error}"
-            )),
-        },
+            Ok(())
+        }
+        (None, None) => Ok(()),
     }
 }
 
@@ -3151,12 +3211,22 @@ fn replay_one(
     if expired(bounds.deadline) {
         return Ok(ReplayOutcome::Pending(WALL_CLOCK_REASON.to_owned()));
     }
-    let opened = area::open_folder(
+    // The record must still declare a durability at all, which is what the folder's
+    // own resolution checked while it used the registry's hint.
+    record.declared_durability()?;
+    // The volume is found by the UUID the intent recorded — refusing a duplicated
+    // mount rather than choosing one — and the area folder is then walked from that
+    // live mount, so a reconnect that moved the mount point does not strand the
+    // intent on a stale registry hint.
+    let volume = match locate_walk_volume(volumes, intent) {
+        Ok(volume) => volume,
+        Err(reason) => return Ok(ReplayOutcome::Pending(reason)),
+    };
+    let opened = area::open_folder_on_mount(
         dirs,
-        volumes,
-        volumes,
         observer,
-        record,
+        &volume.mount,
+        volume.device,
         &intent.root_dir,
         &intent.folder,
     )?;
@@ -3181,14 +3251,6 @@ fn replay_one(
             "the area folder is gone but the removed phase was not recorded, so completion is unknown"
                 .to_owned(),
         ));
-    };
-    // The volume the deletion walks under is read now, not taken from the intent.
-    // A device number identifies this mount instance, so a reboot, a power cycle or
-    // a reconnect gives the same filesystem a new one; no durable comparison uses
-    // it, and the walk's own checks are made against the live number.
-    let volume = match live_walk_volume(volumes, &area_path, &area_handle, intent) {
-        Ok(volume) => volume,
-        Err(reason) => return Ok(ReplayOutcome::Pending(reason)),
     };
     // The unit is the recorded one, with the device this run verified: the parent
     // walk proves containment on the live filesystem, and the unit's own identity is
@@ -3263,14 +3325,9 @@ fn replay_one(
     // intent stays pending.
     let mut remounted = false;
     if volume.device.get() != intent.unit.device {
-        if let Err(reason) = reestablish_identity(
-            state_paths,
-            dirs,
-            observer,
-            intent,
-            leaf_handle.as_ref(),
-            &volume,
-        ) {
+        if let Err(reason) =
+            reestablish_identity(state_paths, dirs, observer, intent, &parent, &volume)
+        {
             return Ok(ReplayOutcome::Pending(reason));
         }
         remounted = true;
@@ -8183,9 +8240,142 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_device_without_a_reestablishable_identity_keeps_the_intent_pending() {
-        // An unmarked claimed unit has nothing durable but the device the plan
-        // recorded, so a changed device is unknown: nothing is unlinked.
+    fn a_duplicate_mount_refuses_a_pending_intent_and_unlinks_nothing() {
+        // Two live mounts carry the volume's UUID, so which one is "the volume" is
+        // undecidable. The design never picks one: the intent stays pending with the
+        // duplicate named, and the captured leaf is untouched.
+        let prepared = prepared("delete-replay-duplicate");
+        plant_unit_contents(&prepared);
+        rename_to_quarantine(&prepared);
+        publish(&prepared, &[IntentPhase::Renamed]);
+        let facts = prepared.fixture.facts();
+        facts.duplicate_mounts();
+
+        let replay = replay_with(
+            &prepared.fixture.state,
+            &Faults::new(),
+            &facts,
+            &prepared.fixture.observer(),
+            prepared.bounds(),
+            None,
+        )
+        .expect("the replay reports");
+        assert_eq!(replay.resumed, 0, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert!(
+            replay.pending[0].reason.contains("duplicate_volume_uuid"),
+            "{}",
+            replay.pending[0].reason
+        );
+        assert!(
+            prepared.quarantine().join("payload.txt").is_file(),
+            "nothing is unlinked"
+        );
+        assert_eq!(prepared.pending_intents().len(), 1);
+    }
+
+    #[test]
+    fn a_moved_mount_is_found_by_its_uuid_not_the_stale_hint() {
+        // The registry's mount hint is an observation: after a reconnect the mount is
+        // somewhere else while the UUID and every component below the mount are
+        // unchanged. The replay locates the live mount by that UUID and settles.
+        let prepared = prepared("delete-replay-moved-mount");
+        plant_unit_contents(&prepared);
+        rename_to_quarantine(&prepared);
+        publish(&prepared, &[IntentPhase::Renamed]);
+        let stale = prepared.fixture.root.join("stale-mount");
+        std::fs::create_dir(&stale).expect("the stale mount point exists");
+        let mut record = prepared.fixture.record.clone();
+        record.mount_hint = Some(stale.clone());
+        prepared.fixture.register_record(&record);
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 1, "{replay:?}");
+        assert!(replay.is_settled(), "{replay:?}");
+        assert!(!prepared.unit_path().exists(), "the root is deleted");
+        assert!(
+            stale.is_dir(),
+            "the stale mount point is never written to or treated as the volume"
+        );
+    }
+
+    #[test]
+    fn a_changed_device_rolls_back_a_pre_rename_intent() {
+        // The rename never happened: the unit is still at its own name, so the
+        // changed device is tolerated on that unit's identity and the intent rolls
+        // back instead of staying pending forever.
+        let prepared = prepared("delete-remount-pre-rename");
+        plant_unit_contents(&prepared);
+        publish_with(
+            &prepared,
+            &[],
+            &evidence_for(&prepared),
+            prepared.unit.device.get().saturating_add(9),
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.rolled_back, 1, "{replay:?}");
+        assert!(replay.is_settled(), "{replay:?}");
+        assert!(prepared.unit_path().join("payload.txt").is_file());
+        assert!(prepared.pending_intents().is_empty());
+    }
+
+    #[test]
+    fn a_changed_device_settles_a_marker_last_intent() {
+        // `marker_last` is the phase that records the marker's positive absence, so
+        // the marker is already gone by design; the leaf's recorded inode and kind on
+        // the verified volume are the identity that a changed device leaves.
+        let prepared = prepared("delete-remount-marker-last");
+        plant_unit_contents(&prepared);
+        rename_to_quarantine(&prepared);
+        settle_leaf_contents(&prepared, &prepared.quarantine());
+        publish_with(
+            &prepared,
+            &[IntentPhase::Renamed, IntentPhase::MarkerLast],
+            &evidence_for(&prepared),
+            prepared.unit.device.get().saturating_add(9),
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.settled, 1, "{replay:?}");
+        assert!(replay.is_settled(), "{replay:?}");
+        assert_eq!(replay.remounted, 0, "a settle is not a resumed deletion");
+        assert!(!prepared.quarantine().exists(), "the leaf is removed");
+        assert!(prepared.pending_intents().is_empty());
+    }
+
+    #[test]
+    fn a_changed_device_settles_a_removed_intent_from_the_durable_phase() {
+        // The `removed` phase recorded Barge's own final unlink before the reboot, so
+        // completion rests on that phase and a changed device adds nothing to prove.
+        let prepared = prepared("delete-remount-removed");
+        plant_unit_contents(&prepared);
+        rename_to_quarantine(&prepared);
+        remove_leaf_whole(&prepared, &prepared.quarantine());
+        publish_with(
+            &prepared,
+            &[
+                IntentPhase::Renamed,
+                IntentPhase::MarkerLast,
+                IntentPhase::Removed,
+            ],
+            &evidence_for(&prepared),
+            prepared.unit.device.get().saturating_add(9),
+        );
+
+        let replay = prepared.replay();
+        assert_eq!(replay.settled, 1, "{replay:?}");
+        assert!(replay.is_settled(), "{replay:?}");
+        assert!(!prepared.quarantine().exists());
+        assert!(prepared.pending_intents().is_empty());
+    }
+
+    #[test]
+    fn a_markerless_unit_settles_across_a_changed_device_on_its_inode_and_volume() {
+        // An unmarked claimed unit has no marker bytes, so the identity a changed
+        // device leaves is its inode, its kind and the volume this run verified -
+        // plus the intent's own 128-bit private capture name. That is stage 1's own
+        // leaf rule minus the device, and it is what lets the deletion finish.
         let prepared = prepared_unmarked("delete-remount-unmarked");
         plant_unit_contents(&prepared);
         rename_to_quarantine(&prepared);
@@ -8197,17 +8387,46 @@ mod tests {
         );
 
         let replay = prepared.replay();
+        assert_eq!(replay.resumed, 1, "{replay:?}");
+        assert!(replay.is_settled(), "{replay:?}");
+        assert_eq!(replay.remounted, 1);
+        assert!(!prepared.unit_path().exists(), "the unit is deleted");
+    }
+
+    #[test]
+    fn a_changed_device_with_a_swapped_leaf_keeps_the_intent_pending() {
+        // The private name holding a different object is not this unit: its inode is
+        // not the recorded one, so the changed device is not tolerated and nothing
+        // is unlinked.
+        let prepared = prepared_unmarked("delete-remount-swapped");
+        plant_unit_contents(&prepared);
+        let captured = format!("{QUARANTINE_PREFIX}{:032x}", 1);
+        let parent = prepared.parent_path();
+        std::fs::rename(prepared.unit_path(), parent.join(&captured))
+            .expect("the unit is captured");
+        // The captured name now holds another object: the original is moved aside and
+        // a fresh directory takes its private name.
+        std::fs::rename(parent.join(&captured), parent.join("swapped-away"))
+            .expect("the original is moved aside");
+        std::fs::create_dir(parent.join(&captured)).expect("a foreign directory is put there");
+        publish_with(
+            &prepared,
+            &[IntentPhase::Renamed],
+            &state::IntentEvidence::none(),
+            prepared.unit.device.get().saturating_add(9),
+        );
+
+        let replay = prepared.replay();
         assert_eq!(replay.resumed, 0, "{replay:?}");
         assert_eq!(replay.pending.len(), 1, "{replay:?}");
-        assert!(
-            replay.pending[0].reason.contains("device changed"),
-            "{}",
-            replay.pending[0].reason
-        );
         assert_eq!(replay.remounted, 0);
         assert!(
-            prepared.quarantine().join("payload.txt").is_file(),
-            "nothing is unlinked"
+            parent.join(&captured).is_dir(),
+            "the foreign object at the private name is never unlinked"
+        );
+        assert!(
+            parent.join("swapped-away").join("payload.txt").is_file(),
+            "the captured unit is untouched"
         );
     }
 

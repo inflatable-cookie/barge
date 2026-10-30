@@ -1344,17 +1344,38 @@ the scratch sweep and the space prune are unchanged. The release effect, when it
 own brief authorizes it, supplies the plan row's two documents there and nowhere
 else.
 
-Replay under a changed device. A replay never compares a durable fact to the
-device the intent recorded: it reads the live volume through the area folder's own
-descriptor, proves it is the recorded UUID at a real mount root, and walks under that
-live device. A changed device — a reboot, a dock power cycle, a reconnect — is
-tolerated only when something that is not a device proves the unit: its inode, the
-exact marker bytes (which pin the root id and nonce), the marker's volume, and, for
-an intent that carries identity evidence, the durable identity record's root id,
-nonce, mount-relative path and inode. A unit with no such proof (an unmarked claimed
-unit, a foreign marker family, a leaf that cannot be read) keeps stage 1's within-run
-device, so a change there is `Unknown` and the intent stays pending with the reason.
-The replayed intents report how many were re-established this way, and a settled
+Replay under a changed device. A replay never finds its volume through the
+registry's mount hint and never compares a durable fact to the device the intent
+recorded. It asks the platform which live mounts carry the recorded UUID (F2's
+locator): none is `Unknown` — an absent drive is not a deleted root — and more than
+one is `duplicate_volume_uuid`, refused for that intent before any mount is chosen,
+because a decision between two mounts is never made. The one candidate is verified
+as the volume and as a real mount root, and the area folder is walked from *that*
+live mount through the same containment walk, so a reconnect that moved the mount
+point settles on the UUID and the components below it while the stale hint is only a
+stale observation.
+
+What a changed device is re-proved from depends on the phase, because each phase
+acts on a different object and `marker_last` has already removed the marker the
+earlier ones compare. `removed` and `deleted` rest on the durable phase — Barge's own
+recorded final unlink — and not on an object's identity at all. `intent` acts on
+whichever name holds the unit: the unit itself, where the rename never happened and
+the intent rolls back, or its capture, where it resumes. `renamed` acts on the
+capture with its marker in place, and `marker_last` on the capture whose marker must
+be *positively absent*, which is that phase's own proof. In every case the object
+must be the recorded kind and inode on the volume this run verified; below
+`marker_last` its marker must be the exact recorded bytes (which pin the root id,
+nonce and volume); at `marker_last` the marker must be gone and the inode and kind
+are the identity. A markerless unit therefore settles on its inode, its kind, the
+verified volume and the intent's own 128-bit private capture name — stage 1's own
+leaf rule minus the device. An intent that carries identity evidence must also have
+its durable record agree: root id, nonce, mount-relative path, inode and kind, and
+the generation the record was written at; at `marker_last` the marker's own facts are
+gone by design, so the evidence's inode and the acted-on inode are what remain. An
+object that is anything else — a different inode, a leaf that cannot be read, a
+marker that is not the recorded bytes — keeps stage 1's within-run device, so the
+change is `Unknown` and the intent stays pending with the reason. The replayed
+intents report how many resumed deletions were re-established this way, and a settled
 intent's record keeps its evidence as the diagnostic a later run reads.
 
 The `barge.root/1`-to-`/2` settlement. A pending intent written by an older reader

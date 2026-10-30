@@ -1914,12 +1914,15 @@ Choices S5 made where this design left the mechanic to the slice:
   re-establishes them, an intent is written only when its gate held — so a
   recorded identity is `verified` and its inode and marker digest name this unit —
   and a record written before F4, `/2` or `/1`, still reads with neither. The
-  replay reads the live volume rather than the intent's recorded device, tolerates
-  a device that changed with a remount only when the unit's inode and exact marker
-  bytes (and its durable identity record, when the intent carries that evidence)
-  prove it, and settles a pending `barge.intent/1` record over a `barge.root/1`
-  root without rewriting the marker or inventing an identity record. The design's
-  own owner for those rules is
+  replay finds the volume by the recorded UUID (refusing a duplicated mount and
+  locating a moved one) rather than through the registry's hint, and tolerates a
+  device that changed with a remount only from what the phase still proves: the
+  acted-on unit's or capture's inode and kind on the verified volume, its exact
+  recorded marker bytes below `marker_last`, the marker's positive absence at
+  `marker_last`, the durable phase at `removed`, and the durable identity record
+  when the intent carries that evidence. A pending `barge.intent/1` record over a
+  `barge.root/1` root settles the same way, without rewriting the marker or
+  inventing an identity record. The design's own owner for those rules is
   [stage 4](stage4-design.md#f4-landed-surface).
 - **Deletion order.** The intent is durable, custody is re-decided, the unit is
   renamed inside its parent, `renamed` is durable, the volume and the leaf's
