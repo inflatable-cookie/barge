@@ -1705,5 +1705,113 @@ fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
     );
     assert_eq!(row["space_idle"]["state"], "idle");
     assert!(row["space_idle"].get("reason").is_none());
+    assert_eq!(
+        row["idle"], true,
+        "stage 1's hold-only idleness is unchanged"
+    );
+
+    // The other two decision rows: a held root is kept because of its hold, and a
+    // root whose activity record is lost is kept as unknown.
+    let created = run_area(
+        &[
+            "root",
+            "create",
+            "--namespace",
+            "fixture",
+            "--area",
+            "pool",
+            "--volume",
+            &volume,
+            "--kind",
+            "area_root",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(created.status.code(), Some(0), "the second root is created");
+    let second = stdout_document(&created)["data"]["root"]["root_id"]
+        .as_str()
+        .expect("the creation names the root")
+        .to_owned();
+    let held = run_area(
+        &[
+            "hold",
+            "--root",
+            &second,
+            "--holder",
+            "prover",
+            "--pid",
+            &pid,
+            "--scope",
+            "write",
+            "--purpose",
+            "a fixture CLI holder",
+        ],
+        &state_dir,
+    );
+    assert_eq!(held.status.code(), Some(0), "the second hold succeeds");
+    let listed = run_area(
+        &[
+            "root",
+            "list",
+            "--namespace",
+            "fixture",
+            "--area",
+            "pool",
+            "--volume",
+            &volume,
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(listed.status.code(), Some(0));
+    let listed = stdout_document(&listed);
+    let row = listed["data"]["roots"]["rows"]
+        .as_array()
+        .expect("the listing carries rows")
+        .iter()
+        .find(|row| row["root_id"] == Value::String(second.clone()))
+        .expect("the held root is listed");
+    assert_eq!(row["idle"], false, "a live hold is not stage 1's idle");
+    assert_eq!(row["holds"][0]["state"], "live");
+    assert_eq!(row["activity"]["state"], "unreleased");
+    assert_eq!(row["space_idle"]["state"], "not_idle");
+    assert_eq!(row["space_idle"]["reason"], "hold_live");
+
+    let released = run_area(
+        &["release", "--root", &second, "--holder", "prover"],
+        &state_dir,
+    );
+    assert_eq!(released.status.code(), Some(0));
+
+    // A lost activity record is kept as unknown, never idle.
+    std::fs::remove_file(state_dir.join(format!("activity/{second}.json")))
+        .expect("the second root's activity record is removed");
+    let listed = run_area(
+        &[
+            "root",
+            "list",
+            "--namespace",
+            "fixture",
+            "--area",
+            "pool",
+            "--volume",
+            &volume,
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(listed.status.code(), Some(0));
+    let listed = stdout_document(&listed);
+    let row = listed["data"]["roots"]["rows"]
+        .as_array()
+        .expect("the listing carries rows")
+        .iter()
+        .find(|row| row["root_id"] == Value::String(second.clone()))
+        .expect("the root is listed");
+    assert_eq!(row["idle"], true, "no hold covers it");
+    assert_eq!(row["activity"]["state"], "missing");
+    assert_eq!(row["space_idle"]["state"], "not_idle");
+    assert_eq!(row["space_idle"]["reason"], "activity_unknown");
     drop(fixture);
 }
