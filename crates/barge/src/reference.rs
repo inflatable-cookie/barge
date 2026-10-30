@@ -1216,6 +1216,16 @@ fn read_receipts_with(
     if !outputs_state {
         return OxideReceipts::Absent;
     }
+    // The bound is checked before anything is concluded, including an empty folder:
+    // a census that reached its own deadline did not see the whole folder, so it is
+    // unknown rather than a complete empty one.
+    if deadline.expired() {
+        return OxideReceipts::Unknown {
+            reason: format!(
+                "reading Oxide's receipts did not finish inside its {REFERENCE_WALL:?} bound"
+            ),
+        };
+    }
     let listing = match std::fs::read_dir(outputs) {
         Ok(listing) => listing,
         Err(error) => {
@@ -1272,6 +1282,15 @@ fn read_receipts_with(
             }
             Err(reason) => return OxideReceipts::Unknown { reason },
         }
+    }
+    // The last entry can consume the bound: the census is only complete while it is
+    // still inside its own wall clock.
+    if deadline.expired() {
+        return OxideReceipts::Unknown {
+            reason: format!(
+                "reading Oxide's receipts did not finish inside its {REFERENCE_WALL:?} bound"
+            ),
+        };
     }
     OxideReceipts::Read(receipts)
 }
@@ -2547,6 +2566,24 @@ mod tests {
             read_receipts(&listed, deadline),
             OxideReceipts::Read(receipts) if receipts.len() == 1
         ));
+        // An overdue deadline is unknown even for an empty folder and for a folder
+        // whose entries all read: the census only reports completeness inside its own
+        // bound.
+        let expired = Deadline::after(Duration::ZERO);
+        assert!(
+            matches!(
+                read_receipts(&empty, expired),
+                OxideReceipts::Unknown { .. }
+            ),
+            "an overdue empty census was reported complete"
+        );
+        assert!(
+            matches!(
+                read_receipts(&listed, expired),
+                OxideReceipts::Unknown { .. }
+            ),
+            "an overdue census with entries was reported complete"
+        );
         let vanished =
             |_path: &Path,
              _id: &str,

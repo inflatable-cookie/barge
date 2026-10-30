@@ -1346,6 +1346,10 @@ fn prune_plans_one_area_and_only_writes_the_file_it_was_given() {
     assert_eq!(document["data"]["plan"]["area"]["area"], "pool");
     assert_eq!(document["data"]["plan"]["rows"]["count"], 0);
     assert_eq!(document["data"]["plan"]["eligible_count"], 0);
+    // The plan carries its own wall clock's outcome: a plan that finished says so,
+    // and names no unreached root.
+    assert_eq!(document["data"]["plan"]["timed_out"], false);
+    assert_eq!(document["data"]["plan"]["unreached_count"], 0);
     assert_eq!(document["data"]["volume"]["state"], "absent");
     assert_eq!(document["data"]["volume"]["loud"], false);
     let digest = document["data"]["plan_digest"]

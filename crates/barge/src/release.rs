@@ -45,7 +45,7 @@
 //!   budget is a report rather than something waited out.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +71,15 @@ pub const REFERENCE_ROWS: usize = 64;
 /// The most roots one plan examines (stage 4 design, "Bounded resources").
 pub const PLAN_ROOTS: usize = 4096;
 
+/// How long one plan may take (stage 4 design, "Bounded resources": stage 1's run
+/// wall).
+pub const PLAN_WALL: Duration = Duration::from_secs(600);
+
+/// How much of that wall is reserved for stopping: no new root is attempted inside
+/// it, so the plan reports the roots it did not reach instead of being killed in the
+/// middle of one.
+pub const PLAN_STOP_MARGIN: Duration = Duration::from_secs(30);
+
 /// The verdict a proof that could not be established carries.
 const ABSENCE_VERDICT_UNKNOWN: &str = "unknown";
 
@@ -82,6 +91,11 @@ pub struct ReleaseBounds {
     /// How long one shared lock may wait for a live owner. It is the run's own
     /// deadline for a lock: a holder past it is refused, never waited out twice.
     pub lock_wait: Duration,
+    /// The whole plan's wall clock, which the design fixes at 600 s.
+    pub wall: Duration,
+    /// The window at the end of that wall in which no new root is attempted, so a
+    /// plan reports what it did not reach instead of being killed mid-row.
+    pub stop_margin: Duration,
 }
 
 impl ReleaseBounds {
@@ -91,6 +105,8 @@ impl ReleaseBounds {
         Self {
             custody: CustodyBounds::default(),
             lock_wait: state::LOCK_WAIT,
+            wall: PLAN_WALL,
+            stop_margin: PLAN_STOP_MARGIN,
         }
     }
 }
@@ -324,6 +340,11 @@ pub struct PrunePlan {
     pub examined_count: usize,
     /// Whether a listing bound cut the plan before the area was exhausted.
     pub truncated: bool,
+    /// Whether the plan's own wall clock stopped it before every listed root was
+    /// examined. Every unreached root is reported as a kept row.
+    pub timed_out: bool,
+    /// How many listed roots the wall clock stopped the plan before.
+    pub unreached_count: usize,
 }
 
 impl PrunePlan {
@@ -394,7 +415,7 @@ impl PruneReport {
     /// declared, or a reference set that could not be read completely. `0` is a
     /// plan whose every refusal is an ordinary "keep this root".
     pub fn needs_human(&self) -> bool {
-        self.volume.loud || !self.oxide.complete
+        self.volume.loud || !self.oxide.complete || self.plan.timed_out
     }
 }
 
@@ -574,9 +595,36 @@ pub fn plan(
     let pending = pending_intents(state_paths)?;
     let uid = observer.effective_uid()?;
 
+    // The run's own wall clock, from the moment its bounded work starts. No row is
+    // attempted inside the stop margin, so reaching it reports the roots the plan
+    // did not reach instead of being killed in the middle of one.
+    let started = Instant::now();
+    let deadline = started
+        + request
+            .bounds
+            .wall
+            .saturating_sub(request.bounds.stop_margin);
     let mut rows = Vec::new();
     let truncated = listing.truncated;
+    let mut timed_out = false;
+    let mut unreached = 0usize;
     for root in &listing.names {
+        if Instant::now() >= deadline {
+            // Every listed root the wall clock stopped the plan before stays
+            // unverified and kept, and the plan says how many there were.
+            timed_out = true;
+            unreached = unreached.saturating_add(1);
+            rows.push(unobserved_row(
+                &root.name,
+                relative_to_mount(&root.path, &resolved.mount_point),
+                "timeout",
+                format!(
+                    "the plan's {:?} wall clock was reached before this root, so nothing about it was read",
+                    request.bounds.wall
+                ),
+            ));
+            continue;
+        }
         rows.push(decide_root(
             state_paths,
             dirs,
@@ -599,13 +647,10 @@ pub fn plan(
     // the volume's observation lock is the only one still held here.
     drop(volume_lock);
     let examined = listing.examined;
-    finish(
-        volume,
-        area_ref,
-        request,
-        PlanRows::with_counts(rows, examined, truncated),
-        oxide,
-    )
+    let mut plan_rows = PlanRows::with_counts(rows, examined, truncated);
+    plan_rows.timed_out = timed_out;
+    plan_rows.unreached = unreached;
+    finish(volume, area_ref, request, plan_rows, oxide)
 }
 
 /// The rows and counts one plan assembles.
@@ -613,6 +658,8 @@ struct PlanRows {
     rows: Vec<PrunePlanRow>,
     examined: usize,
     truncated: bool,
+    timed_out: bool,
+    unreached: usize,
 }
 
 impl PlanRows {
@@ -622,6 +669,8 @@ impl PlanRows {
             rows: Vec::new(),
             examined: 0,
             truncated: false,
+            timed_out: false,
+            unreached: 0,
         }
     }
 
@@ -631,6 +680,8 @@ impl PlanRows {
             rows,
             examined,
             truncated,
+            timed_out: false,
+            unreached: 0,
         }
     }
 }
@@ -653,6 +704,8 @@ fn finish(
         eligible_count,
         examined_count: rows.examined,
         truncated: rows.truncated || plan_rows_truncated(total),
+        timed_out: rows.timed_out,
+        unreached_count: rows.unreached,
     };
     let plan_digest = sha256_hex(&canonical_plan_bytes(&plan)?);
     Ok(PruneReport {
@@ -1527,6 +1580,13 @@ pub fn read_prune_plan(bytes: &[u8]) -> Result<PrunePlan> {
         )
     })?;
     plan.rows.validate()?;
+    if plan.unreached_count > plan.rows.count {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the plan's unreached count is larger than its rows",
+        )
+        .with_detail("unreached_count", plan.unreached_count.into()));
+    }
     if plan.eligible_count != plan.rows.rows.iter().filter(|row| row.eligible).count() {
         return Err(Error::new(
             ErrorKind::UnknownState,
@@ -2666,6 +2726,55 @@ mod tests {
             kept.identity.reason.as_deref(),
             Some("not_a_real_directory")
         );
+    }
+
+    #[test]
+    fn the_plans_wall_clock_keeps_every_unreached_root() {
+        // The plan carries stage 1's 600 s run wall and starts no row inside its stop
+        // margin. A plan whose wall is already spent reports each listed root as a
+        // kept, unobserved row, says how many it did not reach, and needs a human.
+        let fixture = Fixture::new("release-wall");
+        let first = fixture.root();
+        let second = fixture.root();
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let bounds = ReleaseBounds {
+            wall: Duration::ZERO,
+            stop_margin: Duration::ZERO,
+            ..ReleaseBounds::design()
+        };
+        let request = ReleaseRequest {
+            bounds,
+            ..fixture.request(fixture.overdue())
+        };
+        let mounts = fixture.volume.mounts();
+        let report = plan(
+            &fixture.volume.state,
+            &fixture.volume.platform(),
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.account,
+            &request,
+        )
+        .expect("an expired wall clock is a report, not a refusal");
+        assert!(report.plan.timed_out);
+        assert_eq!(report.plan.unreached_count, 2);
+        assert_eq!(report.plan.rows.count, 2);
+        assert_eq!(report.plan.eligible_count, 0);
+        for root in [&first, &second] {
+            let kept = row(&report, root);
+            assert!(!kept.eligible, "{kept:?}");
+            assert_eq!(kept.blocked_by.as_deref(), Some("timeout"));
+            assert!(kept.bytes.is_none(), "nothing about the root was read");
+        }
+        assert!(report.needs_human(), "a timed-out plan needs a human");
+
+        // The same fixture under the design's wall clock plans normally.
+        let report = fixture.plan();
+        assert!(!report.plan.timed_out);
+        assert_eq!(report.plan.unreached_count, 0);
+        assert_eq!(report.plan.eligible_count, 2);
     }
 
     #[test]

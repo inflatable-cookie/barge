@@ -1085,6 +1085,13 @@ contract's bounded `RowSet`s, so a list whose counts disagree with its rows is
 refused on read. A root with more than 64 references is kept: a set the plan
 cannot report in full is never a short set.
 
+The plan carries stage 1's 600 s run wall (`PLAN_WALL`, with a 30 s stop margin):
+no root is attempted inside that window, so reaching it reports `timed_out`, counts
+the listed roots it did not reach in `unreached_count`, and gives every one of them
+a kept row with `blocked_by: timeout` and no observation. A timed-out plan forces
+exit `3`, and every unreached root stays unverified and kept — the bound never
+reports the part it did not see as eligible.
+
 What the reference readers read, and where. Barge's own: every placement record
 (the whole census, so a truncated one is `Unknown`), the area declaration the
 plan is built under (current when its policy never releases a root), and the
@@ -1168,7 +1175,10 @@ was listed and is gone by the time it is read changed the census under the
 observation, which is unknown too rather than an empty complete census. "No Oxide
 record names this root" is only ever concluded from a complete look, never from a
 look that failed or that watched the source change. A complete snapshot is reported on
-the command document, and an incomplete one forces exit `3`. More than one distinct consumer path for one root, or two records that
+the command document, and an incomplete one forces exit `3`. The census's own bound
+is part of that: a folder that is empty, or whose entries all read, is only a
+complete look while the observation is still inside its bound, so an overdue census
+is unknown rather than a complete empty one. More than one distinct consumer path for one root, or two records that
 disagree about one path's volume, is also unknown and keeps that root: the plan
 proves what it can name exactly once.
 
