@@ -765,12 +765,15 @@ impl Builder<'_> {
             &declaration,
             Some(document),
         )?;
-        let listing = area::list_roots(
+        // The age this step decides is the stage 4 rule: a bounded scan of the
+        // root's subtree, never the marker's creation time alone.
+        let listing = area::list_roots_with(
             self.dirs,
             self.observer,
             self.state_paths,
             &resolved,
             ROOT_ROWS,
+            area::ActivityMode::Scan,
         )?;
         let age_ms = age_seconds.saturating_mul(1000);
         let mut candidates = Vec::new();
@@ -1784,7 +1787,14 @@ fn reverify_area_root(
         &declaration,
         Some(&stored),
     )?;
-    let listing = area::list_roots(dirs, observer, state_paths, &resolved, ROOT_ROWS)?;
+    let listing = area::list_roots_with(
+        dirs,
+        observer,
+        state_paths,
+        &resolved,
+        ROOT_ROWS,
+        area::ActivityMode::Scan,
+    )?;
     let Some(observed) = listing
         .roots
         .iter()
@@ -2137,6 +2147,70 @@ mod tests {
 
     fn canonical(report: &MaintainReport) -> Vec<u8> {
         canonical_plan_bytes(&report.plan).expect("the plan encodes")
+    }
+
+    #[test]
+    fn an_effect_revalidation_uses_the_roots_own_fresh_time() {
+        // A root planned as idle is touched after the preview so its own directory now
+        // says a time ahead of the plan's clock, while an earlier listing still says the
+        // old one. The effect-time revalidation reads the root's own fresh time, so the
+        // age is unknown and the root is kept; an implementation that preferred the
+        // stale listing would delete it.
+        let harness = Harness::new("maintain-effect-fresh-time");
+        let root = harness.create_root(RootKind::AreaRoot);
+        let preview = harness.preview();
+        assert!(
+            preview.plan.volumes.rows.iter().any(|volume| volume
+                .areas
+                .rows
+                .iter()
+                .any(|area| area.candidates.count == 1)),
+            "the root is planned as idle: {:?}",
+            preview.plan
+        );
+
+        // The root is touched at a time ahead of the plan's clock, and every listing
+        // keeps reporting the old time.
+        let plan_now = harness.aged();
+        let touched = plan_now + 2 * DAY_MS;
+        let directory = std::fs::File::open(&root.path).expect("the root directory opens");
+        directory
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(touched))
+            .expect("the root's modification time is set");
+        drop(directory);
+        let dirs = crate::testkit::Faults::default();
+        dirs.listing_the_modified_time_as(harness.fixture.state_biased_now() - 8 * DAY_MS);
+        let report = harness
+            .real_with(&dirs, plan_now, &preview)
+            .expect("the real run completes");
+        assert_eq!(report.volumes.rows.len(), 1);
+        let deleted: usize = report
+            .volumes
+            .rows
+            .iter()
+            .map(|volume| {
+                volume
+                    .areas
+                    .iter()
+                    .map(|area| area.deleted.count)
+                    .sum::<usize>()
+            })
+            .sum();
+        assert_eq!(deleted, 0, "the touched root was deleted: {report:?}");
+        let skipped: usize = report
+            .volumes
+            .rows
+            .iter()
+            .map(|volume| {
+                volume
+                    .areas
+                    .iter()
+                    .map(|area| area.skipped.count)
+                    .sum::<usize>()
+            })
+            .sum();
+        assert_eq!(skipped, 1, "the root is reported as kept: {report:?}");
+        assert!(root.path.is_dir(), "the root is still there");
     }
 
     #[test]

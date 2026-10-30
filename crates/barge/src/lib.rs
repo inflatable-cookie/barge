@@ -16,7 +16,9 @@
 //! S7 adds `prune`: `barge maintain` in preview and real form, which sweeps every
 //! registered, present volume's scratch folder through S4's sweep and then
 //! applies each declared area's prune policy, with one canonical plan and digest
-//! and the 0/2/3 exit contract. Every other module states its job and carries no
+//! and the 0/2/3 exit contract. Slice `reference` reads Barge's and Oxide's own
+//! records for the release gate, and slice `release` is that gate's plan:
+//! `barge prune --plan` in one area, with its `barge.prune.plan/1` evidence. Every other module states its job and carries no
 //! placeholder logic for a later slice to undo.
 //!
 //! `unsafe` is denied for the whole crate and allowed only in the macOS
@@ -41,7 +43,9 @@ pub mod identity;
 pub mod inspect;
 pub mod os;
 pub mod prune;
+pub mod reference;
 pub mod registry;
+pub mod release;
 pub mod scratch;
 pub mod space;
 pub mod state;

@@ -209,9 +209,10 @@ use crate::area::{self, AreaDeclaration, OwnedRoot, ResolvedArea, RootSpec};
 use crate::contract::HOLD_SCHEMA;
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
-    AccountFacts, ChildListing, ChildRemoval, DescriptorScan, DescriptorScanRequest, DeviceId,
-    DirHandle, DirId, DirOps, EntryFacts, FileSystem, MacOs, MountPoint, MountRoot, OpenDescriptor,
-    ProcessObserver, RemoveKind, RenameOutcome, VolumeFacts, VolumeIdentity, VolumeUuid,
+    AbsenceVolume, AccountFacts, ChildListing, ChildRemoval, DescriptorScan, DescriptorScanRequest,
+    DeviceId, DirHandle, DirId, DirOps, EntryFacts, FileSystem, MacOs, MountPoint, MountRoot,
+    OpenDescriptor, ProcessObserver, RemoveKind, RenameOutcome, VolumeFacts, VolumeIdentity,
+    VolumeUuid,
 };
 use crate::registry::{
     Availability, Durability, FolderOverrides, RecordOrigin, RegistryDocument, RegistryWriter,
@@ -304,6 +305,75 @@ impl VolumeFacts for FakeVolume {
             device,
             volume_uuid: Some(self.uuid.clone()),
             boot_volume: false,
+        })
+    }
+}
+
+/// The volume locator's seam over the fixture volume: its one mount.
+impl crate::os::VolumeLocator for FakeVolume {
+    fn mounts_for_uuid(&self, uuid: &VolumeUuid) -> Result<Vec<MountPoint>> {
+        Ok(if self.present.get() && &self.uuid == uuid {
+            vec![MountPoint::new(self.root.clone())]
+        } else {
+            Vec::new()
+        })
+    }
+}
+
+/// The mount-root proof over the fixture volume itself, for a caller that takes
+/// one seam instead of two.
+impl MountRoot for FakeVolume {
+    fn mount_root(&self, path: &Path) -> Result<MountPoint> {
+        if path != self.root {
+            return Err(Error::new(
+                ErrorKind::VolumeMismatch,
+                format!("{} is not the fixture mount root", path.display()),
+            ));
+        }
+        Ok(MountPoint::new(self.root.clone()))
+    }
+}
+
+/// The absence proof's volume seam over the fixture volume.
+///
+/// The fixture root stands in for both the registered volume and the boot Data
+/// volume: a directory outside the fixture root is read as an ancestor on the
+/// fixture's boot Data stand-in, whose device, UUID and mount point are the
+/// fixture's. That is a fixture fiction with one purpose — proving the walk and
+/// the volume proof without a real drive — and it is the only way these tests
+/// touch an absence proof.
+impl AbsenceVolume for FakeVolume {
+    /// The prefix the fixture volume is mounted at, for a path inside it.
+    ///
+    /// A real platform answers only for a path under its mount parent; the
+    /// fixture answers for the one directory it stands in for, so a consumer path
+    /// outside it is decided against the boot Data stand-in below.
+    fn volume_prefix(&self, path: &Path) -> Option<PathBuf> {
+        (path != self.root && path.starts_with(&self.root)).then(|| self.root.clone())
+    }
+
+    /// The identity of the directory one opened descriptor names.
+    ///
+    /// The fixture volume is one real directory tree, so the identity is the
+    /// fixture's UUID and mount point with the descriptor's own device.
+    fn identify_directory(&self, handle: &DirHandle) -> Result<VolumeIdentity> {
+        Ok(VolumeIdentity {
+            mount_point: self.root.clone(),
+            filesystem: FileSystem::Apfs,
+            device: handle.identity().device,
+            volume_uuid: Some(self.uuid.clone()),
+            boot_volume: false,
+        })
+    }
+
+    /// The fixture's boot Data stand-in: the fixture volume itself.
+    fn boot_data(&self) -> Result<VolumeIdentity> {
+        Ok(VolumeIdentity {
+            mount_point: self.root.clone(),
+            filesystem: FileSystem::Apfs,
+            device: self.device,
+            volume_uuid: Some(self.uuid.clone()),
+            boot_volume: true,
         })
     }
 }
@@ -537,6 +607,29 @@ pub struct Faults {
     /// A device the descriptor a capture is verified through reports, so the
     /// parent binding fails and the captured facts cannot be read.
     pub parent_device_shift: Cell<Option<DeviceId>>,
+    /// When set, every fact this wrapper reports states no modification time, so
+    /// a platform that reports none can be simulated without a second `DirOps`.
+    pub no_modified_times: Cell<bool>,
+    /// When set, only a *directory's own* facts state no modification time, while
+    /// its entries still do. It is how a root whose own time is unavailable but
+    /// whose children carry old times is simulated.
+    pub no_directory_modified_times: Cell<bool>,
+    /// When set, every directory's own facts report another owner, which is how a
+    /// root that belongs to a different account is simulated.
+    pub foreign_directory_owner: Cell<bool>,
+    /// A name whose file is removed between its observation and its read, so the
+    /// reader meets a marker that was there and is gone.
+    pub vanish_on_read_name: RefCell<Option<String>>,
+    /// A one-shot pause immediately before a directory listing, so a scan's own
+    /// deadline can expire while it is listing.
+    pub sleep_before_listing: RefCell<Option<std::time::Duration>>,
+    /// A modification time every *listing* reports instead of the real one, so an
+    /// earlier observation can be stale while the directory's own descriptor facts
+    /// stay current.
+    pub stale_listing_modified_ms: Cell<Option<u64>>,
+    /// Every child name this wrapper opened, in order. A caller that must not
+    /// read an entry before its own lock uses it to prove nothing was opened.
+    pub opened_child_names: RefCell<Vec<String>>,
     /// A name whose entry read fails, so the walk aborts where a real read error
     /// would abort it.
     pub failing_facts_name: Option<String>,
@@ -661,6 +754,45 @@ impl Faults {
     }
 
     /// Refuse one directory removal with `ENOTEMPTY` `times` times.
+    /// Report no modification times at all, as a platform without them does.
+    pub fn hiding_modified_times(&self) {
+        self.no_modified_times.set(true);
+    }
+
+    /// Report no modification time for a directory's own facts, while its entries
+    /// keep theirs.
+    pub fn hiding_directory_modified_times(&self) {
+        self.no_directory_modified_times.set(true);
+    }
+
+    /// Report another owner for every directory's own facts, as a root owned by a
+    /// different account would.
+    pub fn with_foreign_directory_owner(&self) {
+        self.foreign_directory_owner.set(true);
+    }
+
+    /// Remove this child between the observation that listed it and the read that
+    /// follows, as a racer would.
+    pub fn vanishing_on_read(&self, name: &str) {
+        *self.vanish_on_read_name.borrow_mut() = Some(name.to_owned());
+    }
+
+    /// Pause once, immediately before the next directory listing.
+    pub fn sleeping_before_listing(&self, pause: std::time::Duration) {
+        *self.sleep_before_listing.borrow_mut() = Some(pause);
+    }
+
+    /// Report this modification time in every listing, leaving each directory's own
+    /// facts alone: an earlier observation, not the current one.
+    pub fn listing_the_modified_time_as(&self, modified_ms: u64) {
+        self.stale_listing_modified_ms.set(Some(modified_ms));
+    }
+
+    /// Stop reporting a stale listing time.
+    pub fn listing_the_real_modified_time(&self) {
+        self.stale_listing_modified_ms.set(None);
+    }
+
     pub fn failing_remove(&self, name: &str, times: usize) {
         self.not_empty.borrow_mut().insert(name.to_owned(), times);
     }
@@ -1003,6 +1135,7 @@ impl DirOps for Faults {
     }
 
     fn open_child_dir(&self, parent: &DirHandle, name: &str) -> Result<DirHandle> {
+        self.opened_child_names.borrow_mut().push(name.to_owned());
         let swap = self
             .swap_on_dir_open
             .borrow_mut()
@@ -1081,6 +1214,12 @@ impl DirOps for Faults {
                 facts.device = device;
             }
         }
+        if self.no_modified_times.get() {
+            facts.modified_ms = None;
+        }
+        if let Some(stale) = self.stale_listing_modified_ms.get() {
+            facts.modified_ms = Some(stale);
+        }
         // The racer replaces the entry after the check that just read these
         // facts, so the returned observation describes an object that is no
         // longer at the name: the exact window a check-then-unlink by name loses.
@@ -1127,7 +1266,20 @@ impl DirOps for Faults {
                 "injected interrupted settings readback",
             ));
         }
+        let vanish = self.vanish_on_read_name.borrow().clone();
+        if vanish.as_deref() == Some(name) {
+            *self.vanish_on_read_name.borrow_mut() = None;
+            let _ = self.inner.remove_child(parent, name, RemoveKind::File);
+            return Ok(None);
+        }
         self.inner.read_child_file(parent, name, cap)
+    }
+
+    fn list_names(&self, parent: &DirHandle, max_names: usize) -> Result<crate::os::DirNames> {
+        if let Some(pause) = self.sleep_before_listing.borrow_mut().take() {
+            std::thread::sleep(pause);
+        }
+        self.inner.list_names(parent, max_names)
     }
 
     fn list_children(&self, parent: &DirHandle, max_names: usize) -> Result<ChildListing> {
@@ -1138,7 +1290,22 @@ impl DirOps for Faults {
                 "the listing after the mode change did not happen",
             ));
         }
-        self.inner.list_children(parent, max_names)
+        if let Some(pause) = self.sleep_before_listing.borrow_mut().take() {
+            std::thread::sleep(pause);
+        }
+        let mut listing = self.inner.list_children(parent, max_names)?;
+        for entry in &mut listing.entries {
+            if self.no_modified_times.get()
+                || (self.no_directory_modified_times.get()
+                    && entry.facts.kind == crate::os::EntryKind::Directory)
+            {
+                entry.facts.modified_ms = None;
+            }
+            if let Some(stale) = self.stale_listing_modified_ms.get() {
+                entry.facts.modified_ms = Some(stale);
+            }
+        }
+        Ok(listing)
     }
 
     fn remove_child(
@@ -1236,7 +1403,14 @@ impl DirOps for Faults {
     }
 
     fn dir_facts(&self, handle: &DirHandle) -> Result<EntryFacts> {
-        self.inner.dir_facts(handle)
+        let mut facts = self.inner.dir_facts(handle)?;
+        if self.no_modified_times.get() || self.no_directory_modified_times.get() {
+            facts.modified_ms = None;
+        }
+        if self.foreign_directory_owner.get() {
+            facts.uid = facts.uid.saturating_add(1);
+        }
+        Ok(facts)
     }
 
     fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> Result<()> {
