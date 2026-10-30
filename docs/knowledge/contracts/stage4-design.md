@@ -1380,8 +1380,11 @@ effect, so the proof is not a gate there and is not consulted.
 What the release effect's own brief still owns: the verb, its authorization
 (the plan's exact bytes and digest), the effect-time re-establishment of every
 predicate in order, and the operator gate that precedes a real run. Nothing in F4
-changes what may be deleted, and no CLI verb or document changed: the only CLI edit
-is the extra seam and the summary's remounted count.
+changes what may be deleted, and no CLI verb changed. The documents that did gain
+fields are the intent's two optional ones and, additively, the replay report's
+`remounted` count inside `barge.scratch.expire/1`, whose human summary names it only
+when it is not zero; the CLI's only other edit is the absence seam the replay's
+platform object already supplies.
 
 ## Proposed validation
 

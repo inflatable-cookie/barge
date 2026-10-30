@@ -4141,24 +4141,43 @@ mod tests {
         evidence: &state::IntentEvidence,
         device: u64,
     ) -> IntentRecord {
-        let intent_id = format!("{:032x}", 1);
+        publish_unit(
+            &prepared.fixture,
+            &prepared.unit,
+            &format!("{:032x}", 1),
+            phases,
+            evidence,
+            device,
+        )
+    }
+
+    /// Publish one intent for an explicit unit, which a test may build from a
+    /// second root in the same area.
+    fn publish_unit(
+        fixture: &VolumeFixture,
+        unit: &DeletionUnit,
+        intent_id: &str,
+        phases: &[IntentPhase],
+        evidence: &state::IntentEvidence,
+        device: u64,
+    ) -> IntentRecord {
         let now = state::now_ms();
         let mut intent = IntentRecord {
             schema: crate::contract::INTENT_SCHEMA.to_owned(),
-            intent_id: intent_id.clone(),
-            volume_uuid: prepared.unit.volume_uuid.clone(),
-            mount_hint: prepared.fixture.root.clone(),
-            root_dir: prepared.unit.root_dir.clone(),
-            folder: prepared.unit.folder.clone(),
+            intent_id: intent_id.to_owned(),
+            volume_uuid: unit.volume_uuid.clone(),
+            mount_hint: fixture.root.clone(),
+            root_dir: unit.root_dir.clone(),
+            folder: unit.folder.clone(),
             unit: IntentUnit {
-                parent: prepared.unit.parent.clone(),
-                name: prepared.unit.name.clone(),
-                kind: prepared.unit.kind,
+                parent: unit.parent.clone(),
+                name: unit.name.clone(),
+                kind: unit.kind,
                 device,
-                inode: prepared.unit.inode,
-                marker: prepared.unit.marker.clone(),
+                inode: unit.inode,
+                marker: unit.marker.clone(),
                 capture_name: format!("{QUARANTINE_PREFIX}{intent_id}"),
-                grant: prepared.unit.grant.clone(),
+                grant: unit.grant.clone(),
             },
             plan_digest: PLAN.to_owned(),
             phase: IntentPhase::Intent,
@@ -4170,16 +4189,15 @@ mod tests {
             identity: evidence.identity.clone(),
             absence: evidence.absence.clone(),
         };
-        let mut locks = LockSet::new(prepared.fixture.state.clone());
+        let mut locks = LockSet::new(fixture.state.clone());
         let _volume = locks
-            .lock_volume(&prepared.fixture.uuid)
+            .lock_volume(&unit.volume_uuid)
             .expect("the volume lock");
-        let _root = super::lock_deletion_unit(&mut locks, &prepared.unit).expect("the unit lock");
+        let _root = super::lock_deletion_unit(&mut locks, unit).expect("the unit lock");
         let write = locks.begin_intent_write().expect("the intent step");
-        state::publish_intent(&write, &prepared.fixture.state, &intent)
-            .expect("the intent publishes");
+        state::publish_intent(&write, &fixture.state, &intent).expect("the intent publishes");
         for phase in phases {
-            intent = state::advance_intent(&write, &prepared.fixture.state, &intent, *phase)
+            intent = state::advance_intent(&write, &fixture.state, &intent, *phase)
                 .expect("the phase advances");
         }
         intent
@@ -8260,6 +8278,85 @@ mod tests {
             "the changed device was tolerated through the v1 marker"
         );
         assert!(!prepared.unit_path().exists(), "the root is deleted");
+    }
+
+    #[test]
+    fn one_intent_that_cannot_be_reestablished_never_blocks_another() {
+        // Two roots of one area, both captured before a reboot. The first intent's
+        // unit is re-established from its identity evidence; the second one's marker
+        // bytes are not the ones it recorded, so its identity is unknown. The second
+        // stays pending and the first still settles: one undecidable object never
+        // blocks another.
+        let prepared = prepared("delete-replay-per-object");
+        plant_unit_contents(&prepared);
+        let (other, resolved) = prepared.fixture.create_root(
+            &prepared.fixture.record,
+            &prepared.declaration,
+            RootKind::AreaRoot,
+        );
+        let other_unit =
+            DeletionUnit::from_owned(&other, &resolved.root_dir, &resolved.folder, PLAN);
+        VolumeFixture::payload(&other_unit.path_in(&prepared.area), "payload.txt", b"mine");
+
+        let shifted = prepared.unit.device.get().saturating_add(9);
+        let first = format!("{:032x}", 21);
+        let second = format!("{:032x}", 22);
+        publish_unit(
+            &prepared.fixture,
+            &prepared.unit,
+            &first,
+            &[IntentPhase::Renamed],
+            &evidence_for(&prepared),
+            shifted,
+        );
+        publish_unit(
+            &prepared.fixture,
+            &other_unit,
+            &second,
+            &[IntentPhase::Renamed],
+            &state::IntentEvidence::none(),
+            shifted,
+        );
+
+        std::fs::rename(
+            prepared.unit_path(),
+            prepared
+                .parent_path()
+                .join(format!("{QUARANTINE_PREFIX}{first}")),
+        )
+        .expect("the first root is captured");
+        let other_quarantine = prepared
+            .parent_path()
+            .join(format!("{QUARANTINE_PREFIX}{second}"));
+        std::fs::rename(other_unit.path_in(&prepared.area), &other_quarantine)
+            .expect("the second root is captured");
+        let marker_path = other_quarantine.join(ROOT_MARKER_FILE);
+        let mut marker: crate::area::RootMarker =
+            serde_json::from_slice(&std::fs::read(&marker_path).expect("the marker reads"))
+                .expect("the marker decodes");
+        marker.created_ms = marker.created_ms.saturating_add(1);
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&marker).expect("the altered marker encodes"),
+        )
+        .expect("the altered marker is written");
+
+        let replay = prepared.replay();
+        assert_eq!(replay.resumed, 1, "{replay:?}");
+        assert_eq!(replay.pending.len(), 1, "{replay:?}");
+        assert_eq!(replay.pending[0].intent_id, second, "{replay:?}");
+        assert!(
+            replay.pending[0]
+                .reason
+                .contains("marker is not the recorded bytes"),
+            "{}",
+            replay.pending[0].reason
+        );
+        assert!(!prepared.unit_path().exists(), "the first root is deleted");
+        assert!(
+            other_quarantine.join("payload.txt").is_file(),
+            "the second root is untouched"
+        );
     }
 
     #[test]
