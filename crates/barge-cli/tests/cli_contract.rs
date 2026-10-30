@@ -1394,3 +1394,316 @@ fn volume_registration_requires_explicit_modes() {
         assert!(!state_dir.exists());
     }
 }
+
+/// The scratch directory this test owns inside the volume it runs on, removed
+/// when the test finishes.
+struct MountScratch {
+    path: PathBuf,
+}
+
+impl Drop for MountScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// The `/Volumes/<name>` mount root a path is under, when it is under one.
+fn volumes_mount(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    components.next()?;
+    if components.next()?.as_os_str() != "Volumes" {
+        return None;
+    }
+    let name = components.next()?;
+    Some(PathBuf::from("/Volumes").join(name))
+}
+
+/// The CLI documents only a volume-backed command can print.
+///
+/// `barge.area.idle-baseline/1`'s success document and `barge.area.root.list/1`'s
+/// `activity` and `space_idle` rows need a verified volume and a real root, so this
+/// case registers the volume this checkout runs on inside its own throwaway state
+/// directory, keeps every write inside one scratch directory it creates and
+/// removes, and asserts the documents the CLI prints. A checkout that is not on a
+/// `/Volumes` mount has no non-boot volume the OS layer can verify; the library's
+/// tests own the semantics in that case and this case says so rather than
+/// pretending.
+#[test]
+fn the_cli_documents_a_successful_idle_baseline_and_root_list_rows() {
+    let cwd = std::env::current_dir().expect("the working directory");
+    let Some(mount) = volumes_mount(&cwd) else {
+        eprintln!(
+            "skipped: {} is not under a /Volumes mount, so there is no non-boot volume to verify",
+            cwd.display()
+        );
+        return;
+    };
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    let scratch = MountScratch {
+        path: mount
+            .join("scratch/barge")
+            .join(format!("cli-volume-{}-{nanos}", std::process::id())),
+    };
+    std::fs::create_dir_all(&scratch.path).expect("the scratch directory is created");
+    let root_dir = scratch
+        .path
+        .strip_prefix(&mount)
+        .expect("the scratch directory is inside the mount")
+        .to_str()
+        .expect("the scratch path is UTF-8")
+        .to_owned();
+
+    let (fixture, state_dir) = absent_state_dir("area-volume-documents");
+    let mount_text = mount.to_str().expect("the mount path is UTF-8").to_owned();
+
+    // Preview the registration, then publish exactly those bytes and digest.
+    let preview = run_in(
+        &[
+            "volume",
+            "register",
+            "--mount",
+            &mount_text,
+            "--availability",
+            "permanent",
+            "--durability",
+            "expendable",
+            "--root-dir",
+            &root_dir,
+            "--reserve",
+            "64MiB",
+            "--declared-by",
+            "fixture",
+            "--plan",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(
+        preview.status.code(),
+        Some(0),
+        "the registration preview succeeds: {}",
+        String::from_utf8_lossy(&preview.stdout)
+    );
+    let preview = stdout_document(&preview);
+    assert_eq!(preview["schema"], "barge.volume.register/1");
+    let plan = preview["data"]["plan"]
+        .as_str()
+        .expect("the preview carries its plan bytes")
+        .to_owned();
+    let digest = preview["data"]["plan_sha256"]
+        .as_str()
+        .expect("the preview carries its digest")
+        .to_owned();
+    let plan_file = fixture.join("register.plan.json");
+    std::fs::write(&plan_file, plan.as_bytes()).expect("the plan bytes are saved");
+    let applied = run_in(
+        &[
+            "volume",
+            "register",
+            "--plan-file",
+            plan_file.to_str().expect("the plan path is UTF-8"),
+            "--plan-sha256",
+            &digest,
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(
+        applied.status.code(),
+        Some(0),
+        "the registration publishes: {}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
+    let applied = stdout_document(&applied);
+    let volume = applied["data"]["volume_uuid"]
+        .as_str()
+        .expect("the registration names the volume")
+        .to_owned();
+
+    let declared = run_area(
+        &[
+            "declare",
+            "--namespace",
+            "fixture",
+            "--area",
+            "pool",
+            "--folder",
+            "example/pool",
+            "--absent",
+            "fail:drive",
+            "--prune",
+            "none",
+            "--reserve",
+            "counts",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(
+        declared.status.code(),
+        Some(0),
+        "the area declares: {}",
+        String::from_utf8_lossy(&declared.stdout)
+    );
+
+    let created = run_area(
+        &[
+            "root",
+            "create",
+            "--namespace",
+            "fixture",
+            "--area",
+            "pool",
+            "--volume",
+            &volume,
+            "--kind",
+            "area_root",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(
+        created.status.code(),
+        Some(0),
+        "the root is created: {}",
+        String::from_utf8_lossy(&created.stdout)
+    );
+    let created = stdout_document(&created);
+    let root = created["data"]["root"]["root_id"]
+        .as_str()
+        .expect("the creation names the root")
+        .to_owned();
+
+    // A created root that was never released is reported, and is not idle.
+    let listed = run_area(
+        &[
+            "root",
+            "list",
+            "--namespace",
+            "fixture",
+            "--area",
+            "pool",
+            "--volume",
+            &volume,
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(listed.status.code(), Some(0));
+    let listed = stdout_document(&listed);
+    assert_eq!(listed["schema"], "barge.area.root.list/1");
+    let row = listed["data"]["roots"]["rows"]
+        .as_array()
+        .expect("the listing carries rows")
+        .iter()
+        .find(|row| row["root_id"] == Value::String(root.clone()))
+        .expect("the created root is listed");
+    assert_eq!(row["activity"]["state"], "unreleased");
+    assert_eq!(row["activity"]["releases"], 0);
+    assert_eq!(row["space_idle"]["state"], "not_idle");
+    assert_eq!(row["space_idle"]["reason"], "activity_unreleased");
+    assert_eq!(row["idle"], true);
+
+    let pid = std::process::id().to_string();
+    let held = run_area(
+        &[
+            "hold",
+            "--root",
+            &root,
+            "--holder",
+            "prover",
+            "--pid",
+            &pid,
+            "--scope",
+            "write",
+            "--purpose",
+            "a fixture CLI holder",
+        ],
+        &state_dir,
+    );
+    assert_eq!(held.status.code(), Some(0), "the hold succeeds");
+    let released = run_area(
+        &["release", "--root", &root, "--holder", "prover"],
+        &state_dir,
+    );
+    assert_eq!(
+        released.status.code(),
+        Some(0),
+        "the release succeeds: {}",
+        String::from_utf8_lossy(&released.stdout)
+    );
+    let released = stdout_document(&released);
+    assert_eq!(released["schema"], "barge.area.release/1");
+    assert_eq!(released["data"]["released"], true);
+    assert_eq!(released["data"]["activity"]["state"], "released");
+    assert_eq!(released["data"]["activity"]["releases"], 1);
+
+    // The successful idle-baseline document.
+    let baseline = run_area(&["idle-baseline", "--root", &root, "--json"], &state_dir);
+    assert_eq!(
+        baseline.status.code(),
+        Some(0),
+        "the baseline succeeds: {}",
+        String::from_utf8_lossy(&baseline.stdout)
+    );
+    let baseline = stdout_document(&baseline);
+    assert_eq!(baseline["schema"], "barge.area.idle-baseline/1");
+    assert_eq!(baseline["command"], "area.idle-baseline");
+    assert_eq!(baseline["ok"], true);
+    assert_eq!(baseline["data"]["root_id"], root.as_str());
+    assert_eq!(baseline["data"]["volume_uuid"], volume.as_str());
+    assert_eq!(
+        baseline["data"]["activity"]["state"], "released",
+        "the baseline records a release as of now"
+    );
+    assert_eq!(baseline["data"]["activity"]["releases"], 1);
+    assert_eq!(
+        baseline["data"]["activity"]["generation"], 2,
+        "the baseline is one write after the release"
+    );
+    assert!(baseline["data"]["activity"]["last_release_ms"].is_number());
+    assert!(
+        baseline["data"]["custody"].is_string(),
+        "the baseline names the custody capability it was gated on"
+    );
+    assert!(Path::new(
+        baseline["data"]["path"]
+            .as_str()
+            .expect("the baseline names the path it verified")
+    )
+    .is_dir());
+
+    // The listing now reports the recorded release and the pressure verdict.
+    let listed = run_area(
+        &[
+            "root",
+            "list",
+            "--namespace",
+            "fixture",
+            "--area",
+            "pool",
+            "--volume",
+            &volume,
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(listed.status.code(), Some(0));
+    let listed = stdout_document(&listed);
+    let row = listed["data"]["roots"]["rows"]
+        .as_array()
+        .expect("the listing carries rows")
+        .iter()
+        .find(|row| row["root_id"] == Value::String(root.clone()))
+        .expect("the root is listed");
+    assert_eq!(row["activity"]["state"], "released");
+    assert_eq!(
+        row["activity"]["last_release_ms"],
+        baseline["data"]["activity"]["last_release_ms"]
+    );
+    assert_eq!(row["space_idle"]["state"], "idle");
+    assert!(row["space_idle"].get("reason").is_none());
+    drop(fixture);
+}

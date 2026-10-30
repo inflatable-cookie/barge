@@ -1568,6 +1568,13 @@ T6, and no native proof exists or is claimed.
   a root whose creation time was never recorded is ordered after every known one
   rather than being treated as the oldest. T4 orders candidates with it; nothing
   in T3 orders or prunes anything.
+- **The CLI prints these documents against a verified volume.** The suite's CLI
+  case registers the `/Volumes/<name>` mount its checkout is on inside its own
+  throwaway state directory, keeps every write inside one scratch directory it
+  removes, and asserts the successful `barge.area.idle-baseline/1` document and the
+  root-list `activity`/`space_idle` rows end to end. A checkout that is not under a
+  `/Volumes` mount has no non-boot volume the OS layer can verify; the case reports
+  that it skipped, and the library tests own the semantics there.
 - `barge describe`'s `formats` names `barge.activity/1`.
 
 Two readings this slice fixes for later ones. First, an operator's idle baseline
