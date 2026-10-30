@@ -132,45 +132,17 @@ design](contracts/stage3-space-policy.md#activity-records).
 
 ## Q-012 — How is an unconfirmed activity record marked as unknown when the state volume refuses every write?
 
-Status: open — needs the design delegate (Oxide Supervisor); recorded by barge#024
-(slice T3) at the exact-head review's request (comment 6502602706).
-
-`state::publish_atomic` renames the record and then syncs the directory, so a
-publication can fail *after* the new bytes are visible. A release (and now a
-baseline) recovers in three steps, all inside the frozen `barge.activity/1`:
-restore the previous record byte for byte; else remove the unconfirmed record
-(absent is `activity_unknown`); else invalidate it in place by truncation (invalid
-is `activity_unknown` under O-013). Truncation needs only the file's own write
-permission, so it covers the ordinary post-rename failures, including a directory
-whose rename or unlink is refused.
-
-The unrepresentable case is a state volume that refuses **every** write touching
-that record: it can be neither restored, removed nor invalidated, so the
-unconfirmed bytes stay readable. The record is syntactically valid, so once the
-leftover hold is stale the idleness matrix has nothing left to gate on and reads it
-as a release, with its time available to the LRU order. The frozen record has no
-field that says "this fact's publication was not confirmed", and the matrix reads
-only the record and the holds, so no ordering of the release's steps and no
-existing field can mark it. The release reports `unknown_state` with
-`detail.restored`, `detail.removed` and `detail.invalidated` all false and says the
-store that refuses every write cannot be marked, but a later reader cannot be
-constrained by an earlier caller's message.
-
-Options for the delegate, in the order this slice recommends them:
-
-1. **A confirmed-publication marker in `barge.activity/1`** (an optional field, the
-   forward-only addition `barge.registry/1` used for `space`, or a new major):
-   written before the hold removal and confirmed by a second write, with the
-   matrix refusing while it is set or unconfirmed. This closes the case the same
-   way it closes the ordering window, at the cost of the format freeze.
-2. **A second durable fact outside the record** — a pending/unconfirmed document
-   under `state/activity/` — which is a new authoritative document rather than a
-   field.
-3. **Accept the residual as a broken-store limit**: a volume that cannot take any
-   write cannot be marked, the operator repairs it and runs the baseline, and the
-   contract's failure section says so (what it says now). This is the current
-   state of the code and the docs.
-
-Until it is answered, `a_state_volume_that_refuses_every_write_cannot_be_marked`
-pins today's outcome so the answer is a visible change, and this contract does not
-claim that an unconfirmed record can never be read as a release.
+Status: answered 2026-10-29
+Answer: it is not marked, and that limit is accepted: `barge.activity/1` keeps its
+frozen field set, with no confirmed-publication marker and no separate pending
+record. A release and an idle baseline publish their fact through one shared
+fail-closed recovery — restore the previous record byte for byte, else remove the
+unconfirmed record, else invalidate it in place by truncation (both absences and
+invalid records are `activity_unknown` under O-013, never idle) — and a state
+volume that refuses **every** write touching the record is the one case no step can
+mark. It is reported as `unknown_state` with `detail.restored`,
+`detail.removed` and `detail.invalidated` all false, and the operator repairs the
+state volume and runs `barge area idle-baseline`. The contract states that residual
+as an accepted limit and does not claim an unconfirmed record can never be read as
+a release (Oxide Supervisor, decision `7684287e`, implemented by barge#024); see the
+[stage 3 design](contracts/stage3-space-policy.md#activity-records).
