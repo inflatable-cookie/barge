@@ -1060,7 +1060,13 @@ The row's identity is the **listed** root's, bound to its durable record: the
 record is looked up by this root's id (the marker's for an adopted root, else the
 directory's own name when that is a root id), and then its `mount_relative_path`,
 its inode and its marker's root id, nonce, kind and area are compared against what
-was just observed at this path under this root's lock. A record that names another
+was just observed at this path under this root's lock. The comparison's live side
+is observed, never supplied: the root's owner is the owner read from its opened
+descriptor, compared with the account's effective uid, and the live volume UUID and
+mount are the verified volume this root was found on (with the root's device
+compared to the area folder's own descriptor), never the recorded UUID compared
+with itself. A root owned by another account, or a root whose record names another
+volume, is therefore `unknown` and kept. A record that names another
 path is a `path_changed` mismatch — a copied root that reuses an original's id in
 a second area is kept, never verified on the original's record — and the row
 always reports the path it observed rather than the record's stored one.

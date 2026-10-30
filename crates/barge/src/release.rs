@@ -854,8 +854,20 @@ fn decide_root(
     // The root was opened, so it is a real directory; a symbolic link never
     // reaches this point, because opening it no-follow would have been refused.
     let activity = area::scan_activity(dirs, &handle, None, state::now_ms());
+    let root_facts = match dirs.dir_facts(&handle) {
+        Ok(facts) => facts,
+        Err(error) => {
+            return unobserved_row(
+                &root.name,
+                mount_relative_path,
+                "identity",
+                format!("the root directory's own facts cannot be read under its lock: {error}"),
+            )
+        }
+    };
     let locked = LockedObservation {
         identity: handle.identity(),
+        facts: root_facts,
         marker_state,
         marker_digest,
         activity,
@@ -865,7 +877,7 @@ fn decide_root(
     let mut blockers: Vec<(&'static str, String)> = Vec::new();
 
     // Condition 2: the durable identity.
-    let identity = identity_evidence(facts, uid, root, resolved, &locked, stored.as_ref());
+    let identity = identity_evidence(dirs, facts, uid, root, resolved, &locked, stored.as_ref());
     if identity.verdict != "verified" {
         blockers.push((
             "identity",
@@ -1065,6 +1077,10 @@ fn marker_id(marker: &area::MarkerState) -> Option<String> {
 struct LockedObservation {
     /// The root directory's identity, read through the opened descriptor.
     identity: crate::os::DirId,
+    /// The root directory's own facts — its owner among them — read through the
+    /// opened descriptor. They are observations of this directory, never the
+    /// account's own identity supplied in their place.
+    facts: crate::os::EntryFacts,
     /// The marker as it was at this observation.
     marker_state: area::MarkerState,
     /// The SHA-256 of that marker's exact bytes, when it was read.
@@ -1087,6 +1103,7 @@ impl LockedObservation {
 /// The identity evidence for one root, from the durable record and the walk.
 #[allow(clippy::too_many_arguments)]
 fn identity_evidence(
+    dirs: &dyn DirOps,
     facts: &dyn AbsenceVolume,
     uid: u32,
     root: &area::RootName,
@@ -1104,74 +1121,95 @@ fn identity_evidence(
     // never the verdict for whatever path the record happens to name — a copied
     // root that reuses an original's id in another area is kept, not verified.
     let listed_relative = relative_to_mount(&root.path, &resolved.mount_point);
-    let verdict = match (stored, &locked.marker_state) {
-        // A record whose path is not this listed path describes another directory:
-        // a copied root that reuses an original's id in another folder is exactly
-        // this case, and it is kept on its own path rather than verified on the
-        // original's.
-        (Some(record), _) if record.mount_relative_path != listed_relative => {
-            IdentityVerdict::Unknown {
-                reason: IdentityReason::PathChanged,
-            }
+    // The area folder this plan resolved is on the verified volume; the root must be
+    // on that same filesystem, which is a device comparison between two opened
+    // descriptors rather than an assumption.
+    let same_volume = match dirs.open_path(&resolved.path) {
+        Ok(folder) => folder.identity().device == locked.identity.device,
+        Err(_) => false,
+    };
+    let owner = locked.facts.uid;
+    let verdict = if !same_volume || owner != uid {
+        IdentityVerdict::Unknown {
+            reason: IdentityReason::NotARealDirectory,
         }
-        (Some(record), area::MarkerState::Owned(marker)) => {
-            let Ok(record_uuid) = crate::os::VolumeUuid::parse(&record.volume_uuid) else {
-                return IdentityEvidence {
-                    verdict: "unknown".to_owned(),
-                    reason: Some(identity_reason(IdentityReason::IdentityRecordInvalid).to_owned()),
-                    inode,
-                    device_at_record,
-                    device_live,
-                    remount: None,
-                    mount_moved: None,
-                    marker_digest,
-                };
-            };
-            let matching_mounts = match facts.mount_census(&record_uuid) {
-                Ok(mounts) => mounts.len(),
-                // An unavailable census is unknown, never "no mount".
-                Err(_) => {
+    } else {
+        match (stored, &locked.marker_state) {
+            // A record whose path is not this listed path describes another directory:
+            // a copied root that reuses an original's id in another folder is exactly
+            // this case, and it is kept on its own path rather than verified on the
+            // original's.
+            (Some(record), _) if record.mount_relative_path != listed_relative => {
+                IdentityVerdict::Unknown {
+                    reason: IdentityReason::PathChanged,
+                }
+            }
+            (Some(record), area::MarkerState::Owned(marker)) => {
+                let Ok(record_uuid) = crate::os::VolumeUuid::parse(&record.volume_uuid) else {
                     return IdentityEvidence {
                         verdict: "unknown".to_owned(),
-                        reason: Some(identity_reason(IdentityReason::VolumeUnverified).to_owned()),
+                        reason: Some(
+                            identity_reason(IdentityReason::IdentityRecordInvalid).to_owned(),
+                        ),
                         inode,
                         device_at_record,
                         device_live,
                         remount: None,
                         mount_moved: None,
                         marker_digest,
+                    };
+                };
+                let matching_mounts = match facts.mount_census(&record_uuid) {
+                    Ok(mounts) => mounts.len(),
+                    // An unavailable census is unknown, never "no mount".
+                    Err(_) => {
+                        return IdentityEvidence {
+                            verdict: "unknown".to_owned(),
+                            reason: Some(
+                                identity_reason(IdentityReason::VolumeUnverified).to_owned(),
+                            ),
+                            inode,
+                            device_at_record,
+                            device_live,
+                            remount: None,
+                            mount_moved: None,
+                            marker_digest,
+                        }
                     }
-                }
-            };
-            identity::compare(
-                record,
-                &crate::identity::RootObservation {
-                    matching_mounts,
-                    volume_uuid: record_uuid.as_str().to_owned(),
-                    mount: resolved.mount_point.clone(),
-                    device: locked.identity.device.get(),
-                    inode: locked.identity.inode,
-                    root_uid: uid,
-                    effective_uid: uid,
-                    root_id: marker.root_id.clone(),
-                    nonce: marker.nonce.clone(),
-                    mount_relative_path: relative_to_mount(&root.path, &resolved.mount_point),
-                    kind: marker.kind,
-                    area: marker.area.clone(),
-                },
-            )
+                };
+                identity::compare(
+                    record,
+                    &crate::identity::RootObservation {
+                        matching_mounts,
+                        // The live volume is the one this plan verified and this root was
+                        // found on, never the recorded UUID compared with itself: a record
+                        // that names another volume is a mismatch, not a match.
+                        volume_uuid: resolved.volume_uuid.as_str().to_owned(),
+                        mount: resolved.mount_point.clone(),
+                        device: locked.identity.device.get(),
+                        inode: locked.identity.inode,
+                        root_uid: owner,
+                        effective_uid: uid,
+                        root_id: marker.root_id.clone(),
+                        nonce: marker.nonce.clone(),
+                        mount_relative_path: relative_to_mount(&root.path, &resolved.mount_point),
+                        kind: marker.kind,
+                        area: marker.area.clone(),
+                    },
+                )
+            }
+            // The record exists, but this path's marker is not an owned marker: there is
+            // nothing at this path that says it is that root.
+            (Some(_), area::MarkerState::Absent) => IdentityVerdict::Unknown {
+                reason: IdentityReason::MarkerAbsent,
+            },
+            (Some(_), area::MarkerState::Unknown { .. }) => IdentityVerdict::Unknown {
+                reason: IdentityReason::MarkerUnreadable,
+            },
+            (None, _) => IdentityVerdict::Unknown {
+                reason: IdentityReason::IdentityRecordMissing,
+            },
         }
-        // The record exists, but this path's marker is not an owned marker: there is
-        // nothing at this path that says it is that root.
-        (Some(_), area::MarkerState::Absent) => IdentityVerdict::Unknown {
-            reason: IdentityReason::MarkerAbsent,
-        },
-        (Some(_), area::MarkerState::Unknown { .. }) => IdentityVerdict::Unknown {
-            reason: IdentityReason::MarkerUnreadable,
-        },
-        (None, _) => IdentityVerdict::Unknown {
-            reason: IdentityReason::IdentityRecordMissing,
-        },
     };
     match verdict {
         IdentityVerdict::Verified {
@@ -2588,6 +2626,132 @@ mod tests {
             observed.borrow()
         );
         drop(held);
+    }
+
+    #[test]
+    fn a_root_owned_by_another_account_cannot_be_verified() {
+        // The owner compared against the account must be the owner *observed* on the
+        // opened root, not the account's own uid supplied as both sides. A root
+        // reported as another account's is unknown and kept.
+        let fixture = Fixture::new("release-foreign-owner");
+        let root = fixture.root();
+        let dirs = crate::testkit::Faults::default();
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let report = fixture
+            .plan_with_dirs(
+                &dirs,
+                &observer,
+                &facts,
+                fixture.overdue(),
+                ReleaseBounds::design(),
+            )
+            .expect("the plan is built");
+        assert!(row(&report, &root).eligible, "the fixture root is ours");
+
+        dirs.with_foreign_directory_owner();
+        let report = fixture
+            .plan_with_dirs(
+                &dirs,
+                &observer,
+                &facts,
+                fixture.overdue(),
+                ReleaseBounds::design(),
+            )
+            .expect("the plan is built");
+        let kept = row(&report, &root);
+        assert!(!kept.eligible, "{kept:?}");
+        assert_eq!(kept.blocked_by.as_deref(), Some("identity"));
+        assert_eq!(
+            kept.identity.reason.as_deref(),
+            Some("not_a_real_directory")
+        );
+    }
+
+    #[test]
+    fn a_record_naming_another_volume_cannot_be_verified() {
+        // The live volume is the verified one this root was found on, never the
+        // recorded UUID compared with itself. A record that names volume B while the
+        // root sits on the verified volume A is a mismatch — even when B also has a
+        // live mount, which is what makes the comparison meaningful.
+        let fixture = Fixture::new("release-volume-mismatch");
+        let root = fixture.root();
+        let record_path = identity_path(&fixture, &root);
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record_path).expect("the record is read"))
+                .expect("the record is JSON");
+        record["volume_uuid"] = serde_json::Value::String(crate::testkit::OTHER_UUID.to_owned());
+        std::fs::write(
+            &record_path,
+            serde_json::to_vec(&record).expect("the record encodes"),
+        )
+        .expect("the record is rewritten");
+        std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o600))
+            .expect("the record is private");
+
+        // A census that reports a live mount for both UUIDs: the fabricated-volume
+        // comparison would then pass, so only the live verification can refuse it.
+        struct TwoVolumes {
+            inner: FakeVolume,
+        }
+        impl crate::os::VolumeFacts for TwoVolumes {
+            // One live mount for *either* UUID: the fabricated comparison (the
+            // record's UUID against itself) would then pass, so only binding the
+            // live, verified volume can refuse this record.
+            fn mount_census(&self, _uuid: &crate::os::VolumeUuid) -> Result<Vec<PathBuf>> {
+                Ok(vec![self.inner.root.clone()])
+            }
+            fn identify(&self, path: &std::path::Path) -> Result<crate::os::VolumeIdentity> {
+                self.inner.identify(path)
+            }
+        }
+        impl crate::os::VolumeLocator for TwoVolumes {
+            fn mounts_for_uuid(
+                &self,
+                _uuid: &crate::os::VolumeUuid,
+            ) -> Result<Vec<crate::os::MountPoint>> {
+                Ok(vec![crate::os::MountPoint::new(self.inner.root.clone())])
+            }
+        }
+        impl crate::os::MountRoot for TwoVolumes {
+            fn mount_root(&self, path: &std::path::Path) -> Result<crate::os::MountPoint> {
+                self.inner.mount_root(path)
+            }
+        }
+        impl crate::os::AbsenceVolume for TwoVolumes {
+            fn volume_prefix(&self, path: &std::path::Path) -> Option<PathBuf> {
+                self.inner.volume_prefix(path)
+            }
+            fn identify_directory(
+                &self,
+                handle: &crate::os::DirHandle,
+            ) -> Result<crate::os::VolumeIdentity> {
+                self.inner.identify_directory(handle)
+            }
+            fn boot_data(&self) -> Result<crate::os::VolumeIdentity> {
+                self.inner.boot_data()
+            }
+        }
+        let facts = TwoVolumes {
+            inner: fixture.volume.facts(),
+        };
+        let observer = fixture.volume.observer();
+        let mounts = fixture.volume.mounts();
+        let request = fixture.request(fixture.overdue());
+        let report = plan(
+            &fixture.volume.state,
+            &fixture.volume.platform(),
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.account,
+            &request,
+        )
+        .expect("the plan is built");
+        let kept = row(&report, &root);
+        assert!(!kept.eligible, "{kept:?}");
+        assert_eq!(kept.blocked_by.as_deref(), Some("identity"));
+        assert_eq!(kept.identity.reason.as_deref(), Some("volume_unverified"));
     }
 
     /// Publish one pending intent for a unit in this fixture's area.

@@ -614,6 +614,9 @@ pub struct Faults {
     /// its entries still do. It is how a root whose own time is unavailable but
     /// whose children carry old times is simulated.
     pub no_directory_modified_times: Cell<bool>,
+    /// When set, every directory's own facts report another owner, which is how a
+    /// root that belongs to a different account is simulated.
+    pub foreign_directory_owner: Cell<bool>,
     /// Every child name this wrapper opened, in order. A caller that must not
     /// read an entry before its own lock uses it to prove nothing was opened.
     pub opened_child_names: RefCell<Vec<String>>,
@@ -750,6 +753,12 @@ impl Faults {
     /// keep theirs.
     pub fn hiding_directory_modified_times(&self) {
         self.no_directory_modified_times.set(true);
+    }
+
+    /// Report another owner for every directory's own facts, as a root owned by a
+    /// different account would.
+    pub fn with_foreign_directory_owner(&self) {
+        self.foreign_directory_owner.set(true);
     }
 
     pub fn failing_remove(&self, name: &str, times: usize) {
@@ -1347,6 +1356,9 @@ impl DirOps for Faults {
         let mut facts = self.inner.dir_facts(handle)?;
         if self.no_modified_times.get() || self.no_directory_modified_times.get() {
             facts.modified_ms = None;
+        }
+        if self.foreign_directory_owner.get() {
+            facts.uid = facts.uid.saturating_add(1);
         }
         Ok(facts)
     }
