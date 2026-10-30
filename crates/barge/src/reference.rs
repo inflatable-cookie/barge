@@ -85,6 +85,23 @@ fn is_hex64(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+/// Whether a path is a *usable* absolute path: absolute, with no `.` or `..`
+/// component.
+///
+/// It is Oxide's own `safe_absolute` for a receipt's root paths. A path with a parent
+/// component is never the component chain of a root Barge walks, so accepting one
+/// would let a snapshot look complete while a root it names looks unreferenced: the
+/// document is divergent instead.
+fn is_safe_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|component| {
+            !matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+}
+
 /// Whether a value is usable identifying text: non-empty, bounded and free of NUL.
 fn is_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_TEXT_BYTES && !value.contains('\0')
@@ -1249,7 +1266,7 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
         if !is_hex64(&row.checkout_id)
             || !is_text(&row.member)
             || !is_text(&row.recipe)
-            || !row.root.is_absolute()
+            || !is_safe_absolute(&row.root)
             || !row.checkout.is_absolute()
             || !row.receipt.is_absolute()
         {
@@ -1347,7 +1364,7 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
         if intent.identity.dev == 0
             || intent.identity.ino == 0
             || intent.identity.generation == 0
-            || !intent.identity.root.is_absolute()
+            || !is_safe_absolute(&intent.identity.root)
             || intent.identity.marker_digest.len() != 64
             || !intent
                 .identity
@@ -1911,17 +1928,19 @@ fn parse_receipt(
         if placement
             .selected
             .as_ref()
-            .is_some_and(|selected| !selected.root.is_absolute())
-            || placement
-                .prepared
-                .as_ref()
-                .is_some_and(|prepared| !prepared.to.root.is_absolute())
+            .is_some_and(|selected| !is_safe_absolute(&selected.root))
+            || placement.prepared.as_ref().is_some_and(|prepared| {
+                !is_safe_absolute(&prepared.to.root) || !prepared.link.is_absolute()
+            })
             || placement
                 .reserved
                 .as_ref()
-                .is_some_and(|reserved| !reserved.root.is_absolute())
+                .is_some_and(|reserved| !is_safe_absolute(&reserved.root))
         {
-            return Err("a receipt names a relative root".to_owned());
+            return Err(
+                "a receipt names a root path that is relative or has a `.` or `..` component"
+                    .to_owned(),
+            );
         }
     }
     for selected in raw
@@ -1931,14 +1950,17 @@ fn parse_receipt(
         .chain(raw.roots.iter())
         .chain(raw.transition.as_ref().map(|journal| &journal.root))
     {
-        if !selected.root.is_absolute() {
-            return Err("a receipt names a relative root".to_owned());
+        if !is_safe_absolute(&selected.root) {
+            return Err(
+                "a receipt names a root path that is relative or has a `.` or `..` component"
+                    .to_owned(),
+            );
         }
     }
     if raw
         .reserved
         .as_ref()
-        .is_some_and(|reserved| !reserved.root.is_absolute())
+        .is_some_and(|reserved| !is_safe_absolute(&reserved.root))
     {
         return Err("a receipt names a relative root".to_owned());
     }
@@ -2268,6 +2290,112 @@ mod tests {
         assert!(parse_receipt(receipt, &"c".repeat(64)).is_err());
         let reserved = br#"{"version":"oxide.outputs.transition/3","checkout":"/c","checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":1,"state":"committed","layout":"profile","links":[{"member":"target"}],"reserved":{"id":"r1","nonce":"00112233445566778899aabbccddeeff","kind":"external","root":"future","generation":2,"created_ms":1},"updated_ms":9}"#;
         assert!(parse_receipt(reserved, &"c".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn a_root_path_with_a_parent_component_is_divergent() {
+        // Oxide's `safe_absolute` refuses `.` and `..` components, and a path with one
+        // can never be the component chain of a root Barge walks: accepting it would
+        // let the snapshot look complete while the named root looks unreferenced.
+        let id = "c".repeat(64);
+        let unsafe_root = "/Volumes/Builds/pool/existing/../root";
+        let receipt = |site: &str| {
+            let selected =
+                serde_json::json!({"kind": "external", "root": unsafe_root, "generation": 1});
+            let mut document = serde_json::json!({
+                "version": OXIDE_RECEIPT_V2,
+                "checkout": "/c",
+                "checkout_id": id,
+                "generation": 1,
+                "state": "committed",
+                "links": [{"member": "target", "selected": selected}],
+                "roots": [],
+                "updated_ms": 9
+            });
+            match site {
+                "history" => {
+                    document["links"] = serde_json::json!([{"member": "target"}]);
+                    document["roots"] = serde_json::json!([
+                        {"kind": "external", "root": unsafe_root, "generation": 1}
+                    ]);
+                }
+                "prepared" => {
+                    document["links"] = serde_json::json!([{
+                        "member": "target",
+                        "prepared": {
+                            "generation": 2,
+                            "to": {"kind": "external", "root": unsafe_root, "generation": 2},
+                            "link": "/c/target"
+                        }
+                    }]);
+                }
+                "reservation" => {
+                    document["links"] = serde_json::json!([{"member": "target"}]);
+                    document["reserved"] = serde_json::json!({
+                        "id": "r1",
+                        "nonce": "00112233445566778899aabbccddeeff",
+                        "kind": "external",
+                        "root": unsafe_root,
+                        "generation": 2,
+                        "created_ms": 1
+                    });
+                }
+                _ => {}
+            }
+            serde_json::to_vec(&document).expect("the fixture encodes")
+        };
+        for site in ["selection", "history", "prepared", "reservation"] {
+            let document = receipt(site);
+            assert!(
+                parse_receipt(&document, &id).is_err(),
+                "a receipt `{site}` with a parent component was accepted"
+            );
+        }
+        // A journal root with one is refused too.
+        let journal = serde_json::to_vec(&serde_json::json!({
+            "version": OXIDE_RECEIPT_V3,
+            "checkout": "/c",
+            "checkout_id": id,
+            "generation": 3,
+            "state": "committed",
+            "layout": "whole_target",
+            "links": [{"member": "target"}],
+            "transition": {
+                "generation": 4,
+                "phase": "staged",
+                "root": {"kind": "external", "root": unsafe_root, "nonce": "00112233445566778899aabbccddeeff", "generation": 3},
+                "members": ["debug"],
+                "link": "/c/target",
+                "link_text": "/r",
+                "link_dev": 1,
+                "link_ino": 2,
+                "parent_dev": 1,
+                "parent_ino": 2,
+                "stage": "/s",
+                "backup": "/b",
+                "prior_receipt_sha": "0000000000000000000000000000000000000000000000000000000000000000",
+                "registry_revision": 3,
+                "created_ms": 1,
+                "updated_ms": 2
+            },
+            "updated_ms": 9
+        }))
+        .expect("the fixture encodes");
+        assert!(parse_receipt(&journal, &id).is_err());
+
+        // The registry row and the intent compare the same way, so their root paths are
+        // held to the same rule.
+        let row = format!(
+            r#"{{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[{{"checkout_id":"{id}","checkout":"/c","receipt":"/r","member":"target","root":"{unsafe_root}","root_kind":"external","recipe":"target-debug-v1","generation":1,"selected":false,"pending":false}}]}}"#
+        );
+        assert!(parse_registry(row.as_bytes()).is_err());
+        let intent = format!(
+            r#"{{"version":"oxide.outputs.registry/2","schema":2,"revision":1,"complete":true,"created_by":"oxide","rows":[],"intents":[{{"version":"{OXIDE_INTENT_V1}","id":"{}","identity":{{"checkout_id":"{id}","checkout":"/c","receipt":"/r","member":"target","root":"{unsafe_root}","root_kind":"external","generation":1,"dev":7,"ino":42,"marker_digest":"{}"}},"phase":"renamed","quarantine":"/q","preview_sha256":"{}","created_ms":1,"updated_ms":2}}]}}"#,
+            "1".repeat(32),
+            "a".repeat(64),
+            "0".repeat(64),
+        );
+        assert!(parse_registry(intent.as_bytes()).is_err());
     }
 
     #[test]

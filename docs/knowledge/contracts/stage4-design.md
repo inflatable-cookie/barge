@@ -1149,9 +1149,13 @@ of the two Oxide writes (`external` or `local`). Each unfinished prune intent mu
 also carry the root identity Oxide pins, pass Oxide's own intent validation (a
 lowercase 32-hex id, a lowercase 64-hex checkout id, absolute receipt and quarantine
 paths, a 64-hex plan digest, an empty-or-64-hex preimage and a sorted unique group)
-and state one of Oxide's six phases. Every path a receipt names is absolute too: a
-relative selection, history entry, prepared destination, reservation or journal root
-names nothing this reader could match. A document
+and state one of Oxide's six phases. Every root path a receipt names is a **usable absolute**
+path in Oxide's own `safe_absolute` sense — absolute, with no `.` or `..` component —
+for selections, history entries, prepared destinations, reservations and journal roots
+alike, and the same rule holds for the registry row's and the prune intent's root,
+because those are the paths this reader matches. A relative path, or one with a parent
+component, can never be the component chain of a root Barge walks, so it is divergent
+rather than a reference that names nothing. A document
 that omits any of these, or states a root kind this build does not know, is a
 schema divergence — never a settled row, an empty registry or "no references" —
 and a root marker that omits a field Oxide always writes — or states a root kind

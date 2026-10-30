@@ -2717,6 +2717,49 @@ mod tests {
     }
 
     #[test]
+    fn a_receipt_root_with_a_parent_component_keeps_the_whole_batch() {
+        // The receipt's own root carries a `..` component: divergent, so the snapshot is
+        // unknown and both otherwise eligible roots are kept rather than one of them
+        // looking unreferenced.
+        let fixture = Fixture::new("release-parent-component");
+        let first = fixture.root();
+        let second = fixture.root();
+        let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
+        std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
+        let id = "c".repeat(64);
+        let unsafe_root = format!("/Volumes/Builds/pool/existing/../{}", first.root_id);
+        let document = serde_json::json!({
+            "version": reference::OXIDE_RECEIPT_V2,
+            "checkout": fixture.account.home.join("checkout").display().to_string(),
+            "checkout_id": id,
+            "generation": 1,
+            "state": "committed",
+            "links": [{
+                "member": "target",
+                "selected": {"kind": "external", "root": unsafe_root, "generation": 1}
+            }],
+            "roots": [],
+            "updated_ms": 9
+        });
+        std::fs::write(
+            outputs.join(format!("{id}.json")),
+            serde_json::to_vec(&document).expect("the receipt encodes"),
+        )
+        .expect("the receipt is written");
+
+        let report = fixture.plan();
+        for root in [&first, &second] {
+            let kept = row(&report, root);
+            assert!(!kept.eligible, "{kept:?}");
+            assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+            assert!(!kept.references_complete);
+        }
+        assert_eq!(report.plan.eligible_count, 0);
+        assert!(!report.oxide.complete);
+        assert!(report.needs_human());
+    }
+
+    #[test]
     fn a_registry_row_with_an_unusable_identity_keeps_the_whole_covered_batch() {
         // A selected row whose root is relative names nothing this plan could match.
         // It is a divergent registry, so the snapshot is unknown and both otherwise
