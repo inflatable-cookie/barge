@@ -2323,7 +2323,18 @@ fn space_prune_previews_a_canonical_plan_and_writes_only_the_file_it_was_given()
         .find(|row| row["area"] == "fixture/excluded")
         .expect("the excluded area is reported");
     assert_eq!(excluded_row["state"], "excluded");
-    assert_eq!(excluded_row["roots"], Value::Null);
+    // A count the plan did not observe is an explicit null, never a missing key
+    // and never zero: an unlisted area is not an empty one.
+    for field in ["roots", "candidates", "kept"] {
+        assert!(
+            excluded_row
+                .as_object()
+                .expect("the participation row is an object")
+                .contains_key(field),
+            "{field} is present"
+        );
+        assert_eq!(excluded_row[field], Value::Null, "{field} is explicit null");
+    }
 
     // The saved file is exactly the bytes the digest covers, and the library's
     // reader accepts them.
@@ -2342,7 +2353,109 @@ fn space_prune_previews_a_canonical_plan_and_writes_only_the_file_it_was_given()
             .expect("the report names its policy generation")
     );
 
-    // Nothing else was created beside the plan file the caller named.
+    // An adopted root keeps the directory name it already had, which need not
+    // be a root id. The plan names it, and its canonical bytes read back.
+    use barge::area::{MarkerArea, MarkerWrite, RootKind, RootOrigin};
+    use barge::os::VolumeUuid;
+    use barge::os::{DirOps, ProcessObserver};
+
+    let adopted_path = scratch.path.join("example/pool/adopted-cache-run");
+    std::fs::create_dir_all(&adopted_path).expect("the adopted root directory is made");
+    let platform = barge::os::platform();
+    let handle = platform
+        .open_path(&adopted_path)
+        .expect("the adopted root opens");
+    let volume_uuid = VolumeUuid::parse(&volume).expect("the fixture volume uuid");
+    let marker = barge::area::write_marker(
+        &platform,
+        &handle,
+        &MarkerWrite {
+            root_id: None,
+            volume_uuid: &volume_uuid,
+            resolved_path: &adopted_path,
+            mount_point: &mount,
+            area: MarkerArea::identity("fixture", "pool"),
+            kind: RootKind::AreaRoot,
+            origin: RootOrigin::AdoptedExisting,
+        },
+        platform
+            .effective_uid()
+            .expect("this account's effective uid"),
+    )
+    .expect("the adopted root's marker is written");
+    // An activity record is written by the tests as account state, exactly as a
+    // release would leave it, because an adopted root's directory name differs
+    // from its root id and the idle-baseline verb's custody unit addresses the
+    // directory name. That verb's refusal is outside this slice; the plan and its
+    // reader are what this case proves.
+    let activity_dir = state_dir.join("activity");
+    std::fs::create_dir_all(&activity_dir).expect("the activity directory is made");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_millis() as u64;
+    let released_ms = now.saturating_sub(1_000);
+    let record = serde_json::json!({
+        "schema": "barge.activity/1",
+        "root_id": marker.root_id,
+        "volume_uuid": volume,
+        "last_release_ms": released_ms,
+        "first_created_ms": now.saturating_sub(2_000),
+        "releases": 1,
+        "generation": 1,
+        "recorded_ms": released_ms,
+    });
+    let record_path = activity_dir.join(format!("{}.json", marker.root_id));
+    std::fs::write(
+        &record_path,
+        serde_json::to_vec_pretty(&record).expect("the activity record encodes"),
+    )
+    .expect("the activity record is written");
+    std::fs::set_permissions(
+        &record_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("the activity record is private");
+
+    let adopted_plan_out = fixture.join("space-prune-adopted.plan.json");
+    let output = run_in(
+        &[
+            "space",
+            "prune",
+            "--volume",
+            &volume,
+            "--plan",
+            "--plan-out",
+            adopted_plan_out.to_str().expect("the plan path is UTF-8"),
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(0), "the second preview succeeds");
+    let document = stdout_document(&output);
+    assert_eq!(document["data"]["candidates"], 2);
+    let rows = document["data"]["plan"]["candidates"]["rows"]
+        .as_array()
+        .expect("the plan carries candidate rows");
+    let adopted = rows
+        .iter()
+        .find(|row| row["root_id"] == marker.root_id.as_str())
+        .expect("the adopted root is a candidate");
+    assert_eq!(adopted["name"], "adopted-cache-run");
+    assert_ne!(
+        adopted["name"], adopted["root_id"],
+        "an adopted root's directory name is not its root id"
+    );
+    let saved = std::fs::read(&adopted_plan_out).expect("the adopted plan file was written");
+    assert_eq!(
+        barge::digest::sha256_hex(&saved),
+        document["data"]["plan_sha256"]
+            .as_str()
+            .expect("the report carries its digest")
+    );
+    barge::space::read_plan(&saved).expect("a plan naming an adopted root reads back");
+
+    // Nothing else was created beside the plan files the caller named.
     assert!(!fixture.join("space-prune-other.json").exists());
 }
 

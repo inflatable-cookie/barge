@@ -1631,7 +1631,10 @@ and T6, and this slice claims no native proof.
   `target_bytes` (`max(reserve, floor)`) and the ordered candidates. Each
   candidate carries `root_id`, `area`, `name`, `path`, `bytes`,
   `last_release_ms`, `first_created_ms`, `device`, `inode`, `marker_digest` and
-  `identity_digest`. The identity digest is the SHA-256 over
+  `identity_digest`. Its `name` is validated as one safe directory component —
+  non-empty, not `.` or `..`, no separator and no NUL — and **not** as a root id:
+  an adopted root keeps the directory name it already had, so its name need not
+  be 32 hex digits. The identity digest is the SHA-256 over
   `<device>:<inode>:<marker_digest>`, and the plan reader recomputes it: a row
   whose digest does not describe its own identity is refused rather than
   resolved, as are a zero policy threshold, a policy with no declarer and a
@@ -1645,7 +1648,9 @@ and T6, and this slice claims no native proof.
 - **Participation.** Every declared area is reported in `participation`. An area
   whose `reserve` is `counts` is listed and its idle roots may be candidates; an
   area whose `reserve` is `excluded` is never enumerated, so its roots never
-  enter the list and its counts are `null` rather than `0`. Barge's scratch
+  enter the list and its three counts are explicit `null` rather than `0` or a
+  missing key. The same holds for an area that is absent, unknown or unreached:
+  unknown is never absent, empty or zero. Barge's scratch
   folder participates by construction (`reserve: by_construction`). Barge's
   `caches/` is never enumerated by this plan, and a `cache_root`-kind root inside
   a participating area is kept rather than planned, because a cache root is a
@@ -1666,10 +1671,13 @@ and T6, and this slice claims no native proof.
   relaxed to "idle now" (O-015). An unconcluded, negative, retained, unclosed,
   hosting, non-exclusive or nested-marker root is kept whatever its age, and a
   live or undecidable hold keeps it too. `scratch::pressure_plan` is that plan:
-  the expiry classification with only the native age relaxed, filtered to
-  Barge's own native units so a foreign family can never consume the plan's row
-  bound. A root reaching it still has to pass the pressure idleness matrix in
-  this slice; the sweep alone authorizes nothing.
+  the expiry classification with only the native age relaxed. A foreign family is
+  never a candidate, so it can never consume the candidate capacity a native root
+  needs, and every entry the sweep cannot classify — a foreign family, a
+  symbolic link, a quarantine leaf, an unreadable project folder, an unmarked
+  entry — is reported as a kept row with its reason instead of disappearing from
+  the preview. A root reaching it still has to pass the pressure idleness matrix
+  in this slice; the sweep alone authorizes nothing.
 - **Fail per object.** One root, area or scratch folder that cannot be decided
   never stops the rest. An area that cannot be resolved or listed is a
   `participation` row in state `unknown` with the reason and `null` counts; a
@@ -1679,8 +1687,10 @@ and T6, and this slice claims no native proof.
 - **Bounds.** The plan's wall clock is 10 s. It reads at most the contract's 4096
   roots per listing and 4096 candidate rows, and the scratch sweep's own 4096
   entries. The candidate bound keeps the **oldest** 4096 in LRU order, so it can
-  never drop an older root in favour of a younger one, and every count reports
-  the volume's real total. A bound reached sets `truncated`, records `truncated_reason`, counts
+  never drop an older root in favour of a younger one. The kept list is bounded
+  too, and each participation row counts every decision it made even after that
+  output bound was reached; the report's `truncated` covers candidate, kept and
+  listing overflow, and every count reports the volume's real total. A bound reached sets `truncated`, records `truncated_reason`, counts
   `unreached` root rows, and turns the areas it never reached into `unreached`
   participation rows. A truncated plan says what it did not reach; it never
   presents a short plan as a whole one.
@@ -1702,10 +1712,15 @@ and T6, and this slice claims no native proof.
   reported as `unknown` while another area still plans; an undeclared policy, an
   undeclared durability, a `kept` volume and an absent volume each refused; and
   scratch's concluded-and-released root planned while the expiry sweep's own age
-  still keeps it, an unconcluded root kept, and an absent scratch folder reported
-  as absent. The CLI suite prints the document against a verified volume, checks
-  the saved plan file's bytes against the digest and the library reader, asserts
-  the excluded root is absent from the plan, and pins the effect-form, missing
-  `--plan`, bad-uuid and unknown-verb refusals.
+  still keeps it, an unconcluded root kept, a symbolic link and a foreign family
+  entry reported as kept and never candidates, an absent scratch folder reported
+  as absent, kept counts and participation counts beyond the 4096-row output
+  bound, and a candidate name that is a safe component rather than a root id. The
+  CLI suite prints the document against a verified volume, checks the saved plan
+  file's bytes against the digest and the library reader, asserts the excluded
+  root is absent from the plan and that its participation counts are explicit
+  nulls, round-trips a plan naming an **adopted** root whose directory name is not
+  its root id, and pins the effect-form, missing `--plan`, bad-uuid and
+  unknown-verb refusals.
 - `barge describe`'s `formats` names `barge.space.prune/1` and
   `barge.space.prune.plan/1`.

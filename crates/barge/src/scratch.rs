@@ -1728,9 +1728,10 @@ pub fn sweep(
 /// now", which is the predicate the stage 3 design fixes for scratch under the
 /// reserve (O-015): the four facts a positive conclusion records — closed,
 /// positive, exclusive and kept as evidence — are never relaxed, and neither is
-/// the hold, device, uid or nested-marker rule. Foreign families are not
-/// Barge-owned data and are never space candidates, so this plan records only
-/// native rows and does not let a foreign unit consume its row bound.
+/// the hold, device, uid or nested-marker rule. Foreign families and entries the
+/// sweep cannot classify are not space candidates, so they never consume the
+/// candidate capacity a native root needs, but they are still reported as kept
+/// rows: an entry this plan cannot classify must not disappear from it.
 ///
 /// The pressure idleness matrix still decides each root against its activity
 /// record and holds; that step belongs to the caller, which is why this plan
@@ -1739,7 +1740,10 @@ pub fn sweep(
 pub struct PressurePlan {
     /// The native runs that passed the expiry predicate with its age relaxed.
     pub candidates: RowSet<PlanRow>,
-    /// The native runs kept, with the expiry reason, which is never age alone.
+    /// The entries kept, with the reason. It carries every decision the sweep
+    /// made, including a foreign family, a symbolic link, a quarantine leaf, an
+    /// unreadable project folder and a native run kept by the expiry predicate;
+    /// age alone is never a reason.
     pub kept: RowSet<KeptRow>,
     /// How many entries the sweep examined.
     pub examined: usize,
@@ -1782,21 +1786,14 @@ pub fn pressure_plan(
         policy,
         true,
     )?;
-    // The plan records only native rows, but a top-level entry that is a symlink,
-    // a quarantine leaf or an unreadable folder is kept outside `classify_unit`
-    // too. This plan is about Barge's own runs, so those entry rows stay out of
-    // it; the sweep that owns them still reports them.
-    let kept: Vec<KeptRow> = plan
-        .kept
-        .rows
-        .into_iter()
-        .filter(|row| row.state == UnitFamily::Native.as_str())
-        .collect();
-    let kept_total = kept.len();
+    // Every kept row the sweep decided is reported, including a symlink, a
+    // quarantine leaf, an unreadable project folder, a foreign family and an
+    // unmarked entry: an entry this plan cannot classify must not vanish from it,
+    // and only native rows were ever in `candidates`.
     Ok(PressurePlan {
         truncated: plan.truncated || plan.candidates.truncated || plan.kept.truncated,
         candidates: plan.candidates,
-        kept: RowSet::bounded(kept, kept_total, ROOT_ROWS),
+        kept: plan.kept,
         examined: plan.examined,
     })
 }
@@ -2946,9 +2943,18 @@ fn classify_unit(
         return Ok(());
     }
     // A caller that plans only Barge's own native units (the stage 3 pressure
-    // plan) records nothing for a foreign family: it is not Barge-owned data and
-    // its rows would otherwise push a native root past the plan's row bound.
+    // plan) never makes a foreign family a candidate, because it is not
+    // Barge-owned data. It is still reported as kept: an entry the plan cannot
+    // classify must not disappear from it, and a kept row cannot consume the
+    // candidate capacity a native root needs.
     if ctx.native_only && family != UnitFamily::Native {
+        kept.push(kept_row(
+            name,
+            &scope.key(),
+            Some(path.to_path_buf()),
+            family.as_str(),
+            "the entry is not Barge-owned data, so it never yields under the reserve",
+        ));
         return Ok(());
     }
     match assess(ctx, parent, name, path, scope, family, budget)? {

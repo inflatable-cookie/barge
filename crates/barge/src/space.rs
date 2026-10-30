@@ -329,14 +329,17 @@ pub struct SpaceParticipationRow {
     pub reserve: String,
     /// `participating`, `excluded`, `absent`, `unknown` or `unreached`.
     pub state: String,
-    /// How many root rows the listing examined.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// How many root rows the listing examined. It is an explicit `null` when
+    /// the area was not enumerated, so a reader can never mistake an unlisted
+    /// area for an empty one.
+    #[serde(default)]
     pub roots: Option<u64>,
-    /// How many candidates this plan took from it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// How many candidates this plan took from it, or `null` when not enumerated.
+    #[serde(default)]
     pub candidates: Option<u64>,
-    /// How many roots it kept, with the reasons in `kept`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// How many roots it kept, with the reasons in `kept`, or `null` when not
+    /// enumerated.
+    #[serde(default)]
     pub kept: Option<u64>,
     /// Why it was not enumerated, or what bound stopped it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -510,7 +513,7 @@ pub fn plan(
     };
     let plan_sha256 = sha256_hex(&canonical_plan_bytes(&plan)?);
     let participation_total = participation.len();
-    let truncated = truncated || plan.candidates.truncated;
+    let truncated = truncated || plan.candidates.truncated || kept_total > ROOT_ROWS;
     Ok(SpacePruneReport {
         preview: true,
         planned_ms: request.now_ms,
@@ -635,8 +638,10 @@ pub fn read_plan(bytes: &[u8]) -> Result<SpacePrunePlan> {
         if !state::is_identifier(&row.root_id) {
             return Err(invalid("its root id is not 32 hex digits"));
         }
-        if !state::is_identifier(&row.name) {
-            return Err(invalid("its name is not a root id"));
+        if !is_safe_component(&row.name) {
+            return Err(invalid(
+                "its name is not a single safe directory component, so a real run could not address it",
+            ));
         }
         if !unit::is_sha256(&row.marker_digest) {
             return Err(invalid("its marker digest is not a SHA-256"));
@@ -651,6 +656,16 @@ pub fn read_plan(bytes: &[u8]) -> Result<SpacePrunePlan> {
         }
     }
     Ok(plan)
+}
+
+/// Whether one candidate name is a single safe directory component.
+///
+/// It is deliberately not a root id: an adopted root keeps the directory name it
+/// already had, which need not be 32 hex digits, and the plan must accept it.
+/// What a real run needs is a name it can address inside its folder, so the name
+/// must be non-empty, not `.` or `..`, and contain no separator or NUL.
+fn is_safe_component(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }
 
 /// The identity a real run re-verifies: device, inode and marker digest.
@@ -858,11 +873,11 @@ impl Planner<'_> {
                 break;
             }
             examined = examined.saturating_add(1);
-            let before = self.kept.len();
+            let before = self.kept_total;
             if self.area_root(&label, root) {
                 candidates = candidates.saturating_add(1);
             }
-            if self.kept.len() > before {
+            if self.kept_total > before {
                 kept = kept.saturating_add(1);
             }
         }
@@ -1842,6 +1857,17 @@ mod tests {
         area::release(&fixture.state, &observer, &unconcluded.root_id, "prover")
             .expect("the owner hold releases");
 
+        // Two entries the plan cannot classify: a symbolic link and a foreign
+        // family unit. Both must be reported as kept, neither may vanish, and
+        // neither may consume the candidate capacity.
+        let scratch_directory = fixture.root.join("scratch");
+        std::os::unix::fs::symlink(&fixture.root, scratch_directory.join("links"))
+            .expect("the fixture symlink is made");
+        let foreign = scratch_directory.join("foreign-run");
+        std::fs::create_dir(&foreign).expect("the foreign unit directory is made");
+        std::fs::write(foreign.join(".effigy-scratch.json"), b"foreign")
+            .expect("the foreign family marker is written");
+
         let report = plan(
             &fixture.state,
             &fixture.platform(),
@@ -1910,7 +1936,109 @@ mod tests {
         assert_eq!(scratch_row.state, "participating");
         assert_eq!(scratch_row.reserve, "by_construction");
         assert_eq!(scratch_row.candidates, Some(1));
+        assert_eq!(
+            scratch_row.kept,
+            Some(3),
+            "unconcluded, symlink and foreign"
+        );
+        let scratch_kept: Vec<&SpaceKeptRow> = report
+            .kept
+            .rows
+            .iter()
+            .filter(|row| row.area == "barge/scratch")
+            .collect();
+        assert!(
+            scratch_kept
+                .iter()
+                .any(|row| row.name == "links" && row.state == "symlink"),
+            "a symbolic link is reported, never followed"
+        );
+        assert!(
+            scratch_kept
+                .iter()
+                .any(|row| row.name == "foreign-run" && row.state == "effigy_scratch"),
+            "a foreign family is reported and never a candidate"
+        );
+        assert!(
+            report
+                .plan
+                .candidates
+                .rows
+                .iter()
+                .all(|row| row.name != "links" && row.name != "foreign-run"),
+            "an unclassified entry never enters the candidate list"
+        );
         assert_eq!(report.plan.candidates.rows.len(), report.candidates);
+    }
+
+    #[test]
+    fn kept_counts_report_every_decision_beyond_the_output_bound() {
+        let fixture = VolumeFixture::new("space-plan-kept-bound");
+        policy_record(&fixture, 16, 4);
+        let observer = fixture.observer();
+        let other = declaration("other", "example/other", ReserveParticipation::Counts);
+        let pool = declaration("pool", "example/pool", ReserveParticipation::Counts);
+        for document in [&other, &pool] {
+            area::declare(&fixture.state, document, 1).expect("the area declares");
+        }
+        let limit = crate::contract::ROOT_ROWS;
+        std::fs::create_dir_all(fixture.root.join("example/other"))
+            .expect("the other folder is made");
+        std::fs::create_dir_all(fixture.root.join("example/pool"))
+            .expect("the pool folder is made");
+        std::fs::create_dir(fixture.root.join("example/other/only"))
+            .expect("the single kept entry is made");
+        for index in 0..limit {
+            std::fs::create_dir(fixture.root.join(format!("example/pool/d{index:04}")))
+                .expect("the unmarked entry is made");
+        }
+
+        let report = plan(
+            &fixture.state,
+            &fixture.platform(),
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &Injected(true),
+            &plan_request(&fixture.uuid, test_now()),
+        )
+        .expect("the plan is built");
+        assert_eq!(report.kept.count, limit, "the output is bounded");
+        assert_eq!(
+            report.kept.total,
+            limit + 1,
+            "every kept decision is counted, not only the bounded rows"
+        );
+        assert!(report.truncated);
+        assert!(report.truncated_reason.is_some());
+        let counts = |area: &str| {
+            let row = report
+                .participation
+                .rows
+                .iter()
+                .find(|row| row.area == area)
+                .expect("the area is reported");
+            (row.roots, row.candidates, row.kept)
+        };
+        assert_eq!(counts("example/other"), (Some(1), Some(0), Some(1)));
+        assert_eq!(
+            counts("example/pool"),
+            (Some(limit as u64), Some(0), Some(limit as u64)),
+            "an area's kept count does not depend on the global output bound"
+        );
+        assert!(report.plan.candidates.rows.is_empty());
+    }
+
+    #[test]
+    fn a_candidate_name_is_a_safe_component_not_a_root_id() {
+        // An adopted root keeps the directory name it already had, so the plan
+        // reader validates the name as one safe component, never as a root id.
+        for name in ["adopted-cache-run", "my cache", "d0001"] {
+            assert!(is_safe_component(name), "{name} is addressable");
+        }
+        for name in ["", ".", "..", "a/b", "a\0b"] {
+            assert!(!is_safe_component(name), "{name} is not one component");
+        }
     }
 
     #[test]
