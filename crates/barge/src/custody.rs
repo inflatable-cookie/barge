@@ -2124,7 +2124,7 @@ mod tests {
             intent_id: "a".repeat(32),
             volume_uuid: holder.unit.volume_uuid.clone(),
             root_dir: holder.unit.root_dir.clone(),
-            folder: format!("{}", holder.unit.folder),
+            folder: holder.unit.folder.clone(),
             parent: String::new(),
             name: "c".repeat(32),
         }];
