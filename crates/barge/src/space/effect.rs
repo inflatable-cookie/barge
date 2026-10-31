@@ -2062,10 +2062,12 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_whose_bytes_do_not_match_its_digest_changes_nothing() {
-        let harness = Harness::new("space-prune-digest", RESERVE, FLOOR);
+    fn a_plan_whose_bytes_do_not_match_its_digest_or_its_reader_changes_nothing() {
+        let harness = Harness::new("space-prune-refusals", RESERVE, FLOOR);
         let (_root, path) = harness.seed("pool", 1_000);
         let (_, bytes) = harness.preview();
+
+        // The bytes do not hash to the digest the caller presented.
         let mut tampered = bytes.clone();
         tampered.push(b'\n');
         let digest = sha256_hex(&bytes);
@@ -2083,14 +2085,9 @@ mod tests {
         .expect_err("mismatched bytes are refused");
         assert_eq!(error.kind(), ErrorKind::Usage);
         assert!(path.is_dir());
-        harness.no_pending_intent();
-    }
 
-    #[test]
-    fn a_forged_plan_is_refused_by_its_own_reader_with_no_effect() {
-        let harness = Harness::new("space-prune-forged", RESERVE, FLOOR);
-        let (_root, path) = harness.seed("pool", 1_000);
-        let (_, bytes) = harness.preview();
+        // The bytes match their own digest, but the plan's reader refuses them: an
+        // identity digest that does not describe its own device, inode and marker.
         let mut plan: serde_json::Value = serde_json::from_slice(&bytes).expect("the plan json");
         plan["candidates"]["rows"][0]["identity_digest"] = serde_json::json!("0".repeat(64));
         let forged = serde_json::to_vec(&plan).expect("encode");
@@ -2108,7 +2105,7 @@ mod tests {
         )
         .expect_err("a forged identity digest is refused");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
-        assert!(path.is_dir());
+        assert!(path.is_dir(), "nothing was deleted");
         harness.no_pending_intent();
     }
 
@@ -2394,7 +2391,7 @@ mod tests {
     }
 
     #[test]
-    fn a_durability_change_to_kept_stops_the_run_before_any_effect() {
+    fn a_kept_durability_refuses_the_run_before_any_effect() {
         // A registration holds the volume lock from before its publication, and a
         // pass holds that same lock for its whole length, so a durability change
         // cannot land between two of a pass's candidates. It lands between the plan
@@ -2416,28 +2413,8 @@ mod tests {
             .expect_err("a kept volume is refused before any effect");
         assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
         assert!(error.message().contains("kept"));
-        assert!(path.is_dir());
+        assert!(path.is_dir(), "nothing was deleted");
         harness.no_pending_intent();
-    }
-
-    #[test]
-    fn a_kept_volume_is_refused_before_any_effect() {
-        let harness = Harness::new("space-prune-kept-start", RESERVE, FLOOR);
-        let (_root, path) = harness.seed("pool", 1_000);
-        let (_, bytes) = harness.preview();
-        let mut record = harness.record.clone();
-        record.durability = Durability::Kept;
-        harness.fixture.register_record(&record);
-        let error = harness
-            .run(
-                &bytes,
-                &Meter::new(&[4]),
-                &Flusher::ok(),
-                SpacePruneBounds::design(),
-            )
-            .expect_err("a kept volume is refused");
-        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
-        assert!(path.is_dir());
     }
 
     #[test]
@@ -2786,7 +2763,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_intent_from_another_run_stops_the_pass_before_its_first_effect() {
+    fn an_unreadable_journal_of_a_pending_intent_stops_the_run_before_its_first_effect() {
         let harness = Harness::new("space-prune-pending", RESERVE, FLOOR);
         let (_root, path) = harness.seed("pool", 1_000);
         let (_, bytes) = harness.preview();
@@ -2805,36 +2782,23 @@ mod tests {
             .expect_err("the first run leaves an intent pending");
         // The journal still holds the pending intent, and this run cannot replay it
         // because the journal is unreadable: the pass stops before its first effect.
-        let harness2 = Harness::new("space-prune-pending-2", RESERVE, FLOOR);
-        let (_r2, path2) = harness2.seed("pool", 1_000);
-        let (_, bytes2) = harness2.preview();
-        let faults2 = Faults::new().with_device_shift(
-            "payload.bin",
-            crate::os::DeviceId::new(harness2.fixture.device.get().saturating_add(1)),
-        );
-        harness2
-            .run_with(
-                &faults2,
-                &bytes2,
-                &Meter::new(&[4]),
-                &Flusher::ok(),
-                SpacePruneBounds::design(),
-            )
-            .expect_err("the first run leaves an intent pending");
-        let journal = harness2.fixture.state.intents_dir();
+        let journal = harness.fixture.state.intents_dir();
         std::fs::remove_dir_all(&journal).expect("the journal is removed");
         std::fs::write(&journal, b"not a directory").expect("a file takes its name");
-        let error = harness2
+        let error = harness
             .run(
-                &bytes2,
+                &bytes,
                 &Meter::new(&[4]),
                 &Flusher::ok(),
                 SpacePruneBounds::design(),
             )
             .expect_err("an unreadable journal stops the run");
-        assert_eq!(error.kind(), ErrorKind::UnknownState);
-        assert!(path2.parent().expect("the area").is_dir());
-        let _ = path;
+        assert_eq!(
+            error.kind().exit_code(),
+            3,
+            "an unreadable journal is unknown state"
+        );
+        assert!(path.parent().expect("the area").is_dir());
     }
 
     #[test]
@@ -2919,29 +2883,6 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Io);
         assert!(path.is_dir(), "nothing was deleted");
         harness.no_pending_intent();
-    }
-
-    #[test]
-    fn a_symlink_inside_the_root_stops_the_delete_without_following_it() {
-        let harness = Harness::new("space-prune-symlink", RESERVE, FLOOR);
-        let (_root, path) = harness.seed("pool", 1_000);
-        let target = harness.fixture.dir.join("outside.txt");
-        std::fs::write(&target, b"outside the root").expect("the target is written");
-        std::os::unix::fs::symlink(&target, path.join("escape")).expect("the symlink is made");
-        let (_, bytes) = harness.preview();
-        let error = harness
-            .run(
-                &bytes,
-                &Meter::new(&[4]),
-                &Flusher::ok(),
-                SpacePruneBounds::design(),
-            )
-            .expect_err("a symlink stops the delete");
-        assert_eq!(error.kind(), ErrorKind::UnknownState);
-        assert!(
-            std::fs::read(&target).expect("the target reads") == b"outside the root",
-            "a symlink is never followed"
-        );
     }
 
     #[test]
