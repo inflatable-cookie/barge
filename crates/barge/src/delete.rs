@@ -96,7 +96,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::area::{self, AreaDeclaration, AreaDocument, MarkerExpectation};
 use crate::contract::{INTENT_ROWS, LISTING_NAME_ROWS};
-use crate::custody::{self, CustodyBounds, CustodyEvidence, PendingIntent};
+use crate::custody::{self, CustodyBounds, CustodyEvidence, CustodyVerdict, PendingIntent};
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
     AbsenceVolume, AncestorExpected, ChildRemoval, DeviceId, DirHandle, DirId, DirOps, EntryFacts,
@@ -623,7 +623,7 @@ fn delete_unit_locked(
     // Custody is decided before anything durable is written.
     let intents = state::read_intents(state_paths, INTENT_ROWS)?;
     let pending = PendingIntent::pending(&intents.records);
-    let evidence = custody::take_custody(
+    let evidence = unit_custody(
         dirs,
         facts,
         mounts,
@@ -683,7 +683,7 @@ fn delete_unit_locked(
 
     // The effect may not start on a custody verdict that has aged: it is
     // re-decided after the intent publish and before the first destructive step.
-    let after_publish = custody::take_custody(
+    let after_publish = unit_custody(
         dirs,
         facts,
         mounts,
@@ -799,18 +799,87 @@ struct WalkVolume {
     device: DeviceId,
 }
 
-/// Take the lock of the unit being deleted: the root lock for a Barge root id,
-/// which is the lock a hold on that root takes too, and the unit's own derived
-/// key otherwise.
-fn lock_deletion_unit(locks: &mut LockSet, unit: &DeletionUnit) -> Result<crate::state::StateLock> {
-    if state::is_identifier(&unit.name) {
-        return locks.lock_root(&unit.name);
+/// Decide one unit's custody under the root id its marker proves.
+///
+/// A Barge-created root's directory name is its root id, so the marker, the holds
+/// and the evidence are all keyed by that name. An **adopted** root's name is not
+/// its root id, and its holds are recorded under the root id a consumer holds, so
+/// custody must read and compare under that id — otherwise a `hold` on the root
+/// would be invisible to the verdict that authorises deleting it. The evidence
+/// gate is the same either way: only a `Safe` verdict may be turned into one.
+#[allow(clippy::too_many_arguments)]
+fn unit_custody(
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    state_paths: &StatePaths,
+    unit: &DeletionUnit,
+    pending: &[PendingIntent],
+    bounds: CustodyBounds,
+) -> CustodyVerdict {
+    match &unit.root_id {
+        Some(root_id) => custody::take_identity_custody(
+            dirs,
+            facts,
+            mounts,
+            observer,
+            state_paths,
+            unit,
+            pending,
+            bounds,
+            root_id,
+        ),
+        None => custody::take_custody(
+            dirs,
+            facts,
+            mounts,
+            observer,
+            state_paths,
+            unit,
+            pending,
+            bounds,
+        ),
     }
-    locks.lock_unit(&state::unit_lock_key(
-        &unit.volume_uuid,
-        &unit.parent,
-        &unit.name,
-    ))
+}
+
+/// The locks one deletion unit holds for its whole effect.
+///
+/// `name` is the root lock for a Barge root id — which is the lock a `hold` on that
+/// root takes too — and the unit's own derived key otherwise. `root_id` is the
+/// second lock an **adopted** root needs: its directory name is not its root id, so
+/// the name's lock is not the one a consumer's `hold` takes, and a deletion that
+/// took only the name's lock could rename the root out from under its holder. It is
+/// an exclusive lock in its own set because a lock set refuses a second lock at the
+/// same rank (stage 3 T4's own double-lock rule for an adopted root).
+struct UnitLocks {
+    /// The lock the unit's directory name takes.
+    _name: crate::state::StateLock,
+    /// The marker's root-id lock, when the name is not that id.
+    _root_id: Option<crate::state::StateLock>,
+}
+
+fn lock_deletion_unit(locks: &mut LockSet, unit: &DeletionUnit) -> Result<UnitLocks> {
+    let name = if state::is_identifier(&unit.name) {
+        locks.lock_root(&unit.name)?
+    } else {
+        locks.lock_unit(&state::unit_lock_key(
+            &unit.volume_uuid,
+            &unit.parent,
+            &unit.name,
+        ))?
+    };
+    let root_id = match &unit.root_id {
+        Some(root_id) if *root_id != unit.name => {
+            let mut root_locks = LockSet::new(locks.state().clone());
+            Some(root_locks.lock_root(root_id)?)
+        }
+        _ => None,
+    };
+    Ok(UnitLocks {
+        _name: name,
+        _root_id: root_id,
+    })
 }
 
 /// What one renamed quarantine leaf is: absent, or not the object the intent
@@ -2769,6 +2838,70 @@ pub fn replay_pending(
     bounds: DeleteBounds,
     deadline: Option<Instant>,
 ) -> Result<ReplayReport> {
+    replay_pending_scope(
+        state_paths,
+        dirs,
+        volumes,
+        observer,
+        None,
+        VolumeLocking::Take,
+        bounds,
+        deadline,
+    )
+}
+
+/// Replay the pending intents of **one** volume, under that volume's exclusive lock
+/// which the caller already holds (stage 3, slice T5).
+///
+/// A space prune's replay is part of its pass: the pass holds the volume lock from
+/// its first authoritative measurement to its final decision, so its replay runs
+/// under that lock rather than taking it again, and it touches only the intents of
+/// the volume it was asked to prune. An unrelated volume's pending intent is a
+/// different object's business and never blocks, delays or is acted on by this
+/// pass (Supervisor decision `698d9ba3`'s per-object rule).
+#[allow(clippy::too_many_arguments)]
+pub fn replay_pending_on_volume(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    observer: &dyn ProcessObserver,
+    volume_uuid: &VolumeUuid,
+    volume_lock: &crate::state::StateLock,
+    bounds: DeleteBounds,
+    deadline: Option<Instant>,
+) -> Result<ReplayReport> {
+    if volume_lock.rank() != crate::state::LockRank::Volume
+        || volume_lock.mode() != crate::state::LockMode::Exclusive
+        || volume_lock.path() != state_paths.volume_lock_path(volume_uuid)
+    {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "a replay under a caller's volume lock needs that volume's exclusive lock, held by the caller; nothing was changed",
+        ));
+    }
+    replay_pending_scope(
+        state_paths,
+        dirs,
+        volumes,
+        observer,
+        Some(volume_uuid),
+        VolumeLocking::Held,
+        bounds,
+        deadline,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_pending_scope(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    observer: &dyn ProcessObserver,
+    only: Option<&VolumeUuid>,
+    volume_locking: VolumeLocking,
+    bounds: DeleteBounds,
+    deadline: Option<Instant>,
+) -> Result<ReplayReport> {
     let intents = state::read_intents(state_paths, INTENT_ROWS)?;
     let mut report = ReplayReport {
         examined: intents.total,
@@ -2779,7 +2912,18 @@ pub fn replay_pending(
         entries_removed: 0,
         remounted: 0,
     };
-    let pending: Vec<IntentRecord> = intents.pending().cloned().collect();
+    let pending: Vec<IntentRecord> = intents
+        .pending()
+        .filter(|intent| only.is_none_or(|volume| &intent.volume_uuid == volume))
+        .cloned()
+        .collect();
+    if let Some(volume) = only {
+        // The counts are this scope's, so a volume's replay never reports another
+        // volume's intents as examined.
+        report.examined = pending.len();
+        report.pending.clear();
+        let _ = volume;
+    }
     if pending.is_empty() {
         return Ok(report);
     }
@@ -2817,6 +2961,7 @@ pub fn replay_pending(
             observer,
             &record,
             &intent,
+            volume_locking,
             bounds,
         ) {
             Ok(outcome) => match outcome {
@@ -3305,6 +3450,7 @@ fn replay_one(
     observer: &dyn ProcessObserver,
     record: &registry::VolumeRecord,
     intent: &IntentRecord,
+    volume_locking: VolumeLocking,
     bounds: DeleteBounds,
 ) -> Result<ReplayOutcome> {
     // The clock is checked before anything this replay can do, because the first
@@ -3384,7 +3530,9 @@ fn replay_one(
     };
 
     let mut locks = LockSet::new(state_paths.clone());
-    let _volume_lock = locks.lock_volume(&intent.volume_uuid)?;
+    if matches!(volume_locking, VolumeLocking::Take) {
+        locks.lock_volume(&intent.volume_uuid)?;
+    }
     let _unit_lock = lock_deletion_unit(&mut locks, &unit)?;
     // The replay's preflight (volume, folder, locks) can be slow, so the caller's
     // clock is checked here, before its first durable step: a spent clock leaves
@@ -4024,6 +4172,7 @@ mod tests {
             folder: declaration.folder.clone(),
             parent: parent.to_owned(),
             name: name.to_owned(),
+            root_id: None,
             kind,
             device: facts.device,
             inode: facts.inode,

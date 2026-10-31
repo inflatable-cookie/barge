@@ -1353,6 +1353,7 @@ fn unit_for(
         folder: resolved.folder.clone(),
         parent: String::new(),
         name: root.name.clone(),
+        root_id: None,
         kind: UnitKind::Directory,
         device: DeviceId::new(device),
         inode,

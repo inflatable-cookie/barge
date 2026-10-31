@@ -1274,6 +1274,7 @@ impl IntentRecord {
             folder: self.folder.clone(),
             parent: self.unit.parent.clone(),
             name: self.unit.name.clone(),
+            root_id: None,
             kind: self.unit.kind,
             device: crate::os::DeviceId::new(self.unit.device),
             inode: self.unit.inode,

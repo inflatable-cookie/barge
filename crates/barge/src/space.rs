@@ -311,6 +311,20 @@ pub fn read_prune_report(bytes: &[u8]) -> Result<SpacePruneReport> {
         return Err(invalid());
     }
     let data = value.get("data").ok_or_else(invalid)?;
+    // `effect` is a required field of this major even though it is `null` in a
+    // preview: a document that omits it is a removed field, and absence is never
+    // the same fact as "this run did nothing".
+    if !data
+        .as_object()
+        .is_some_and(|body| body.contains_key("effect"))
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the document omits `effect`, a required field of {SPACE_PRUNE_SCHEMA}; a preview states it as null"
+            ),
+        ));
+    }
     let report: SpacePruneReport = serde_json::from_value(data.clone()).map_err(|error| {
         Error::new(
             ErrorKind::UnknownState,
@@ -497,7 +511,10 @@ pub struct SpacePruneReport {
     pub unreached: usize,
     /// What a real run did, and what it did not reach. It is `null` for a preview,
     /// which changes nothing (stage 3, slice T5).
-    #[serde(default)]
+    ///
+    /// It is a **required** field of this major, present as `null` in a preview: a
+    /// reader of `barge.space.prune/1` refuses a document that simply omits it,
+    /// because absence is never the same fact as "this run did nothing".
     pub effect: Option<SpacePruneEffect>,
 }
 

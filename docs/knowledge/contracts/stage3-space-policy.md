@@ -1814,15 +1814,30 @@ is claimed.**
   left it).
 - **Lock order.** The pass reads the registry before taking the volume lock, takes
   it **exclusively** and holds it from its first authoritative measurement to its
-  final decision, and then takes **one root lock at a time** for each candidate's
-  plan → intent → rename → delete, releasing it before the next (carried ruling
-  `6ac32f24`). No registry lock is held across a walk or a delete; the policy is
-  re-read lock-free from the atomically published bytes. A prune and a release
-  plan on one volume therefore cannot interleave, and a consumer's `hold` waits
-  for at most one deletion.
+  final decision, and then takes **one root's locks at a time** for each
+  candidate's plan → intent → rename → delete, releasing them before the next
+  (carried ruling `6ac32f24`). No registry lock is held across a walk or a delete;
+  the policy is re-read lock-free from the atomically published bytes. A prune and
+  a release plan on one volume therefore cannot interleave, and a consumer's
+  `hold` waits for at most one deletion.
+- **An adopted root's two locks, and its holds under the right key.** A Barge-created
+  root's directory name is its root id, so one lock covers both. An **adopted**
+  root's name is not its root id: a `hold` takes `root-<root-id>` while a delete of
+  that directory name takes the unit's own key, and they are different files. The
+  deletion unit therefore carries the marker's root id whenever it differs from the
+  name (`DeletionUnit::root_id`), the deletion takes **both** locks — the root id's
+  in its own lock set, because a lock set refuses a second lock at the same rank —
+  and custody reads the unit's holds and compares the marker **under that root
+  id**. Without this a held adopted root could be renamed out from under its
+  holder, and the hold that should have kept it would not even have been read. It is
+  pinned by a counterfactual: a `hold` attempted while the pass holds the adopted
+  root's lock fails `locked`, and one recorded first keeps the root as `held`.
 - **The policy snapshot is versioned, and a change is not a refusal.** The pass
-  starts on the plan's own `policy_generation` and policy. Before each effect it
-  re-reads the registry and compares the generation. A changed generation is
+  starts on the plan's own `policy_generation` and policy, and re-reads the registry
+  **before its first decision** as well as before each effect — so no stop and no
+  effect ever rests on the plan's stale thresholds, and an invalid registry or a
+  durability change is met before anything can be deleted. Before each effect it
+  re-reads the registry again and compares the generation. A changed generation is
   adopted: the new policy's `max(reserve, floor)` becomes the target, a fresh
   measurement decides, and a candidate the new policy no longer needs is skipped
   as `policy_changed`. Only these stop the pass, with `unknown_state`/`unknown
@@ -1867,12 +1882,16 @@ is claimed.**
   wall clock and no new option (the design delegate's ruling). No effect starts
   inside the last 5 s. Every bound reports what it did not reach, with counts, and
   a pass that ends on one exits `3` rather than presenting itself as complete.
-- **Replay.** A real run replays the volume's pending intents **before** its first
-  effect, from their recorded identities only, after the volume re-verifies; a
-  replay that settles or resumes everything continues, and one that cannot settle
-  an intent stops the pass before its first effect with `detail.pending_intent`.
-  The report carries the replay's counts in `effect.replay`. The per-phase replay
-  rules themselves are `delete`'s and are pinned there.
+- **Replay is this volume's, under this pass's lock.** The pass takes the volume's
+  exclusive lock first and replays **only the pending intents whose recorded volume
+  is that volume**, under the lock it already holds, from their recorded identities
+  only, after the volume re-verifies — never the account journal's other volumes'
+  intents, which are a different object's business and cannot block, delay or be
+  acted on by this pass. A replay that settles or resumes everything continues, and
+  one that cannot settle one of this volume's intents stops the pass before its
+  first effect with `detail.pending_intent`. The report carries this volume's
+  replay counts in `effect.replay`. The per-phase replay rules themselves are
+  `delete`'s and are pinned there.
 - **Failure matrix rows this slice owns.** Drive pulled before the run
   (`volume_absent`, nothing changed); a root renamed or absent since the plan
   (`identity_changed`, no delete); `ENOSPC` or an unreadable state volume at the
@@ -1896,9 +1915,10 @@ is claimed.**
   and `replay`. The plan's own policy and generation stay at the top level, so a
   generation change is visible rather than hidden. A real run does **not**
   re-plan, so its `participation`, `kept` and `examined` are empty: those rows
-  belong to the preview whose bytes authorised it. `space::read_prune_report`
-  reads the document and refuses an unknown major, a removed field and counts that
-  disagree with their rows.
+  belong to the preview whose bytes authorised it. `effect` is a **required** field
+  of this major — a preview states it as `null` — and `space::read_prune_report`
+  refuses an unknown major, a document that omits `effect`, any other removed
+  field, and counts that disagree with their rows.
 - **Tests.** The library suite runs the pass against a real-OS fixture volume and
   pins: a completed deletion with its intent settled, its marker removed last and
   its document reading back; a volume already above its target deleting nothing; a

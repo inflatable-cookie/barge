@@ -461,16 +461,46 @@ pub fn prune(
     })?;
     let verified = crate::os::verify_volume(facts, mounts, &mount, &record.expected_volume())?;
 
-    // Replay first: a real run settles what an earlier one left pending before it
-    // deletes anything, and only from the recorded identity, after the volume
-    // re-verifies. An intent that stays pending stops this pass before its first
-    // effect, because a new delete over an unsettled one is what the journal
-    // exists to prevent.
-    let replay = delete::replay_pending(
+    // One prune per volume: the volume's exclusive lock is held from this first
+    // authoritative measurement to the final decision.
+    paths.initialize()?;
+    let mut locks = LockSet::with_deadline(
+        paths.clone(),
+        super::lock_deadline(effect_deadline, request.lock_wait),
+    );
+    let _volume_lock = locks.lock_volume(request.volume_uuid).map_err(|error| {
+        Error::new(
+            ErrorKind::Locked,
+            format!(
+                "volume {}'s lock could not be taken for this prune: {}; nothing was changed",
+                request.volume_uuid,
+                error.message()
+            ),
+        )
+        .with_detail("volume_uuid", request.volume_uuid.as_str().into())
+        .with_detail(
+            "lock",
+            paths
+                .volume_lock_path(request.volume_uuid)
+                .display()
+                .to_string()
+                .into(),
+        )
+    })?;
+    // Replay next, under that lock and **only** for this volume: a real run settles
+    // what an earlier one left pending before it deletes anything, from the
+    // recorded identities only, after the volume re-verifies. Another volume's
+    // pending intent is a different object's business and never blocks, delays or
+    // is acted on here. An intent of this volume that stays pending stops the pass
+    // before its first effect, because a new delete over an unsettled one is what
+    // the journal exists to prevent.
+    let replay = delete::replay_pending_on_volume(
         paths,
         dirs,
         facts,
         observer,
+        request.volume_uuid,
+        &_volume_lock,
         DeleteBounds {
             deadline: Some(deadline),
             ..request.delete_bounds
@@ -499,40 +529,14 @@ pub fn prune(
         return Err(Error::new(
             ErrorKind::UnknownState,
             format!(
-                "an earlier space prune left {} intent(s) pending and this run could not settle them, so nothing was deleted; a later run replays them",
+                "an earlier space prune of volume {} left {} intent(s) pending and this run could not settle them, so nothing was deleted; a later run replays them",
+                request.volume_uuid,
                 replay.pending.len()
             ),
         )
         .with_detail("pending_intent", serde_json::json!(ids))
         .with_detail("pending", serde_json::json!(rows)));
     }
-
-    // One prune per volume: the volume's exclusive lock is held from this first
-    // authoritative measurement to the final decision.
-    paths.initialize()?;
-    let mut locks = LockSet::with_deadline(
-        paths.clone(),
-        super::lock_deadline(effect_deadline, request.lock_wait),
-    );
-    let _volume_lock = locks.lock_volume(request.volume_uuid).map_err(|error| {
-        Error::new(
-            ErrorKind::Locked,
-            format!(
-                "volume {}'s lock could not be taken for this prune: {}; nothing was changed",
-                request.volume_uuid,
-                error.message()
-            ),
-        )
-        .with_detail("volume_uuid", request.volume_uuid.as_str().into())
-        .with_detail(
-            "lock",
-            paths
-                .volume_lock_path(request.volume_uuid)
-                .display()
-                .to_string()
-                .into(),
-        )
-    })?;
     let before = space.measure_space(&verified)?;
     // The plan's own snapshot is what authorizes the run. A policy published between
     // the plan and this pass is the first generation change an effect step
@@ -642,10 +646,21 @@ impl Pass<'_> {
     fn run(&mut self) -> Result<()> {
         let candidates = self.plan.candidates.rows.clone();
         let mut cursor = 0usize;
-        if self.current.free_bytes > self.target() {
-            // The volume already satisfies the policy, so there is nothing to
-            // reclaim: an operator's real run never deletes data it was not asked
-            // to free.
+        // The policy is re-read **before** the first decision, not trusted from the
+        // plan: an operator's real run never acts on a stale threshold and never
+        // stops on one. A policy published between the plan and this pass is
+        // adopted here, with a fresh measurement, exactly as it is before every
+        // later effect; only then does the pass decide whether there is anything to
+        // reclaim.
+        match self.refresh_policy() {
+            Ok(true) => {}
+            Ok(false) => self.stop = Some("target_reached"),
+            Err(error) => return Err(self.annotate(error)),
+        }
+        if self.stop.is_none() && self.current.free_bytes > self.target() {
+            // The volume already satisfies the policy in force, so there is nothing
+            // to reclaim: an operator's real run never deletes data it was not
+            // asked to free.
             self.stop = Some("target_reached");
         }
         while self.stop.is_none() {
@@ -1408,16 +1423,19 @@ fn reverify_candidate(
             ),
         ));
     }
+    // One handle to the root, under the lock the deletion holds: it serves the
+    // scratch predicate and the durable identity binding below, so both read the
+    // object this effect is about to rename.
+    let handle = dirs.open_path(&row.configured_path).map_err(|error| {
+        Skip::new(
+            "identity_changed",
+            format!(
+                "the root `{}` could not be opened again, so it is kept: {error}",
+                candidate.name
+            ),
+        )
+    })?;
     if candidate.area == scratch_label() {
-        let handle = dirs.open_path(&row.configured_path).map_err(|error| {
-            Skip::new(
-                "identity_changed",
-                format!(
-                    "the scratch root `{}` could not be opened again, so it is kept: {error}",
-                    candidate.name
-                ),
-            )
-        })?;
         let eligibility = scratch::pressure_eligible(
             dirs,
             observer,
@@ -1462,39 +1480,113 @@ fn reverify_candidate(
             ));
         }
     }
-    // The durable record must agree with this observation when the root has one.
+    // The durable record must agree with **this** observation when the root has one.
     // A root that predates the record has none, and that absence is not a
     // disagreement; an unreadable or disagreeing record keeps the root rather than
-    // being resolved in either direction.
+    // being resolved in either direction. The comparison is this candidate's, never
+    // the record's own path: a copied root that reuses another root's id in another
+    // folder is exactly the case the record alone would verify and this comparison
+    // refuses.
     let uid = observer.effective_uid().map_err(|error| {
         Skip::new(
             "identity_changed",
             format!("this account's effective uid is unreadable: {error}"),
         )
     })?;
-    match identity::verify(paths, dirs, facts, mounts, uid, &candidate.root_id) {
-        IdentityVerdict::Verified { .. } => {}
-        IdentityVerdict::Unknown {
-            reason: IdentityReason::IdentityRecordMissing,
-        } => {}
-        IdentityVerdict::Unknown { reason } => {
+    let record = match identity::read(paths, dirs, &candidate.root_id, uid) {
+        Ok(None) => None,
+        Ok(Some(record)) => Some(record),
+        Err(error) => {
             return Err(Skip::new(
                 "identity_changed",
                 format!(
-                    "the root `{}`'s durable identity record does not verify ({}), so it is kept",
+                "the root `{}`'s durable identity record could not be read, so it is kept: {error}",
+                candidate.name
+            ),
+            ))
+        }
+    };
+    if let Some(record) = record {
+        let Some(marker) = observed_marker(
+            dirs,
+            &handle,
+            &resolved.volume_uuid,
+            &resolved.mount_point,
+            &row.configured_path,
+            uid,
+            now_ms,
+            candidate,
+        ) else {
+            return Err(Skip::new(
+                "identity_changed",
+                format!(
+                    "the root `{}`'s marker could not be re-read for its identity record, so it is kept",
+                    candidate.name
+                ),
+            ));
+        };
+        let dir_facts = dirs.dir_facts(&handle).map_err(|error| {
+            Skip::new(
+                "identity_changed",
+                format!(
+                    "the root `{}`'s own facts could not be read, so it is kept: {error}",
+                    candidate.name
+                ),
+            )
+        })?;
+        let record_uuid = match VolumeUuid::parse(&record.volume_uuid) {
+            Ok(uuid) => uuid,
+            Err(error) => {
+                return Err(Skip::new(
+                    "identity_changed",
+                    format!(
+                        "the root `{}`'s identity record names a volume that is not a UUID, so it is kept: {error}",
+                        candidate.name
+                    ),
+                ))
+            }
+        };
+        let matching_mounts = match facts.mount_census(&record_uuid) {
+            Ok(mounts) => mounts.len(),
+            Err(error) => {
+                return Err(Skip::new(
+                    "identity_changed",
+                    format!(
+                        "volume {}'s mount census is unavailable, so the root `{}`'s identity is unknown: {error}",
+                        record.volume_uuid, candidate.name
+                    ),
+                ))
+            }
+        };
+        let verdict = identity::compare(
+            &record,
+            &identity::RootObservation {
+                matching_mounts,
+                // The live volume is the one this pass verified, never the record's
+                // uuid compared with itself: a record that names another volume is a
+                // mismatch, not a match.
+                volume_uuid: resolved.volume_uuid.as_str().to_owned(),
+                mount: resolved.mount_point.clone(),
+                device: candidate.device,
+                inode: candidate.inode,
+                root_uid: dir_facts.uid,
+                effective_uid: uid,
+                root_id: marker.root_id,
+                nonce: marker.nonce,
+                mount_relative_path: relative_to_mount(&row.configured_path, &resolved.mount_point),
+                kind: marker.kind,
+                area: marker.area,
+            },
+        );
+        if let IdentityVerdict::Unknown { reason } = verdict {
+            return Err(Skip::new(
+                "identity_changed",
+                format!(
+                    "the root `{}`'s durable identity record does not describe this observation ({}), so it is kept",
                     candidate.name,
                     identity_reason(reason)
                 ),
-            ))
-        }
-        IdentityVerdict::Gone => {
-            return Err(Skip::new(
-                "identity_changed",
-                format!(
-                    "the root `{}`'s durable identity record proves the root is gone, so it is kept and reported",
-                    candidate.name
-                ),
-            ))
+            ));
         }
     }
     // No pending intent may cover this root: the deletion's own custody reads them
@@ -1541,6 +1633,10 @@ fn deletion_unit(
             MarkerFamily::Barge,
             candidate.marker_digest.clone(),
         )),
+        // An adopted root's directory name is not its root id, so the deletion must
+        // also take the root-id lock a consumer's `hold` takes; without it a held
+        // root could be renamed out from under its holder.
+        root_id: (candidate.root_id != candidate.name).then(|| candidate.root_id.clone()),
         grant: UnitGrant::native_root(candidate.name.clone()),
         plan_digest: digest.to_owned(),
     }
@@ -1573,6 +1669,49 @@ const fn reserve_name(reserve: ReserveParticipation) -> &'static str {
         ReserveParticipation::Counts => "counts",
         ReserveParticipation::Excluded => "excluded",
     }
+}
+
+/// Re-read the marker of the root an effect step is about to rename, under the lock
+/// the deletion holds, for the identity record's binding. It returns the owned
+/// marker when the root is positively Barge's own.
+#[allow(clippy::too_many_arguments)]
+fn observed_marker(
+    dirs: &dyn DirOps,
+    handle: &crate::os::DirHandle,
+    volume_uuid: &VolumeUuid,
+    mount_point: &Path,
+    resolved_path: &Path,
+    uid: u32,
+    now_ms: u64,
+    candidate: &SpaceCandidateRow,
+) -> Option<crate::area::RootMarker> {
+    let expectation = area::MarkerExpectation {
+        volume_uuid,
+        resolved_path,
+        mount_point: Some(mount_point),
+        effective_uid: uid,
+        now_ms,
+    };
+    let (marker, digest) = area::read_marker_with_digest(dirs, handle, &expectation);
+    if digest.as_deref() != Some(candidate.marker_digest.as_str()) {
+        return None;
+    }
+    match marker {
+        area::MarkerState::Owned(marker) if marker.root_id == candidate.root_id => Some(*marker),
+        _ => None,
+    }
+}
+
+/// One path's form below a mount point, as a durable identity record spells it.
+fn relative_to_mount(path: &Path, mount: &Path) -> String {
+    let Ok(relative) = path.strip_prefix(mount) else {
+        return String::new();
+    };
+    relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<&str>>()
+        .join("/")
 }
 
 /// A durable identity refusal's reason code, which is the design's reason table.
@@ -1612,7 +1751,9 @@ mod tests {
     use crate::delete::DeleteBounds;
     use crate::digest::sha256_hex;
     use crate::error::ErrorKind;
-    use crate::os::{Flush, OpenDescriptor, SpaceFacts, SpaceMeasurement, VerifiedVolume};
+    use crate::os::{
+        Flush, OpenDescriptor, SpaceFacts, SpaceMeasurement, VerifiedVolume, VolumeUuid,
+    };
     use crate::registry::{self, Durability, SpacePolicy, VolumeRecord};
     use crate::space::{
         canonical_plan_bytes, plan, read_prune_report, SpacePruneReport, SpacePruneRequest,
@@ -1672,6 +1813,7 @@ mod tests {
     /// A flush that succeeds or fails on demand, and counts its calls.
     struct Flusher {
         fail: Cell<bool>,
+        pause: Cell<Duration>,
         calls: Cell<usize>,
     }
 
@@ -1679,6 +1821,7 @@ mod tests {
         fn ok() -> Self {
             Self {
                 fail: Cell::new(false),
+                pause: Cell::new(Duration::ZERO),
                 calls: Cell::new(0),
             }
         }
@@ -1686,6 +1829,17 @@ mod tests {
         fn failing() -> Self {
             Self {
                 fail: Cell::new(true),
+                pause: Cell::new(Duration::ZERO),
+                calls: Cell::new(0),
+            }
+        }
+
+        /// A flush that takes at least `pause`, so a bound shorter than it is
+        /// reached by measurement rather than by a clock race.
+        fn slow(pause: Duration) -> Self {
+            Self {
+                fail: Cell::new(false),
+                pause: Cell::new(pause),
                 calls: Cell::new(0),
             }
         }
@@ -1698,6 +1852,9 @@ mod tests {
     impl Flush for Flusher {
         fn flush_volume(&self, _volume: &VerifiedVolume) -> crate::error::Result<()> {
             self.calls.set(self.calls.get().saturating_add(1));
+            if !self.pause.get().is_zero() {
+                std::thread::sleep(self.pause.get());
+            }
             if self.fail.get() {
                 return Err(crate::error::Error::new(
                     ErrorKind::UnknownState,
@@ -1799,37 +1956,132 @@ mod tests {
             (root.root_id, root.path)
         }
 
+        /// Record one root's release as account state, exactly as a release
+        /// leaves it: the release publishes its fact first (T3's order), and this
+        /// writes that fact directly so a fixture does not need a hold round trip.
         fn release_at(&self, root_id: &str, at: u64, created: u64) {
-            area::hold(
-                &self.fixture.state,
-                &self.observer,
-                &HoldRequest {
-                    root_id: root_id.to_owned(),
-                    holder: "prover".to_owned(),
-                    pid: std::process::id(),
-                    scope: HoldScope::Write,
-                    purpose: "a fixture holder".to_owned(),
-                },
-            )
-            .expect("the hold is written");
-            area::release(&self.fixture.state, &self.observer, root_id, "prover")
-                .expect("the hold releases");
             let path = self
                 .fixture
                 .state
                 .activity_path(root_id)
                 .expect("the record path");
-            let mut value: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&path).expect("the record reads"))
-                    .expect("the record parses");
-            value["last_release_ms"] = at.into();
-            value["recorded_ms"] = at.into();
-            value["first_created_ms"] = created.into();
+            let record = serde_json::json!({
+                "schema": "barge.activity/1",
+                "root_id": root_id,
+                "volume_uuid": self.record.volume_uuid.as_str(),
+                "last_release_ms": at,
+                "first_created_ms": created,
+                "releases": 1,
+                "generation": 1,
+                "recorded_ms": at,
+            });
+            std::fs::create_dir_all(path.parent().expect("the activity directory"))
+                .expect("the activity directory is made");
             std::fs::write(
                 &path,
-                serde_json::to_vec_pretty(&value).expect("the record encodes"),
+                serde_json::to_vec_pretty(&record).expect("the record encodes"),
             )
             .expect("the record is written");
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .expect("the record is private");
+        }
+
+        /// One adopted root: a directory whose marker proves a root id that is not
+        /// its name. Returns the marker's root id, its path and its nonce.
+        fn seed_adopted(
+            &self,
+            area_name: &str,
+            name: &str,
+            released_at: u64,
+        ) -> (String, std::path::PathBuf, String) {
+            use crate::area::{MarkerArea, MarkerWrite, RootOrigin};
+            let folder = format!("example/{area_name}");
+            let path = self.fixture.root.join(&folder).join(name);
+            std::fs::create_dir_all(&path).expect("the adopted root's directory is made");
+            VolumeFixture::payload(&path, "payload.bin", &[5u8; 2048]);
+            let platform = self.fixture.platform();
+            let dirs: &dyn crate::os::DirOps = &platform;
+            let facts: &dyn crate::os::ProcessObserver = &platform;
+            let handle = dirs.open_path(&path).expect("the adopted root opens");
+            let uid = facts.effective_uid().expect("this account's uid");
+            let marker = area::write_marker(
+                &platform,
+                &handle,
+                &MarkerWrite {
+                    root_id: None,
+                    volume_uuid: &self.record.volume_uuid,
+                    resolved_path: &path,
+                    mount_point: &self.fixture.root,
+                    area: MarkerArea::identity("example", area_name),
+                    kind: RootKind::AreaRoot,
+                    origin: RootOrigin::AdoptedExisting,
+                },
+                uid,
+            )
+            .expect("the adopted root's marker is written");
+            self.release_at(
+                &marker.root_id,
+                released_at,
+                released_at.saturating_sub(100),
+            );
+            (marker.root_id, path, marker.nonce)
+        }
+
+        /// Publish one durable `barge.root.identity/1` record by hand, for the
+        /// counterfactual where the record does not describe the candidate.
+        fn write_identity(
+            &self,
+            root_id: &str,
+            inode: u64,
+            nonce: &str,
+            mount_relative_path: &str,
+            area_name: &str,
+        ) {
+            let roots = self.fixture.state.root().join("roots");
+            let dir = roots.join(root_id);
+            std::fs::create_dir_all(&dir).expect("the identity directory is made");
+            std::fs::set_permissions(&roots, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .expect("the identity root is private");
+            std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .expect("the identity directory is private");
+            let record = serde_json::json!({
+                "schema": "barge.root.identity/1",
+                "root_id": root_id,
+                "nonce": nonce,
+                "volume_uuid": self.record.volume_uuid.as_str(),
+                "mount_relative_path": mount_relative_path,
+                "inode": inode,
+                "device_at_record": self.fixture.device.get(),
+                "mount_at_record": self.fixture.root.to_str().expect("the mount path is UTF-8"),
+                "kind": "area_root",
+                "area": {"namespace": "example", "area": area_name},
+                "origin": "created",
+                "marker_generation_at_record": 1,
+                "recorded_ms": 1,
+            });
+            let file = dir.join("identity.json");
+            std::fs::write(
+                &file,
+                serde_json::to_vec_pretty(&record).expect("the record encodes"),
+            )
+            .expect("the identity record is written");
+            std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .expect("the identity record is private");
+        }
+
+        /// Publish a registry of every record one account holds, so two volumes can
+        /// share one journal.
+        fn register_all(&self, records: &[VolumeRecord]) {
+            use crate::registry::{RegistryDocument, RegistryWriter};
+            self.fixture.state.initialize().expect("the layout exists");
+            let mut locks = LockSet::with_deadline(
+                self.fixture.state.clone(),
+                Deadline::after(Duration::from_secs(5)),
+            );
+            let lock = locks.lock_registry().expect("the registry lock");
+            RegistryWriter::new(&self.fixture.state)
+                .publish(&lock, &RegistryDocument::new(records.to_vec()))
+                .expect("the registry is written");
         }
 
         fn hold(&self, root_id: &str) {
@@ -1987,7 +2239,7 @@ mod tests {
 
         assert!(!report.preview);
         let effect = report.effect.as_ref().expect("the effect is reported");
-        assert_eq!(effect.pruned.count, 1);
+        assert_eq!(effect.pruned.count, 1, "{effect:?}");
         assert_eq!(effect.pruned.rows[0].root_id, root_a);
         assert_eq!(effect.pruned.rows[0].intent_id.len(), 32);
         assert!(effect.pruned.rows[0].marker_removed, "the marker went last");
@@ -2304,12 +2556,12 @@ mod tests {
     }
 
     #[test]
-    fn a_reserve_lowered_below_the_measurement_keeps_the_root_and_stops() {
+    fn a_reserve_lowered_below_the_measurement_stops_on_the_fresh_policy() {
         let harness = Harness::new("space-prune-reserve-down", RESERVE, FLOOR);
         let (root, path) = harness.seed("pool", 1_000);
         let (_, bytes) = harness.preview();
         // Reserve 4, floor 2: the fresh measurement (20) already satisfies the new
-        // policy, so the candidate no longer qualifies and nothing is deleted.
+        // policy, so nothing is deleted and no candidate is even attempted.
         Harness::register(&harness.fixture, 4, 2);
         let report = harness
             .run(
@@ -2320,13 +2572,22 @@ mod tests {
             )
             .expect("the pass runs");
         let effect = report.effect.as_ref().expect("the effect");
-        assert_eq!(effect.pruned.count, 0, "{effect:?}");
         assert_eq!(effect.stop, "target_reached");
         assert_eq!(
-            held_reason(&report, &root).as_deref(),
-            Some("policy_changed")
+            effect.policy.reserve_bytes, 4,
+            "the fresh policy is adopted"
         );
-        assert!(path.is_dir());
+        assert_eq!(effect.target_bytes, 4);
+        assert_eq!(effect.pruned.count, 0);
+        assert_eq!(effect.batches, 0, "no effect starts on a satisfied policy");
+        assert_eq!(effect.not_reached.count, 1);
+        assert_eq!(effect.not_reached.rows[0].reason, "target_reached");
+        assert!(path.is_dir(), "the root is kept");
+        assert!(
+            report.plan.policy.reserve_bytes == RESERVE,
+            "the plan's own snapshot stays beside the effect, so the change is visible"
+        );
+        let _ = root;
     }
 
     #[test]
@@ -2886,21 +3147,328 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_flush_bound_is_reported_as_a_reached_bound() {
+    fn a_flush_that_outlives_its_bound_is_reported_as_a_reached_bound() {
         let harness = Harness::new("space-prune-flush-bound", RESERVE, FLOOR);
         harness.seed("pool", 1_000);
         let (_, bytes) = harness.preview();
+        // A flush that certainly takes longer than its bound: 20 ms of sleeping
+        // against a 1 ms bound, so the overrun is measured, never a clock race.
         let bounds = SpacePruneBounds {
-            flush_deadline: Duration::ZERO,
+            flush_deadline: Duration::from_millis(1),
             ..SpacePruneBounds::design()
         };
+        let flusher = Flusher::slow(Duration::from_millis(20));
         let report = harness
-            .run(&bytes, &Meter::new(&[4, 20]), &Flusher::ok(), bounds)
+            .run(&bytes, &Meter::new(&[4, 20]), &flusher, bounds)
             .expect("the pass runs");
         let effect = report.effect.as_ref().expect("the effect");
         assert_eq!(effect.stop, "budget_exhausted");
         assert_eq!(effect.pruned.count, 1);
         assert!(report.needs_human());
+    }
+
+    /// An adopted root's directory name is not its root id, so a consumer's `hold`
+    /// and the deletion take two different files unless the unit carries the root
+    /// id. This is the counterfactual both halves of that rule:
+    ///
+    /// - a hold recorded before the pass keeps the root (`held`), and
+    /// - a `hold` attempted while the pass holds the root's lock fails `locked`,
+    ///   which can only be true if the deletion took the **root-id** lock the hold
+    ///   takes rather than the unit key its directory name derives.
+    #[test]
+    fn an_adopted_roots_deletion_holds_the_root_id_lock_a_consumer_hold_takes() {
+        let harness = Harness::new("space-prune-adopted", RESERVE, FLOOR);
+        let (root_id, path, nonce) = harness.seed_adopted("pool", "adopted-run", 1_000);
+        assert_ne!(root_id, "adopted-run", "the name is not the root id");
+        let _ = nonce;
+        let _ = &path;
+        let (preview, bytes) = harness.preview();
+        assert_eq!(preview.candidates, 1);
+        assert_eq!(preview.plan.candidates.rows[0].root_id, root_id);
+        assert_eq!(preview.plan.candidates.rows[0].name, "adopted-run");
+
+        // A `hold` attempted during the effect waits on the lock the deletion holds
+        // and then fails `locked`; without the root-id lock it would succeed.
+        let refused = std::rc::Rc::new(RefCell::new(None));
+        let refused_in_probe = std::rc::Rc::clone(&refused);
+        let state = harness.fixture.state.clone();
+        let probed = root_id.clone();
+        let faults = Faults::new();
+        faults.observing(Box::new(move |_name| {
+            if refused_in_probe.borrow().is_some() {
+                return;
+            }
+            let mut locks =
+                LockSet::with_deadline(state.clone(), Deadline::after(Duration::from_millis(50)));
+            if let Err(error) = locks.lock_root(&probed) {
+                *refused_in_probe.borrow_mut() = Some(error.kind());
+            }
+        }));
+        let report = harness
+            .run_with(
+                &faults,
+                &bytes,
+                &Meter::new(&[4, 20]),
+                &Flusher::ok(),
+                SpacePruneBounds::design(),
+            )
+            .expect("the pass runs");
+        assert_eq!(report.effect.as_ref().expect("the effect").pruned.count, 1);
+        assert_eq!(
+            *refused.borrow(),
+            Some(ErrorKind::Locked),
+            "the deletion holds the root-id lock a hold takes"
+        );
+
+        // A hold recorded before the pass is read under that lock and keeps the root.
+        let harness = Harness::new("space-prune-adopted-held", RESERVE, FLOOR);
+        let (root_id, path, _nonce) = harness.seed_adopted("pool", "adopted-run", 1_000);
+        let (_, bytes) = harness.preview();
+        harness.hold(&root_id);
+        let report = harness
+            .run(
+                &bytes,
+                &Meter::new(&[4]),
+                &Flusher::ok(),
+                SpacePruneBounds::design(),
+            )
+            .expect("the pass runs");
+        assert_eq!(
+            held_reason(&report, &root_id).as_deref(),
+            Some("held"),
+            "a held adopted root is skipped and reported"
+        );
+        assert!(path.is_dir(), "the held adopted root is never touched");
+    }
+
+    /// The durable identity record must describe **this** candidate, not merely
+    /// verify somewhere: a record whose path is another folder is a copy's record and
+    /// keeps the root.
+    #[test]
+    fn a_copied_identity_record_does_not_authorize_this_root() {
+        let harness = Harness::new("space-prune-copied-identity", RESERVE, FLOOR);
+        let (root_id, path, nonce) = harness.seed_adopted("pool", "adopted-run", 1_000);
+        let (preview, bytes) = harness.preview();
+        let row = &preview.plan.candidates.rows[0];
+        assert_eq!(row.root_id, root_id);
+        // The record itself verifies: its inode, marker identity and volume are this
+        // root's, and only its recorded path is another folder's.
+        harness.write_identity(
+            &root_id,
+            row.inode,
+            &nonce,
+            "example/pool/another-adopted-run",
+            "pool",
+        );
+        let report = harness
+            .run(
+                &bytes,
+                &Meter::new(&[4]),
+                &Flusher::ok(),
+                SpacePruneBounds::design(),
+            )
+            .expect("the pass runs");
+        assert_eq!(
+            held_reason(&report, &root_id).as_deref(),
+            Some("identity_changed"),
+            "a record for another path does not authorize this root"
+        );
+        let detail = report
+            .effect
+            .as_ref()
+            .expect("the effect")
+            .held
+            .rows
+            .iter()
+            .find(|row| row.root_id == root_id)
+            .and_then(|row| row.detail.clone())
+            .expect("the refusal reads its evidence");
+        assert!(
+            detail.contains("does not describe this observation"),
+            "the refusal names the binding: {detail}"
+        );
+        assert!(path.is_dir(), "the root is kept");
+    }
+
+    /// The journal is one account journal, but a pass is one volume's. Another
+    /// volume's pending intent is neither replayed by this pass nor allowed to
+    /// block it.
+    #[test]
+    fn another_volumes_pending_intent_neither_blocks_nor_is_replayed() {
+        let harness = Harness::new("space-prune-two-volumes", RESERVE, FLOOR);
+        let (root_a, path_a) = harness.seed("pool", 1_000);
+        let (_, bytes_a) = harness.preview();
+
+        // A second volume in the same account: its own tree, its own record, one
+        // declaration and one idle root.
+        let other = VolumeFixture::under_scratch("space-prune-two-volumes-b");
+        let other_uuid = VolumeUuid::parse(crate::testkit::OTHER_UUID).expect("the second uuid");
+        let mut record_b = other.record.clone();
+        record_b.volume_uuid = other_uuid.clone();
+        record_b.space = Some(SpacePolicy {
+            reserve_bytes: RESERVE,
+            floor_bytes: FLOOR,
+            declared_by: "fixture".to_owned(),
+            declared_ms: 1,
+        });
+        harness.register_all(&[harness.record.clone(), record_b.clone()]);
+        area::declare(
+            &harness.fixture.state,
+            &Harness::declaration("other", "example/other", ReserveParticipation::Counts),
+            1,
+        )
+        .expect("the second area declares");
+        let path_b = other.root.join("example/other/adopted-run");
+        std::fs::create_dir_all(&path_b).expect("the second root's directory is made");
+        VolumeFixture::payload(&path_b, "payload.bin", &[3u8; 2048]);
+        let platform = other.platform();
+        let dirs: &dyn crate::os::DirOps = &platform;
+        let other_observer = other.observer();
+        let process: &dyn crate::os::ProcessObserver = &other_observer;
+        let uid = process.effective_uid().expect("the uid");
+        let marker = area::write_marker(
+            &platform,
+            &dirs.open_path(&path_b).expect("the second root opens"),
+            &area::MarkerWrite {
+                root_id: None,
+                volume_uuid: &other_uuid,
+                resolved_path: &path_b,
+                mount_point: &other.root,
+                area: area::MarkerArea::identity("example", "other"),
+                kind: RootKind::AreaRoot,
+                origin: area::RootOrigin::AdoptedExisting,
+            },
+            uid,
+        )
+        .expect("the second root's marker is written");
+        {
+            let record = serde_json::json!({
+                "schema": "barge.activity/1",
+                "root_id": marker.root_id,
+                "volume_uuid": other_uuid.as_str(),
+                "last_release_ms": 1_000,
+                "first_created_ms": 900,
+                "releases": 1,
+                "generation": 1,
+                "recorded_ms": 1_000,
+            });
+            let activity = harness
+                .fixture
+                .state
+                .activity_path(&marker.root_id)
+                .expect("the record path");
+            std::fs::create_dir_all(activity.parent().expect("the activity directory"))
+                .expect("the activity directory is made");
+            std::fs::write(
+                &activity,
+                serde_json::to_vec_pretty(&record).expect("the record encodes"),
+            )
+            .expect("the record is written");
+            std::fs::set_permissions(
+                &activity,
+                std::os::unix::fs::PermissionsExt::from_mode(0o600),
+            )
+            .expect("the record is private");
+        }
+        let facts_b = crate::testkit::FakeVolume {
+            root: other.root.clone(),
+            uuid: other_uuid.clone(),
+            device: other.device,
+            present: std::cell::Cell::new(true),
+            shifted: std::cell::Cell::new(false),
+            duplicate: std::cell::Cell::new(false),
+        };
+        let observer = harness.fixture.observer();
+        let (preview_b, bytes_b) = {
+            let meter = Meter::new(&[4]);
+            let report = plan(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &facts_b,
+                &other.mounts(),
+                &observer,
+                &meter,
+                &SpacePruneRequest {
+                    volume_uuid: &other_uuid,
+                    now_ms: harness.now_ms,
+                    wall: SPACE_PLAN_WALL,
+                    lock_wait: Duration::from_secs(1),
+                },
+            )
+            .expect("the second volume's plan is built");
+            let bytes = canonical_plan_bytes(&report.plan).expect("the plan encodes");
+            (report, bytes)
+        };
+        assert_eq!(preview_b.candidates, 1);
+        // Interrupt the second volume's pass so it leaves a pending intent, in this
+        // account's one journal.
+        let faults = Faults::new().with_device_shift(
+            "payload.bin",
+            crate::os::DeviceId::new(other.device.get().saturating_add(1)),
+        );
+        let digest = sha256_hex(&bytes_b);
+        let request_b = SpacePruneRunRequest {
+            volume_uuid: &other_uuid,
+            plan_digest: &digest,
+            plan_bytes: &bytes_b,
+            now_ms: harness.now_ms,
+            lock_wait: Duration::from_secs(1),
+            delete_bounds: DeleteBounds {
+                retry_pause: Duration::ZERO,
+                ..DeleteBounds::default()
+            },
+            bounds: SpacePruneBounds::design(),
+        };
+        prune(
+            &harness.fixture.state,
+            &faults,
+            &facts_b,
+            &other.mounts(),
+            &observer,
+            &Meter::new(&[4]),
+            &Flusher::ok(),
+            &request_b,
+        )
+        .expect_err("the second volume's pass is interrupted");
+        let journal =
+            state::read_intents(&harness.fixture.state, INTENT_ROWS).expect("the journal");
+        assert_eq!(
+            PendingIntent::pending(&journal.records)
+                .iter()
+                .filter(|intent| intent.volume_uuid == other_uuid)
+                .count(),
+            1,
+            "the second volume left an intent pending"
+        );
+
+        // This volume's pass is neither blocked nor made to replay it.
+        let report = harness
+            .run(
+                &bytes_a,
+                &Meter::new(&[4, 20]),
+                &Flusher::ok(),
+                SpacePruneBounds::design(),
+            )
+            .expect("this volume's pass runs");
+        let effect = report.effect.as_ref().expect("the effect");
+        let replay = effect.replay.expect("the replay is reported");
+        assert_eq!(
+            replay.examined, 0,
+            "another volume's intent is not this pass's"
+        );
+        assert_eq!(effect.pruned.count, 1);
+        assert_eq!(effect.pruned.rows[0].root_id, root_a);
+        assert!(!path_a.exists());
+        let journal =
+            state::read_intents(&harness.fixture.state, INTENT_ROWS).expect("the journal");
+        assert_eq!(
+            PendingIntent::pending(&journal.records)
+                .iter()
+                .filter(|intent| intent.volume_uuid == other_uuid)
+                .count(),
+            1,
+            "the other volume's intent is still pending, untouched"
+        );
     }
 
     #[test]
@@ -2919,6 +3487,19 @@ mod tests {
         let read = read_prune_report(&encoded).expect("a preview reads");
         assert!(read.preview);
         assert!(read.effect.is_none());
+        // `effect` is a required field of this major, present as `null` in a preview:
+        // omitting it is a removed field, never "this run did nothing".
+        let mut missing = serde_json::from_slice::<serde_json::Value>(&encoded).expect("json");
+        missing["data"]
+            .as_object_mut()
+            .expect("the data is an object")
+            .remove("effect");
+        assert_eq!(
+            read_prune_report(&serde_json::to_vec(&missing).expect("encode"))
+                .expect_err("a removed effect field is refused")
+                .kind(),
+            ErrorKind::UnknownState
+        );
         let _ = RowSet::<u8>::empty();
     }
 }

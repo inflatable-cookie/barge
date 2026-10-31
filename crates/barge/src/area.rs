@@ -4627,6 +4627,7 @@ pub(crate) fn idle_baseline_with(
         folder: folder.clone(),
         parent: String::new(),
         name: name.clone(),
+        root_id: None,
         kind: crate::unit::UnitKind::Directory,
         device: root.identity().device,
         inode: root.identity().inode,

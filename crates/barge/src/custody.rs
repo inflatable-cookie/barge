@@ -1590,6 +1590,7 @@ mod tests {
                 folder: self.folder.clone(),
                 parent: parent.to_owned(),
                 name: name.to_owned(),
+                root_id: None,
                 kind,
                 device: facts.device,
                 inode: facts.inode,
