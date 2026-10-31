@@ -331,8 +331,8 @@ struct Counts {
 /// Every refusal the unit record, the registry, the volume, the declaration and
 /// custody can cause happens before the first effect. Once the intent is
 /// published, a stop leaves it pending and returns a report instead of pretending
-/// the unit is gone; the caller (S4's expiry or S7's `maintain`) reports that and
-/// exits `3`.
+/// the unit is gone; the caller (S4's expiry, S7's `maintain` or stage 3's space
+/// prune) reports that and exits `3`.
 #[allow(clippy::too_many_arguments)]
 pub fn delete_unit_on_volume(
     state_paths: &StatePaths,
@@ -362,6 +362,16 @@ pub fn delete_unit_on_volume(
 
 type EligibilityCheck<'a> = dyn Fn(&registry::VolumeRecord) -> Result<()> + 'a;
 
+/// Whether this call takes the volume's exclusive lock itself, or the caller
+/// already holds it (a space prune holds it for its whole pass).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumeLocking {
+    /// Take the volume lock here, as every ordinary deletion does.
+    Take,
+    /// The caller holds this volume's exclusive lock already.
+    Held,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn delete_unit_authorized(
     state_paths: &StatePaths,
@@ -373,6 +383,89 @@ pub(crate) fn delete_unit_authorized(
     stored: Option<&AreaDocument>,
     unit: &DeletionUnit,
     bounds: DeleteBounds,
+    authorize: Option<&EligibilityCheck<'_>>,
+    intent_evidence: &state::IntentEvidence,
+) -> Result<DeleteReport> {
+    delete_unit_locked(
+        state_paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        declaration,
+        stored,
+        unit,
+        bounds,
+        VolumeLocking::Take,
+        authorize,
+        intent_evidence,
+    )
+}
+
+/// Delete one deletion unit while the caller already holds the volume's exclusive
+/// lock (stage 3, slice T5).
+///
+/// A space prune holds one volume lock from its first authoritative measurement to
+/// its final decision, so it cannot let the deletion take that lock again: a second
+/// exclusive `flock` on the same file from this process would refuse itself. It is
+/// the same deletion path as every other caller — the same pre-flight, re-read,
+/// custody, intent, quarantine and journal — with the volume lock supplied instead
+/// of taken. The caller's lock token is checked to be this volume's exclusive
+/// volume lock, and the deletion then takes rank 3 for its own unit in its own lock
+/// set, exactly as the fixed lock order requires; one root's lock is released
+/// before the next, so a consumer's `hold` waits for at most one deletion.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn delete_unit_under_volume_lock(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    declaration: &AreaDeclaration,
+    stored: Option<&AreaDocument>,
+    unit: &DeletionUnit,
+    bounds: DeleteBounds,
+    volume_lock: &crate::state::StateLock,
+    authorize: Option<&EligibilityCheck<'_>>,
+    intent_evidence: &state::IntentEvidence,
+) -> Result<DeleteReport> {
+    if volume_lock.rank() != crate::state::LockRank::Volume
+        || volume_lock.mode() != crate::state::LockMode::Exclusive
+        || volume_lock.path() != state_paths.volume_lock_path(&unit.volume_uuid)
+    {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "a deletion under a caller's volume lock needs that volume's exclusive lock, held by the caller; nothing was changed",
+        ));
+    }
+    delete_unit_locked(
+        state_paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        declaration,
+        stored,
+        unit,
+        bounds,
+        VolumeLocking::Held,
+        authorize,
+        intent_evidence,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn delete_unit_locked(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    declaration: &AreaDeclaration,
+    stored: Option<&AreaDocument>,
+    unit: &DeletionUnit,
+    bounds: DeleteBounds,
+    volume_locking: VolumeLocking,
     authorize: Option<&EligibilityCheck<'_>>,
     intent_evidence: &state::IntentEvidence,
 ) -> Result<DeleteReport> {
@@ -442,7 +535,8 @@ pub(crate) fn delete_unit_authorized(
                 "the unit's parent is not there, so there is nothing to delete at {}",
                 unit.path_in(&resolved.path).display()
             ),
-        ));
+        )
+        .with_detail("reason", "unit_parent_absent".into()));
     };
     let Some(present) = dirs.child_facts(&parent, &unit.name)? else {
         return Err(Error::new(
@@ -451,7 +545,8 @@ pub(crate) fn delete_unit_authorized(
                 "the unit {} is not there, so there is nothing to delete",
                 unit.path_in(&resolved.path).display()
             ),
-        ));
+        )
+        .with_detail("reason", "unit_absent".into()));
     };
     if present.kind != unit.entry_kind() {
         return Err(Error::new(
@@ -462,12 +557,18 @@ pub(crate) fn delete_unit_authorized(
                 present.kind.as_str(),
                 unit.kind.as_str()
             ),
-        ));
+        )
+        .with_detail("reason", "unit_kind_changed".into()));
     }
 
     state_paths.initialize()?;
+    // A caller that already holds this volume's lock supplied it; the deletion then
+    // takes only its own unit's lock, in a set of its own, so the pass's volume lock
+    // stays held without the rank check refusing a second root lock later.
     let mut locks = LockSet::new(state_paths.clone());
-    let _volume_lock = locks.lock_volume(&volume_uuid)?;
+    if matches!(volume_locking, VolumeLocking::Take) {
+        locks.lock_volume(&volume_uuid)?;
+    }
     let _unit_lock = lock_deletion_unit(&mut locks, unit)?;
 
     // The registry is re-read under the locks before the intent is written, so a
@@ -575,6 +676,7 @@ pub(crate) fn delete_unit_authorized(
             ErrorKind::RefusedBoundary,
             "the run's wall clock was reached before this deletion's intent was published; the unit is kept",
         )
+        .with_detail("reason", "deadline_before_intent".into())
         .with_detail("unit", unit.name.clone().into()));
     }
     state::publish_intent(&write, state_paths, &intent)?;

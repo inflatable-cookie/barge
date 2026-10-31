@@ -1,5 +1,14 @@
-//! Read-only measurements of registered volumes, and the space-prune candidate
-//! plan.
+//! Read-only measurements of registered volumes, and the space prune: its
+//! candidate plan and, in [`effect`], its real run.
+
+mod effect;
+
+pub use effect::{
+    prune, SpaceFlushRow, SpacePruneBounds, SpacePruneEffect, SpacePruneHeldRow,
+    SpacePruneRunRequest, SpacePrunedRow, SpaceReplayRow, SpaceUnreachedRow, SPACE_FLUSH_DEADLINE,
+    SPACE_PRUNE_BATCHES, SPACE_PRUNE_BATCH_ROOTS, SPACE_PRUNE_ROOTS, SPACE_PRUNE_ROOT_DEADLINE,
+    SPACE_PRUNE_STOP_MARGIN, SPACE_PRUNE_WALL,
+};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -269,6 +278,65 @@ pub fn read_document(bytes: &[u8]) -> Result<SpaceReport> {
     Ok(report)
 }
 
+/// Read one `barge.space.prune/1` from its own bytes: the preview or the real
+/// run's report.
+///
+/// It refuses an unknown major, an envelope that is not this command's, and a body
+/// that does not provide exactly the field set this major defines, so a removed
+/// field is never read as absent and an unknown one is never ignored. A real run's
+/// `effect` is `null` in a preview and populated by a pass, and both read.
+pub fn read_prune_report(bytes: &[u8]) -> Result<SpacePruneReport> {
+    let value = crate::contract::parse_document(bytes)?;
+    let invalid = || {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!("invalid {SPACE_PRUNE_SCHEMA} document"),
+        )
+    };
+    let found = value
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    if found != SPACE_PRUNE_SCHEMA {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!("`{found}` is an unknown major; this reader knows {SPACE_PRUNE_SCHEMA}"),
+        )
+        .with_detail("found", found.into())
+        .with_detail("supported", SPACE_PRUNE_SCHEMA.into()));
+    }
+    if value.get("command").and_then(serde_json::Value::as_str) != Some("space.prune")
+        || value.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+    {
+        return Err(invalid());
+    }
+    let data = value.get("data").ok_or_else(invalid)?;
+    let report: SpacePruneReport = serde_json::from_value(data.clone()).map_err(|error| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the document does not provide the field set {SPACE_PRUNE_SCHEMA} requires: {error}"
+            ),
+        )
+    })?;
+    report.plan.candidates.validate()?;
+    if report.plan.schema != SPACE_PRUNE_PLAN_SCHEMA {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the report's plan is `{}`, not {SPACE_PRUNE_PLAN_SCHEMA}",
+                report.plan.schema
+            ),
+        ));
+    }
+    if let Some(effect) = &report.effect {
+        effect.pruned.validate()?;
+        effect.held.validate()?;
+        effect.not_reached.validate()?;
+    }
+    Ok(report)
+}
+
 /// What one caller asks the space-prune planner for.
 #[derive(Debug, Clone, Copy)]
 pub struct SpacePruneRequest<'a> {
@@ -427,6 +495,20 @@ pub struct SpacePruneReport {
     pub truncated_reason: Option<String>,
     /// How many root rows the bound left unexamined.
     pub unreached: usize,
+    /// What a real run did, and what it did not reach. It is `null` for a preview,
+    /// which changes nothing (stage 3, slice T5).
+    #[serde(default)]
+    pub effect: Option<SpacePruneEffect>,
+}
+
+impl SpacePruneReport {
+    /// Whether this document is a real run whose outcome needs an operator: a pass
+    /// that ended on a bound, or one that deleted data for no measured reclaim.
+    pub fn needs_human(&self) -> bool {
+        self.effect
+            .as_ref()
+            .is_some_and(SpacePruneEffect::needs_human)
+    }
 }
 
 /// Build the space-prune candidate plan for one registered volume.
@@ -609,6 +691,7 @@ pub fn plan(
             })
         }),
         unreached,
+        effect: None,
     })
 }
 

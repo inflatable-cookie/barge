@@ -2479,13 +2479,272 @@ fn space_prune_previews_a_canonical_plan_and_writes_only_the_file_it_was_given()
     assert!(!fixture.join("space-prune-other.json").exists());
 }
 
-/// The space-prune effect form, a missing `--plan` and a bad volume are refusals
-/// that plan nothing.
+/// The real space prune: `--plan <file> --plan-sha256 <hex>` consumes the
+/// preview's exact bytes and deletes the plan's candidates under the stage 1
+/// custody, intent and quarantine protocol.
+///
+/// The fixture raises the volume's registered reserve to the volume's own capacity,
+/// so the pass is below its target and actually prunes; every write stays inside
+/// this case's `mktemp -d` directory, its own throwaway state directory and the
+/// roots it created there. A four-kilobyte root cannot move a real volume's free
+/// space, so the pass reports `space_not_reclaimed` and exits `3` — the operator
+/// reads a measured fact instead of a claimed success.
 #[test]
-fn space_prune_refuses_the_effect_form_and_a_missing_plan() {
+fn space_prune_runs_the_plan_it_is_given_and_deletes_its_candidates() {
+    let Some((mount, scratch)) = volume_scratch() else {
+        return;
+    };
+    let root_dir = scratch
+        .path
+        .strip_prefix(&mount)
+        .expect("the scratch directory is inside the mount")
+        .to_str()
+        .expect("the scratch path is UTF-8")
+        .to_owned();
+    let (fixture, state_dir) = absent_state_dir("space-prune-run");
+    let volume = register_fixture_volume(
+        &mount,
+        &root_dir,
+        &state_dir,
+        &fixture.join("register.plan.json"),
+    );
+    // Register a reserve at the volume's own capacity: free space is always below
+    // it, so the fixture's pass has a real target to prune towards.
+    let total = volume_total_bytes(&mount, &volume);
+    let updated = run_in(
+        &[
+            "volume",
+            "update",
+            &volume,
+            "--reserve",
+            &total.to_string(),
+            "--declared-by",
+            "fixture",
+            "--plan",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(
+        updated.status.code(),
+        Some(0),
+        "the update previews: {}",
+        String::from_utf8_lossy(&updated.stdout)
+    );
+    let updated_document = stdout_document(&updated);
+    let update_plan = fixture.join("update.plan.json");
+    std::fs::write(
+        &update_plan,
+        updated_document["data"]["plan"]
+            .as_str()
+            .expect("the update previews its plan"),
+    )
+    .expect("the update plan is saved");
+    let applied = run_in(
+        &[
+            "volume",
+            "update",
+            "--plan-file",
+            update_plan.to_str().expect("the plan path is UTF-8"),
+            "--plan-sha256",
+            updated_document["data"]["plan_sha256"]
+                .as_str()
+                .expect("the update previews its digest"),
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(
+        applied.status.code(),
+        Some(0),
+        "the update publishes: {}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
+
+    declare_area(&state_dir, "pool", "counts");
+    let idle = create_root(&state_dir, "pool", &volume, "area_root");
+    hold_root(&state_dir, &idle);
+    release_root(&state_dir, &idle);
+    let root_path = scratch.path.join("example/pool").join(&idle);
+    assert!(root_path.is_dir());
+
+    let plan_out = fixture.join("space-prune.plan.json");
+    let output = run_in(
+        &[
+            "space",
+            "prune",
+            "--volume",
+            &volume,
+            "--plan",
+            "--plan-out",
+            plan_out.to_str().expect("the plan path is UTF-8"),
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the preview succeeds: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let preview = stdout_document(&output);
+    assert_eq!(preview["data"]["candidates"], 1);
+    let digest = preview["data"]["plan_sha256"]
+        .as_str()
+        .expect("the preview carries its digest")
+        .to_owned();
+
+    // The bytes and the digest must agree; a mismatched plan changes nothing.
+    let mut tampered = std::fs::read(&plan_out).expect("the plan file was written");
+    tampered.push(b'\n');
+    let tampered_path = fixture.join("tampered.plan.json");
+    std::fs::write(&tampered_path, &tampered).expect("the tampered plan is saved");
+    let refused = run_in(
+        &[
+            "space",
+            "prune",
+            "--volume",
+            &volume,
+            "--plan",
+            tampered_path.to_str().expect("the path is UTF-8"),
+            "--plan-sha256",
+            &digest,
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(refused.status.code(), Some(2), "a digest mismatch refuses");
+    let refused_document = stdout_document(&refused);
+    assert_eq!(refused_document["schema"], "barge.error/1");
+    assert_eq!(refused_document["error"]["kind"], "usage");
+    assert!(root_path.is_dir(), "a mismatched plan changes nothing");
+
+    // The real run consumes exactly the preview's bytes.
+    let output = run_in(
+        &[
+            "space",
+            "prune",
+            "--volume",
+            &volume,
+            "--plan",
+            plan_out.to_str().expect("the plan path is UTF-8"),
+            "--plan-sha256",
+            &digest,
+            "--json",
+        ],
+        &state_dir,
+    );
+    let document = stdout_document(&output);
+    assert_eq!(document["schema"], "barge.space.prune/1");
+    assert_eq!(document["command"], "space.prune");
+    assert_eq!(document["data"]["preview"], false);
+    assert_eq!(document["data"]["plan_sha256"], digest);
+    let effect = &document["data"]["effect"];
+    assert_eq!(
+        effect["pruned"]["count"], 1,
+        "the planned candidate is deleted: {document}"
+    );
+    assert_eq!(effect["pruned"]["rows"][0]["root_id"], idle);
+    assert_eq!(effect["held"]["count"], 0);
+    // A four-kilobyte deletion may or may not move a real volume's free space, so
+    // the stop is whichever measured fact the pass found: the target reached, no
+    // reclaim, or nothing eligible left. What the exit code must agree with is the
+    // stop's own shape, never a claimed success over a reached bound or no reclaim.
+    let stop = effect["stop"].as_str().expect("the pass names its stop");
+    assert!(
+        matches!(
+            stop,
+            "target_reached" | "space_not_reclaimed" | "nothing_eligible"
+        ),
+        "the pass stops on a measured fact: {document}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(
+            if matches!(stop, "space_not_reclaimed" | "budget_exhausted") {
+                3
+            } else {
+                0
+            }
+        ),
+        "the exit code agrees with the stop: {document}"
+    );
+    assert_eq!(
+        effect["reclaimed_bytes"]
+            .as_u64()
+            .expect("a measured reclaim"),
+        effect["after"]["free_bytes"]
+            .as_u64()
+            .expect("the last measurement")
+            .saturating_sub(
+                effect["before"]["free_bytes"]
+                    .as_u64()
+                    .expect("the first measurement")
+            ),
+        "reclaim is the measured difference, not a sum of recorded sizes"
+    );
+    assert!(!root_path.exists(), "the root is gone");
+    // The document reads back through its own reader.
+    let saved = serde_json::to_vec(&document).expect("the document encodes");
+    let read = barge::space::read_prune_report(&saved).expect("the pass's document reads");
+    assert!(!read.preview);
+    assert_eq!(
+        read.effect.expect("the effect").pruned.rows[0].root_id,
+        idle
+    );
+
+    // The same plan again: its candidate is no longer there, which is that
+    // candidate's refusal, and nothing is deleted.
+    let output = run_in(
+        &[
+            "space",
+            "prune",
+            "--volume",
+            &volume,
+            "--plan",
+            plan_out.to_str().expect("the plan path is UTF-8"),
+            "--plan-sha256",
+            &digest,
+            "--json",
+        ],
+        &state_dir,
+    );
+    let document = stdout_document(&output);
+    let effect = &document["data"]["effect"];
+    assert_eq!(effect["pruned"]["count"], 0);
+    assert_eq!(effect["stop"], "nothing_eligible");
+    assert_eq!(effect["held"]["rows"][0]["reason"], "identity_changed");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// One verified volume's total bytes, which the fixture's policy uses to put free
+/// space below its reserve.
+fn volume_total_bytes(mount: &Path, volume: &str) -> u64 {
+    use barge::os::{self, ExpectedVolume, SpaceFacts, VolumeUuid};
+    let platform = os::platform();
+    let uuid = VolumeUuid::parse(volume).expect("the registered volume uuid");
+    let expected = ExpectedVolume {
+        volume_uuid: &uuid,
+        mount_hint: Some(mount),
+    };
+    let verified = os::verify_volume(&platform, &platform, mount, &expected)
+        .expect("the fixture volume verifies");
+    platform
+        .measure_space(&verified)
+        .expect("the fixture volume measures")
+        .total_bytes
+}
+
+/// The space-prune line's argument shapes: a preview needs `--plan`, a real run
+/// needs the plan file *and* its digest, and a bad volume or an unknown verb is a
+/// usage refusal that plans nothing.
+#[test]
+fn space_prune_refuses_a_missing_plan_a_missing_digest_and_a_bad_volume() {
     let (_fixture, state_dir) = absent_state_dir("space-prune-refusals");
     let volume = "A6AC3ED7-33EA-46B4-8082-7254CF291ED2";
 
+    // No `--plan` at all.
     let output = run_in(
         &["space", "prune", "--volume", volume, "--json"],
         &state_dir,
@@ -2499,7 +2758,7 @@ fn space_prune_refuses_the_effect_form_and_a_missing_plan() {
         .expect("the refusal states its reason")
         .contains("--plan"));
 
-    let digest = "a".repeat(64);
+    // A plan file without a digest.
     let output = run_in(
         &[
             "space",
@@ -2507,43 +2766,13 @@ fn space_prune_refuses_the_effect_form_and_a_missing_plan() {
             "--volume",
             volume,
             "--plan",
-            "--plan-sha256",
-            &digest,
+            "/nonexistent/plan.json",
             "--json",
         ],
         &state_dir,
     );
-    assert_eq!(output.status.code(), Some(2), "the effect form is not ours");
+    assert_eq!(output.status.code(), Some(2), "a real run needs a digest");
     let document = stdout_document(&output);
-    assert_eq!(document["schema"], "barge.error/1");
-    assert_eq!(document["error"]["kind"], "usage");
-    assert!(document["error"]["message"]
-        .as_str()
-        .expect("the refusal states its reason")
-        .contains("T5"));
-
-    // The same effect-shaped option *before* the verb is refused too: the whole
-    // line is parsed once, so it can never be silently discarded.
-    let output = run_in(
-        &[
-            "space",
-            "--plan-sha256",
-            &digest,
-            "prune",
-            "--volume",
-            volume,
-            "--plan",
-            "--json",
-        ],
-        &state_dir,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "an effect option before the verb is still refused"
-    );
-    let document = stdout_document(&output);
-    assert_eq!(document["schema"], "barge.error/1");
     assert_eq!(document["error"]["kind"], "usage");
     assert_eq!(
         document["command"], "space.prune",
@@ -2552,7 +2781,66 @@ fn space_prune_refuses_the_effect_form_and_a_missing_plan() {
     assert!(document["error"]["message"]
         .as_str()
         .expect("the refusal states its reason")
-        .contains("T5"));
+        .contains("--plan-sha256"));
+
+    // A digest without a plan file, wherever the option sits on the line.
+    let digest = "a".repeat(64);
+    for args in [
+        vec![
+            "space",
+            "prune",
+            "--volume",
+            volume,
+            "--plan-sha256",
+            &digest,
+            "--json",
+        ],
+        vec![
+            "space",
+            "--plan-sha256",
+            &digest,
+            "prune",
+            "--volume",
+            volume,
+            "--json",
+        ],
+    ] {
+        let output = run_in(&args, &state_dir);
+        assert_eq!(output.status.code(), Some(2));
+        let document = stdout_document(&output);
+        assert_eq!(document["error"]["kind"], "usage");
+        assert_eq!(document["command"], "space.prune");
+        assert!(document["error"]["message"]
+            .as_str()
+            .expect("the refusal states its reason")
+            .contains("--plan <file>"));
+    }
+
+    // A bare `--plan` with a digest names no file for the real run.
+    let output = run_in(
+        &[
+            "space",
+            "prune",
+            "--volume",
+            volume,
+            "--plan",
+            "--plan-sha256",
+            &digest,
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let document = stdout_document(&output);
+    assert_eq!(document["error"]["kind"], "usage");
+    assert!(document["error"]["message"]
+        .as_str()
+        .expect("the refusal states its reason")
+        .contains("--plan <file>"));
+    assert!(document["error"]["message"]
+        .as_str()
+        .expect("the refusal states its reason")
+        .contains("nothing was changed"));
 
     // An unknown option before the verb is named, not discarded in favour of a
     // value error it came with.
@@ -2607,6 +2895,11 @@ fn space_prune_refuses_the_effect_form_and_a_missing_plan() {
         .expect("the refusal states its reason")
         .contains("--volume"));
 
+    let output = run_in(&["space", "elsewhere", "--json"], &state_dir);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+    assert!(!state_dir.exists(), "a refusal creates no state");
+    // A bad volume is the uuid's own refusal.
     let output = run_in(
         &[
             "space",
@@ -2620,9 +2913,4 @@ fn space_prune_refuses_the_effect_form_and_a_missing_plan() {
     );
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
-
-    let output = run_in(&["space", "elsewhere", "--json"], &state_dir);
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
-    assert!(!state_dir.exists(), "a refusal creates no state");
 }

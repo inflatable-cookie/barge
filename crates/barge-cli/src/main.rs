@@ -51,6 +51,8 @@ const USAGE: &str = "usage: barge <describe|inspect|space|volume|maintain|prune|
        barge volume update <uuid> [--reserve <bytes>] [--floor <bytes>] --declared-by <name> --plan
        barge volume <register|update> --plan-file <file> --plan-sha256 <digest>
        barge volume describe <uuid>
+       barge space prune --volume <uuid> --plan [--plan-out <file>]
+       barge space prune --volume <uuid> --plan <file> --plan-sha256 <hex>
        barge maintain [--plan-out <file>]
        barge maintain --plan <file> --plan-sha256 <hex>
        barge prune --plan --area <namespace>/<area> --volume <uuid> [--plan-out <file>]
@@ -343,6 +345,21 @@ fn parse(args: &[String]) -> Result<Parsed, Error> {
 /// they are a flag elsewhere: `maintain`'s `--plan` names the preview bytes,
 /// while `scratch expire` and `cache adopt` take it as a bare flag.
 fn parse_taking(args: &[String], value_options: &[&str]) -> Result<Parsed, Error> {
+    parse_taking_soft(args, value_options, &[])
+}
+
+/// [`parse_taking`] with options that take a value only when one is there.
+///
+/// `space prune`'s `--plan` is the design's own spelling for both forms: bare it
+/// asks for a preview, and with a file and `--plan-sha256` it is the operator's
+/// real run. An option named here is a bare flag when it is last or followed by
+/// another option, and otherwise takes the next argument as its value, so neither
+/// form is ambiguous and neither can swallow an option.
+fn parse_taking_soft(
+    args: &[String],
+    value_options: &[&str],
+    soft_value_options: &[&str],
+) -> Result<Parsed, Error> {
     let mut words = Vec::new();
     let mut options: Options = BTreeMap::new();
     let mut rest_positional = false;
@@ -362,6 +379,20 @@ fn parse_taking(args: &[String], value_options: &[&str]) -> Result<Parsed, Error
             let key = argument.trim_start_matches("--").to_owned();
             if key.is_empty() {
                 return Err(usage("an empty option name"));
+            }
+            if soft_value_options.contains(&key.as_str()) {
+                let soft_value = args.get(index + 1).filter(|value| !value.starts_with("--"));
+                match soft_value {
+                    Some(value) => {
+                        options.entry(key).or_default().push(value.clone());
+                        index += 2;
+                    }
+                    None => {
+                        options.entry(key).or_default().push("true".to_owned());
+                        index += 1;
+                    }
+                }
+                continue;
             }
             // A flag carries no value; every other option takes exactly one.
             if FLAGS.contains(&key.as_str()) && !value_options.contains(&key.as_str()) {
@@ -1075,16 +1106,17 @@ fn maintain_summary(report: &MaintainReport) -> String {
 
 /// Run one `space` verb.
 ///
-/// Without a verb it is the read-only report. `prune` is the effect-free
-/// candidate plan (stage 3, slice T4); the effect form belongs to T5 and is
-/// refused here rather than implied. The line is parsed once so an option before
+/// Without a verb it is the read-only report. `prune` previews the candidate plan
+/// (stage 3, slice T4), and with the preview's exact bytes and digest it is the
+/// operator's real pass (slice T5). The line is parsed once so an option before
 /// the verb is validated by it, never discarded by the dispatch.
 fn space(args: &[String]) -> Result<Report, Error> {
     // The whole command line is parsed once, before the verb is chosen, so an
     // option that appears before `prune` is validated by the verb rather than
-    // discarded: `barge space --plan-sha256 <hex> prune ...` is the same
-    // effect-form refusal, and an unknown option is named rather than ignored.
-    let Parsed { words, options } = parse_taking(args, &["volume", "plan-out", "plan-sha256"])?;
+    // discarded: `barge space --plan-sha256 <hex> prune ...` reaches the same
+    // real-run checks, and an unknown option is named rather than ignored.
+    let Parsed { words, options } =
+        parse_taking_soft(args, &["volume", "plan-out", "plan-sha256"], &["plan"])?;
     match words.first().map(String::as_str) {
         None => {
             refuse_unknown(options)?;
@@ -1102,62 +1134,121 @@ fn space(args: &[String]) -> Result<Report, Error> {
     }
 }
 
-/// Plan one volume's space candidates: `barge space prune --volume <uuid> --plan`.
+/// Preview or run one volume's space prune: `barge space prune --volume <uuid>
+/// --plan [--plan-out <file>]`, or `--plan <file> --plan-sha256 <hex>`.
 ///
-/// The plan is effect-free and prints one bounded canonical
-/// `barge.space.prune.plan/1` inside `barge.space.prune/1` with its SHA-256.
-/// `--plan-out` writes the exact plan bytes a later slice's real run will
-/// present. There is no effect in this build: the real run, its custody and its
-/// replay are slice T5, so every effect-shaped argument is refused rather than
-/// ignored.
+/// The preview is effect-free and prints one bounded canonical
+/// `barge.space.prune.plan/1` inside `barge.space.prune/1` with its SHA-256;
+/// `--plan-out` writes the exact bytes the real run presents. The real run is
+/// authorised by those bytes and their digest, and deletes the plan's candidates
+/// one at a time under the stage 1 custody, intent and quarantine protocol,
+/// flushing and re-measuring once per batch. An unknown option is named before any
+/// value it came with is interpreted, wherever it sits on the line.
 fn space_prune(mut options: Options) -> Result<Report, Error> {
-    let plan = flag(&mut options, "plan")?;
+    let plan = one_option(&mut options, "plan")?;
     let plan_out = one_option(&mut options, "plan-out")?.map(PathBuf::from);
+    let digest = one_option(&mut options, "plan-sha256")?;
     let volume = one_option(&mut options, "volume")?;
-    // The effect-shaped argument is refused wherever it sits on the line, and an
-    // unknown option is named before any value it could have come with is
-    // interpreted.
-    if let Some(_digest) = one_option(&mut options, "plan-sha256")? {
-        return Err(usage(
-            "barge space prune previews only in this build: a real run, its plan bytes and its digest are stage 3 T5, so nothing was planned",
-        ));
-    }
     refuse_unknown(options)?;
     let Some(volume) = volume else {
         return Err(usage("--volume is required"));
     };
-    if !plan {
-        return Err(usage(
-            "barge space prune previews only with --plan; the effect form belongs to a later slice and was not run",
-        ));
-    }
     let volume_uuid = volume_arg(&volume)?;
+    // `--plan` is the design's spelling for both forms: bare it asks for the
+    // preview, and with a file it is a real run, which needs the digest too.
+    let bare_plan = plan.as_deref() == Some("true");
+    match (&plan, &digest) {
+        (Some(_), None) if bare_plan => {}
+        (Some(_), None) => {
+            return Err(usage(
+                "a real run needs the preview's exact plan bytes and --plan-sha256; nothing was changed",
+            ))
+        }
+        (Some(_), Some(_)) if bare_plan => {
+            return Err(usage(
+                "--plan-sha256 needs --plan <file> naming the preview's exact bytes; nothing was changed",
+            ))
+        }
+        (Some(_), Some(_)) => {}
+        (None, Some(_)) => {
+            return Err(usage(
+                "a real run needs the preview's exact plan bytes (--plan <file>) as well as --plan-sha256; nothing was changed",
+            ))
+        }
+        (None, None) => {
+            return Err(usage(
+                "barge space prune needs --plan to preview, or --plan <file> --plan-sha256 <hex> for the real run",
+            ))
+        }
+    }
     let state = state_paths()?;
     let platform = os::platform();
-    let report = barge::space::plan(
+    if bare_plan {
+        // A preview with no output file is still a preview: it prints the plan and
+        // its digest, and writes nothing.
+        let report = barge::space::plan(
+            &state,
+            &platform,
+            &platform,
+            &platform,
+            &platform,
+            &platform,
+            &barge::space::SpacePruneRequest {
+                volume_uuid: &volume_uuid,
+                now_ms: state::now_ms(),
+                wall: barge::space::SPACE_PLAN_WALL,
+                lock_wait: state::LOCK_WAIT,
+            },
+        )?;
+        if let Some(path) = &plan_out {
+            let bytes = barge::space::canonical_plan_bytes(&report.plan)?;
+            write_plan_file(path, &bytes)?;
+        }
+        let human = space_prune_summary(&report);
+        return Report::verb(
+            barge::space::SPACE_PRUNE_SCHEMA,
+            "space.prune",
+            &report,
+            human,
+        );
+    }
+    if plan_out.is_some() {
+        return Err(usage(
+            "--plan-out writes a preview's plan and has no meaning on a real run; nothing was changed",
+        ));
+    }
+    let (Some(path), Some(digest)) = (plan, digest) else {
+        return Err(usage(
+            "a real run needs --plan <file> and --plan-sha256 <hex>; nothing was changed",
+        ));
+    };
+    let bytes = read_plan_file(Path::new(&path))?;
+    let report = barge::space::prune(
         &state,
         &platform,
         &platform,
         &platform,
         &platform,
         &platform,
-        &barge::space::SpacePruneRequest {
+        &platform,
+        &barge::space::SpacePruneRunRequest {
             volume_uuid: &volume_uuid,
+            plan_digest: &digest,
+            plan_bytes: &bytes,
             now_ms: state::now_ms(),
-            wall: barge::space::SPACE_PLAN_WALL,
             lock_wait: state::LOCK_WAIT,
+            delete_bounds: barge::delete::DeleteBounds::default(),
+            bounds: barge::space::SpacePruneBounds::design(),
         },
     )?;
-    if let Some(path) = &plan_out {
-        let bytes = barge::space::canonical_plan_bytes(&report.plan)?;
-        write_plan_file(path, &bytes)?;
-    }
-    let human = space_prune_summary(&report);
-    Report::verb(
+    let human = space_prune_run_summary(&report);
+    let exit = if report.needs_human() { 3 } else { 0 };
+    Report::outcome(
         barge::space::SPACE_PRUNE_SCHEMA,
         "space.prune",
         &report,
         human,
+        exit,
     )
 }
 
@@ -1174,6 +1265,35 @@ fn space_prune_summary(report: &barge::space::SpacePruneReport) -> String {
         report.policy.reserve_bytes,
         report.state
     )
+}
+
+/// The human summary of a real `barge.space.prune/1` pass.
+fn space_prune_run_summary(report: &barge::space::SpacePruneReport) -> String {
+    let Some(effect) = &report.effect else {
+        return space_prune_summary(report);
+    };
+    let mut text = format!(
+        "pruned {} root(s) under plan {} for {}: {} kept, {} unreached, {} reclaimed ({} free of {} target), stop {} after {} batch(es)\n",
+        effect.pruned.count,
+        report.plan_sha256,
+        report.volume_uuid,
+        effect.held.count,
+        effect.not_reached.count,
+        effect.reclaimed_bytes,
+        effect.after.free_bytes,
+        effect.target_bytes,
+        effect.stop,
+        effect.batches
+    );
+    if let Some(replay) = &effect.replay {
+        if replay.examined > 0 {
+            text.push_str(&format!(
+                "replayed {} earlier intent(s): {} settled, {} rolled back, {} resumed\n",
+                replay.examined, replay.settled, replay.rolled_back, replay.resumed
+            ));
+        }
+    }
+    text
 }
 
 /// Run one `prune` verb (the release plan).
