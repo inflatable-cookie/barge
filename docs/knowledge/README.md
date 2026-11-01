@@ -36,8 +36,9 @@ Contracts own durable interfaces and formats:
   order. It is a plan, not a receipt.
 - [S7 native proof](contracts/s7-maintain-proof.md) records S7's elevated native
   proof plan: `barge maintain` preview and real on one owned image, the pinned
-  supervisor, the nine premises, the six cases, the receipt shape and the
-  activation order. It is a plan, not a receipt.
+  supervisor, the nine premises, the seven cases (the release-class policy's
+  included), the receipt shape and the activation order. It is a plan, not a
+  receipt.
 
 Rust quality policy owns the strict profile for the Rust workspace:
 [activation](contracts/language-quality-activation.json) records the

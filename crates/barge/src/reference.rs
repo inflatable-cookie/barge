@@ -392,6 +392,12 @@ fn hold_reference(reading: &HoldReading) -> ReferenceSet {
 }
 
 /// Whether one declaration's prune policy can release a root at all.
+///
+/// Only an age policy can, because the age is what this reader's rows decide.
+/// `release_on_reference` permits a release too, but by reference, and the
+/// effect that reads that permission is not part of this build: a reference row
+/// that called it permission here would report a release nothing may perform.
+/// The slice that adds the release-by-reference effect changes this reading.
 pub const fn policy_permits_release(policy: &PrunePolicy) -> bool {
     matches!(policy, PrunePolicy::OldestIdleAfter { .. })
 }

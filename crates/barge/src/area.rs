@@ -118,6 +118,10 @@ pub enum AbsentPolicy {
 }
 
 /// How an area's roots may be pruned.
+///
+/// This is an additive `barge.area/1` field value: `release_on_reference` is
+/// one a reader that knows only `none` and `oldest_idle_after` refuses as
+/// unknown, rather than approximating it with a policy it never declared.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PrunePolicy {
@@ -128,13 +132,20 @@ pub enum PrunePolicy {
         /// The declared age, in seconds.
         age_seconds: u64,
     },
+    /// A root is released only by the release gate, when nothing references it.
+    ///
+    /// This is not an age policy: `maintain` never plans one of its roots and
+    /// the space path never takes one for the reserve, whatever the area's
+    /// `reserve` says. Only the release gate may release it, and only when that
+    /// gate reads this policy as permission by release.
+    ReleaseOnReference,
 }
 
 impl PrunePolicy {
     /// The declared age, when the policy has one.
     pub const fn age(&self) -> Option<Duration> {
         match self {
-            Self::None => None,
+            Self::None | Self::ReleaseOnReference => None,
             Self::OldestIdleAfter { age_seconds } => Some(Duration::from_secs(*age_seconds)),
         }
     }
@@ -148,6 +159,16 @@ pub enum ReserveParticipation {
     Counts,
     /// The area's bytes are excluded.
     Excluded,
+}
+
+impl ReserveParticipation {
+    /// The participation's name, as a report spells it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Counts => "counts",
+            Self::Excluded => "excluded",
+        }
+    }
 }
 
 /// The declaration a consumer gives Barge, and the shape it is stored in.
@@ -6697,6 +6718,49 @@ mod tests {
     }
 
     #[test]
+    fn a_release_on_reference_declaration_round_trips_and_an_older_reader_refuses_it() {
+        let fixture = Fixture::new("area-release-on-reference");
+        let mut declaration = fixture.declaration("example/outputs");
+        declaration.area = "outputs".to_owned();
+        declaration.prune = super::PrunePolicy::ReleaseOnReference;
+        declaration.reserve = super::ReserveParticipation::Excluded;
+        let written = declare(&fixture.state, &declaration, 1_000).expect("the declaration writes");
+        assert_eq!(
+            written.declaration().prune,
+            super::PrunePolicy::ReleaseOnReference
+        );
+
+        // The stored record carries the exact value an older reader must refuse,
+        // rather than one it could read as a policy the area never declared.
+        let path = super::declaration_path(&fixture.state, "example", "outputs").expect("the path");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("the record reads"))
+                .expect("the record parses");
+        assert_eq!(
+            stored["prune"],
+            serde_json::json!({"kind": "release_on_reference"})
+        );
+        let read_back = show(&fixture.state, "example", "outputs")
+            .expect("the declarations read")
+            .expect("the declaration is there");
+        assert_eq!(read_back, written, "the record round-trips");
+        assert_eq!(read_back.schema, "barge.area/1", "it stays inside major 1");
+
+        /// The prune policy as it stood before `release_on_reference`.
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        #[allow(dead_code)]
+        enum OlderPrunePolicy {
+            None,
+            OldestIdleAfter { age_seconds: u64 },
+        }
+        assert!(
+            serde_json::from_value::<OlderPrunePolicy>(stored["prune"].clone()).is_err(),
+            "an older reader refuses the value as unknown instead of approximating it"
+        );
+    }
+
+    #[test]
     fn two_declarations_over_one_folder_are_refused() {
         let fixture = Fixture::new("area-collision");
         fixture.register(&fixture.record);
@@ -7026,6 +7090,69 @@ mod tests {
         assert_eq!(
             volume.resolved.declaration.reserve,
             super::ReserveParticipation::Counts
+        );
+    }
+
+    #[test]
+    fn a_stored_release_on_reference_policy_cannot_be_traded_for_an_age_by_a_caller() {
+        let fixture = Fixture::new("area-release-on-reference-authority");
+        fixture.register(&fixture.record);
+        // The state directory holds the release-class policy the area declared.
+        let mut declared = fixture.declaration("example/outputs");
+        declared.area = "outputs".to_owned();
+        declared.prune = super::PrunePolicy::ReleaseOnReference;
+        declared.reserve = super::ReserveParticipation::Excluded;
+        let stored = declare(&fixture.state, &declared, 1_000).expect("the declaration writes");
+        assert_eq!(
+            stored.declaration().prune,
+            super::PrunePolicy::ReleaseOnReference
+        );
+        let platform = fixture.platform();
+        let facts = fixture.facts();
+        let mounts = fixture.mounts();
+        let observer = fixture.observer();
+
+        // A caller that presents an age policy — the one that would let
+        // `maintain` and the reserve consider the area — is refused on the
+        // pre-flight every deletion takes, so a caller object can never widen
+        // what the stored release-class policy allows.
+        let mut caller = stored.declaration();
+        caller.prune = super::PrunePolicy::OldestIdleAfter { age_seconds: 60 };
+        let before = snapshot(fixture.dir.path());
+        let error = super::prepare(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.uuid,
+            &caller,
+        )
+        .expect_err("the stored release-class policy governs");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert_eq!(error.detail()["fields"], serde_json::json!(["prune"]));
+        assert!(
+            error.message().contains("the stored declaration governs"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(snapshot(fixture.dir.path()), before);
+
+        // The stored declaration itself resolves with the stored policy, so the
+        // reading that decides deletion is the state directory's own record.
+        let volume = super::prepare(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.uuid,
+            &stored.declaration(),
+        )
+        .expect("the stored declaration resolves");
+        assert_eq!(
+            volume.resolved.declaration.prune,
+            super::PrunePolicy::ReleaseOnReference
         );
     }
 

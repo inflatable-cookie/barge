@@ -125,7 +125,10 @@ pub struct VolumePlan {
 }
 
 impl VolumePlan {
-    /// Whether any work was planned for this volume.
+    /// Whether anything was planned for this volume: a unit to act on, or a
+    /// step the run must report. An excluded step is not a unit, but it is a
+    /// reported stage, so a volume that has only one is not skipped as though it
+    /// had no plan.
     pub fn has_work(&self) -> bool {
         self.scratch.is_some() || !self.areas.rows.is_empty()
     }
@@ -153,6 +156,15 @@ pub struct AreaPrunePlan {
     pub folder: String,
     /// The declared policy the step applied.
     pub policy: PrunePolicy,
+    /// Why this area is excluded from maintenance, when its own policy excludes
+    /// it: a `release_on_reference` area is never a candidate source, so it is
+    /// reported here with the reason instead of being silently left out.
+    ///
+    /// It is `None` for every age step, whose `kept` rows carry their own
+    /// reasons, and absent from the bytes of a plan that has no such area, so
+    /// the digest of a plan this field does not describe is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded_reason: Option<String>,
     /// The owned roots whose idleness is past the declared age.
     pub candidates: RowSet<PruneRootRow>,
     /// The roots this step keeps, with the reason.
@@ -987,13 +999,35 @@ impl Builder<'_> {
     }
 
     /// One declared area's prune step on one volume, or `None` when the area
-    /// declares no prune policy (it is then not a maintain step at all).
+    /// declares `prune: none` (it is then not a maintain step at all).
     fn area_plan(
         &self,
         record: &VolumeRecord,
         document: &AreaDocument,
     ) -> Result<Option<AreaPrunePlan>> {
         let declaration = document.declaration();
+        // A release-class policy is never a maintain step's candidate source:
+        // its roots are released only by the release gate, by reference. The
+        // step is reported as excluded, with its reason, so its absence from the
+        // candidates is a stated fact rather than a silent omission. Nothing is
+        // enumerated for it: not enumerating is what makes "never considered"
+        // true of this run as well as of its plan.
+        if declaration.prune == PrunePolicy::ReleaseOnReference {
+            return Ok(Some(AreaPrunePlan {
+                namespace: document.namespace.clone(),
+                area: document.area.clone(),
+                folder: area::effective_folder(record, &declaration)?,
+                policy: declaration.prune.clone(),
+                excluded_reason: Some(
+                    "the area's prune policy is `release_on_reference`, so only the release gate may release its roots; maintain never plans one"
+                        .to_owned(),
+                ),
+                candidates: RowSet::empty(),
+                kept: RowSet::empty(),
+                examined: 0,
+                truncated: false,
+            }));
+        }
         let Some(age_seconds) = prune_age_seconds(&declaration.prune) else {
             return Ok(None);
         };
@@ -1088,6 +1122,7 @@ impl Builder<'_> {
             area: document.area.clone(),
             folder: resolved.folder.clone(),
             policy: declaration.prune.clone(),
+            excluded_reason: None,
             candidates: RowSet::bounded(candidates, candidate_total, ROOT_ROWS),
             kept: RowSet::bounded(kept, kept_total, ROOT_ROWS),
             examined: listing.examined,
@@ -1097,9 +1132,13 @@ impl Builder<'_> {
 }
 
 /// The declared prune age, when the policy has one.
+///
+/// A release-class policy has no age: nothing about idleness releases its roots,
+/// so a real run that somehow presented one of its roots as a candidate refuses
+/// that unit (`prune_age_seconds` is the effect's own guard as well).
 fn prune_age_seconds(policy: &PrunePolicy) -> Option<u64> {
     match policy {
-        PrunePolicy::None => None,
+        PrunePolicy::None | PrunePolicy::ReleaseOnReference => None,
         PrunePolicy::OldestIdleAfter { age_seconds } => Some(*age_seconds),
     }
 }
@@ -2177,9 +2216,11 @@ mod tests {
         }
 
         fn create_root(&self, kind: RootKind) -> OwnedRoot {
-            let resolved = self
-                .fixture
-                .resolved(&self.fixture.record, &self.declaration());
+            self.create_root_in(&self.declaration(), kind)
+        }
+
+        fn create_root_in(&self, declaration: &area::AreaDeclaration, kind: RootKind) -> OwnedRoot {
+            let resolved = self.fixture.resolved(&self.fixture.record, declaration);
             area::create_root(
                 &self.fixture.state,
                 &self.fixture.platform(),
@@ -4336,6 +4377,79 @@ mod tests {
         let report = harness.preview();
         assert!(report.plan.volumes.rows[0].areas.rows.is_empty());
         assert!(root.path.is_dir());
+    }
+
+    #[test]
+    fn a_release_on_reference_area_is_never_a_maintain_candidate() {
+        let harness = Harness::new("maintain-release-on-reference");
+        // The age area stays exactly as it was: its root is still planned.
+        let aged = harness.create_root(RootKind::AreaRoot);
+
+        // The release-class area holds an idle, owned root of its own. It is
+        // declared with `reserve: counts` on purpose: the policy alone is what
+        // keeps it out of maintenance, not the reservation.
+        let mut release = harness.declaration();
+        release.area = "outputs".to_owned();
+        release.folder = "example/outputs".to_owned();
+        release.prune = PrunePolicy::ReleaseOnReference;
+        release.reserve = crate::area::ReserveParticipation::Counts;
+        area::declare(&harness.fixture.state, &release, harness.now_ms)
+            .expect("the area is declared");
+        let unreleased = harness.create_root_in(&release, RootKind::AreaRoot);
+
+        let preview = harness.preview();
+        let areas = &preview.plan.volumes.rows[0].areas.rows;
+        assert_eq!(areas.len(), 2, "the age area and the release area");
+
+        let age_row = areas
+            .iter()
+            .find(|row| row.area == "pool")
+            .expect("the age area is planned");
+        assert_eq!(
+            age_row.policy,
+            PrunePolicy::OldestIdleAfter {
+                age_seconds: AREA_AGE_SECONDS
+            }
+        );
+        assert_eq!(age_row.excluded_reason, None, "an age step is not excluded");
+        assert_eq!(age_row.candidates.count, 1, "the age area is unchanged");
+
+        let release_row = areas
+            .iter()
+            .find(|row| row.area == "outputs")
+            .expect("the release area is reported, never omitted");
+        // The step's policy is the state directory's own record, which is what
+        // decides deletion: `maintain` takes no declaration from a caller.
+        let stored = area::show(&harness.fixture.state, "example", "outputs")
+            .expect("the declarations read")
+            .expect("the stored declaration is there");
+        assert_eq!(release_row.policy, stored.declaration().prune);
+        assert_eq!(release_row.policy, PrunePolicy::ReleaseOnReference);
+        assert_eq!(
+            release_row.candidates.count, 0,
+            "a release-class area never yields a candidate"
+        );
+        assert_eq!(release_row.kept.count, 0, "nothing was enumerated for it");
+        assert_eq!(release_row.examined, 0);
+        let reason = release_row
+            .excluded_reason
+            .as_deref()
+            .expect("the exclusion carries its reason");
+        assert!(reason.contains("release_on_reference"), "{reason}");
+        assert_eq!(preview.candidates, 1, "only the age area's unit is planned");
+
+        // A real run acts on exactly that unit: the release area's root survives.
+        let report = harness.real(&preview).expect("the run reports");
+        assert!(!aged.path.exists(), "the age area's root is deleted");
+        assert!(
+            unreleased.path.is_dir(),
+            "a release-class root is never deleted by maintain"
+        );
+        assert!(report.plan.volumes.rows[0]
+            .areas
+            .rows
+            .iter()
+            .any(|row| row.area == "outputs" && row.excluded_reason.is_some()));
     }
 
     #[test]

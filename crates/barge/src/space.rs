@@ -618,7 +618,9 @@ impl SpacePruneReport {
 /// The plan is effect-free. It reads the volume's declared policy, measures it,
 /// lists every declared area whose `reserve` is `counts` and Barge's own scratch
 /// folder, and orders the idle roots by the volume-wide least-recently-used key.
-/// An area whose `reserve` is `excluded`, and Barge's caches, never contribute a
+/// An area whose `reserve` is `excluded`, an area whose prune policy is
+/// `release_on_reference` (whose roots only the release gate may release,
+/// whatever its `reserve` records), and Barge's caches never contribute a
 /// candidate. A root is a candidate only when every input positively concluded
 /// its idleness and a complete bounded scan counted its bytes; anything else is
 /// kept with the reason, and one undecidable root or area never stops the rest.
@@ -1570,6 +1572,26 @@ impl Planner<'_> {
     fn area(&mut self, document: &AreaDocument) {
         let label = format!("{}/{}", document.namespace, document.area);
         let declaration = document.declaration();
+        // A release-class policy is never a reserve participant: its roots are
+        // released only by the release gate, by reference, so pressure never
+        // takes one, whatever `reserve` records. The area is reported as
+        // excluded with its reason and is not enumerated, so no count is stated
+        // for a listing that did not happen.
+        if declaration.prune == area::PrunePolicy::ReleaseOnReference {
+            self.participation.push(SpaceParticipationRow {
+                area: label,
+                reserve: declaration.reserve.name().to_owned(),
+                state: "excluded".to_owned(),
+                roots: None,
+                candidates: None,
+                kept: None,
+                reason: Some(
+                    "the area's prune policy is `release_on_reference`, so only the release gate may release its roots; the space path never enumerates or prunes them"
+                        .to_owned(),
+                ),
+            });
+            return;
+        }
         if declaration.reserve == ReserveParticipation::Excluded {
             self.participation.push(SpaceParticipationRow {
                 area: label,
@@ -2754,6 +2776,87 @@ mod tests {
         }))
         .expect("the document encodes");
         assert!(read_plan(&unknown_major).is_err());
+    }
+
+    #[test]
+    fn a_release_on_reference_area_is_never_a_space_participant_or_candidate() {
+        let fixture = VolumeFixture::new("space-release-on-reference");
+        let record = policy_record(&fixture, 16, 4);
+        let observer = fixture.observer();
+        let pool = declaration("pool", "example/pool", ReserveParticipation::Counts);
+        // Declared `counts` on purpose: the policy alone must keep the area out
+        // of the plan, not the reservation it happens to record.
+        let mut outputs = declaration("outputs", "example/outputs", ReserveParticipation::Counts);
+        outputs.prune = area::PrunePolicy::ReleaseOnReference;
+        for document in [&pool, &outputs] {
+            area::declare(&fixture.state, document, 1).expect("the area declares");
+        }
+
+        let (ageable, _) = fixture.create_root(&record, &pool, RootKind::AreaRoot);
+        release_at(&fixture, &observer, &ageable.root_id, 1_000, 500);
+        let (reference_only, _) = fixture.create_root(&record, &outputs, RootKind::AreaRoot);
+        release_at(&fixture, &observer, &reference_only.root_id, 100, 50);
+
+        let report = plan(
+            &fixture.state,
+            &fixture.platform(),
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &Injected(true),
+            &plan_request(&fixture.uuid, test_now()),
+        )
+        .expect("the plan is built");
+
+        assert_eq!(report.candidates, 1);
+        assert_eq!(report.plan.candidates.rows[0].root_id, ageable.root_id);
+        assert!(
+            report
+                .plan
+                .candidates
+                .rows
+                .iter()
+                .all(|row| row.root_id != reference_only.root_id),
+            "a release-class area's root never enters the list"
+        );
+        assert!(
+            report
+                .kept
+                .rows
+                .iter()
+                .all(|row| row.area != "example/outputs"),
+            "the area is not enumerated, so it has no kept rows"
+        );
+
+        let release_row = report
+            .participation
+            .rows
+            .iter()
+            .find(|row| row.area == "example/outputs")
+            .expect("the excluded area is reported");
+        assert_eq!(release_row.state, "excluded");
+        assert_eq!(
+            release_row.reserve, "counts",
+            "the row reports the declared reserve; the policy is what excludes it"
+        );
+        assert_eq!(release_row.roots, None, "an unlisted area reports no count");
+        assert_eq!(release_row.candidates, None);
+        assert_eq!(release_row.kept, None);
+        let reason = release_row
+            .reason
+            .as_deref()
+            .expect("the exclusion carries its reason");
+        assert!(reason.contains("release_on_reference"), "{reason}");
+
+        // The age area is unchanged: it still participates and still yields.
+        let pool_row = report
+            .participation
+            .rows
+            .iter()
+            .find(|row| row.area == "example/pool")
+            .expect("the pool area is reported");
+        assert_eq!(pool_row.state, "participating");
+        assert_eq!(pool_row.candidates, Some(1));
     }
 
     #[test]

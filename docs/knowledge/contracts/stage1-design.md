@@ -417,6 +417,7 @@ pub enum AbsentPolicy {
 pub enum PrunePolicy {
     None,
     OldestIdleAfter { age: Duration },
+    ReleaseOnReference, // no age: released only by the release gate, by reference
 }
 pub enum ReserveParticipation { Counts, Excluded }
 ```
@@ -486,6 +487,23 @@ generation 1; a later creation can only match it. The effective declaration
 recorded in a root's marker is always the governing record's, so a later reader
 sees which policies produced the root and no report implies that a differing
 caller policy was applied. [O-003 is closed](#closed-design-issues).
+
+`prune` is the policy the area declares, and each value is a different source of
+permission:
+
+| `prune` | Meaning |
+| --- | --- |
+| `none` | No root of the area is ever pruned. The area is not a `maintain` step at all. |
+| `oldest_idle_after { age_seconds }` | An owned root idle past the declared age may be pruned by `maintain`, and the release gate reads the policy as permission by age once its other conditions hold. |
+| `release_on_reference` | A root is released only by the release gate, and only by reference: `maintain` never plans one and the space path never takes one for the reserve, whatever the area's `reserve` says. |
+
+`release_on_reference` is an additive value inside `barge.area/1`: a reader that
+knows only the two earlier values refuses it as unknown rather than reading it as
+`none` or as an age it never declared. Barge's own release gate does not read it
+as permission yet, because no release_by_reference effect exists; until that
+slice lands, the policy releases nothing. Like every other policy, the governing
+value is the stored `barge.area/1` record, so a library caller cannot present a
+stronger or weaker policy than the one the state directory holds.
 
 ### Owned roots, markers and holds
 
@@ -2667,7 +2685,10 @@ Choices S7 made where this design left the mechanic to the slice:
   is still a timeout, and only the units after it are reported as unreached. A
   timeout is never success.
 - **Area prune mechanics.** A step exists only for a declaration whose policy is
-  `oldest-idle:<seconds>`; a candidate is an owned root (`barge.root/1`, any kind)
+  `oldest-idle:<seconds>`; a `release-on-reference` declaration is a step that is
+  reported as excluded, with its reason and no candidate, and a `none`
+  declaration is not a step at all. A candidate is an owned root (`barge.root/1`,
+  any kind)
   with no live or undecidable hold and last activity — its own directory mtime or
   its marker's creation time, whichever is newer — older than the declared age.
   An unmarked, unknown or foreign-marker entry is never a candidate: S5's
