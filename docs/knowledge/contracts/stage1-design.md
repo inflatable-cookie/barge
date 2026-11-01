@@ -471,12 +471,21 @@ collides with another declaration, with `scratch/` or `caches/`, or with a
 resolved path of another area is refused — two owners of one folder is not a
 state Barge will write.
 
-A library consumer may pass the declaration in memory instead. Authority is the
-same either way: the declaration Barge is given is applied, and the effective
-declaration is recorded in each root's marker and in the placement record so a
-later reader can see which policies produced it. Whether the on-disk document or
-the caller's object is authoritative when both exist is [open design
-issue O-003](#open-design-issues).
+A library consumer presents the same declaration in memory. The stored record is
+the authority once it exists (Tom's Q-G decision `12729764`, carried by the Oxide
+Supervisor's Barge design ruling, Queue decision
+`5e57544c-dfc8-4d2c-9c0b-a7a363c7b547`, implementing D2 of Oxide's F6 adoption
+contract): a caller that presents the same declaration proceeds, and one that
+presents a different `folder`, `overrides`, `absent`, `prune` or `reserve` is
+refused before any effect — nothing is created, pruned, deleted, registered or
+written — with the differing fields named. The library reads the state directory
+itself, so a caller cannot withhold, replace or override the record that governs
+its call. The first creation, when no record exists, publishes the caller's
+validated declaration under the same rules `barge area declare` uses and with
+generation 1; a later creation can only match it. The effective declaration
+recorded in a root's marker is always the governing record's, so a later reader
+sees which policies produced the root and no report implies that a differing
+caller policy was applied. [O-003 is closed](#closed-design-issues).
 
 ### Owned roots, markers and holds
 
@@ -1521,11 +1530,14 @@ Choices S3 made where this design left the mechanic to the slice:
 - **Marker shape.** The marker's top-level field set is exactly the one above.
   The nested `area` object carries the pinned `namespace` and `area` and one
   optional `effective`, which records the effective declaration applied at
-  creation (folder, absent policy, prune policy, reserve participation) exactly
-  as O-003 asks. A marker without `effective` (the pinned two-field form) is
-  valid and owns the root's identity only; a missing value never widens a
-  policy. The effective declaration is the caller's; a stored declaration that
-  differs is reported (`stored_differs: true`) and still never substituted.
+  creation (folder, absent policy, prune policy, reserve participation). A
+  marker without `effective` (the pinned two-field form) is valid and owns the
+  root's identity only; a missing value never widens a policy. The effective
+  declaration is the governing one: the stored `barge.area/1` record whenever one
+  exists, and the caller's declaration only on the first creation that stored it.
+  A caller that presents a different declaration is refused with the differing
+  fields named (O-003, closed by Q-G and D2 of Oxide's F6 adoption contract), so a
+  marker never records a caller policy the state directory did not hold.
 - **Root identity.** `create_root` returns the root directory's device and inode
   read through the created descriptor, the verified volume UUID, the root id and
   nonce, and the SHA-256 of the exact marker bytes. The digest is computed by one
@@ -2802,6 +2814,21 @@ independent reviewer run, each separately activated, each at an exact head. A
 missing native receipt is a missing proof, not a pass; this design task produces
 none and claims none.
 
+## Closed design issues
+
+- **O-003 — Area declarations: file or caller.** Closed 2026-11-01 in favour of
+  the stored record (Tom's Q-G decision `12729764`; Oxide Supervisor's Barge
+  design ruling, Queue decision
+  `5e57544c-dfc8-4d2c-9c0b-a7a363c7b547`; D2 of Oxide's F6 adoption contract).
+  A `barge.area/1` record is the authority once it exists: a library caller
+  presents the same declaration or is refused before any effect with the
+  differing fields named, and the first creation, when no record exists,
+  publishes the caller's validated declaration. A caller's in-memory object can
+  no longer override a stored `absent`, `prune`, `reserve`, `folder` or
+  `overrides` policy, and the effective declaration recorded in a root's marker
+  is the governing record's. See [the declaration section](#area-declaration-record-on-disk)
+  and [Q-013](../questions.md).
+
 ## Open design issues
 
 Named, with the proposed resolution and what the implementation brief must do.
@@ -2821,12 +2848,6 @@ the one reading the owner should confirm before implementation starts.
   mismatch. The implementation brief must decide what `barge` does when the
   account home is on an unavailable volume (proposed: refuse every mutating
   command; `describe` still reports).
-- **O-003 — Area declarations: file or caller.** A library consumer can pass a
-  declaration in memory while a CLI consumer stores one. Proposed: the caller's
-  declaration is authoritative for its call; the stored document is the CLI's
-  form; both write the effective declaration into the root marker so a later
-  reader sees what was applied. The implementation brief must confirm that a
-  stored declaration never silently widens a caller's policy.
 - **O-004 — Kept containment when `root_dir` is empty.** The rulings say kept
   data is outside the "group folders"; with `root_dir = ""` the mount root is
   the owning folder. Proposed reading: kept must be outside the resolved feature

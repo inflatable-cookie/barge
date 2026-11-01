@@ -729,7 +729,6 @@ fn area_root(
                 &platform,
                 &volume,
                 &declaration,
-                Some(&stored),
                 RootSpec { kind },
             )?;
             let human = format!("created root {} at {}\n", root.root_id, root.path.display());
@@ -783,7 +782,6 @@ fn area_root(
                 &platform,
                 &volume,
                 &declaration,
-                Some(&stored),
                 ROOT_ROWS,
             )?;
             let human = format!(

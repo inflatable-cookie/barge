@@ -135,8 +135,10 @@ pub fn scratch_folder(record: &VolumeRecord) -> String {
 /// Scratch is Barge's own folder, not a consumer area, so this declaration is
 /// built here rather than stored: its namespace and area are fixed, its folder
 /// is the one this call acts in (the scratch folder, or one project folder
-/// below it), and its policies are the design's constants. O-003 keeps the
-/// caller's declaration authoritative, so nothing stored can widen it.
+/// below it), and its policies are the design's constants. Because it is derived
+/// per project it is never a `barge.area/1` record, so the store neither governs
+/// nor records it: allocation goes through `create_root_on_volume_derived`
+/// (stage 4 F6 contract D2; Q-G).
 pub fn scratch_declaration(record: &VolumeRecord, folder: &str) -> AreaDeclaration {
     AreaDeclaration {
         namespace: SCRATCH_NAMESPACE.to_owned(),
@@ -228,7 +230,7 @@ pub fn alloc(
     area::folder_components("folders.scratch", &scratch)?;
     let folder = project_folder(&scratch, &request.project);
     let declaration = scratch_declaration(&record, &folder);
-    let (volume, root) = area::create_root_on_volume(
+    let (volume, root) = area::create_root_on_volume_derived(
         state_paths,
         dirs,
         facts,
@@ -236,7 +238,6 @@ pub fn alloc(
         observer,
         &request.volume_uuid,
         &declaration,
-        None,
         RootSpec {
             kind: RootKind::ScratchRun,
         },
@@ -2208,7 +2209,6 @@ pub fn expire_plan(
             mounts,
             observer,
             &declaration,
-            None,
             &unit,
             delete_bounds,
             Some(&authorization),
@@ -6811,7 +6811,6 @@ mod tests {
             &mounts,
             &observer,
             &declaration,
-            None,
             &unit,
             bounds,
             Some(&refuse),
@@ -6840,7 +6839,6 @@ mod tests {
             &mounts,
             &observer,
             &declaration,
-            None,
             &unit,
             bounds,
             Some(&current),

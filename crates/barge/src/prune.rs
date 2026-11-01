@@ -1558,6 +1558,32 @@ fn run(
                     });
                     continue;
                 }
+                // The deletion resolves the declaration a caller presents against
+                // the state directory's own record, so present that record as it now
+                // stands. A declaration edited after this step began is then judged
+                // by the per-unit re-verification below, which keeps the unit under
+                // the plan's own policy instead of the call being refused as stale.
+                // A folder that moved keeps the unit exactly as the step-start check
+                // decides, and an absent or unreadable record presents the step's
+                // declaration and leaves the decision to the deletion's own read.
+                let presented = match area::show(state_paths, &area_plan.namespace, &area_plan.area)
+                {
+                    Ok(Some(document)) => {
+                        let current = document.declaration();
+                        match area::effective_folder(record, &current) {
+                            Ok(folder) if folder == area_plan.folder => current,
+                            _ => {
+                                skipped.push(AreaSkippedRow {
+                                    name: candidate.name.clone(),
+                                    reason: "the area's folder changed since the plan; the planned units are kept"
+                                        .to_owned(),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    Ok(None) | Err(_) => declaration.clone(),
+                };
                 let authorize = |fresh: &VolumeRecord| {
                     reverify_area_root(
                         state_paths,
@@ -1579,8 +1605,7 @@ fn run(
                     facts,
                     mounts,
                     observer,
-                    &declaration,
-                    Some(document),
+                    &presented,
                     &unit,
                     bounds,
                     Some(&authorize),

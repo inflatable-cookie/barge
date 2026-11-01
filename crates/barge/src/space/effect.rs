@@ -1206,7 +1206,6 @@ impl Pass<'_> {
         let facts = self.facts;
         let mounts = self.mounts;
         let observer = self.observer;
-        let stored = target.document.as_ref();
         let authorize = |fresh: &VolumeRecord| {
             reverify_candidate(
                 paths, dirs, facts, mounts, observer, fresh, generation, &target, candidate, &unit,
@@ -1221,7 +1220,6 @@ impl Pass<'_> {
             self.mounts,
             self.observer,
             &target.declaration,
-            stored,
             &unit,
             bounds,
             match self.volume_lock.as_ref() {
