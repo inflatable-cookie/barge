@@ -8,6 +8,10 @@ class FixtureFault(Exception):
     """A fixture operation failed its explicit precondition or oracle."""
 
 
+class CaseInfrastructure(Exception):
+    """A bounded case cannot establish its fixture on this host."""
+
+
 class Fixture:
     def __init__(self, binary, images, root, env, pool):
         self.binary = binary
@@ -91,10 +95,12 @@ class Fixture:
         free = self.free()
         if target <= 0 or target >= free:
             raise FixtureFault(f"target {target} is not below measured free {free}")
-        # Keep a margin for APFS metadata and require a fresh Barge measurement
-        # afterward. Random contents prevent transparent compression of zeroes.
-        amount = free - target
-        if amount > 128 * 1024 * 1024:
+        return self.fill_bytes(path, free - target)
+
+    def fill_bytes(self, path, amount):
+        """Write exactly the bounded requested bytes and remeasure with Barge."""
+        # Random contents prevent transparent compression of zeroes.
+        if amount <= 0 or amount > 128 * 1024 * 1024:
             raise FixtureFault("measured fill exceeds the entire fixture image")
         with open(path, "xb", buffering=0) as handle:
             while amount:

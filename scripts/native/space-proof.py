@@ -16,7 +16,7 @@ import uuid
 sys.dont_write_bytecode = True
 from space_cases import Cases, case_2_sizing_self_check, case_4b_sizing_self_check
 from space_custody import self_check as custody_self_check
-from space_fixture import CensusUnavailable, Fixture
+from space_fixture import CaseInfrastructure, CensusUnavailable, Fixture
 from space_images import Images, self_check as images_self_check
 from space_oracles import self_check as oracles_self_check
 
@@ -93,7 +93,11 @@ def run_cases(diagnostic, execute, ready, check_pool, observation=lambda name: N
     results = []
     passed = set()
     fault = None
+    infrastructure_fault = False
     for name in CASES:
+        if infrastructure_fault:
+            results.append({"case": name, "status": "skipped", "kind": "infrastructure"})
+            continue
         missing = [need for need in CASE_NEEDS[name] if need not in passed]
         if fault and not diagnostic:
             results.append({"case": name, "status": "skipped", "kind": "latched"})
@@ -116,9 +120,10 @@ def run_cases(diagnostic, execute, ready, check_pool, observation=lambda name: N
                             "ms": int((time.monotonic() - started) * 1000)})
         except Exception as error:
             fault = fault or name
+            infrastructure_fault = isinstance(error, CaseInfrastructure)
             actual = observation(name)
             details = {"error": str(error)[:500], "actual": actual}
-            results.append({"case": name, "status": "failed", "kind": type(error).__name__,
+            results.append({"case": name, "status": "failed", "kind": "infrastructure" if infrastructure_fault else type(error).__name__,
                             "detail": json.dumps(details, ensure_ascii=True)[:24000],
                             "trace": traceback.format_exc()[-800:]})
     return results, fault
@@ -154,6 +159,15 @@ def diagnostic_self_check():
     recorded = json.loads(failures[0]["detail"])["actual"]
     if recorded != sample or len(failures[0]["detail"]) > 24000:
         problems.append("oracle failure does not retain bounded exit, stderr and document")
+    def infrastructure_on_two(name):
+        if name == "2":
+            raise CaseInfrastructure("injected ENOSPC")
+        return {}
+    infra_results, _ = run_cases(True, infrastructure_on_two, lambda name: None, lambda: None)
+    infra = {row["case"]: row for row in infra_results}
+    if (infra["2"]["kind"] != "infrastructure" or infra["6"]["kind"] != "infrastructure"
+            or infra["10"]["status"] != "skipped"):
+        problems.append("case infrastructure failure did not abort the diagnostic")
     called, results, fault = run({"1", "10"})
     if called != ["1", "10"] or fault != "1" or results["2"]["kind"] != "dependency":
         problems.append("diagnostic did not continue an independent case or latch the first fault")
@@ -312,6 +326,11 @@ def inner(mode, binary):
 
         results, fault = run_cases(diagnostic, lambda name: getattr(cases, "case_" + name)(),
                                    ready, check_pool, observation)
+        infrastructure_case = next((row for row in results if row.get("kind") == "infrastructure"
+                                    and row["status"] == "failed"), None)
+        if infrastructure_case:
+            infrastructure = {"check": "case_" + infrastructure_case["case"],
+                              "detail": infrastructure_case["detail"]}
     except CensusUnavailable as error:
         infrastructure = {"check": "product_custody_census", "detail": str(error)[:500]}
         preflight = {"outcome": "infrastructure", "reason": str(error)[:500]}

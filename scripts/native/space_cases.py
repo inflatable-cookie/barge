@@ -1,4 +1,5 @@
 """Stage 3 native scenarios. All effects target the owned image and state."""
+import errno
 import hashlib
 import json
 import os
@@ -8,36 +9,68 @@ import sys
 import time
 
 import space_oracles as oracle
+from space_fixture import CaseInfrastructure
 
 MIB = 1024 * 1024
 
 
-def case_2_sizing(free, reserve, older_bytes):
-    """Record the measured reclaim needed and refuse an undersized candidate."""
-    if free <= 0 or free >= reserve or older_bytes <= 0:
-        raise ValueError("case 2 sizing needs positive free bytes below reserve and a nonempty root")
-    result = {"setup_free_bytes": free, "older_bytes": older_bytes,
-              "reserve_bytes": reserve, "reclaim_margin_bytes": free + older_bytes - reserve,
-              "desired_older_bytes": reserve - free + 4 * MIB}
-    if free + older_bytes <= reserve:
-        raise ValueError(f"case 2 measured sizing cannot reach reserve: {result}")
+def case_2_filler_size(free, reserve, payload):
+    """Size filler after the older payload from Barge's measured free bytes."""
+    target = reserve - payload + 4 * MIB
+    amount = free - target
+    if target <= 0 or amount <= 0 or amount > 128 * MIB:
+        raise CaseInfrastructure("case 2 measured filler size is not positive and image-bounded")
+    return amount
+
+
+def case_2_sizing(free, reserve, payload):
+    """Check and record the pre-guard free-space and payload invariant."""
+    result = {"setup_free_bytes": free, "older_bytes": payload, "reserve_bytes": reserve,
+              "reclaim_margin_bytes": free + payload - reserve}
+    if free <= 0 or free >= reserve or free + payload <= reserve + 2 * MIB:
+        raise AssertionError(f"case 2 setup does not establish the two MiB margin: {result}")
     return result
 
 
 def case_2_sizing_self_check():
-    """Reject the measured failing diagnostic and accept a sized candidate."""
+    """Model the required payload-first order on the observed fixture image."""
     problems = []
-    reserve = 48 * MIB
-    free = int(37.3 * MIB)
+    total = 134176768
+    initial_free = 132763648
+    reserve, payload = 48 * MIB, 12 * MIB
+    # Both historical diagnostics recorded this case-1 free measurement. Model
+    # payload first, then a Barge reading, then the filler, with and without a
+    # three MiB metadata cost before that reading and a one MiB filler cost.
+    for observed_free, overhead, filler_overhead in (
+            (initial_free, 0, 0), (initial_free, 3 * MIB, MIB)):
+        if not 0 < observed_free <= total:
+            problems.append("case 2 model's measured free exceeds the image")
+            continue
+        after_payload = observed_free - payload - overhead
+        try:
+            filler = case_2_filler_size(after_payload, reserve, payload)
+            setup = after_payload - filler - filler_overhead
+            if filler <= 0 or filler + payload > total:
+                problems.append("case 2 model exceeds the owned image")
+            case_2_sizing(setup, reserve, payload)
+        except (CaseInfrastructure, AssertionError) as error:
+            problems.append(f"case 2 payload-first model refused: {error}")
+    # The 4ed7d8d filler-first reading made its old payload gate impossible.
+    # It is not used as the starting measurement for the corrected sequence.
+    if 47820800 - 40 * MIB >= payload:
+        problems.append("case 2 model does not reproduce the 4ed7d8d setup failure")
     try:
-        case_2_sizing(free, reserve, int(10.49 * MIB))
-    except ValueError:
+        case_2_filler_size(reserve - payload + 4 * MIB, reserve, payload)
+    except CaseInfrastructure:
         pass
     else:
-        problems.append("case 2 accepted the diagnostic's undersized root")
-    result = case_2_sizing(free, reserve, reserve - free + 4 * MIB)
-    if result["reclaim_margin_bytes"] != 4 * MIB:
-        problems.append("case 2 did not record the four MiB sizing margin")
+        problems.append("case 2 model accepted a nonpositive filler size")
+    try:
+        case_2_sizing(37343232, reserve, 10489856)
+    except AssertionError:
+        pass
+    else:
+        problems.append("case 2 accepted the f73230b shortfall")
     return problems
 
 
@@ -94,29 +127,31 @@ class Cases:
 
     def case_2(self):
         fixture = self.fixture
-        # The second area's root is released first and thus has the older LRU
-        # key. Its size and the filler are derived from fresh Barge readings.
-        # Lay down the non-Barge filler first, then size the older root from
-        # the measured remaining free bytes and a 40 MiB setup target. The
-        # filler target leaves room for metadata and a reclaim margin.
-        self.filler = os.path.join(fixture.mount, "proof-filler")
-        fixture.fill_to(self.filler, 58 * MIB)
-        fixture.hold(self.second, "old", os.getpid())
-        free = fixture.free()
+        # The 12 MiB older payload precedes the filler. Both writes stay on the
+        # owned image; the filler is sized from the measurement after release.
+        payload = 12 * MIB
         reserve_target = 48 * MIB
-        setup_target = 40 * MIB
-        required_payload = reserve_target - setup_target + 4 * MIB
-        payload = free - setup_target
-        if payload < required_payload:
-            raise AssertionError("case 2 lacks measured space for the reserve gap and reclaim margin")
-        fixture.fill_to(os.path.join(self.second["path"], "payload"), free - payload)
-        fixture.release(self.second, "old")
-        time.sleep(0.05)
-        fixture.idle(self.first, "new")
-        fixture.wait_until_idle()
-        measured = fixture.free()
-        if not 24 * MIB < measured < 48 * MIB:
-            raise AssertionError(f"case 2 setup is outside its measured band: {measured}")
+        fixture.hold(self.second, "old", os.getpid())
+        try:
+            if fixture.free() <= payload:
+                raise CaseInfrastructure("case 2 image lacks space for the older payload")
+            fixture.fill_bytes(os.path.join(self.second["path"], "payload"), payload)
+            fixture.release(self.second, "old")
+            time.sleep(0.05)
+            fixture.idle(self.first, "new")
+            fixture.wait_until_idle()
+            free_before_filler = fixture.free()
+            filler_bytes = case_2_filler_size(free_before_filler, reserve_target, payload)
+            self.filler = os.path.join(fixture.mount, "proof-filler")
+            measured = fixture.fill_bytes(self.filler, filler_bytes)
+        except OSError as error:
+            if error.errno == errno.ENOSPC:
+                raise CaseInfrastructure("case 2 fixture write ran out of image space") from error
+            raise
+        sizing = case_2_sizing(measured, reserve_target, payload)
+        sizing.update({"free_before_filler": free_before_filler, "filler_bytes": filler_bytes})
+        self.context["2"] = {"sizing": sizing, "older_root": self.second["root_id"],
+                             "older_area": "proof/second"}
         _, preview = fixture.command("space", "prune", "--volume", fixture.uuid, "--plan")
         candidates = preview["data"]["plan"]["candidates"]
         candidate_rows = oracle.rows(candidates)
@@ -125,11 +160,10 @@ class Cases:
             raise AssertionError("case 2 older root is not a unique eligible candidate")
         reserve = preview["data"]["policy"]["reserve_bytes"]
         older_bytes = older[0]["bytes"]
-        self.context["2"] = {"setup_free_bytes": measured, "older_bytes": older_bytes,
-                             "reserve_bytes": reserve, "older_root": self.second["root_id"],
-                             "older_area": "proof/second", "candidates": candidates}
-        sizing = case_2_sizing(measured, reserve, older_bytes)
-        self.context["2"]["sizing"] = sizing
+        if reserve != reserve_target:
+            raise AssertionError("case 2 registered reserve changed")
+        sizing["planned_older_bytes"] = older_bytes
+        self.context["2"]["candidates"] = candidates
         code, document = fixture.guard()
         evidence = oracle.case_2(code, document, self.second["root_id"], self.first["root_id"],
                                  candidates, preview["data"]["kept"])
