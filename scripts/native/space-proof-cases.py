@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Case identities and expected outcomes for the stage 3 native proof.
 
-This inventory is consumed by the proof apparatus; case execution and custody
-remain the responsibility of that apparatus.
+The proof apparatus must implement and verify these cases, including custody.
+This inventory does not execute them.
 """
 
 CASES = (
