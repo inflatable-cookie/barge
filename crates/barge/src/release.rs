@@ -634,6 +634,24 @@ const fn plan_rows_truncated(total: usize) -> bool {
     total > PLAN_ROOTS
 }
 
+/// Why condition 4 finds no age to decide, when the policy carries none.
+///
+/// `release_on_reference` is the policy a release gate reads as "allowed by
+/// release". No release by reference exists yet, so this release plan states
+/// that it has no age to judge the root by rather than reading the policy as
+/// permission. A later slice that adds the release-by-reference effect changes
+/// this reading, and this plan is where it starts.
+const fn no_age_reason(policy: &PrunePolicy) -> &'static str {
+    match policy {
+        PrunePolicy::ReleaseOnReference => {
+            "the area's prune policy is `release_on_reference`: a release by reference is not part of this release plan, so no root is released"
+        }
+        PrunePolicy::None | PrunePolicy::OldestIdleAfter { .. } => {
+            "the area declares no prune age, so no root is released"
+        }
+    }
+}
+
 fn durability_name(durability: Durability) -> &'static str {
     match durability {
         Durability::Expendable => "expendable",
@@ -895,7 +913,7 @@ fn decide_root(
 
     // Condition 4: policy, durability and age.
     let declared_age = match &declaration.prune {
-        PrunePolicy::None => None,
+        PrunePolicy::None | PrunePolicy::ReleaseOnReference => None,
         PrunePolicy::OldestIdleAfter { age_seconds } => Some(*age_seconds),
     };
     let scan = locked.activity.clone();
@@ -910,7 +928,7 @@ fn decide_root(
             last_activity_ms: last.or(scan.last_activity_ms),
             age_seconds: None,
             declared_age_seconds: None,
-            reason: Some("the area declares no prune age, so no root is released".to_owned()),
+            reason: Some(no_age_reason(&declaration.prune).to_owned()),
         },
         (Some(declared), Some(last), _) => IdleEvidence {
             last_activity_ms: Some(last),
@@ -937,10 +955,7 @@ fn decide_root(
         },
     };
     match declared_age {
-        None => blockers.push((
-            "policy",
-            "the area declares no prune age, so its roots are never released".to_owned(),
-        )),
+        None => blockers.push(("policy", no_age_reason(&declaration.prune).to_owned())),
         Some(declared) => match measured {
             None => blockers.push((
                 "policy",

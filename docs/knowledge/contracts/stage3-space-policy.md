@@ -283,6 +283,13 @@ what needs it:
   oldest_idle_after{7d}` with `reserve: excluded` means "age out normally, never
   evict for space". Conflating them would either block reserve recovery behind an
   age nobody can meet or silently make young data expirable.
+- A release-class policy takes **no** reserve part, whatever `reserve` records.
+  When a declaration's `prune` is `release_on_reference`, its roots are released
+  only by the release gate, by reference, so the space path never enumerates or
+  prunes one. The participation row says `excluded` with that reason and reports
+  no counts, because an unlisted area is not an empty one. This is the policy
+  doing the excluding, not the reservation: declaring it `counts` does not make
+  it a participant, and the run reports that it never yielded.
 - The declaration is where a **consumer consents** to pressure pruning. The
   absence of a declaration is not consent: an undeclared folder is not an area
   and its contents are never Barge's to prune.
@@ -1707,7 +1714,10 @@ and T6, and this slice claims no native proof.
   whose `reserve` is `counts` is listed and its idle roots may be candidates; an
   area whose `reserve` is `excluded` is never enumerated, so its roots never
   enter the list and its three counts are explicit `null` rather than `0` or a
-  missing key. The same holds for an area that is absent, unknown or unreached:
+  missing key. An area whose `prune` is `release_on_reference` is never
+  enumerated either, and is state `excluded` with its reason whatever `reserve`
+  records, because only the release gate may release one of its roots. The same
+  holds for an area that is absent, unknown or unreached:
   a `counts` area whose folder does not exist is state `absent` with null counts,
   never `participating` with zeros, because unknown is never absent, empty or
   zero. Barge's scratch

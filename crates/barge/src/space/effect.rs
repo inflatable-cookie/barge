@@ -58,7 +58,9 @@ use serde::{Deserialize, Serialize};
 use super::{
     read_plan, state_name, SpaceCandidateRow, SpaceMeasurement, SpacePrunePlan, SpacePruneReport,
 };
-use crate::area::{self, AreaDeclaration, AreaDocument, MarkerStateName, ReserveParticipation};
+use crate::area::{
+    self, AreaDeclaration, AreaDocument, MarkerStateName, PrunePolicy, ReserveParticipation,
+};
 use crate::contract::{RowSet, INTENT_ROWS, ROOT_ROWS};
 use crate::custody::PendingIntent;
 use crate::delete::{self, DeleteBounds, DeleteReport};
@@ -1335,7 +1337,21 @@ impl Pass<'_> {
                     "the area {}/{} no longer participates (`{}`), so its root is kept",
                     namespace,
                     area_name,
-                    reserve_name(declaration.reserve)
+                    declaration.reserve.name()
+                ),
+            ));
+        }
+        // A release-class policy is never a space participant, whatever its
+        // `reserve` records: only the release gate may release one of its roots.
+        // The planner never plans such a row, so reaching this is a declaration
+        // that changed under a plan or a plan that did not come from this build;
+        // either way the root is kept.
+        if declaration.prune == PrunePolicy::ReleaseOnReference {
+            return ResolvedTarget::Skipped(Skip::new(
+                "policy_changed",
+                format!(
+                    "the area {}/{} releases its roots only by reference, so the space path never prunes one; the root is kept",
+                    namespace, area_name
                 ),
             ));
         }
@@ -1956,14 +1972,6 @@ fn pruned_row(candidate: &SpaceCandidateRow, report: &DeleteReport) -> SpacePrun
 /// Barge's own scratch area, as a plan spells it.
 fn scratch_label() -> String {
     format!("{}/{}", scratch::SCRATCH_NAMESPACE, scratch::SCRATCH_AREA)
-}
-
-/// A participation's name, as a refusal spells it.
-const fn reserve_name(reserve: ReserveParticipation) -> &'static str {
-    match reserve {
-        ReserveParticipation::Counts => "counts",
-        ReserveParticipation::Excluded => "excluded",
-    }
 }
 
 /// Re-read the marker of the root an effect step is about to rename, under the lock

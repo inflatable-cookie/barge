@@ -1026,7 +1026,7 @@ on its own.
 | F3 | The [release gate](#releasability-the-one-gate): the reference readers (Barge's own records, and Oxide's receipts, registry rows and markers read in place), `last_activity_ms`, the `barge prune --plan` verb, and `barge.prune.plan/1` with its digest and evidence rows | F1, F2, S5 (custody and delete) |
 | F4 | `barge.intent/2` with identity and absence evidence, S5's intent reader accepting them, replay under a changed device, and the `barge.root/1`-to-`/2` settlement for a pending intent written by an older reader | F3, S5 |
 | F5 | `barge inspect`'s Oxide registry census and the drift report; the read-only operation that answers the carried finding without adopting anything | F1, F2, S2 (`inspect`) |
-| F6 | Oxide declares its output areas and switches its prune to Barge's gate; the 91 legacy roots are released with an operator list | F1–F5, the [stage 3 space policy](stage3-space-policy.md)'s slices, Oxide's own project, `ff13f2ef`, operator approval |
+| F6 | Oxide declares its output areas and switches its prune to Barge's gate; the 91 legacy roots are released with an operator list. Barge slice R2 supplies the release-class policy those areas declare | F1–F5, the [stage 3 space policy](stage3-space-policy.md)'s slices, Oxide's own project, `ff13f2ef`, operator approval |
 
 `F1` and `F2` can run in parallel; `F2` needs nothing from `F1` except a shared
 descriptor-walk helper, which now sits beside S3's containment code either way.
@@ -1037,6 +1037,27 @@ policy](stage3-space-policy.md) owns it, and this contract contributes only the
 identity, custody and policy conditions a space prune already supplies. Nothing
 depends on a real drive; `F6` needs its own operator gate because it changes what
 happens to data on a real volume.
+
+**Release-class policy (Barge slice R2).** `PrunePolicy::ReleaseOnReference` has
+landed as an additive `barge.area/1` value named `release_on_reference`, so an
+area whose roots may only be released by reference can be declared before the
+effect that releases one exists. Two rules make it safe to declare early, and
+both are tested with the policy present:
+
+- `maintain` never plans one of its roots. The area is a plan step reported as
+  excluded, with the reason and no candidate, so its absence from the deletion
+  set is stated rather than silently omitted. A `prune: none` area is not a step
+  at all.
+- the space path never enumerates or prunes one of its roots, whatever the
+  area's `reserve` records. The policy, not the reservation, is what keeps it
+  out of the reserve, because only the release gate may release it.
+
+Condition 4 of the [release gate](#releasability-the-one-gate) reads
+`release_on_reference` as permission by release only when a release-by-reference
+effect exists. That effect is a later slice, so this policy currently releases
+nothing: its roots stay, and every report of them says why. An older reader of
+`barge.area/1` refuses the value as unknown rather than reading it as `none` or
+as an age the area never declared.
 
 ### F2 library primitives
 

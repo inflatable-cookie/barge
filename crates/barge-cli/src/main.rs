@@ -59,7 +59,7 @@ const USAGE: &str = "usage: barge <describe|inspect|space|volume|maintain|prune|
        barge maintain [--space] --plan <file> --plan-sha256 <hex>
        barge prune --plan --area <namespace>/<area> --volume <uuid> [--plan-out <file>]
        barge diagnostic descriptor-census --root <existing-directory>
-       barge area declare --namespace <ns> --area <name> --folder <folder> [--override <uuid>=<folder>]... --absent <fail:drive|wait|fallback:path> --prune <none|oldest-idle:seconds> --reserve <counts|excluded>
+       barge area declare --namespace <ns> --area <name> --folder <folder> [--override <uuid>=<folder>]... --absent <fail:drive|wait|fallback:path> --prune <none|oldest-idle:seconds|release-on-reference> --reserve <counts|excluded>
        barge area show --namespace <ns> --area <name>
        barge area list
        barge area root create --namespace <ns> --area <name> --volume <uuid> --kind <area_root|cache_root|scratch_run>
@@ -1860,13 +1860,18 @@ fn parse_prune(raw: &str) -> Result<PrunePolicy, Error> {
     if raw == "none" {
         return Ok(PrunePolicy::None);
     }
+    if raw == "release-on-reference" {
+        return Ok(PrunePolicy::ReleaseOnReference);
+    }
     if let Some(age) = raw.strip_prefix("oldest-idle:") {
         let age_seconds = age
             .parse::<u64>()
             .map_err(|_| usage("--prune oldest-idle takes a number of seconds"))?;
         return Ok(PrunePolicy::OldestIdleAfter { age_seconds });
     }
-    Err(usage("--prune takes none or oldest-idle:<seconds>"))
+    Err(usage(
+        "--prune takes none, oldest-idle:<seconds> or release-on-reference",
+    ))
 }
 
 fn parse_reserve(raw: &str) -> Result<ReserveParticipation, Error> {

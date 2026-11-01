@@ -557,6 +557,65 @@ fn area_declare_show_and_list_round_trip_through_one_document_each() {
 }
 
 #[test]
+fn area_declare_accepts_the_release_on_reference_policy_and_refuses_an_unknown_one() {
+    let (_fixture, state_dir) = absent_state_dir("area-release-on-reference");
+    let output = run_area(
+        &[
+            "declare",
+            "--namespace",
+            "oxide",
+            "--area",
+            "outputs",
+            "--folder",
+            "oxide-outputs",
+            "--absent",
+            "wait",
+            "--prune",
+            "release-on-reference",
+            "--reserve",
+            "excluded",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the declaration is accepted: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let document = stdout_document(&output);
+    assert_eq!(
+        document["data"]["declaration"]["prune"],
+        serde_json::json!({"kind": "release_on_reference"}),
+        "the value is stored as itself, not approximated"
+    );
+    assert!(state_dir.join("areas/oxide/outputs.json").is_file());
+
+    let output = run_area(
+        &[
+            "declare",
+            "--namespace",
+            "oxide",
+            "--area",
+            "pool",
+            "--folder",
+            "oxide-pool",
+            "--absent",
+            "wait",
+            "--prune",
+            "whenever",
+            "--reserve",
+            "excluded",
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_area_refusal(&output, 2, "usage");
+    assert!(!state_dir.join("areas/oxide/pool.json").exists());
+}
+
+#[test]
 fn area_declare_refuses_a_collision_and_writes_nothing_for_it() {
     let (_fixture, state_dir) = absent_state_dir("area-collision");
     let output = run_area(&declare_args("example", "pool", "example/pool"), &state_dir);
