@@ -129,6 +129,11 @@ pub(crate) fn fallback_roots(
             });
         }
     }
+    if declarations.truncated && !records.is_empty() {
+        // The unexamined declarations may include fallbacks; never report a
+        // complete empty observation when their contents are unknown.
+        return Ok(RowSet::bounded(rows, total.saturating_add(1), total));
+    }
     Ok(RowSet::bounded(rows, total, ROOT_ROWS))
 }
 
