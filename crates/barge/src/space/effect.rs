@@ -491,13 +491,24 @@ pub fn prune(
                 .into(),
         )
     })?;
+    // Registration takes this volume lock too. The preflight record may have
+    // become stale while we waited, so no replay may use its pruning authority.
+    let current = area::registered_volume(paths, request.volume_uuid)?;
+    let durability = current.declared_durability()?;
+    if !durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the volume no longer permits pruning; replay and deletion were not started",
+        )
+        .with_detail("volume_uuid", request.volume_uuid.as_str().into())
+        .with_detail("durability", super::durability_name(durability).into()));
+    }
     // Replay next, under that lock and **only** for this volume: a real run settles
     // what an earlier one left pending before it deletes anything, from the
     // recorded identities only, after the volume re-verifies. Another volume's
     // pending intent is a different object's business and never blocks, delays or
     // is acted on here. An intent of this volume that stays pending stops the pass
-    // before its first effect, because a new delete over an unsettled one is what
-    // the journal exists to prevent.
+    // only for its own object; unrelated candidates can still proceed.
     let replay = delete::replay_pending_on_volume(
         paths,
         dirs,
@@ -516,7 +527,9 @@ pub fn prune(
     // skipped and reported as `pending_intent`. It never stops a pass over
     // unrelated paths, and the report carries the replay's own counts so the
     // operator can see what stayed pending.
-    let before = space.measure_space(&verified)?;
+    let before = space
+        .measure_space(&verified)
+        .map_err(|error| error.with_detail("replay", serde_json::json!(&replay)))?;
     // The plan's own snapshot is what authorizes the run. A policy published between
     // the plan and this pass is the first generation change an effect step
     // re-evaluates, never a silent upgrade of what the plan meant.
@@ -555,7 +568,7 @@ pub fn prune(
             last_ms: 0,
             bound_ms: u64::try_from(request.bounds.flush_deadline.as_millis()).unwrap_or(u64::MAX),
         },
-        replay: SpaceReplayRow::from(&replay),
+        replay,
         stop: None,
         batches: 0,
         rounds: 0,
@@ -600,7 +613,7 @@ struct Pass<'a> {
     deleted_bytes: u64,
     unreached: Vec<SpaceUnreachedRow>,
     flush_row: SpaceFlushRow,
-    replay: SpaceReplayRow,
+    replay: delete::ReplayReport,
     stop: Option<&'static str>,
     batches: usize,
     rounds: usize,
@@ -1196,6 +1209,7 @@ impl Pass<'_> {
     fn annotate(&self, error: Error) -> Error {
         let ids: Vec<&str> = self.pruned.iter().map(|row| row.root_id.as_str()).collect();
         error
+            .with_detail("replay", serde_json::json!(&self.replay))
             .with_detail("pruned_root_ids", serde_json::json!(ids))
             .with_detail("pruned", self.pruned.len().into())
             .with_detail("reclaimed_bytes", self.reclaimed().into())
@@ -1235,7 +1249,7 @@ impl Pass<'_> {
                 .saturating_sub(self.before.free_bytes),
             stop: self.stop.unwrap_or("nothing_eligible").to_owned(),
             flush: self.flush_row,
-            replay: Some(self.replay),
+            replay: Some(SpaceReplayRow::from(&self.replay)),
             not_reached: RowSet::bounded(self.unreached, unreached_total, ROOT_ROWS),
         };
         let truncated =
@@ -3681,6 +3695,110 @@ mod tests {
         let pending = PendingIntent::pending(&intents.records);
         assert_eq!(pending.len(), 1);
         assert!(pending[0].intent_id.len() == 32);
+    }
+
+    /// Publish a changed registry after preflight's read, before the prune takes
+    /// the volume lock. This ordering models a registration winning that lock.
+    #[test]
+    fn replay_checks_locked_durability_and_reports_effects_on_later_error() {
+        struct RegistrationAtMount<'a> {
+            harness: &'a Harness,
+            invalid: bool,
+        }
+        impl crate::os::MountRoot for RegistrationAtMount<'_> {
+            fn mount_root(
+                &self,
+                path: &std::path::Path,
+            ) -> crate::error::Result<crate::os::MountPoint> {
+                if self.invalid {
+                    std::fs::write(self.harness.fixture.state.registry_path(), b"{invalid")
+                        .expect("corrupt registry after preflight");
+                } else {
+                    let mut record = self.harness.record.clone();
+                    record.durability = Durability::Kept;
+                    self.harness.fixture.register_record(&record);
+                }
+                self.harness.fixture.mounts().mount_root(path)
+            }
+        }
+        struct FailedMeasurement;
+        impl SpaceFacts for FailedMeasurement {
+            fn measure_space(&self, _: &VerifiedVolume) -> crate::error::Result<SpaceMeasurement> {
+                Err(crate::error::Error::new(
+                    ErrorKind::UnknownState,
+                    "measurement failed after replay",
+                ))
+            }
+        }
+        let harness = Harness::new("space-prune-replay-kept-race", RESERVE, FLOOR);
+        let (root_id, path) = harness.seed("pool", 1_000);
+        let (_, bytes) = harness.preview();
+        let faults = Faults::new().with_device_shift(
+            "payload.bin",
+            crate::os::DeviceId::new(harness.fixture.device.get().saturating_add(1)),
+        );
+        harness
+            .run_with(
+                &faults,
+                &bytes,
+                &Meter::new(&[4]),
+                &Flusher::ok(),
+                SpacePruneBounds::design(),
+            )
+            .expect_err("interrupt after capture");
+        let intents = state::read_intents(&harness.fixture.state, INTENT_ROWS).expect("journal");
+        let pending = PendingIntent::pending(&intents.records);
+        assert_eq!(pending.len(), 1);
+        let leaf = path.parent().expect("area").join(format!(
+            "{}{}",
+            crate::state::QUARANTINE_PREFIX,
+            pending[0].intent_id
+        ));
+        let digest = sha256_hex(&bytes);
+        let request = harness.request(&digest, &bytes, SpacePruneBounds::design());
+        for invalid in [false, true] {
+            harness.fixture.register_record(&harness.record);
+            let error = prune(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &RegistrationAtMount {
+                    harness: &harness,
+                    invalid,
+                },
+                &harness.observer,
+                &Meter::new(&[4]),
+                &Flusher::ok(),
+                &request,
+            )
+            .expect_err("changed authority stops before replay");
+            assert_eq!(error.kind(), ErrorKind::UnknownState);
+            assert!(
+                leaf.join("payload.bin").is_file(),
+                "replay never touches kept or unknown data"
+            );
+            let after = state::read_intents(&harness.fixture.state, INTENT_ROWS).expect("journal");
+            assert_eq!(after.records, intents.records, "intent remains unchanged");
+        }
+        harness.fixture.register_record(&harness.record);
+        let error = prune(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &FailedMeasurement,
+            &Flusher::ok(),
+            &request,
+        )
+        .expect_err("measurement fails after replay completes");
+        assert!(!leaf.exists(), "replay completed the captured deletion");
+        assert_eq!(error.detail()["replay"]["resumed"], 1);
+        assert_eq!(
+            error.detail()["replay"]["resumed_root_ids"],
+            serde_json::json!([root_id])
+        );
+        harness.no_pending_intent();
     }
 
     #[test]

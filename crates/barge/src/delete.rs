@@ -284,6 +284,10 @@ pub struct ReplayReport {
     pub rolled_back: usize,
     /// How many resumed a deletion and completed it.
     pub resumed: usize,
+    /// Root ids (or recorded unit names for older intents) whose deletion this
+    /// replay resumed and completed, separate from prior completed deletions.
+    #[serde(default)]
+    pub resumed_root_ids: Vec<String>,
     /// The intents that stay pending, with their reasons.
     pub pending: Vec<PendingRow>,
     /// How many entries the resumed deletions removed.
@@ -2911,6 +2915,7 @@ fn replay_pending_scope(
         settled: 0,
         rolled_back: 0,
         resumed: 0,
+        resumed_root_ids: Vec::new(),
         pending: Vec::new(),
         entries_removed: 0,
         remounted: 0,
@@ -2972,6 +2977,13 @@ fn replay_pending_scope(
                 ReplayOutcome::RolledBack => report.rolled_back += 1,
                 ReplayOutcome::Resumed { entries, remounted } => {
                     report.resumed += 1;
+                    report.resumed_root_ids.push(
+                        intent
+                            .unit
+                            .root_id
+                            .clone()
+                            .unwrap_or_else(|| intent.unit.name.clone()),
+                    );
                     report.entries_removed = report.entries_removed.saturating_add(entries);
                     if remounted {
                         report.remounted += 1;

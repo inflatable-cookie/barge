@@ -1890,7 +1890,12 @@ is claimed.**
   inside the last 5 s. Every bound reports what it did not reach, with counts, and
   a pass that ends on one exits `3` rather than presenting itself as complete.
 - **Replay is this volume's and each pending intent is that object's.** The pass
-  takes the volume's exclusive lock first and replays **only the pending intents
+  takes the volume's exclusive lock, then re-reads the registry and durability
+  **before replay**. A registration can publish while the pass waits for this lock;
+  the earlier preflight read is not pruning authority. Kept or unreadable durability
+  stops the pass before replay touches a quarantine leaf or changes an intent.
+  Registration shares this lock, so it cannot publish during the locked replay.
+  The pass replays **only the pending intents
   whose recorded volume is that volume**, under the lock it already holds, from
   their recorded identities only, after the volume re-verifies — never the account
   journal's other volumes' intents, which are a different object's business and
@@ -1903,6 +1908,10 @@ is claimed.**
   unsettled intent is not a pass-wide stop; only a journal that cannot be read at
   all is, because then no candidate's custody can be proven. The report carries
   this volume's replay counts in `effect.replay`, including what stayed pending.
+  Errors after replay include `detail.replay` with its counts and
+  `resumed_root_ids` (recorded unit names for older intents without a root id),
+  including an error in the first measurement after replay. These are separate
+  from the pass's newly pruned roots; a failure never implies replay had no effect.
   The per-phase replay rules themselves are `delete`'s and are pinned there, and so
   is the hold rule a replay now carries: **a replay re-reads the unit's holds**, and
   while any is live or undecidable the captured object stays where it is and the

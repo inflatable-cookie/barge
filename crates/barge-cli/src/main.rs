@@ -2195,6 +2195,7 @@ mod tests {
             settled: 0,
             rolled_back: 0,
             resumed: 1,
+            resumed_root_ids: Vec::new(),
             pending: Vec::new(),
             entries_removed: 3,
             remounted,
