@@ -3589,6 +3589,15 @@ fn replay_one(
             }
         }
     }
+    // A replay continues a deletion, so the hold rule applies to it exactly as to a
+    // first effect: while any hold on the unit is live or undecidable, the captured
+    // object stays where it is and the intent stays pending. A hold recorded **after**
+    // the interruption is the case this exists for — without it, resuming the walk
+    // would finish deleting a root its holder believes it holds. The recorded modes
+    // are restored above regardless, because they are Barge's own bookmark.
+    if let Err(reason) = custody::unit_holds_clear(state_paths, observer, &unit, bounds.custody) {
+        return Ok(ReplayOutcome::Pending(reason));
+    }
     // A changed device number is tolerated only when something that is not a device
     // proves the unit: the durable identity record for a release-gated intent, or -
     // for an intent written before this slice carried one, over a `barge.root/1` or

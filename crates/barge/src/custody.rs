@@ -499,6 +499,52 @@ fn read_unit_holds(
     Ok(area::HoldReading::empty())
 }
 
+/// Whether a unit's holds let a deletion continue: `Ok(())` when there is none or
+/// every recorded hold is positively stale, and the reason it may not otherwise.
+///
+/// This is custody's hold rule as one question, for a caller that is **not**
+/// taking a full custody verdict: a replay, which continues a deletion that was
+/// already authorised and captured. A live or undecidable hold keeps the captured
+/// object where it is and the intent pending, so a hold recorded after the
+/// interruption still protects the root it names (stage 3's `held_root_never_touched`
+/// rule, applied to the replay path).
+pub(crate) fn unit_holds_clear(
+    state_paths: &StatePaths,
+    observer: &dyn ProcessObserver,
+    unit: &DeletionUnit,
+    bounds: CustodyBounds,
+) -> std::result::Result<(), String> {
+    let holds =
+        read_unit_holds(state_paths, observer, unit, unit.root_id.as_deref()).map_err(|error| {
+            format!("the unit's holds are unreadable, so a replay cannot prove it held: {error}")
+        })?;
+    if holds.total > bounds.holds || holds.truncated {
+        return Err(format!(
+            "the unit carries {} hold files, over the {}-hold bound, so a replay cannot prove it held",
+            holds.total, bounds.holds
+        ));
+    }
+    for (record, hold_state, reason) in &holds.holds {
+        match hold_state {
+            HoldState::Live => {
+                return Err(format!(
+                    "the holder `{}` on pid {} is live, so the captured unit is kept",
+                    record.holder, record.pid
+                ))
+            }
+            HoldState::Unknown => {
+                return Err(format!(
+                    "the hold `{}` cannot be decided ({}), so the captured unit is kept",
+                    record.holder,
+                    reason.as_deref().unwrap_or("no reason was recorded")
+                ))
+            }
+            HoldState::Stale => {}
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decide(
     dirs: &dyn DirOps,

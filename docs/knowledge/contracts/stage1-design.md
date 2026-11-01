@@ -1068,7 +1068,13 @@ descriptor-relative, and bounded:
    being removed by name. Then the `removed` phase is recorded, and the `deleted`
    phase settles the intent.
 7. On replay, a pending intent is resolved only from its recorded identity, and
-   replay's windows are conservative. It first restores every recorded mode, then:
+   replay's windows are conservative. It first restores every recorded mode, then
+   re-reads the unit's holds: while any hold is live or undecidable, the captured
+   object stays where it is and the intent stays pending. A replay continues a
+   deletion that was already authorised, so a hold recorded **after** the
+   interruption must protect the root it names exactly as a hold recorded before a
+   first effect does; a replay that resumed over one would finish deleting a root
+   its holder believes it holds. With no hold, it:
    - it resumes the deletion only when the captured leaf is still at its visible
      `.barge-prune-<intent-id>` name with the intent's kind, device and inode and,
      when the unit records one, the marker digest matches its record, and the phase

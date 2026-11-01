@@ -1903,7 +1903,12 @@ is claimed.**
   unsettled intent is not a pass-wide stop; only a journal that cannot be read at
   all is, because then no candidate's custody can be proven. The report carries
   this volume's replay counts in `effect.replay`, including what stayed pending.
-  The per-phase replay rules themselves are `delete`'s and are pinned there.
+  The per-phase replay rules themselves are `delete`'s and are pinned there, and so
+  is the hold rule a replay now carries: **a replay re-reads the unit's holds**, and
+  while any is live or undecidable the captured object stays where it is and the
+  intent stays pending — a hold recorded *after* the interruption protects its root
+  exactly as one recorded before a first effect does. For this pass that means the
+  covered root is reported `pending_intent` and nothing of it is deleted.
 - **Failure matrix rows this slice owns.** Drive pulled before the run
   (`volume_absent`, nothing changed); a root renamed or absent since the plan
   (`identity_changed`, no delete); `ENOSPC` or an unreadable state volume at the
