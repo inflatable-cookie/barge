@@ -149,11 +149,18 @@ Rules:
 Deletion is only half of reclaiming space; the filesystem must commit it, and a
 measurement used for a decision must not be a stale one.
 
-- The OS layer gains one flush surface, `Flush::flush_volume(&VerifiedVolume)`,
-  implemented on macOS with `fsync_volume_np(fd, SYNC_VOLUME_FULLFSYNC |
-  SYNC_VOLUME_WAIT)` on the volume's own descriptor, reverified before and after
-  the call. That is the same whole-volume flush Oxide's `Binding::flush` uses
-  today, reused rather than reinvented.
+- The OS layer exposes `Flush::flush_volume(&VerifiedVolume, Instant)`. On
+  macOS the descriptor is verified before a direct child inherits it and calls
+  `fsync_volume_np(fd, SYNC_VOLUME_FULLSYNC | SYNC_VOLUME_WAIT)`. The child does
+  no allocation, path lookup or unrelated write, and exits without Rust cleanup.
+  The parent polls only that owned, unreaped child's PID. At the absolute
+  deadline it sends SIGKILL and positively reaps within a one-second cleanup
+  bound. No detached thread or helper retry exists. The flush deadline is 30 s,
+  clipped to the pass wall clock with that cleanup second reserved inside it.
+  A child that cannot be positively reaped is reported as uncertain custody,
+  with its PID and observed start identity (unknown if the kernel could not
+  supply it). A timeout, killed child or nonzero exit is never successful flush
+  evidence and no further root is deleted by the pass.
 - A prune batch flushes the volume once after its deletions and before its
   post-batch measurement. A decision never admits on an unflushed measurement it
   caused itself; a measurement nothing changed needs no flush.
@@ -1873,8 +1880,8 @@ is claimed.**
 - **Flush and reclaim.** One flush per batch, bounded at 30 s, then the volume is
   re-verified around it and re-measured. A batch a bound cuts short is still
   flushed when it deleted something, so no deletion is ever reported from an
-  unflushed measurement; a batch that deleted nothing has no reclaim to measure and
-  is not flushed. The pass stops when free space is strictly greater than
+  unflushed measurement. A batch cut short before any deletion needs no flush.
+  The pass stops when free space is strictly greater than
   `max(reserve, floor)` (`target_reached`), when nothing eligible remains
   (`nothing_eligible`), when a batch that deleted something measured no reclaim
   (`space_not_reclaimed`), or when a bound is reached (`budget_exhausted`); a bound
@@ -1883,8 +1890,11 @@ is claimed.**
   pass, never a sum of the plan's recorded sizes; `deleted_bytes` is that sum and
   is named separately so the two are never confused. A failed flush, a failed
   post-flush reverify and an unreadable measurement are `unknown_state` at exit
-  `3` with the deleted roots named; a flush that outlives its own bound is a
-  reached bound.
+  `3` with the deleted roots named. A flush deadline is an enforced failure,
+  never a completed budget stop. Helper failures carry `flush_child_pid`,
+  `flush_child_start`, `flush_timed_out`, `flush_child_killed`,
+  `flush_child_reaped` and `custody_uncertain` in the error detail; a successful
+  result is accepted only after positive reaping inside the deadline.
 - **Bounds.** At most 128 roots, in at most 4 batches of 32, with a fixed 120 s
   wall clock and no new option (the design delegate's ruling). No effect starts
   inside the last 5 s. Every bound reports what it did not reach, with counts, and
@@ -1933,8 +1943,14 @@ is claimed.**
   handler: Barge installs no signal handler, the intent is durable before the
   first destructive step, and an interrupted process therefore leaves at worst a
   pending intent that the next run replays — never an unrecorded effect. Its exit
-  is non-zero because the process was terminated. A durability change cannot land
-  *between* two of a pass's candidates, because a registration holds the volume
+  is non-zero because the process was terminated.
+  Unit fixtures exercise actual SIGTERM delivery to a subprocess paused after
+  quarantine, an OS ENOSPC error injected at intent publication, and volume
+  absence injected after capture before the first unlink. They assert preserved
+  payload and intent, refusal/exit semantics, and recovery after re-verification.
+  Flush fixtures use the production supervisor with a stalled child, a child
+  ignoring TERM and a nonzero child; all stop further deletion. A durability
+  change cannot land *between* two of a pass's candidates, because a registration holds the volume
   lock from before its publication and a pass holds that same lock for its whole
   length; it lands between the plan and the run, where it is refused with nothing
   changed, and the per-effect generation compare covers the rest.

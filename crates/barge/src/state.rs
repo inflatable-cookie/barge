@@ -1894,7 +1894,27 @@ pub fn publish_intent(
         )
         .with_detail("intent_id", record.intent_id.clone().into()));
     }
-    publish_atomic(&intent_path(state, &record.intent_id)?, &bytes)
+    let target = intent_path(state, &record.intent_id)?;
+    #[cfg(test)]
+    if let Some(error) = FAIL_INTENT_PUBLISH.with(|cell| cell.borrow_mut().take()) {
+        return Err(
+            Error::new(ErrorKind::Io, format!("cannot publish intent: {error}"))
+                .with_detail("errno", serde_json::json!(error.raw_os_error()))
+                .with_detail("path", target.display().to_string().into()),
+        );
+    }
+    publish_atomic(&target, &bytes)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_INTENT_PUBLISH: std::cell::RefCell<Option<std::io::Error>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Inject an actual OS error at the next intent publication, before any effect.
+#[cfg(test)]
+pub(crate) fn fail_next_intent_publish(error: std::io::Error) {
+    FAIL_INTENT_PUBLISH.with(|cell| *cell.borrow_mut() = Some(error));
 }
 
 // A test seam: fail the next publish of one phase on this thread, so a test can

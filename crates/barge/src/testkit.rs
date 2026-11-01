@@ -597,6 +597,8 @@ pub struct Faults {
     /// A probe the test runs the moment the walk observes an entry, so it can
     /// change the fixture in the window a real fault would happen in.
     pub observe_probe: RefCell<Option<ObserveProbe>>,
+    /// One actual OS error at the named descriptor-relative observation.
+    pub observation_error: RefCell<Option<(String, std::io::Error)>>,
     /// A probe the test runs the moment an entry is put back: it is handed the
     /// private name and answers one fact about the state at that moment, which
     /// [`Faults::put_back_result`] returns.
@@ -1289,6 +1291,14 @@ impl DirOps for Faults {
         self.maybe_race(parent, name);
         if let Some(probe) = self.observe_probe.borrow().as_ref() {
             probe(name);
+        }
+        let mut failure = self.observation_error.borrow_mut();
+        if failure.as_ref().is_some_and(|(target, _)| target == name) {
+            let (_, error) = failure.take().expect("matching injected error");
+            return Err(
+                Error::new(ErrorKind::Io, format!("cannot observe {name}: {error}"))
+                    .with_detail("errno", serde_json::json!(error.raw_os_error())),
+            );
         }
         Ok(Some(facts))
     }

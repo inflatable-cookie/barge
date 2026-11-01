@@ -1905,7 +1905,11 @@ mod tests {
 
     struct InjectedFlush(bool);
     impl crate::os::Flush for InjectedFlush {
-        fn flush_volume(&self, _volume: &VerifiedVolume) -> Result<()> {
+        fn flush_volume(
+            &self,
+            _volume: &VerifiedVolume,
+            _deadline: std::time::Instant,
+        ) -> Result<()> {
             if self.0 {
                 Ok(())
             } else {
@@ -1929,11 +1933,16 @@ mod tests {
         .expect("verified fixture");
         let flush: &dyn crate::os::Flush = &InjectedFlush(false);
         assert_eq!(
-            flush.flush_volume(&volume).expect_err("failure").kind(),
+            flush
+                .flush_volume(&volume, std::time::Instant::now() + Duration::from_secs(30))
+                .expect_err("failure")
+                .kind(),
             ErrorKind::UnknownState
         );
         let flush: &dyn crate::os::Flush = &InjectedFlush(true);
-        assert!(flush.flush_volume(&volume).is_ok());
+        assert!(flush
+            .flush_volume(&volume, std::time::Instant::now() + Duration::from_secs(30))
+            .is_ok());
     }
 
     #[test]

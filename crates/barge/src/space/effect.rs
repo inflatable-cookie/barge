@@ -46,8 +46,8 @@
 //!   with counts.
 //! - **Replay first.** A real run settles what an earlier one left pending before
 //!   it deletes anything, and only after the volume re-verifies and each intent's
-//!   recorded identity matches. Anything still pending stops the pass before its
-//!   first effect.
+//!   recorded identity matches. An unsettled intent keeps its own object; other
+//!   candidates continue. An unreadable journal stops the pass.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -552,6 +552,7 @@ pub fn prune(
         plan_sha256: request.plan_digest.to_owned(),
         now_ms: request.now_ms,
         effect_deadline,
+        wall_deadline: deadline,
         bounds: request.bounds,
         delete_bounds: request.delete_bounds,
         policy: planned_policy,
@@ -600,6 +601,7 @@ struct Pass<'a> {
     now_ms: u64,
     /// The moment no effect may start.
     effect_deadline: Instant,
+    wall_deadline: Instant,
     bounds: SpacePruneBounds,
     delete_bounds: DeleteBounds,
     policy: SpacePolicy,
@@ -843,17 +845,25 @@ impl Pass<'_> {
     fn flush_and_measure(&mut self) -> Result<()> {
         self.flush_row.attempts = self.flush_row.attempts.saturating_add(1);
         let began = Instant::now();
-        let flushed = self.flush.flush_volume(&self.verified);
+        // Reserve the helper's bounded reap window inside the pass wall clock.
+        let deadline = (began + self.bounds.flush_deadline).min(
+            self.wall_deadline
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or(began),
+        );
+        let flushed = self.flush.flush_volume(&self.verified, deadline);
         let elapsed = began.elapsed();
         self.flush_row.last_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         if let Err(error) = flushed {
             self.flush_row.failures = self.flush_row.failures.saturating_add(1);
-            return Err(Error::new(
+            let mut failure = Error::new(
                 ErrorKind::UnknownState,
-                format!(
-                    "the volume flush after this batch failed, so the post-prune measurement is unknown: {error}"
-                ),
-            ));
+                format!("the batch flush failed; post-prune space is unknown: {error}"),
+            );
+            for (key, value) in error.detail() {
+                failure = failure.with_detail(key, value.clone());
+            }
+            return Err(failure.with_detail("flush_failed", true.into()));
         }
         // A drive pulled during the flush is a reverify failure, not a measurement
         // of zero: the post-prune state is unknown and the pass says so.
@@ -866,11 +876,6 @@ impl Pass<'_> {
             )
         })?;
         self.measure()?;
-        if elapsed > self.bounds.flush_deadline {
-            // One uninterruptible platform call can outlive its bound; the pass then
-            // reports a reached bound rather than presenting the batch as complete.
-            self.stop = Some("budget_exhausted");
-        }
         Ok(())
     }
 
@@ -1776,7 +1781,7 @@ mod tests {
 
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{prune, SpacePruneBounds, SpacePruneRunRequest};
     use crate::area::{
@@ -1849,7 +1854,6 @@ mod tests {
     /// A flush that succeeds or fails on demand, and counts its calls.
     struct Flusher {
         fail: Cell<bool>,
-        pause: Cell<Duration>,
         calls: Cell<usize>,
     }
 
@@ -1857,25 +1861,6 @@ mod tests {
         fn ok() -> Self {
             Self {
                 fail: Cell::new(false),
-                pause: Cell::new(Duration::ZERO),
-                calls: Cell::new(0),
-            }
-        }
-
-        fn failing() -> Self {
-            Self {
-                fail: Cell::new(true),
-                pause: Cell::new(Duration::ZERO),
-                calls: Cell::new(0),
-            }
-        }
-
-        /// A flush that takes at least `pause`, so a bound shorter than it is
-        /// reached by measurement rather than by a clock race.
-        fn slow(pause: Duration) -> Self {
-            Self {
-                fail: Cell::new(false),
-                pause: Cell::new(pause),
                 calls: Cell::new(0),
             }
         }
@@ -1883,14 +1868,22 @@ mod tests {
         fn calls(&self) -> usize {
             self.calls.get()
         }
+
+        fn failing() -> Self {
+            Self {
+                fail: Cell::new(true),
+                calls: Cell::new(0),
+            }
+        }
     }
 
     impl Flush for Flusher {
-        fn flush_volume(&self, _volume: &VerifiedVolume) -> crate::error::Result<()> {
+        fn flush_volume(
+            &self,
+            _volume: &VerifiedVolume,
+            _deadline: Instant,
+        ) -> crate::error::Result<()> {
             self.calls.set(self.calls.get().saturating_add(1));
-            if !self.pause.get().is_zero() {
-                std::thread::sleep(self.pause.get());
-            }
             if self.fail.get() {
                 return Err(crate::error::Error::new(
                     ErrorKind::UnknownState,
@@ -3004,13 +2997,8 @@ mod tests {
         drop(root);
     }
 
-    /// The failure matrix's **signal** row, carried by the durable order rather
-    /// than a handler: Barge installs no signal handler, and the intent is durable
-    /// before the first destructive step, so an interruption at exactly this point
-    /// — a process that stopped between publishing its intent and finishing the
-    /// walk — leaves a replayable intent and never an unrecorded effect. A killed
-    /// process exits non-zero by the operating system's doing; the next run replays
-    /// the intent.
+    /// A device fault leaves a journal the next run can replay. The actual
+    /// signal row has its own subprocess regression below.
     #[test]
     fn an_interrupted_prune_leaves_a_durable_intent_and_the_next_run_replays_it() {
         let harness = Harness::new("space-prune-replay", RESERVE, FLOOR);
@@ -3166,9 +3154,7 @@ mod tests {
         let harness = Harness::new("space-prune-state-volume", RESERVE, FLOOR);
         let (_root, path) = harness.seed("pool", 1_000);
         let (_, bytes) = harness.preview();
-        // The state volume refuses the intent write: `ENOSPC` and a read-only state
-        // volume take the same path, and it is the same refusal the failure matrix
-        // asks for — nothing deleted, and the refusal names the state volume.
+        // Permission refusal is separate from the ENOSPC injection below.
         let intents = harness.fixture.state.intents_dir();
         std::fs::set_permissions(&intents, std::fs::Permissions::from_mode(0o500))
             .expect("the journal directory is made read-only");
@@ -3187,25 +3173,349 @@ mod tests {
         harness.no_pending_intent();
     }
 
+    /// Entry point of the real signalled subprocess; inert in an ordinary run.
     #[test]
-    fn a_flush_that_outlives_its_bound_is_reported_as_a_reached_bound() {
-        let harness = Harness::new("space-prune-flush-bound", RESERVE, FLOOR);
-        harness.seed("pool", 1_000);
-        let (_, bytes) = harness.preview();
-        // A flush that certainly takes longer than its bound: 20 ms of sleeping
-        // against a 1 ms bound, so the overrun is measured, never a clock race.
-        let bounds = SpacePruneBounds {
-            flush_deadline: Duration::from_millis(1),
-            ..SpacePruneBounds::design()
+    fn signal_prune_child() {
+        let Some(base) = std::env::var_os("BARGE_SIGNAL_FIXTURE") else {
+            return;
         };
-        let flusher = Flusher::slow(Duration::from_millis(20));
-        let report = harness
-            .run(&bytes, &Meter::new(&[4, 20]), &flusher, bounds)
-            .expect("the pass runs");
-        let effect = report.effect.as_ref().expect("the effect");
-        assert_eq!(effect.stop, "budget_exhausted");
-        assert_eq!(effect.pruned.count, 1);
-        assert!(report.needs_human());
+        let base = std::path::PathBuf::from(base);
+        crate::os::test_allow_termination().expect("known SIGTERM disposition in child");
+        let harness = Harness::new("space-prune-signal-child", RESERVE, FLOOR);
+        let (_, path) = harness.seed("pool", 1_000);
+        let (_, bytes) = harness.preview();
+        std::fs::write(base.join("info.json"), serde_json::to_vec(&serde_json::json!({
+            "state": harness.fixture.state.root(), "mount": harness.fixture.root,
+            "uuid": harness.fixture.uuid.as_str(), "device": harness.fixture.device.get(), "root": path,
+        })).expect("info")).expect("publish owned fixture info");
+        let dirs = Faults::new();
+        dirs.observing(Box::new(move |name| {
+            if name == "payload.bin" && !path.exists() {
+                std::fs::write(base.join("ready"), b"captured").expect("signal handshake");
+                loop {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }));
+        harness
+            .run_with(
+                &dirs,
+                &bytes,
+                &Meter::new(&[4]),
+                &Flusher::ok(),
+                SpacePruneBounds::design(),
+            )
+            .expect("parent signals at the captured-leaf barrier");
+        panic!("signal barrier was not reached");
+    }
+
+    /// Ensure a failing subprocess assertion cannot leave a sleeping child.
+    struct SignalChild(std::process::Child);
+    impl Drop for SignalChild {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let until = Instant::now() + Duration::from_secs(1);
+                while Instant::now() < until {
+                    if self.0.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sigterm_after_quarantine_leaves_a_replayable_durable_intent() {
+        let scratch = crate::testkit::TempDir::under_scratch("space-prune-sigterm");
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "space::effect::tests::signal_prune_child",
+                "--nocapture",
+            ])
+            .env("BARGE_SIGNAL_FIXTURE", scratch.path())
+            .env(crate::testkit::SCRATCH_ROOT_ENV, scratch.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("owned prune subprocess");
+        let mut child = SignalChild(child);
+        let until = Instant::now() + Duration::from_secs(15);
+        while !scratch.join("ready").exists() && Instant::now() < until {
+            if child.0.try_wait().expect("poll").is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ready = scratch.join("ready").exists();
+        if ready {
+            crate::os::test_terminate(&mut child.0).expect("send actual SIGTERM");
+        } else {
+            let _ = child.0.kill();
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().expect("poll signalled child") {
+                break status;
+            }
+            if Instant::now() >= until {
+                let _ = child.0.kill();
+                panic!("owned signalled child did not exit in bound");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(ready, "child reached post-quarantine barrier");
+        assert!(
+            crate::os::test_was_terminated(status),
+            "SIGTERM is the observed exit cause"
+        );
+        let info: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(scratch.join("info.json")).expect("info"))
+                .expect("decode info");
+        let state_path = std::path::Path::new(info["state"].as_str().expect("state"));
+        let platform = crate::os::platform();
+        let paths =
+            crate::state::StatePaths::resolve(&platform, Some(state_path)).expect("owned state");
+        let facts = FakeVolume {
+            root: info["mount"].as_str().expect("mount").into(),
+            uuid: VolumeUuid::parse(info["uuid"].as_str().expect("uuid")).expect("UUID"),
+            device: crate::os::DeviceId::new(info["device"].as_u64().expect("device")),
+            present: Cell::new(true),
+            shifted: Cell::new(false),
+            duplicate: Cell::new(false),
+        };
+        let journal = state::read_intents(&paths, INTENT_ROWS).expect("durable journal");
+        assert_eq!(PendingIntent::pending(&journal.records).len(), 1);
+        assert_eq!(journal.records[0].phase, state::IntentPhase::Renamed);
+        let root = std::path::Path::new(info["root"].as_str().expect("root"));
+        assert!(!root.exists(), "quarantine preceded the signal");
+        let leaf = root
+            .parent()
+            .expect("parent")
+            .join(journal.records[0].capture_name());
+        assert!(
+            leaf.join("payload.bin").is_file(),
+            "signal leaves captured payload intact"
+        );
+        let replay = crate::delete::replay_pending(
+            &paths,
+            &platform,
+            &facts,
+            &FakeObserver::new(),
+            DeleteBounds::default(),
+            None,
+        )
+        .expect("replay");
+        assert_eq!(replay.resumed, 1);
+        assert!(replay.pending.is_empty());
+        assert!(!leaf.exists());
+        assert!(PendingIntent::pending(
+            &state::read_intents(&paths, INTENT_ROWS)
+                .expect("journal")
+                .records
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn enospc_at_intent_publish_refuses_before_the_first_effect() {
+        let harness = Harness::new("space-prune-enospc", RESERVE, FLOOR);
+        let (_, path) = harness.seed("pool", 1_000);
+        let (_, bytes) = harness.preview();
+        let no_space = crate::os::test_no_space();
+        let errno = no_space.raw_os_error().expect("ENOSPC errno");
+        state::fail_next_intent_publish(no_space);
+        let error = harness
+            .run(
+                &bytes,
+                &Meter::new(&[4]),
+                &Flusher::ok(),
+                SpacePruneBounds::design(),
+            )
+            .expect_err("ENOSPC prevents the intent and effect");
+        assert_eq!(error.kind(), ErrorKind::Io);
+        assert_eq!(error.kind().exit_code(), 3);
+        assert_eq!(error.detail()["errno"], errno);
+        assert!(error.detail()["path"]
+            .as_str()
+            .expect("state volume path")
+            .starts_with(harness.fixture.state.root().to_str().expect("UTF8")));
+        assert!(path.join("payload.bin").is_file());
+        harness.no_pending_intent();
+        harness
+            .run(
+                &bytes,
+                &Meter::new(&[4, 20]),
+                &Flusher::ok(),
+                SpacePruneBounds::design(),
+            )
+            .expect("later healthy pass");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_volume_pulled_after_quarantine_keeps_the_intent_until_reverified() {
+        let harness = Harness::new("space-prune-mid-pull", RESERVE, FLOOR);
+        let (_, path) = harness.seed("pool", 1_000);
+        let (_, bytes) = harness.preview();
+        let facts = std::rc::Rc::new(harness.fixture.facts());
+        let pulled = facts.clone();
+        let dirs = Faults::new();
+        *dirs.observation_error.borrow_mut() =
+            Some(("payload.bin".to_owned(), crate::os::test_io_error()));
+        dirs.observing(Box::new(move |name| {
+            if name == "payload.bin" {
+                pulled.present.set(false);
+            }
+        }));
+        let digest = sha256_hex(&bytes);
+        let request = harness.request(&digest, &bytes, SpacePruneBounds::design());
+        let error = prune(
+            &harness.fixture.state,
+            &dirs,
+            facts.as_ref(),
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[4]),
+            &Flusher::ok(),
+            &request,
+        )
+        .expect_err("mid-prune volume loss");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(
+            error
+                .to_string()
+                .contains(&crate::os::test_io_error().to_string()),
+            "actual EIO is the interrupted walk's failure: {error}"
+        );
+        assert_eq!(error.kind().exit_code(), 3);
+        assert!(!path.exists(), "quarantine happened before the pull");
+        let journal = state::read_intents(&harness.fixture.state, INTENT_ROWS).expect("journal");
+        assert_eq!(PendingIntent::pending(&journal.records).len(), 1);
+        let leaf = path
+            .parent()
+            .expect("parent")
+            .join(journal.records[0].capture_name());
+        assert!(leaf.join("payload.bin").is_file());
+        let replay = crate::delete::replay_pending(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            facts.as_ref(),
+            &harness.observer,
+            DeleteBounds::default(),
+            None,
+        )
+        .expect("absent replay reports");
+        assert_eq!(replay.pending.len(), 1);
+        assert!(leaf.join("payload.bin").is_file());
+        facts.present.set(true);
+        harness
+            .run(
+                &bytes,
+                &Meter::new(&[4]),
+                &Flusher::ok(),
+                SpacePruneBounds::design(),
+            )
+            .expect("reverified volume replays");
+        assert!(!leaf.exists());
+        harness.no_pending_intent();
+    }
+
+    #[test]
+    fn a_stalled_flush_is_killed_and_reaped_before_any_further_deletion() {
+        struct Helper {
+            mode: u8,
+            elapsed: Cell<Duration>,
+        }
+        impl Flush for Helper {
+            fn flush_volume(
+                &self,
+                _: &VerifiedVolume,
+                deadline: Instant,
+            ) -> crate::error::Result<()> {
+                if self.mode == 4 {
+                    assert!(
+                        deadline.saturating_duration_since(Instant::now())
+                            <= Duration::from_secs(59),
+                        "flush budget is clipped to the pass, reserving reap time"
+                    );
+                    return Err(crate::error::Error::new(
+                        ErrorKind::UnknownState,
+                        "clipped-deadline fixture",
+                    ));
+                }
+                let began = Instant::now();
+                let result = crate::os::test_flush_helper(deadline, self.mode);
+                self.elapsed.set(began.elapsed());
+                result
+            }
+        }
+        for mode in [0, 1, 2, 3, 4] {
+            let harness = Harness::new("space-prune-flush-bound", RESERVE, FLOOR);
+            let (first, first_path) = harness.seed("pool", 1_000);
+            let (_, second_path) = harness.seed("pool", 2_000);
+            let (_, bytes) = harness.preview();
+            let digest = sha256_hex(&bytes);
+            let bounds = SpacePruneBounds {
+                batch_roots: 1,
+                wall: Duration::from_secs(60),
+                flush_deadline: if mode == 3 {
+                    Duration::ZERO
+                } else if mode == 4 {
+                    Duration::from_secs(90)
+                } else {
+                    Duration::from_millis(100)
+                },
+                ..SpacePruneBounds::design()
+            };
+            let request = harness.request(&digest, &bytes, bounds);
+            let meter = Meter::new(&[4]);
+            let helper = Helper {
+                mode,
+                elapsed: Cell::new(Duration::ZERO),
+            };
+            let error = prune(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &meter,
+                &helper,
+                &request,
+            )
+            .expect_err("a stalled or failed flush stops the pass");
+            assert!(
+                helper.elapsed.get() < Duration::from_secs(5),
+                "stalled helper must not block the pass"
+            );
+            assert_eq!(error.kind(), ErrorKind::UnknownState);
+            assert_eq!(error.kind().exit_code(), 3);
+            if mode < 3 {
+                assert_eq!(error.detail()["flush_child_reaped"], true);
+                assert_eq!(error.detail()["custody_uncertain"], false);
+                if mode < 2 {
+                    assert!(error.detail()["flush_child_start"].is_u64());
+                }
+                if mode < 2 {
+                    assert_eq!(error.detail()["flush_child_killed"], true);
+                    assert_eq!(error.detail()["flush_timed_out"], true);
+                }
+            }
+            assert_eq!(
+                error.detail()["pruned_root_ids"],
+                serde_json::json!([first])
+            );
+            assert!(!first_path.exists());
+            assert!(second_path.is_dir(), "no second delete after failed flush");
+            assert_eq!(
+                meter.calls(),
+                1,
+                "a failed flush never supplies a measurement"
+            );
+        }
     }
 
     /// An adopted root's directory name is not its root id, so a consumer's `hold`
