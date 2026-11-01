@@ -512,13 +512,13 @@ fn delete_unit_locked(
         .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
     }
     record.declared_durability()?;
-    let volume = area::prepare(
+    let volume = area::prepare_by(
+        lookup,
         state_paths,
         dirs,
         facts,
         mounts,
         observer,
-        lookup,
         &volume_uuid,
         declaration,
     )?;

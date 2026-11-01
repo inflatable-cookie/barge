@@ -1801,7 +1801,31 @@ pub fn prepare(
     facts: &dyn VolumeFacts,
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
+    volume_uuid: &VolumeUuid,
+    declaration: &AreaDeclaration,
+) -> Result<VolumeArea> {
+    prepare_by(
+        MountLookup::Hint,
+        state,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        volume_uuid,
+        declaration,
+    )
+}
+
+/// [`prepare`] through the given volume lookup. Only the release path's deletion uses
+/// `ByUuid`; the public `prepare` keeps the stored-point lookup and its signature.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_by(
     lookup: MountLookup<'_>,
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
     volume_uuid: &VolumeUuid,
     declaration: &AreaDeclaration,
 ) -> Result<VolumeArea> {
@@ -2006,7 +2030,6 @@ pub fn list_roots_on_volume(
         facts,
         mounts,
         observer,
-        MountLookup::Hint,
         volume_uuid,
         declaration,
     )?;
@@ -7169,7 +7192,6 @@ mod tests {
             &facts,
             &mounts,
             &observer,
-            super::MountLookup::Hint,
             &fixture.uuid,
             &caller,
         )
@@ -7188,7 +7210,6 @@ mod tests {
             &facts,
             &mounts,
             &observer,
-            super::MountLookup::Hint,
             &fixture.uuid,
             &stored.declaration(),
         )
@@ -7235,7 +7256,6 @@ mod tests {
             &facts,
             &mounts,
             &observer,
-            super::MountLookup::Hint,
             &fixture.uuid,
             &caller,
         )
@@ -7257,7 +7277,6 @@ mod tests {
             &facts,
             &mounts,
             &observer,
-            super::MountLookup::Hint,
             &fixture.uuid,
             &stored.declaration(),
         )
