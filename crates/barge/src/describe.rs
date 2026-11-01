@@ -2135,10 +2135,15 @@ mod tests {
             .as_object_mut()
             .expect("the data is an object");
         data_object.remove("roots");
+        data_object.remove("fallback_roots");
         let mut without = serde_json::to_vec(&value).expect("the document encodes");
         without.push(b'\n');
         let read = read_describe_document(&without).expect("an older document reads");
         assert_eq!(read.roots.count, 0, "a missing optional list is empty");
+        assert!(
+            read.fallback_roots.is_none(),
+            "older fallback reporting is optional"
+        );
 
         // The same holds for the custody object a later S5 document adds.
         let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("the document");

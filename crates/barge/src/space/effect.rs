@@ -3680,6 +3680,32 @@ mod tests {
             .expect("real");
         }
         assert_eq!(calls, 1);
+        let no_work = crate::prune::MaintainRequest {
+            preview: true,
+            plan_digest: None,
+            plan_bytes: None,
+            sweep_bounds: crate::scratch::SweepBounds::default(),
+            delete_bounds: DeleteBounds::default(),
+            maintain_bounds: crate::prune::MaintainBounds::design(),
+            now_ms: harness.now_ms,
+        };
+        let preview = crate::prune::maintain_with_space(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[30]),
+            &Flusher::ok(),
+            &no_work,
+            true,
+        )
+        .expect("preview without pressure");
+        let mut no_work_calls = 0;
+        if preview.candidates > 0 || preview.space_triggered.unwrap_or(0) > 0 {
+            no_work_calls += 1;
+        }
+        assert_eq!(no_work_calls, 0);
     }
 
     #[test]
