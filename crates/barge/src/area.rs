@@ -653,7 +653,7 @@ pub struct RootSpec {
 /// now occupies is not the registered volume, and a UUID mounted twice is refused.
 /// Only the release gate and the deletion it authorises use `ByUuid`.
 #[derive(Clone, Copy)]
-pub enum MountLookup<'a> {
+pub(crate) enum MountLookup<'a> {
     /// Verify the registry's stored mount point.
     Hint,
     /// Find the live mount that carries the record's UUID.
@@ -701,7 +701,7 @@ impl VolumeRoot {
 
     /// [`VolumeRoot::open`] through the given lookup. The containment that follows is
     /// the same for both: the descriptor's device must match the verified volume.
-    pub fn open_with(
+    pub(crate) fn open_with(
         dirs: &dyn DirOps,
         facts: &dyn VolumeFacts,
         mounts: &dyn MountRoot,
