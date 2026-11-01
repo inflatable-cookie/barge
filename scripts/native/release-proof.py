@@ -65,6 +65,7 @@ import sys
 import tempfile
 import time
 import traceback
+from unittest import mock
 
 SCHEMA = "barge.release.native/1"
 SELF_CHECK_SCHEMA = "barge.release.native.self-check/1"
@@ -492,7 +493,12 @@ def stage_proof_binary():
     head = git_head()
     if not head:
         raise Infrastructure("stage", "HEAD is unreadable, so the staged build cannot be named")
-    build = subprocess.run(BUILD_COMMAND, cwd=REPO_ROOT, capture_output=True, text=True, timeout=1800)
+    stage_env = dict(os.environ)
+    stage_env.pop("RUSTFLAGS", None)
+    stage_env.pop("CARGO_ENCODED_RUSTFLAGS", None)
+    stage_env["RUSTUP_AUTO_INSTALL"] = "0"
+    build = subprocess.run(BUILD_COMMAND, cwd=REPO_ROOT, env=stage_env,
+                           capture_output=True, text=True, timeout=1800)
     if build.returncode != 0:
         raise Infrastructure("stage", f"oxide build exited {build.returncode}: {build.stderr[-400:]}")
     found = executable_from_build(build.stdout)
@@ -521,6 +527,35 @@ def stage_proof_binary():
     return manifest
 
 
+def rebound_path(old_mount, new_mount, old_path, identity, uuid):
+    """Bind only the recorded relative identity to the independently verified UUID."""
+    relative = os.path.relpath(old_path, old_mount)
+    if (old_mount == new_mount or not os.path.isabs(old_path)
+            or relative in (".", "..") or relative.startswith(".." + os.sep)
+            or os.path.normpath(old_path) != old_path
+            or identity.get("volume_uuid") != uuid
+            or identity.get("mount_relative_path") != relative):
+        raise Fault("R11", "root path, relative identity or remounted UUID does not match")
+    return os.path.join(new_mount, relative)
+
+
+def verify_rollback(path, identity, identity_bytes, marker_bytes, payload, pending):
+    if pending:
+        raise Fault("R11", "replay left an intent pending")
+    try:
+        with open(identity["record_path"], "rb") as handle:
+            same_record = handle.read() == identity_bytes
+        with open(os.path.join(path, ".barge-root.json"), "rb") as handle:
+            same_marker = handle.read() == marker_bytes
+        with open(os.path.join(path, "proof-content"), "rb") as handle:
+            same_content = handle.read() == payload
+        same_inode = os.stat(path, follow_symlinks=False).st_ino == identity["inode"]
+    except OSError as error:
+        raise Fault("R11", f"rollback root cannot be observed: {error}") from error
+    if not (same_record and same_marker and same_content and same_inode):
+        raise Fault("R11", "rollback identity or content changed")
+
+
 class Proof:
     """One counted or diagnostic run: one image, one private HOME and state, many areas."""
 
@@ -546,6 +581,7 @@ class Proof:
         self.first_fault = None
         self.preflight = None
         self.infrastructure = None
+        self.unknown_custody = False
         self.real_state = None
         self.ownership = None
         self.closure = None
@@ -561,8 +597,13 @@ class Proof:
         self.root = tempfile.mkdtemp(prefix=RUN_ROOT_PREFIX, dir=scratch)
         self.home = tempfile.mkdtemp(prefix="home-", dir=self.root)
         self.state = tempfile.mkdtemp(prefix="state-", dir=self.root)
-        self.env = dict(os.environ)
-        self.env.pop("DYLD_INSERT_LIBRARIES", None)
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(("OXIDE_", "XDG_", "BARGE_"))
+                    and key not in ("DYLD_INSERT_LIBRARIES", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")}
+        self.env["OXIDE_TASK_SCRATCH_ROOT"] = os.environ["OXIDE_TASK_SCRATCH_ROOT"]
+        self.env["OXIDE_PROOF_EVIDENCE"] = os.environ["OXIDE_PROOF_EVIDENCE"]
+        self.env["OXIDE_TEST_HOME_FROM_ENV"] = "1"
+        self.env["RUSTUP_AUTO_INSTALL"] = "0"
         self.env.update(fixture_environment(self.home, self.state, self.root))
         os.makedirs(self.env["CARGO_HOME"], exist_ok=True)
         owned = os.environ["OXIDE_TASK_SCRATCH_ROOT"]
@@ -593,9 +634,9 @@ class Proof:
     def attach(self, first):
         name = f"barge-release-proof-{os.getpid()}-{int(time.time()) % 100000}-{'a' if first else 'b'}"
         mount = f"/Volumes/{name}"
-        run(["hdiutil", "attach", self.image, "-mountpoint", mount, *ATTACH_OPTIONS], self.env)
-        self.attached = True
         self.mount = mount
+        self.attached = True  # An interrupted attach has unknown custody, not absence.
+        run(["hdiutil", "attach", self.image, "-mountpoint", mount, *ATTACH_OPTIONS], self.env)
         self.mount_history.append(mount)
         info = plistlib.loads(run(["diskutil", "info", "-plist", mount], self.env).stdout.encode())
         uuid = info.get(VOLUME_UUID_KEY)
@@ -1001,15 +1042,27 @@ class Proof:
 
     def case_intent_before_rename_then_remount_replay(self):
         area = self.fresh_area("c11", f"oldest-idle:{AREA_AGE_SECONDS}")
-        root = self.new_root(area, aged=True)
+        root = self.new_root(area, aged=False)
+        payload = b"R11 original root content\n"
+        with open(os.path.join(root["path"], "proof-content"), "wb") as handle:
+            handle.write(payload)
+        self.age_root(root["path"])
+        identity_file = self.identity_path(root)
+        with open(identity_file, "rb") as handle:
+            identity_bytes = handle.read()
+        identity = json.loads(identity_bytes)
+        if identity["root_id"] != root["root_id"]:
+            raise Fault("R11", "identity names another root")
+        identity["record_path"] = identity_file
+        with open(os.path.join(root["path"], ".barge-root.json"), "rb") as handle:
+            marker_bytes = handle.read()
+        old_mount = self.mount
         preview, row, plan_file = self.plan_and_run("R11", area, root, expect_eligible=True)
         digest = preview["data"]["plan_digest"]
         folder = self.area_folder(area)
         os.chmod(folder, 0o500)
-        try:
-            code, run_doc = self.real(plan_file, digest, expect=3)
-        finally:
-            os.chmod(folder, 0o700)
+        code, run_doc = self.real(plan_file, digest, expect=3)
+        os.chmod(folder, 0o700)
         if run_doc["data"]["rows"][0]["outcome"] != "pending":
             raise Fault("R11", f"the rename refusal did not leave a pending row: {run_doc['data']['rows']}")
         pending = self.pending_intents()
@@ -1019,26 +1072,50 @@ class Proof:
             raise Fault("R11", "the unit moved before its rename succeeded")
         old_device = self.device
         detached = self.detach()
-        if not detached["mount_absent"]:
-            raise Fault("R11", "the ordinary detach left the mount in place")
+        if detached["exit"] != 0 or not detached["mount_absent"]:
+            self.unknown_custody = True
+            raise Infrastructure("detach", "ordinary detach did not establish a clean closure")
         self.attach(first=False)
-        self.mount_history.append(self.mount)
         remounted = self.device_after_remount != old_device
-        os.chmod(self.area_folder(area), 0o700)
         _code, replay = self.real(plan_file, digest, expect=0)
         if replay["data"]["replay_pending"] != 0 or self.pending_intents():
             raise Fault("R11", f"the remount replay left an intent pending: {replay['data']}")
-        if not os.path.lexists(root["path"]):
-            raise Fault("R11", "the replay removed a root it should have rolled back")
+        root = dict(root, path=rebound_path(old_mount, self.mount, root["path"], identity, self.uuid))
+        verify_rollback(root["path"], identity, identity_bytes, marker_bytes, payload, self.pending_intents())
         preview2, row2, plan2 = self.plan_and_run("R11-after", area, root, expect_eligible=True)
+        if row2["mount_relative_path"] != identity["mount_relative_path"] or row2["identity"]["verdict"] != "verified":
+            raise Fault("R11", "fresh plan did not verify the original relative identity")
         _code, released = self.real(plan2, preview2["data"]["plan_digest"], expect=0)
-        if released["data"]["released_count"] != 1 or os.path.lexists(root["path"]):
+        if (released["data"]["released_count"] != 1 or os.path.lexists(root["path"])
+                or len(released["data"]["rows"]) != 1
+                or released["data"]["rows"][0]["root_id"] != root["root_id"]):
             raise Fault("R11", "the root was not released after the replay settled")
         return {"root": root["root_id"], "pending_before_detach": 1, "detach": detached,
                 "device_before": old_device, "device_after": self.device_after_remount,
                 "device_changed": remounted, "replay_pending": 0, "released_after": 1}
 
+    def reset_registration(self):
+        """Use a new private state and a supported registration, only after R11 passes."""
+        if not self.results or self.results[-1]["case"] != "R11" or self.results[-1]["status"] != "passed":
+            raise Fault("registration", "R11 has not completed successfully")
+        self.state = tempfile.mkdtemp(prefix="state-r12-", dir=self.root)
+        self.env["BARGE_STATE_DIR"] = self.state
+        _code, preview = self.barge(
+            "volume", "register", "--mount", self.mount, "--availability", "permanent",
+            "--durability", "expendable", "--root-dir", "", "--reserve", "0",
+            "--floor", "0", "--declared-by", "release-proof", "--plan", expect=0)
+        plan = preview["data"]["plan"]
+        document = json.loads(plan)
+        if document["record"]["volume_uuid"] != self.uuid or document["record"]["mount_hint"] != self.mount:
+            raise Fault("registration", "registration plan did not bind the verified image")
+        plan_file = os.path.join(self.root, "r12-register.json")
+        with open(plan_file, "w", encoding="utf-8") as handle:
+            handle.write(plan)
+        self.barge("volume", "register", "--plan-file", plan_file,
+                   "--plan-sha256", preview["data"]["plan_sha256"], expect=0)
+
     def case_named_run_refuses_a_root_it_was_not_given(self):
+        self.reset_registration()
         area = self.fresh_area("c12", f"oldest-idle:{AREA_AGE_SECONDS}")
         given = self.new_root(area, aged=True)
         preview, row, plan_file = self.plan_and_run("R12", area, given, expect_eligible=True)
@@ -1068,14 +1145,23 @@ class Proof:
                 evidence = getattr(self, case["method"])()
                 self.results.append({"case": name, "status": "passed", "carried_by": case["carried_by"],
                                      "evidence": evidence, "reference_controls": self.references})
+            except Infrastructure as error:
+                self.unknown_custody = True
+                self.infrastructure = {"check": error.check, "detail": error.detail}
+                self.results.append({"case": name, "status": "failed", "kind": error.check,
+                                     "detail": error.detail, "carried_by": case["carried_by"]})
+                self.first_fault = self.first_fault or name
+                self.stop_remaining(case, unknown=True)
+                return
             except Fault as error:
                 self.results.append({"case": name, "status": "failed", "kind": error.check,
                                      "detail": error.detail, "carried_by": case["carried_by"],
                                      "reference_controls": self.references})
                 if self.first_fault is None:
                     self.first_fault = name
-                if not self.diagnostic:
-                    self.stop_remaining(case)
+                if not self.diagnostic or error.check in ("command", "barge", "premise", "isolation"):
+                    self.unknown_custody = error.check in ("command", "barge", "premise", "isolation")
+                    self.stop_remaining(case, unknown=self.unknown_custody)
                     return
             except Exception as error:
                 self.results.append({"case": name, "status": "failed", "kind": "exception",
@@ -1085,15 +1171,17 @@ class Proof:
                                      "reference_controls": self.references})
                 if self.first_fault is None:
                     self.first_fault = name
-                if not self.diagnostic:
-                    self.stop_remaining(case)
-                    return
+                self.unknown_custody = True
+                self.stop_remaining(case, unknown=True)
+                return
 
-    def stop_remaining(self, failed):
+    def stop_remaining(self, failed, unknown=False):
         index = CASES.index(failed)
         for case in CASES[index + 1:]:
-            self.results.append({"case": case["id"], "status": "skipped",
-                                 "detail": f"the counted run stopped at {failed['id']}"})
+            dependent = failed["id"] == "R11" and case["id"] == "R12"
+            self.results.append({"case": case["id"],
+                                 "status": "skipped" if dependent else "unexecuted",
+                                 "detail": f"{'unknown outcome' if unknown else 'fail-fast'} at {failed['id']}"})
 
     def receipt_document(self, cancelled):
         passed = [result for result in self.results if result["status"] == "passed"]
@@ -1172,25 +1260,37 @@ def inner_half(mode, binary, receipt_path):
             raise Fault("preflight", "; ".join(proof.preflight["problems"]))
         proof.run_cases()
     except Infrastructure as error:
+        proof.unknown_custody = True
         proof.infrastructure = {"check": error.check, "detail": error.detail}
     except Fault as error:
+        proof.unknown_custody = proof.attached
         proof.results.append({"case": "setup", "status": "failed", "kind": error.check,
                               "detail": error.detail})
         proof.first_fault = proof.first_fault or "setup"
     except Exception as error:
+        proof.unknown_custody = proof.attached
         proof.results.append({"case": "setup", "status": "failed", "kind": "exception",
                               "detail": f"{type(error).__name__}: {error}",
                               "trace": traceback.format_exc()[-800:]})
         proof.first_fault = proof.first_fault or "setup"
     finally:
         try:
-            if proof.attached:
+            if proof.unknown_custody:
+                proof.closure = {"exit": None, "mount_absent": False, "mount": proof.mount,
+                                 "detail": "unknown custody; retained without repair"}
+            elif proof.attached:
                 proof.closure = proof.detach()
             else:
                 proof.closure = {"exit": None, "mount_absent": True, "mount": proof.mount}
         except Exception as error:
             cancelled = f"the detach raised: {type(error).__name__}: {error}"
             proof.closure = {"exit": None, "mount_absent": False, "mount": proof.mount}
+
+    recorded = {result["case"] for result in proof.results}
+    for case in CASES:
+        if case["id"] not in recorded:
+            proof.results.append({"case": case["id"], "status": "unexecuted",
+                                  "detail": "setup or infrastructure did not complete"})
 
     if proof.real_state is None:
         proof.real_state = {"before": {"status": "never observed", "digest": None}, "after": None}
@@ -1337,6 +1437,56 @@ def pure_self_check():
         problems.append("a build with no barge binary artifact reports one")
     if not staged_build_problems(os.path.join(scratch, "absent", "barge"), "0" * 40):
         problems.append("a binary with no staged manifest is not refused")
+    # Exercise the same path and rollback helpers used by R11, without a filesystem.
+    identity = {"volume_uuid": "uuid", "mount_relative_path": "area/root", "inode": 7,
+                "record_path": "/state/id"}
+    good = rebound_path("/Volumes/a", "/Volumes/b", "/Volumes/a/area/root", identity, "uuid")
+    if good != "/Volumes/b/area/root":
+        problems.append("rebind did not preserve the relative path")
+    for old, record, uuid in [
+        ("/Volumes/b/area/root", identity, "uuid"),
+        ("/Volumes/a/area/other", identity, "uuid"),
+        ("/Volumes/a/area/root", dict(identity, volume_uuid="other"), "uuid"),
+    ]:
+        try:
+            rebound_path("/Volumes/a", "/Volumes/b", old, record, uuid)
+            problems.append("rebind accepted a substituted path or identity")
+        except Fault:
+            pass
+    with mock.patch("builtins.open", side_effect=[io.BytesIO(b"id"), io.BytesIO(b"marker"), io.BytesIO(b"content")]), \
+            mock.patch("os.stat", return_value=mock.Mock(st_ino=7)):
+        verify_rollback(good, identity, b"id", b"marker", b"content", [])
+    try:
+        verify_rollback(good, identity, b"id", b"marker", b"content", [{"phase": "pending"}])
+        problems.append("rollback accepted an uncleared intent")
+    except Fault:
+        pass
+    # Drive the real dispatcher: an R11 fault cannot enter R12's ordinary commands.
+    fake = Proof("unused", "unused", True, {})
+    for case in CASES:
+        setattr(fake, case["method"], lambda: {})
+    def fail_remount():
+        raise Fault("R11", "synthetic failed oracle")
+    setattr(fake, CASES[-2]["method"], fail_remount)
+    setattr(fake, CASES[-1]["method"], lambda: problems.append("R12 ran after failed R11"))
+    fake.run_cases()
+    if fake.results[-1]["status"] != "skipped":
+        problems.append("failed R11 did not skip R12")
+    # Drive the real R12 body: its failed registration gate must precede all ordinary work.
+    stale = Proof("unused", "unused", True, {})
+    stale.fresh_area = lambda *args: problems.append("ordinary area operation used the stale hint")
+    try:
+        stale.case_named_run_refuses_a_root_it_was_not_given()
+        problems.append("R12 accepted an uncompleted R11")
+    except Fault:
+        pass
+    with mock.patch("builtins.open", side_effect=[io.BytesIO(b"different"), io.BytesIO(b"marker"), io.BytesIO(b"content")]), \
+            mock.patch("os.stat", return_value=mock.Mock(st_ino=7)):
+        try:
+            verify_rollback(good, identity, b"id", b"marker", b"content", [])
+            problems.append("rollback accepted a substituted identity")
+        except Fault:
+            pass
     return problems
 
 
@@ -1370,6 +1520,17 @@ def plan_document():
             "rule": "every bound path resolves inside the supervisor's owned scratch; the reference control each case chose must too",
         },
         "limitation": LIMITATION,
+        "premise_dispositions": {
+            "private_home_rustup": "setup uses private HOME/CARGO_HOME; no fixture builds; stage_proof_binary uses the pinned repository toolchain and committed lock with auto-install disabled",
+            "account_home": "fixture_environment binds HOME and BARGE_ACCOUNT_HOME; setup sets OXIDE_TEST_HOME_FROM_ENV for children",
+            "environment": "setup scrubs inherited OXIDE, XDG and BARGE variables, then restores guard and fixture bindings",
+            "adoption": "no checkout build in the fixture; roots are created explicitly by new_root",
+            "cargo_argv": "no fake Cargo external subcommand is invoked",
+            "owned_image": "attach uses owners on; UUID and ownership checked; ordinary detach only; uncertain custody retained",
+            "compiler_flags": "stage_proof_binary and fixture setup remove both inherited flag variables",
+            "temporary_storage": "setup creates run root inside the guard scratch, image backing inside run root",
+            "mktemp": "setup and reset_registration use tempfile.mkdtemp with an explicit owned parent",
+        },
         "bounds": {
             "admission": "heavy",
             "image_mib": IMAGE_MIB,

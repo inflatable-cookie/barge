@@ -1626,6 +1626,17 @@ case's plan:
 | R11 | a pending intent is written before the rename; after an ordinary detach and reattach, a later run settles it by UUID and the root releases after | the intent and remount |
 | R12 | a run releases only the rows its presented plan carries | the plan's scope |
 
+R11 retains the original identity record, marker, inode and fixture content through
+replay. It binds the recorded relative path to the reattached mount only after the
+UUID is verified, requires a cleared journal and an eligible plan for that identity,
+and checks the exact root's release. The mount names and device observations are
+separate facts. After R11 completes, R12 uses a fresh private state directory and a
+digest-bound `volume register` plan for the same verified image; the old registration
+is never rewritten. A failed R11 skips R12. Unknown command, device or custody
+outcomes stop collection and retain the image without a repair attempt; receipts
+identify skipped and unexecuted cases. The effect-free self-check exercises the
+rebind, rollback and dispatch gates; it supplies no native credit.
+
 The receipt, `release-proof-receipt.json` under `OXIDE_PROOF_EVIDENCE`, records the
 head, the binary's and the supervisor's digests, the volume UUID and its device
 before and after the remount, the closure (ordinary detach, mount absent), the
