@@ -17,6 +17,10 @@
 //!   selected, pending, reserved, pruning or cancelling is current; Oxide's own
 //!   [`Row::live`] predicate includes `pending`, and this reader keeps that
 //!   stricter reading so a row Oxide has not settled never releases a root.
+//! - **Oxide's pool writer custody** (R4, [`crate::pool_custody`]): each pool's
+//!   control state and ledger, read once. A checkout with a live writer is
+//!   current; a checkout whose writers cannot be read as closed keeps its set
+//!   incomplete. Closed adds no row.
 //!
 //! Two rules run through every reader:
 //!
@@ -40,6 +44,7 @@ use crate::area::{self, AreaDocument, HoldReading, PrunePolicy};
 use crate::cache::{self, PlacementForm, PlacementSet};
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{AccountFacts, DirHandle, DirOps, VolumeUuid};
+use crate::pool_custody::{Custody, PoolCustody, REMOVABLE_POOL_DIR};
 use crate::state::{self, Bounds, Deadline, ReadOutcome, StatePaths};
 
 /// A reference from one of Barge's own records.
@@ -54,6 +59,9 @@ pub const OXIDE_RECEIPT: &str = "oxide_receipt";
 pub const OXIDE_REGISTRY: &str = "oxide_registry";
 /// Ownership recorded by an Oxide root marker.
 pub const OXIDE_MARKER: &str = "oxide_marker";
+/// A checkout's writer custody, read from Oxide's pool state and ledger. Held
+/// names the root as wanted; unknown keeps the set incomplete.
+pub const OXIDE_WRITER_CUSTODY: &str = "oxide_writer_custody";
 
 /// Oxide's current outputs registry.
 pub const OXIDE_REGISTRY_V2: &str = "oxide.outputs.registry/2";
@@ -521,6 +529,8 @@ pub struct OxideSnapshot {
     pub receipts: OxideReceipts,
     /// Why the snapshot as a whole is incomplete, when it is.
     pub detail: Option<String>,
+    /// The writer custody of the pools that hold these outputs, read once.
+    pub custody: PoolCustody,
 }
 
 impl OxideSnapshot {
@@ -531,6 +541,7 @@ impl OxideSnapshot {
             registry: OxideRegistry::Absent,
             receipts: OxideReceipts::Absent,
             detail: None,
+            custody: PoolCustody::default(),
         }
     }
 
@@ -545,7 +556,9 @@ impl OxideSnapshot {
             OxideRegistry::Read { complete, .. } => *complete,
             OxideRegistry::Unknown { .. } => false,
         };
-        registry_complete && !matches!(self.receipts, OxideReceipts::Unknown { .. })
+        registry_complete
+            && !matches!(self.receipts, OxideReceipts::Unknown { .. })
+            && self.custody.unattributed().is_none()
     }
 
     /// Read Oxide's reference records for this account, bounded and read-only.
@@ -576,16 +589,23 @@ impl OxideSnapshot {
         let outputs = control.join(OXIDE_OUTPUTS_DIR);
         let registry = read_registry(&outputs.join(OXIDE_REGISTRY_FILE), deadline);
         let receipts = read_receipts(&outputs, deadline);
+        let custody = match pools_holding(&control) {
+            Ok(pools) => PoolCustody::read(&pools, deadline),
+            Err(reason) => PoolCustody::unknown(reason),
+        };
         let detail = match (&registry, &receipts) {
             (OxideRegistry::Unknown { reason }, _) => Some(reason.clone()),
             (_, OxideReceipts::Unknown { reason }) => Some(reason.clone()),
-            _ => None,
+            _ => custody
+                .unattributed()
+                .map(|reason| format!("Oxide's pool custody is unknown: {reason}")),
         };
         Self {
             control: Some(control),
             registry,
             receipts,
             detail,
+            custody,
         }
     }
 
@@ -606,6 +626,7 @@ impl OxideSnapshot {
                 reason: reason.clone(),
             },
             detail: Some(reason),
+            custody: PoolCustody::default(),
         }
     }
 
@@ -635,6 +656,8 @@ impl OxideSnapshot {
         // The checkouts whose own records still select this root. A marker's
         // reference is current only when its own checkout is one of them.
         let mut selecting: Vec<PathBuf> = Vec::new();
+        // Every checkout that names this root, whose writers must be closed first.
+        let mut named: Vec<PathBuf> = Vec::new();
         match &self.registry {
             OxideRegistry::Absent => {}
             OxideRegistry::Unknown { reason } => {
@@ -657,6 +680,7 @@ impl OxideSnapshot {
                     .filter(|row| row_names_root(row, root_path, mount_relative_path))
                 {
                     let row_volume = row.checkout_volume.clone();
+                    named.push(row.checkout.clone());
                     let reference =
                         ReferenceRow::new(OXIDE_REGISTRY, row.live()).with_detail(format!(
                             "the registry row for checkout {} is {}",
@@ -702,6 +726,7 @@ impl OxideSnapshot {
                     {
                         continue;
                     }
+                    named.push(receipt.checkout.clone());
                     let current = receipt
                         .current
                         .iter()
@@ -732,6 +757,7 @@ impl OxideSnapshot {
             }
         }
         if let Some(marker) = marker {
+            named.push(marker.checkout.clone());
             // A marker names the checkout that owns the root. It is not a
             // selection, so a marker-only reference is never current on its own:
             // its own rule is "the consumer path is gone", and the gate must prove
@@ -809,6 +835,26 @@ impl OxideSnapshot {
                     "the receipt for checkout id {} that owns this root is not present",
                     marker.checkout_id
                 )));
+            }
+        }
+        named.sort();
+        named.dedup();
+        for checkout in &named {
+            match self.custody.for_checkout(checkout) {
+                Custody::Closed => {}
+                Custody::Held(detail) => {
+                    set.rows
+                        .push(
+                            ReferenceRow::new(OXIDE_WRITER_CUSTODY, true).with_detail(format!(
+                                "checkout {} has a writer still held: {detail}",
+                                checkout.display()
+                            )),
+                        )
+                }
+                Custody::Unknown(detail) => set.absorb(ReferenceSet::unknown(format!(
+                    "the writer custody of checkout {} is unknown: {detail}",
+                    checkout.display()
+                ))),
             }
         }
         set
@@ -1008,6 +1054,35 @@ fn control_directory_with(
                 .map(|path| path.display().to_string())
                 .collect::<Vec<String>>()
                 .into(),
+        )),
+    }
+}
+
+/// The pool directories whose writers can name Oxide's outputs under one control
+/// directory: the internal pool, and the removable pool when one is registered.
+/// The removable pool lives at `<internal control>/removable`, and its control
+/// directory is the `oxide-managed` folder inside that. An entry there that is
+/// not a real directory is unknown, never skipped.
+fn pools_holding(control: &Path) -> std::result::Result<Vec<PathBuf>, String> {
+    let Some(internal) = control.parent() else {
+        return Err(format!(
+            "{} has no pool directory above it, so its writers are unknown",
+            control.display()
+        ));
+    };
+    let removable = control.join(REMOVABLE_POOL_DIR);
+    match std::fs::symlink_metadata(&removable) {
+        Ok(metadata) if metadata.is_dir() => Ok(vec![internal.to_path_buf(), removable]),
+        Ok(_) => Err(format!(
+            "{} exists and is not a directory, so the removable pool's writers are unknown",
+            removable.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(vec![internal.to_path_buf()])
+        }
+        Err(error) => Err(format!(
+            "{} cannot be inspected, so the removable pool's writers are unknown: {error}",
+            removable.display()
         )),
     }
 }
@@ -3304,5 +3379,137 @@ mod tests {
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         )
         .is_ok());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod writer_custody_tests {
+    use super::*;
+    use crate::pool_custody::PoolCustody;
+    use crate::testkit::TempDir;
+    use std::time::Duration;
+
+    const CHECKOUT: &str = "/work/app";
+
+    fn custody(state: &str) -> (TempDir, PoolCustody) {
+        let dir = TempDir::new("writer-custody-wiring");
+        let pool = dir.path().join("pool");
+        std::fs::create_dir_all(pool.join("oxide-managed")).unwrap();
+        std::fs::write(pool.join("oxide-managed").join("state.json"), state).unwrap();
+        std::fs::write(
+            pool.join("ledger.json"),
+            r#"{"version":1,"store_id":"0123456789abcdef0123456789abcdef","cap_bytes":1024,"next_slot":1,"next_lease":1,"slots":[]}"#,
+        )
+        .unwrap();
+        let reading = PoolCustody::read(&[pool], Deadline::after(Duration::from_secs(10)));
+        (dir, reading)
+    }
+
+    fn state_with(record: &str) -> String {
+        format!(
+            r#"{{"version":9,"next_id":2,"next_use":1,"tickets":[],"cleans":[],"records":[{record}],"recorded_accounting":"oxide.accounting/1","eviction_accounting":"oxide.eviction-accounting/1","slot_ceiling":"oxide.slots/256","holding":"oxide.holding/1"}}"#
+        )
+    }
+
+    fn snapshot(custody: PoolCustody) -> OxideSnapshot {
+        OxideSnapshot {
+            control: None,
+            registry: OxideRegistry::Absent,
+            receipts: OxideReceipts::Absent,
+            detail: None,
+            custody,
+        }
+    }
+
+    fn marker() -> OxideMarker {
+        OxideMarker {
+            checkout: PathBuf::from(CHECKOUT),
+            checkout_id: "checkout-1".to_owned(),
+            checkout_volume: None,
+        }
+    }
+
+    fn custody_rows(set: &ReferenceSet) -> Vec<&ReferenceRow> {
+        set.rows
+            .iter()
+            .filter(|row| row.source == OXIDE_WRITER_CUSTODY)
+            .collect()
+    }
+
+    #[test]
+    fn a_held_checkout_names_the_root_it_owns_as_current() {
+        let running = r#"{"id":1,"identity":"i","compatibility":"c","profile":"release","checkout":"/work/app","phase":"running","process_group":null,"last_used":1}"#;
+        let (_dir, reading) = custody(&state_with(running));
+        let set = snapshot(reading).references_for(
+            Path::new("/Volumes/Builds/oxide-outputs/app/target"),
+            "oxide/outputs/app",
+            Some(&marker()),
+            None,
+        );
+        let rows = custody_rows(&set);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].current, "a held writer keeps the root");
+        assert!(set.any_current());
+    }
+
+    #[test]
+    fn an_unknown_checkout_makes_its_set_incomplete() {
+        let lost = r#"{"id":1,"identity":"i","compatibility":"c","profile":"release","checkout":"/work/app","phase":"retired","process_group":null,"last_used":1,"lost":{"slot_id":"4","at_ms":1,"unclosed":"writers unknown"}}"#;
+        let (_dir, reading) = custody(&state_with(lost));
+        let set = snapshot(reading).references_for(
+            Path::new("/Volumes/Builds/oxide-outputs/app/target"),
+            "oxide/outputs/app",
+            Some(&marker()),
+            None,
+        );
+        assert!(!set.complete);
+        assert!(set
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("writer custody of checkout")));
+    }
+
+    #[test]
+    fn a_closed_checkout_adds_no_custody_row() {
+        let idle = r#"{"id":1,"identity":"i","compatibility":"c","profile":"release","checkout":"/work/app","phase":"idle","process_group":null,"last_used":1}"#;
+        let (_dir, reading) = custody(&state_with(idle));
+        let set = snapshot(reading).references_for(
+            Path::new("/Volumes/Builds/oxide-outputs/app/target"),
+            "oxide/outputs/app",
+            Some(&marker()),
+            None,
+        );
+        assert!(custody_rows(&set).is_empty());
+        assert!(!set
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("custody"));
+    }
+
+    #[test]
+    fn a_pool_wide_unknown_makes_the_snapshot_incomplete() {
+        assert!(snapshot(PoolCustody::default()).complete());
+        assert!(!snapshot(PoolCustody::unknown("a pool cannot be read")).complete());
+    }
+
+    #[test]
+    fn the_removable_pool_is_read_only_when_it_is_a_directory() {
+        let dir = TempDir::new("writer-custody-pools");
+        let internal = dir.path().join("pool");
+        let control = internal.join("oxide-managed");
+        std::fs::create_dir_all(&control).unwrap();
+        assert_eq!(pools_holding(&control).unwrap(), vec![internal.clone()]);
+
+        std::fs::create_dir(control.join(REMOVABLE_POOL_DIR)).unwrap();
+        assert_eq!(
+            pools_holding(&control).unwrap(),
+            vec![internal.clone(), control.join(REMOVABLE_POOL_DIR)]
+        );
+
+        std::fs::remove_dir(control.join(REMOVABLE_POOL_DIR)).unwrap();
+        std::fs::write(control.join(REMOVABLE_POOL_DIR), b"not a pool").unwrap();
+        assert!(pools_holding(&control).is_err());
     }
 }

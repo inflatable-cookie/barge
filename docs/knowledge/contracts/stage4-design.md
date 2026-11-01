@@ -637,6 +637,15 @@ names it is not current:
   `pruning`, `reservation` and `cancelling` flags; Oxide's root marker names the
   `checkout` and `checkout_id` that own it. A row that is selected, reserved,
   pruning or cancelling is current.
+- **Writer custody, read in place** (R4): every checkout that names the root
+  must have its writers positively closed. The control state
+  (`<pool>/oxide-managed/state.json`) and the pool ledger (`<pool>/ledger.json`)
+  of the internal pool, and of the removable pool inside it, are read once per
+  plan. A checkout with a spawning, running or acquiring record, or with a running
+  clean, is current. A checkout whose custody cannot be read as closed makes its
+  set incomplete. A closed checkout adds no row. A fact that belongs to no one
+  checkout (an unreadable pool, a held ledger row with no record) makes every
+  Oxide set incomplete, so the whole batch is kept.
 - **The absence requirement** applies to the reference, not to the root: when a
   reference's own rule is "the consumer path is gone", that path needs a
   `barge.absence/1` proof of `Absent`. When a reference's rule is only "no
@@ -659,6 +668,7 @@ is deliberately compatible in both directions.
 | only the leaf may be `ENOENT`; a missing non-leaf ancestor is uncertainty, never absence | the same, for the same reason | identical |
 | no ownership or device check on a walk component; the volume proof is the local-volume check | the same | identical, and required: `/Users` and `/private` are root-owned and reach the Data volume through firmlinks, so either check on a component would refuse every real `/Users/...` checkout |
 | `Absent` requires the root's own identity, custody and no current selection | the same, as the [gate](#releasability-the-one-gate) | identical |
+| a checkout's writers are closed in both pools: Oxide's `checkout_custody` over `state.json`, with the ledger's held rows bound to their records | the same reading, `pool_custody`: closed, held or unknown per checkout; a lost, unknown, unreadable, malformed, oversized, unknown-version or mid-read-changed fact is unknown | stricter in three places, each keeping more: a retired record without a lost fact is unknown; an unclosed lost slot is unknown whatever its holder's boot session; an acquiring record or a running clean is held |
 | `diskutil`/`statfs` text | never identity; kernel facts through descriptors | stage 1's rule |
 
 Rules that keep the handover safe:
@@ -666,9 +676,11 @@ Rules that keep the handover safe:
 - While Oxide prunes, **Barge deletes no Oxide root.** The primitive is
   implemented and proven against Barge-owned roots first; Oxide's adoption is
   its own slice with its own brief (stage 1 S8, `F6` below).
-- Barge never writes an Oxide marker, receipt, registry row or tombstone. It
-  reads `oxide.outputs.root/2` markers, `oxide.outputs.registry/2` rows and the
-  receipts strictly, bounded, and reports them.
+- Barge never writes an Oxide marker, receipt, registry row, tombstone, control
+  state or ledger. It reads `oxide.outputs.root/2` markers,
+  `oxide.outputs.registry/2` rows, the receipts and each pool's `state.json` and
+  `ledger.json` strictly, bounded and in place, and reports them. It takes no
+  Oxide lock and creates no file.
 - Where Oxide's own rule is stricter than Barge's — the complete-receipt
   requirement, and the operator list that can waive it for named legacy roots —
   Oxide's rule wins while Oxide owns the prune.
