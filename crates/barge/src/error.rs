@@ -30,6 +30,8 @@ pub enum ErrorKind {
     RefusedContainment,
     /// The volume that holds the path is not attached.
     VolumeAbsent,
+    /// The floor is breached and no deletion occurred.
+    SpaceBelowFloor,
     /// A different volume is at the expected place.
     VolumeMismatch,
     /// A fact could not be read or did not validate; unknown is never a default.
@@ -54,6 +56,7 @@ impl ErrorKind {
             Self::RefusedBoundary => "refused_boundary",
             Self::RefusedContainment => "refused_containment",
             Self::VolumeAbsent => "volume_absent",
+            Self::SpaceBelowFloor => "space_below_floor",
             Self::VolumeMismatch => "volume_mismatch",
             Self::UnknownState => "unknown_state",
             Self::ForeignOwner => "foreign_owner",
@@ -74,6 +77,7 @@ impl ErrorKind {
             | Self::RefusedBoundary
             | Self::RefusedContainment
             | Self::VolumeAbsent
+            | Self::SpaceBelowFloor
             | Self::VolumeMismatch
             | Self::ForeignOwner
             | Self::CustodyNotProven
@@ -204,6 +208,7 @@ mod tests {
             (ErrorKind::RefusedBoundary, "refused_boundary", 2),
             (ErrorKind::RefusedContainment, "refused_containment", 2),
             (ErrorKind::VolumeAbsent, "volume_absent", 2),
+            (ErrorKind::SpaceBelowFloor, "space_below_floor", 2),
             (ErrorKind::VolumeMismatch, "volume_mismatch", 2),
             (ErrorKind::UnknownState, "unknown_state", 3),
             (ErrorKind::ForeignOwner, "foreign_owner", 2),

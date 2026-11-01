@@ -2,6 +2,9 @@
 //! candidate plan and, in [`effect`], its real run.
 
 mod effect;
+mod guard;
+
+pub use guard::{SpaceDecision, SpaceGuard};
 
 pub use effect::{
     prune, SpaceFlushRow, SpacePruneBounds, SpacePruneEffect, SpacePruneHeldRow,
