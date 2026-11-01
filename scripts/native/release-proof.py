@@ -1102,8 +1102,8 @@ class Proof:
         self.env["BARGE_STATE_DIR"] = self.state
         _code, preview = self.barge(
             "volume", "register", "--mount", self.mount, "--availability", "permanent",
-            "--durability", "expendable", "--root-dir", "", "--reserve", "0",
-            "--floor", "0", "--declared-by", "release-proof", "--plan", expect=0)
+            "--durability", "expendable", "--root-dir", "", "--reserve", "1KiB",
+            "--floor", "1KiB", "--declared-by", "release-proof", "--plan", expect=0)
         plan = preview["data"]["plan"]
         document = json.loads(plan)
         if document["record"]["volume_uuid"] != self.uuid or document["record"]["mount_hint"] != self.mount:
