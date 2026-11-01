@@ -91,8 +91,19 @@ pub(crate) fn fallback_roots(
     mounts: &dyn MountRoot,
     records: &[VolumeRecord],
 ) -> Result<RowSet<FallbackRoot>> {
+    fallback_roots_with_bounds(paths, facts, mounts, records, ROOT_ROWS, READ_DEADLINE)
+}
+
+fn fallback_roots_with_bounds(
+    paths: &StatePaths,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    records: &[VolumeRecord],
+    limit: usize,
+    wall: Duration,
+) -> Result<RowSet<FallbackRoot>> {
     let declarations = area::read_declarations(paths)?;
-    let deadline = Instant::now() + READ_DEADLINE;
+    let deadline = Instant::now() + wall;
     let mut rows = Vec::new();
     let mut total = 0usize;
     for record in records {
@@ -100,8 +111,8 @@ pub(crate) fn fallback_roots(
             let area::AbsentPolicy::FallbackLocal { path } = &declaration.absent else {
                 continue;
             };
-            if Instant::now() >= deadline || total >= ROOT_ROWS {
-                return Ok(RowSet::bounded(rows, total.saturating_add(1), ROOT_ROWS));
+            if Instant::now() >= deadline || total >= limit {
+                return Ok(RowSet::bounded(rows, total.saturating_add(1), limit));
             }
             let observation = match std::fs::symlink_metadata(path) {
                 Ok(metadata) => metadata.is_dir() && !metadata.file_type().is_symlink(),
@@ -134,7 +145,7 @@ pub(crate) fn fallback_roots(
         // complete empty observation when their contents are unknown.
         return Ok(RowSet::bounded(rows, total.saturating_add(1), total));
     }
-    Ok(RowSet::bounded(rows, total, ROOT_ROWS))
+    Ok(RowSet::bounded(rows, total, limit))
 }
 
 /// A registered volume and its present measurement.
@@ -2955,6 +2966,17 @@ mod tests {
         declaration.absent = area::AbsentPolicy::FallbackLocal { path: path.clone() };
         area::declare(&fixture.state, &declaration, 1).expect("declare");
         let facts = fixture.facts();
+        let bounded = fallback_roots_with_bounds(
+            &fixture.state,
+            &facts,
+            &fixture.mounts(),
+            std::slice::from_ref(&fixture.record),
+            0,
+            READ_DEADLINE,
+        )
+        .expect("bounded");
+        assert!(bounded.truncated);
+        assert_eq!(bounded.count, 0);
         let present =
             report(&fixture.state, &facts, &fixture.mounts(), &Injected(true)).expect("present");
         assert_eq!(
@@ -2968,6 +2990,22 @@ mod tests {
             absent.fallback_roots.unwrap().rows[0].reason,
             "volume_absent"
         );
+        let blocked = fixture.dir.join("blocked");
+        std::fs::create_dir(&blocked).expect("blocked parent");
+        let inaccessible = blocked.join("fallback");
+        std::fs::create_dir(&inaccessible).expect("blocked fallback");
+        let mut changed = declaration.clone();
+        changed.absent = area::AbsentPolicy::FallbackLocal { path: inaccessible };
+        area::declare(&fixture.state, &changed, 2).expect("update declaration");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0))
+            .expect("close parent");
+        let unknown = report(&fixture.state, &facts, &fixture.mounts(), &Injected(true))
+            .expect("unknown fallback");
+        assert_eq!(unknown.fallback_roots.unwrap().rows[0].reason, "unknown");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700))
+            .expect("restore fixture permissions");
+        area::declare(&fixture.state, &declaration, 3).expect("restore declaration");
         std::fs::remove_dir(path).expect("remove fixture fallback");
         let missing =
             report(&fixture.state, &facts, &fixture.mounts(), &Injected(true)).expect("missing");
