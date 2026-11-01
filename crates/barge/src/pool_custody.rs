@@ -24,8 +24,9 @@
 //!   or mid-read-changed fact, or a record that cannot be read as closed.
 //!
 //! Unknown keeps. A fact that cannot be tied to one checkout (a held row with no
-//! record, an unreadable pool) is pool-wide unknown, and the caller keeps every
-//! root that the reading covers.
+//! record, an active or unclosed record that names no checkout, an unreadable
+//! pool) is pool-wide unknown, and the caller keeps every root that the reading
+//! covers.
 //!
 //! Where this reader is stricter than Oxide's own check, the difference keeps
 //! more, never less:
@@ -259,6 +260,11 @@ impl PoolCustody {
 
         for record in records {
             let Some(checkout) = record.checkout.as_deref() else {
+                // No checkout to assign to, so an active or unclosed fact is
+                // pool-wide: it could be any checkout's writer.
+                if let Some(detail) = unassigned_fact(record) {
+                    self.pool_unknown(pool, &detail);
+                }
                 continue;
             };
             match record.phase {
@@ -324,22 +330,22 @@ impl PoolCustody {
                 );
                 continue;
             };
-            let Some(checkout) = record.checkout.as_deref() else {
-                continue;
+            let mismatch = match (slot.state, record.phase) {
+                (SlotState::Held, Phase::Idle) => Some(format!(
+                    "ledger slot {} is held but its record is idle",
+                    slot.id
+                )),
+                (SlotState::Evicting, phase) if phase != Phase::Idle => Some(format!(
+                    "ledger slot {} is evicting while its record is {phase:?}",
+                    slot.id
+                )),
+                _ => None,
             };
-            match (slot.state, record.phase) {
-                (SlotState::Held, Phase::Idle) => self.add_unknown(
-                    checkout,
-                    format!("ledger slot {} is held but its record is idle", slot.id),
-                ),
-                (SlotState::Evicting, phase) if phase != Phase::Idle => self.add_unknown(
-                    checkout,
-                    format!(
-                        "ledger slot {} is evicting while its record is {phase:?}",
-                        slot.id
-                    ),
-                ),
-                _ => {}
+            if let Some(detail) = mismatch {
+                match record.checkout.as_deref() {
+                    Some(checkout) => self.add_unknown(checkout, detail),
+                    None => self.pool_unknown(pool, &detail),
+                }
             }
         }
     }
@@ -415,6 +421,31 @@ fn fence_matches(value: Option<&str>, known: &str, first_version: u32, version: 
     match value {
         None => version < first_version,
         Some(found) => found == known && version >= first_version,
+    }
+}
+
+/// The unknown fact a record with no checkout still carries, if any. An idle
+/// record carries none. A lost slot whose writers were confirmed closed carries
+/// none. Every other active or unclosed record is a fact no checkout can own.
+fn unassigned_fact(record: &RawRecord) -> Option<String> {
+    match record.phase {
+        Phase::Idle => None,
+        Phase::Acquiring | Phase::Spawning | Phase::Running => Some(format!(
+            "slot record {} is {:?} with no checkout, so its writers cannot be assigned",
+            record.id, record.phase
+        )),
+        Phase::Retired => match &record.lost {
+            None => Some(format!(
+                "slot record {} is retired without a lost fact and no checkout, so its writers cannot be assigned",
+                record.id
+            )),
+            Some(lost) => lost.unclosed.as_ref().map(|why| {
+                format!(
+                    "slot {} is lost with writers never confirmed closed ({why}) and no checkout",
+                    lost.slot_id
+                )
+            }),
+        },
     }
 }
 
@@ -854,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_with_no_checkout_names_no_checkout() {
+    fn an_active_record_with_no_checkout_is_pool_wide_unknown() {
         let (_dir, pool) = fixture("custody-no-checkout");
         write(
             &pool,
@@ -862,8 +893,44 @@ mod tests {
             Some(&ledger(&[slot(1, "held", &affinity(&pool, 1))])),
         );
         let reading = read(&pool);
+        assert_unknown(&reading, checkout());
+        assert_pool_unknown(&reading);
+    }
+
+    #[test]
+    fn an_idle_record_with_no_checkout_names_no_checkout() {
+        let (_dir, pool) = fixture("custody-idle-no-checkout");
+        write(
+            &pool,
+            Some(&state(&[record(1, None, "idle", "")], "")),
+            Some(&ledger(&[slot(1, "idle", &affinity(&pool, 1))])),
+        );
+        let reading = read(&pool);
         assert_closed(&reading, checkout());
         assert_eq!(reading.unattributed(), None);
+    }
+
+    #[test]
+    fn an_unclosed_lost_record_with_no_checkout_is_pool_wide_unknown() {
+        let (_dir, pool) = fixture("custody-lost-no-checkout");
+        let retired = record(1, None, "retired", &lost("3", Some("writers unknown")));
+        write(
+            &pool,
+            Some(&state(&[retired], "")),
+            Some(&ledger(&[slot(1, "held", &affinity(&pool, 1))])),
+        );
+        assert_pool_unknown(&read(&pool));
+    }
+
+    #[test]
+    fn a_held_row_on_an_idle_record_with_no_checkout_is_pool_wide_unknown() {
+        let (_dir, pool) = fixture("custody-held-idle-no-checkout");
+        write(
+            &pool,
+            Some(&state(&[record(1, None, "idle", "")], "")),
+            Some(&ledger(&[slot(1, "held", &affinity(&pool, 1))])),
+        );
+        assert_pool_unknown(&read(&pool));
     }
 
     #[test]

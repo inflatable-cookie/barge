@@ -644,8 +644,9 @@ names it is not current:
   plan. A checkout with a spawning, running or acquiring record, or with a running
   clean, is current. A checkout whose custody cannot be read as closed makes its
   set incomplete. A closed checkout adds no row. A fact that belongs to no one
-  checkout (an unreadable pool, a held ledger row with no record) makes every
-  Oxide set incomplete, so the whole batch is kept.
+  checkout makes every Oxide set incomplete, so the whole batch is kept: an
+  unreadable pool, a held ledger row with no record, or an active or unclosed
+  record that names no checkout, since no checkout can own its writers.
 - **The absence requirement** applies to the reference, not to the root: when a
   reference's own rule is "the consumer path is gone", that path needs a
   `barge.absence/1` proof of `Absent`. When a reference's rule is only "no
