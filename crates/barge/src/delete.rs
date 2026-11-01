@@ -94,7 +94,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::area::{self, AreaDeclaration, AreaDocument, MarkerExpectation};
+use crate::area::{self, AreaDeclaration, MarkerExpectation};
 use crate::contract::{INTENT_ROWS, LISTING_NAME_ROWS};
 use crate::custody::{self, CustodyBounds, CustodyEvidence, CustodyVerdict, PendingIntent};
 use crate::error::{Error, ErrorKind, Result};
@@ -357,7 +357,6 @@ pub fn delete_unit_on_volume(
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
     declaration: &AreaDeclaration,
-    stored: Option<&AreaDocument>,
     unit: &DeletionUnit,
     bounds: DeleteBounds,
 ) -> Result<DeleteReport> {
@@ -368,7 +367,6 @@ pub fn delete_unit_on_volume(
         mounts,
         observer,
         declaration,
-        stored,
         unit,
         bounds,
         None,
@@ -396,7 +394,6 @@ pub(crate) fn delete_unit_authorized(
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
     declaration: &AreaDeclaration,
-    stored: Option<&AreaDocument>,
     unit: &DeletionUnit,
     bounds: DeleteBounds,
     authorize: Option<&EligibilityCheck<'_>>,
@@ -409,7 +406,6 @@ pub(crate) fn delete_unit_authorized(
         mounts,
         observer,
         declaration,
-        stored,
         unit,
         bounds,
         VolumeLocking::Take,
@@ -438,7 +434,6 @@ pub(crate) fn delete_unit_under_volume_lock(
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
     declaration: &AreaDeclaration,
-    stored: Option<&AreaDocument>,
     unit: &DeletionUnit,
     bounds: DeleteBounds,
     volume_lock: &crate::state::StateLock,
@@ -461,7 +456,6 @@ pub(crate) fn delete_unit_under_volume_lock(
         mounts,
         observer,
         declaration,
-        stored,
         unit,
         bounds,
         VolumeLocking::Held,
@@ -478,7 +472,6 @@ fn delete_unit_locked(
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
     declaration: &AreaDeclaration,
-    stored: Option<&AreaDocument>,
     unit: &DeletionUnit,
     bounds: DeleteBounds,
     volume_locking: VolumeLocking,
@@ -523,7 +516,6 @@ fn delete_unit_locked(
         observer,
         &volume_uuid,
         declaration,
-        stored,
     )?;
     let resolved = &volume.resolved;
     if unit.root_dir != resolved.root_dir || unit.folder != resolved.folder {
@@ -4461,7 +4453,6 @@ mod tests {
                 &mounts,
                 observer,
                 &self.declaration,
-                None,
                 &self.unit,
                 self.bounds(),
             )
@@ -5172,7 +5163,6 @@ mod tests {
             &mounts,
             &observer,
             &prepared.declaration,
-            None,
             &prepared.unit,
             bounds,
             None,
@@ -5757,7 +5747,6 @@ mod tests {
             &mounts,
             &observer,
             &prepared.declaration,
-            None,
             &unit,
             prepared.bounds(),
         )
@@ -5791,7 +5780,6 @@ mod tests {
             &mounts,
             &observer,
             &prepared.declaration,
-            None,
             &prepared.unit,
             prepared.bounds(),
         )
@@ -5835,7 +5823,6 @@ mod tests {
             &mounts,
             &observer,
             &prepared.declaration,
-            None,
             &prepared.unit,
             prepared.bounds(),
         )
@@ -8853,7 +8840,6 @@ mod tests {
             &mounts,
             &prepared.fixture.observer(),
             &prepared.declaration,
-            None,
             &prepared.unit,
             prepared.bounds(),
             None,

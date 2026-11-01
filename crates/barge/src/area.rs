@@ -22,11 +22,15 @@
 //!   fields, validated field by field, and never repaired or defaulted. An
 //!   absent, oversized, symlinked, foreign-owned, future-dated or
 //!   unknown-version record is unknown, and unknown is never owned.
-//! - **The caller's declaration wins (O-003).** A stored declaration is the
-//!   CLI's form of the same declaration, never a wider policy than the one a
-//!   caller passed: the effective declaration is recorded exactly, and the
-//!   caller's `absent`, `prune` and `reserve` values are never widened by what
-//!   the state directory happens to hold.
+//! - **The stored declaration governs.** A `barge.area/1` record is the
+//!   authority once it exists: a library caller presenting the same declaration
+//!   proceeds, and one presenting a different folder, override, `absent`,
+//!   `prune` or `reserve` policy is refused before any effect, naming every
+//!   field that differs. The first creation, when no record exists, publishes
+//!   the caller's validated declaration under the same rules `barge area
+//!   declare` uses. The effective declaration recorded in a root's marker is
+//!   always the governing record's, so no report implies that a differing caller
+//!   policy was applied (stage 4 F6 contract D2; Q-G).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -34,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::contract::{
     RowSet, AREA_DECLARATION_CAP_BYTES, AREA_ROWS, HOLD_CAP_BYTES, HOLD_ROWS, LISTING_NAME_ROWS,
@@ -340,10 +345,12 @@ impl AreaDocument {
 
 /// The effective policy a root was created under, recorded exactly.
 ///
-/// It is the caller's declaration with the folder resolved for the volume. A
-/// stored declaration never widens it (O-003): when the caller's policies differ
-/// from a stored document's, `stored_differs` says so and the caller's values
-/// stand.
+/// It is the governing declaration with the folder resolved for the volume: the
+/// stored `barge.area/1` record's values whenever one exists, and the caller's
+/// declaration only on first creation, when that declaration is what the state
+/// directory received. A caller that presents a different declaration is refused
+/// rather than substituted, so this record never describes a policy the state
+/// directory did not hold (stage 4 F6 contract D2; Q-G).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectiveDeclaration {
@@ -359,31 +366,19 @@ pub struct EffectiveDeclaration {
     pub prune: PrunePolicy,
     /// Whether this area's bytes count toward the reserve.
     pub reserve: ReserveParticipation,
-    /// Whether a stored declaration for the same area carries different
-    /// policies. The caller's values are still the ones applied.
-    pub stored_differs: bool,
 }
 
 impl EffectiveDeclaration {
-    /// The caller's declaration as the effective policy, with `folder` already
+    /// The governing declaration as the effective policy, with `folder` already
     /// resolved for one volume.
-    pub fn new(caller: &AreaDeclaration, stored: Option<&AreaDocument>, folder: String) -> Self {
-        let stored_differs = stored.is_some_and(|document| {
-            let declaration = document.declaration();
-            declaration.absent != caller.absent
-                || declaration.prune != caller.prune
-                || declaration.reserve != caller.reserve
-                || declaration.folder != caller.folder
-                || declaration.overrides != caller.overrides
-        });
+    pub fn new(governing: &AreaDeclaration, folder: String) -> Self {
         Self {
-            namespace: caller.namespace.clone(),
-            area: caller.area.clone(),
+            namespace: governing.namespace.clone(),
+            area: governing.area.clone(),
             folder,
-            absent: caller.absent.clone(),
-            prune: caller.prune.clone(),
-            reserve: caller.reserve,
-            stored_differs,
+            absent: governing.absent.clone(),
+            prune: governing.prune.clone(),
+            reserve: governing.reserve,
         }
     }
 }
@@ -1319,12 +1314,78 @@ impl ResolvedArea {
     }
 }
 
+/// The policy fields two declarations for one area disagree on, in the fixed
+/// order a refusal names them.
+///
+/// Identity is compared before this and reported on its own. These are the fields
+/// that decide what an area may do: the folder it resolves to, its per-volume
+/// overrides, when a caller sees it as absent, whether its roots may be pruned and
+/// whether its bytes count toward the reserve. `prune` and `reserve` are the
+/// fields that decide deletion authority.
+fn declaration_differences(
+    caller: &AreaDeclaration,
+    stored: &AreaDeclaration,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if caller.folder != stored.folder {
+        fields.push("folder");
+    }
+    if caller.overrides != stored.overrides {
+        fields.push("overrides");
+    }
+    if caller.absent != stored.absent {
+        fields.push("absent");
+    }
+    if caller.prune != stored.prune {
+        fields.push("prune");
+    }
+    if caller.reserve != stored.reserve {
+        fields.push("reserve");
+    }
+    fields
+}
+
+/// Refuse a caller declaration that is not the stored one, naming the fields.
+///
+/// Nothing has been opened, created or published when this is returned: the
+/// stored record is the authority, so a caller can never widen an `absent`,
+/// `prune` or `reserve` policy, or move a folder, by passing its own object.
+fn refuse_declaration_mismatch(
+    caller: &AreaDeclaration,
+    stored: &AreaDocument,
+    fields: &[&'static str],
+) -> Error {
+    Error::new(
+        ErrorKind::Usage,
+        format!(
+            "the caller's declaration for {}/{} differs from the stored `{}` record in {}; the stored declaration governs and nothing was changed",
+            caller.namespace,
+            caller.area,
+            crate::contract::AREA_SCHEMA,
+            fields.join(", ")
+        ),
+    )
+    .with_detail("namespace", caller.namespace.clone().into())
+    .with_detail("area", caller.area.clone().into())
+    .with_detail("stored_generation", stored.generation.into())
+    .with_detail(
+        "fields",
+        fields
+            .iter()
+            .map(|field| (*field).into())
+            .collect::<Vec<Value>>()
+            .into(),
+    )
+}
+
 /// Resolve one declaration for one volume, creating nothing.
 ///
 /// The volume is verified, `root_dir` and then the effective folder are walked
-/// from the verified mount root, and the effective declaration is built from the
-/// caller's declaration: a stored document is reported as differing but never
-/// widens a policy (O-003).
+/// from the verified mount root. A stored document is the authority: a caller
+/// presenting a different declaration is refused here, before the volume is
+/// opened and before anything is created or deleted, and the effective
+/// declaration is built from the stored record. With no stored document the
+/// caller's declaration is the governing one, which is the first-creation case.
 pub fn resolve(
     dirs: &dyn DirOps,
     facts: &dyn VolumeFacts,
@@ -1335,7 +1396,7 @@ pub fn resolve(
     stored: Option<&AreaDocument>,
 ) -> Result<ResolvedArea> {
     caller.validate()?;
-    if let Some(document) = stored {
+    let governing = if let Some(document) = stored {
         document.validate()?;
         if document.namespace != caller.namespace || document.area != caller.area {
             return Err(Error::new(
@@ -1351,7 +1412,15 @@ pub fn resolve(
                 format!("{}/{}", caller.namespace, caller.area).into(),
             ));
         }
-    }
+        let declaration = document.declaration();
+        let fields = declaration_differences(caller, &declaration);
+        if !fields.is_empty() {
+            return Err(refuse_declaration_mismatch(caller, document, &fields));
+        }
+        declaration
+    } else {
+        caller.clone()
+    };
     // An undeclared durability refuses every area use, before a byte is read or
     // written: expending data is never inferred.
     record.declared_durability()?;
@@ -1361,7 +1430,7 @@ pub fn resolve(
     let base = root.mount_point().to_path_buf();
     let root_handle = root.into_handle();
 
-    let folder = effective_folder(record, caller)?;
+    let folder = effective_folder(record, &governing)?;
     let walked = walk_folder_chain(
         dirs,
         root_handle,
@@ -1372,7 +1441,7 @@ pub fn resolve(
         &folder,
     )?;
 
-    let declaration = EffectiveDeclaration::new(caller, stored, folder);
+    let declaration = EffectiveDeclaration::new(&governing, folder);
     let dirs_state = if walked.exists() {
         Direction::Existing {
             handle: walked.handle,
@@ -1605,8 +1674,11 @@ pub fn registered_volume(state: &StatePaths, volume_uuid: &VolumeUuid) -> Result
 /// Prepare one declared area on one registered volume, mutating nothing.
 ///
 /// This is the CLI's route: the registry is read (an invalid registry refuses),
-/// the volume must be registered and its durability declared, and the area is
-/// resolved through the descriptor walk. No folder is created here.
+/// the volume must be registered and its durability declared, the state
+/// directory's record for the area is read here (a caller cannot present or
+/// withhold it), and the area is resolved through the descriptor walk. A caller
+/// declaration that differs from that record is refused, naming the fields. No
+/// folder is created here.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare(
     state: &StatePaths,
@@ -1616,20 +1688,77 @@ pub fn prepare(
     observer: &dyn ProcessObserver,
     volume_uuid: &VolumeUuid,
     declaration: &AreaDeclaration,
-    stored: Option<&AreaDocument>,
 ) -> Result<VolumeArea> {
     let record = registered_volume(state, volume_uuid)?;
-    let resolved = resolve(dirs, facts, mounts, observer, &record, declaration, stored)?;
-    Ok(VolumeArea { record, resolved })
+    let stored = stored_declaration(state, declaration)?;
+    prepare_with(
+        &record,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        declaration,
+        stored.as_ref(),
+    )
+}
+
+/// Resolve one caller declaration against a store snapshot the caller did not
+/// supply.
+#[allow(clippy::too_many_arguments)]
+fn prepare_with(
+    record: &VolumeRecord,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    declaration: &AreaDeclaration,
+    stored: Option<&AreaDocument>,
+) -> Result<VolumeArea> {
+    let resolved = resolve(dirs, facts, mounts, observer, record, declaration, stored)?;
+    Ok(VolumeArea {
+        record: record.clone(),
+        resolved,
+    })
+}
+
+/// The state directory's record for the caller's area, when the area is
+/// declared.
+///
+/// The store is read here, never taken from the caller: a library caller cannot
+/// withhold, replace or override the declaration that governs its call.
+fn stored_declaration(
+    state: &StatePaths,
+    declaration: &AreaDeclaration,
+) -> Result<Option<AreaDocument>> {
+    Ok(read_declarations(state)?
+        .find(&declaration.namespace, &declaration.area)
+        .cloned())
+}
+
+/// Where a root creation's declaration authority comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclarationSource {
+    /// A consumer declaration: the state directory's stored record governs, and a
+    /// first creation publishes the caller's declaration.
+    Store,
+    /// A declaration Barge derives itself for each call (scratch): it is neither
+    /// a consumer declaration nor an area document, so the store neither governs
+    /// nor records it.
+    Derived,
 }
 
 /// Create one owned root inside a declared area on a registered volume.
 ///
-/// The volume lock is held across the resolution and the creation, so two Barge
-/// commands cannot create folder structure on one volume at the same time. The
-/// registry lock is not held across the walk. Nothing is created when the
+/// The caller's declaration is first resolved against the state directory's
+/// record: a stored record governs and must match, and an area with no record
+/// receives the caller's declaration once ([`ensure_declared`]), so the first
+/// creation stores what the caller presented and a later call can only match it.
+/// The volume lock is then held across the resolution and the creation, so two
+/// Barge commands cannot create folder structure on one volume at the same time.
+/// The registry lock is not held across the walk. Nothing is created when the
 /// volume is absent or mismatched, the durability is undeclared, the registry is
-/// invalid or the declaration does not contain its folder.
+/// invalid, the declaration does not contain its folder or the caller's
+/// declaration disagrees with the stored one.
 #[allow(clippy::too_many_arguments)]
 pub fn create_root_on_volume(
     state: &StatePaths,
@@ -1639,8 +1768,62 @@ pub fn create_root_on_volume(
     observer: &dyn ProcessObserver,
     volume_uuid: &VolumeUuid,
     declaration: &AreaDeclaration,
-    stored: Option<&AreaDocument>,
     spec: RootSpec,
+) -> Result<(VolumeArea, OwnedRoot)> {
+    create_root_on_volume_with(
+        state,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        volume_uuid,
+        declaration,
+        spec,
+        DeclarationSource::Store,
+    )
+}
+
+/// Create one owned root under a declaration Barge derives for each call.
+///
+/// This is Barge's own scratch allocation: `barge/scratch`'s folder is derived
+/// from the volume's `folders.scratch` and the project name, so it is never a
+/// stored consumer declaration and the store neither governs nor records it
+/// (`scratch::scratch_declaration`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_root_on_volume_derived(
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    volume_uuid: &VolumeUuid,
+    declaration: &AreaDeclaration,
+    spec: RootSpec,
+) -> Result<(VolumeArea, OwnedRoot)> {
+    create_root_on_volume_with(
+        state,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        volume_uuid,
+        declaration,
+        spec,
+        DeclarationSource::Derived,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_root_on_volume_with(
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    volume_uuid: &VolumeUuid,
+    declaration: &AreaDeclaration,
+    spec: RootSpec,
+    source: DeclarationSource,
 ) -> Result<(VolumeArea, OwnedRoot)> {
     // Every refusal the volume itself can cause happens before any effect: an
     // unregistered UUID, an undeclared durability, an absent volume and a
@@ -1649,24 +1832,35 @@ pub fn create_root_on_volume(
     let record = registered_volume(state, volume_uuid)?;
     record.declared_durability()?;
     VolumeRoot::open(dirs, facts, mounts, &record)?;
+    // A consumer declaration is stored first, so the record the creation is
+    // authorized by exists before any folder does. `ensure_declared` refuses a
+    // declaration that disagrees with an existing record without writing
+    // anything, and it publishes the caller's declaration the first time.
+    let stored = match source {
+        DeclarationSource::Store => Some(ensure_declared(state, declaration, state::now_ms())?),
+        DeclarationSource::Derived => None,
+    };
     state.initialize()?;
     let mut locks = state::LockSet::new(state.clone());
     let _volume_lock = locks.lock_volume(volume_uuid)?;
-    let volume = prepare(
-        state,
+    let volume = prepare_with(
+        &record,
         dirs,
         facts,
         mounts,
         observer,
-        volume_uuid,
         declaration,
-        stored,
+        stored.as_ref(),
     )?;
     let root = create_root(state, dirs, observer, &volume.resolved, spec)?;
     Ok((volume, root))
 }
 
 /// List one declared area's roots on a registered volume, mutating nothing.
+///
+/// The state directory's record governs, exactly as it does for creation: a
+/// caller declaration that differs from it is refused, naming the fields. A
+/// listing creates and stores nothing.
 #[allow(clippy::too_many_arguments)]
 pub fn list_roots_on_volume(
     state: &StatePaths,
@@ -1676,7 +1870,6 @@ pub fn list_roots_on_volume(
     observer: &dyn ProcessObserver,
     volume_uuid: &VolumeUuid,
     declaration: &AreaDeclaration,
-    stored: Option<&AreaDocument>,
     max_roots: usize,
 ) -> Result<(VolumeArea, RootListing)> {
     let volume = prepare(
@@ -1687,7 +1880,6 @@ pub fn list_roots_on_volume(
         observer,
         volume_uuid,
         declaration,
-        stored,
     )?;
     let listing = list_roots(dirs, observer, state, &volume.resolved, max_roots)?;
     Ok((volume, listing))
@@ -2611,6 +2803,18 @@ pub(crate) fn read_directory(path: &Path) -> Result<Option<Vec<String>>> {
     Ok(Some(names))
 }
 
+/// Why one declaration write happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclarationWrite {
+    /// `barge area declare`: the caller's declaration is published, and a
+    /// re-declaration of the same area bumps the generation.
+    Declare,
+    /// The store's first creation: an existing record governs and must match,
+    /// and an area with no record receives the caller's declaration once, never
+    /// a replacement.
+    FirstWins,
+}
+
 /// Declare one area, refusing a collision before anything is written.
 ///
 /// The declaration is validated, the registry and every stored declaration are
@@ -2618,9 +2822,44 @@ pub(crate) fn read_directory(path: &Path) -> Result<Option<Vec<String>>> {
 /// declaration are compared per registered volume against each other and
 /// against Barge's own `scratch/` and `caches/` folders, and only then is the
 /// document published atomically. Two owners of one folder is not a state Barge
-/// writes.
+/// writes. A re-declaration of the same area replaces its record and bumps the
+/// generation; the library's [`ensure_declared`] is the first-wins form.
 pub fn declare(state: &StatePaths, caller: &AreaDeclaration, now_ms: u64) -> Result<AreaDocument> {
+    write_declaration(state, caller, now_ms, DeclarationWrite::Declare)
+}
+
+/// Store the caller's declaration the first time, and match it afterwards.
+///
+/// This is the library form of `barge area declare`. A `barge.area/1` record is
+/// the authority once it exists, so a caller that presents a different
+/// declaration is refused before anything is written or created, naming the
+/// fields that differ; one that presents the same declaration receives the
+/// stored record. An area with no record receives the caller's declaration under
+/// the same publication rules as `declare` (validation, collision check under the
+/// registry lock and one atomic publication) with generation 1, and a first
+/// creation never replaces an existing record.
+pub fn ensure_declared(
+    state: &StatePaths,
+    caller: &AreaDeclaration,
+    now_ms: u64,
+) -> Result<AreaDocument> {
+    write_declaration(state, caller, now_ms, DeclarationWrite::FirstWins)
+}
+
+fn write_declaration(
+    state: &StatePaths,
+    caller: &AreaDeclaration,
+    now_ms: u64,
+    write: DeclarationWrite,
+) -> Result<AreaDocument> {
     caller.validate()?;
+    // A first creation decides a stored record before it creates anything, so a
+    // caller that disagrees with the store leaves no state layout behind.
+    if write == DeclarationWrite::FirstWins {
+        if let Some(document) = match_stored(caller, &read_declarations(state)?)? {
+            return Ok(document);
+        }
+    }
     // Refuse an invalid registry before any effect, including creating the
     // state layout. It is then re-read under the lock, so the collision check
     // sees the registry the write is authorized by.
@@ -2630,6 +2869,13 @@ pub fn declare(state: &StatePaths, caller: &AreaDeclaration, now_ms: u64) -> Res
     let lock = locks.lock_registry()?;
     let registry = registry::read(state)?;
     let stored = read_declarations(state)?;
+    if write == DeclarationWrite::FirstWins {
+        // The store is re-read under the lock: a competing first creation either
+        // already published the same declaration or is refused here.
+        if let Some(document) = match_stored(caller, &stored)? {
+            return Ok(document);
+        }
+    }
     ensure_no_collisions(registry.volumes(), &stored.documents, caller)?;
     let generation = stored
         .find(&caller.namespace, &caller.area)
@@ -2665,6 +2911,21 @@ pub fn declare(state: &StatePaths, caller: &AreaDeclaration, now_ms: u64) -> Res
     state::publish_atomic(&path, &bytes)?;
     drop(lock);
     Ok(document)
+}
+
+/// The stored document for the caller's area when the store already rules it.
+///
+/// `Ok(None)` means the area has no record, which is the only case a first
+/// creation may publish into.
+fn match_stored(caller: &AreaDeclaration, stored: &DeclarationSet) -> Result<Option<AreaDocument>> {
+    let Some(document) = stored.find(&caller.namespace, &caller.area) else {
+        return Ok(None);
+    };
+    let fields = declaration_differences(caller, &document.declaration());
+    if !fields.is_empty() {
+        return Err(refuse_declaration_mismatch(caller, document, &fields));
+    }
+    Ok(Some(document.clone()))
 }
 
 /// The declaration for one area, if it is declared.
@@ -6503,24 +6764,312 @@ mod tests {
         assert!(!fixture.state.areas_dir().exists(), "nothing was written");
     }
 
-    #[test]
-    fn the_effective_declaration_is_the_callers_and_is_never_widened() {
-        let fixture = Fixture::new("area-effective");
-        let mut stored_declaration = fixture.declaration("example/pool");
-        stored_declaration.prune = super::PrunePolicy::OldestIdleAfter { age_seconds: 60 };
-        stored_declaration.absent = super::AbsentPolicy::FallbackLocal {
-            path: PathBuf::from("/Users/a-fixture-account/fallback"),
-        };
-        let stored = declare(&fixture.state, &stored_declaration, 1_000)
-            .expect("the stored declaration writes");
+    /// Every path under one fixture directory, with each regular file's bytes.
+    ///
+    /// A mismatch refusal must leave both the state directory and the volume
+    /// byte for byte as they were, so a test compares this snapshot before and
+    /// after the refused call.
+    fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            let mut entries: Vec<_> = entries.map(|entry| entry.expect("an entry")).collect();
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                let path = entry.path();
+                let metadata = std::fs::symlink_metadata(&path).expect("the entry's metadata");
+                let relative = path
+                    .strip_prefix(base)
+                    .expect("the entry is under the fixture")
+                    .display()
+                    .to_string();
+                if metadata.is_dir() {
+                    out.push((format!("{relative}/"), Vec::new()));
+                    walk(base, &path, out);
+                } else if metadata.is_file() {
+                    out.push((relative, std::fs::read(&path).expect("the file's bytes")));
+                } else {
+                    out.push((relative, Vec::new()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out
+    }
 
-        // The caller's policies are narrower than the stored document's: the
-        // stored declaration must not widen them.
-        let mut caller = fixture.declaration("example/pool");
-        caller.prune = super::PrunePolicy::None;
-        caller.absent = super::AbsentPolicy::Fail {
-            attach: "the build volume".to_owned(),
+    /// A stored declaration whose `prune` and `reserve` values decide deletion
+    /// authority: a root may be pruned by idle age and counts toward the reserve.
+    fn stored_for_deletion(fixture: &Fixture) -> super::AreaDocument {
+        let mut declaration = fixture.declaration("example/pool");
+        declaration.prune = super::PrunePolicy::OldestIdleAfter { age_seconds: 600 };
+        declaration.reserve = super::ReserveParticipation::Counts;
+        declare(&fixture.state, &declaration, 1_000).expect("the stored declaration writes")
+    }
+
+    #[test]
+    fn the_first_creation_stores_the_callers_declaration() {
+        let fixture = Fixture::new("area-first-create");
+        fixture.register(&fixture.record);
+        let mut declaration = fixture.declaration("example/pool");
+        declaration.prune = super::PrunePolicy::OldestIdleAfter { age_seconds: 600 };
+        declaration.reserve = super::ReserveParticipation::Excluded;
+        assert!(
+            read_declarations(&fixture.state)
+                .expect("the store reads")
+                .documents
+                .is_empty(),
+            "the fixture starts with no declaration"
+        );
+
+        let platform = fixture.platform();
+        let facts = fixture.facts();
+        let mounts = fixture.mounts();
+        let observer = fixture.observer();
+        let (volume, root) = super::create_root_on_volume(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.uuid,
+            &declaration,
+            RootSpec {
+                kind: RootKind::AreaRoot,
+            },
+        )
+        .expect("the first creation stores the declaration and creates the root");
+        assert!(root.path.is_dir());
+
+        // The store holds exactly the caller's declaration, generation 1.
+        let stored = read_declarations(&fixture.state)
+            .expect("the store reads")
+            .find("example", "pool")
+            .cloned()
+            .expect("the first creation stored the caller's declaration");
+        assert_eq!(stored.generation, 1);
+        assert_eq!(stored.declaration(), declaration);
+        assert_eq!(
+            volume.resolved.declaration,
+            super::EffectiveDeclaration::new(&stored.declaration(), "example/pool".to_owned()),
+            "the effective declaration is the stored record's"
+        );
+        let marker = match read_owned(&fixture, &volume.resolved, &root.root_id) {
+            MarkerState::Owned(marker) => marker,
+            other => panic!("the marker is owned: {other:?}"),
         };
+        let effective = marker
+            .area
+            .effective
+            .as_ref()
+            .expect("the effective declaration is recorded");
+        assert_eq!(effective.prune, declaration.prune);
+        assert_eq!(effective.reserve, declaration.reserve);
+
+        // A second creation presenting the same declaration proceeds and writes
+        // no new record: the first creation is the only write.
+        let document_path = super::declaration_path(&fixture.state, "example", "pool")
+            .expect("the declaration path");
+        let before = std::fs::read(&document_path).expect("the document reads");
+        let (_, second) = super::create_root_on_volume(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.uuid,
+            &declaration,
+            RootSpec {
+                kind: RootKind::AreaRoot,
+            },
+        )
+        .expect("a matching caller proceeds");
+        assert!(second.path.is_dir());
+        assert_eq!(
+            std::fs::read(&document_path).expect("the document reads"),
+            before,
+            "a matching caller rewrites nothing"
+        );
+        assert_eq!(
+            read_declarations(&fixture.state)
+                .expect("the store reads")
+                .find("example", "pool")
+                .expect("the record is still there")
+                .generation,
+            1
+        );
+    }
+
+    #[test]
+    fn a_differing_caller_declaration_refuses_before_any_effect() {
+        let fixture = Fixture::new("area-mismatch");
+        fixture.register(&fixture.record);
+        let stored = stored_for_deletion(&fixture);
+        let platform = fixture.platform();
+        let facts = fixture.facts();
+        let mounts = fixture.mounts();
+        let observer = fixture.observer();
+
+        // Every policy field differs, in the order a refusal names them.
+        let mut caller = fixture.declaration("example/elsewhere");
+        caller.overrides.insert(
+            fixture.uuid.as_str().to_owned(),
+            "example/overridden".to_owned(),
+        );
+        caller.absent = super::AbsentPolicy::Wait;
+        caller.prune = super::PrunePolicy::None;
+        caller.reserve = super::ReserveParticipation::Excluded;
+
+        // Resolution refuses, and so does the creation path: both are checked
+        // against one snapshot of the state directory and the volume, so a
+        // refusal that created a folder, a lock, a registry change or a
+        // declaration would show up here.
+        let before = snapshot(fixture.dir.path());
+        let error = resolve(
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.record,
+            &caller,
+            Some(&stored),
+        )
+        .expect_err("a different declaration refuses");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert_eq!(
+            error.detail()["fields"],
+            serde_json::json!(["folder", "overrides", "absent", "prune", "reserve"]),
+            "{}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("the stored declaration governs"),
+            "{}",
+            error.message()
+        );
+        let error = super::create_root_on_volume(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.uuid,
+            &caller,
+            RootSpec {
+                kind: RootKind::AreaRoot,
+            },
+        )
+        .expect_err("a different declaration refuses before any effect");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert_eq!(
+            error.detail()["fields"],
+            serde_json::json!(["folder", "overrides", "absent", "prune", "reserve"])
+        );
+        assert_eq!(
+            snapshot(fixture.dir.path()),
+            before,
+            "a refused mismatch writes, creates and deletes nothing"
+        );
+    }
+
+    #[test]
+    fn a_stored_prune_or_reserve_policy_is_not_overridden_by_a_caller() {
+        let fixture = Fixture::new("area-deletion-authority");
+        fixture.register(&fixture.record);
+        // The stored record permits pruning by idle age and counts the area's
+        // bytes toward the reserve.
+        let stored = stored_for_deletion(&fixture);
+        let platform = fixture.platform();
+        let facts = fixture.facts();
+        let mounts = fixture.mounts();
+        let observer = fixture.observer();
+
+        // A caller that would exclude the area from the reserve and never let it
+        // be pruned is refused on the pre-flight every deletion takes.
+        let mut caller = stored.declaration();
+        caller.prune = super::PrunePolicy::None;
+        caller.reserve = super::ReserveParticipation::Excluded;
+        let before = snapshot(fixture.dir.path());
+        let error = super::prepare(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.uuid,
+            &caller,
+        )
+        .expect_err("the store's deletion-authority values govern");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert_eq!(
+            error.detail()["fields"],
+            serde_json::json!(["prune", "reserve"])
+        );
+        assert_eq!(snapshot(fixture.dir.path()), before);
+
+        // The stored declaration itself resolves, with the stored values.
+        let volume = super::prepare(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.uuid,
+            &stored.declaration(),
+        )
+        .expect("the stored declaration resolves");
+        assert_eq!(
+            volume.resolved.declaration.prune,
+            super::PrunePolicy::OldestIdleAfter { age_seconds: 600 }
+        );
+        assert_eq!(
+            volume.resolved.declaration.reserve,
+            super::ReserveParticipation::Counts
+        );
+    }
+
+    #[test]
+    fn the_first_declaration_is_written_once_and_then_matched() {
+        let fixture = Fixture::new("area-ensure-declared");
+        fixture.register(&fixture.record);
+        let declaration = fixture.declaration("example/pool");
+        let written = super::ensure_declared(&fixture.state, &declaration, 1_000)
+            .expect("the first creation writes the caller's declaration");
+        assert_eq!(written.generation, 1);
+        assert_eq!(written.declaration(), declaration);
+        let document_path = super::declaration_path(&fixture.state, "example", "pool")
+            .expect("the declaration path");
+        let bytes = std::fs::read(&document_path).expect("the document reads");
+
+        // The same declaration is matched and nothing is rewritten.
+        let matched = super::ensure_declared(&fixture.state, &declaration, 2_000)
+            .expect("a matching declaration is matched");
+        assert_eq!(matched, written);
+        assert_eq!(
+            std::fs::read(&document_path).expect("the document reads"),
+            bytes,
+            "a match writes nothing"
+        );
+
+        // A different declaration is refused and the record is untouched.
+        let mut changed = declaration.clone();
+        changed.prune = super::PrunePolicy::None;
+        let error = super::ensure_declared(&fixture.state, &changed, 3_000)
+            .expect_err("a different declaration is refused");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert_eq!(error.detail()["fields"], serde_json::json!(["prune"]));
+        assert_eq!(
+            std::fs::read(&document_path).expect("the document reads"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn the_effective_declaration_never_reports_a_differing_caller_policy() {
+        let fixture = Fixture::new("area-effective");
+        fixture.register(&fixture.record);
+        let stored = stored_for_deletion(&fixture);
         let platform = fixture.platform();
         let facts = fixture.facts();
         let mounts = fixture.mounts();
@@ -6531,26 +7080,10 @@ mod tests {
             &mounts,
             &observer,
             &fixture.record,
-            &caller,
+            &stored.declaration(),
             Some(&stored),
         )
-        .expect("the caller's declaration resolves");
-        assert_eq!(resolved.declaration.prune, super::PrunePolicy::None);
-        assert!(matches!(
-            resolved.declaration.absent,
-            super::AbsentPolicy::Fail { .. }
-        ));
-        assert_eq!(
-            resolved.declaration.reserve,
-            super::ReserveParticipation::Counts
-        );
-        assert!(
-            resolved.declaration.stored_differs,
-            "the difference is reported, and the caller's policy still stands"
-        );
-
-        // The created root's marker records the caller's effective declaration
-        // exactly.
+        .expect("the stored declaration resolves");
         let root = super::create_root(
             &fixture.state,
             &platform,
@@ -6561,17 +7094,26 @@ mod tests {
             },
         )
         .expect("the root is created");
-        let marker = match read_owned(&fixture, &resolved, &root.root_id) {
-            MarkerState::Owned(marker) => marker,
-            other => panic!("the marker is owned: {other:?}"),
-        };
-        let effective = marker
-            .area
-            .effective
-            .as_ref()
+
+        // The marker's effective declaration carries exactly the fields of the
+        // governing record: the former `stored_differs` report path is gone, so
+        // no report can imply that a differing caller policy was applied.
+        let bytes = std::fs::read(marker_path(&root)).expect("the marker is read");
+        let marker: serde_json::Value = serde_json::from_slice(&bytes).expect("the marker parses");
+        let effective = marker["area"]["effective"]
+            .as_object()
             .expect("the effective declaration is recorded");
-        assert_eq!(effective.prune, super::PrunePolicy::None);
-        assert!(matches!(effective.absent, super::AbsentPolicy::Fail { .. }));
+        let mut keys: Vec<&str> = effective.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["absent", "area", "folder", "namespace", "prune", "reserve"]
+        );
+        assert_eq!(
+            effective["prune"],
+            serde_json::json!({"kind": "oldest_idle_after", "age_seconds": 600})
+        );
+        assert_eq!(effective["reserve"], serde_json::json!("counts"));
     }
 
     #[test]
@@ -9967,7 +10509,6 @@ mod tests {
             &observer,
             &fixture.uuid,
             &declaration,
-            None,
             RootSpec {
                 kind: RootKind::AreaRoot,
             },
@@ -9989,7 +10530,6 @@ mod tests {
             &observer,
             &fixture.uuid,
             &declaration,
-            None,
             RootSpec {
                 kind: RootKind::AreaRoot,
             },
@@ -10010,7 +10550,6 @@ mod tests {
             &observer,
             &fixture.uuid,
             &declaration,
-            None,
             RootSpec {
                 kind: RootKind::AreaRoot,
             },

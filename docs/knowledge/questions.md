@@ -153,3 +153,17 @@ state volume and runs `barge area idle-baseline`. The contract states that resid
 as an accepted limit and does not claim an unconfirmed record can never be read as
 a release (Oxide Supervisor, decision `7684287e`, implemented by barge#024); see the
 [stage 3 design](contracts/stage3-space-policy.md#activity-records).
+
+## Q-013 — Who is authoritative for an area declaration, the stored record or the caller's object?
+
+Status: answered 2026-11-01
+Answer: the stored `barge.area/1` record. A library caller presents the same
+declaration or is refused before any effect, naming the differing `folder`,
+`overrides`, `absent`, `prune` or `reserve`; the first creation, when no record
+exists, publishes the caller's validated declaration under `barge area declare`'s
+rules with generation 1, and a later creation can only match it. The library reads
+the state directory itself, so a caller object can no longer override a stored
+policy, and the effective declaration recorded in a root's marker is the governing
+record's (Tom's Q-G decision `12729764`; Oxide Supervisor's Barge design ruling,
+Queue decision `5e57544c-dfc8-4d2c-9c0b-a7a363c7b547`; D2 of Oxide's F6 adoption
+contract, closing O-003); see the [stage 1 design](contracts/stage1-design.md#closed-design-issues).

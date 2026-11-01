@@ -1580,7 +1580,6 @@ fn run(
                     mounts,
                     observer,
                     &declaration,
-                    Some(document),
                     &unit,
                     bounds,
                     Some(&authorize),
