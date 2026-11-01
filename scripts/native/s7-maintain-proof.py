@@ -670,8 +670,17 @@ class Proof:
         return os.path.join(self.mount, "pool")
 
     def tree_age(self, path, days):
+        """Backdate every entry under `path`, symlinks included, as its own self.
+
+        `-h` is load-bearing. The root's activity scan reads each entry's own
+        no-follow modification time (`fstatat` with `AT_SYMLINK_NOFOLLOW`), so a
+        plain `touch` on a symbolic link would update the *referent* and leave the
+        link itself at "now": that one entry would keep the whole root from being
+        idle. The 4976f7c diagnostic failed exactly there, in the pending-intent
+        case, and the self-check refuses a `touch` without `-h`.
+        """
         stamp = time.strftime("%Y%m%d%H%M", time.gmtime(time.time() - days * 86400))
-        run(["find", path, "-exec", "touch", "-t", f"{stamp}.00", "{}", "+"], self.env)
+        run(["find", path, "-exec", "touch", "-h", "-t", f"{stamp}.00", "{}", "+"], self.env)
 
     def edit_marker(self, root_path, change):
         """Rewrite one fixture root's marker in place, keeping it private.
@@ -1051,6 +1060,10 @@ class Proof:
         # preview would plan nothing at all — the arrangement defect the first
         # 9a573a9 diagnostic exposed.
         os.symlink(referent, os.path.join(root["path"], "link"))
+        # `age_area_root` backdates the link's own mtime too (`touch -h`), because
+        # the scan reads the entry's no-follow time: a plain `touch` would update
+        # only the referent and the link would stay fresh, which is what the
+        # 4976f7c diagnostic observed as an empty candidate list.
         self.age_area_root(root["path"])
         # A shared host can make the pre-intent custody census or the hold check
         # undecidable for a moment (another process closing a descriptor). Barge
@@ -1567,6 +1580,25 @@ def preflight_problems():
             problems.append(
                 "`age_area_root` backdates the tree before rewriting the marker, so the "
                 "marker's own fresh mtime keeps the root from being idle"
+            )
+    # A root's activity scan reads each entry's own no-follow modification time, so
+    # `tree_age` has to backdate a symbolic link itself: a `touch` without `-h`
+    # updates the referent and leaves the link at "now". The 4976f7c diagnostic
+    # failed in the pending-intent case with an empty candidate list for exactly
+    # that reason.
+    age_tree = methods.get("tree_age")
+    if age_tree is None:
+        problems.append("`tree_age` is missing")
+    else:
+        literals = {
+            node.value
+            for node in ast.walk(age_tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        if "-h" not in literals:
+            problems.append(
+                "`tree_age` does not pass `-h` to `touch`, so a symlink entry keeps its "
+                "own fresh mtime and the root is never idle"
             )
     adders = sorted(
         name

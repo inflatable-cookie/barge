@@ -193,7 +193,11 @@ any later real run would replay.
    entry created **before** the root is aged (adding an entry refreshes the
    directory mtime, so aging first would plan nothing — the arrangement defect the
    first `9a573a9` diagnostic exposed), and the symlink pointing at a fixture file
-   inside the run root. The case asserts the preview names exactly that unit before
+   inside the run root. Aging backdates the link's own modification time too
+   (`touch -h`): the activity scan reads each entry's no-follow time, so a plain
+   `touch` would update only the referent and leave the link fresh, which kept the
+   whole root ineligible in the `4976f7c` diagnostic. The case asserts the preview
+   names exactly that unit before
    the real run; the real run then exits `3` with exactly one pending intent, the
    intent record is not `deleted`, the area folder holds exactly one
    `.barge-prune-` leaf, the unit's visible name is gone, and the symlink's
@@ -413,3 +417,42 @@ half.
   proves the R2 policy keeps its root on the real image. No product change; a
   fresh, separately owner-activated diagnostic at the final head is still
   required.
+
+### 2026-11-01: head `4976f7c`, maintain diagnostic: 6 of 7 passed, pending-intent arrangement defect (symlink mtime)
+
+- **Selector and mode:** `effigy maintain:native:diagnostic` at
+  `4976f7cde00ca5a8bffc3a5b86ce4f0d30bc8693`, one invocation; exit `3`,
+  `qualified: false` (an uncounted diagnostic is never promoted).
+- **Passed:** the first six cases, including
+  `a_release_on_reference_area_keeps_its_root`, so a stored
+  `release_on_reference` declaration produced no candidate on the real image
+  while the age area's root was still deleted.
+- **Failed (apparatus arrangement, not product):** `exit_3_with_a_pending_intent`
+  asserted its aged root was in the preview's candidates and saw `[]`
+  (`s7-maintain-proof.py:1077`, `('50b0cd63…', [])`). The case declares nothing:
+  it creates its root in `example/pool`, the age area, and the release-class case
+  uses a different area (`example/outputs`), so no stored declaration was reused
+  and the stored-wins ruling had nothing to govern differently. The cause is the
+  link the case plants: `tree_age` ran `touch -t` on every entry, and `touch`
+  follows a symbolic link, so the *referent* was backdated while the link's own
+  modification time stayed at "now". The activity scan reads each entry with
+  `fstatat(..., AT_SYMLINK_NOFOLLOW)` (`crates/barge/src/os/macos.rs:3297-3303`)
+  and takes the newest over every entry (`crates/barge/src/area.rs`,
+  `walk_activity`), so that one link kept the whole root as "idle for less than
+  the declared 60 s" (`crates/barge/src/prune.rs:1102`). It is the same
+  arrangement class as the `7850685` marker defect, for a second entry kind, and
+  it appeared only now because this is the first time the pending-intent case ran
+  under stage 4 F3's subtree scan.
+- **Evidence:** selector log
+  `/Volumes/Builds/scratch/barge/r2-logs/diag-s7-maintain-proof-4976f7c.log`;
+  receipt
+  `/Volumes/Builds/scratch/barge/oxide-proof.3pllgj66/evidence/s7-maintain-receipt.json`.
+  The space diagnostic at this head was clean 11/11
+  (`/Volumes/Builds/scratch/barge/r2-logs/diag-space-proof-4976f7c.log`); it
+  remains history pending the reviewer's exact-input carry.
+- **Corrected by:** `tree_age` now runs `touch -h -t`, which backdates a symbolic
+  link itself, and `maintain:native:test` refuses a `tree_age` whose `touch` has
+  no `-h`. No product change: the scan's no-follow reading is the design's rule
+  and nothing about it was altered. A fresh, separately owner-activated
+  diagnostic at the final head is still required, then the counted author and
+  distinct counted reviewer chains.
