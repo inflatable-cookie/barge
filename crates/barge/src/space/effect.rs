@@ -554,7 +554,21 @@ pub fn prune(
         })?;
     }
     let before = space.measure_space(&verified).map_err(|error| {
-        error
+        // An absence observed after replay is not a no-effect refusal: replay
+        // may already have deleted. Preserve the facts but require exit 3.
+        let failure = if replay.examined > 0 {
+            let mut failure = Error::new(
+                ErrorKind::UnknownState,
+                format!("space is unknown after replay: {error}"),
+            );
+            for (key, value) in error.detail() {
+                failure = failure.with_detail(key, value.clone());
+            }
+            failure
+        } else {
+            error
+        };
+        failure
             .with_detail("replay", serde_json::json!(&replay))
             .with_detail("flush", serde_json::json!(&flush_row))
     })?;
@@ -4266,8 +4280,8 @@ mod tests {
         impl SpaceFacts for FailedMeasurement {
             fn measure_space(&self, _: &VerifiedVolume) -> crate::error::Result<SpaceMeasurement> {
                 Err(crate::error::Error::new(
-                    ErrorKind::UnknownState,
-                    "measurement failed after replay",
+                    ErrorKind::VolumeAbsent,
+                    "volume disappeared after the replay flush",
                 ))
             }
         }
@@ -4338,6 +4352,12 @@ mod tests {
             &request,
         )
         .expect_err("measurement fails after replay completes");
+        assert_eq!(
+            error.kind(),
+            ErrorKind::UnknownState,
+            "a post-replay absence must report the effects at exit 3"
+        );
+        assert_eq!(error.kind().exit_code(), 3);
         assert!(!leaf.exists(), "replay completed the captured deletion");
         assert_eq!(
             replay_flush.calls(),

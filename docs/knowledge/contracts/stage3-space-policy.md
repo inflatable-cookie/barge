@@ -1934,6 +1934,9 @@ is claimed.**
   pending after removing entries. A failed replay flush is `unknown_state` at
   exit `3` with zero deciding measurements and no further deletion; error detail
   retains the full replay accounting and the flush attempt/failure record.
+  A failed first measurement after replay also keeps that accounting and exits
+  `3` as `unknown_state`, including a volume absence observed at that point;
+  it cannot be described as a no-effect refusal.
   `effect.flush.attempts` includes this preliminary replay flush as well as
   candidate-batch flushes. `effect.batches` counts candidate batches only.
   The first measurement (`effect.before`) is taken after replay and its flush;
