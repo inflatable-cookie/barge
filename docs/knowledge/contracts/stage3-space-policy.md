@@ -1198,14 +1198,14 @@ native, and a missing receipt from the slice that runs it is a missing proof.
 | # | Case | What it proves |
 | --- | --- | --- |
 | 1 | Register the image with `reserve 48 MiB`, `floor 24 MiB`; fill two areas with roots so free is above the reserve; guard | admission with no prune, no flush, nothing deleted |
-| 2 | Fill below the reserve with idle roots in two areas of different ages; guard | LRU across areas: the older-release root from the second area goes first; admission once free is back above the reserve |
+| 2 | Fill below the reserve with idle roots in two areas of different ages; guard | LRU across areas: the older-release root from the second area is pruned first (batch-granular target check); admission once free is back above the reserve |
 | 3 | Hold one root and keep writing to it in a second process while a guard prunes the rest | the held root's inode and bytes are unchanged, the writer's data is intact, the pass reports it as held |
 | 4 | Fill below the floor with every eligible root held | no-effect refusal `space_below_floor` at exit `2` (the pass deleted nothing); the message and detail carry free, floor, reserve, held bytes and cause; the fake internal pool is empty afterwards |
 | 4b | Fill below the floor again, this time with one large eligible idle root | the pass deletes it and the floor is still breached: a **completed stop** (`ok: true`, `decision: stop_below_floor`, exit `0`) listing the deleted root, and the fake internal pool is still empty |
 | 5 | One root with an unreadable hold file and one with no activity record, both large | both survive, both are reported, and the pass never treats them as idle |
 | 6 | Register a second fixture volume with `reserve 16 MiB`, `floor 32 MiB`; fill so free sits between the two (above the reserve, below the floor), with nothing eligible left | the floor wins: the guard prunes, then stops at 32 MiB although free is above the 16 MiB reserve, in the completed-stop shape if its prune deleted anything |
-| 7 | Delete a chosen root whose file is still open by a same-uid process, so free does not rise | `space_not_reclaimed` after the flush, no further deletion, and after the writer exits a recheck sees the space |
-| 8 | Detach the image (ordinary, after the writers finish) mid-pass, then re-attach | pending intent with the quarantine leaf kept, exit `3`, replay completes after re-attach; no stale mount point written |
+| 7 | Delete a chosen root whose payload is hard-linked outside Barge's folders on the image | The root is deleted and measured reclaim is at most 1% of planned bytes, allowing APFS metadata; after removing the outside link, a recheck sees the space and returns `continue`. Exactly-zero `space_not_reclaimed` is covered by the fake-Meter unit test, not claimed by this native. |
+| 8 | Pause and terminate a guard mid-pass, ordinary-detach after reaping it, then re-attach | The absent guard refuses with a pending intent; after re-attach the measured free space selects replay or admission with the intent kept. No stale mount point is written. |
 | 9 | A stale `/Volumes/<name>` directory left after detach | never written to, never recreated; the decision refuses |
 | 10 | Registration refusals on the image: absent, unverified UUID, malformed size, floor above total | each refuses with nothing written and no mount created |
 
@@ -1820,9 +1820,9 @@ preview's exact plan through the stage 1 custody, intent and quarantine protocol
 flushes and re-measures once per batch, and stops on the policy or on a bound.
 There is no second delete path — the same `delete` sequence every other Barge
 deletion uses runs, with the pass's volume lock supplied instead of taken — and
-the guard and recheck are described in [slice T6](#implemented-space-guard-and-recheck-surface-slice-t6). **The stage's native proof is missing: T8 owns
-it. This surface is not qualified by any native receipt, and no real-drive action
-is claimed.**
+the guard and recheck are described in [slice T6](#implemented-space-guard-and-recheck-surface-slice-t6). The stage's native apparatus is described in [T8](#stage-3-native-proof-surface-t8).
+Qualification requires its separately activated receipts; no real-drive action
+is claimed.
 
 - **The effect form.** `barge space prune --volume <uuid> --plan <file>
   --plan-sha256 <hex>` replaces T4's usage refusal. A plan whose bytes do not
@@ -2054,7 +2054,7 @@ neither call makes more than four measurements.
 Attribution is bounded and uses complete scans for the roots it can establish.
 An uncountable or unenumerated component is `null`, not zero; the remaining
 non-Barge figure is labelled an estimate and is unknown if it cannot be formed.
-The stage native proof remains T8's; this surface has no native receipt.
+The [stage native apparatus](#stage-3-native-proof-surface-t8) requires separately activated receipts.
 
 
 ### Implemented maintenance space surface (slice T7)
@@ -2070,5 +2070,27 @@ refusals are per-volume rows. The stage uses the remaining maintenance window.
 `describe` and `space` report observed fallback roots without creating them;
 only an absent volume explains an active fallback, and one observed while the
 volume is present is a contract violation. Unknown observations remain unknown.
-The stage native is missing and belongs to T8. No real-drive qualification or
+The [stage native apparatus](#stage-3-native-proof-surface-t8) requires separately activated receipts. No real-drive qualification or
 host-job change is claimed; scheduled enablement is operator-gated T9.
+
+
+### Stage 3 native proof surface (T8)
+
+`effigy space:native:test` checks the effect-free apparatus and
+`effigy space:native:plan` prints its plan. `effigy space:native` and
+`effigy space:native:diagnostic` are held for separate owner activation with
+`BARGE_PROOF_BIN` naming the binary under test. Case 2 checks that the older
+second-area root is pruned first (batch-granular target check), and records
+planned and actual order with the measurements and policy. Case 7 records the
+small measured APFS metadata reclaim and verifies the recheck after its outside
+hard link is removed. The native does not claim the exactly-zero
+`space_not_reclaimed` stop; the fake-Meter unit test covers that behavior. The
+uncounted diagnostic is
+followed by one counted author run and one distinct independent reviewer run,
+each at the exact head. The supervisor and proof receipts are required for each:
+`space-native-receipt.json` and the qualified supervisor's `receipt.json` in the
+run's `OXIDE_PROOF_EVIDENCE`. A missing receipt is missing proof, not a pass.
+
+The proof does not claim real USB or Thunderbolt surprise removal, real-drive
+flush latency, internal SSD write savings, APFS purgeable behaviour under real
+pressure, or qualification of Oxide's stage 4 adoption.

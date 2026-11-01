@@ -4314,6 +4314,55 @@ mod tests {
     }
 
     #[test]
+    fn guard_refuses_absent_and_stale_mount_without_recreating_it() {
+        let harness = Harness::new("guard-absent-mount", 100, 20);
+        let mount = &harness.fixture.root;
+        std::fs::remove_dir(mount).expect("empty fixture mount is removed");
+        harness.facts.present.set(false);
+        let guard = |mounts: &dyn crate::os::MountRoot| {
+            crate::space::guard(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                mounts,
+                &harness.observer,
+                &Meter::new(&[50]),
+                &Flusher::ok(),
+                &crate::space::GuardRequest {
+                    volume_uuid: &harness.record.volume_uuid,
+                    namespace: "example",
+                    area: "pool",
+                    wall: Duration::from_secs(30),
+                    recheck: false,
+                },
+            )
+        };
+        let error = guard(&harness.fixture.mounts()).expect_err("absent fixture volume refuses");
+        assert_eq!(error.kind(), ErrorKind::VolumeAbsent);
+        assert!(!mount.exists(), "guard must not recreate the mount");
+        std::fs::create_dir(mount).expect("the stale directory is planted");
+        struct StaleMount;
+        impl crate::os::MountRoot for StaleMount {
+            fn mount_root(
+                &self,
+                _: &std::path::Path,
+            ) -> crate::error::Result<crate::os::MountPoint> {
+                Err(crate::error::Error::new(
+                    ErrorKind::VolumeMismatch,
+                    "not a mount root",
+                ))
+            }
+        }
+        harness.facts.present.set(true);
+        let error = guard(&StaleMount).expect_err("a stale directory is not a mounted volume");
+        assert_eq!(error.kind(), ErrorKind::VolumeMismatch);
+        assert_eq!(
+            std::fs::read_dir(mount).expect("stale directory").count(),
+            0
+        );
+    }
+
+    #[test]
     fn guard_foreign_open_child() {
         let Some(dir) = std::env::var_os("BARGE_FOREIGN_OPEN_FIXTURE") else {
             return;
