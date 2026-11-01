@@ -654,7 +654,7 @@ pub(crate) fn decide_volume(
         let remaining = wall.saturating_sub(started.elapsed());
         bounds.wall = remaining;
         let run = SpacePruneRunRequest {
-            volume_uuid: volume_uuid,
+            volume_uuid,
             plan_digest: "",
             plan_bytes: &[],
             now_ms: state::now_ms(),
