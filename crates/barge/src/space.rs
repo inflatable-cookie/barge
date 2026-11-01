@@ -2998,7 +2998,7 @@ mod tests {
         changed.absent = area::AbsentPolicy::FallbackLocal { path: inaccessible };
         area::declare(&fixture.state, &changed, 2).expect("update declaration");
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0))
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000))
             .expect("close parent");
         let unknown = report(&fixture.state, &facts, &fixture.mounts(), &Injected(true))
             .expect("unknown fallback");
