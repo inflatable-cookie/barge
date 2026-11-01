@@ -74,6 +74,48 @@ fn stdout_document(output: &Output) -> Value {
     })
 }
 
+/// The child's own reason, as one line: a `barge.error/1` envelope's kind,
+/// message and detail, or the document itself when it is not a refusal.
+fn child_refusal(document: &Value) -> String {
+    if document["schema"] == "barge.error/1" {
+        format!(
+            "barge.error/1 kind={} message={} detail={}",
+            document["error"]["kind"].as_str().unwrap_or_default(),
+            document["error"]["message"].as_str().unwrap_or_default(),
+            document["error"]["detail"]
+        )
+    } else {
+        document.to_string()
+    }
+}
+
+/// The child's own reason when a `space prune` call did not print a report.
+///
+/// A real `space prune` may end on a measured stop (exit `0` or `3`), but it
+/// never ends on a refusal document. When it does, the failure must carry the
+/// child's `barge.error/1` kind, message and detail — and its stderr — so a
+/// failing run is classified from the child's evidence instead of from the
+/// first assertion that tripped.
+fn space_prune_refusal(output: &Output, document: &Value) -> Option<String> {
+    (document["schema"] != "barge.space.prune/1").then(|| {
+        format!(
+            "the child prints a space-prune report, not a refusal: exit={:?} reason={} stderr={}",
+            output.status.code(),
+            child_refusal(document),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+/// One `barge.space.prune/1` report, or a panic that names the child's refusal.
+fn space_prune_report(output: &Output) -> Value {
+    let document = stdout_document(output);
+    if let Some(refusal) = space_prune_refusal(output, &document) {
+        panic!("{refusal}");
+    }
+    document
+}
+
 /// The usage's first line; the full text names every area verb too.
 const USAGE: &str =
     "usage: barge <describe|inspect|space|volume|maintain|prune|area|cache|diagnostic|scratch> [--json]";
@@ -2690,7 +2732,10 @@ fn space_prune_runs_the_plan_it_is_given_and_deletes_its_candidates() {
         String::from_utf8_lossy(&output.stdout)
     );
     let preview = stdout_document(&output);
-    assert_eq!(preview["data"]["candidates"], 1);
+    assert_eq!(
+        preview["data"]["candidates"], 1,
+        "the preview plans the idle root: {preview}"
+    );
     let digest = preview["data"]["plan_sha256"]
         .as_str()
         .expect("the preview carries its digest")
@@ -2736,8 +2781,7 @@ fn space_prune_runs_the_plan_it_is_given_and_deletes_its_candidates() {
         ],
         &state_dir,
     );
-    let document = stdout_document(&output);
-    assert_eq!(document["schema"], "barge.space.prune/1");
+    let document = space_prune_report(&output);
     assert_eq!(document["command"], "space.prune");
     assert_eq!(document["data"]["preview"], false);
     assert_eq!(document["data"]["plan_sha256"], digest);
@@ -2811,12 +2855,64 @@ fn space_prune_runs_the_plan_it_is_given_and_deletes_its_candidates() {
         ],
         &state_dir,
     );
-    let document = stdout_document(&output);
+    let document = space_prune_report(&output);
     let effect = &document["data"]["effect"];
-    assert_eq!(effect["pruned"]["count"], 0);
-    assert_eq!(effect["stop"], "nothing_eligible");
-    assert_eq!(effect["held"]["rows"][0]["reason"], "identity_changed");
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(effect["pruned"]["count"], 0, "{document}");
+    assert_eq!(effect["stop"], "nothing_eligible", "{document}");
+    assert_eq!(
+        effect["held"]["rows"][0]["reason"], "identity_changed",
+        "{document}"
+    );
+    assert_eq!(output.status.code(), Some(0), "{document}");
+}
+
+/// A refused `space prune` reports the child's own `barge.error/1` reason.
+///
+/// The real-run cases in this suite assert on a `barge.space.prune/1` report; when
+/// the child refuses instead, the failure in those cases must carry the child's
+/// kind, message, detail and stderr rather than only the schema that differed.
+/// This exercises that reading directly, with the child's envelope built here so
+/// it needs no volume and no child process.
+#[test]
+fn a_space_prune_refusal_names_the_child_s_own_error() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let envelope = serde_json::json!({
+        "schema": "barge.error/1",
+        "command": "space.prune",
+        "ok": false,
+        "error": {
+            "kind": "unknown_state",
+            "message": "volume <uuid> is declared `kept`, which never permits pruning, so nothing was changed",
+            "detail": {"volume_uuid": "<uuid>", "durability": "kept"}
+        }
+    });
+    let output = Output {
+        status: std::process::ExitStatus::from_raw(3 << 8),
+        stdout: serde_json::to_vec(&envelope).expect("the refusal encodes"),
+        stderr: b"barge: nothing was changed\n".to_vec(),
+    };
+    let document = stdout_document(&output);
+    let refusal = space_prune_refusal(&output, &document).expect("a refusal is reported");
+    assert!(refusal.contains("barge.error/1"), "{refusal}");
+    assert!(refusal.contains("kind=unknown_state"), "{refusal}");
+    assert!(
+        refusal.contains("message=volume <uuid> is declared `kept`"),
+        "the child's message is reported: {refusal}"
+    );
+    assert!(
+        refusal.contains("durability") && refusal.contains("kept"),
+        "the child's detail is reported: {refusal}"
+    );
+    assert!(
+        refusal.contains("barge: nothing was changed"),
+        "the child's stderr is reported: {refusal}"
+    );
+    assert!(refusal.contains("exit=Some(3)"), "{refusal}");
+
+    // A real report is not a refusal and carries no such message.
+    let report = serde_json::json!({"schema": "barge.space.prune/1"});
+    assert!(space_prune_refusal(&output, &report).is_none());
 }
 
 /// One verified volume's total bytes, which the fixture's policy uses to put free
