@@ -12,6 +12,17 @@ STOP. Oxide and Effigy entries must appear only as kept rows, never candidates.
 `root_dir=barge` keeps this area distinct from the shared
 `/Volumes/Builds/scratch`. Registration must show empty scratch grants.
 
+## Qualification criteria
+
+Report each criterion as pass, fail or not established, with supporting evidence:
+
+- **a. Registration:** the approved record round-trips and the registry digest is recorded.
+- **b. Measurement:** `barge space --json` reports the state and free and total match `df` within one filesystem block.
+- **c. Candidates:** the plan has no candidate outside Barge-owned scratch; any Oxide or Effigy entry appears only as a kept row.
+- **d. Prune boundary:** the at-most-one reviewed prune changes nothing outside its planned candidates, checked with before and after listing digests of Builds' top level, `oxide-pool`, `oxide-outputs`, shared `scratch` and Barge's own `barge/scratch`.
+- **e. Maintenance preview:** its digest and `space_triggered` value are recorded.
+- **f. Withdrawal:** the authorized update to kept succeeds and describes back as kept.
+
 ## Common protocol
 
 Run as the intended account on macOS with Builds mounted; unset
@@ -21,8 +32,26 @@ command's exit in `notes.txt` in the packet. Every command below is sequential;
 stop on nonzero exit, an unknown/truncated result, unexpected document schema,
 identity change or a deadline, unless explicitly stated otherwise. Capture stdout
 and stderr separately as shown. Do not retry a real prune. After every step run
-`(cd "$E" && shasum -a 256 -- *.json *.txt 2>/dev/null > SHA256SUMS)` and
-retain the packet. Hashes identify evidence, not permission to proceed. If a
+the following command and retain the packet. It includes only existing JSON and
+text evidence, requires at least one file, and fails on a read or write error:
+
+```sh
+python3 - "$E" <<'PYHASH'
+import hashlib, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+files = sorted(f for f in p.iterdir() if f.suffix in ('.json', '.txt'))
+if not files:
+    raise RuntimeError('no evidence files')
+lines = []
+for f in files:
+    if f.is_symlink() or not f.is_file() or '\n' in f.name or '\r' in f.name:
+        raise RuntimeError('unsafe evidence file: ' + f.name)
+    lines.append(hashlib.sha256(f.read_bytes()).hexdigest() + '  ' + f.name + '\n')
+(p/'SHA256SUMS').write_text(''.join(lines))
+PYHASH
+```
+
+ Hashes identify evidence, not permission to proceed. If a
 command times out or an effect has uncertain state, stop and retain evidence;
 do not kill or retry it. The Barge internal limits are 10 seconds for a space
 plan, 120 seconds for prune and 600 seconds for maintenance; allow 30 seconds
@@ -119,22 +148,47 @@ rollback is needed before registration; discard no evidence.
    This plan may legitimately be empty because Builds is above reserve.
 4. Capture pre-prune directory listings and their hashes using the exact command
    below. It records names and `lstat` identity, not contents, without following
-   links. Each directory has a 100,000-entry cap; a missing, unreadable or
-   changing directory is a STOP. Repeat after the prune with `PHASE=after`.
+   links. The Barge scratch listing includes each project directory's immediate
+   children, where scratch roots live. Each directory has a 100,000-entry cap;
+   a missing required directory, unreadable or changing directory is a STOP.
+   `barge` or `barge/scratch` may be positively absent and is recorded as such;
+   an unexpected link, non-directory or other error is a STOP. Repeat after the
+   prune with `PHASE=after`.
 
    ```sh
    PHASE=before python3 - "$E" <<'PY'
-import json, os, pathlib, sys
+import json, os, pathlib, stat, sys
 out = {}; root = pathlib.Path('/Volumes/Builds')
-for name in ('.', 'oxide-pool', 'oxide-outputs', 'scratch'):
-    p = root/name; before = p.stat(); rows = []
+def listing(name, optional=False):
+    p = root/name
+    try:
+        before = p.lstat()
+    except FileNotFoundError:
+        if optional:
+            out[name] = {'state': 'absent'}
+            return []
+        raise
+    if not stat.S_ISDIR(before.st_mode):
+        raise RuntimeError('not a direct directory: ' + name)
+    rows = []
     with os.scandir(p) as entries:
         for e in entries:
             if len(rows) >= 100000: raise RuntimeError('listing cap')
             s = e.stat(follow_symlinks=False); rows.append([e.name, s.st_mode, s.st_dev, s.st_ino])
-    after = p.stat()
-    if (before.st_ino, before.st_mtime_ns) != (after.st_ino, after.st_mtime_ns): raise RuntimeError('listing changed')
-    out[name] = sorted(rows)
+    after = p.lstat()
+    if (before.st_ino, before.st_dev, before.st_mtime_ns) != (after.st_ino, after.st_dev, after.st_mtime_ns): raise RuntimeError('listing changed')
+    out[name] = {'state': 'present', 'entries': sorted(rows)}
+    return rows
+for name in ('.', 'oxide-pool', 'oxide-outputs', 'scratch'):
+    listing(name)
+barge = listing('barge', optional=True)
+if out['barge']['state'] == 'absent':
+    out['barge/scratch'] = {'state': 'absent'}
+else:
+    projects = listing('barge/scratch', optional=True)
+    for name, mode, _, _ in projects:
+        if stat.S_ISDIR(mode):
+            listing('barge/scratch/' + name)
 pathlib.Path(sys.argv[1], os.environ['PHASE']+'-listings.json').write_text(json.dumps(out, ensure_ascii=True, sort_keys=True)+'\n')
 PY
    ```
@@ -195,7 +249,7 @@ where `W` is its digest. Run `"$B" volume describe "$U" --json >"$E/withdraw-des
 Both have 30 s bounds; any refusal or unknown is a STOP. Record exits and hashes.
 There is no unregister; do not restore expendable durability without a new go.
 
-Finish by recording pass/fail for each criterion, UUID, commit and binary hash,
+Finish by recording pass, fail or not established for each criterion a–f above, UUID, commit and binary hash,
 registry digest, `df` comparison, plan digests, all candidates, before/after
 listing differences, real prune effects, maintenance trigger, withdrawal and
 any uncertainty in `report.txt`. Recompute `SHA256SUMS`; verify it with

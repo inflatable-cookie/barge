@@ -17,6 +17,7 @@ Contracts own durable interfaces and formats:
   idleness and least-recently-used order, concurrent pruning under consumer
   holds, the stage 3 formats, bounds, failure matrix, slices and its bounded
   native design.
+- [Builds real-drive qualification](contracts/t9-real-drive-qualification.md) owns the gated qualification procedure, evidence and withdrawal.
 - [Stage 4 design](contracts/stage4-design.md) owns owned-root identity across
   remounts, the durable identity and the path-absence documents and their
   versions, the reference check, the gate that authorizes releasing a whole
