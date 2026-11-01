@@ -11,6 +11,7 @@ Tom's scope and authority ruling lives in [vision](docs/knowledge/vision.md). Co
 ## Guardrails
 
 - No moving live data, changing host or tool settings, or deleting existing data without explicit operator approval for that action.
+  Oxide's own idle-slot eviction and output placement during ordinary Oxide-routed builds are not Barge data deletion.
 - Never write scratch to a home folder or a drive root. Use `/Volumes/Builds/scratch/barge/` when the Builds drive is present.
 - Do not change Oxide from this repository. Oxide changes go through Oxide's own Queue project.
 - When a change alters current truth, update its owning knowledge file in the same change. Record operator rulings before yielding.

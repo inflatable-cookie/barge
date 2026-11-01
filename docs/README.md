@@ -7,6 +7,7 @@ Barge moves heavy, rebuildable developer data (build output, caches, scratch, VM
 - [Stage 1 design: library, CLI, locations, areas, scratch and caches](knowledge/contracts/stage1-design.md)
 - [Host-job hand-off: how a launchd job calls `barge maintain`](knowledge/contracts/host-job.md)
 - [Stage 3 design: registration, space policy, reserve pruning and the floor](knowledge/contracts/stage3-space-policy.md)
+- [Builds real-drive qualification procedure](knowledge/contracts/t9-real-drive-qualification.md)
 - [Stage 4 design: owned-root identity across remounts and absence proofs for pruning](knowledge/contracts/stage4-design.md)
 - [Open decisions](knowledge/questions.md)
 - [Knowledge map](knowledge/README.md)

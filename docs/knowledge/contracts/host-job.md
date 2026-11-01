@@ -121,3 +121,101 @@ The handover proof the design asks for before the host job is changed is one
 `barge maintain --plan` run compared against the current reaper's dry run, so a
 missing grant shows up as a reported leftover rather than a silent leak. That
 comparison needs a real drive and is an operator step, not a code slice.
+
+## Builds space enablement change plan
+
+This is a proposed change only. It requires completed real-drive qualification,
+Tom's explicit go for the host change, and a separately approved installation of
+the reviewed Barge binary. The live `com.tom.scratch-reaper` plist observed for
+this plan has one `ProgramArguments` element naming
+`/Users/tom/.local/share/scratch-reaper/scratch-reaper`; it runs at 04:30 and
+logs under that same directory. Re-read and hash the live plist and reaper before
+applying; if either has changed, stop and re-review the diff. The precise plist
+change, leaving every other key unchanged, is:
+
+```diff
+-  <array><string>/Users/tom/.local/share/scratch-reaper/scratch-reaper</string></array>
++  <array><string>/Users/tom/.local/share/scratch-reaper/barge-space-job</string></array>
+```
+
+The proposed new executable `barge-space-job` is the following complete script.
+It runs the existing reaper first, preserving its own Oxide outputs prune, then
+one Barge preview and at most one Barge run. It uses a fresh plan directory on
+Builds and retains evidence for operator review; no automatic cleanup occurs.
+The Barge binary path is the separately installed, reviewed binary, whose hash
+must be checked against its install receipt before enablement. The job must not
+be installed until that path exists and is approved.
+
+```sh
+#!/bin/sh
+set -u
+REAPER=/Users/tom/.local/share/scratch-reaper/scratch-reaper
+BARGE=/Users/tom/.local/bin/barge
+PARENT=/Volumes/Builds/scratch/barge
+"$REAPER"
+reaper_exit=$?
+if [ "$reaper_exit" -ne 0 ]; then
+  echo "reaper exit=$reaper_exit; Barge skipped"
+  exit "$reaper_exit"
+fi
+WORK=$(/usr/bin/mktemp -d "$PARENT/host-maintain.XXXXXXXX") || exit 2
+"$BARGE" maintain --space --json --plan-out "$WORK/plan.json" >"$WORK/preview.json" 2>"$WORK/preview.err"
+preview_exit=$?
+# A completed exit-3 plan is actionable but remains a human alert. An error
+# document, a malformed plan, or an exit other than 0 or 3 stops this schedule.
+case "$preview_exit" in 0|3) ;; *) echo "preview exit=$preview_exit packet=$WORK"; exit "$preview_exit";; esac
+VALUES=$(/usr/bin/python3 - "$WORK/preview.json" "$WORK/plan.json" <<'PY'
+import hashlib, json, pathlib, sys
+try:
+    doc = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+    data = doc['data']; digest = data['plan_digest']
+    candidates = data['candidates']; triggered = data['space_triggered']
+    assert doc['schema'] == 'barge.maintain/1' and doc['ok'] is True
+    assert type(candidates) is int and candidates >= 0
+    assert type(triggered) is int and triggered >= 0
+    assert hashlib.sha256(pathlib.Path(sys.argv[2]).read_bytes()).hexdigest() == digest
+    print(digest, candidates, triggered)
+except Exception:
+    sys.exit(1)
+PY
+) || { echo "invalid preview exit=$preview_exit packet=$WORK"; exit 3; }
+set -- $VALUES
+DIGEST=$1 CANDIDATES=$2 TRIGGERED=$3
+if [ "$CANDIDATES" -eq 0 ] && [ "$TRIGGERED" -eq 0 ]; then
+  echo "preview exit=$preview_exit candidates=0 space_triggered=0 packet=$WORK"
+  exit "$preview_exit"
+fi
+"$BARGE" maintain --space --json --plan "$WORK/plan.json" --plan-sha256 "$DIGEST" >"$WORK/real.json" 2>"$WORK/real.err"
+real_exit=$?
+result=$real_exit
+if [ "$preview_exit" -gt "$result" ]; then result=$preview_exit; fi
+echo "preview exit=$preview_exit real exit=$real_exit candidates=$CANDIDATES space_triggered=$TRIGGERED digest=$DIGEST packet=$WORK"
+exit "$result"
+```
+
+Before enabling, compare a Barge `maintain --space --json` preview against the
+current reaper's `/usr/bin/python3 /Users/tom/.local/share/scratch-reaper/reap.py --dry-run`.
+The reaper's dry run appends its own log and can create a baseline if absent;
+this is an operator host action, not the effect-free T9a preview. Capture both
+outputs, exit codes and hashes, and account for every reaper candidate missing
+from Barge as a reported leftover; no new grant is implied. Stop on unreadable,
+incomplete, unexpected candidates or exit 3 pending operator investigation.
+The job's completed exit-3 plan semantics remain those above: it runs the one
+authorized real step when either count is positive and records exit 3. An error
+document or exit 3 from the real step is an alert and must never be retried.
+
+For enablement, archive the exact original plist and its hash in operator-owned
+scratch, install and hash the reviewed wrapper, apply the single diff and reload
+the job only on Tom's go. Record the loaded job and hashes. Observe the next
+seven scheduled runs (at least seven days), inspecting each retained packet and
+launchd log for exits, candidates, triggered volumes, pending intents, stops
+and unexpected effects. Stop the job and investigate on a nonzero exit,
+missing packet, overlapping run, unknown state or unexpected candidate. No
+automatic retries. This observation is evidence, not a claim that pressure
+reclaim occurred.
+
+Rollback requires the operator to unload the changed job, restore the exact
+archived plist and reload it, then verify the loaded program path and compare
+its hash to the saved original. Retain the wrapper and packets for evidence;
+restoring the plist does not undo Barge effects. If needed, use the separate
+kept-durability withdrawal in the [qualification procedure](t9-real-drive-qualification.md#withdrawal-and-report).
