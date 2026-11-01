@@ -2289,6 +2289,31 @@ fn prune_run_refuses_a_plan_whose_digest_or_bytes_are_not_the_presented_ones() {
     );
     assert_eq!(output.status.code(), Some(2), "a real run needs the digest");
     assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+
+    // A named root belongs to the preview: the presented plan already states its own.
+    let output = run_in(
+        &[
+            "prune",
+            "--plan",
+            plan_arg,
+            "--plan-sha256",
+            &wrong_digest,
+            "--root",
+            &"a".repeat(32),
+            area[0],
+            area[1],
+            volume[0],
+            volume[1],
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stdout_document(&output)["error"]["message"]
+        .as_str()
+        .expect("the refusal states its reason")
+        .contains("--root"));
+    assert!(!state_dir.exists(), "a refusal creates nothing");
 }
 
 #[test]

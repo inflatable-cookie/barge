@@ -60,7 +60,7 @@ const USAGE: &str = "usage: barge <describe|inspect|space|volume|maintain|prune|
        barge space prune --volume <uuid> --plan <file> --plan-sha256 <hex>
        barge maintain [--space] [--plan-out <file>]
        barge maintain [--space] --plan <file> --plan-sha256 <hex>
-       barge prune --plan --area <namespace>/<area> --volume <uuid> [--plan-out <file>]
+       barge prune --plan --area <namespace>/<area> --volume <uuid> [--plan-out <file>] [--root <root-id>]...
        barge prune --plan <file> --plan-sha256 <hex> --area <namespace>/<area> --volume <uuid>
        barge diagnostic descriptor-census --root <existing-directory>
        barge area declare --namespace <ns> --area <name> --folder <folder> [--override <uuid>=<folder>]... --absent <fail:drive|wait|fallback:path> --prune <none|oldest-idle:seconds|release-on-reference> --reserve <counts|excluded>
@@ -1379,7 +1379,7 @@ fn space_prune_run_summary(report: &barge::space::SpacePruneReport) -> String {
 fn prune_plan(args: &[String]) -> Result<Report, Error> {
     let Parsed { words, mut options } = parse_taking_soft(
         args,
-        &["area", "volume", "plan-out", "plan-sha256"],
+        &["area", "volume", "plan-out", "plan-sha256", "root"],
         &["plan"],
     )?;
     if let Some(word) = words.first() {
@@ -1390,8 +1390,15 @@ fn prune_plan(args: &[String]) -> Result<Report, Error> {
     let area_ref = required(&mut options, "area")?;
     let volume = required(&mut options, "volume")?;
     let plan_out = one_option(&mut options, "plan-out")?.map(PathBuf::from);
+    // `--root` may repeat: each names one root the operator waives the age gate for.
+    let named_roots = options.remove("root").unwrap_or_default();
     refuse_unknown(options)?;
     let bare_plan = plan.as_deref() == Some("true");
+    if !bare_plan && !named_roots.is_empty() {
+        return Err(usage(
+            "--root belongs to the preview: a real run takes the named roots its presented plan states; nothing was changed",
+        ));
+    }
     let (namespace, area) = match area_ref.split_once('/') {
         Some((namespace, area)) => (namespace.to_owned(), area.to_owned()),
         None => {
@@ -1458,6 +1465,8 @@ fn prune_plan(args: &[String]) -> Result<Report, Error> {
                     volume_uuid: &volume_uuid,
                     now_ms: state::now_ms(),
                     bounds: ReleaseBounds::design(),
+                    // The run takes the presented plan's own named roots.
+                    named_roots: &[],
                 },
                 delete: DeleteBounds::default(),
             },
@@ -1485,6 +1494,7 @@ fn prune_plan(args: &[String]) -> Result<Report, Error> {
             volume_uuid: &volume_uuid,
             now_ms: state::now_ms(),
             bounds: ReleaseBounds::design(),
+            named_roots: &named_roots,
         },
     )?;
     if let Some(path) = &plan_out {

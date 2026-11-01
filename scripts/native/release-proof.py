@@ -59,6 +59,9 @@ CASES = [
     ("X4", "each condition that changed after the plan keeps the root", "a_run_keeps_a_root_whose_condition_changed_after_the_plan_was_written"),
     ("X5", "intent written before the rename; replay after a remount", "an_intent_is_written_before_the_rename_and_a_remount_replays_it"),
     ("X6", "CLI refuses a digest that is not the presented bytes'", "prune_run_refuses_a_plan_whose_digest_or_bytes_are_not_the_presented_ones"),
+    ("X7", "a named root waives only the age gate, and the plan says so", "a_named_root_waives_only_the_age_gate_and_the_plan_says_so"),
+    ("X7b", "a named root must be listed; a waiver must name its root", "a_named_root_must_be_listed_and_a_waiver_must_name_its_root"),
+    ("X8", "identity re-decided under the unit lock against the record's contents", "the_unit_lock_re_proof_refuses_each_condition_it_re_reads"),
 ]
 
 # The apparatus's own refusal list: names that must not appear as activated

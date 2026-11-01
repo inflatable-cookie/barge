@@ -208,6 +208,10 @@ pub struct PrunePlanRow {
     /// The bytes this plan's scan counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<BytesEvidence>,
+    /// Whether the named-root waiver stood in for condition 4's age gate. It is
+    /// stated in the plan so the digest covers it and an effect re-decides it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub age_waived: bool,
     /// Whether all six conditions hold.
     pub eligible: bool,
     /// The first condition that keeps the root, when one does.
@@ -248,6 +252,10 @@ pub struct PrunePlan {
     pub timed_out: bool,
     /// How many listed roots the wall clock stopped the plan before.
     pub unreached_count: usize,
+    /// The roots named explicitly, sorted and unique. Empty when none was named,
+    /// and then the field is absent from the document.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub named_roots: Vec<String>,
 }
 
 impl PrunePlan {
@@ -335,6 +343,9 @@ pub struct ReleaseRequest<'a> {
     pub now_ms: u64,
     /// The run's bounds.
     pub bounds: ReleaseBounds,
+    /// The roots an operator named explicitly. A named root waives only the
+    /// policy's age gate (`oldest-idle`); every other condition still applies.
+    pub named_roots: &'a [String],
 }
 
 /// Plan the release of one area's roots on one volume. Nothing is changed.
@@ -364,6 +375,10 @@ struct ObservedRoot {
     unit: DeletionUnit,
     path: PathBuf,
     mount_point: PathBuf,
+    /// The area the row was resolved under, which identity is decided against.
+    identity_area: IdentityArea,
+    /// The listed name the row was found under.
+    root: area::RootName,
 }
 
 /// [`plan`], and the observed deletion unit of each row that observed one, in row
@@ -648,6 +663,27 @@ fn finish(
     let eligible_count = rows.rows.iter().filter(|row| row.eligible).count();
     let total = rows.rows.len();
     let observed = rows.observed;
+    // A named root must be a root id and must be one the area lists: a name the plan
+    // cannot see would waive nothing, and it is refused rather than dropped.
+    let mut named_roots = request.named_roots.to_vec();
+    named_roots.sort();
+    named_roots.dedup();
+    for named in &named_roots {
+        if !state::is_identifier(named) {
+            return Err(Error::new(
+                ErrorKind::Usage,
+                format!("the named root `{named}` is not a root id, so nothing was planned"),
+            ));
+        }
+        if !rows.rows.iter().any(|row| &row.root_id == named) {
+            return Err(Error::new(
+                ErrorKind::Usage,
+                format!(
+                    "the named root `{named}` is not listed in the area, so nothing was planned"
+                ),
+            ));
+        }
+    }
     let plan = PrunePlan {
         schema: PRUNE_PLAN_SCHEMA.to_owned(),
         area: area_ref,
@@ -658,6 +694,7 @@ fn finish(
         truncated: rows.truncated || plan_rows_truncated(total),
         timed_out: rows.timed_out,
         unreached_count: rows.unreached,
+        named_roots,
     };
     let plan_digest = sha256_hex(&canonical_plan_bytes(&plan)?);
     let report = PruneReport {
@@ -673,6 +710,11 @@ fn finish(
         volume,
     };
     Ok((report, observed))
+}
+
+/// The serde predicate that keeps a `false` flag out of the document.
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Whether the plan's own row cap cut the listing.
@@ -894,12 +936,13 @@ fn decide_root(
     let mut blockers: Vec<(&'static str, String)> = Vec::new();
 
     // Condition 2: the durable identity.
+    let identity_area = IdentityArea::of(resolved);
     let identity = identity_evidence(
         dirs,
         facts,
         uid,
         root,
-        resolved,
+        &identity_area,
         &locked,
         stored.as_ref(),
         record_unreadable,
@@ -922,6 +965,8 @@ fn decide_root(
             unit: unit.clone(),
             path: root.path.clone(),
             mount_point: resolved.mount_point.clone(),
+            identity_area: IdentityArea::of(resolved),
+            root: root.clone(),
         });
     }
     let (custody, custody_reason) = match &unit {
@@ -972,6 +1017,10 @@ fn decide_root(
     // is exactly the case: it is not a known age of zero.
     let measured = scan.last_activity_ms.filter(|last| *last <= request.now_ms);
     let ahead_of_the_plan = scan.last_activity_ms.filter(|last| *last > request.now_ms);
+    // A named root waives the age comparison and nothing else. Its activity must still
+    // be known, so an unknown age keeps it.
+    let age_waived =
+        declared_age.is_some() && request.named_roots.iter().any(|named| named == &root_id);
     let idle = match (declared_age, measured, ahead_of_the_plan) {
         (None, _, last) => IdleEvidence {
             last_activity_ms: last.or(scan.last_activity_ms),
@@ -1033,7 +1082,7 @@ fn decide_root(
             )),
             Some(last) => {
                 let age_ms = request.now_ms.saturating_sub(last);
-                if age_ms < declared.saturating_mul(1000) {
+                if age_ms < declared.saturating_mul(1000) && !age_waived {
                     blockers.push((
                         "policy",
                         format!("idle for less than the declared {declared} s"),
@@ -1124,6 +1173,7 @@ fn decide_root(
         idle,
         references: reference_rows,
         references_complete: references.complete && !references_truncated,
+        age_waived,
         absence,
         bytes: Some(BytesEvidence {
             logical: scan.logical_bytes,
@@ -1200,7 +1250,7 @@ fn identity_evidence(
     facts: &dyn AbsenceVolume,
     uid: u32,
     root: &area::RootName,
-    resolved: &area::ResolvedArea,
+    identity_area: &IdentityArea,
     locked: &LockedObservation,
     stored: Option<&crate::identity::RootIdentity>,
     record_unreadable: bool,
@@ -1214,11 +1264,11 @@ fn identity_evidence(
     // area are all compared against what was just observed **at this path**. It is
     // never the verdict for whatever path the record happens to name — a copied
     // root that reuses an original's id in another area is kept, not verified.
-    let listed_relative = relative_to_mount(&root.path, &resolved.mount_point);
+    let listed_relative = relative_to_mount(&root.path, &identity_area.mount_point);
     // The area folder this plan resolved is on the verified volume; the root must be
     // on that same filesystem, which is a device comparison between two opened
     // descriptors rather than an assumption.
-    let same_volume = match dirs.open_path(&resolved.path) {
+    let same_volume = match dirs.open_path(&identity_area.path) {
         Ok(folder) => folder.identity().device == locked.identity.device,
         Err(_) => false,
     };
@@ -1282,15 +1332,18 @@ fn identity_evidence(
                         // The live volume is the one this plan verified and this root was
                         // found on, never the recorded UUID compared with itself: a record
                         // that names another volume is a mismatch, not a match.
-                        volume_uuid: resolved.volume_uuid.as_str().to_owned(),
-                        mount: resolved.mount_point.clone(),
+                        volume_uuid: identity_area.volume_uuid.as_str().to_owned(),
+                        mount: identity_area.mount_point.clone(),
                         device: locked.identity.device.get(),
                         inode: locked.identity.inode,
                         root_uid: owner,
                         effective_uid: uid,
                         root_id: marker.root_id.clone(),
                         nonce: marker.nonce.clone(),
-                        mount_relative_path: relative_to_mount(&root.path, &resolved.mount_point),
+                        mount_relative_path: relative_to_mount(
+                            &root.path,
+                            &identity_area.mount_point,
+                        ),
                         kind: marker.kind,
                         area: marker.area.clone(),
                     },
@@ -1406,6 +1459,7 @@ fn unobserved_row(
         references_complete: false,
         absence: None,
         bytes: None,
+        age_waived: false,
         eligible: false,
         blocked_by: Some(detail_blocked_by.to_owned()),
         reason: Some(detail),
@@ -1626,6 +1680,29 @@ pub fn read_prune_plan(bytes: &[u8]) -> Result<PrunePlan> {
         )
     })?;
     plan.rows.validate()?;
+    // A waiver is only ever a named root's, and every named root is a root id.
+    for named in &plan.named_roots {
+        if !state::is_identifier(named) {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("the plan names `{named}`, which is not a root id"),
+            ));
+        }
+    }
+    if let Some(row) = plan
+        .rows
+        .rows
+        .iter()
+        .find(|row| row.age_waived && !plan.named_roots.contains(&row.root_id))
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the plan waives the age of `{}`, which it does not name",
+                row.root_id
+            ),
+        ));
+    }
     // The two evidence documents are read strictly here too: a row's condition 2
     // and condition 6 evidence is what a later effect re-establishes, so a
     // document whose verdict and shape disagree is not one this reader understands.
@@ -1650,6 +1727,25 @@ pub fn read_prune_plan(bytes: &[u8]) -> Result<PrunePlan> {
         .with_detail("eligible_count", plan.eligible_count.into()));
     }
     Ok(plan)
+}
+
+/// The three facts of a resolved area that identity is decided against: the verified
+/// volume, its mount root and the area folder's path on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IdentityArea {
+    volume_uuid: crate::os::VolumeUuid,
+    mount_point: PathBuf,
+    path: PathBuf,
+}
+
+impl IdentityArea {
+    fn of(resolved: &area::ResolvedArea) -> Self {
+        Self {
+            volume_uuid: resolved.volume_uuid.clone(),
+            mount_point: resolved.mount_point.clone(),
+            path: resolved.path.clone(),
+        }
+    }
 }
 
 /// What one release run asks for: the presented plan's exact bytes and digest, and
@@ -1797,6 +1893,12 @@ pub fn execute(
     // The fresh gate runs before the effect's exclusive lock: a plan takes the volume
     // lock shared, so the two cannot be held together by one process.
     let run_ms = state::now_ms();
+    // The fresh gate plans with the presented plan's own named roots, so a waiver the
+    // plan stated is decided again, and a named root that is no longer listed refuses.
+    let fresh_request = ReleaseRequest {
+        named_roots: &presented.named_roots,
+        ..request.release
+    };
     let (fresh, observed) = plan_observed(
         state_paths,
         dirs,
@@ -1804,8 +1906,14 @@ pub fn execute(
         mounts,
         observer,
         account,
-        &request.release,
+        &fresh_request,
     )?;
+    if fresh.plan.named_roots != presented.named_roots {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "the plan's named roots are not in the canonical form a plan writes; nothing was changed",
+        ));
+    }
     if fresh.volume.state != VolumeState::Present {
         return Err(Error::new(
             ErrorKind::VolumeAbsent,
@@ -2078,6 +2186,9 @@ fn matching_fresh_row<'a>(
     {
         return Err("the root's identity or marker changed after the plan was written".to_owned());
     }
+    if fresh_row.age_waived != row.age_waived {
+        return Err("the named-root waiver changed after the plan was written".to_owned());
+    }
     if fresh_row.references != row.references {
         return Err("the root's references changed after the plan was written".to_owned());
     }
@@ -2113,22 +2224,24 @@ struct Reprove<'a> {
 }
 
 /// Re-prove the release conditions the presented row relies on, before the intent
-/// is published: the marker and inode the row named, its identity record, its
-/// policy's age, its references and any consumer path's absence. The `String` is
-/// the reason the root is kept; nothing is written here.
+/// is published. Identity is decided again under the lock, against the durable
+/// record's own contents and the root's marker and inode. The policy's age is read
+/// again, and a named root's waiver is the row's own flag. Every reference is
+/// re-read, and any consumer path's absence is proved again. The `String` is the
+/// reason the root is kept; nothing is written here.
 fn reprove_row(context: &Reprove<'_>) -> std::result::Result<(), String> {
     let row = context.row;
+    let observed = context.observed;
     let handle = context
         .dirs
-        .open_path(&context.observed.path)
+        .open_path(&observed.path)
         .map_err(|error| format!("the root could not be opened under its lock: {error}"))?;
 
-    // Identity: the marker is still the one the row named, and the root is still the
-    // inode it named, with its durable record still readable.
+    // The marker is the one the row named, and the record is the one the row named.
     let expectation = area::MarkerExpectation {
         volume_uuid: context.volume_uuid,
-        resolved_path: &context.observed.path,
-        mount_point: Some(&context.observed.mount_point),
+        resolved_path: &observed.path,
+        mount_point: Some(&observed.mount_point),
         effective_uid: context.uid,
         now_ms: state::now_ms(),
     };
@@ -2140,25 +2253,61 @@ fn reprove_row(context: &Reprove<'_>) -> std::result::Result<(), String> {
     if marker_id(&marker_state).as_deref() != Some(row.root_id.as_str()) {
         return Err("the root's marker no longer names the root the plan named".to_owned());
     }
-    if Some(handle.identity().inode) != row.identity.inode {
-        return Err("the root's inode changed after the plan was written".to_owned());
-    }
-    let (stored, unreadable) =
+    let (stored, record_unreadable) =
         read_record(context.state_paths, context.dirs, &row.root_id, context.uid);
-    if unreadable {
-        return Err("the root's identity record is unreadable".to_owned());
+
+    // The same locked observation a plan takes, read again now, so identity is decided
+    // by the same rule: the record's path, inode, volume, root id, nonce, kind and area
+    // against this directory, and the marker's own facts.
+    let entry_facts = context.dirs.dir_facts(&handle).map_err(|error| {
+        format!("the root directory's own facts cannot be read under its lock: {error}")
+    })?;
+    let activity = area::scan_activity(context.dirs, &handle, state::now_ms());
+    let (holds, holds_error) =
+        match area::read_holds(context.state_paths, context.observer, &row.root_id) {
+            Ok(reading) => (reading, None),
+            Err(error) => (area::HoldReading::empty(), Some(error.to_string())),
+        };
+    let locked = LockedObservation {
+        identity: handle.identity(),
+        facts: entry_facts,
+        marker_state,
+        marker_digest,
+        activity,
+        holds,
+        holds_error,
+    };
+    let identity = identity_evidence(
+        context.dirs,
+        context.facts,
+        context.uid,
+        &observed.root,
+        &observed.identity_area,
+        &locked,
+        stored.as_ref(),
+        record_unreadable,
+    );
+    if identity.verdict != "verified" {
+        return Err(format!(
+            "the root's identity is not verified now: {}",
+            identity
+                .reason
+                .as_deref()
+                .unwrap_or(identity.verdict.as_str())
+        ));
     }
-    if stored.is_none() {
-        return Err("the root's identity record is missing".to_owned());
+    if identity.inode != row.identity.inode || identity.marker_digest != row.identity.marker_digest
+    {
+        return Err("the root's identity changed after the plan was written".to_owned());
     }
 
-    // Policy and age: the area still permits a release, and an age gate is still
-    // passed. Activity is read under the root's lock, so a write since the plan
-    // keeps the root.
+    // Policy and age: the area still permits a release, and the age gate is passed
+    // unless the row's own named-root waiver stands in for it. Activity must be known
+    // in every form, so an unknown age keeps the root.
     let declaration = context.document.declaration();
     let permits_release = !matches!(declaration.prune, PrunePolicy::None);
-    let activity = area::scan_activity(context.dirs, &handle, state::now_ms());
-    let measured = activity
+    let measured = locked
+        .activity
         .last_activity_ms
         .filter(|last| *last <= context.now_ms);
     match &declaration.prune {
@@ -2173,7 +2322,9 @@ fn reprove_row(context: &Reprove<'_>) -> std::result::Result<(), String> {
         PrunePolicy::OldestIdleAfter { age_seconds } => match measured {
             None => return Err("the root's last activity cannot be observed".to_owned()),
             Some(last) => {
-                if context.now_ms.saturating_sub(last) < age_seconds.saturating_mul(1000) {
+                if !row.age_waived
+                    && context.now_ms.saturating_sub(last) < age_seconds.saturating_mul(1000)
+                {
                     return Err(format!(
                         "the root is idle for less than the declared {age_seconds} s"
                     ));
@@ -2186,11 +2337,6 @@ fn reprove_row(context: &Reprove<'_>) -> std::result::Result<(), String> {
     // current, the set is complete and unchanged, and any consumer path that a
     // reference requires is absent now.
     let placements = BargeReferences::read(context.state_paths);
-    let (holds, holds_error) =
-        match area::read_holds(context.state_paths, context.observer, &row.root_id) {
-            Ok(reading) => (reading, None),
-            Err(error) => (area::HoldReading::empty(), Some(error.to_string())),
-        };
     let oxide = OxideSnapshot::read_within(context.account, context.reference_wall);
     let (marker, marker_unknown) = match reference::read_oxide_marker(context.dirs, &handle) {
         Ok(Some(marker)) => (Some(marker), None),
@@ -2202,14 +2348,14 @@ fn reprove_row(context: &Reprove<'_>) -> std::result::Result<(), String> {
         permits_release,
         reference::RootRef {
             id: &row.root_id,
-            path: &context.observed.path,
+            path: &observed.path,
             mount_relative_path: &row.mount_relative_path,
         },
-        &holds,
-        holds_error.as_deref(),
+        &locked.holds,
+        locked.holds_error.as_deref(),
     );
     references.absorb(oxide.references_for(
-        &context.observed.path,
+        &observed.path,
         &row.mount_relative_path,
         marker.as_ref(),
         marker_unknown.as_deref(),
@@ -2312,6 +2458,7 @@ mod tests {
                 volume_uuid: Box::leak(Box::new(self.volume.uuid.clone())),
                 now_ms,
                 bounds: ReleaseBounds::design(),
+                named_roots: &[],
             }
         }
 
@@ -2547,6 +2694,7 @@ mod tests {
             volume_uuid: &fixture.volume.uuid,
             now_ms: fixture.overdue(),
             bounds: ReleaseBounds::design(),
+            named_roots: &[],
         };
         let error = plan(
             &fixture.volume.state,
@@ -4938,7 +5086,13 @@ mod tests {
         // The effect re-reads the same facts under the unit's own lock before it writes
         // an intent. Each mutation here stands in for a change between the fresh gate
         // and that lock, and each must be refused by `reprove_row` alone.
-        for case in ["identity record", "marker", "live hold", "placement"] {
+        for case in [
+            "identity record",
+            "identity record contents",
+            "marker",
+            "live hold",
+            "placement",
+        ] {
             let fixture = Fixture::new("release-reprove");
             let root = fixture.root();
             let mut observer = fixture.volume.observer();
@@ -4977,6 +5131,24 @@ mod tests {
                         .processes
                         .insert(std::process::id(), Some(7_000_000));
                     hold(&fixture, &observer, &root);
+                }
+                "identity record contents" => {
+                    // The record is still there and still parses, but it names another
+                    // volume: identity is decided against the record's own contents.
+                    let record_path = identity_path(&fixture, &root);
+                    let mut record: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(&record_path).expect("the record is read"),
+                    )
+                    .expect("the record is JSON");
+                    record["volume_uuid"] =
+                        serde_json::Value::String(crate::testkit::OTHER_UUID.to_owned());
+                    std::fs::write(
+                        &record_path,
+                        serde_json::to_vec(&record).expect("the record encodes"),
+                    )
+                    .expect("the record is rewritten");
+                    std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o600))
+                        .expect("the record is private");
                 }
                 "placement" => publish_placement(&fixture, &root),
                 _ => unreachable!("every case names one fact"),
@@ -5139,5 +5311,112 @@ mod tests {
             intent_records(&fixture).is_empty(),
             "a rolled-back intent is settled and leaves the journal"
         );
+    }
+
+    /// One plan at `now_ms`, naming the roots an operator waives the age gate for.
+    fn plan_naming(fixture: &Fixture, now_ms: u64, named: &[String]) -> Result<PruneReport> {
+        let platform = fixture.volume.platform();
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let mounts = fixture.volume.mounts();
+        let request = ReleaseRequest {
+            named_roots: named,
+            ..fixture.request(now_ms)
+        };
+        plan(
+            &fixture.volume.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.account,
+            &request,
+        )
+    }
+
+    #[test]
+    fn a_named_root_waives_only_the_age_gate_and_the_plan_says_so() {
+        // A young root under an age-gated area is kept, and a named root is released
+        // without its age. The waiver is stated in the plan, so the digest covers it.
+        let fixture = Fixture::new("release-named-root");
+        let root = fixture.root();
+        let now = crate::state::now_ms();
+        let unnamed = plan_naming(&fixture, now, &[]).expect("the plan is built");
+        assert!(!row(&unnamed, &root).eligible);
+        assert_eq!(row(&unnamed, &root).blocked_by.as_deref(), Some("policy"));
+
+        let named = vec![root.root_id.clone()];
+        let report = plan_naming(&fixture, now, &named).expect("the plan is built");
+        let waived = row(&report, &root);
+        assert!(waived.eligible, "{waived:?}");
+        assert!(waived.age_waived, "the waiver is stated on the row");
+        assert_eq!(report.plan.named_roots, named);
+        let (bytes, digest) = presented(&report);
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let run = release_with(&fixture, &observer, &facts, now, &bytes, &digest)
+            .expect("the run is reported");
+        assert_eq!(run.released_count, 1, "{run:?}");
+        assert!(std::fs::metadata(&root.path).is_err());
+
+        // A named root keeps every other condition: a live hold still keeps it.
+        let held = Fixture::new("release-named-root-hold");
+        let held_root = held.root();
+        let mut held_observer = held.volume.observer();
+        held_observer
+            .processes
+            .insert(std::process::id(), Some(7_000_000));
+        hold(&held, &held_observer, &held_root);
+        let report = plan_naming(
+            &held,
+            held.overdue(),
+            std::slice::from_ref(&held_root.root_id),
+        )
+        .expect("the plan is built");
+        let kept = row(&report, &held_root);
+        assert!(!kept.eligible);
+        assert_eq!(kept.blocked_by.as_deref(), Some("custody"));
+
+        // A policy that never releases is not waived by a name.
+        let never = Fixture::new("release-named-root-none");
+        let never_root = never.root();
+        let mut declaration = never.declaration.clone();
+        declaration.prune = PrunePolicy::None;
+        area::declare(&never.volume.state, &declaration, 2_000).expect("the policy changes");
+        let report = plan_naming(
+            &never,
+            never.overdue(),
+            std::slice::from_ref(&never_root.root_id),
+        )
+        .expect("the plan is built");
+        let kept = row(&report, &never_root);
+        assert!(!kept.eligible);
+        assert!(!kept.age_waived);
+        assert_eq!(kept.blocked_by.as_deref(), Some("policy"));
+    }
+
+    #[test]
+    fn a_named_root_must_be_listed_and_a_waiver_must_name_its_root() {
+        let fixture = Fixture::new("release-named-unlisted");
+        let root = fixture.root();
+        let now = crate::state::now_ms();
+
+        // A root id the area does not list is refused: a name the plan cannot see
+        // would waive nothing.
+        let unlisted = vec!["a".repeat(32)];
+        let error = plan_naming(&fixture, now, &unlisted).expect_err("an unlisted name refuses");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert!(std::fs::metadata(&root.path).is_ok(), "nothing was changed");
+
+        // A plan whose waiver names no root is not a plan this reader accepts.
+        let named = vec![root.root_id.clone()];
+        let report = plan_naming(&fixture, now, &named).expect("the plan is built");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&canonical_plan_bytes(&report.plan).expect("the plan encodes"))
+                .expect("the plan is JSON");
+        value["named_roots"] = serde_json::json!([]);
+        let forged = serde_json::to_vec(&value).expect("the forged plan encodes");
+        let error = read_prune_plan(&forged).expect_err("a waiver the plan does not name refuses");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
 }

@@ -842,6 +842,7 @@ fields are understood by both.
 | `barge.describe` | `/1`, optional fields added | `barge describe` | adds `identity.capability` (what may be compared across a remount) and `volumes[].mounts` (how many live mounts carry each registered UUID) |
 | `barge.inspect` | `/1`, optional fields added | `barge inspect` | adds `oxide_census`: the Oxide output-registry observation, its per-row identity census and the drift summary |
 | `barge.prune` | `/1` | `barge prune --plan` | the command document around the plan, as `barge.maintain/1` wraps `barge.maintain.plan/1`: the plan, its SHA-256, when it was planned, the volume's state and whether the Oxide reference snapshot was complete |
+| `barge.prune.plan` (F6-R1 additions) | `/1`, optional fields | `barge prune --plan --root` | `named_roots` (sorted, unique root ids) and each row's `age_waived`, present only when a root was named; both covered by the digest |
 | `barge.prune.run` | `/1` | `barge prune --plan <file> --plan-sha256 <hex>` | new in F6-R1: the release effect's report, the presented digest, the fresh gate's digest for the same area, the replay's pending count and one outcome per presented eligible row |
 
 The versioning rules are stage 1's: adding an optional field stays inside a
@@ -1472,8 +1473,8 @@ this, in order. Each batch-wide refusal changes nothing.
 1. The bytes must hash to the digest, read through F4's strict reader, and
    re-serialise to the same bytes. The plan's area and volume must be the
    command's.
-2. The gate runs again for the same area (F3's `plan`), before the volume lock,
-   because a plan takes that lock shared. A volume that is not attached, a volume
+2. The gate runs again for the same area (F3's `plan`), with the presented plan's
+   own named roots, before the volume lock, because a plan takes that lock shared. A volume that is not attached, a volume
    with an undeclared durability, or an incomplete Oxide reference set refuses the
    whole batch.
 3. Each presented eligible row must agree with the fresh row on identity verdict,
@@ -1482,9 +1483,12 @@ this, in order. Each batch-wide refusal changes nothing.
 4. The run takes the volume's exclusive lock and replays pending intents on the
    volume (F4). Then each candidate's deletion takes its unit's lock, and before
    the intent is written, `reprove_row` re-reads under that lock: the marker and
-   inode the row named, the identity record, the policy and its age, every
-   reference (holds, placements, Oxide's registry, receipts and marker), and any
-   consumer path's absence. Any change keeps that root and writes no intent.
+   inode the row named, the durable identity record's contents, the policy and its
+   age, every reference (holds, placements, Oxide's registry, receipts and marker),
+   and any consumer path's absence. Identity is decided again by the plan's own
+   rule, against the record's volume, root id, nonce, path, kind and area, so a
+   record that names another volume or another root keeps the root. Any change
+   keeps that root and writes no intent.
 5. The intent is `barge.intent/2` with the fresh identity and absence evidence.
    Its `plan_digest` is the presented digest, which is the permission. The rest is
    S5: custody after publish, the quarantine rename, the whole-unit delete and the
@@ -1501,11 +1505,19 @@ unknown activity keeps a root everywhere in this gate. `oldest-idle` keeps its a
 gate, and `none` releases nothing. `maintain` and the space path still never
 consider a `release_on_reference` root (slice R2, in the slices section above).
 
-**What the run does not do.** It has no named-root waiver. The text above says an
-operator command that names one root may waive the age gate; this slice does not
-build that form, because the brief's acceptance does not require it and no plan
-field carries a waiver. A later brief would add it, with its own digest and its own
-authorization. The run never reads a root that a plan did not list, and it never
+**The named-root waiver.** `barge prune --plan --root <root-id>` (repeatable) names
+the roots an operator waives the age gate for. It waives that one condition and
+nothing else: custody, durability, identity, references, absence and the policy's
+own permission all still apply, and a named root's last activity must still be
+known. An `oldest-idle` area is the only one whose age gate it waives; a `none`
+area still releases nothing, and a `release_on_reference` area has no age gate to
+waive. The plan states the waiver: `named_roots` is the sorted, unique list of root
+ids the operator named, and each row the waiver stood in for carries
+`age_waived: true`. The digest covers both, and the effect plans with the presented
+plan's own named roots, so the same waiver is decided again. A name the area does
+not list refuses the plan, and a waived row whose root the plan does not name is a
+document the reader refuses. A real run takes no `--root`; the presented plan
+states its own. The run never reads a root that a plan did not list, and it never
 settles an Oxide intent.
 
 **Output.** `barge.prune.run/1`: `plan_digest`, `fresh_plan_digest`, `run_ms`,
@@ -1543,14 +1555,16 @@ run.
 | X4 | each condition that changed after the plan keeps the root and writes no intent | `a_run_keeps_a_root_whose_condition_changed_after_the_plan_was_written` |
 | X5 | the intent is written before the rename; a remount replays it | `an_intent_is_written_before_the_rename_and_a_remount_replays_it` |
 | X6 | the CLI refuses a digest that is not the presented bytes' | `prune_run_refuses_a_plan_whose_digest_or_bytes_are_not_the_presented_ones` |
+| X7 | a named root waives only the age gate; custody and policy still keep, the plan states the waiver, and an unlisted name or an unnamed waiver refuses | `a_named_root_waives_only_the_age_gate_and_the_plan_says_so`, `a_named_root_must_be_listed_and_a_waiver_must_name_its_root` |
+| X8 | identity re-decided under the lock against the record's contents | `the_unit_lock_re_proof_refuses_each_condition_it_re_reads` (case `identity record contents`) |
 
-**Native proof: held.** `scripts/native/release-proof.py` carries the declaration
-side only: `release:native:test` (self-check) and `release:native:plan`. The
-elevated run the brief describes (one owned APFS fixture image of at most 64 MiB,
+**Native proof: held, and missing.** `scripts/native/release-proof.py` carries the
+declaration side only: `release:native:test` (self-check) and `release:native:plan`.
+The elevated run the brief describes (one owned APFS fixture image of at most 64 MiB,
 the qualified shared supervisor, a 300 s wall, 512 MiB of scratch, an uncounted
-diagnostic, a counted author pass and a distinct reviewer pass) is not built.
-Until its body lands and an owner activates it at an exact head, no receipt
-exists, and a missing receipt is a missing proof.
+diagnostic, a counted author pass and a distinct reviewer pass) is not built, and
+no owner activation has happened. No author or reviewer receipt exists. A missing
+receipt is a missing proof.
 
 ## Proposed validation
 
