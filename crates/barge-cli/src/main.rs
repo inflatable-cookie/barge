@@ -51,6 +51,8 @@ const USAGE: &str = "usage: barge <describe|inspect|space|volume|maintain|prune|
        barge volume update <uuid> [--reserve <bytes>] [--floor <bytes>] --declared-by <name> --plan
        barge volume <register|update> --plan-file <file> --plan-sha256 <digest>
        barge volume describe <uuid>
+       barge space guard --volume <uuid> --area <namespace>/<area> [--wall <seconds>]
+       barge space recheck --guard <token> [--wall <seconds>]
        barge space prune --volume <uuid> --plan [--plan-out <file>]
        barge space prune --volume <uuid> --plan <file> --plan-sha256 <hex>
        barge maintain [--plan-out <file>]
@@ -135,7 +137,7 @@ const COMMAND_VERBS: &[(&str, &[&str])] = &[
         &["alloc", "conclude", "expire", "grants", "delegate", "claim"],
     ),
     ("volume", &["register", "update", "describe"]),
-    ("space", &["prune"]),
+    ("space", &["prune", "guard", "recheck"]),
     ("cache", &["adopt", "undo", "list"]),
 ];
 
@@ -156,6 +158,9 @@ fn command_name(args: &[String]) -> String {
         };
     };
     match words.find(|word| verbs.contains(&word.as_str())) {
+        Some(verb) if command == "space" && matches!(verb.as_str(), "guard" | "recheck") => {
+            format!("{command} {verb}")
+        }
         Some(verb) => format!("{command}.{verb}"),
         None => command.clone(),
     }
@@ -1125,6 +1130,8 @@ fn space(args: &[String]) -> Result<Report, Error> {
             let human = format!("space: {} registered volumes\n", report.volumes.count);
             Report::verb(barge::space::SPACE_SCHEMA, "space", &report, human)
         }
+        Some("guard") if words.len() == 1 => space_guard(options, false),
+        Some("recheck") if words.len() == 1 => space_guard(options, true),
         Some("prune") if words.len() == 1 => space_prune(options),
         Some("prune") => Err(usage(format!(
             "unexpected argument after prune: {}",
@@ -1132,6 +1139,62 @@ fn space(args: &[String]) -> Result<Report, Error> {
         ))),
         Some(other) => Err(usage(format!("unknown space verb: {other}"))),
     }
+}
+
+/// Decide admission or re-evaluate a checkpoint using current facts.
+fn space_guard(mut options: Options, recheck: bool) -> Result<Report, Error> {
+    let wall = one_option(&mut options, "wall")?.map_or(Ok(30), |value| {
+        value
+            .parse::<u64>()
+            .map_err(|_| usage("--wall needs whole seconds"))
+    })?;
+    let platform = os::platform();
+    let paths = state_paths()?;
+    let report = if recheck {
+        let token = barge::space::SpaceGuard::parse(&required(&mut options, "guard")?)?;
+        refuse_unknown(options)?;
+        barge::space::recheck(
+            &paths,
+            &platform,
+            &platform,
+            &platform,
+            &platform,
+            &platform,
+            &platform,
+            &token,
+            std::time::Duration::from_secs(wall),
+        )?
+    } else {
+        let volume = volume_arg(&required(&mut options, "volume")?)?;
+        let area = required(&mut options, "area")?;
+        let (namespace, area) = area
+            .split_once('/')
+            .ok_or_else(|| usage("--area needs namespace/area"))?;
+        refuse_unknown(options)?;
+        barge::space::guard(
+            &paths,
+            &platform,
+            &platform,
+            &platform,
+            &platform,
+            &platform,
+            &platform,
+            &barge::space::GuardRequest {
+                volume_uuid: &volume,
+                namespace,
+                area,
+                wall: std::time::Duration::from_secs(wall),
+                recheck: false,
+            },
+        )?
+    };
+    let command = if recheck {
+        "space recheck"
+    } else {
+        "space guard"
+    };
+    let human = format!("{}\n", report.message);
+    Report::verb(barge::space::SPACE_GUARD_SCHEMA, command, &report, human)
 }
 
 /// Preview or run one volume's space prune: `barge space prune --volume <uuid>

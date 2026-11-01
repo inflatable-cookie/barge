@@ -4,7 +4,10 @@
 mod effect;
 mod guard;
 
-pub use guard::{SpaceDecision, SpaceGuard};
+pub use guard::{
+    guard, read_guard_document, recheck, GuardArea, GuardKept, GuardPruned, GuardReport,
+    GuardRequest, SpaceDecision, SpaceGuard, SPACE_GUARD_SCHEMA,
+};
 
 pub use effect::{
     prune, SpaceFlushRow, SpacePruneBounds, SpacePruneEffect, SpacePruneHeldRow,
@@ -625,6 +628,46 @@ pub fn plan(
             }
         }
     };
+    let report = plan_from_snapshot(
+        paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        request,
+        started,
+        record,
+        declarations,
+        verified,
+        measurement,
+        mount,
+        policy,
+        target_bytes,
+        state,
+    );
+    drop(volume_lock);
+    report
+}
+
+/// Build a candidate plan using the caller's existing volume-lock custody.
+#[allow(clippy::too_many_arguments)]
+fn plan_from_snapshot(
+    paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    request: &SpacePruneRequest<'_>,
+    started: Instant,
+    record: VolumeRecord,
+    declarations: area::DeclarationSet,
+    verified: os::VerifiedVolume,
+    measurement: SpaceMeasurement,
+    mount: PathBuf,
+    policy: registry::SpacePolicy,
+    target_bytes: u64,
+    state: String,
+) -> Result<SpacePruneReport> {
     let declarations_truncated = declarations.truncated;
     let mut planner = Planner {
         paths,
@@ -652,9 +695,6 @@ pub fn plan(
         planner.area(document);
     }
     planner.scratch();
-    // One root's shared lock at a time: every entry took and released its own, so
-    // the volume's observation lock is the only one still held here.
-    drop(volume_lock);
     let Planner {
         stopped,
         truncated,
@@ -712,6 +752,255 @@ pub fn plan(
         }),
         unreached,
         effect: None,
+    })
+}
+
+/// Re-plan under a guard's existing exclusive volume lock without another measurement.
+#[allow(clippy::too_many_arguments)]
+fn plan_locked(
+    paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    request: &SpacePruneRequest<'_>,
+    measurement: SpaceMeasurement,
+    lock: &StateLock,
+) -> Result<SpacePruneReport> {
+    if lock.path() != paths.volume_lock_path(request.volume_uuid)
+        || lock.rank() != LockRank::Volume
+        || lock.mode() != state::LockMode::Exclusive
+    {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "live space planning requires the volume's exclusive lock",
+        ));
+    }
+    let started = Instant::now();
+    let record = area::registered_volume(paths, request.volume_uuid)?;
+    let durability = record.declared_durability()?;
+    if !durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "volume no longer permits pruning",
+        ));
+    }
+    let policy = record.declared_space()?.clone();
+    let declarations = area::read_declarations(paths)?;
+    let mount = record.mount_hint.clone().ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnknownState,
+            "registered volume has no mount hint",
+        )
+    })?;
+    let verified = os::verify_volume(facts, mounts, &mount, &record.expected_volume())?;
+    let state = state_name(&measurement, &policy).to_owned();
+    let target_bytes = policy.reserve_bytes.max(policy.floor_bytes);
+    plan_from_snapshot(
+        paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        request,
+        started,
+        record,
+        declarations,
+        verified,
+        measurement,
+        mount,
+        policy,
+        target_bytes,
+        state,
+    )
+}
+
+/// Bounded best-effort attribution. Missing values mean the evidence was incomplete.
+struct GuardAttribution {
+    prunable: Option<u64>,
+    held: Option<u64>,
+    excluded: Option<u64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attribute_locked(
+    paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    uuid: &VolumeUuid,
+    now_ms: u64,
+    wall: Duration,
+    measurement: SpaceMeasurement,
+    lock: &StateLock,
+) -> Result<GuardAttribution> {
+    let started = Instant::now();
+    let request = SpacePruneRequest {
+        volume_uuid: uuid,
+        now_ms,
+        wall: wall.min(SPACE_PLAN_WALL),
+        lock_wait: Duration::ZERO,
+    };
+    let report = plan_locked(
+        paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        &request,
+        measurement,
+        lock,
+    )?;
+    let record = area::registered_volume(paths, uuid)?;
+    let verified = os::verify_volume(
+        facts,
+        mounts,
+        record
+            .mount_hint
+            .as_deref()
+            .ok_or_else(|| Error::new(ErrorKind::UnknownState, "volume mount is unknown"))?,
+        &record.expected_volume(),
+    )?;
+    let declarations = area::read_declarations(paths)?;
+    let planner = Planner {
+        paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        record: &record,
+        device: verified.identity().device,
+        now_ms,
+        wall,
+        lock_wait: Duration::ZERO,
+        deadline: started + wall,
+        stopped: None,
+        truncated: false,
+        examined: 0,
+        unreached: 0,
+        candidates: BTreeMap::new(),
+        candidate_total: 0,
+        kept: Vec::new(),
+        kept_total: 0,
+        participation: Vec::new(),
+    };
+    let mut prunable = if report.truncated { None } else { Some(0u64) };
+    for row in &report.plan.candidates.rows {
+        prunable = prunable.and_then(|n| n.checked_add(row.bytes));
+    }
+    let mut held = if report.truncated { None } else { Some(0u64) };
+    for row in &report.kept.rows {
+        let Some(path) = &row.path else {
+            held = None;
+            continue;
+        };
+        match planner.observe_entry(&row.name, path) {
+            Ok(observed) if observed.handle.identity().device == planner.device => {
+                held = held.and_then(|n| {
+                    planner
+                        .scan_bytes(&observed.handle)
+                        .ok()
+                        .and_then(|bytes| n.checked_add(bytes))
+                });
+            }
+            _ => held = None,
+        }
+    }
+    let mut excluded = if declarations.truncated {
+        None
+    } else {
+        Some(0u64)
+    };
+    for doc in &declarations.documents {
+        if doc.reserve != ReserveParticipation::Excluded {
+            continue;
+        }
+        let resolved = match area::resolve(
+            dirs,
+            facts,
+            mounts,
+            observer,
+            &record,
+            &doc.declaration(),
+            Some(doc),
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                excluded = None;
+                continue;
+            }
+        };
+        let listing = match area::list_names(dirs, &resolved, ROOT_ROWS) {
+            Ok(value) => value,
+            Err(_) => {
+                excluded = None;
+                continue;
+            }
+        };
+        if listing.truncated {
+            excluded = None;
+        }
+        for row in listing.names {
+            match planner.observe_entry(&row.name, &row.path) {
+                Ok(observed)
+                    if matches!(observed.marker, MarkerState::Owned(_))
+                        && observed.handle.identity().device == planner.device =>
+                {
+                    excluded = excluded.and_then(|n| {
+                        planner
+                            .scan_bytes(&observed.handle)
+                            .ok()
+                            .and_then(|bytes| n.checked_add(bytes))
+                    });
+                }
+                _ => excluded = None,
+            }
+        }
+    }
+    // Cache placements do not participate, but verified owned roots are counted.
+    match area::resolve_feature(
+        dirs,
+        facts,
+        mounts,
+        observer,
+        &record,
+        area::Feature::Caches,
+    ) {
+        Ok(folder) => match area::open_existing_feature(dirs, &folder) {
+            Ok(Some(handle)) => match dirs.list_names(&handle, ROOT_ROWS) {
+                Ok(names) => {
+                    if names.truncated {
+                        excluded = None;
+                    }
+                    for name in names.names {
+                        match planner.observe_entry(&name, &folder.path.join(&name)) {
+                            Ok(observed)
+                                if matches!(observed.marker, MarkerState::Owned(_))
+                                    && observed.handle.identity().device == planner.device =>
+                            {
+                                excluded = excluded.and_then(|n| {
+                                    planner
+                                        .scan_bytes(&observed.handle)
+                                        .ok()
+                                        .and_then(|bytes| n.checked_add(bytes))
+                                });
+                            }
+                            _ => excluded = None,
+                        }
+                    }
+                }
+                Err(_) => excluded = None,
+            },
+            Ok(None) => {}
+            Err(_) => excluded = None,
+        },
+        Err(_) => excluded = None,
+    }
+    Ok(GuardAttribution {
+        prunable,
+        held,
+        excluded,
     })
 }
 

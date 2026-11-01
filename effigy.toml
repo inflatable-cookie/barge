@@ -22,6 +22,14 @@ alias = "barge"
 # The unit suite is defined once, under `[test.suites.rust]`; this task is
 # Effigy's own task-ref composition so one name selects it.
 "rust:test" = [{ task = "test rust" }]
+# Individually bounded target runs support exact-head covering evidence.
+"rust:test:prewarm" = "oxide test --admission-budget 300s --execution-budget 600s --workspace --all-targets --locked --no-run"
+"rust:test:lib" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib"
+"rust:test:native-harness" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --test native_proof_harness"
+"rust:test:volume-probe" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --example volume_probe"
+"rust:test:cli" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge-cli --bin barge"
+"rust:test:cli-contract" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge-cli --test cli_contract"
+
 
 # S6's elevated native proof (docs/knowledge/contracts/s6-native-proof.md).
 # Owner-gated: the run attaches one owned APFS image and writes only inside the

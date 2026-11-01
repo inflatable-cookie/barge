@@ -105,3 +105,498 @@ mod tests {
         }
     }
 }
+
+use super::{effect, SpacePruneBounds, SpacePruneRunRequest};
+use crate::contract::{RowSet, ROOT_ROWS};
+use crate::delete::DeleteBounds;
+use crate::os::{
+    self, AbsenceVolume, DirOps, Flush, MountRoot, ProcessObserver, SpaceFacts, SpaceMeasurement,
+};
+use crate::registry::SpacePolicy;
+use crate::state::{self, StatePaths};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+/// The schema of a completed guard or recheck.
+pub const SPACE_GUARD_SCHEMA: &str = "barge.space.guard/1";
+
+/// Inputs to one guard or recheck.
+#[derive(Debug, Clone)]
+pub struct GuardRequest<'a> {
+    /// Volume registry lookup key.
+    pub volume_uuid: &'a VolumeUuid,
+    /// Stored namespace.
+    pub namespace: &'a str,
+    /// Stored area name.
+    pub area: &'a str,
+    /// Overall wall budget, at most 120 seconds.
+    pub wall: Duration,
+    /// Whether this call is a running consumer's checkpoint.
+    pub recheck: bool,
+}
+
+/// Area identity in a guard document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardArea {
+    /// Namespace.
+    pub namespace: String,
+    /// Area name.
+    pub area: String,
+}
+
+/// A root deleted by the guard, without an internal path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardPruned {
+    /// Root identity.
+    pub root_id: String,
+    /// Owning area.
+    pub area: String,
+    /// Planned bytes.
+    pub bytes: u64,
+    /// Last recorded release.
+    pub last_release_ms: u64,
+}
+
+/// A root kept because a durable intent still covers it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardKept {
+    /// Root identity where recorded.
+    pub root_id: String,
+    /// Why the root is kept.
+    pub reason: String,
+    /// The pending intent that covers it.
+    pub intent_id: String,
+}
+
+/// A completed guard decision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardReport {
+    /// Decision for the consumer.
+    pub decision: SpaceDecision,
+    /// Registered and verified volume.
+    pub volume_uuid: VolumeUuid,
+    /// Verified volume mount.
+    pub mount_hint: PathBuf,
+    /// Area identity.
+    pub area: GuardArea,
+    /// First measurement.
+    pub before: SpaceMeasurement,
+    /// Deciding measurement.
+    pub after: SpaceMeasurement,
+    /// Current policy.
+    pub policy: SpacePolicy,
+    /// Newly pruned roots.
+    pub pruned: RowSet<GuardPruned>,
+    /// Roots protected by pending intents.
+    pub kept: RowSet<GuardKept>,
+    /// Measured reclaimed bytes.
+    pub reclaimed_bytes: u64,
+    /// Flush and measurement rounds.
+    pub rounds: usize,
+    /// A competing prune outlived this guard's lock wait.
+    pub decided_after_wait: bool,
+    /// Human explanation.
+    pub message: String,
+    /// Measurements, attribution and effect accounting.
+    pub detail: serde_json::Value,
+    /// Token for a later recheck.
+    pub guard: String,
+}
+
+/// Read a completed guard document, rejecting other schemas and invalid counts.
+pub fn read_guard_document(bytes: &[u8]) -> Result<GuardReport> {
+    let invalid = || {
+        Error::new(
+            ErrorKind::UnknownState,
+            "invalid barge.space.guard/1 document",
+        )
+    };
+    let value = crate::contract::parse_document(bytes)?;
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some(SPACE_GUARD_SCHEMA)
+        || value.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+        || !matches!(
+            value.get("command").and_then(serde_json::Value::as_str),
+            Some("space guard" | "space recheck")
+        )
+    {
+        return Err(invalid());
+    }
+    let report: GuardReport =
+        serde_json::from_value(value.get("data").ok_or_else(invalid)?.clone())
+            .map_err(|_| invalid())?;
+    report.pruned.validate()?;
+    report.kept.validate()?;
+    SpaceGuard::parse(&report.guard).map_err(|_| invalid())?;
+    let detail = report.detail.as_object().ok_or_else(invalid)?;
+    for key in [
+        "free_bytes",
+        "floor_bytes",
+        "reserve_bytes",
+        "pruned_root_ids",
+        "reclaimed_bytes",
+        "owned_prunable_bytes",
+        "held_or_unknown_bytes",
+        "excluded_bytes",
+        "other_estimate_bytes",
+        "other_estimate_label",
+        "cause",
+        "measurement_source",
+        "observed_ms",
+    ] {
+        if !detail.contains_key(key) {
+            return Err(invalid());
+        }
+    }
+    Ok(report)
+}
+
+/// Recheck an untrusted token using current registry, area and volume facts.
+#[allow(clippy::too_many_arguments)]
+pub fn recheck(
+    paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn AbsenceVolume,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    space: &dyn SpaceFacts,
+    flush: &dyn Flush,
+    token: &SpaceGuard,
+    wall: Duration,
+) -> Result<GuardReport> {
+    guard(
+        paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        space,
+        flush,
+        &GuardRequest {
+            volume_uuid: &token.volume_uuid,
+            namespace: &token.namespace,
+            area: &token.area,
+            wall,
+            recheck: true,
+        },
+    )
+}
+
+fn measured(space: &dyn SpaceFacts, volume: &os::VerifiedVolume) -> Result<SpaceMeasurement> {
+    space.measure_space(volume).map_err(|error| {
+        if error.kind() == ErrorKind::VolumeAbsent {
+            return error;
+        }
+        let mut unknown = Error::new(
+            ErrorKind::UnknownState,
+            format!("space measurement is unknown: {error}"),
+        );
+        for (key, value) in error.detail() {
+            unknown = unknown.with_detail(key, value.clone());
+        }
+        unknown
+    })
+}
+
+/// Check the registered volume and current area declaration, then decide admission.
+#[allow(clippy::too_many_arguments)]
+pub fn guard(
+    paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn AbsenceVolume,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    space: &dyn SpaceFacts,
+    flush: &dyn Flush,
+    request: &GuardRequest<'_>,
+) -> Result<GuardReport> {
+    guard_with_bounds(
+        paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        space,
+        flush,
+        request,
+        SpacePruneBounds::design(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn guard_with_bounds(
+    paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn AbsenceVolume,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    space: &dyn SpaceFacts,
+    flush: &dyn Flush,
+    request: &GuardRequest<'_>,
+    mut bounds: SpacePruneBounds,
+) -> Result<GuardReport> {
+    if request.wall.is_zero() || request.wall > Duration::from_secs(120) {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "guard wall must be greater than zero and at most 120 seconds",
+        ));
+    }
+    let started = Instant::now();
+    let record = area::registered_volume(paths, request.volume_uuid)?;
+    if !record.declared_durability()?.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the volume is kept and does not permit expendable work",
+        ));
+    }
+    let policy = record.declared_space()?.clone();
+    let mount = record.mount_hint.clone().ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnknownState,
+            "registered volume has no mount hint",
+        )
+    })?;
+    let verified =
+        os::verify_volume(facts, mounts, &mount, &record.expected_volume()).map_err(|error| {
+            if error.kind() == ErrorKind::RefusedBoundary {
+                Error::new(
+                    ErrorKind::VolumeMismatch,
+                    "the mounted volume does not match the registered volume",
+                )
+            } else {
+                error
+            }
+        })?;
+    let doc = area::show(paths, request.namespace, request.area)?
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "the area is not declared"))?;
+    area::resolve(
+        dirs,
+        facts,
+        mounts,
+        observer,
+        &record,
+        &doc.declaration(),
+        Some(&doc),
+    )?;
+    state::read_intents(paths, crate::contract::INTENT_ROWS).map_err(|error| {
+        let mut unknown = Error::new(
+            ErrorKind::UnknownState,
+            format!("intent journal is unreadable: {error}"),
+        );
+        for (key, value) in error.detail() {
+            unknown = unknown.with_detail(key, value.clone());
+        }
+        unknown
+    })?;
+    let before = measured(space, &verified)?;
+    let mut after = before.clone();
+    let mut current_policy = policy;
+    let mut generation = record.generation;
+    let mut rows = Vec::new();
+    let mut reclaimed = 0;
+    let mut rounds = 0;
+    let mut after_wait = false;
+    let mut stop = String::new();
+    let mut pass_lock = None;
+    if before.free_bytes <= current_policy.reserve_bytes.max(current_policy.floor_bytes) {
+        let remaining = request.wall.saturating_sub(started.elapsed());
+        bounds.wall = remaining;
+        let run = SpacePruneRunRequest {
+            volume_uuid: request.volume_uuid,
+            plan_digest: "",
+            plan_bytes: &[],
+            now_ms: state::now_ms(),
+            lock_wait: Duration::from_secs(5).min(remaining),
+            delete_bounds: DeleteBounds::default(),
+            bounds,
+        };
+        match effect::prune_live(
+            paths, dirs, facts, mounts, observer, space, flush, &run, None,
+        ) {
+            Ok((report, lock)) => {
+                pass_lock = Some(lock);
+                let effect = report.effect.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::UnknownState,
+                        "live prune did not report its effect",
+                    )
+                })?;
+                after = effect.after;
+                current_policy = effect.policy;
+                generation = effect.policy_generation;
+                reclaimed = effect.reclaimed_bytes;
+                rounds = effect.rounds;
+                stop = effect.stop;
+                rows = effect
+                    .pruned
+                    .rows
+                    .into_iter()
+                    .map(|row| GuardPruned {
+                        root_id: row.root_id,
+                        area: row.area,
+                        bytes: row.bytes,
+                        last_release_ms: row.last_release_ms,
+                    })
+                    .collect();
+            }
+            Err(error) if error.kind() == ErrorKind::Locked => {
+                after_wait = true;
+                let current = area::registered_volume(paths, request.volume_uuid)?;
+                if !current.declared_durability()?.permits_pruning() {
+                    return Err(Error::new(
+                        ErrorKind::UnknownState,
+                        "volume no longer permits expendable work",
+                    ));
+                }
+                current_policy = current.declared_space()?.clone();
+                generation = current.generation;
+                let verified =
+                    os::verify_volume(facts, mounts, &mount, &current.expected_volume())?;
+                after = measured(space, &verified)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let intents = state::read_intents(paths, crate::contract::INTENT_ROWS).map_err(|error| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!("intent journal is unreadable: {error}"),
+        )
+        .with_detail(
+            "pruned_root_ids",
+            serde_json::json!(rows.iter().map(|row| &row.root_id).collect::<Vec<_>>()),
+        )
+    })?;
+    let kept: Vec<GuardKept> = intents
+        .records
+        .iter()
+        .filter(|intent| intent.is_pending() && &intent.volume_uuid == request.volume_uuid)
+        .map(|intent| GuardKept {
+            root_id: intent
+                .unit
+                .root_id
+                .clone()
+                .unwrap_or_else(|| intent.unit.name.clone()),
+            reason: "pending_intent".to_owned(),
+            intent_id: intent.intent_id.clone(),
+        })
+        .collect();
+    let attribution = if let Some(lock) = pass_lock.as_ref() {
+        let remaining = request.wall.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            None
+        } else {
+            Some(
+                super::attribute_locked(
+                    paths,
+                    dirs,
+                    facts,
+                    mounts,
+                    observer,
+                    request.volume_uuid,
+                    state::now_ms(),
+                    remaining,
+                    after.clone(),
+                    lock,
+                )
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::UnknownState,
+                        format!("attribution could not be established: {error}"),
+                    )
+                    .with_detail(
+                        "pruned_root_ids",
+                        serde_json::json!(rows.iter().map(|row| &row.root_id).collect::<Vec<_>>()),
+                    )
+                })?,
+            )
+        }
+    } else {
+        None
+    };
+    let prunable = attribution.as_ref().and_then(|a| a.prunable);
+    let held = attribution.as_ref().and_then(|a| a.held);
+    let excluded = attribution.as_ref().and_then(|a| a.excluded);
+    let other = prunable.zip(held).zip(excluded).and_then(|((p, h), e)| {
+        after
+            .total_bytes
+            .checked_sub(after.free_bytes)?
+            .checked_sub(p)?
+            .checked_sub(h)?
+            .checked_sub(e)
+    });
+    let cause = if matches!(stop.as_str(), "budget_exhausted" | "space_not_reclaimed") {
+        "budget_exhausted"
+    } else if other.is_none() {
+        "unknown"
+    } else if held.unwrap_or(0) > 0 {
+        "held_owned_roots"
+    } else if excluded.unwrap_or(0) > 0 || other.unwrap_or(0) > 0 {
+        "excluded_or_non_barge"
+    } else {
+        "none"
+    };
+    let ids: Vec<&str> = rows.iter().map(|row| row.root_id.as_str()).collect();
+    let message = format!(
+        "volume {} at {}: {} bytes free, floor {} bytes, reserve {} bytes; cause: {} (other bytes are an estimate). No work was sent to the internal drive.",
+        request.volume_uuid,
+        mount.display(),
+        after.free_bytes,
+        current_policy.floor_bytes,
+        current_policy.reserve_bytes,
+        cause
+    );
+    let detail = serde_json::json!({"free_bytes":after.free_bytes,"floor_bytes":current_policy.floor_bytes,"reserve_bytes":current_policy.reserve_bytes,"pruned_root_ids":ids,"pending_intents":kept,"reclaimed_bytes":reclaimed,"owned_prunable_bytes":prunable,"held_or_unknown_bytes":held,"excluded_bytes":excluded,"other_estimate_bytes":other,"other_estimate_label":"estimate","cause":cause,"measurement_source":after.source,"observed_ms":after.observed_ms,"decided_after_wait":after_wait,"waited_lock":if after_wait { Some(paths.volume_lock_path(request.volume_uuid).display().to_string()) } else { None },"stop":stop});
+    let decision = if after.free_bytes <= current_policy.floor_bytes {
+        if rows.is_empty() {
+            let mut error = Error::new(ErrorKind::SpaceBelowFloor, message);
+            if let Some(fields) = detail.as_object() {
+                for (key, value) in fields {
+                    error = error.with_detail(key, value.clone());
+                }
+            }
+            return Err(error);
+        }
+        SpaceDecision::StopBelowFloor
+    } else if request.recheck {
+        SpaceDecision::Continue
+    } else if after.free_bytes <= current_policy.reserve_bytes {
+        SpaceDecision::AdmitBelowReserve
+    } else {
+        SpaceDecision::Admit
+    };
+    let token = SpaceGuard {
+        volume_uuid: request.volume_uuid.clone(),
+        namespace: request.namespace.to_owned(),
+        area: request.area.to_owned(),
+        generation,
+        observed_ms: after.observed_ms,
+    }
+    .token();
+    let total = rows.len();
+    let report = GuardReport {
+        decision,
+        volume_uuid: request.volume_uuid.clone(),
+        mount_hint: mount,
+        area: GuardArea {
+            namespace: request.namespace.to_owned(),
+            area: request.area.to_owned(),
+        },
+        before,
+        after,
+        policy: current_policy,
+        pruned: RowSet::bounded(rows, total, ROOT_ROWS),
+        kept: RowSet::bounded(kept.clone(), kept.len(), crate::contract::INTENT_ROWS),
+        reclaimed_bytes: reclaimed,
+        rounds,
+        decided_after_wait: after_wait,
+        message,
+        detail,
+        guard: token,
+    };
+    drop(pass_lock);
+    Ok(report)
+}
