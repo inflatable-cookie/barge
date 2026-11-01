@@ -6,6 +6,7 @@ never be converted to a positive detach decision or a successful post-state.
 
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+import math
 import re
 
 _DEVICE = re.compile(r"/dev/disk[0-9]{1,4}(?:s[0-9]{1,3})?\Z")
@@ -56,7 +57,8 @@ class DetachPreconditions:
     def timeout(self):
         """Return the bounded timeout, or refuse without attempting a detach."""
         if (self.all_children_reaped is not True or self.request_withdrawn is not True
-                or self.identity_verified is not True or self.remaining_seconds <= 0):
+                or self.identity_verified is not True or not math.isfinite(self.remaining_seconds)
+                or self.remaining_seconds <= 0):
             raise ValueError("ordinary detach preconditions are not established")
         return min(30.0, self.remaining_seconds)
 
