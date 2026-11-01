@@ -1056,6 +1056,13 @@ class Proof:
     def run_cases(self):
         for case in CASES:
             name = case["id"]
+            if name == "R12" and any(
+                result["case"] == "R11" and result["status"] != "passed"
+                for result in self.results
+            ):
+                self.results.append({"case": name, "status": "skipped",
+                                     "detail": "R11 did not establish a known remount and registration state"})
+                continue
             self.references = []
             try:
                 evidence = getattr(self, case["method"])()
