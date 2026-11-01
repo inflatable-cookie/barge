@@ -65,8 +65,10 @@ pub trait SpaceFacts {
 
 /// Flush a reverified volume after a deletion batch.
 pub trait Flush {
-    /// Refuse a failure or changed identity; no caller may assume reclaim.
-    fn flush_volume(&self, volume: &VerifiedVolume) -> Result<()>;
+    /// Enforce the absolute deadline while flushing. On timeout kill the owned
+    /// helper and positively reap it within a one-second cleanup bound; report
+    /// uncertain custody if that cannot be established. Never infer reclaim.
+    fn flush_volume(&self, volume: &VerifiedVolume, deadline: std::time::Instant) -> Result<()>;
 }
 
 #[cfg(test)]

@@ -149,11 +149,25 @@ Rules:
 Deletion is only half of reclaiming space; the filesystem must commit it, and a
 measurement used for a decision must not be a stale one.
 
-- The OS layer gains one flush surface, `Flush::flush_volume(&VerifiedVolume)`,
-  implemented on macOS with `fsync_volume_np(fd, SYNC_VOLUME_FULLFSYNC |
-  SYNC_VOLUME_WAIT)` on the volume's own descriptor, reverified before and after
-  the call. That is the same whole-volume flush Oxide's `Binding::flush` uses
-  today, reused rather than reinvented.
+- The OS layer exposes `Flush::flush_volume(&VerifiedVolume, Instant)`. On
+  macOS the descriptor is verified before a direct child inherits it and calls
+  `fsync_volume_np(fd, SYNC_VOLUME_FULLSYNC | SYNC_VOLUME_WAIT)`. The child does
+  no allocation, path lookup or unrelated write, and exits without Rust cleanup.
+  The parent polls only that owned, unreaped child's PID. At the absolute
+  deadline it sends SIGKILL and positively reaps within a one-second cleanup
+  bound. No detached thread or helper retry exists. The flush deadline is 30 s,
+  clipped to the pass wall clock with that cleanup second reserved inside it.
+  A child that cannot be positively reaped is reported as uncertain custody,
+  with its PID and observed start identity (unknown if the kernel could not
+  supply it). A timeout, killed child or nonzero exit is never successful flush
+  evidence and no further root is deleted by the pass.
+- Replay is part of the effect surface. After any scoped replay that examined
+  intents, the pass flushes before its first measurement or any new deletion.
+  This is conservative even for a replay that reports only pending intents:
+  it may already have removed entries without completing a unit, so zero
+  completed deletions is not evidence of zero effect. A replay-free pass adds
+  no preliminary flush. Replay uses the same deadline, helper supervision,
+  post-flush identity verification and failure outcome as a prune batch.
 - A prune batch flushes the volume once after its deletions and before its
   post-batch measurement. A decision never admits on an unflushed measurement it
   caused itself; a measurement nothing changed needs no flush.
@@ -844,7 +858,8 @@ rows, `unknown` never read as absent or default.
 | `barge.space.prune/1` | plan and report | **new**: ordered candidates with identity digests, the plan's SHA-256, and the executed result. |
 | `barge.error/1` | report | the only envelope for a refusal, including this command's: one new `kind`, `space_below_floor`, used only for a no-effect refusal; an unsettled delete is `unknown_state` at exit `3`. |
 | `barge.describe/1` | report | optional additions: a `space` row set and the new format names in `formats`; absent in an older document is valid. |
-| `barge.root/1`, `barge.hold/1`, `barge.intent/1` | authoritative | unchanged. This stage adds no field to a marker, a hold or an intent. |
+| `barge.root/1`, `barge.hold/1` | authoritative | unchanged. This stage adds no field to a marker or a hold. |
+| `barge.intent/2` | authoritative | **not** `barge.intent/1` as first drafted here: stage 4's F4 landed the `/2` record with its optional `identity` and `absence` evidence, and `barge.intent/1` stays readable for records written before it (stage 4 design, "The intent record"; stage 1 design, "Durable custody of captured objects"). A space prune writes the same `/2` record and reads both, and T5 adds one optional `unit.root_id` member inside the major (stage 1 design, "The intent record"), so a replay of an adopted root's intent takes the lock a `hold` takes. |
 
 ### `barge.space/1`
 
@@ -1623,12 +1638,12 @@ and T6, and this slice claims no native proof.
 
 - **The command.** `barge space prune --volume <uuid> --plan --json` prints one
   bounded `barge.space.prune/1` document. `--plan-out <file>` writes the exact
-  canonical plan bytes a later slice's real run will present. The effect form
-  (`--plan <file> --plan-sha256 <hex>`) is refused as a usage error naming T5;
-  this build never implies an effect it does not have. The whole command line is
-  parsed once, before the verb is chosen: an option that appears before `prune`
-  is validated by that verb, so an effect-shaped option is refused wherever it
-  sits and an unknown option is named rather than silently discarded. The error
+  canonical plan bytes the real run presents. Slice T5 implements the effect form
+  (`--plan <file> --plan-sha256 <hex>`); see the T5 surface below. The whole
+  command line is parsed once, before the verb is chosen: an option that appears
+  before `prune` is validated by that verb, so an effect-shaped option reaches
+  the effect form's own checks wherever it sits and an unknown option is named
+  rather than silently discarded. The error
   document names the verb the line selected (`space.prune`), never an option's
   value, however the options are ordered. Without a verb, any option is a usage
   refusal too, never ignored.
@@ -1779,7 +1794,227 @@ and T6, and this slice claims no native proof.
   file's bytes against the digest and the library reader, asserts the excluded
   root is absent from the plan and that its participation counts are explicit
   nulls, round-trips a plan naming an **adopted** root whose directory name is not
-  its root id, and pins the effect-form, missing `--plan`, bad-uuid and
-  unknown-verb refusals.
+  its root id, and pins the argument-shape refusals (a missing `--plan`, a plan
+  file with no digest, a digest with no file, a bad uuid, an unknown verb, and an
+  unknown option before the verb).
 - `barge describe`'s `formats` names `barge.space.prune/1` and
   `barge.space.prune.plan/1`.
+### Implemented space prune surface (slice T5)
+
+Slice T5 is the space prune's effect half: the operator's real run applies a
+preview's exact plan through the stage 1 custody, intent and quarantine protocol,
+flushes and re-measures once per batch, and stops on the policy or on a bound.
+There is no second delete path — the same `delete` sequence every other Barge
+deletion uses runs, with the pass's volume lock supplied instead of taken — and
+the guard and recheck stay T6's. **The stage's native proof is missing: T8 owns
+it. This surface is not qualified by any native receipt, and no real-drive action
+is claimed.**
+
+- **The effect form.** `barge space prune --volume <uuid> --plan <file>
+  --plan-sha256 <hex>` replaces T4's usage refusal. A plan whose bytes do not
+  match the digest is refused with `usage` and no effect, and so is a plan that
+  T4's plan reader refuses (an unknown major, a removed field, a forged identity
+  digest) — with `unknown_state` and no effect. A plan naming another volume is
+  `volume_mismatch`. A volume lock a live owner holds past the lock wait is
+  `locked`, names the volume and its lock file, and changes nothing. `--plan`
+  keeps one spelling for both forms: bare it is the preview, and with a file it is
+  a real run, which needs the digest; the parser treats it as a value option only
+  when a value is there, so neither form can swallow the next option.
+- **The plan is the authorization.** Nothing is recomputed and compared, so one
+  candidate's change keeps that candidate only. Every planned root is accounted
+  for in the document: `effect.pruned` (deleted, in delete order, with its intent
+  and entry counts), `effect.held` (kept, with the reason and what was read) and
+  `effect.not_reached` (never attempted, with its planned bytes and the stop that
+  left it).
+- **Lock order.** The pass reads the registry before taking the volume lock, takes
+  it **exclusively** and holds it from its first authoritative measurement to its
+  final decision, and then takes **one root's locks at a time** for each
+  candidate's plan → intent → rename → delete, releasing them before the next
+  (carried ruling `6ac32f24`). No registry lock is held across a walk or a delete;
+  the policy is re-read lock-free from the atomically published bytes. A prune and
+  a release plan on one volume therefore cannot interleave, and a consumer's
+  `hold` waits for at most one deletion.
+- **An adopted root's two locks, and its holds under the right key.** A Barge-created
+  root's directory name is its root id, so one lock covers both. An **adopted**
+  root's name is not its root id: a `hold` takes `root-<root-id>` while a delete of
+  that directory name takes the unit's own key, and they are different files. The
+  deletion unit therefore carries the marker's root id whenever it differs from the
+  name (`DeletionUnit::root_id`), the deletion takes **both** locks — the root id's
+  in its own lock set, because a lock set refuses a second lock at the same rank —
+  and custody reads the unit's holds and compares the marker **under that root
+  id**. Without this a held adopted root could be renamed out from under its
+  holder, and the hold that should have kept it would not even have been read. It is
+  pinned by a counterfactual: a `hold` attempted while the pass holds the adopted
+  root's lock fails `locked`, and one recorded first keeps the root as `held`.
+- **The policy snapshot is versioned, and a change is not a refusal.** The pass
+  starts on the plan's own `policy_generation` and policy, and re-reads the registry
+  **before its first decision** as well as before each effect — so no stop and no
+  effect ever rests on the plan's stale thresholds, and an invalid registry or a
+  durability change is met before anything can be deleted. Before each effect it
+  re-reads the registry again and compares the generation. A changed generation is
+  adopted: the new policy's `max(reserve, floor)` becomes the target, a fresh
+  measurement decides, and a candidate the new policy no longer needs is skipped
+  as `policy_changed`. Only these stop the pass, with `unknown_state` at exit `3`
+  and anything already deleted in `detail.pruned_root_ids`: an unreadable or
+  invalid registry, a volume that left the registry, an undeclared durability, and
+  a durability that became `kept`. A durability that does not permit pruning — at
+  the pass's start or mid-pass — is exit `3`, never a no-effect refusal at exit `2`:
+  the operator asked for a real prune of data the volume no longer says is
+  expendable, which needs their decision.
+- **The effect step's re-verification (the frozen custody set).** Each candidate is
+  re-proved inside the deletion, under the volume and root locks it holds, before
+  its intent: the registry generation adopted above; the area's declaration still
+  present, unchanged and `counts` (a withdrawn or edited one is `policy_changed`);
+  the root still in the folder the configuration resolves; its directory name,
+  root id, device, inode and marker digest equal to the plan's
+  (`identity_changed`); its marker still owned; the T3 pressure idleness matrix
+  still `idle` (`held`, or `not_idle` with the matrix's reason); for a scratch
+  root, its own positive-closure and exclusive-nesting predicate re-decided under
+  the lock (`not_idle`); its durable `barge.root.identity/1` record verifying and
+  agreeing when it has one (`identity_changed`, never resolved in either
+  direction); and no pending intent covering it (`pending_intent`). The same-uid
+  descriptor scan and the volume re-verification are custody's and the
+  deletion's own and run in the same locked window; a root they refuse is skipped
+  and reported as `held`, with custody's own reason in the row's `detail`.
+- **Delete, intent and quarantine.** A candidate deletes only through stage 1's
+  whole-root deletion: the intent is durable before the quarantine rename, the
+  walk's unknown-entry refusal, Finder tolerance and marker-last rule are stage
+  1's exactly, and no rule widens what is deleted. A deletion that stops short
+  leaves its pending intent and quarantine leaf in place and stops the pass at
+  exit `3` with `detail.pending_intent` — never a clean report over an unsettled
+  effect. The per-root deadline is `min(120 s, remaining - 5 s)`, and the
+  deletion's own bound is checked at each of its durable boundaries.
+- **Flush and reclaim.** One flush per batch, bounded at 30 s, then the volume is
+  re-verified around it and re-measured. A batch a bound cuts short is still
+  flushed when it deleted something, so no deletion is ever reported from an
+  unflushed measurement. A batch cut short before any deletion needs no flush.
+  The pass stops when free space is strictly greater than
+  `max(reserve, floor)` (`target_reached`), when nothing eligible remains
+  (`nothing_eligible`), when a batch that deleted something measured no reclaim
+  (`space_not_reclaimed`), or when a bound is reached (`budget_exhausted`); a bound
+  keeps its `budget_exhausted` answer even when the flush beside it shows the target
+  reached, because the pass still ended on the bound. `reclaimed_bytes` is the measured difference across the
+  pass, never a sum of the plan's recorded sizes; `deleted_bytes` is that sum and
+  is named separately so the two are never confused. A failed flush, a failed
+  post-flush reverify and an unreadable measurement are `unknown_state` at exit
+  `3` with the deleted roots named. A flush deadline is an enforced failure,
+  never a completed budget stop. Helper failures carry `flush_child_pid`,
+  `flush_child_start`, `flush_timed_out`, `flush_child_killed`,
+  `flush_child_reaped` and `custody_uncertain` in the error detail; a successful
+  result is accepted only after positive reaping inside the deadline.
+- **Bounds.** At most 128 roots, in at most 4 batches of 32, with a fixed 120 s
+  wall clock and no new option (the design delegate's ruling). No effect starts
+  inside the last 5 s. Every bound reports what it did not reach, with counts, and
+  a pass that ends on one exits `3` rather than presenting itself as complete.
+- **Replay is this volume's and each pending intent is that object's.** The pass
+  takes the volume's exclusive lock, then re-reads the registry and durability
+  **before replay**. A registration can publish while the pass waits for this lock;
+  the earlier preflight read is not pruning authority. Kept or unreadable durability
+  stops the pass before replay touches a quarantine leaf or changes an intent.
+  Registration shares this lock, so it cannot publish during the locked replay.
+  The shared ordinary deletion and replay paths also retain their volume lock
+  tokens for the whole operation. A `removed` intent whose folder or parent is
+  positively absent settles under the caller's existing volume lock rather than
+  trying to acquire it again.
+  The pass replays **only the pending intents
+  whose recorded volume is that volume**, under the lock it already holds, from
+  their recorded identities only, after the volume re-verifies — never the account
+  journal's other volumes' intents, which are a different object's business and
+  cannot block, delay or be acted on by this pass. An intent it cannot settle keeps
+  **its own object** and nothing else: every candidate the intent covers is skipped
+  and reported as `pending_intent` (checked before the candidate's folder is read,
+  because that delete has already renamed the root into its quarantine leaf), and
+  the pass still prunes the roots the intent does not cover. That is ruling
+  `698d9ba3`'s per-object rule applied to the operator's pass, and it is why an
+  unsettled intent is not a pass-wide stop; only a journal that cannot be read at
+  all is, because then no candidate's custody can be proven. The report carries
+  this volume's replay counts in `effect.replay`, including what stayed pending.
+  Before the first measurement or any new candidate deletion, any replay with
+  examined intents is flushed, including an interrupted replay that remains
+  pending after removing entries. A failed replay flush is `unknown_state` at
+  exit `3` with zero deciding measurements and no further deletion; error detail
+  retains the full replay accounting and the flush attempt/failure record.
+  A failed first measurement after replay also keeps that accounting and exits
+  `3` as `unknown_state`, including a volume absence observed at that point;
+  it cannot be described as a no-effect refusal.
+  `effect.flush.attempts` includes this preliminary replay flush as well as
+  candidate-batch flushes. `effect.batches` counts candidate batches only.
+  The first measurement (`effect.before`) is taken after replay and its flush;
+  measured reclaim and planned deleted bytes for subsequent candidate batches
+  remain separate from replay's completion and pending-intent accounting.
+  Errors after replay include `detail.replay` with its counts and
+  `resumed_root_ids` (recorded unit names for older intents without a root id),
+  including an error in the first measurement after replay. These are separate
+  from the pass's newly pruned roots; a failure never implies replay had no effect.
+  The per-phase replay rules themselves are `delete`'s and are pinned there, and so
+  is the hold rule a replay now carries: **a replay re-reads the unit's holds**, and
+  while any is live or undecidable the captured object stays where it is and the
+  intent stays pending — a hold recorded *after* the interruption protects its root
+  exactly as one recorded before a first effect does. For this pass that means the
+  covered root is reported `pending_intent` and nothing of it is deleted.
+- **Failure matrix rows this slice owns.** Drive pulled before the run
+  (`volume_absent`, nothing changed); a root renamed or absent since the plan
+  (`identity_changed`, no delete); `ENOSPC` or an unreadable state volume at the
+  intent write (refused before the effect, naming the state volume); a signal;
+  drive pulled mid-prune or during the flush (the pending intent and quarantine
+  are kept, or the measurement is unknown, at exit `3`); Finder/`ENOTEMPTY` after
+  three tries (a pending intent at exit `3`); a durability changed to `kept`; and
+  `budget_exhausted`. The signal row is carried by the durable order rather than a
+  handler: Barge installs no signal handler, the intent is durable before the
+  first destructive step, and an interrupted process therefore leaves at worst a
+  pending intent that the next run replays — never an unrecorded effect. Its exit
+  is non-zero because the process was terminated.
+  Unit fixtures exercise actual SIGTERM delivery to a subprocess paused after
+  quarantine, an OS ENOSPC error injected at intent publication, and volume
+  absence injected after capture before the first unlink. They assert preserved
+  payload and intent, refusal/exit semantics, and recovery after re-verification.
+  Flush fixtures use the production supervisor with a stalled child, a child
+  ignoring TERM and a nonzero child; all stop further deletion. A durability
+  change cannot land *between* two of a pass's candidates, because a registration holds the volume
+  lock from before its publication and a pass holds that same lock for its whole
+  length; it lands between the plan and the run, where it is refused with nothing
+  changed, and the per-effect generation compare covers the rest.
+- **What the document reports.** `barge.space.prune/1` gains `effect`, `null` in a
+  preview: the pass's first and last measurements, the policy and generation in
+  force when it stopped, its target, batches and rounds, `pruned`, `held`,
+  `not_reached`, `deleted_bytes`, `reclaimed_bytes`, `stop`, the flush accounting
+  and `replay`. The plan's own policy and generation stay at the top level, so a
+  generation change is visible rather than hidden. A real run does **not**
+  re-plan, so its `participation`, `kept` and `examined` are empty: those rows
+  belong to the preview whose bytes authorised it. `effect` is a **required** field
+  of this major — a preview states it as `null` — and `space::read_prune_report`
+  refuses an unknown major, a document that omits `effect`, any other removed
+  field, and counts that disagree with their rows.
+- **Tests.** The library suite runs the pass against a real-OS fixture volume and
+  pins: a completed deletion with its intent settled, its marker removed last and
+  its document reading back; a volume already above its target deleting nothing; a
+  digest mismatch and a forged identity digest each changing nothing; a busy
+  volume lock (`locked`, nothing changed) and the same run succeeding once it is
+  free; a hold recorded after the plan keeping the root as `held`; an older held
+  root skipped while the younger one is deleted; a replaced root skipped as
+  `identity_changed`; a withdrawn and an `excluded` declaration each
+  `policy_changed`; a raised reserve adopted and acted on and a lowered one
+  keeping the root and stopping; an invalid registry refused before any effect; a
+  stop after a deletion naming the deleted root; a durability change to `kept`
+  refused with nothing changed; an open same-uid descriptor keeping the root; the
+  root lock being held for the whole effect (a concurrent lock attempt fails
+  `locked`); a failed flush at exit `3` with the deleted roots named; a zero
+  reclaim stopping the pass before the next root; the roots, batch, wall,
+  stop-window, per-root and flush bounds each reported with counts; a
+  device change before the first unlink and a symlink inside the root each
+  stopping the delete; `ENOTEMPTY` after three tries leaving a pending intent at
+  exit `3`; an interrupted pass leaving a durable intent that the next run
+  replays and completes; and an unusable journal stopping a run before its first
+  effect. The CLI suite runs the real form end to end against a verified volume,
+  with the volume's own registered reserve raised to its capacity so the pass has
+  a real target: the digest-mismatch refusal changing nothing, the completed pass
+  deleting the planned root and reporting `space_not_reclaimed` at exit `3` on a
+  volume a four-kilobyte deletion cannot move, its document reading back, and the
+  same plan again keeping what is no longer there; plus the argument-shape
+  refusals above.
+- **What it does not do.** It does not decide admission, it does not report a
+  `barge.space.guard/1` document, and it does not run the guard's or the recheck's
+  own prune (T6). It never deletes an `excluded` area's root, a cache placement's
+  root, a root on another device or anything outside the verified volume, and it
+  never widens a delete to make space. It writes only the stage 1 intent and
+  journal records of deletions that actually ran.

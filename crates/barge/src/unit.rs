@@ -400,6 +400,16 @@ pub struct DeletionUnit {
     /// The marker the plan read, when the unit carries one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marker: Option<UnitMarker>,
+    /// The marker's root id, when it is not the directory name.
+    ///
+    /// A consumer's `hold` takes the root-id lock, while a delete of a unit whose
+    /// name is not a Barge root id takes that unit's own key. For an adopted root
+    /// those are two different files, so a deletion that took only the name's lock
+    /// could rename a root out from under its holder. The deletion therefore takes
+    /// the root-id lock **as well** whenever this is set, and `None` says the name
+    /// is the root id, so the name's lock is the root lock already.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_id: Option<String>,
     /// The recorded grant that authorises the deletion.
     pub grant: UnitGrant,
     /// The SHA-256 of the plan that named this unit.
@@ -425,6 +435,7 @@ impl DeletionUnit {
             folder: folder.to_owned(),
             parent: String::new(),
             name: owned.root_id.clone(),
+            root_id: None,
             kind: UnitKind::Directory,
             device: owned.identity.device,
             inode: owned.identity.inode,
@@ -447,12 +458,17 @@ impl DeletionUnit {
         plan_digest: &str,
     ) -> Option<Self> {
         let root_id = row.root_id.clone()?;
+        let name = row.name.clone();
+        // An adopted root's directory name need not be its root id, and then the
+        // name's lock is not the lock a `hold` takes: the unit carries the id so the
+        // deletion takes both.
+        let marker_root_id = (name != root_id).then(|| root_id.clone());
         Some(Self {
             volume_uuid: volume_uuid.clone(),
             root_dir: root_dir.to_owned(),
             folder: folder.to_owned(),
             parent: String::new(),
-            name: root_id.clone(),
+            name,
             kind: UnitKind::Directory,
             device: DeviceId::new(row.device?),
             inode: row.inode?,
@@ -460,6 +476,7 @@ impl DeletionUnit {
                 MarkerFamily::Barge,
                 row.marker_digest.clone()?,
             )),
+            root_id: marker_root_id,
             grant: UnitGrant::native_root(root_id),
             plan_digest: plan_digest.to_owned(),
         })
@@ -572,6 +589,37 @@ impl DeletionUnit {
             ));
         }
         self.grant.validate()?;
+        if let Some(root_id) = &self.root_id {
+            // The root id a deletion will also lock for is held to the same shape
+            // as a name, and it is never the same lock twice.
+            if !crate::state::is_identifier(root_id) {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "the unit's marker root id is not 32 lowercase hex digits".to_owned(),
+                )
+                .with_detail("unit", self.name.clone().into())
+                .with_detail("root_id", root_id.clone().into()));
+            }
+            if *root_id == self.name {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "the unit records a marker root id equal to its own name, which is one lock, not two".to_owned(),
+                )
+                .with_detail("unit", self.name.clone().into()));
+            }
+            if self.kind != UnitKind::Directory
+                || !matches!(
+                    self.marker.as_ref().map(|marker| marker.family),
+                    Some(MarkerFamily::Barge)
+                )
+            {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "only a Barge-marked directory root can name a marker root id".to_owned(),
+                )
+                .with_detail("unit", self.name.clone().into()));
+            }
+        }
         match (&self.marker, self.kind) {
             (Some(marker), UnitKind::Directory) => marker.validate()?,
             (Some(_), UnitKind::File) => {
@@ -728,6 +776,7 @@ mod tests {
             folder: "example/pool".to_owned(),
             parent: String::new(),
             name: "run-1".to_owned(),
+            root_id: None,
             kind,
             device: DeviceId::new(16_777_219),
             inode: 4_242,

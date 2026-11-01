@@ -444,30 +444,187 @@ impl super::SpaceFacts for MacOs {
     }
 }
 
+/// The child branch is deliberately closed: only a volume sync in production,
+/// and syscall-only inert stubs in tests. No arbitrary post-fork Rust closure.
+enum FlushAction {
+    Sync(RawFd),
+    #[cfg(test)]
+    Stall(bool),
+    #[cfg(test)]
+    Fail,
+}
+
+fn bounded_flush(action: FlushAction, deadline: Instant) -> Result<()> {
+    if Instant::now() >= deadline {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "flush deadline reached before spawn",
+        ));
+    }
+    // SAFETY: the child calls only the syscall wrapper and _exit below, never
+    // Rust allocation, locks, destructors or unwinding in the forked runtime.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!("cannot spawn flush helper: {}", io::Error::last_os_error()),
+        ));
+    }
+    if pid == 0 {
+        // SAFETY: inherited fd stays open; fsync_volume_np is Apple's thin
+        // ffsctl wrapper (Libc/gen/sync_volume_np.c). No Rust runtime is used.
+        unsafe {
+            let code = match action {
+                FlushAction::Sync(fd) => {
+                    extern "C" {
+                        fn fsync_volume_np(fd: libc::c_int, flags: libc::c_int) -> libc::c_int;
+                    }
+                    const SYNC_VOLUME_FULLSYNC: libc::c_int = 0x01;
+                    const SYNC_VOLUME_WAIT: libc::c_int = 0x02;
+                    fsync_volume_np(fd, SYNC_VOLUME_FULLSYNC | SYNC_VOLUME_WAIT)
+                }
+                #[cfg(test)]
+                FlushAction::Fail => 7,
+                #[cfg(test)]
+                FlushAction::Stall(ignore_term) => {
+                    if ignore_term {
+                        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                    }
+                    loop {
+                        libc::pause();
+                    }
+                }
+            };
+            libc::_exit(code);
+        }
+    }
+    // This remains our unreaped direct child throughout. Even after exit its
+    // PID cannot be recycled until waitpid positively collects it.
+    let start = MacOs::new().process_start(pid as u32).ok().flatten();
+    let mut status = 0;
+    let mut timed_out = false;
+    let mut killed = false;
+    let mut reap_deadline = deadline;
+    loop {
+        // SAFETY: status is writable, pid is this call's unreaped child, and
+        // WNOHANG cannot block on a stalled filesystem operation.
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if waited == pid {
+            timed_out |= Instant::now() >= deadline;
+            if !timed_out && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                return Ok(());
+            }
+            return Err(flush_child_error(pid, start, timed_out, killed, true)
+                .with_detail("flush_child_status", status.into()));
+        }
+        if waited < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return Err(flush_child_error(pid, start, timed_out, killed, false));
+        }
+        if !timed_out && Instant::now() >= deadline {
+            timed_out = true;
+            // SAFETY: only our own unreaped child PID is signalled. It cannot
+            // be reused, even if it exited between waitpid and kill.
+            killed = unsafe { libc::kill(pid, libc::SIGKILL) } == 0;
+            reap_deadline = Instant::now() + Duration::from_secs(1);
+        }
+        if timed_out && Instant::now() >= reap_deadline {
+            // No detached reaper or retry. The child can only complete its
+            // already-issued flush; it cannot delete or publish anything. Its
+            // descriptor may remain open, so report uncertain custody.
+            return Err(flush_child_error(pid, start, true, killed, false));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn flush_child_error(
+    pid: libc::pid_t,
+    start: Option<u64>,
+    timed_out: bool,
+    killed: bool,
+    reaped: bool,
+) -> Error {
+    Error::new(
+        ErrorKind::UnknownState,
+        "volume flush helper failed or exceeded its deadline; reclaim is unknown",
+    )
+    .with_detail("flush_child_pid", (pid as u32).into())
+    .with_detail("flush_child_start", serde_json::json!(start))
+    .with_detail("flush_timed_out", timed_out.into())
+    .with_detail("flush_child_killed", killed.into())
+    .with_detail("flush_child_reaped", reaped.into())
+    .with_detail("custody_uncertain", (!reaped).into())
+}
+
+/// Exercise exactly the production child supervisor without touching a volume.
+#[cfg(test)]
+pub(crate) fn test_flush_helper(deadline: Instant, mode: u8) -> Result<()> {
+    bounded_flush(
+        match mode {
+            0 => FlushAction::Stall(false),
+            1 => FlushAction::Stall(true),
+            _ => FlushAction::Fail,
+        },
+        deadline,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_no_space() -> io::Error {
+    io::Error::from_raw_os_error(libc::ENOSPC)
+}
+
+#[cfg(test)]
+pub(crate) fn test_terminate(child: &mut std::process::Child) -> io::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Err(io::Error::other("child already exited"));
+    }
+    // SAFETY: the test owns this unreaped child, so its PID cannot be recycled.
+    if unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_io_error() -> io::Error {
+    io::Error::from_raw_os_error(libc::EIO)
+}
+
+#[cfg(test)]
+pub(crate) fn test_allow_termination() -> io::Result<()> {
+    // SAFETY: this runs only in the single-test subprocess before its barrier.
+    // The set is initialized, stack-owned and valid for these calls. Undo the
+    // test supervisor's inherited signal mask/disposition only in that child.
+    let result = unsafe {
+        let mut set: libc::sigset_t = 0;
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        if libc::signal(libc::SIGTERM, libc::SIG_DFL) == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut())
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_was_terminated(status: std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal() == Some(libc::SIGTERM)
+}
+
 impl super::Flush for MacOs {
-    fn flush_volume(&self, volume: &VerifiedVolume) -> Result<()> {
-        const SYNC_VOLUME_FULLSYNC: libc::c_int = 0x01;
-        const SYNC_VOLUME_WAIT: libc::c_int = 0x02;
-        extern "C" {
-            fn fsync_volume_np(fd: libc::c_int, flags: libc::c_int) -> libc::c_int;
-        }
+    fn flush_volume(&self, volume: &VerifiedVolume, deadline: Instant) -> Result<()> {
         let descriptor = self.space_descriptor(volume)?;
-        // SAFETY: the descriptor stays open for the call and both flags are documented.
-        let result = unsafe {
-            fsync_volume_np(
-                descriptor.as_raw_fd(),
-                SYNC_VOLUME_FULLSYNC | SYNC_VOLUME_WAIT,
-            )
-        };
-        if result != 0 {
-            return Err(Error::new(
-                ErrorKind::UnknownState,
-                format!(
-                    "volume flush failed: {}",
-                    io::Error::from_raw_os_error(result)
-                ),
-            ));
-        }
+        // Descriptor identity is verified before the child inherits it. The
+        // child does no path lookup, allocation, unwinding or unrelated write.
+        bounded_flush(FlushAction::Sync(descriptor.as_raw_fd()), deadline)?;
         let path = &volume.identity().mount_point;
         if read_identity(&descriptor, path)? != *volume.identity() {
             return Err(Error::new(

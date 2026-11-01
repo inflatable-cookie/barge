@@ -3688,6 +3688,7 @@ fn observed_link_root(
         folder: record.folder.clone(),
         parent: String::new(),
         name: form.root_id.clone(),
+        root_id: None,
         kind: crate::unit::UnitKind::Directory,
         device: root.identity().device,
         inode: root.identity().inode,

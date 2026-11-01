@@ -38,7 +38,9 @@ pub use macos::MacOs;
 /// them.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::{
-    retry_schedule, StatedCall, StatedListing, StatedPlatform, StatedVnodeRead,
+    retry_schedule, test_allow_termination, test_flush_helper, test_io_error, test_no_space,
+    test_terminate, test_was_terminated, StatedCall, StatedListing, StatedPlatform,
+    StatedVnodeRead,
 };
 
 #[cfg(not(target_os = "macos"))]

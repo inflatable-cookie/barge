@@ -480,6 +480,7 @@ pub fn identify(
         folder: folder.to_owned(),
         parent: String::new(),
         name: name.to_owned(),
+        root_id: None,
         kind: crate::unit::UnitKind::Directory,
         device: observed.root.identity.device,
         inode: observed.root.identity.inode,

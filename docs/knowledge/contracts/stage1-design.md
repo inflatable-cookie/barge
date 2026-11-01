@@ -1068,7 +1068,19 @@ descriptor-relative, and bounded:
    being removed by name. Then the `removed` phase is recorded, and the `deleted`
    phase settles the intent.
 7. On replay, a pending intent is resolved only from its recorded identity, and
-   replay's windows are conservative. It first restores every recorded mode, then:
+   replay's windows are conservative. Ordinary deletion and replay retain the
+   volume lock token through their effect observations, custody scans, journal
+   changes and deletion walk; a remembered lock rank alone does not hold custody.
+   Volume-scoped replay uses the caller's token, including when a durable
+   `removed` intent settles after its area folder or unit parent is positively
+   absent. That settlement takes the unit locks without reacquiring the volume
+   lock the caller already holds. It first restores every recorded mode, then
+   re-reads the unit's holds: while any hold is live or undecidable, the captured
+   object stays where it is and the intent stays pending. A replay continues a
+   deletion that was already authorised, so a hold recorded **after** the
+   interruption must protect the root it names exactly as a hold recorded before a
+   first effect does; a replay that resumed over one would finish deleting a root
+   its holder believes it holds. With no hold, it:
    - it resumes the deletion only when the captured leaf is still at its visible
      `.barge-prune-<intent-id>` name with the intent's kind, device and inode and,
      when the unit records one, the marker digest matches its record, and the phase
@@ -1863,7 +1875,11 @@ Choices S5 made where this design left the mechanic to the slice:
   object carries exactly the unit's `parent`, `name`, `kind` (`directory` or
   `file`), its expected `device` and `inode`, an optional `marker` (filename,
   family and digest), the planned private `capture_name` and the `grant`
-  (kind and reference). The capture name is the
+  (kind and reference). Stage 3's T5 added one optional member inside this major,
+  `unit.root_id`: the marker's root id when the unit's directory name is not it
+  (an adopted root), so a replay and an effect can take the `root-<root-id>` lock
+  a consumer's `hold` takes as well as the name's. A record written before it
+  carries none, and its name is its root id. The capture name is the
   `.barge-prune-<intent-id>` leaf in the unit's parent, recorded **before** the
   capture and re-derived and checked on every read, never trusted as free text.
   The phases are `intent`, `renamed`, `marker_last`, `removed` and `deleted`.

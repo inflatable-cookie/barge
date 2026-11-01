@@ -1705,6 +1705,7 @@ fn area_unit(
         folder: area_plan.folder.clone(),
         parent: String::new(),
         name: candidate.name.clone(),
+        root_id: None,
         kind: UnitKind::Directory,
         device: DeviceId::new(candidate.device),
         inode: candidate.inode,

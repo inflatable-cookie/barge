@@ -499,6 +499,52 @@ fn read_unit_holds(
     Ok(area::HoldReading::empty())
 }
 
+/// Whether a unit's holds let a deletion continue: `Ok(())` when there is none or
+/// every recorded hold is positively stale, and the reason it may not otherwise.
+///
+/// This is custody's hold rule as one question, for a caller that is **not**
+/// taking a full custody verdict: a replay, which continues a deletion that was
+/// already authorised and captured. A live or undecidable hold keeps the captured
+/// object where it is and the intent pending, so a hold recorded after the
+/// interruption still protects the root it names (stage 3's `held_root_never_touched`
+/// rule, applied to the replay path).
+pub(crate) fn unit_holds_clear(
+    state_paths: &StatePaths,
+    observer: &dyn ProcessObserver,
+    unit: &DeletionUnit,
+    bounds: CustodyBounds,
+) -> std::result::Result<(), String> {
+    let holds =
+        read_unit_holds(state_paths, observer, unit, unit.root_id.as_deref()).map_err(|error| {
+            format!("the unit's holds are unreadable, so a replay cannot prove it held: {error}")
+        })?;
+    if holds.total > bounds.holds || holds.truncated {
+        return Err(format!(
+            "the unit carries {} hold files, over the {}-hold bound, so a replay cannot prove it held",
+            holds.total, bounds.holds
+        ));
+    }
+    for (record, hold_state, reason) in &holds.holds {
+        match hold_state {
+            HoldState::Live => {
+                return Err(format!(
+                    "the holder `{}` on pid {} is live, so the captured unit is kept",
+                    record.holder, record.pid
+                ))
+            }
+            HoldState::Unknown => {
+                return Err(format!(
+                    "the hold `{}` cannot be decided ({}), so the captured unit is kept",
+                    record.holder,
+                    reason.as_deref().unwrap_or("no reason was recorded")
+                ))
+            }
+            HoldState::Stale => {}
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decide(
     dirs: &dyn DirOps,
@@ -1330,6 +1376,8 @@ mod tests {
         /// The backoff schedule the scan retries on: the production one, or the
         /// empty schedule of the counterfactual.
         backoffs: Vec<Duration>,
+        /// An exact scan answer for custody's evidence-propagation contract.
+        scan_answer: Option<DescriptorScan>,
     }
 
     impl TableObserver {
@@ -1339,6 +1387,7 @@ mod tests {
                 table,
                 faults: Vec::new(),
                 backoffs: retry_schedule().to_vec(),
+                scan_answer: None,
             }
         }
 
@@ -1384,6 +1433,9 @@ mod tests {
             &self,
             request: &DescriptorScanRequest<'_>,
         ) -> Result<DescriptorScan> {
+            if let Some(answer) = &self.scan_answer {
+                return Ok(answer.clone());
+            }
             // The stated answers are consumed, so each scan reads its own copy.
             let mut faults = self.faults.clone();
             self.inner
@@ -1590,6 +1642,7 @@ mod tests {
                 folder: self.folder.clone(),
                 parent: parent.to_owned(),
                 name: name.to_owned(),
+                root_id: None,
                 kind,
                 device: facts.device,
                 inode: facts.inode,
@@ -3161,10 +3214,45 @@ mod tests {
         // The record of the pid that was mid-re-observation when the bound
         // stopped the scan is not discarded with the bounded answer.
         let retry = verdict.retry();
-        assert_eq!(retry.retried_unreadable, 1);
-        let record = retry.retried.first().expect("the retried pid is recorded");
-        assert_eq!(record.pid, identity.pid);
-        assert_eq!(record.resolution, RetryResolution::Bounded);
+        // The scan may exhaust 20 ms before reaching this pid on a loaded
+        // host. That is still bounded, and must not invent a retry observation.
+        assert!(retry.retried_unreadable <= 1);
+        assert_eq!(retry.retried.len(), retry.retried_unreadable);
+        if let Some(record) = retry.retried.first() {
+            assert_eq!(record.pid, identity.pid);
+            assert_eq!(record.resolution, RetryResolution::Bounded);
+        }
+    }
+
+    #[test]
+    fn custody_preserves_a_scan_bound_recorded_mid_reobservation() {
+        // Pin propagation independently of whether a 20 ms kernel scan happens
+        // to reach its injected pid. OS-layer deadline projection tests pin the
+        // retry window itself; custody must retain the scan's actual evidence.
+        let holder = real_holder("custody-bounded-retry-evidence");
+        let identity = self_identity();
+        let mut observer = TableObserver::new(vec![identity]);
+        let retry = crate::os::RetryEvidence {
+            retried_unreadable: 1,
+            retried: vec![crate::os::RetriedUnreadable {
+                pid: identity.pid,
+                command: Some("fixture".to_owned()),
+                start: identity.start,
+                errnos: vec![EPERM],
+                identity_changes: 0,
+                resolution: RetryResolution::Bounded,
+            }],
+        };
+        observer.scan_answer = Some(DescriptorScan::Bounded {
+            processes: 1,
+            descriptors: 0,
+            bound: "time",
+            retry: retry.clone(),
+        });
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "unknown");
+        assert!(verdict.reason().unwrap_or_default().contains("bound"));
+        assert_eq!(verdict.retry(), &retry);
     }
 
     #[test]
