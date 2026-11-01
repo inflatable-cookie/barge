@@ -616,7 +616,7 @@ pub fn maintain_with_space(
             .volumes
             .rows
             .iter()
-            .map(|v| space_empty_row(&v.volume_uuid, "unreached"))
+            .map(|v| space_empty_row(&v.volume_uuid, "unknown_state"))
             .collect();
         let total = rows.len();
         report.space_rows = Some(RowSet::bounded(rows, total, VOLUME_ROWS));
@@ -632,7 +632,7 @@ pub fn maintain_with_space(
             .volumes
             .rows
             .iter()
-            .map(|v| space_empty_row(&v.volume_uuid, "unreached"))
+            .map(|v| space_empty_row(&v.volume_uuid, "unknown_state"))
             .collect();
         let total = rows.len();
         report.space_rows = Some(RowSet::bounded(rows, total, VOLUME_ROWS));
@@ -654,7 +654,7 @@ pub fn maintain_with_space(
             continue;
         };
         if planned.state == VolumeState::Absent {
-            rows.push(space_empty_row(&planned.volume_uuid, "volume_absent"));
+            // The plan already reports the absent volume. No space stage ran.
             continue;
         }
         if record.generation != planned.record_generation || record.root_dir != planned.root_dir {
@@ -664,7 +664,10 @@ pub fn maintain_with_space(
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             report.timed_out = true;
-            rows.push(space_empty_row(record.volume_uuid.as_str(), "unreached"));
+            rows.push(space_empty_row(
+                record.volume_uuid.as_str(),
+                "unknown_state",
+            ));
             continue;
         }
         let uuid = &record.volume_uuid;
@@ -782,8 +785,13 @@ fn space_empty_row(uuid: &str, decision: &str) -> serde_json::Value {
 
 fn space_error_row(uuid: &crate::os::VolumeUuid, error: &Error) -> serde_json::Value {
     let detail = error.detail();
+    let decision = if error.kind() == ErrorKind::SpaceBelowFloor {
+        "space_below_floor"
+    } else {
+        "unknown_state"
+    };
     serde_json::json!({
-        "volume_uuid": uuid, "decision": error.kind().as_str(), "message": error.message(),
+        "volume_uuid": uuid, "decision": decision, "error_kind": error.kind().as_str(), "message": error.message(),
         "F": detail.get("free_bytes"), "R": detail.get("reserve_bytes"), "L": detail.get("floor_bytes"),
         "measurement_source": detail.get("measurement_source"),
         "pruned_root_ids": detail.get("pruned_root_ids"), "replayed_root_ids": detail.get("replayed_root_ids"),
