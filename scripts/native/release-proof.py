@@ -887,7 +887,8 @@ class Proof:
         area = self.fresh_area("c04", f"oldest-idle:{AREA_AGE_SECONDS}")
         root = self.new_root(area, aged=False)
         _p, young, _f = self.plan_and_run("R4-young", area, root, expect_eligible=False)
-        if young["blocked_by"] != "policy" or young["age_waived"]:
+        # The plan omits `age_waived` when it is false, so an absent key is an unwaived row.
+        if young["blocked_by"] != "policy" or young.get("age_waived"):
             raise Fault("R4", "an unnamed young root was not kept by the age gate")
         preview, row, plan_file = self.plan_and_run(
             "R4-named", area, root, named=[root["root_id"]], expect_eligible=True
@@ -917,7 +918,10 @@ class Proof:
     def case_release_by_reference_needs_the_consumer_path_absent(self):
         area = self.fresh_area("c06", "release-on-reference")
         root = self.new_root(area, aged=False)
-        checkout = os.path.join(self.home, "checkouts", "settled")
+        # A consumer path on the synthetic volume: its absence is proved under that volume's
+        # mount, which the absence anchor finds by UUID. A path under /Volumes that no
+        # registered volume owns is unknown, and a consumer path must not be one of those.
+        checkout = os.path.join(self.mount, "checkouts", "settled")
         os.makedirs(checkout)
         self.oxide_registry([self.oxide_row(root, checkout)], complete=True)
         preview, row, plan_file = self.plan_and_run("R6-present", area, root, expect_eligible=False)
@@ -978,7 +982,7 @@ class Proof:
     def case_reappeared_consumer_path_keeps_the_root(self):
         area = self.fresh_area("c10", "release-on-reference")
         root = self.new_root(area, aged=False)
-        checkout = os.path.join(self.home, "checkouts", "reappears")
+        checkout = os.path.join(self.mount, "checkouts", "reappears")
         self.oxide_registry([self.oxide_row(root, checkout)], complete=True)
         preview, row, plan_file = self.plan_and_run("R10", area, root, expect_eligible=True)
         os.makedirs(checkout)
