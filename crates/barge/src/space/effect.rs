@@ -278,6 +278,12 @@ pub struct SpacePruneEffect {
     pub stop: String,
     /// The pass's flush accounting.
     pub flush: SpaceFlushRow,
+    /// Whether the guard's live plan was truncated (internal to the guard).
+    #[serde(skip)]
+    pub(super) live_plan_truncated: bool,
+    /// Root rows the bounded live planner did not reach.
+    #[serde(skip)]
+    pub(super) live_plan_unreached: usize,
     /// What the run replayed and flushed before its first measurement, when it
     /// had any scoped intents to examine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -419,16 +425,49 @@ pub fn prune(
             ),
         )
     })?;
-    if &plan.volume_uuid != request.volume_uuid {
-        return Err(Error::new(
-            ErrorKind::VolumeMismatch,
-            format!(
-                "the plan names volume {} but --volume names {}; nothing was changed",
-                plan.volume_uuid, request.volume_uuid
-            ),
-        )
-        .with_detail("plan_volume_uuid", plan.volume_uuid.as_str().into())
-        .with_detail("volume_uuid", request.volume_uuid.as_str().into()));
+    prune_live(
+        paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        space,
+        flush,
+        request,
+        Some(plan),
+    )
+    .map(|(report, _lock, _replay)| report)
+}
+
+/// Apply an in-memory plan through the same custody and effect path.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prune_live(
+    paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn AbsenceVolume,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    space: &dyn SpaceFacts,
+    flush: &dyn Flush,
+    request: &SpacePruneRunRequest<'_>,
+    plan: Option<SpacePrunePlan>,
+) -> Result<(
+    SpacePruneReport,
+    crate::state::StateLock,
+    delete::ReplayReport,
+)> {
+    if let Some(plan) = &plan {
+        if &plan.volume_uuid != request.volume_uuid {
+            return Err(Error::new(
+                ErrorKind::VolumeMismatch,
+                format!(
+                    "the plan names volume {} but --volume names {}; nothing was changed",
+                    plan.volume_uuid, request.volume_uuid
+                ),
+            )
+            .with_detail("plan_volume_uuid", plan.volume_uuid.as_str().into())
+            .with_detail("volume_uuid", request.volume_uuid.as_str().into()));
+        }
     }
     let started = Instant::now();
     let deadline = started + request.bounds.wall;
@@ -474,6 +513,9 @@ pub fn prune(
         super::lock_deadline(effect_deadline, request.lock_wait),
     );
     let _volume_lock = locks.lock_volume(request.volume_uuid).map_err(|error| {
+        if error.kind() != ErrorKind::Locked {
+            return error;
+        }
         Error::new(
             ErrorKind::Locked,
             format!(
@@ -548,15 +590,16 @@ pub fn prune(
             &mut flush_row,
         )
         .map_err(|error| {
-            error
+            with_replay_detail(error, &replay)
                 .with_detail("replay", serde_json::json!(&replay))
                 .with_detail("flush", serde_json::json!(&flush_row))
         })?;
     }
+    let live = plan.is_none();
     let before = space.measure_space(&verified).map_err(|error| {
         // An absence observed after replay is not a no-effect refusal: replay
         // may already have deleted. Preserve the facts but require exit 3.
-        let failure = if replay.examined > 0 {
+        let failure = if replay.examined > 0 || (live && error.kind() != ErrorKind::VolumeAbsent) {
             let mut failure = Error::new(
                 ErrorKind::UnknownState,
                 format!("space is unknown after replay: {error}"),
@@ -568,10 +611,49 @@ pub fn prune(
         } else {
             error
         };
-        failure
+        with_replay_detail(failure, &replay)
             .with_detail("replay", serde_json::json!(&replay))
             .with_detail("flush", serde_json::json!(&flush_row))
     })?;
+    let (plan, plan_sha256, live_plan_truncated, live_plan_unreached) = if let Some(plan) = plan {
+        (plan, request.plan_digest.to_owned(), false, 0)
+    } else {
+        let planned = super::plan_locked(
+            paths,
+            dirs,
+            facts,
+            mounts,
+            observer,
+            &super::SpacePruneRequest {
+                volume_uuid: request.volume_uuid,
+                now_ms: request.now_ms,
+                wall: deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(super::SPACE_PLAN_WALL),
+                lock_wait: request.lock_wait,
+            },
+            before.clone(),
+            &_volume_lock,
+        )
+        .map_err(|error| {
+            let mut unknown = Error::new(
+                ErrorKind::UnknownState,
+                format!("live planning failed after replay: {error}"),
+            );
+            for (key, value) in error.detail() {
+                unknown = unknown.with_detail(key, value.clone());
+            }
+            with_replay_detail(unknown, &replay)
+                .with_detail("replay", serde_json::json!(&replay))
+                .with_detail("pruned_root_ids", serde_json::json!([]))
+        })?;
+        (
+            planned.plan,
+            planned.plan_sha256,
+            planned.truncated,
+            planned.unreached,
+        )
+    };
     // The plan's own snapshot is what authorizes the run. A policy published between
     // the plan and this pass is the first generation change an effect step
     // re-evaluates, never a silent upgrade of what the plan meant.
@@ -586,12 +668,17 @@ pub fn prune(
         observer,
         space,
         flush,
-        volume_lock: _volume_lock,
+        volume_lock: Some(_volume_lock),
         verified,
         record,
         mount,
         plan,
-        plan_sha256: request.plan_digest.to_owned(),
+        plan_sha256,
+        live,
+        live_plan_truncated,
+        live_plan_unreached,
+        dirty: false,
+        measurements: if live { 2 } else { 0 },
         now_ms: request.now_ms,
         effect_deadline,
         wall_deadline: deadline,
@@ -613,7 +700,27 @@ pub fn prune(
         started_ms: request.now_ms,
     };
     pass.run()?;
-    Ok(pass.into_report(started))
+    let lock = pass
+        .volume_lock
+        .take()
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "the volume lock was lost"))?;
+    let replay = pass.replay.clone();
+    Ok((pass.into_report(started), lock, replay))
+}
+
+fn with_replay_detail(error: Error, replay: &delete::ReplayReport) -> Error {
+    let mut completed = replay.resumed_root_ids.clone();
+    completed.extend(replay.completed_by_settlement_root_ids.clone());
+    error
+        .with_detail("replayed_root_ids", serde_json::json!(completed))
+        .with_detail(
+            "replay_partial_root_ids",
+            serde_json::json!(replay.partial_root_ids),
+        )
+        .with_detail(
+            "replay_settled_root_ids",
+            serde_json::json!(replay.settled_root_ids),
+        )
 }
 
 /// The shared replay/batch flush boundary. A failed flush never authorizes a
@@ -674,12 +781,17 @@ struct Pass<'a> {
     /// The volume's exclusive lock token, held from the first authoritative
     /// measurement to the final decision. Each candidate's deletion takes its own
     /// root lock in a lock set of its own, so only one root lock is ever held.
-    volume_lock: crate::state::StateLock,
+    volume_lock: Option<crate::state::StateLock>,
     verified: VerifiedVolume,
     record: VolumeRecord,
     mount: PathBuf,
     plan: SpacePrunePlan,
     plan_sha256: String,
+    live: bool,
+    live_plan_truncated: bool,
+    live_plan_unreached: usize,
+    dirty: bool,
+    measurements: usize,
     now_ms: u64,
     /// The moment no effect may start.
     effect_deadline: Instant,
@@ -720,7 +832,7 @@ impl Pass<'_> {
     /// Run the bounded pass: batches of the plan's candidates, one flush and one
     /// measurement per batch, stopping on the policy or on a bound.
     fn run(&mut self) -> Result<()> {
-        let candidates = self.plan.candidates.rows.clone();
+        let mut candidates = self.plan.candidates.rows.clone();
         let mut cursor = 0usize;
         // The policy is re-read **before** the first decision, not trusted from the
         // plan: an operator's real run never acts on a stale threshold and never
@@ -730,7 +842,11 @@ impl Pass<'_> {
         // reclaim.
         match self.refresh_policy() {
             Ok(true) => {}
-            Ok(false) => self.stop = Some("target_reached"),
+            Ok(false) => {
+                if self.stop.is_none() {
+                    self.stop = Some("target_reached");
+                }
+            }
             Err(error) => return Err(self.annotate(error)),
         }
         if self.stop.is_none() && self.current.free_bytes > self.target() {
@@ -740,7 +856,8 @@ impl Pass<'_> {
             self.stop = Some("target_reached");
         }
         while self.stop.is_none() {
-            if self.pruned.len() >= self.bounds.roots
+            if (self.live && self.measurements >= 4)
+                || self.pruned.len() >= self.bounds.roots
                 || self.batches >= self.bounds.batches
                 || Instant::now() >= self.effect_deadline
             {
@@ -748,7 +865,11 @@ impl Pass<'_> {
                 break;
             }
             if cursor >= candidates.len() {
-                self.stop = Some("nothing_eligible");
+                self.stop = Some(if self.live_plan_truncated {
+                    "budget_exhausted"
+                } else {
+                    "nothing_eligible"
+                });
                 break;
             }
             let take = self
@@ -776,6 +897,7 @@ impl Pass<'_> {
                 }
                 match self.effect(candidate) {
                     Outcome::Deleted(row) => {
+                        self.dirty = true;
                         self.deleted_bytes = self.deleted_bytes.saturating_add(row.bytes);
                         self.pruned.push(*row);
                         batch_deleted = batch_deleted.saturating_add(1);
@@ -796,10 +918,11 @@ impl Pass<'_> {
             // short is still flushed when it deleted something, so no deletion is
             // ever reported from an unflushed measurement; a batch that deleted
             // nothing has no reclaim to measure.
-            if !cut_short || batch_deleted > 0 {
+            if (!self.live && !cut_short) || batch_deleted > 0 {
                 if let Err(error) = self.flush_and_measure() {
                     return Err(self.annotate(error));
                 }
+                self.dirty = false;
                 self.rounds = self.rounds.saturating_add(1);
             }
             if self.stop.is_some() {
@@ -816,8 +939,46 @@ impl Pass<'_> {
                 // filesystem that has not committed — is undecidable, so the pass
                 // stops rather than deleting more data for no effect.
                 self.stop = Some("space_not_reclaimed");
-            } else if cursor >= candidates.len() {
-                self.stop = Some("nothing_eligible");
+            } else if self.live && batch_deleted > 0 {
+                self.now_ms = self.now_ms.max(state::now_ms());
+                let planned = super::plan_locked(
+                    self.paths,
+                    self.dirs,
+                    self.facts,
+                    self.mounts,
+                    self.observer,
+                    &super::SpacePruneRequest {
+                        volume_uuid: &self.record.volume_uuid,
+                        now_ms: self.now_ms,
+                        wall: self
+                            .effect_deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(super::SPACE_PLAN_WALL),
+                        lock_wait: self.bounds.wall.min(std::time::Duration::from_secs(5)),
+                    },
+                    self.current.clone(),
+                    self.volume_lock.as_ref().ok_or_else(|| {
+                        Error::new(ErrorKind::UnknownState, "the volume lock was lost")
+                    })?,
+                )
+                .map_err(|error| self.annotate(error))?;
+                self.live_plan_truncated |= planned.truncated;
+                self.live_plan_unreached = self.live_plan_unreached.max(planned.unreached);
+                candidates = planned.plan.candidates.rows;
+                cursor = 0;
+                if candidates.is_empty() {
+                    self.stop = Some(if self.live_plan_truncated {
+                        "budget_exhausted"
+                    } else {
+                        "nothing_eligible"
+                    });
+                }
+            } else if cursor >= candidates.len() || (self.live && batch_deleted == 0) {
+                self.stop = Some(if self.live_plan_truncated {
+                    "budget_exhausted"
+                } else {
+                    "nothing_eligible"
+                });
             }
         }
         // The pass accounts for every planned root: one it never attempted is
@@ -830,8 +991,13 @@ impl Pass<'_> {
             .map(|row| row.root_id.as_str())
             .chain(self.held.iter().map(|row| row.root_id.as_str()))
             .collect();
-        for row in &self.plan.candidates.rows {
-            if attempted.contains(&row.root_id.as_str()) {
+        for row in self.plan.candidates.rows.iter().chain(candidates.iter()) {
+            if attempted.contains(&row.root_id.as_str())
+                || self
+                    .unreached
+                    .iter()
+                    .any(|other| other.root_id == row.root_id)
+            {
                 continue;
             }
             self.unreached.push(SpaceUnreachedRow {
@@ -902,6 +1068,13 @@ impl Pass<'_> {
             // the new policy no longer needs is kept.
             self.policy = policy;
             self.policy_generation = self.record.generation;
+            if self.live && self.measurements >= 3 {
+                self.stop = Some("budget_exhausted");
+                if !self.dirty && self.measurements < 4 {
+                    self.measure()?;
+                }
+                return Ok(false);
+            }
             self.measure()?;
             if self.current.free_bytes > self.target() {
                 return Ok(false);
@@ -912,6 +1085,7 @@ impl Pass<'_> {
 
     /// Measure the volume without flushing and adopt the fresh fact.
     fn measure(&mut self) -> Result<()> {
+        self.measurements = self.measurements.saturating_add(1);
         let measurement = self.space.measure_space(&self.verified).map_err(|error| {
             Error::new(
                 ErrorKind::UnknownState,
@@ -945,7 +1119,9 @@ impl Pass<'_> {
             Ok(false) => {
                 // The policy in force is satisfied by the fresh measurement, so this
                 // candidate no longer qualifies and the pass stops before it.
-                self.stop = Some("target_reached");
+                if self.stop.is_none() {
+                    self.stop = Some("target_reached");
+                }
                 return Outcome::Skipped(Skip::new(
                     "policy_changed",
                     format!(
@@ -1040,7 +1216,15 @@ impl Pass<'_> {
             stored,
             &unit,
             bounds,
-            &self.volume_lock,
+            match self.volume_lock.as_ref() {
+                Some(lock) => lock,
+                None => {
+                    return Outcome::Stop(Error::new(
+                        ErrorKind::UnknownState,
+                        "the volume lock was lost",
+                    ))
+                }
+            },
             Some(&authorize),
             &state::IntentEvidence::none(),
         );
@@ -1270,7 +1454,7 @@ impl Pass<'_> {
     /// `unknown_state` refusal is never silent about the effects before it.
     fn annotate(&self, error: Error) -> Error {
         let ids: Vec<&str> = self.pruned.iter().map(|row| row.root_id.as_str()).collect();
-        error
+        with_replay_detail(error, &self.replay)
             .with_detail("replay", serde_json::json!(&self.replay))
             .with_detail("pruned_root_ids", serde_json::json!(ids))
             .with_detail("pruned", self.pruned.len().into())
@@ -1311,6 +1495,8 @@ impl Pass<'_> {
                 .saturating_sub(self.before.free_bytes),
             stop: self.stop.unwrap_or("nothing_eligible").to_owned(),
             flush: self.flush_row,
+            live_plan_truncated: self.live_plan_truncated,
+            live_plan_unreached: self.live_plan_unreached,
             replay: Some(SpaceReplayRow::from(&self.replay)),
             not_reached: RowSet::bounded(self.unreached, unreached_total, ROOT_ROWS),
         };
@@ -3192,10 +3378,13 @@ mod tests {
                     let effect = report.effect.as_ref().expect("effect");
                     assert_eq!(space.meter.calls(), 1);
                     assert_eq!(
-                        effect.replay.expect("replay").resumed,
+                        effect.replay.as_ref().expect("replay").resumed,
                         usize::from(!partial)
                     );
-                    assert_eq!(effect.replay.expect("replay").pending, usize::from(partial));
+                    assert_eq!(
+                        effect.replay.as_ref().expect("replay").pending,
+                        usize::from(partial)
+                    );
                     assert_eq!(effect.flush.attempts, 1);
                     assert_eq!(effect.pruned.count, 0, "replay alone satisfied the target");
                     assert_eq!(effect.batches, 0);
@@ -3204,6 +3393,1310 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn guard_decision_table_and_recheck_use_fresh_measurements() {
+        for (reserve, floor, free) in [
+            (10, 20, 10),
+            (10, 20, 20),
+            (10, 20, 21),
+            (20, 20, 20),
+            (20, 20, 21),
+            (100, 20, 10),
+            (100, 20, 20),
+            (100, 20, 50),
+            (100, 20, 100),
+            (100, 20, 101),
+        ] {
+            let harness = Harness::new("guard-decision", reserve, floor);
+            let meter = Meter::new(&[free, free]);
+            let result = crate::space::guard(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &meter,
+                &Flusher::ok(),
+                &crate::space::GuardRequest {
+                    volume_uuid: &harness.record.volume_uuid,
+                    namespace: "example",
+                    area: "pool",
+                    wall: Duration::from_secs(30),
+                    recheck: false,
+                },
+            );
+            if free <= floor {
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::SpaceBelowFloor);
+            } else {
+                let report = result.expect("above floor admits");
+                let expected = if free <= reserve {
+                    crate::space::SpaceDecision::AdmitBelowReserve
+                } else {
+                    crate::space::SpaceDecision::Admit
+                };
+                assert_eq!(report.decision, expected);
+                let token = crate::space::SpaceGuard::parse(&report.guard).expect("token");
+                let again = crate::space::recheck(
+                    &harness.fixture.state,
+                    &harness.fixture.platform(),
+                    &harness.facts,
+                    &harness.fixture.mounts(),
+                    &harness.observer,
+                    &Meter::new(&[free, free]),
+                    &Flusher::ok(),
+                    &token,
+                    Duration::from_secs(30),
+                )
+                .expect("recheck");
+                assert_eq!(again.decision, crate::space::SpaceDecision::Continue);
+            }
+            assert!(meter.calls() <= 4);
+        }
+    }
+
+    #[test]
+    fn guard_prunes_and_stops_or_admits_from_flushed_measurement() {
+        for (after, expect_stop) in [(10, true), (50, false)] {
+            let harness = Harness::new("guard-prune", 100, 20);
+            let (root, path) = harness.seed("pool", 1_000);
+            let meter = Meter::new(&[10, 10, after]);
+            let flush = Flusher::ok();
+            let report = crate::space::guard(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &meter,
+                &flush,
+                &crate::space::GuardRequest {
+                    volume_uuid: &harness.record.volume_uuid,
+                    namespace: "example",
+                    area: "pool",
+                    wall: Duration::from_secs(30),
+                    recheck: false,
+                },
+            )
+            .expect("guard completed");
+            assert!(!path.exists());
+            assert_eq!(report.pruned.rows[0].root_id, root);
+            assert_eq!(report.after.free_bytes, after);
+            assert_eq!(
+                report.decision,
+                if expect_stop {
+                    crate::space::SpaceDecision::StopBelowFloor
+                } else {
+                    crate::space::SpaceDecision::AdmitBelowReserve
+                }
+            );
+            assert_eq!(flush.calls(), 1);
+            assert!(meter.calls() <= 4);
+        }
+    }
+
+    #[test]
+    fn guard_flush_failure_never_admits_after_deletion() {
+        let harness = Harness::new("guard-flush-failure", 100, 20);
+        let (root, path) = harness.seed("pool", 1_000);
+        let error = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[10, 10]),
+            &Flusher::failing(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect_err("flush failure stops admission");
+        assert!(!path.exists());
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert_eq!(error.detail()["pruned_root_ids"], serde_json::json!([root]));
+    }
+
+    #[test]
+    fn guard_budget_counterfactuals_and_flush_override() {
+        for (free, max_roots, fail_flush) in [
+            (50, 0, false),
+            (50, 1, false),
+            (10, 0, false),
+            (10, 1, false),
+            (10, 1, true),
+        ] {
+            let harness = Harness::new("guard-budget", 100, 20);
+            let (first, first_path) = harness.seed("pool", 1_000);
+            let (_, second_path) = harness.seed("pool", 2_000);
+            let meter = Meter::new(&[free, free, free]);
+            let flush = if fail_flush {
+                Flusher::failing()
+            } else {
+                Flusher::ok()
+            };
+            let mut bounds = SpacePruneBounds::design();
+            bounds.roots = max_roots;
+            let result = crate::space::guard::guard_with_bounds(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &meter,
+                &flush,
+                &crate::space::GuardRequest {
+                    volume_uuid: &harness.record.volume_uuid,
+                    namespace: "example",
+                    area: "pool",
+                    wall: Duration::from_secs(30),
+                    recheck: false,
+                },
+                bounds,
+            );
+            if fail_flush {
+                let error = result.expect_err("failed flush is unknown");
+                assert_eq!(error.kind(), ErrorKind::UnknownState);
+                assert_eq!(
+                    error.detail()["pruned_root_ids"],
+                    serde_json::json!([first])
+                );
+            } else if free <= 20 && max_roots == 0 {
+                let error = result.expect_err("below floor, no deletion");
+                assert_eq!(error.kind(), ErrorKind::SpaceBelowFloor);
+                assert_eq!(error.detail()["cause"], "budget_exhausted");
+                assert_eq!(error.detail()["not_reached"]["count"], 2);
+            } else {
+                let report = result.expect("completed guard");
+                assert_eq!(
+                    report.decision,
+                    if free <= 20 {
+                        crate::space::SpaceDecision::StopBelowFloor
+                    } else {
+                        crate::space::SpaceDecision::AdmitBelowReserve
+                    }
+                );
+                assert_eq!(report.pruned.count, max_roots);
+                assert_eq!(report.not_reached.count, 2 - max_roots);
+                assert_eq!(report.detail["cause"], "budget_exhausted");
+            }
+            assert_eq!(first_path.exists(), max_roots == 0);
+            assert!(second_path.exists());
+            assert!(meter.calls() <= 4);
+        }
+    }
+
+    #[test]
+    fn guard_skips_held_root_and_reports_no_effect_refusal() {
+        let harness = Harness::new("guard-held", 100, 20);
+        let (root, path) = harness.seed("pool", 1_000);
+        harness.hold(&root);
+        let error = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[10, 10]),
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect_err("held root is not deleted and floor is breached");
+        assert_eq!(error.kind(), ErrorKind::SpaceBelowFloor);
+        assert!(path.join("payload.bin").exists());
+        assert_eq!(error.detail()["pruned_root_ids"], serde_json::json!([]));
+        assert!(error.detail()["held_or_unknown_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0));
+        assert_eq!(error.detail()["owned_prunable_bytes"], 0);
+    }
+
+    #[test]
+    fn guard_decides_after_busy_volume_lock_without_deleting() {
+        let harness = Harness::new("guard-wait", 100, 20);
+        let (_, path) = harness.seed("pool", 1_000);
+        let mut locks = LockSet::with_deadline(
+            harness.fixture.state.clone(),
+            Deadline::after(Duration::from_secs(1)),
+        );
+        let _lock = locks
+            .lock_volume(&harness.record.volume_uuid)
+            .expect("held volume lock");
+        let meter = Meter::new(&[10, 50]);
+        let report = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &meter,
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect("fresh measurement above floor admits");
+        assert_eq!(
+            report.decision,
+            crate::space::SpaceDecision::AdmitBelowReserve
+        );
+        assert!(report.decided_after_wait);
+        assert_eq!(report.after.free_bytes, 50);
+        assert!(path.join("payload.bin").exists());
+        assert_eq!(meter.calls(), 2);
+    }
+
+    #[test]
+    fn recheck_reverifies_token_volume_and_ignores_forged_observations() {
+        let harness = Harness::new("guard-token-binding", 10, 5);
+        let token = crate::space::SpaceGuard {
+            volume_uuid: harness.record.volume_uuid.clone(),
+            namespace: "example".to_owned(),
+            area: "pool".to_owned(),
+            generation: u64::MAX,
+            observed_ms: u64::MAX,
+        };
+        let call = |facts: &FakeVolume, token: &crate::space::SpaceGuard| {
+            crate::space::recheck(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &Meter::new(&[30]),
+                &Flusher::ok(),
+                token,
+                Duration::from_secs(30),
+            )
+        };
+        let fresh = call(&harness.facts, &token).expect("forged observations grant nothing");
+        assert_eq!(fresh.decision, crate::space::SpaceDecision::Continue);
+        assert_ne!(
+            crate::space::SpaceGuard::parse(&fresh.guard)
+                .expect("token")
+                .generation,
+            u64::MAX
+        );
+        let mut older = token.clone();
+        older.generation = 0;
+        older.observed_ms = 0;
+        assert_eq!(
+            call(&harness.facts, &older).expect("old token").decision,
+            fresh.decision
+        );
+        let mut wrong = harness.fixture.facts();
+        wrong.uuid = VolumeUuid::parse(crate::testkit::OTHER_UUID).expect("other UUID");
+        assert_eq!(
+            call(&wrong, &token)
+                .expect_err("different mounted UUID")
+                .kind(),
+            ErrorKind::VolumeMismatch
+        );
+        harness.facts.present.set(false);
+        assert_eq!(
+            call(&harness.facts, &token)
+                .expect_err("absent volume")
+                .kind(),
+            ErrorKind::VolumeAbsent
+        );
+        harness.facts.present.set(true);
+        let mut unregistered = token.clone();
+        unregistered.volume_uuid = VolumeUuid::parse(crate::testkit::OTHER_UUID).expect("UUID");
+        assert_eq!(
+            call(&harness.facts, &unregistered)
+                .expect_err("unregistered")
+                .kind(),
+            ErrorKind::UnknownState
+        );
+        let mut undeclared = token.clone();
+        undeclared.area = "missing".to_owned();
+        assert_eq!(
+            call(&harness.facts, &undeclared)
+                .expect_err("undeclared")
+                .kind(),
+            ErrorKind::UnknownState
+        );
+        let parent = harness.fixture.root.join("example");
+        std::fs::create_dir_all(&parent).expect("fixture area parent");
+        let target = harness.fixture.root.join("local-only-target");
+        std::fs::create_dir(&target).expect("fixture target");
+        std::os::unix::fs::symlink(&target, parent.join("pool")).expect("fixture symlink");
+        assert!(
+            call(&harness.facts, &token).is_err(),
+            "an unresolvable area is refused"
+        );
+    }
+
+    #[test]
+    fn recheck_applies_current_floor_and_reserve() {
+        let harness = Harness::new("guard-policy-edit", 10, 5);
+        let token = crate::space::SpaceGuard {
+            volume_uuid: harness.record.volume_uuid.clone(),
+            namespace: "example".to_owned(),
+            area: "pool".to_owned(),
+            generation: harness.record.generation,
+            observed_ms: 1,
+        };
+        let mut changed = harness.record.clone();
+        changed.generation += 1;
+        changed.space.as_mut().expect("policy").floor_bytes = 20;
+        changed.space.as_mut().expect("policy").reserve_bytes = 100;
+        harness.fixture.register_record(&changed);
+        let error = crate::space::recheck(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[10, 10]),
+            &Flusher::ok(),
+            &token,
+            Duration::from_secs(30),
+        )
+        .expect_err("new floor stops work");
+        assert_eq!(error.kind(), ErrorKind::SpaceBelowFloor);
+        assert_eq!(error.detail()["floor_bytes"], 20);
+        assert_eq!(error.detail()["reserve_bytes"], 100);
+    }
+
+    #[test]
+    fn guard_replans_a_root_released_during_the_previous_batch() {
+        let harness = Harness::new("guard-release-mid-pass", 100, 20);
+        let (_, first_path) = harness.seed("pool", 1_000);
+        let (second, second_path) = harness.seed("pool", 2_000);
+        harness.hold(&second);
+        let state = harness.fixture.state.clone();
+        let released = std::rc::Rc::new(Cell::new(false));
+        let signalled = released.clone();
+        let second_id = second.clone();
+        let dirs = Faults::new();
+        dirs.observing(Box::new(move |name| {
+            if name == "payload.bin" && !first_path.exists() && !signalled.replace(true) {
+                area::release(&state, &FakeObserver::new(), &second_id, "consumer")
+                    .expect("release during first delete");
+            }
+        }));
+        let meter = Meter::new(&[10, 10, 15, 30]);
+        let mut bounds = SpacePruneBounds::design();
+        bounds.batch_roots = 1;
+        let report = crate::space::guard::guard_with_bounds(
+            &harness.fixture.state,
+            &dirs,
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &meter,
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+            bounds,
+        )
+        .expect("guard");
+        assert!(released.get());
+        assert!(
+            !second_path.exists(),
+            "the released root was considered in the next batch"
+        );
+        assert_eq!(report.pruned.count, 2);
+        assert_eq!(meter.calls(), 4);
+    }
+
+    #[test]
+    fn guard_pending_intent_keeps_only_covered_root_and_attributes_it() {
+        let harness = Harness::new("guard-pending", 100, 20);
+        let (root, path) = harness.seed("pool", 1_000);
+        let (_, bytes) = harness.preview();
+        let faults = Faults::new().with_device_shift(
+            "payload.bin",
+            crate::os::DeviceId::new(harness.fixture.device.get().saturating_add(1)),
+        );
+        harness
+            .run_with(
+                &faults,
+                &bytes,
+                &Meter::new(&[10]),
+                &Flusher::ok(),
+                SpacePruneBounds::design(),
+            )
+            .expect_err("leave pending intent");
+        assert!(!path.exists());
+        harness.hold(&root);
+        let error = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[10, 10]),
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect_err("floor refuses, pending root stays kept");
+        assert_eq!(error.kind(), ErrorKind::SpaceBelowFloor);
+        assert_eq!(
+            error.detail()["pending_intents"][0]["reason"],
+            "pending_intent"
+        );
+        assert_eq!(error.detail()["pending_intents"][0]["root_id"], root);
+        assert!(error.detail()["held_or_unknown_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0));
+    }
+
+    #[test]
+    fn guard_attributes_excluded_root_without_touching_it() {
+        let harness = Harness::new("guard-excluded", 100, 20);
+        harness.declare("archive", ReserveParticipation::Excluded);
+        let (_, path) = harness.seed("archive", 1_000);
+        let error = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[10, 10]),
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect_err("floor refuses");
+        assert_eq!(error.kind(), ErrorKind::SpaceBelowFloor);
+        assert!(path.join("payload.bin").exists());
+        assert!(error.detail()["excluded_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0));
+    }
+
+    #[test]
+    fn guard_volume_disappears_after_capture_and_during_flush() {
+        for during_flush in [false, true] {
+            let harness = Harness::new("guard-volume-loss", 100, 20);
+            let (_, path) = harness.seed("pool", 1_000);
+            let facts = std::rc::Rc::new(harness.fixture.facts());
+            let pull = facts.clone();
+            let captured_path = path.clone();
+            let dirs = std::rc::Rc::new(Faults::new());
+            if !during_flush {
+                let weak = std::rc::Rc::downgrade(&dirs);
+                dirs.observing(Box::new(move |name| {
+                    if name == "payload.bin" && !captured_path.exists() {
+                        pull.present.set(false);
+                        if let Some(dirs) = weak.upgrade() {
+                            *dirs.observation_error.borrow_mut() = Some((
+                                name.to_owned(),
+                                std::io::Error::from_raw_os_error(libc::EIO),
+                            ));
+                        }
+                    }
+                }));
+            }
+            struct PullFlush<'a> {
+                facts: &'a FakeVolume,
+                pull: bool,
+            }
+            impl Flush for PullFlush<'_> {
+                fn flush_volume(&self, _: &VerifiedVolume, _: Instant) -> crate::error::Result<()> {
+                    if self.pull {
+                        self.facts.present.set(false);
+                    }
+                    Ok(())
+                }
+            }
+            let error = crate::space::guard(
+                &harness.fixture.state,
+                dirs.as_ref(),
+                facts.as_ref(),
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &Meter::new(&[10, 10]),
+                &PullFlush {
+                    facts: facts.as_ref(),
+                    pull: during_flush,
+                },
+                &crate::space::GuardRequest {
+                    volume_uuid: &harness.record.volume_uuid,
+                    namespace: "example",
+                    area: "pool",
+                    wall: Duration::from_secs(30),
+                    recheck: false,
+                },
+            )
+            .expect_err("volume loss stops guard");
+            assert!(!facts.present.get(), "loss injection was reached");
+            assert_eq!(error.kind(), ErrorKind::UnknownState);
+            if during_flush {
+                assert_eq!(
+                    error.detail()["pruned_root_ids"]
+                        .as_array()
+                        .expect("ids")
+                        .len(),
+                    1
+                );
+            } else {
+                let journal =
+                    state::read_intents(&harness.fixture.state, INTENT_ROWS).expect("journal");
+                assert!(
+                    !PendingIntent::pending(&journal.records).is_empty(),
+                    "error={error:?}; phases={:?}; path={}",
+                    journal.records.iter().map(|r| r.phase).collect::<Vec<_>>(),
+                    path.exists()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guard_foreign_open_child() {
+        let Some(dir) = std::env::var_os("BARGE_FOREIGN_OPEN_FIXTURE") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let mut file = std::fs::File::open(dir.join("foreign-open")).expect("open foreign file");
+        std::fs::write(dir.join("foreign-ready"), b"ready").expect("ready");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !dir.join("foreign-finish").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        use std::io::Read;
+        let mut text = String::new();
+        file.read_to_string(&mut text)
+            .expect("read held descriptor");
+        assert_eq!(text, "open payload");
+    }
+
+    #[test]
+    fn guard_reports_unlinked_but_open_foreign_file_and_zero_reclaim() {
+        let harness = Harness::new("guard-open-foreign", 100, 20);
+        let (_, path) = harness.seed("pool", 1_000);
+        let foreign = harness.fixture.root.join("foreign-open");
+        std::fs::write(&foreign, b"open payload").expect("foreign file");
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "space::effect::tests::guard_foreign_open_child"])
+            .env("BARGE_FOREIGN_OPEN_FIXTURE", &harness.fixture.root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("foreign subprocess");
+        let mut child = SignalChild(child);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !harness.fixture.root.join("foreign-ready").exists() && Instant::now() < deadline {
+            if child.0.try_wait().expect("poll").is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(harness.fixture.root.join("foreign-ready").exists());
+        std::fs::remove_file(&foreign).expect("unlink while foreign descriptor is open");
+        let report = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[10, 10, 10]),
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect("completed stop");
+        assert!(!path.exists());
+        assert_eq!(report.decision, crate::space::SpaceDecision::StopBelowFloor);
+        assert_eq!(report.detail["stop"], "space_not_reclaimed");
+        assert_eq!(report.reclaimed_bytes, 0);
+        std::fs::write(harness.fixture.root.join("foreign-finish"), b"done").expect("finish child");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.0.try_wait().expect("poll") {
+                assert!(status.success());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "foreign child exited within bound"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn guard_enospc_at_intent_write_precedes_effect() {
+        let harness = Harness::new("guard-enospc", 100, 20);
+        let (_, path) = harness.seed("pool", 1_000);
+        let no_space = crate::os::test_no_space();
+        let errno = no_space.raw_os_error().expect("ENOSPC");
+        state::fail_next_intent_publish(no_space);
+        let error = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[10, 10]),
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect_err("intent write fails");
+        assert_eq!(error.detail()["errno"], errno);
+        assert!(path.join("payload.bin").exists());
+        harness.no_pending_intent();
+    }
+
+    #[test]
+    fn guard_and_error_readers_refuse_each_others_schema() {
+        let harness = Harness::new("guard-contracts", 10, 5);
+        let report = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[30]),
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect("guard");
+        let bytes = crate::contract::success_bytes(
+            crate::space::SPACE_GUARD_SCHEMA,
+            "space guard",
+            &report,
+        )
+        .expect("encode");
+        assert_eq!(
+            crate::space::read_guard_document(&bytes).expect("guard read"),
+            report
+        );
+        assert!(crate::error::read_document(&bytes).is_err());
+        let error = crate::error::Error::new(ErrorKind::SpaceBelowFloor, "below floor");
+        let bytes = crate::contract::error_bytes("space guard", &error);
+        assert_eq!(
+            crate::error::read_document(&bytes)
+                .expect("error read")
+                .kind(),
+            ErrorKind::SpaceBelowFloor
+        );
+        assert!(crate::space::read_guard_document(&bytes).is_err());
+        let mut value: serde_json::Value = serde_json::from_slice(
+            &crate::contract::success_bytes(
+                crate::space::SPACE_GUARD_SCHEMA,
+                "space guard",
+                &report,
+            )
+            .expect("encode"),
+        )
+        .expect("JSON");
+        value["schema"] = "barge.space.guard/999".into();
+        assert!(
+            crate::space::read_guard_document(&serde_json::to_vec(&value).expect("encode"))
+                .is_err()
+        );
+        value["schema"] = crate::space::SPACE_GUARD_SCHEMA.into();
+        value["data"]["detail"]
+            .as_object_mut()
+            .expect("detail")
+            .remove("replay_partial_root_ids");
+        assert!(
+            crate::space::read_guard_document(&serde_json::to_vec(&value).expect("encode"))
+                .is_err()
+        );
+        value["data"]["detail"]["replay_partial_root_ids"] = "not an array".into();
+        assert!(
+            crate::space::read_guard_document(&serde_json::to_vec(&value).expect("encode"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn guard_uses_falling_post_flush_measurement() {
+        let harness = Harness::new("guard-falling-free", 100, 20);
+        let (_, path) = harness.seed("pool", 1_000);
+        let report = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[50, 50, 10]),
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect("completed stop");
+        assert!(!path.exists());
+        assert_eq!(report.after.free_bytes, 10);
+        assert_eq!(report.decision, crate::space::SpaceDecision::StopBelowFloor);
+    }
+
+    #[test]
+    fn guard_refuses_overflow_and_undeclared_policy_and_durability() {
+        struct Overflow;
+        impl SpaceFacts for Overflow {
+            fn measure_space(
+                &self,
+                volume: &VerifiedVolume,
+            ) -> crate::error::Result<SpaceMeasurement> {
+                SpaceMeasurement::from_blocks(
+                    Some(u64::MAX),
+                    Some(2),
+                    Some(2),
+                    Some(2),
+                    1,
+                    volume.identity().device,
+                )
+            }
+        }
+        let harness = Harness::new("guard-unknown", 100, 20);
+        let run = |meter: &dyn SpaceFacts| {
+            crate::space::guard(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                meter,
+                &Flusher::ok(),
+                &crate::space::GuardRequest {
+                    volume_uuid: &harness.record.volume_uuid,
+                    namespace: "example",
+                    area: "pool",
+                    wall: Duration::from_secs(30),
+                    recheck: false,
+                },
+            )
+        };
+        assert_eq!(
+            run(&Overflow).expect_err("overflow").kind(),
+            ErrorKind::UnknownState
+        );
+        let mut record = harness.record.clone();
+        record.space = None;
+        harness.fixture.register_record(&record);
+        assert_eq!(
+            run(&Meter::new(&[50]))
+                .expect_err("undeclared policy")
+                .detail()["space_undeclared"],
+            true
+        );
+        record.space = harness.record.space.clone();
+        record.durability = crate::registry::Durability::Kept;
+        harness.fixture.register_record(&record);
+        assert_eq!(
+            run(&Meter::new(&[50])).expect_err("kept").kind(),
+            ErrorKind::RefusedBoundary
+        );
+        record.durability = crate::registry::Durability::Undeclared;
+        harness.fixture.register_record(&record);
+        assert_eq!(
+            run(&Meter::new(&[50]))
+                .expect_err("undeclared durability")
+                .kind(),
+            ErrorKind::UnknownState
+        );
+    }
+
+    #[test]
+    fn guard_holds_root_lock_during_the_live_effect() {
+        let harness = Harness::new("guard-root-lock", 100, 20);
+        let (root, path) = harness.seed("pool", 1_000);
+        let locked = std::rc::Rc::new(Cell::new(false));
+        let flag = locked.clone();
+        let state = harness.fixture.state.clone();
+        let root_id = root.clone();
+        let captured = path.clone();
+        let dirs = Faults::new();
+        dirs.observing(Box::new(move |name| {
+            if name == "payload.bin" && !captured.exists() && !flag.get() {
+                let attempt = area::hold(
+                    &state,
+                    &FakeObserver::new(),
+                    &HoldRequest {
+                        root_id: root_id.clone(),
+                        holder: "racer".to_owned(),
+                        pid: std::process::id(),
+                        scope: HoldScope::Write,
+                        purpose: "race".to_owned(),
+                    },
+                );
+                assert_eq!(
+                    attempt.expect_err("root lock is held").kind(),
+                    ErrorKind::Locked
+                );
+                flag.set(true);
+            }
+        }));
+        let report = crate::space::guard(
+            &harness.fixture.state,
+            &dirs,
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[10, 10, 30]),
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect("guard");
+        assert!(locked.get());
+        assert!(!path.exists());
+        assert_eq!(report.pruned.rows[0].root_id, root);
+    }
+
+    #[test]
+    fn guard_stops_after_registry_corruption_or_kept_durability() {
+        for kept in [false, true] {
+            let harness = Harness::new("guard-registry-change", 100, 20);
+            let (first, first_path) = harness.seed("pool", 1_000);
+            let (_, second_path) = harness.seed("pool", 2_000);
+            struct ChangeRegistry {
+                state: crate::state::StatePaths,
+                record: VolumeRecord,
+                kept: bool,
+            }
+            impl Flush for ChangeRegistry {
+                fn flush_volume(&self, _: &VerifiedVolume, _: Instant) -> crate::error::Result<()> {
+                    if self.kept {
+                        let mut record = self.record.clone();
+                        record.generation += 1;
+                        record.durability = crate::registry::Durability::Kept;
+                        let mut locks = LockSet::with_deadline(
+                            self.state.clone(),
+                            Deadline::after(Duration::from_secs(1)),
+                        );
+                        let lock = locks.lock_registry()?;
+                        crate::registry::RegistryWriter::new(&self.state).publish(
+                            &lock,
+                            &crate::registry::RegistryDocument::new(vec![record]),
+                        )?;
+                    } else {
+                        std::fs::write(self.state.registry_path(), b"invalid registry")
+                            .expect("corrupt registry at flush");
+                    }
+                    Ok(())
+                }
+            }
+            let mut bounds = SpacePruneBounds::design();
+            bounds.batch_roots = 1;
+            let error = crate::space::guard::guard_with_bounds(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &Meter::new(&[10, 10, 15]),
+                &ChangeRegistry {
+                    state: harness.fixture.state.clone(),
+                    record: harness.record.clone(),
+                    kept,
+                },
+                &crate::space::GuardRequest {
+                    volume_uuid: &harness.record.volume_uuid,
+                    namespace: "example",
+                    area: "pool",
+                    wall: Duration::from_secs(30),
+                    recheck: false,
+                },
+                bounds,
+            )
+            .expect_err("registry change stops further pruning");
+            assert_eq!(error.kind(), ErrorKind::UnknownState);
+            assert_eq!(
+                error.detail()["pruned_root_ids"],
+                serde_json::json!([first])
+            );
+            assert!(!first_path.exists());
+            assert!(second_path.exists());
+        }
+    }
+
+    #[test]
+    fn guard_replay_completed_root_below_floor_requires_completed_stop() {
+        let harness = Harness::new("guard-replay-stop", 100, 20);
+        let (root, path) = harness.seed("pool", 1_000);
+        let (_, bytes) = harness.preview();
+        let faults = Faults::new().with_device_shift(
+            "payload.bin",
+            crate::os::DeviceId::new(harness.fixture.device.get().saturating_add(1)),
+        );
+        harness
+            .run_with(
+                &faults,
+                &bytes,
+                &Meter::new(&[10]),
+                &Flusher::ok(),
+                SpacePruneBounds::design(),
+            )
+            .expect_err("leave pending intent");
+        assert!(!path.exists());
+        let result = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[10, 10]),
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        );
+        let report = result
+            .expect("a replay that completed a root changed data and is not a no-effect refusal");
+        assert_eq!(report.decision, crate::space::SpaceDecision::StopBelowFloor);
+        assert!(report.detail["replayed_root_ids"]
+            .as_array()
+            .expect("ids")
+            .iter()
+            .any(|id| id == &root));
+    }
+
+    #[test]
+    fn guard_replay_completed_and_partial_effects_above_and_below_floor() {
+        for (partial, free) in [(false, 10), (false, 50), (true, 10), (true, 50)] {
+            let harness = Harness::new("guard-replay-outcome", 100, 20);
+            let (root, path) = harness.seed("pool", 1_000);
+            let (_, bytes) = harness.preview();
+            let faults = Faults::new().with_device_shift(
+                "payload.bin",
+                crate::os::DeviceId::new(harness.fixture.device.get().saturating_add(1)),
+            );
+            harness
+                .run_with(
+                    &faults,
+                    &bytes,
+                    &Meter::new(&[10]),
+                    &Flusher::ok(),
+                    SpacePruneBounds::design(),
+                )
+                .expect_err("pending");
+            if partial {
+                state::fail_next_phase_publish(state::IntentPhase::MarkerLast);
+            }
+            let report = crate::space::guard(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &Meter::new(&[10, free]),
+                &Flusher::ok(),
+                &crate::space::GuardRequest {
+                    volume_uuid: &harness.record.volume_uuid,
+                    namespace: "example",
+                    area: "pool",
+                    wall: Duration::from_secs(30),
+                    recheck: false,
+                },
+            )
+            .expect("completed guard");
+            assert_eq!(
+                report.decision,
+                if free <= 20 {
+                    crate::space::SpaceDecision::StopBelowFloor
+                } else {
+                    crate::space::SpaceDecision::AdmitBelowReserve
+                }
+            );
+            let key = if partial {
+                "replay_partial_root_ids"
+            } else {
+                "replayed_root_ids"
+            };
+            assert_eq!(report.detail[key], serde_json::json!([root]));
+            assert_eq!(report.detail["pruned_root_ids"], serde_json::json!([]));
+            assert_eq!(report.detail["cause"], "replay");
+            assert!(!path.exists());
+            if partial {
+                assert_eq!(report.kept.count, 1);
+                assert_eq!(report.kept.rows[0].reason, "pending_intent");
+                assert!(
+                    report.detail["held_or_unknown_bytes"].as_u64().is_some(),
+                    "detail: {}",
+                    report.detail
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guard_journal_only_rollback_remains_a_no_effect_refusal() {
+        let harness = Harness::new("guard-replay-settled", 100, 20);
+        let (root, path) = harness.seed("pool", 1_000);
+        let (_, bytes) = harness.preview();
+        let faults = Faults::new().with_device_shift(
+            "payload.bin",
+            crate::os::DeviceId::new(harness.fixture.device.get().saturating_add(1)),
+        );
+        harness
+            .run_with(
+                &faults,
+                &bytes,
+                &Meter::new(&[10]),
+                &Flusher::ok(),
+                SpacePruneBounds::design(),
+            )
+            .expect_err("pending");
+        let journal = state::read_intents(&harness.fixture.state, INTENT_ROWS).expect("journal");
+        let mut intent = journal.records[0].clone();
+        let leaf = path.parent().expect("parent").join(intent.capture_name());
+        std::fs::rename(&leaf, &path).expect("fixture restores original name");
+        intent.phase = state::IntentPhase::Intent;
+        intent.captures.clear();
+        intent.foreign_captures.clear();
+        std::fs::write(
+            state::intent_path(&harness.fixture.state, &intent.intent_id).expect("intent path"),
+            serde_json::to_vec(&intent).expect("intent bytes"),
+        )
+        .expect("fixture journal");
+        struct HoldAfterReplay<'a> {
+            state: &'a crate::state::StatePaths,
+            root: &'a str,
+        }
+        impl Flush for HoldAfterReplay<'_> {
+            fn flush_volume(&self, _: &VerifiedVolume, _: Instant) -> crate::error::Result<()> {
+                area::hold(
+                    self.state,
+                    &FakeObserver::new(),
+                    &HoldRequest {
+                        root_id: self.root.to_owned(),
+                        holder: "after-replay".to_owned(),
+                        pid: std::process::id(),
+                        scope: HoldScope::Write,
+                        purpose: "fixture".to_owned(),
+                    },
+                )?;
+                Ok(())
+            }
+        }
+        let error = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[10, 10]),
+            &HoldAfterReplay {
+                state: &harness.fixture.state,
+                root: &root,
+            },
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect_err("journal-only settlement does not change refusal shape");
+        assert_eq!(error.kind(), ErrorKind::SpaceBelowFloor);
+        assert_eq!(
+            error.detail()["replay_settled_root_ids"],
+            serde_json::json!([root])
+        );
+        assert!(path.join("payload.bin").exists());
+    }
+
+    #[test]
+    fn guard_no_effect_refusal_can_create_state_lock_without_volume_effect() {
+        let harness = Harness::new("guard-no-effect-lock", 100, 20);
+        let lock_path = harness
+            .fixture
+            .state
+            .volume_lock_path(&harness.record.volume_uuid);
+        if lock_path.exists() {
+            std::fs::remove_file(&lock_path).expect("remove fixture lock");
+        }
+        assert!(!lock_path.exists());
+        let error = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[10, 10]),
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect_err("below floor");
+        assert_eq!(error.kind(), ErrorKind::SpaceBelowFloor);
+        assert!(
+            lock_path.exists(),
+            "the lock is state-only and creates no volume-byte effect"
+        );
+    }
+
+    #[test]
+    fn guard_keeps_root_when_holder_pid_was_reused() {
+        let harness = Harness::new("guard-reused-pid", 100, 20);
+        let (root, path) = harness.seed("pool", 1_000);
+        let hold = area::hold(
+            &harness.fixture.state,
+            &harness.observer,
+            &HoldRequest {
+                root_id: root,
+                holder: "reused".to_owned(),
+                pid: std::process::id(),
+                scope: HoldScope::Write,
+                purpose: "fixture".to_owned(),
+            },
+        )
+        .expect("hold");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&hold.path).expect("hold file")).expect("JSON");
+        value["process_start"] = 1u64.into();
+        std::fs::write(&hold.path, serde_json::to_vec(&value).expect("JSON"))
+            .expect("fixture reused PID");
+        let error = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[10, 10]),
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect_err("unknown holder keeps root");
+        assert_eq!(error.kind(), ErrorKind::SpaceBelowFloor);
+        assert!(path.join("payload.bin").exists());
+        assert!(error.detail()["held_or_unknown_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0));
+    }
+
+    #[test]
+    fn guard_refuses_unreadable_intent_journal_before_effect() {
+        let harness = Harness::new("guard-bad-journal", 100, 20);
+        let (_, path) = harness.seed("pool", 1_000);
+        let journal = harness.fixture.state.intents_dir();
+        std::fs::remove_dir_all(&journal).expect("remove fixture journal");
+        std::fs::write(&journal, b"not a directory").expect("unreadable journal fixture");
+        let error = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[10, 10]),
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect_err("unknown journal");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(path.join("payload.bin").exists());
+    }
+
+    #[test]
+    fn guard_low_space_never_reports_the_declared_fallback_path() {
+        let harness = Harness::new("guard-no-fallback", 100, 20);
+        let fallback = harness.fixture.dir.join("fallback");
+        let mut declaration =
+            Harness::declaration("pool", "example/pool", ReserveParticipation::Counts);
+        declaration.absent = area::AbsentPolicy::FallbackLocal {
+            path: fallback.clone(),
+        };
+        area::declare(&harness.fixture.state, &declaration, 2).expect("fallback declaration");
+        let error = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[10, 10]),
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect_err("low space refuses");
+        assert_eq!(error.kind(), ErrorKind::SpaceBelowFloor);
+        let serialized = crate::contract::error_bytes("space guard", &error);
+        assert!(!String::from_utf8(serialized)
+            .expect("UTF-8")
+            .contains(&fallback.display().to_string()));
+        assert!(!fallback.exists());
     }
 
     /// A device fault leaves a journal the next run can replay. The actual
@@ -3244,7 +4737,7 @@ mod tests {
             )
             .expect("the second run replays and prunes");
         let effect = report.effect.as_ref().expect("the effect");
-        let replay = effect.replay.expect("the replay is reported");
+        let replay = effect.replay.as_ref().expect("the replay is reported");
         assert_eq!(replay.examined, 1);
         assert_eq!(replay.pending, 0);
         assert!(replay.resumed + replay.settled == 1, "the intent settled");
@@ -3422,6 +4915,48 @@ mod tests {
         panic!("signal barrier was not reached");
     }
 
+    #[test]
+    fn signal_guard_child() {
+        let Some(base) = std::env::var_os("BARGE_GUARD_SIGNAL_FIXTURE") else {
+            return;
+        };
+        let base = std::path::PathBuf::from(base);
+        crate::os::test_allow_termination().expect("SIGTERM disposition");
+        let harness = Harness::new("guard-signal-child", RESERVE, FLOOR);
+        let (root_id, path) = harness.seed("pool", 1_000);
+        std::fs::write(base.join("info.json"), serde_json::to_vec(&serde_json::json!({
+            "state": harness.fixture.state.root(), "mount": harness.fixture.root,
+            "uuid": harness.fixture.uuid.as_str(), "device": harness.fixture.device.get(), "root": path, "root_id": root_id,
+        })).expect("info")).expect("publish fixture info");
+        let dirs = Faults::new();
+        dirs.observing(Box::new(move |name| {
+            if name == "payload.bin" && !path.exists() {
+                std::fs::write(base.join("ready"), b"captured").expect("handshake");
+                loop {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }));
+        crate::space::guard(
+            &harness.fixture.state,
+            &dirs,
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[4, 4]),
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect("parent signals post-quarantine");
+        panic!("signal barrier was not reached");
+    }
+
     /// Ensure a failing subprocess assertion cannot leave a sleeping child.
     struct SignalChild(std::process::Child);
     impl Drop for SignalChild {
@@ -3437,6 +4972,209 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn guard_sigterm_releases_locks_and_next_guard_flushes_replay_before_measure() {
+        let scratch = crate::testkit::TempDir::under_scratch("guard-sigterm");
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "space::effect::tests::signal_guard_child",
+                "--nocapture",
+            ])
+            .env("BARGE_GUARD_SIGNAL_FIXTURE", scratch.path())
+            .env(crate::testkit::SCRATCH_ROOT_ENV, scratch.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("guard subprocess");
+        let mut child = SignalChild(child);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !scratch.join("ready").exists() && Instant::now() < deadline {
+            if child.0.try_wait().expect("poll").is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            scratch.join("ready").exists(),
+            "post-quarantine barrier reached"
+        );
+        // A second guard actually contends with the paused guard's volume lock.
+        let info: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(scratch.join("info.json")).expect("info"))
+                .expect("JSON");
+        let platform = crate::os::platform();
+        let paths = crate::state::StatePaths::resolve(
+            &platform,
+            Some(std::path::Path::new(info["state"].as_str().expect("state"))),
+        )
+        .expect("state");
+        let uuid = VolumeUuid::parse(info["uuid"].as_str().expect("uuid")).expect("UUID");
+        let facts = FakeVolume {
+            root: info["mount"].as_str().expect("mount").into(),
+            uuid: uuid.clone(),
+            device: crate::os::DeviceId::new(info["device"].as_u64().expect("device")),
+            present: Cell::new(true),
+            shifted: Cell::new(false),
+            duplicate: Cell::new(false),
+        };
+        let contender_meter = Meter::new(&[4, 20]);
+        let contender = crate::space::guard(
+            &paths,
+            &platform,
+            &facts,
+            &facts,
+            &FakeObserver::new(),
+            &contender_meter,
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect("contending guard decides");
+        assert!(contender.decided_after_wait);
+        assert_eq!(contender.decision, crate::space::SpaceDecision::Admit);
+        assert_eq!(contender.pruned.count, 0);
+        assert_eq!(contender_meter.calls(), 2);
+        // While the first guard remains paused, a guard on another registered
+        // volume must be able to acquire its distinct lock and decide.
+        let other = VolumeFixture::under_scratch("guard-other-volume");
+        let other_uuid = VolumeUuid::parse(crate::testkit::OTHER_UUID).expect("other UUID");
+        let mut other_record = other.record.clone();
+        other_record.volume_uuid = other_uuid.clone();
+        other_record.space = Some(SpacePolicy {
+            reserve_bytes: RESERVE,
+            floor_bytes: FLOOR,
+            declared_by: "fixture".to_owned(),
+            declared_ms: 1,
+        });
+        let original = registry::read(&paths)
+            .expect("registry")
+            .volume(&uuid)
+            .expect("first record")
+            .clone();
+        let mut registry_locks =
+            LockSet::with_deadline(paths.clone(), Deadline::after(Duration::from_secs(1)));
+        let registry_lock = registry_locks.lock_registry().expect("registry lock");
+        crate::registry::RegistryWriter::new(&paths)
+            .publish(
+                &registry_lock,
+                &crate::registry::RegistryDocument::new(vec![original, other_record]),
+            )
+            .expect("two volumes");
+        drop(registry_lock);
+        drop(registry_locks);
+        let other_facts = FakeVolume {
+            root: other.root.clone(),
+            uuid: other_uuid.clone(),
+            device: other.device,
+            present: Cell::new(true),
+            shifted: Cell::new(false),
+            duplicate: Cell::new(false),
+        };
+        let other_result = crate::space::guard(
+            &paths,
+            &platform,
+            &other_facts,
+            &other.mounts(),
+            &FakeObserver::new(),
+            &Meter::new(&[4, 4]),
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &other_uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect_err("other volume below floor");
+        assert_eq!(other_result.kind(), ErrorKind::SpaceBelowFloor);
+        assert_eq!(other_result.detail()["decided_after_wait"], false);
+        crate::os::test_terminate(&mut child.0).expect("SIGTERM");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().expect("poll") {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "child exits within bound");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(crate::os::test_was_terminated(status));
+        let info: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(scratch.join("info.json")).expect("info"))
+                .expect("JSON");
+        let platform = crate::os::platform();
+        let paths = crate::state::StatePaths::resolve(
+            &platform,
+            Some(std::path::Path::new(info["state"].as_str().expect("state"))),
+        )
+        .expect("state");
+        let uuid = VolumeUuid::parse(info["uuid"].as_str().expect("uuid")).expect("UUID");
+        let facts = FakeVolume {
+            root: info["mount"].as_str().expect("mount").into(),
+            uuid: uuid.clone(),
+            device: crate::os::DeviceId::new(info["device"].as_u64().expect("device")),
+            present: Cell::new(true),
+            shifted: Cell::new(false),
+            duplicate: Cell::new(false),
+        };
+        let journal = state::read_intents(&paths, INTENT_ROWS).expect("journal");
+        assert_eq!(PendingIntent::pending(&journal.records).len(), 1);
+        assert_eq!(journal.records[0].phase, state::IntentPhase::Renamed);
+        let mut locks = LockSet::with_deadline(paths.clone(), Deadline::after(Duration::ZERO));
+        let volume_lock = locks
+            .lock_volume(&uuid)
+            .expect("volume lock released immediately");
+        let root_lock = locks
+            .lock_root(info["root_id"].as_str().expect("root id"))
+            .expect("root lock released immediately");
+        drop(root_lock);
+        drop(volume_lock);
+        drop(locks);
+        struct OrderedFlush<'a>(&'a Meter);
+        impl Flush for OrderedFlush<'_> {
+            fn flush_volume(&self, _: &VerifiedVolume, _: Instant) -> crate::error::Result<()> {
+                assert_eq!(
+                    self.0.calls(),
+                    1,
+                    "replay flush precedes authoritative measurement"
+                );
+                Ok(())
+            }
+        }
+        let meter = Meter::new(&[4, 20]);
+        let report = crate::space::guard(
+            &paths,
+            &platform,
+            &facts,
+            &facts,
+            &FakeObserver::new(),
+            &meter,
+            &OrderedFlush(&meter),
+            &crate::space::GuardRequest {
+                volume_uuid: &uuid,
+                namespace: "example",
+                area: "pool",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        )
+        .expect("guard replays and decides");
+        assert_eq!(report.decision, crate::space::SpaceDecision::Admit);
+        assert_eq!(meter.calls(), 2);
+        assert!(PendingIntent::pending(
+            &state::read_intents(&paths, INTENT_ROWS)
+                .expect("journal")
+                .records
+        )
+        .is_empty());
     }
 
     #[test]
@@ -4038,7 +5776,7 @@ mod tests {
             )
             .expect("this volume's pass runs");
         let effect = report.effect.as_ref().expect("the effect");
-        let replay = effect.replay.expect("the replay is reported");
+        let replay = effect.replay.as_ref().expect("the replay is reported");
         assert_eq!(
             replay.examined, 0,
             "another volume's intent is not this pass's"
@@ -4106,7 +5844,7 @@ mod tests {
             )
             .expect("the second run prunes the roots the intent does not cover");
         let effect = report.effect.as_ref().expect("the effect");
-        let replay = effect.replay.expect("the replay is reported");
+        let replay = effect.replay.as_ref().expect("the replay is reported");
         assert_eq!(
             replay.examined, 1,
             "the volume's one pending intent was replayed"
@@ -4218,7 +5956,7 @@ mod tests {
                 )
                 .expect("the pass runs");
             let effect = report.effect.as_ref().expect("the effect");
-            let replay = effect.replay.expect("the replay is reported");
+            let replay = effect.replay.as_ref().expect("the replay is reported");
             assert_eq!(replay.examined, 1);
             assert_eq!(replay.resumed, 0, "the replay must not resume a held unit");
             assert_eq!(replay.pending, 1, "the held intent stays pending");

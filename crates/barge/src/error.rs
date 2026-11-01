@@ -30,6 +30,8 @@ pub enum ErrorKind {
     RefusedContainment,
     /// The volume that holds the path is not attached.
     VolumeAbsent,
+    /// The floor is breached and no deletion occurred.
+    SpaceBelowFloor,
     /// A different volume is at the expected place.
     VolumeMismatch,
     /// A fact could not be read or did not validate; unknown is never a default.
@@ -54,6 +56,7 @@ impl ErrorKind {
             Self::RefusedBoundary => "refused_boundary",
             Self::RefusedContainment => "refused_containment",
             Self::VolumeAbsent => "volume_absent",
+            Self::SpaceBelowFloor => "space_below_floor",
             Self::VolumeMismatch => "volume_mismatch",
             Self::UnknownState => "unknown_state",
             Self::ForeignOwner => "foreign_owner",
@@ -74,6 +77,7 @@ impl ErrorKind {
             | Self::RefusedBoundary
             | Self::RefusedContainment
             | Self::VolumeAbsent
+            | Self::SpaceBelowFloor
             | Self::VolumeMismatch
             | Self::ForeignOwner
             | Self::CustodyNotProven
@@ -190,6 +194,40 @@ pub struct ErrorBody<'a> {
     pub detail: &'a BTreeMap<String, Value>,
 }
 
+/// Read an error envelope and refuse success schemas.
+pub fn read_document(bytes: &[u8]) -> Result<Error> {
+    let value = crate::contract::parse_document(bytes)?;
+    let invalid = || Error::new(ErrorKind::UnknownState, "invalid barge.error/1 document");
+    if value.get("schema").and_then(Value::as_str) != Some(ERROR_SCHEMA)
+        || value.get("ok").and_then(Value::as_bool) != Some(false)
+        || value.get("command").and_then(Value::as_str).is_none()
+    {
+        return Err(invalid());
+    }
+    let body = value
+        .get("error")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    let kind = serde_json::from_value(body.get("kind").ok_or_else(invalid)?.clone())
+        .map_err(|_| invalid())?;
+    let message = body
+        .get("message")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let detail = body
+        .get("detail")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    Ok(Error {
+        kind,
+        message: message.to_owned(),
+        detail: detail
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -204,6 +242,7 @@ mod tests {
             (ErrorKind::RefusedBoundary, "refused_boundary", 2),
             (ErrorKind::RefusedContainment, "refused_containment", 2),
             (ErrorKind::VolumeAbsent, "volume_absent", 2),
+            (ErrorKind::SpaceBelowFloor, "space_below_floor", 2),
             (ErrorKind::VolumeMismatch, "volume_mismatch", 2),
             (ErrorKind::UnknownState, "unknown_state", 3),
             (ErrorKind::ForeignOwner, "foreign_owner", 2),

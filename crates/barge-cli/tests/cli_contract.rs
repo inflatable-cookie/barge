@@ -130,6 +130,7 @@ fn describe_json_prints_one_document_and_creates_nothing() {
     assert_eq!(data["formats"]["registry"], "barge.registry/1");
     assert_eq!(data["formats"]["activity"], "barge.activity/1");
     assert_eq!(data["formats"]["space"], "barge.space/1");
+    assert_eq!(data["formats"]["space_guard"], "barge.space.guard/1");
     assert_eq!(data["formats"]["space_prune"], "barge.space.prune/1");
     assert_eq!(
         data["formats"]["space_prune_plan"],
@@ -2913,4 +2914,29 @@ fn space_prune_refuses_a_missing_plan_a_missing_digest_and_a_bad_volume() {
     );
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+}
+
+#[test]
+fn space_guard_and_recheck_refuse_malformed_arguments() {
+    let (_fixture, state) = absent_state_dir("guard-arguments");
+    for args in [
+        vec!["space", "guard", "--json"],
+        vec![
+            "space",
+            "guard",
+            "--volume",
+            "bad",
+            "--area",
+            "example/pool",
+            "--json",
+        ],
+        vec!["space", "recheck", "--guard", "bad", "--json"],
+    ] {
+        let output = run_in(&args, &state);
+        assert_eq!(output.status.code(), Some(2));
+        let document = stdout_document(&output);
+        assert_eq!(document["schema"], "barge.error/1");
+        assert_eq!(document["error"]["kind"], "usage");
+    }
+    assert!(!state.exists());
 }

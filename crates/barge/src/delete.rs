@@ -288,6 +288,18 @@ pub struct ReplayReport {
     /// replay resumed and completed, separate from prior completed deletions.
     #[serde(default)]
     pub resumed_root_ids: Vec<String>,
+    /// Roots whose final leaf was removed while settling replay.
+    #[serde(skip)]
+    pub completed_by_settlement_root_ids: Vec<String>,
+    /// Roots whose replay removed entries but remains pending.
+    #[serde(skip)]
+    pub partial_root_ids: Vec<String>,
+    /// Roots whose replay only settled or rolled back the journal.
+    #[serde(skip)]
+    pub settled_root_ids: Vec<String>,
+    /// Entries removed by partial replays.
+    #[serde(skip)]
+    pub partial_entries_removed: usize,
     /// The intents that stay pending, with their reasons.
     pub pending: Vec<PendingRow>,
     /// How many entries the resumed deletions removed.
@@ -2917,6 +2929,10 @@ fn replay_pending_scope(
         rolled_back: 0,
         resumed: 0,
         resumed_root_ids: Vec::new(),
+        completed_by_settlement_root_ids: Vec::new(),
+        partial_root_ids: Vec::new(),
+        settled_root_ids: Vec::new(),
+        partial_entries_removed: 0,
         pending: Vec::new(),
         entries_removed: 0,
         remounted: 0,
@@ -2974,8 +2990,26 @@ fn replay_pending_scope(
             bounds,
         ) {
             Ok(outcome) => match outcome {
-                ReplayOutcome::Settled => report.settled += 1,
-                ReplayOutcome::RolledBack => report.rolled_back += 1,
+                ReplayOutcome::Settled => {
+                    report.settled += 1;
+                    report.settled_root_ids.push(
+                        intent
+                            .unit
+                            .root_id
+                            .clone()
+                            .unwrap_or_else(|| intent.unit.name.clone()),
+                    );
+                }
+                ReplayOutcome::RolledBack => {
+                    report.rolled_back += 1;
+                    report.settled_root_ids.push(
+                        intent
+                            .unit
+                            .root_id
+                            .clone()
+                            .unwrap_or_else(|| intent.unit.name.clone()),
+                    );
+                }
                 ReplayOutcome::Resumed { entries, remounted } => {
                     report.resumed += 1;
                     report.resumed_root_ids.push(
@@ -2989,6 +3023,35 @@ fn replay_pending_scope(
                     if remounted {
                         report.remounted += 1;
                     }
+                }
+                ReplayOutcome::SettledWithRemoval { entries } => {
+                    report.settled += 1;
+                    report.completed_by_settlement_root_ids.push(
+                        intent
+                            .unit
+                            .root_id
+                            .clone()
+                            .unwrap_or_else(|| intent.unit.name.clone()),
+                    );
+                    report.entries_removed = report.entries_removed.saturating_add(entries);
+                }
+                ReplayOutcome::Partial { reason, entries } => {
+                    report.partial_root_ids.push(
+                        intent
+                            .unit
+                            .root_id
+                            .clone()
+                            .unwrap_or_else(|| intent.unit.name.clone()),
+                    );
+                    report.partial_entries_removed =
+                        report.partial_entries_removed.saturating_add(entries);
+                    report.pending.push(PendingRow {
+                        intent_id: intent.intent_id.clone(),
+                        unit_name: intent.unit.name.clone(),
+                        unit_kind: intent.unit.kind.as_str().to_owned(),
+                        phase: intent.phase,
+                        reason,
+                    });
                 }
                 ReplayOutcome::Pending(reason) => report.pending.push(PendingRow {
                     intent_id: intent.intent_id.clone(),
@@ -3044,6 +3107,10 @@ enum ReplayOutcome {
         /// recorded.
         remounted: bool,
     },
+    /// It settled after removing its final leaf.
+    SettledWithRemoval { entries: usize },
+    /// It stays pending after removing entries.
+    Partial { reason: String, entries: usize },
     /// It stays pending, with the reason.
     Pending(String),
 }
@@ -3706,6 +3773,16 @@ fn replay_one(
                         entries: report.entries_removed,
                         remounted,
                     },
+                    _ if report.entries_removed > 0 || report.directories_removed > 0 => {
+                        ReplayOutcome::Partial {
+                            reason: report
+                                .reason
+                                .unwrap_or_else(|| "the resumed deletion stopped".to_owned()),
+                            entries: report
+                                .entries_removed
+                                .saturating_add(report.directories_removed),
+                        }
+                    }
                     _ => ReplayOutcome::Pending(
                         report
                             .reason
@@ -3739,6 +3816,16 @@ fn replay_one(
                         entries: report.entries_removed,
                         remounted,
                     },
+                    _ if report.entries_removed > 0 || report.directories_removed > 0 => {
+                        ReplayOutcome::Partial {
+                            reason: report
+                                .reason
+                                .unwrap_or_else(|| "the resumed deletion stopped".to_owned()),
+                            entries: report
+                                .entries_removed
+                                .saturating_add(report.directories_removed),
+                        }
+                    }
                     _ => ReplayOutcome::Pending(
                         report
                             .reason
@@ -3816,19 +3903,59 @@ fn replay_one(
             // The leaf is captured and verified again here too: the visible
             // private name is never removed by name, so a replacement put there
             // cannot be deleted and recorded as a completion.
-            match walk.remove_leaf(&parent, intent, leaf_mode, &mut counts)? {
+            let removal = match walk.remove_leaf(&parent, intent, leaf_mode, &mut counts) {
+                Ok(removal) => removal,
+                Err(error) if counts.entries > 0 || counts.directories > 0 => {
+                    return Ok(ReplayOutcome::Partial {
+                        reason: error.to_string(),
+                        entries: counts.entries.saturating_add(counts.directories),
+                    })
+                }
+                Err(error) => return Err(error),
+            };
+            match removal {
                 Removal::Gone => {
                     // The replay's own final unlink is the durable completion
                     // evidence, recorded before the intent settles. Removing the leaf
                     // can itself be slow, so the clock is checked again here, at the
                     // journal boundary: a spent window records nothing.
-                    if let Some(outcome) = journal_clock_spent(bounds.deadline) {
-                        return Ok(outcome);
+                    if journal_clock_spent(bounds.deadline).is_some() {
+                        return Ok(ReplayOutcome::Partial {
+                            reason: WALL_CLOCK_REASON.to_owned(),
+                            entries: counts.entries.saturating_add(counts.directories),
+                        });
                     }
-                    let removed =
-                        state::advance_intent(&write, state_paths, intent, IntentPhase::Removed)?;
-                    state::advance_intent(&write, state_paths, &removed, IntentPhase::Deleted)?;
-                    Ok(ReplayOutcome::Settled)
+                    let removed = match state::advance_intent(
+                        &write,
+                        state_paths,
+                        intent,
+                        IntentPhase::Removed,
+                    ) {
+                        Ok(removed) => removed,
+                        Err(error) => {
+                            return Ok(ReplayOutcome::Partial {
+                                reason: error.to_string(),
+                                entries: counts.entries.saturating_add(counts.directories),
+                            })
+                        }
+                    };
+                    if let Err(error) =
+                        state::advance_intent(&write, state_paths, &removed, IntentPhase::Deleted)
+                    {
+                        return Ok(ReplayOutcome::Partial {
+                            reason: error.to_string(),
+                            entries: counts.entries.saturating_add(counts.directories),
+                        });
+                    }
+                    Ok(ReplayOutcome::SettledWithRemoval {
+                        entries: counts.entries.saturating_add(counts.directories),
+                    })
+                }
+                Removal::Stopped(reason) if counts.entries > 0 || counts.directories > 0 => {
+                    Ok(ReplayOutcome::Partial {
+                        reason,
+                        entries: counts.entries.saturating_add(counts.directories),
+                    })
                 }
                 Removal::Stopped(reason) => Ok(ReplayOutcome::Pending(reason)),
             }

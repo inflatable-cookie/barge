@@ -169,6 +169,9 @@ pub struct FormatVersions {
     /// `barge.space/<major>`.
     #[serde(default)]
     pub space: String,
+    /// `barge.space.guard/<major>`: the admission decision.
+    #[serde(default)]
+    pub space_guard: String,
     /// `barge.space.prune/<major>`: the space candidate plan and its preview.
     #[serde(default)]
     pub space_prune: String,
@@ -204,6 +207,7 @@ impl FormatVersions {
             activity: ACTIVITY_SCHEMA.to_owned(),
             intent: INTENT_SCHEMA.to_owned(),
             space: crate::space::SPACE_SCHEMA.to_owned(),
+            space_guard: crate::space::SPACE_GUARD_SCHEMA.to_owned(),
             space_prune: crate::space::SPACE_PRUNE_SCHEMA.to_owned(),
             space_prune_plan: crate::space::SPACE_PRUNE_PLAN_SCHEMA.to_owned(),
             prune_plan: PRUNE_PLAN_SCHEMA.to_owned(),
