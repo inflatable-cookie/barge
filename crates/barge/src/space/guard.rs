@@ -93,6 +93,33 @@ mod tests {
     }
 
     #[test]
+    fn guard_golden_document_unchanged() {
+        let golden = concat!(
+            r#"{"schema":"barge.space.guard/1","command":"space guard","ok":true,"data":{"decision":"admit","volume_uuid":"A6AC3ED7-0A5B-4E6D-8BA0-813B8DD4C99A","mount_hint":"/fixture","area":{"namespace":"oxide","area":"pool"},"#,
+            r#""before":{"free_bytes":30,"free_blocks_total_bytes":30,"total_bytes":100,"source":"fstatfs.f_bavail*bsize","purgeable":"unknown","observed_ms":1,"device":1},"#,
+            r#""after":{"free_bytes":30,"free_blocks_total_bytes":30,"total_bytes":100,"source":"fstatfs.f_bavail*bsize","purgeable":"unknown","observed_ms":1,"device":1},"#,
+            r#""policy":{"reserve_bytes":20,"floor_bytes":10,"declared_by":"operator","declared_ms":1},"#,
+            r#""pruned":{"rows":[],"count":0,"total":0,"truncated":false},"not_reached":{"rows":[],"count":0,"total":0,"truncated":false},"kept":{"rows":[],"count":0,"total":0,"truncated":false},"observed_kept":null,"reclaimed_bytes":0,"rounds":0,"decided_after_wait":false,"message":"ok","#,
+            r#""detail":{"cause":"unknown","excluded_bytes":null,"floor_bytes":10,"free_bytes":30,"held_or_unknown_bytes":null,"measurement_source":"fstatfs.f_bavail*bsize","observed_ms":1,"other_estimate_bytes":null,"other_estimate_label":"estimate","owned_prunable_bytes":null,"pruned_root_ids":[],"reclaimed_bytes":0,"replay_partial_root_ids":[],"replay_settled_root_ids":[],"replayed_root_ids":[],"reserve_bytes":20},"#,
+            r#""guard":"A6AC3ED7-0A5B-4E6D-8BA0-813B8DD4C99A:oxide/pool:1:1"}}"#,
+            "\n"
+        );
+        let report = read_guard_document(golden.as_bytes()).expect("golden reads");
+        let encoded = crate::contract::success_bytes(SPACE_GUARD_SCHEMA, "space guard", &report)
+            .expect("encode");
+        assert_eq!(encoded, golden.as_bytes());
+    }
+
+    #[test]
+    fn shared_core_is_only_live_effect_caller() {
+        let source = include_str!("guard.rs");
+        assert_eq!(
+            source.matches(concat!("effect::", "prune_live(")).count(),
+            1
+        );
+    }
+
+    #[test]
     fn checkpoint_token_round_trips_and_rejects_malformed_values() {
         let token = "A6AC3ED7-0A5B-4E6D-8BA0-813B8DD4C99A:oxide/pool:7:123";
         let guard = SpaceGuard::parse(token).unwrap();
@@ -454,16 +481,124 @@ pub(super) fn guard_with_bounds(
     space: &dyn SpaceFacts,
     flush: &dyn Flush,
     request: &GuardRequest<'_>,
-    mut bounds: SpacePruneBounds,
+    bounds: SpacePruneBounds,
 ) -> Result<GuardReport> {
-    if request.wall.is_zero() || request.wall > Duration::from_secs(120) {
+    let record = area::registered_volume(paths, request.volume_uuid)?;
+    let doc = area::show(paths, request.namespace, request.area)?
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "the area is not declared"))?;
+    area::resolve(
+        dirs,
+        facts,
+        mounts,
+        observer,
+        &record,
+        &doc.declaration(),
+        Some(&doc),
+    )?;
+    let result = decide_volume(
+        paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        space,
+        flush,
+        request.volume_uuid,
+        request.wall,
+        request.recheck,
+        bounds,
+    )?;
+    let token = SpaceGuard {
+        volume_uuid: request.volume_uuid.clone(),
+        namespace: request.namespace.to_owned(),
+        area: request.area.to_owned(),
+        generation: result.generation,
+        observed_ms: result.after.observed_ms,
+    }
+    .token();
+    Ok(GuardReport {
+        decision: result.decision,
+        volume_uuid: request.volume_uuid.clone(),
+        mount_hint: result.mount_hint,
+        area: GuardArea {
+            namespace: request.namespace.to_owned(),
+            area: request.area.to_owned(),
+        },
+        before: result.before,
+        after: result.after,
+        policy: result.policy,
+        pruned: result.pruned,
+        not_reached: result.not_reached,
+        kept: result.kept,
+        observed_kept: result.observed_kept,
+        reclaimed_bytes: result.reclaimed_bytes,
+        rounds: result.rounds,
+        decided_after_wait: result.decided_after_wait,
+        message: result.message,
+        detail: result.detail,
+        guard: token,
+    })
+}
+
+pub(super) fn registered_volume_with_budget(
+    paths: &StatePaths,
+    uuid: &VolumeUuid,
+    budget: Duration,
+) -> Result<crate::registry::VolumeRecord> {
+    let registry = crate::registry::read_with_deadline(
+        paths,
+        state::Deadline::after(budget.min(state::READ_DEADLINE)),
+    )?;
+    registry.volume(uuid).cloned().ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!("volume {uuid} is not registered"),
+        )
+    })
+}
+
+/// Volume-wide decision shared by consumer guards and maintenance.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VolumeDecision {
+    pub decision: SpaceDecision,
+    pub mount_hint: PathBuf,
+    pub before: SpaceMeasurement,
+    pub after: SpaceMeasurement,
+    pub policy: SpacePolicy,
+    pub pruned: RowSet<GuardPruned>,
+    pub not_reached: RowSet<GuardUnreached>,
+    pub kept: RowSet<GuardKept>,
+    pub observed_kept: Option<RowSet<GuardObservedKept>>,
+    pub reclaimed_bytes: u64,
+    pub rounds: usize,
+    pub decided_after_wait: bool,
+    pub message: String,
+    pub detail: serde_json::Value,
+    pub generation: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decide_volume(
+    paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn AbsenceVolume,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    space: &dyn SpaceFacts,
+    flush: &dyn Flush,
+    volume_uuid: &VolumeUuid,
+    wall: Duration,
+    recheck: bool,
+    mut bounds: SpacePruneBounds,
+) -> Result<VolumeDecision> {
+    if wall.is_zero() || wall > Duration::from_secs(120) {
         return Err(Error::new(
             ErrorKind::Usage,
             "guard wall must be greater than zero and at most 120 seconds",
         ));
     }
     let started = Instant::now();
-    let record = area::registered_volume(paths, request.volume_uuid)?;
+    let record = registered_volume_with_budget(paths, volume_uuid, wall)?;
     if !record.declared_durability()?.permits_pruning() {
         return Err(Error::new(
             ErrorKind::RefusedBoundary,
@@ -488,18 +623,15 @@ pub(super) fn guard_with_bounds(
                 error
             }
         })?;
-    let doc = area::show(paths, request.namespace, request.area)?
-        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "the area is not declared"))?;
-    area::resolve(
-        dirs,
-        facts,
-        mounts,
-        observer,
-        &record,
-        &doc.declaration(),
-        Some(&doc),
-    )?;
-    state::read_intents(paths, crate::contract::INTENT_ROWS).map_err(|error| {
+    state::read_intents_with_deadline(
+        paths,
+        crate::contract::INTENT_ROWS,
+        state::Deadline::after(
+            wall.saturating_sub(started.elapsed())
+                .min(state::READ_DEADLINE),
+        ),
+    )
+    .map_err(|error| {
         let mut unknown = Error::new(
             ErrorKind::UnknownState,
             format!("intent journal is unreadable: {error}"),
@@ -527,10 +659,10 @@ pub(super) fn guard_with_bounds(
     let mut replay_removed_entries = 0usize;
     let mut pass_lock = None;
     if before.free_bytes <= current_policy.reserve_bytes.max(current_policy.floor_bytes) {
-        let remaining = request.wall.saturating_sub(started.elapsed());
+        let remaining = wall.saturating_sub(started.elapsed());
         bounds.wall = remaining;
         let run = SpacePruneRunRequest {
-            volume_uuid: request.volume_uuid,
+            volume_uuid,
             plan_digest: "",
             plan_bytes: &[],
             now_ms: state::now_ms(),
@@ -591,7 +723,11 @@ pub(super) fn guard_with_bounds(
             }
             Err(error) if error.kind() == ErrorKind::Locked => {
                 after_wait = true;
-                let current = area::registered_volume(paths, request.volume_uuid)?;
+                let current = registered_volume_with_budget(
+                    paths,
+                    volume_uuid,
+                    wall.saturating_sub(started.elapsed()),
+                )?;
                 if !current.declared_durability()?.permits_pruning() {
                     return Err(Error::new(
                         ErrorKind::UnknownState,
@@ -607,7 +743,15 @@ pub(super) fn guard_with_bounds(
             Err(error) => return Err(error),
         }
     }
-    let intents = state::read_intents(paths, crate::contract::INTENT_ROWS).map_err(|error| {
+    let intents = state::read_intents_with_deadline(
+        paths,
+        crate::contract::INTENT_ROWS,
+        state::Deadline::after(
+            wall.saturating_sub(started.elapsed())
+                .min(state::READ_DEADLINE),
+        ),
+    )
+    .map_err(|error| {
         Error::new(
             ErrorKind::UnknownState,
             format!("intent journal is unreadable: {error}"),
@@ -629,7 +773,7 @@ pub(super) fn guard_with_bounds(
     let kept: Vec<GuardKept> = intents
         .records
         .iter()
-        .filter(|intent| intent.is_pending() && &intent.volume_uuid == request.volume_uuid)
+        .filter(|intent| intent.is_pending() && &intent.volume_uuid == volume_uuid)
         .map(|intent| GuardKept {
             root_id: intent
                 .unit
@@ -641,7 +785,7 @@ pub(super) fn guard_with_bounds(
         })
         .collect();
     let attribution = if let Some(lock) = pass_lock.as_ref() {
-        let remaining = request.wall.saturating_sub(started.elapsed());
+        let remaining = wall.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             None
         } else {
@@ -652,7 +796,7 @@ pub(super) fn guard_with_bounds(
                     facts,
                     mounts,
                     observer,
-                    request.volume_uuid,
+                    volume_uuid,
                     state::now_ms(),
                     remaining,
                     after.clone(),
@@ -713,14 +857,14 @@ pub(super) fn guard_with_bounds(
     let ids: Vec<&str> = rows.iter().map(|row| row.root_id.as_str()).collect();
     let message = format!(
         "volume {} at {}: {} bytes free, floor {} bytes, reserve {} bytes; cause: {} (other bytes are an estimate). No work was sent to the internal drive.",
-        request.volume_uuid,
+        volume_uuid,
         mount.display(),
         after.free_bytes,
         current_policy.floor_bytes,
         current_policy.reserve_bytes,
         cause
     );
-    let detail = serde_json::json!({"free_bytes":after.free_bytes,"floor_bytes":current_policy.floor_bytes,"reserve_bytes":current_policy.reserve_bytes,"pruned_root_ids":ids,"replayed_root_ids":replayed_root_ids,"replay_partial_root_ids":replay_partial_root_ids,"replay_settled_root_ids":replay_settled_root_ids,"pending_intents":kept,"observed_kept":observed_kept,"not_reached":not_reached,"plan_truncated":plan_truncated,"plan_unreached":plan_unreached,"reclaimed_bytes":reclaimed,"owned_prunable_bytes":prunable,"held_or_unknown_bytes":held,"excluded_bytes":excluded,"other_estimate_bytes":other,"other_estimate_label":"estimate","cause":cause,"measurement_source":after.source,"observed_ms":after.observed_ms,"decided_after_wait":after_wait,"waited_lock":if after_wait { Some(paths.volume_lock_path(request.volume_uuid).display().to_string()) } else { None },"stop":stop});
+    let detail = serde_json::json!({"free_bytes":after.free_bytes,"floor_bytes":current_policy.floor_bytes,"reserve_bytes":current_policy.reserve_bytes,"pruned_root_ids":ids,"replayed_root_ids":replayed_root_ids,"replay_partial_root_ids":replay_partial_root_ids,"replay_settled_root_ids":replay_settled_root_ids,"pending_intents":kept,"observed_kept":observed_kept,"not_reached":not_reached,"plan_truncated":plan_truncated,"plan_unreached":plan_unreached,"reclaimed_bytes":reclaimed,"owned_prunable_bytes":prunable,"held_or_unknown_bytes":held,"excluded_bytes":excluded,"other_estimate_bytes":other,"other_estimate_label":"estimate","cause":cause,"measurement_source":after.source,"observed_ms":after.observed_ms,"decided_after_wait":after_wait,"waited_lock":if after_wait { Some(paths.volume_lock_path(volume_uuid).display().to_string()) } else { None },"stop":stop});
     let decision = if after.free_bytes <= current_policy.floor_bytes {
         if rows.is_empty() && !replay_had_effect {
             let mut error = Error::new(ErrorKind::SpaceBelowFloor, message);
@@ -732,30 +876,17 @@ pub(super) fn guard_with_bounds(
             return Err(error);
         }
         SpaceDecision::StopBelowFloor
-    } else if request.recheck {
+    } else if recheck {
         SpaceDecision::Continue
     } else if after.free_bytes <= current_policy.reserve_bytes {
         SpaceDecision::AdmitBelowReserve
     } else {
         SpaceDecision::Admit
     };
-    let token = SpaceGuard {
-        volume_uuid: request.volume_uuid.clone(),
-        namespace: request.namespace.to_owned(),
-        area: request.area.to_owned(),
-        generation,
-        observed_ms: after.observed_ms,
-    }
-    .token();
     let total = rows.len();
-    let report = GuardReport {
+    let report = VolumeDecision {
         decision,
-        volume_uuid: request.volume_uuid.clone(),
         mount_hint: mount,
-        area: GuardArea {
-            namespace: request.namespace.to_owned(),
-            area: request.area.to_owned(),
-        },
         before,
         after,
         policy: current_policy,
@@ -768,7 +899,7 @@ pub(super) fn guard_with_bounds(
         decided_after_wait: after_wait,
         message,
         detail,
-        guard: token,
+        generation,
     };
     drop(pass_lock);
     Ok(report)

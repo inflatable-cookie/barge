@@ -1263,6 +1263,47 @@ fn a_scratch_conclude_without_its_five_facts_is_a_usage_refusal() {
 }
 
 #[test]
+fn maintain_space_flag_keeps_the_empty_plan_bytes() {
+    let (fixture, state_dir) = absent_state_dir("maintain-space-option");
+    let plain_file = fixture.join("plain.json");
+    let space_file = fixture.join("space.json");
+    let plain = run_in(
+        &[
+            "maintain",
+            "--json",
+            "--plan-out",
+            plain_file.to_str().unwrap(),
+        ],
+        &state_dir,
+    );
+    let opted = run_in(
+        &[
+            "maintain",
+            "--space",
+            "--json",
+            "--plan-out",
+            space_file.to_str().unwrap(),
+        ],
+        &state_dir,
+    );
+    assert_eq!(plain.status.code(), Some(0));
+    assert_eq!(opted.status.code(), Some(0));
+    let plain_doc = stdout_document(&plain);
+    let opted_doc = stdout_document(&opted);
+    assert_eq!(plain_doc["data"]["space_stage"], "disabled");
+    assert!(plain_doc["data"].get("space_triggered").is_none());
+    assert_eq!(opted_doc["data"]["space_triggered"], 0);
+    assert_eq!(
+        plain_doc["data"]["plan_digest"],
+        opted_doc["data"]["plan_digest"]
+    );
+    assert_eq!(
+        std::fs::read(plain_file).unwrap(),
+        std::fs::read(space_file).unwrap()
+    );
+}
+
+#[test]
 fn maintain_previews_one_bounded_plan_and_writes_only_the_file_it_was_given() {
     let (fixture, state_dir) = absent_state_dir("maintain-preview");
     let plan_out = fixture.join("plan.json");

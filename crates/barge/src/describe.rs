@@ -157,6 +157,9 @@ pub struct DescribeData {
     /// Per-volume space measurements and declared policies.
     #[serde(default)]
     pub space: RowSet<crate::space::SpaceRow>,
+    /// Report-only fallback observations, absent in older documents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_roots: Option<RowSet<crate::space::FallbackRoot>>,
     /// Foreign observations, bounded to the observation row cap.
     pub observations: RowSet<ObservationRow>,
     /// Identity facts used across a remount.
@@ -547,6 +550,12 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
         placements,
         roots,
         space,
+        fallback_roots: Some(crate::space::fallback_roots(
+            &paths,
+            request.facts,
+            request.mounts,
+            registry.volumes(),
+        )?),
         observations: RowSet::bounded(observation_rows, observation_total, OBSERVATION_ROWS),
         custody: crate::custody::capability_report(),
         identity: IdentityCapability::default(),
@@ -1968,14 +1977,14 @@ mod tests {
             uuid,
             device,
         };
+        let fallback = fixture.dir.join("fallback");
+        std::fs::create_dir(&fallback).expect("fallback fixture");
         let declaration = crate::area::AreaDeclaration {
             namespace: "example".to_owned(),
             area: "pool".to_owned(),
             folder: "example/pool".to_owned(),
             overrides: std::collections::BTreeMap::new(),
-            absent: crate::area::AbsentPolicy::Fail {
-                attach: "the build volume".to_owned(),
-            },
+            absent: crate::area::AbsentPolicy::FallbackLocal { path: fallback },
             prune: crate::area::PrunePolicy::None,
             reserve: crate::area::ReserveParticipation::Counts,
         };
@@ -2025,6 +2034,10 @@ mod tests {
             })
         );
         assert_eq!(data.areas.count, 1, "the declared area is reported");
+        assert_eq!(
+            data.fallback_roots.as_ref().unwrap().rows[0].reason,
+            "fallback_while_present"
+        );
         assert_eq!(data.roots.count, 1, "the owned root is reported");
         let row = &data.roots.rows[0];
         assert_eq!(row.state, crate::area::MarkerStateName::Owned);
@@ -2122,10 +2135,15 @@ mod tests {
             .as_object_mut()
             .expect("the data is an object");
         data_object.remove("roots");
+        data_object.remove("fallback_roots");
         let mut without = serde_json::to_vec(&value).expect("the document encodes");
         without.push(b'\n');
         let read = read_describe_document(&without).expect("an older document reads");
         assert_eq!(read.roots.count, 0, "a missing optional list is empty");
+        assert!(
+            read.fallback_roots.is_none(),
+            "older fallback reporting is optional"
+        );
 
         // The same holds for the custody object a later S5 document adds.
         let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("the document");

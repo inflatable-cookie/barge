@@ -3,6 +3,7 @@
 
 mod effect;
 mod guard;
+pub(crate) use guard::decide_volume;
 
 pub use guard::{
     guard, read_guard_document, recheck, GuardArea, GuardKept, GuardObservedKept, GuardPruned,
@@ -68,6 +69,83 @@ pub struct SpaceReport {
     pub observed_ms: u64,
     /// Registered volumes, bounded by the registry limit.
     pub volumes: RowSet<SpaceRow>,
+    /// Observed fallback roots, or absent in older documents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_roots: Option<RowSet<FallbackRoot>>,
+}
+
+/// A report-only observation of a declared fallback path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FallbackRoot {
+    pub volume_uuid: VolumeUuid,
+    pub namespace: String,
+    pub area: String,
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+/// Observe fallbacks without following links or creating paths.
+pub(crate) fn fallback_roots(
+    paths: &StatePaths,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    records: &[VolumeRecord],
+) -> Result<RowSet<FallbackRoot>> {
+    fallback_roots_with_bounds(paths, facts, mounts, records, ROOT_ROWS, READ_DEADLINE)
+}
+
+fn fallback_roots_with_bounds(
+    paths: &StatePaths,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    records: &[VolumeRecord],
+    limit: usize,
+    wall: Duration,
+) -> Result<RowSet<FallbackRoot>> {
+    let declarations = area::read_declarations(paths)?;
+    let deadline = Instant::now() + wall;
+    let mut rows = Vec::new();
+    let mut total = 0usize;
+    for record in records {
+        for declaration in &declarations.documents {
+            let area::AbsentPolicy::FallbackLocal { path } = &declaration.absent else {
+                continue;
+            };
+            if Instant::now() >= deadline || total >= limit {
+                return Ok(RowSet::bounded(rows, total.saturating_add(1), limit));
+            }
+            let observation = match std::fs::symlink_metadata(path) {
+                Ok(metadata) => metadata.is_dir() && !metadata.file_type().is_symlink(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => false,
+            };
+            let reason = if !observation {
+                "unknown"
+            } else if let Some(mount) = &record.mount_hint {
+                match os::verify_volume(facts, mounts, mount, &record.expected_volume()) {
+                    Ok(_) => "fallback_while_present",
+                    Err(error) if error.kind() == ErrorKind::VolumeAbsent => "volume_absent",
+                    Err(_) => "unknown",
+                }
+            } else {
+                "unknown"
+            };
+            total += 1;
+            rows.push(FallbackRoot {
+                volume_uuid: record.volume_uuid.clone(),
+                namespace: declaration.namespace.clone(),
+                area: declaration.area.clone(),
+                path: path.clone(),
+                reason: reason.to_owned(),
+            });
+        }
+    }
+    if declarations.truncated && !records.is_empty() {
+        // The unexamined declarations may include fallbacks; never report a
+        // complete empty observation when their contents are unknown.
+        return Ok(RowSet::bounded(rows, total.saturating_add(1), total));
+    }
+    Ok(RowSet::bounded(rows, total, limit))
 }
 
 /// A registered volume and its present measurement.
@@ -226,6 +304,7 @@ pub fn report(
     Ok(SpaceReport {
         observed_ms: state::now_ms(),
         volumes: RowSet::bounded(rows, total, VOLUME_ROWS),
+        fallback_roots: Some(fallback_roots(paths, facts, mounts, registry.volumes())?),
     })
 }
 
@@ -2875,6 +2954,119 @@ mod tests {
             },
         )
         .expect("the scratch root is concluded");
+    }
+
+    #[test]
+    fn fallback_report_observation_and_bounds() {
+        let fixture = VolumeFixture::under_scratch("fallback-report");
+        policy_record(&fixture, 16, 4);
+        let path = fixture.dir.join("local-fallback");
+        std::fs::create_dir(&path).expect("fixture fallback");
+        let mut declaration = declaration("pool", "example/pool", ReserveParticipation::Counts);
+        declaration.absent = area::AbsentPolicy::FallbackLocal { path: path.clone() };
+        area::declare(&fixture.state, &declaration, 1).expect("declare");
+        let facts = fixture.facts();
+        let bounded = fallback_roots_with_bounds(
+            &fixture.state,
+            &facts,
+            &fixture.mounts(),
+            std::slice::from_ref(&fixture.record),
+            0,
+            READ_DEADLINE,
+        )
+        .expect("bounded");
+        assert!(bounded.truncated);
+        assert_eq!(bounded.count, 0);
+        let present =
+            report(&fixture.state, &facts, &fixture.mounts(), &Injected(true)).expect("present");
+        assert_eq!(
+            present.fallback_roots.unwrap().rows[0].reason,
+            "fallback_while_present"
+        );
+        facts.present.set(false);
+        let absent =
+            report(&fixture.state, &facts, &fixture.mounts(), &Injected(true)).expect("absent");
+        assert_eq!(
+            absent.fallback_roots.unwrap().rows[0].reason,
+            "volume_absent"
+        );
+        let blocked = fixture.dir.join("blocked");
+        std::fs::create_dir(&blocked).expect("blocked parent");
+        let inaccessible = blocked.join("fallback");
+        std::fs::create_dir(&inaccessible).expect("blocked fallback");
+        let mut changed = declaration.clone();
+        changed.absent = area::AbsentPolicy::FallbackLocal { path: inaccessible };
+        area::declare(&fixture.state, &changed, 2).expect("update declaration");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000))
+            .expect("close parent");
+        let unknown = report(&fixture.state, &facts, &fixture.mounts(), &Injected(true))
+            .expect("unknown fallback");
+        assert_eq!(unknown.fallback_roots.unwrap().rows[0].reason, "unknown");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700))
+            .expect("restore fixture permissions");
+        area::declare(&fixture.state, &declaration, 3).expect("restore declaration");
+        std::fs::remove_dir(path).expect("remove fixture fallback");
+        let missing =
+            report(&fixture.state, &facts, &fixture.mounts(), &Injected(true)).expect("missing");
+        assert_eq!(missing.fallback_roots.unwrap().count, 0);
+    }
+
+    #[test]
+    fn maintain_scratch_only_uses_shared_core() {
+        let fixture = VolumeFixture::under_scratch("maintain-space-scratch");
+        policy_record(&fixture, 16, 4);
+        let observer = fixture.observer();
+        let root = alloc_scratch(&fixture, &observer, "proj");
+        VolumeFixture::payload(&root.path, "payload.bin", &[3u8; 8192]);
+        conclude_scratch(&fixture, &observer, "proj", &root.root_id);
+        area::release(&fixture.state, &observer, &root.root_id, "prover").expect("release");
+        let request = crate::prune::MaintainRequest {
+            preview: true,
+            plan_digest: None,
+            plan_bytes: None,
+            sweep_bounds: scratch::SweepBounds::default(),
+            delete_bounds: crate::delete::DeleteBounds::default(),
+            maintain_bounds: crate::prune::MaintainBounds::design(),
+            now_ms: test_now(),
+        };
+        let preview = crate::prune::maintain_with_space(
+            &fixture.state,
+            &fixture.platform(),
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &Injected(true),
+            &InjectedFlush(true),
+            &request,
+            true,
+        )
+        .expect("preview");
+        assert_eq!(preview.space_triggered, Some(1));
+        let bytes = crate::prune::canonical_plan_bytes(&preview.plan).unwrap();
+        let real_request = crate::prune::MaintainRequest {
+            preview: false,
+            plan_digest: Some(&preview.plan_digest),
+            plan_bytes: Some(&bytes),
+            ..request
+        };
+        let result = crate::prune::maintain_with_space(
+            &fixture.state,
+            &fixture.platform(),
+            &fixture.facts(),
+            &fixture.mounts(),
+            &observer,
+            &Injected(true),
+            &InjectedFlush(true),
+            &real_request,
+            true,
+        )
+        .expect("real");
+        assert!(!root.path.exists());
+        assert_eq!(
+            result.space_rows.unwrap().rows[0]["pruned_root_ids"][0],
+            root.root_id
+        );
     }
 
     #[test]

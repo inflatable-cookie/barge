@@ -548,12 +548,13 @@ impl Registry {
 /// The caller takes the registry lock first — shared to observe, exclusive to
 /// change — because this function reads bytes and nothing else.
 pub fn read(state: &StatePaths) -> Result<Registry> {
+    read_with_deadline(state, Deadline::after(READ_DEADLINE))
+}
+
+/// Read the registry within a caller's remaining operation budget.
+pub(crate) fn read_with_deadline(state: &StatePaths, deadline: Deadline) -> Result<Registry> {
     let path = state.registry_path();
-    let bounds = Bounds::new(
-        REGISTRY_SIZE_CAP_BYTES,
-        REGISTRY_VOLUME_ROWS,
-        Deadline::after(READ_DEADLINE),
-    );
+    let bounds = Bounds::new(REGISTRY_SIZE_CAP_BYTES, REGISTRY_VOLUME_ROWS, deadline);
     let bytes = match state::read_bounded(&path, &bounds) {
         ReadOutcome::Absent => return Ok(Registry::Absent),
         ReadOutcome::Present(bytes) => bytes,

@@ -71,7 +71,7 @@ use crate::os::{
 };
 use crate::registry::{self, SpacePolicy, VolumeRecord};
 use crate::scratch;
-use crate::state::{self, LockSet, StatePaths};
+use crate::state::{self, Deadline, LockSet, StatePaths};
 use crate::unit::{self, DeletionUnit, MarkerFamily, UnitGrant, UnitKind, UnitMarker};
 
 /// One real prune pass's wall clock (design, "Bounded resources": the operator's
@@ -476,7 +476,11 @@ pub(super) fn prune_live(
     // Pre-flight, effect-free: the volume must be registered, its durability must
     // permit pruning and its declared policy must exist. A refusal here changes
     // nothing, so it is an ordinary refusal document.
-    let record = area::registered_volume(paths, request.volume_uuid)?;
+    let record = super::guard::registered_volume_with_budget(
+        paths,
+        request.volume_uuid,
+        deadline.saturating_duration_since(Instant::now()),
+    )?;
     let durability = record.declared_durability()?;
     if !durability.permits_pruning() {
         // The failure matrix's durability row: a volume that may not be pruned is
@@ -536,7 +540,11 @@ pub(super) fn prune_live(
     })?;
     // Registration takes this volume lock too. The preflight record may have
     // become stale while we waited, so no replay may use its pruning authority.
-    let current = area::registered_volume(paths, request.volume_uuid)?;
+    let current = super::guard::registered_volume_with_budget(
+        paths,
+        request.volume_uuid,
+        deadline.saturating_duration_since(Instant::now()),
+    )?;
     let durability = current.declared_durability()?;
     if !durability.permits_pruning() {
         return Err(Error::new(
@@ -1018,7 +1026,7 @@ impl Pass<'_> {
     /// different. An unreadable or invalid registry, an undeclared durability and a
     /// durability that became `kept` are the only things that stop the pass here.
     fn refresh_policy(&mut self) -> Result<bool> {
-        let registry = registry::read(self.paths).map_err(|error| {
+        let registry = registry::read_with_deadline(self.paths, Deadline::after(self.wall_deadline.saturating_duration_since(Instant::now()).min(state::READ_DEADLINE))).map_err(|error| {
             Error::new(
                 ErrorKind::UnknownState,
                 format!(
@@ -1145,7 +1153,7 @@ impl Pass<'_> {
         // quarantine leaf, and the operator needs to know a replay owes it. A
         // pending intent over another path is a different object's business (ruling
         // `698d9ba3`) and reaches no other candidate.
-        let pending = state::read_intents(self.paths, INTENT_ROWS).map_err(|error| {
+        let pending = state::read_intents_with_deadline(self.paths, INTENT_ROWS, Deadline::after(self.wall_deadline.saturating_duration_since(Instant::now()).min(state::READ_DEADLINE))).map_err(|error| {
             Outcome::Stop(
                 Error::new(
                     ErrorKind::UnknownState,
@@ -1566,7 +1574,12 @@ fn reverify_candidate(
     // read as "renamed or absent" and hide the fact an operator needs: a replay owes
     // this object. A pending intent over another path is a different object's
     // business and never reaches this candidate (ruling `698d9ba3`).
-    let intents = state::read_intents(paths, INTENT_ROWS).map_err(|error| {
+    let intents = state::read_intents_with_deadline(
+        paths,
+        INTENT_ROWS,
+        Deadline::after(wall.min(state::READ_DEADLINE)),
+    )
+    .map_err(|error| {
         Skip::new(
             "pending_intent",
             format!("the intent journal could not be read, so the root is kept: {error}"),
@@ -3393,6 +3406,330 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn maintain_space_disabled_preview_and_real() {
+        let harness = Harness::new("maintain-space-disabled", RESERVE, FLOOR);
+        let meter = Meter::new(&[1]);
+        let flusher = Flusher::ok();
+        let request = crate::prune::MaintainRequest {
+            preview: true,
+            plan_digest: None,
+            plan_bytes: None,
+            sweep_bounds: crate::scratch::SweepBounds::default(),
+            delete_bounds: DeleteBounds::default(),
+            maintain_bounds: crate::prune::MaintainBounds::design(),
+            now_ms: harness.now_ms,
+        };
+        let preview = crate::prune::maintain_with_space(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &meter,
+            &flusher,
+            &request,
+            false,
+        )
+        .expect("preview");
+        assert_eq!(preview.space_stage, "disabled");
+        assert!(preview.space_triggered.is_none());
+        let bytes = crate::prune::canonical_plan_bytes(&preview.plan).expect("plan");
+        let real_request = crate::prune::MaintainRequest {
+            preview: false,
+            plan_digest: Some(&preview.plan_digest),
+            plan_bytes: Some(&bytes),
+            ..request
+        };
+        let real = crate::prune::maintain_with_space(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &meter,
+            &flusher,
+            &real_request,
+            false,
+        )
+        .expect("real");
+        assert_eq!(real.space_stage, "disabled");
+        assert_eq!(meter.calls(), 0);
+        assert_eq!(flusher.calls(), 0);
+    }
+
+    #[test]
+    fn maintain_space_preview_and_trigger() {
+        let harness = Harness::new("maintain-space-preview", RESERVE, FLOOR);
+        let request = crate::prune::MaintainRequest {
+            preview: true,
+            plan_digest: None,
+            plan_bytes: None,
+            sweep_bounds: crate::scratch::SweepBounds::default(),
+            delete_bounds: DeleteBounds::default(),
+            maintain_bounds: crate::prune::MaintainBounds::design(),
+            now_ms: harness.now_ms,
+        };
+        let run = |enabled| {
+            crate::prune::maintain_with_space(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &Meter::new(&[8]),
+                &Flusher::ok(),
+                &request,
+                enabled,
+            )
+            .expect("preview")
+        };
+        let disabled = run(false);
+        let enabled = run(true);
+        assert_eq!(disabled.plan_digest, enabled.plan_digest);
+        assert_eq!(
+            crate::prune::canonical_plan_bytes(&disabled.plan).unwrap(),
+            crate::prune::canonical_plan_bytes(&enabled.plan).unwrap()
+        );
+        assert_eq!(enabled.candidates, 0);
+        assert_eq!(enabled.space_triggered, Some(1));
+        assert!(disabled.space_triggered.is_none());
+    }
+
+    #[test]
+    fn maintain_space_decision_table() {
+        for (free, expected) in [
+            (30, "admit"),
+            (8, "admit_below_reserve"),
+            (1, "space_below_floor"),
+        ] {
+            let harness = Harness::new("maintain-space-decision", RESERVE, FLOOR);
+            let request = crate::prune::MaintainRequest {
+                preview: true,
+                plan_digest: None,
+                plan_bytes: None,
+                sweep_bounds: crate::scratch::SweepBounds::default(),
+                delete_bounds: DeleteBounds::default(),
+                maintain_bounds: crate::prune::MaintainBounds::design(),
+                now_ms: harness.now_ms,
+            };
+            let preview = crate::prune::maintain_with_space(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &Meter::new(&[free]),
+                &Flusher::ok(),
+                &request,
+                true,
+            )
+            .expect("preview");
+            let bytes = crate::prune::canonical_plan_bytes(&preview.plan).unwrap();
+            let real = crate::prune::MaintainRequest {
+                preview: false,
+                plan_digest: Some(&preview.plan_digest),
+                plan_bytes: Some(&bytes),
+                ..request
+            };
+            let report = crate::prune::maintain_with_space(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &Meter::new(&[free]),
+                &Flusher::ok(),
+                &real,
+                true,
+            )
+            .expect("real");
+            assert_eq!(report.space_rows.unwrap().rows[0]["decision"], expected);
+        }
+    }
+
+    #[test]
+    fn maintain_space_remaining_budget() {
+        let harness = Harness::new("maintain-space-deadline", RESERVE, FLOOR);
+        let meter = Meter::new(&[8]);
+        let request = crate::prune::MaintainRequest {
+            preview: true,
+            plan_digest: None,
+            plan_bytes: None,
+            sweep_bounds: crate::scratch::SweepBounds::default(),
+            delete_bounds: DeleteBounds::default(),
+            maintain_bounds: crate::prune::MaintainBounds {
+                wall: Duration::ZERO,
+                stop_margin: Duration::ZERO,
+            },
+            now_ms: harness.now_ms,
+        };
+        let report = crate::prune::maintain_with_space(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &meter,
+            &Flusher::ok(),
+            &request,
+            true,
+        )
+        .expect("preview");
+        assert!(report.timed_out);
+        assert_eq!(meter.calls(), 0);
+    }
+
+    #[test]
+    fn maintain_space_excludes_kept_and_undeclared() {
+        for kept in [false, true] {
+            let fixture = VolumeFixture::under_scratch("maintain-space-policy");
+            let mut record = fixture.record.clone();
+            if kept {
+                record.durability = Durability::Kept;
+                record.space = Some(SpacePolicy {
+                    reserve_bytes: RESERVE,
+                    floor_bytes: FLOOR,
+                    declared_by: "fixture".to_owned(),
+                    declared_ms: 1,
+                });
+            }
+            fixture.register_record(&record);
+            let meter = Meter::new(&[1]);
+            let request = crate::prune::MaintainRequest {
+                preview: true,
+                plan_digest: None,
+                plan_bytes: None,
+                sweep_bounds: crate::scratch::SweepBounds::default(),
+                delete_bounds: DeleteBounds::default(),
+                maintain_bounds: crate::prune::MaintainBounds::design(),
+                now_ms: state::now_ms(),
+            };
+            let report = crate::prune::maintain_with_space(
+                &fixture.state,
+                &fixture.platform(),
+                &fixture.facts(),
+                &fixture.mounts(),
+                &fixture.observer(),
+                &meter,
+                &Flusher::ok(),
+                &request,
+                true,
+            )
+            .expect("preview");
+            assert_eq!(report.space_triggered, Some(0));
+            assert_eq!(meter.calls(), 0);
+            assert_eq!(
+                report.space_rows.unwrap().rows[0]["decision"],
+                if kept {
+                    "skipped_kept"
+                } else {
+                    "space_undeclared"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn future_host_job_space_trigger_runs_once() {
+        let harness = Harness::new("future-host-space", RESERVE, FLOOR);
+        let request = crate::prune::MaintainRequest {
+            preview: true,
+            plan_digest: None,
+            plan_bytes: None,
+            sweep_bounds: crate::scratch::SweepBounds::default(),
+            delete_bounds: DeleteBounds::default(),
+            maintain_bounds: crate::prune::MaintainBounds::design(),
+            now_ms: harness.now_ms,
+        };
+        let preview = crate::prune::maintain_with_space(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[8]),
+            &Flusher::ok(),
+            &request,
+            true,
+        )
+        .expect("preview");
+        let bytes = crate::prune::canonical_plan_bytes(&preview.plan).expect("plan");
+        let mut calls = 0;
+        if preview.candidates > 0 || preview.space_triggered.unwrap_or(0) > 0 {
+            calls += 1;
+            let real = crate::prune::MaintainRequest {
+                preview: false,
+                plan_digest: Some(&preview.plan_digest),
+                plan_bytes: Some(&bytes),
+                ..request
+            };
+            crate::prune::maintain_with_space(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &Meter::new(&[30]),
+                &Flusher::ok(),
+                &real,
+                true,
+            )
+            .expect("real");
+        }
+        assert_eq!(calls, 1);
+        let no_work = crate::prune::MaintainRequest {
+            preview: true,
+            plan_digest: None,
+            plan_bytes: None,
+            sweep_bounds: crate::scratch::SweepBounds::default(),
+            delete_bounds: DeleteBounds::default(),
+            maintain_bounds: crate::prune::MaintainBounds::design(),
+            now_ms: harness.now_ms,
+        };
+        let preview = crate::prune::maintain_with_space(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[30]),
+            &Flusher::ok(),
+            &no_work,
+            true,
+        )
+        .expect("preview without pressure");
+        let mut no_work_calls = 0;
+        if preview.candidates > 0 || preview.space_triggered.unwrap_or(0) > 0 {
+            no_work_calls += 1;
+        }
+        assert_eq!(no_work_calls, 0);
+    }
+
+    #[test]
+    fn guard_undeclared_area_never_enters_core() {
+        let harness = Harness::new("guard-missing-area", RESERVE, FLOOR);
+        let meter = Meter::new(&[8]);
+        let result = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &meter,
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "missing",
+                area: "missing",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::UnknownState);
+        assert_eq!(meter.calls(), 0);
     }
 
     #[test]

@@ -380,6 +380,19 @@ pub struct MaintainReport {
     pub pending: RowSet<PendingRow>,
     /// The stages the wall clock stopped before.
     pub unreached: RowSet<UnreachedRow>,
+    /// Whether the optional space stage ran.
+    #[serde(default = "disabled_space_stage")]
+    pub space_stage: String,
+    /// Per-volume space previews or decisions, outside the canonical plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_rows: Option<RowSet<serde_json::Value>>,
+    /// Number of volumes whose preview crossed its declared trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_triggered: Option<usize>,
+}
+
+fn disabled_space_stage() -> String {
+    "disabled".to_owned()
 }
 
 impl MaintainReport {
@@ -500,6 +513,9 @@ pub fn maintain(
             // replays it.
             pending: preview_pending(state_paths)?,
             unreached: RowSet::empty(),
+            space_stage: disabled_space_stage(),
+            space_rows: None,
+            space_triggered: None,
         });
     }
 
@@ -574,11 +590,236 @@ pub fn maintain(
     )
 }
 
+/// Run maintenance with an optional, non-persisted space stage.
+#[allow(clippy::too_many_arguments)]
+pub fn maintain_with_space(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn AbsenceVolume,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    space: &dyn crate::os::SpaceFacts,
+    flush: &dyn crate::os::Flush,
+    request: &MaintainRequest<'_>,
+    enabled: bool,
+) -> Result<MaintainReport> {
+    let started = Instant::now();
+    let deadline = request.maintain_bounds.deadline(started);
+    let mut report = maintain(state_paths, dirs, facts, mounts, observer, request)?;
+    if !enabled {
+        return Ok(report);
+    }
+    report.space_stage = "enabled".to_owned();
+    if report.timed_out || report.stopped.is_some() {
+        let rows: Vec<_> = report
+            .plan
+            .volumes
+            .rows
+            .iter()
+            .map(|v| space_empty_row(&v.volume_uuid, "unknown_state"))
+            .collect();
+        let total = rows.len();
+        report.space_rows = Some(RowSet::bounded(rows, total, VOLUME_ROWS));
+        return Ok(report);
+    }
+    let mut rows = Vec::new();
+    let mut triggered = 0;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        report.timed_out = true;
+        let rows: Vec<_> = report
+            .plan
+            .volumes
+            .rows
+            .iter()
+            .map(|v| space_empty_row(&v.volume_uuid, "unknown_state"))
+            .collect();
+        let total = rows.len();
+        report.space_rows = Some(RowSet::bounded(rows, total, VOLUME_ROWS));
+        return Ok(report);
+    }
+    let records = match read_registry_with_budget(state_paths, remaining) {
+        Ok(records) => records,
+        Err(error) => {
+            report.stopped = Some(error.message().to_owned());
+            return Ok(report);
+        }
+    };
+    for planned in &report.plan.volumes.rows {
+        let Some(record) = records
+            .iter()
+            .find(|record| record.volume_uuid.as_str() == planned.volume_uuid)
+        else {
+            rows.push(space_empty_row(&planned.volume_uuid, "unknown_state"));
+            continue;
+        };
+        if planned.state == VolumeState::Absent {
+            // The plan already reports the absent volume. No space stage ran.
+            continue;
+        }
+        if record.generation != planned.record_generation || record.root_dir != planned.root_dir {
+            rows.push(space_empty_row(&planned.volume_uuid, "unknown_state"));
+            continue;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            report.timed_out = true;
+            rows.push(space_empty_row(
+                record.volume_uuid.as_str(),
+                "unknown_state",
+            ));
+            continue;
+        }
+        let uuid = &record.volume_uuid;
+        if record.durability == Durability::Kept {
+            rows.push(space_empty_row(uuid.as_str(), "skipped_kept"));
+            continue;
+        }
+        if record.space.is_none() {
+            rows.push(space_empty_row(uuid.as_str(), "space_undeclared"));
+            continue;
+        }
+        if request.preview {
+            let preview = crate::space::plan(
+                state_paths,
+                dirs,
+                facts,
+                mounts,
+                observer,
+                space,
+                &crate::space::SpacePruneRequest {
+                    volume_uuid: uuid,
+                    now_ms: request.now_ms,
+                    wall: remaining.min(crate::space::SPACE_PLAN_WALL),
+                    lock_wait: remaining.min(Duration::from_secs(5)),
+                },
+            );
+            match preview {
+                Ok(preview) => {
+                    if preview.measurement.free_bytes <= preview.target_bytes {
+                        triggered += 1;
+                    }
+                    rows.push(serde_json::json!({"volume_uuid": uuid, "preview": {"schema": crate::space::SPACE_PRUNE_SCHEMA, "command": "space prune", "ok": true, "data": preview}}));
+                }
+                Err(error) => {
+                    if matches!(error.kind(), ErrorKind::UnknownState | ErrorKind::Io) {
+                        report.stopped = Some(error.message().to_owned());
+                    }
+                    rows.push(space_error_row(uuid, &error));
+                }
+            }
+        } else {
+            let result = crate::space::decide_volume(
+                state_paths,
+                dirs,
+                facts,
+                mounts,
+                observer,
+                space,
+                flush,
+                uuid,
+                remaining.min(Duration::from_secs(120)),
+                false,
+                crate::space::SpacePruneBounds::design(),
+            );
+            match result {
+                Ok(decision) => rows.push(serde_json::json!({
+                    "volume_uuid": uuid, "decision": decision.decision,
+                    "F": decision.after.free_bytes, "R": decision.policy.reserve_bytes, "L": decision.policy.floor_bytes,
+                    "measurement_source": decision.after.source,
+                    "pruned_root_ids": decision.pruned.rows.iter().map(|row| &row.root_id).collect::<Vec<_>>(),
+                    "replayed_root_ids": decision.detail["replayed_root_ids"],
+                    "replay_partial_root_ids": decision.detail["replay_partial_root_ids"],
+                    "replay_settled_root_ids": decision.detail["replay_settled_root_ids"],
+                    "cause": decision.detail["cause"], "owned_prunable_bytes": decision.detail["owned_prunable_bytes"],
+                    "held_or_unknown_bytes": decision.detail["held_or_unknown_bytes"],
+                    "excluded_bytes": decision.detail["excluded_bytes"], "other_estimate_bytes": decision.detail["other_estimate_bytes"]
+                })),
+                Err(error) => {
+                    if matches!(error.kind(), ErrorKind::UnknownState | ErrorKind::Io) {
+                        report.stopped = Some(error.message().to_owned());
+                    }
+                    rows.push(space_error_row(uuid, &error));
+                }
+            }
+        }
+    }
+    if request.preview {
+        report.space_triggered = Some(triggered);
+    }
+    let total = rows.len();
+    report.space_rows = Some(RowSet::bounded(rows, total, VOLUME_ROWS));
+    // Keep the enclosing command within its document bound. Each omitted volume
+    // is counted, rather than turning an incomplete report into an empty one.
+    loop {
+        let size = serde_json::to_vec(&report)
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Io,
+                    format!("cannot encode maintenance report: {error}"),
+                )
+            })?
+            .len();
+        if size <= DOCUMENT_SIZE_CAP_BYTES.saturating_sub(1024) {
+            break;
+        }
+        let Some(rowset) = report.space_rows.as_mut() else {
+            break;
+        };
+        if rowset.rows.pop().is_none() {
+            break;
+        }
+        rowset.count = rowset.rows.len();
+        rowset.truncated = rowset.total > rowset.count;
+    }
+    Ok(report)
+}
+
+fn space_empty_row(uuid: &str, decision: &str) -> serde_json::Value {
+    serde_json::json!({"volume_uuid": uuid, "decision": decision, "F": null, "R": null, "L": null,
+        "measurement_source": null, "pruned_root_ids": null, "replayed_root_ids": null,
+        "replay_partial_root_ids": null, "replay_settled_root_ids": null, "cause": null,
+        "owned_prunable_bytes": null, "held_or_unknown_bytes": null, "excluded_bytes": null,
+        "other_estimate_bytes": null})
+}
+
+fn space_error_row(uuid: &crate::os::VolumeUuid, error: &Error) -> serde_json::Value {
+    let detail = error.detail();
+    let decision = if error.kind() == ErrorKind::SpaceBelowFloor {
+        "space_below_floor"
+    } else {
+        "unknown_state"
+    };
+    serde_json::json!({
+        "volume_uuid": uuid, "decision": decision, "error_kind": error.kind().as_str(), "message": error.message(),
+        "F": detail.get("free_bytes"), "R": detail.get("reserve_bytes"), "L": detail.get("floor_bytes"),
+        "measurement_source": detail.get("measurement_source"),
+        "pruned_root_ids": detail.get("pruned_root_ids"), "replayed_root_ids": detail.get("replayed_root_ids"),
+        "replay_partial_root_ids": detail.get("replay_partial_root_ids"),
+        "replay_settled_root_ids": detail.get("replay_settled_root_ids"), "cause": detail.get("cause"),
+        "owned_prunable_bytes": detail.get("owned_prunable_bytes"),
+        "held_or_unknown_bytes": detail.get("held_or_unknown_bytes"),
+        "excluded_bytes": detail.get("excluded_bytes"), "other_estimate_bytes": detail.get("other_estimate_bytes")
+    })
+}
+
 /// Read the registry under the shared observation lock. Nothing is created.
 fn read_registry(state_paths: &StatePaths) -> Result<Vec<VolumeRecord>> {
     let mut locks = state::LockSet::new(state_paths.clone());
     let _lock = locks.observe_registry()?;
     Ok(registry::read(state_paths)?.volumes().to_vec())
+}
+
+fn read_registry_with_budget(
+    state_paths: &StatePaths,
+    budget: Duration,
+) -> Result<Vec<VolumeRecord>> {
+    let deadline = state::Deadline::after(budget.min(state::READ_DEADLINE));
+    let mut locks = state::LockSet::with_deadline(state_paths.clone(), deadline);
+    let _lock = locks.observe_registry()?;
+    Ok(registry::read_with_deadline(state_paths, deadline)?
+        .volumes()
+        .to_vec())
 }
 
 /// The plan's canonical bytes: one compact JSON document, exactly the bytes the
@@ -1484,6 +1725,9 @@ fn run(
         volumes: RowSet::bounded(volumes, volume_total, VOLUME_ROWS),
         pending: RowSet::bounded(pending, pending_total, ROOT_ROWS),
         unreached: RowSet::bounded(unreached, unreached_total, ROOT_ROWS),
+        space_stage: disabled_space_stage(),
+        space_rows: None,
+        space_triggered: None,
     })
 }
 

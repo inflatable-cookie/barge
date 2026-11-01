@@ -293,6 +293,9 @@ what needs it:
   now" — positively concluded, `nested_scope: exclusive`, `kept_reason:
   evidence`, no live hold. An unconcluded root (a crashed run, or evidence kept
   deliberately) is **never** pressure-pruned; it is reported as a floor cause.
+- Maintenance uses the same volume-wide decision and prune core as guard,
+  without inventing a consumer area. Guard and recheck still validate the stored
+  area before entering that core (design-delegate decision `57fbc529`).
 - Barge's `caches/` never participates in stage 3 (see
   [alternatives](#alternatives-considered-and-rejected)): a cache root is a link
   target, and deleting it whole would leave the consumer's original path pointing
@@ -1267,9 +1270,10 @@ slice skips a stage:
 4. **The bounded native design above**, under the qualified shared supervisor,
    before any real-drive action is proposed.
 5. **A real-drive qualification** and the host-job change, each operator-gated
-   and each its own brief. `maintain`'s space stage is only enabled after the
-   qualification, and the host job keeps running Oxide's prune entry until stage
-   4.
+   and each its own brief. `maintain`'s space stage is enabled for the scheduled
+   host job only after the qualification (operator-gated T9); before that it runs
+   only on an explicit --space invocation, as T8’s native does. The host job keeps
+   running Oxide's prune entry until stage 4.
 
 No native receipt from this design task exists or is claimed. A slice that cannot
 run its native proof reports it missing rather than claiming the slice qualified.
@@ -2051,3 +2055,20 @@ Attribution is bounded and uses complete scans for the roots it can establish.
 An uncountable or unenumerated component is `null`, not zero; the remaining
 non-Barge figure is labelled an estimate and is unknown if it cannot be formed.
 The stage native proof remains T8's; this surface has no native receipt.
+
+
+### Implemented maintenance space surface (slice T7)
+
+`barge maintain --space` opts this invocation into a volume-wide space stage
+following scratch and age maintenance. Without the flag the stage is disabled,
+measures nothing and has no effect. A preview keeps the maintain plan bytes and
+digest unchanged, reports a space-prune preview beside the plan and counts
+triggered volumes in `space_triggered`. A real run uses the shared guard core,
+which remeasures and revalidates its candidates before effects. Stops and
+refusals are per-volume rows. The stage uses the remaining maintenance window.
+
+`describe` and `space` report observed fallback roots without creating them;
+only an absent volume explains an active fallback, and one observed while the
+volume is present is a contract violation. Unknown observations remain unknown.
+The stage native is missing and belongs to T8. No real-drive qualification or
+host-job change is claimed; scheduled enablement is operator-gated T9.
