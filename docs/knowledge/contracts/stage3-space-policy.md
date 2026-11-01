@@ -8,7 +8,7 @@ rules that let pruning run while consumers work, and the formats, locks, bounds,
 failure matrix, test plan, bounded native design and implementation slices
 those need.
 
-The measurement and registration slices are implemented. This contract alone
+The measurement, registration, prune, guard and recheck slices are implemented. This contract alone
 does not authorize a native run, a real drive registration, a mount or host
 setting, a data move, or an Oxide change. [Architecture](../architecture.md) owns the concepts and the
 boundary; the [stage 1 design](stage1-design.md) owns the crate and CLI shape
@@ -348,8 +348,8 @@ anything. Stage 1's exit codes already say it; this stage must not bend them:
 
 | Outcome | Envelope | Exit | When |
 | --- | --- | --- | --- |
-| **Completed stop** | `barge.space.guard/1`, `data.decision: "stop_below_floor"` | `0` | the pass deleted at least one root and the floor is still breached. Stage 1's `0` is exactly "the command completed and its report says what it did". |
-| **No-effect refusal** | `barge.error/1`, `kind: "space_below_floor"` | `2` | the pass deleted nothing at all — nothing was eligible, or every candidate failed its re-verification — and the floor is breached. Nothing changed, so "refused before any effect" is literally true. |
+| **Completed stop** | `barge.space.guard/1`, `data.decision: "stop_below_floor"` | `0` | this call removed volume bytes by a new prune or replay and the floor is still breached. Stage 1's `0` is exactly "the command completed and its report says what it did". |
+| **No-effect refusal** | `barge.error/1`, `kind: "space_below_floor"` | `2` | this call removed no volume bytes by either new prune or replay, and the floor is breached. Journal-only rollback or settlement does not change this shape. |
 | **Unsettled state** | `barge.error/1`, `kind: "unknown_state"` | `3` | the pass left a pending intent, or the measurement, flush, policy or registry became unknown. `detail` names the pending intent id or the unknown fact, and `detail.pruned_root_ids` reports anything already deleted. |
 
 Rules:
@@ -387,12 +387,15 @@ is not Barge-owned (estimated). No work was sent to the internal drive.
 | Detail field | Meaning |
 | --- | --- |
 | `free_bytes`, `floor_bytes`, `reserve_bytes` | The measured facts and the declared policy that decided. |
-| `pruned_root_ids`, `reclaimed_bytes` | What the pass deleted before the stop or the refusal; empty and zero for a no-effect refusal. |
+| `pruned_root_ids`, `reclaimed_bytes` | New prune completions and measured reclaim; `pruned_root_ids` excludes replay. |
+| `replayed_root_ids` | Roots whose replay completed during this call. |
+| `replay_partial_root_ids` | Roots whose replay removed entries but remains pending; they stay kept and attributed as held or unknown. |
+| `replay_settled_root_ids` | Roots whose replay changed only journal state by rollback or settlement; this alone is not a volume-byte effect. |
 | `owned_prunable_bytes` | Idle, eligible, Barge-owned bytes still present: zero once the pass has taken everything eligible, which is what a stop means. |
 | `held_or_unknown_bytes` | Barge-owned bytes in eligible areas that were **not** idle: held roots, unknown markers, unknown holds, unconcluded scratch. |
 | `excluded_bytes` | Barge-owned bytes in areas whose `reserve` is `excluded`, and in unparticipating folders. |
 | `other_estimate_bytes` | `total - free - owned - excluded`, labelled `estimate`: everything else on the volume, including APFS metadata, kept data and other tools. It is a lower bound on "not Barge's", never authority, and it exists so an operator can see that a full drive is somebody else's data. |
-| `cause` | `held_owned_roots`, `excluded_or_non_barge`, `unknown`, or `none`. `unknown` when the estimate cannot be formed; it is never presented as `none`. |
+| `cause` | `held_owned_roots`, `excluded_or_non_barge`, `unknown`, `none`, `budget_exhausted`, or `replay`. An unformable estimate is unknown, never `none`; replay and budget causes identify the pass that stopped. |
 
 The message names the internal drive only to say no work went there. Its wording
 names what could not be freed, so the sentence differs by cause while the fields
@@ -797,12 +800,11 @@ This is the ruling most easily broken by accident, so it is carried four ways.
    `stop_below_floor`; a no-effect refusal is a `barge.error/1` document with
    `kind: space_below_floor` at exit `2`.
    Neither is allowed to carry a path the consumer could write to.
-3. **A no-effect refusal changes nothing first** — the name is accurate: no
-   directory, no marker, no state file, no link, no mount point. A pass that did
-   delete something reports it as the completed stop instead, so the "changed
-   nothing" claim is never made by a command that changed something. In both
-   shapes the only writes are the stage 1 intents and journal records of
-   deletions that actually completed.
+3. **A no-effect refusal removes no volume bytes.** A guard may create its
+   account-state lock file or settle a journal-only replay before refusing;
+   neither is a volume-byte removal. A replay or new prune that removes volume
+   bytes reports the completed stop when the floor remains breached. No fallback
+   directory, link or mount point is created.
 4. **A fallback is visible and attributed.** `barge space` and
    `barge describe --json` list every fallback root in use with the reason it
    exists, and the only reason they can name is `volume_absent`. A fallback root
@@ -955,6 +957,12 @@ something:
   }
 }
 ```
+
+The guard's detail also carries `replayed_root_ids`, `replay_partial_root_ids`,
+and `replay_settled_root_ids`. Replay removals select a completed stop below the
+floor, and attribution names `replay` as the cause. Journal-only settlement does
+not select that shape. A partial replay remains pending and protects its root;
+an unreadable journal or registry or failed flush still overrides to unknown.
 
 A **no-effect** refusal is not a guard document: it is stage 1's ordinary error
 envelope, `barge.error/1`, naming the command and carrying the same `message` and
@@ -1808,7 +1816,7 @@ preview's exact plan through the stage 1 custody, intent and quarantine protocol
 flushes and re-measures once per batch, and stops on the policy or on a bound.
 There is no second delete path — the same `delete` sequence every other Barge
 deletion uses runs, with the pass's volume lock supplied instead of taken — and
-the guard and recheck stay T6's. **The stage's native proof is missing: T8 owns
+the guard and recheck are described in [slice T6](#implemented-space-guard-and-recheck-surface-slice-t6). **The stage's native proof is missing: T8 owns
 it. This surface is not qualified by any native receipt, and no real-drive action
 is claimed.**
 
@@ -2020,3 +2028,26 @@ is claimed.**
   root, a root on another device or anything outside the verified volume, and it
   never widens a delete to make space. It writes only the stage 1 intent and
   journal records of deletions that actually ran.
+
+### Implemented space guard and recheck surface (slice T6)
+
+`barge space guard --volume <uuid> --area <namespace>/<area>` decides admission;
+`barge space recheck --guard <token>` repeats the decision from fresh registry,
+area, volume and measurement evidence. The token is a lookup value, not a lease.
+Both accept `--wall <seconds>` (default 30, maximum 120). They use the same
+whole-root custody and deletion path as the operator prune, re-plan between live
+batches under the volume lock, and never send work to an internal path.
+
+A decision below the floor is `space_below_floor` at exit 2 when the call removed
+no volume bytes, and a completed `stop_below_floor` document at exit 0 otherwise.
+Replay-completed, replay-partial and journal-only roots are reported separately
+from newly pruned roots. A failed flush or unknown policy, journal or measurement
+is unknown state, with the effects already observed. Pending intent custody is per
+root. A guard that cannot take the volume lock waits at most five seconds, then
+re-measures and decides without pruning. A recheck uses current thresholds, and
+neither call makes more than four measurements.
+
+Attribution is bounded and uses complete scans for the roots it can establish.
+An uncountable or unenumerated component is `null`, not zero; the remaining
+non-Barge figure is labelled an estimate and is unknown if it cannot be formed.
+The stage native proof remains T8's; this surface has no native receipt.

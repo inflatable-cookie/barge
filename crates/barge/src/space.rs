@@ -5,8 +5,8 @@ mod effect;
 mod guard;
 
 pub use guard::{
-    guard, read_guard_document, recheck, GuardArea, GuardKept, GuardPruned, GuardReport,
-    GuardRequest, SpaceDecision, SpaceGuard, SPACE_GUARD_SCHEMA,
+    guard, read_guard_document, recheck, GuardArea, GuardKept, GuardObservedKept, GuardPruned,
+    GuardReport, GuardRequest, GuardUnreached, SpaceDecision, SpaceGuard, SPACE_GUARD_SCHEMA,
 };
 
 pub use effect::{
@@ -820,6 +820,8 @@ struct GuardAttribution {
     prunable: Option<u64>,
     held: Option<u64>,
     excluded: Option<u64>,
+    kept: Vec<GuardObservedKept>,
+    kept_total: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -897,6 +899,58 @@ fn attribute_locked(
         };
         match planner.observe_entry(&row.name, path) {
             Ok(observed) if observed.handle.identity().device == planner.device => {
+                held = held.and_then(|n| {
+                    planner
+                        .scan_bytes(&observed.handle)
+                        .ok()
+                        .and_then(|bytes| n.checked_add(bytes))
+                });
+            }
+            _ => held = None,
+        }
+    }
+    // A quarantined pending root is deliberately omitted from the candidate
+    // planner. Count the remaining captured object from its recorded identity.
+    let intents = state::read_intents(paths, crate::contract::INTENT_ROWS)?;
+    for intent in intents
+        .pending()
+        .filter(|intent| &intent.volume_uuid == uuid)
+    {
+        let Some(mount) = record.mount_hint.as_ref() else {
+            held = None;
+            continue;
+        };
+        let parent = mount
+            .join(&intent.root_dir)
+            .join(&intent.folder)
+            .join(&intent.unit.parent);
+        let captured = parent.join(intent.capture_name());
+        let original = parent.join(&intent.unit.name);
+        let path = match dirs.path_facts(&captured) {
+            Ok(Some(_)) => captured,
+            Ok(None) => original,
+            Err(_) => {
+                held = None;
+                continue;
+            }
+        };
+        if report
+            .kept
+            .rows
+            .iter()
+            .any(|row| row.path.as_ref() == Some(&path))
+        {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            held = None;
+            continue;
+        };
+        match planner.observe_entry(name, &path) {
+            Ok(observed)
+                if observed.handle.identity().device == planner.device
+                    && observed.handle.identity().inode == intent.unit.inode =>
+            {
                 held = held.and_then(|n| {
                     planner
                         .scan_bytes(&observed.handle)
@@ -997,10 +1051,23 @@ fn attribute_locked(
         },
         Err(_) => excluded = None,
     }
+    let kept = report
+        .kept
+        .rows
+        .iter()
+        .map(|row| GuardObservedKept {
+            area: row.area.clone(),
+            name: row.name.clone(),
+            root_id: row.root_id.clone(),
+            reason: row.reason.clone(),
+        })
+        .collect();
     Ok(GuardAttribution {
         prunable,
         held,
         excluded,
+        kept,
+        kept_total: report.kept.total,
     })
 }
 

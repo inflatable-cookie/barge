@@ -87,6 +87,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decision_has_no_fallback_variant() {
+        assert!(serde_json::from_str::<SpaceDecision>("\"fallback_local\"").is_err());
+        assert!(serde_json::from_str::<SpaceDecision>("{\"fallback_local\":\"/tmp\"}").is_err());
+    }
+
+    #[test]
     fn checkpoint_token_round_trips_and_rejects_malformed_values() {
         let token = "A6AC3ED7-0A5B-4E6D-8BA0-813B8DD4C99A:oxide/pool:7:123";
         let guard = SpaceGuard::parse(token).unwrap();
@@ -159,6 +165,20 @@ pub struct GuardPruned {
     pub last_release_ms: u64,
 }
 
+/// A planned root left untouched when a bound stopped the pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardUnreached {
+    /// Root identity.
+    pub root_id: String,
+    /// Owning area.
+    pub area: String,
+    /// Planned bytes, not reclaimed bytes.
+    pub bytes: u64,
+    /// Why it was not reached.
+    pub reason: String,
+}
+
 /// A root kept because a durable intent still covers it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -169,6 +189,20 @@ pub struct GuardKept {
     pub reason: String,
     /// The pending intent that covers it.
     pub intent_id: String,
+}
+
+/// One kept object, without a filesystem path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardObservedKept {
+    /// Area containing the object.
+    pub area: String,
+    /// Entry name.
+    pub name: String,
+    /// Root identity when known.
+    pub root_id: Option<String>,
+    /// Why the object is kept.
+    pub reason: String,
 }
 
 /// A completed guard decision.
@@ -191,8 +225,12 @@ pub struct GuardReport {
     pub policy: SpacePolicy,
     /// Newly pruned roots.
     pub pruned: RowSet<GuardPruned>,
+    /// Planned roots left untouched by the pass.
+    pub not_reached: RowSet<GuardUnreached>,
     /// Roots protected by pending intents.
     pub kept: RowSet<GuardKept>,
+    /// Kept objects, or null when the volume could not be enumerated.
+    pub observed_kept: Option<RowSet<GuardObservedKept>>,
     /// Measured reclaimed bytes.
     pub reclaimed_bytes: u64,
     /// Flush and measurement rounds.
@@ -230,6 +268,10 @@ pub fn read_guard_document(bytes: &[u8]) -> Result<GuardReport> {
             .map_err(|_| invalid())?;
     report.pruned.validate()?;
     report.kept.validate()?;
+    report.not_reached.validate()?;
+    if let Some(rows) = &report.observed_kept {
+        rows.validate()?;
+    }
     SpaceGuard::parse(&report.guard).map_err(|_| invalid())?;
     let detail = report.detail.as_object().ok_or_else(invalid)?;
     for key in [
@@ -237,6 +279,9 @@ pub fn read_guard_document(bytes: &[u8]) -> Result<GuardReport> {
         "floor_bytes",
         "reserve_bytes",
         "pruned_root_ids",
+        "replayed_root_ids",
+        "replay_partial_root_ids",
+        "replay_settled_root_ids",
         "reclaimed_bytes",
         "owned_prunable_bytes",
         "held_or_unknown_bytes",
@@ -250,6 +295,79 @@ pub fn read_guard_document(bytes: &[u8]) -> Result<GuardReport> {
         if !detail.contains_key(key) {
             return Err(invalid());
         }
+    }
+    for key in [
+        "pruned_root_ids",
+        "replayed_root_ids",
+        "replay_partial_root_ids",
+        "replay_settled_root_ids",
+    ] {
+        if !detail
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|ids| ids.iter().all(serde_json::Value::is_string))
+        {
+            return Err(invalid());
+        }
+    }
+    for key in [
+        "owned_prunable_bytes",
+        "held_or_unknown_bytes",
+        "excluded_bytes",
+        "other_estimate_bytes",
+    ] {
+        if !detail
+            .get(key)
+            .is_some_and(|value| value.is_null() || value.as_u64().is_some())
+        {
+            return Err(invalid());
+        }
+    }
+    if detail.get("free_bytes").and_then(serde_json::Value::as_u64) != Some(report.after.free_bytes)
+        || detail
+            .get("floor_bytes")
+            .and_then(serde_json::Value::as_u64)
+            != Some(report.policy.floor_bytes)
+        || detail
+            .get("reserve_bytes")
+            .and_then(serde_json::Value::as_u64)
+            != Some(report.policy.reserve_bytes)
+        || detail
+            .get("reclaimed_bytes")
+            .and_then(serde_json::Value::as_u64)
+            != Some(report.reclaimed_bytes)
+        || detail
+            .get("observed_ms")
+            .and_then(serde_json::Value::as_u64)
+            != Some(report.after.observed_ms)
+        || detail
+            .get("measurement_source")
+            .and_then(serde_json::Value::as_str)
+            != Some(report.after.source.as_str())
+        || detail
+            .get("other_estimate_label")
+            .and_then(serde_json::Value::as_str)
+            != Some("estimate")
+        || !matches!(
+            detail.get("cause").and_then(serde_json::Value::as_str),
+            Some(
+                "held_owned_roots"
+                    | "excluded_or_non_barge"
+                    | "unknown"
+                    | "none"
+                    | "budget_exhausted"
+                    | "replay"
+            )
+        )
+    {
+        return Err(invalid());
+    }
+    if detail
+        .get("other_estimate_bytes")
+        .is_some_and(serde_json::Value::is_null)
+        && detail.get("cause").and_then(serde_json::Value::as_str) == Some("none")
+    {
+        return Err(invalid());
     }
     Ok(report)
 }
@@ -396,10 +514,17 @@ pub(super) fn guard_with_bounds(
     let mut current_policy = policy;
     let mut generation = record.generation;
     let mut rows = Vec::new();
+    let mut not_reached = RowSet::empty();
     let mut reclaimed = 0;
     let mut rounds = 0;
     let mut after_wait = false;
     let mut stop = String::new();
+    let mut plan_truncated = false;
+    let mut plan_unreached = 0usize;
+    let mut replayed_root_ids = Vec::new();
+    let mut replay_partial_root_ids = Vec::new();
+    let mut replay_settled_root_ids = Vec::new();
+    let mut replay_removed_entries = 0usize;
     let mut pass_lock = None;
     if before.free_bytes <= current_policy.reserve_bytes.max(current_policy.floor_bytes) {
         let remaining = request.wall.saturating_sub(started.elapsed());
@@ -416,7 +541,7 @@ pub(super) fn guard_with_bounds(
         match effect::prune_live(
             paths, dirs, facts, mounts, observer, space, flush, &run, None,
         ) {
-            Ok((report, lock)) => {
+            Ok((report, lock, replay)) => {
                 pass_lock = Some(lock);
                 let effect = report.effect.ok_or_else(|| {
                     Error::new(
@@ -430,6 +555,28 @@ pub(super) fn guard_with_bounds(
                 reclaimed = effect.reclaimed_bytes;
                 rounds = effect.rounds;
                 stop = effect.stop;
+                plan_truncated = effect.live_plan_truncated;
+                plan_unreached = effect.live_plan_unreached;
+                let total = effect.not_reached.total;
+                let unreached = effect
+                    .not_reached
+                    .rows
+                    .into_iter()
+                    .map(|row| GuardUnreached {
+                        root_id: row.root_id,
+                        area: row.area,
+                        bytes: row.bytes,
+                        reason: row.reason,
+                    })
+                    .collect();
+                not_reached = RowSet::bounded(unreached, total, ROOT_ROWS);
+                replayed_root_ids = replay.resumed_root_ids;
+                replayed_root_ids.extend(replay.completed_by_settlement_root_ids);
+                replay_partial_root_ids = replay.partial_root_ids;
+                replay_settled_root_ids = replay.settled_root_ids;
+                replay_removed_entries = replay
+                    .entries_removed
+                    .saturating_add(replay.partial_entries_removed);
                 rows = effect
                     .pruned
                     .rows
@@ -468,6 +615,15 @@ pub(super) fn guard_with_bounds(
         .with_detail(
             "pruned_root_ids",
             serde_json::json!(rows.iter().map(|row| &row.root_id).collect::<Vec<_>>()),
+        )
+        .with_detail("replayed_root_ids", serde_json::json!(replayed_root_ids))
+        .with_detail(
+            "replay_partial_root_ids",
+            serde_json::json!(replay_partial_root_ids),
+        )
+        .with_detail(
+            "replay_settled_root_ids",
+            serde_json::json!(replay_settled_root_ids),
         )
     })?;
     let kept: Vec<GuardKept> = intents
@@ -511,12 +667,24 @@ pub(super) fn guard_with_bounds(
                         "pruned_root_ids",
                         serde_json::json!(rows.iter().map(|row| &row.root_id).collect::<Vec<_>>()),
                     )
+                    .with_detail("replayed_root_ids", serde_json::json!(replayed_root_ids))
+                    .with_detail(
+                        "replay_partial_root_ids",
+                        serde_json::json!(replay_partial_root_ids),
+                    )
+                    .with_detail(
+                        "replay_settled_root_ids",
+                        serde_json::json!(replay_settled_root_ids),
+                    )
                 })?,
             )
         }
     } else {
         None
     };
+    let observed_kept = attribution
+        .as_ref()
+        .map(|a| RowSet::bounded(a.kept.clone(), a.kept_total, ROOT_ROWS));
     let prunable = attribution.as_ref().and_then(|a| a.prunable);
     let held = attribution.as_ref().and_then(|a| a.held);
     let excluded = attribution.as_ref().and_then(|a| a.excluded);
@@ -528,7 +696,10 @@ pub(super) fn guard_with_bounds(
             .checked_sub(h)?
             .checked_sub(e)
     });
-    let cause = if matches!(stop.as_str(), "budget_exhausted" | "space_not_reclaimed") {
+    let replay_had_effect = replay_removed_entries > 0 || !replayed_root_ids.is_empty();
+    let cause = if replay_had_effect {
+        "replay"
+    } else if matches!(stop.as_str(), "budget_exhausted" | "space_not_reclaimed") {
         "budget_exhausted"
     } else if other.is_none() {
         "unknown"
@@ -549,9 +720,9 @@ pub(super) fn guard_with_bounds(
         current_policy.reserve_bytes,
         cause
     );
-    let detail = serde_json::json!({"free_bytes":after.free_bytes,"floor_bytes":current_policy.floor_bytes,"reserve_bytes":current_policy.reserve_bytes,"pruned_root_ids":ids,"pending_intents":kept,"reclaimed_bytes":reclaimed,"owned_prunable_bytes":prunable,"held_or_unknown_bytes":held,"excluded_bytes":excluded,"other_estimate_bytes":other,"other_estimate_label":"estimate","cause":cause,"measurement_source":after.source,"observed_ms":after.observed_ms,"decided_after_wait":after_wait,"waited_lock":if after_wait { Some(paths.volume_lock_path(request.volume_uuid).display().to_string()) } else { None },"stop":stop});
+    let detail = serde_json::json!({"free_bytes":after.free_bytes,"floor_bytes":current_policy.floor_bytes,"reserve_bytes":current_policy.reserve_bytes,"pruned_root_ids":ids,"replayed_root_ids":replayed_root_ids,"replay_partial_root_ids":replay_partial_root_ids,"replay_settled_root_ids":replay_settled_root_ids,"pending_intents":kept,"observed_kept":observed_kept,"not_reached":not_reached,"plan_truncated":plan_truncated,"plan_unreached":plan_unreached,"reclaimed_bytes":reclaimed,"owned_prunable_bytes":prunable,"held_or_unknown_bytes":held,"excluded_bytes":excluded,"other_estimate_bytes":other,"other_estimate_label":"estimate","cause":cause,"measurement_source":after.source,"observed_ms":after.observed_ms,"decided_after_wait":after_wait,"waited_lock":if after_wait { Some(paths.volume_lock_path(request.volume_uuid).display().to_string()) } else { None },"stop":stop});
     let decision = if after.free_bytes <= current_policy.floor_bytes {
-        if rows.is_empty() {
+        if rows.is_empty() && !replay_had_effect {
             let mut error = Error::new(ErrorKind::SpaceBelowFloor, message);
             if let Some(fields) = detail.as_object() {
                 for (key, value) in fields {
@@ -589,7 +760,9 @@ pub(super) fn guard_with_bounds(
         after,
         policy: current_policy,
         pruned: RowSet::bounded(rows, total, ROOT_ROWS),
+        not_reached,
         kept: RowSet::bounded(kept.clone(), kept.len(), crate::contract::INTENT_ROWS),
+        observed_kept,
         reclaimed_bytes: reclaimed,
         rounds,
         decided_after_wait: after_wait,

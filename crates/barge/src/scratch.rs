@@ -7211,6 +7211,10 @@ mod tests {
             rolled_back: 0,
             resumed: 0,
             resumed_root_ids: Vec::new(),
+            completed_by_settlement_root_ids: Vec::new(),
+            partial_root_ids: Vec::new(),
+            settled_root_ids: Vec::new(),
+            partial_entries_removed: 0,
             remounted: 0,
             pending: vec![crate::delete::PendingRow {
                 intent_id: "0123456789abcdef0123456789abcdef".to_owned(),
