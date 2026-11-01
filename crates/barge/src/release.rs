@@ -1958,24 +1958,21 @@ pub fn execute(
         }
     }
 
-    let mut replay_pending = 0usize;
-    let mut stopped = None;
-    if !candidates.is_empty() {
-        let (pending, stop) = delete_candidates(
-            state_paths,
-            dirs,
-            facts,
-            mounts,
-            observer,
-            account,
-            request,
-            &fresh,
-            &candidates,
-            &mut rows,
-        )?;
-        replay_pending = pending;
-        stopped = stop;
-    }
+    // Every run takes the volume's exclusive lock and settles pending intents, even
+    // when no row is a candidate: an intent left by an earlier run is settled by the
+    // next one, as S5's replay settles it, whatever this plan decides.
+    let (replay_pending, stopped) = delete_candidates(
+        state_paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        account,
+        request,
+        &fresh,
+        &candidates,
+        &mut rows,
+    )?;
 
     let released_count = rows.iter().filter(|row| row.outcome == "released").count();
     let kept_count = rows.iter().filter(|row| row.outcome == "kept").count();
@@ -5418,5 +5415,54 @@ mod tests {
         let forged = serde_json::to_vec(&value).expect("the forged plan encodes");
         let error = read_prune_plan(&forged).expect_err("a waiver the plan does not name refuses");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
+    }
+
+    #[test]
+    fn a_later_run_settles_a_pending_intent_even_when_nothing_is_a_candidate() {
+        // The first run stops at the rename, leaving its intent pending. The next run
+        // keeps the root, because its custody is not safe, and its replay settles the
+        // intent whether or not any row is a candidate.
+        let fixture = Fixture::new("release-settle-pending");
+        let root = fixture.root();
+        let report = fixture.plan();
+        let (bytes, digest) = presented(&report);
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let area_dir = root
+            .path
+            .parent()
+            .expect("the root sits in its area")
+            .to_path_buf();
+        std::fs::set_permissions(&area_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("the area is read-only");
+        let first = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &digest,
+        );
+        std::fs::set_permissions(&area_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("the area is writable again");
+        assert_eq!(
+            first.expect("the run is reported").rows[0].outcome,
+            "pending"
+        );
+        assert_eq!(intent_records(&fixture).len(), 1);
+
+        let second = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &digest,
+        )
+        .expect("the second run is reported");
+        assert_eq!(second.released_count, 0, "{second:?}");
+        assert_eq!(second.replay_pending, 0, "{second:?}");
+        assert!(std::fs::metadata(&root.path).is_ok(), "the root is kept");
+        assert!(intent_records(&fixture).is_empty(), "the intent is settled");
     }
 }

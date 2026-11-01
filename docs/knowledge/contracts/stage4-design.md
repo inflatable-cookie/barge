@@ -1481,7 +1481,8 @@ this, in order. Each batch-wide refusal changes nothing.
    inode, marker digest, references and absence verdict, and the fresh row must
    still be eligible. A row that does not is kept with its reason.
 4. The run takes the volume's exclusive lock and replays pending intents on the
-   volume (F4). Then each candidate's deletion takes its unit's lock, and before
+   volume (F4), whether or not any row is a candidate, so a later run settles an
+   intent an earlier run left. Then each candidate's deletion takes its unit's lock, and before
    the intent is written, `reprove_row` re-reads under that lock: the marker and
    inode the row named, the durable identity record's contents, the policy and its
    age, every reference (holds, placements, Oxide's registry, receipts and marker),
@@ -1558,13 +1559,42 @@ run.
 | X7 | a named root waives only the age gate; custody and policy still keep, the plan states the waiver, and an unlisted name or an unnamed waiver refuses | `a_named_root_waives_only_the_age_gate_and_the_plan_says_so`, `a_named_root_must_be_listed_and_a_waiver_must_name_its_root` |
 | X8 | identity re-decided under the lock against the record's contents | `the_unit_lock_re_proof_refuses_each_condition_it_re_reads` (case `identity record contents`) |
 
-**Native proof: held, and missing.** `scripts/native/release-proof.py` carries the
-declaration side only: `release:native:test` (self-check) and `release:native:plan`.
-The elevated run the brief describes (one owned APFS fixture image of at most 64 MiB,
-the qualified shared supervisor, a 300 s wall, 512 MiB of scratch, an uncounted
-diagnostic, a counted author pass and a distinct reviewer pass) is not built, and
-no owner activation has happened. No author or reviewer receipt exists. A missing
-receipt is a missing proof.
+**Native proof: built, held for owner activation, not run.**
+`scripts/native/release-proof.py` carries the bounded native body. It runs under
+Oxide's qualified shared supervisor, pinned to the same bytes the S6, S7 and space
+proofs name, with a 300 s wall and 512 MiB of scratch. It creates one owned
+64 MiB sparse APFS image under the guard's scratch, attaches it with `-owners on`,
+and registers it as the only volume. Each of its twelve cases declares its own area,
+so one case's roots never reach another case's plan:
+
+| Case | Claim | Counterfactual of |
+| --- | --- | --- |
+| R1 | one aged, unreferenced root is released from its presented bytes; the replay releases nothing, and the settled intent keeps the identity | the positive case |
+| R2 | a missing identity record keeps the root | R1, identity |
+| R3 | a live hold keeps the root through custody | R1, custody |
+| R4 | a young root is kept; a named root is released with its waiver stated | R1, age |
+| R5 | a pending Oxide reference keeps the root | R1, references |
+| R6 | a settled row releases only once its consumer path is absent (release by reference) | the release-by-reference policy |
+| R7 | an incomplete Oxide set refuses the batch (`unknown_state`) and changes nothing | R1, complete reference set |
+| R8 | a marker whose kind is unknown keeps the root | R1, marker kind |
+| R9 | a changed digest refuses and changes nothing; the presented bytes then release | the digest |
+| R10 | a consumer path that reappears between plan and run keeps the root | the release-by-reference case |
+| R11 | a pending intent is written before the rename; after an ordinary detach and reattach, a later run settles it by UUID and the root releases after | the intent and remount |
+| R12 | a run releases only the rows its presented plan carries | the plan's scope |
+
+The receipt, `release-proof-receipt.json` under `OXIDE_PROOF_EVIDENCE`, records the
+head, the binary's and the supervisor's digests, the volume UUID and its device
+before and after the remount, the closure (ordinary detach, mount absent), the
+wall time, each case's status and evidence, the first fault, and the real-state
+premise. `qualified` is `true` only for a counted pass with every case passed, a
+closed image and an unchanged real state. The diagnostic is always `qualified:
+false`.
+
+What is not yet established: nothing in this repository has run the body. Its
+self-check (`release:native:test`) and its refusals before any effect are checked.
+The diagnostic pass, the counted author pass and a distinct reviewer pass each need
+owner activation at an exact head. Until those receipts exist, a missing receipt is
+a missing proof.
 
 ## Proposed validation
 
