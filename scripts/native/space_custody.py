@@ -70,3 +70,44 @@ def detached_poststate(mount_absent, backing_entities):
     the caller to abort and retain the owned root and evidence.
     """
     return mount_absent is True and isinstance(backing_entities, list) and not backing_entities
+
+
+def self_check():
+    """Exercise both positive and refusal paths without filesystem effects."""
+    problems = []
+    root = "/owned/root"
+    images = [root + "/one.sparseimage", root + "/two.sparseimage"]
+    if custody_document(root, images) != {"version": 1, "backings": images}:
+        problems.append("custody document changed its image bindings")
+    for candidate in ([images[0], images[0]], [images[0], "/elsewhere/two"],
+                      [images[0], root + "/../escape"]):
+        try:
+            custody_document(root, candidate)
+        except ValueError:
+            pass
+        else:
+            problems.append("unsafe image list was accepted")
+    valid = DetachPreconditions(True, True, True, 40)
+    if valid.timeout() != 30 or DetachPreconditions(True, True, True, 12).timeout() != 12:
+        problems.append("detach timeout is not bounded by remaining work and 30 seconds")
+    for gate in (DetachPreconditions(False, True, True, 10),
+                 DetachPreconditions(True, False, True, 10),
+                 DetachPreconditions(True, True, False, 10),
+                 DetachPreconditions(True, True, True, 0),
+                 DetachPreconditions(True, True, True, float("nan"))):
+        try:
+            gate.timeout()
+        except ValueError:
+            pass
+        else:
+            problems.append("detach without established preconditions was accepted")
+    if not detached_poststate(True, []):
+        problems.append("positive detach post-state refused")
+    for mount, entities in ((False, []), (None, []), (True, None), (True, ["disk"])):
+        if detached_poststate(mount, entities):
+            problems.append("unknown or attached post-state accepted")
+    request = detach_request(images[0], "/Volumes/barge-proof", "/dev/disk12s1",
+                             "12345678-1234-1234-1234-123456789abc")
+    if request["backing"] != images[0] or request["version"] != 1:
+        problems.append("detach request lost its backing binding")
+    return problems
