@@ -780,9 +780,14 @@ class Proof:
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(document, handle)
 
-    def oxide_row(self, root, checkout, pending=False, selected=False):
+    def oxide_row(self, root, checkout, pending=False, selected=False, on_volume=False):
+        """One registry row. `on_volume` names the synthetic volume the checkout lives on.
+
+        Absence is proved against the volume a row names, so a consumer path on the
+        volume must say so; a row that does not name one cannot prove absence there.
+        """
         receipt = os.path.join(self.root, "receipts", os.path.basename(checkout) + ".json")
-        return {
+        row = {
             "checkout_id": OXIDE_CHECKOUT_ID,
             "checkout": checkout,
             "receipt": receipt,
@@ -794,6 +799,9 @@ class Proof:
             "selected": selected,
             "pending": pending,
         }
+        if on_volume:
+            row["checkout_volume_uuid"] = self.uuid
+        return row
 
     def pending_intents(self):
         directory = os.path.join(self.state, "intents")
@@ -923,7 +931,7 @@ class Proof:
         # registered volume owns is unknown, and a consumer path must not be one of those.
         checkout = os.path.join(self.mount, "checkouts", "settled")
         os.makedirs(checkout)
-        self.oxide_registry([self.oxide_row(root, checkout)], complete=True)
+        self.oxide_registry([self.oxide_row(root, checkout, on_volume=True)], complete=True)
         preview, row, plan_file = self.plan_and_run("R6-present", area, root, expect_eligible=False)
         if row["blocked_by"] != "absence" or (row.get("absence") or {}).get("verdict") != "present":
             raise Fault("R6", "a present consumer path did not keep the root")
@@ -983,7 +991,7 @@ class Proof:
         area = self.fresh_area("c10", "release-on-reference")
         root = self.new_root(area, aged=False)
         checkout = os.path.join(self.mount, "checkouts", "reappears")
-        self.oxide_registry([self.oxide_row(root, checkout)], complete=True)
+        self.oxide_registry([self.oxide_row(root, checkout, on_volume=True)], complete=True)
         preview, row, plan_file = self.plan_and_run("R10", area, root, expect_eligible=True)
         os.makedirs(checkout)
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
