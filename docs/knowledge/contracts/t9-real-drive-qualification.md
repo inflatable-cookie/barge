@@ -72,7 +72,14 @@ print('plan SHA256', data['plan_sha256'], 'registry SHA256', json.loads(raw)['re
 PY
 ```
 
-Capture this output in `notes.txt`. STOP if any of those checks fail. No
+Capture this output in `notes.txt`, then set the values used below:
+
+```sh
+U=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["VolumeUUID"])' "$E/volume.json")
+D=$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["stdout"])["data"]["plan_sha256"])' "$E/register_plan.json")
+```
+
+STOP if any of those checks fail. No
 rollback is needed before registration; discard no evidence.
 
 ## Registration and measurement
@@ -135,7 +142,7 @@ PY
    Record the exit, timestamp and hashes. Stop on any listing failure.
 5. **Go point.** Present the preview, candidates, `prune.plan.json` digest and
    before listings to Tom. Stop until Tom explicitly authorizes this exact
-   plan. Set `P` to its digest; execute at most once (120 s internal bound):
+   plan. Set `P=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"]["plan_sha256"])' "$E/prune-preview.json")`; verify it against the saved file and execute at most once (120 s internal bound):
 
    ```sh
    "$B" space prune --volume "$U" --plan "$E/prune.plan.json" --plan-sha256 "$P" --json >"$E/prune-real.json" 2>"$E/prune-real.err.txt"
@@ -165,8 +172,22 @@ PY
 Plan a withdrawal (30 s bound) with `"$B" volume update "$U" --durability kept
 --declared-by t9-qualification --plan --json >"$E/withdraw.json" 2>"$E/withdraw.err.txt"`.
 Expect `barge.volume.update/1` with `data.plan` and `data.plan_sha256`; extract
-and verify the bytes as for registration, substituting `withdraw.json` and
-`withdraw.plan.json`. Review the proposed kept record and registry digest.
+and verify the bytes as for registration, using this command (the withdrawal document is direct JSON):
+
+```sh
+python3 - "$E" <<'PYCODE'
+import hashlib, json, pathlib, sys
+p = pathlib.Path(sys.argv[1]); doc = json.loads((p/'withdraw.json').read_bytes())
+assert doc['schema'] == 'barge.volume.update/1' and doc['ok']
+data = doc['data']; raw = data['plan'].encode()
+assert hashlib.sha256(raw).hexdigest() == data['plan_sha256']
+(p/'withdraw.plan.json').write_bytes(raw)
+print(data['plan_sha256'], json.loads(raw)['registry_sha256'])
+PYCODE
+W=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"]["plan_sha256"])' "$E/withdraw.json")
+```
+
+Review the proposed kept record and registry digest.
 Record and hash evidence. This rehearsal alone changes nothing. To demonstrate
 withdrawal, obtain Tom's explicit go for this exact plan, then execute once
 `"$B" volume update --plan-file "$E/withdraw.plan.json" --plan-sha256 "$W" --json >"$E/withdraw-applied.json" 2>"$E/withdraw-applied.err.txt"`,
