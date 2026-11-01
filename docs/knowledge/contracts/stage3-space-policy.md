@@ -520,11 +520,12 @@ barge space          --volume <uuid> --json        (a report; no effect)
 
 A **guard call** is the admission step a consumer makes before it writes. It:
 
-1. resolves the volume from the area's own declaration on the verified volume —
-   never from a caller's claim — then reads the policy snapshot (registry,
-   bounded read) and the volume's identity, and refuses without a measurement if
-   the policy is missing, the durability forbids expendable work or the volume is
-   absent;
+1. uses the requested UUID to look up the registered volume, verifies the
+   mounted kernel identity against that record, and resolves the stored area
+   declaration on the verified record. The UUID is a lookup key, not authority.
+   It reads the policy snapshot (bounded registry read) and refuses without a
+   measurement if policy is missing, durability forbids expendable work, or the
+   volume is absent;
 2. measures (flush-free: nothing has changed yet). A measurement needs no lock:
    it is a read, and a concurrent prune can only free space;
 3. if that measurement is at or below `max(R, L)` — the trigger, or already the
@@ -747,8 +748,9 @@ barge space recheck --guard <token> --json     # or space::recheck(&guard)
   (`<uuid>:<namespace>/<area>:<generation>:<observed_ms>`, bounded and parsed
   strictly); it is **not** authority — a forged or stale token gains nothing,
   because every call re-reads the policy, re-verifies the volume and
-  re-measures. A token whose volume UUID differs from the volume the area
-  resolves on is `volume_mismatch`.
+  re-measures. The UUID selects a registry record; `volume_mismatch` means the
+  mounted kernel volume differs from that record and token. An empty mount is
+  `volume_absent`. The stored area resolves on the verified record.
 - A `recheck` on a volume that has become absent returns `volume_absent`; a
   running consumer treats that as a stop, because its writes are failing anyway.
 - Each call measures, prunes if needed, flushes, and reports the same
