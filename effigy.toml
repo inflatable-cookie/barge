@@ -55,6 +55,13 @@ alias = "barge"
 "space:native:test" = "python3 scripts/native/space-proof.py --self-check"
 "space:native:plan" = "python3 scripts/native/space-proof.py --plan"
 
+# F6-R1's release effect: the declaration side of its native proof only. The
+# apparatus's case table is checked against the regressions that carry each case,
+# and the plan prints the held bounds and activation order. No image, no scratch,
+# no child process, and no native run exists: the native body is not built yet.
+"release:native:test" = "python3 scripts/native/release-proof.py --self-check"
+"release:native:plan" = "python3 scripts/native/release-proof.py --plan"
+
 [test.suites.rust]
 # The library and CLI suites. The budgets are the test route's timeout and
 # forced exit: an expired admission window starts no child, and an expired

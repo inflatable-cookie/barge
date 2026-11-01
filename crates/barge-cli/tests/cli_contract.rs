@@ -2250,10 +2250,52 @@ fn prune_plans_one_area_and_only_writes_the_file_it_was_given() {
 }
 
 #[test]
+fn prune_run_refuses_a_plan_whose_digest_or_bytes_are_not_the_presented_ones() {
+    // The release run is authorised by the presented plan's exact bytes and digest.
+    // A digest that is not those bytes' digest, and a missing half of the pair, both
+    // refuse before any root is looked at.
+    let (fixture, state_dir) = absent_state_dir("prune-run-refusal");
+    let plan = fixture.join("plan.json");
+    std::fs::write(&plan, b"{}").expect("the plan file is written");
+    let plan_arg = plan.to_str().expect("the fixture path is UTF-8");
+    let area = ["--area", "example/pool"];
+    let volume = ["--volume", "A6AC3ED7-33EA-46B4-8082-7254CF291ED2"];
+
+    let wrong_digest = "0".repeat(64);
+    let output = run_in(
+        &[
+            "prune",
+            "--plan",
+            plan_arg,
+            "--plan-sha256",
+            &wrong_digest,
+            area[0],
+            area[1],
+            volume[0],
+            volume[1],
+            "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+    assert!(!state_dir.exists(), "a refusal creates nothing");
+
+    let output = run_in(
+        &[
+            "prune", "--plan", plan_arg, area[0], area[1], volume[0], volume[1], "--json",
+        ],
+        &state_dir,
+    );
+    assert_eq!(output.status.code(), Some(2), "a real run needs the digest");
+    assert_eq!(stdout_document(&output)["error"]["kind"], "usage");
+}
+
+#[test]
 fn prune_refuses_the_effect_form_missing_arguments_and_an_unregistered_volume() {
     let (fixture, state_dir) = absent_state_dir("prune-refusals");
 
-    // The effect form is not this build's: it refuses instead of implying one.
+    // A bare `prune` names no action: it refuses before any state is touched.
     let output = run_in(
         &[
             "prune",

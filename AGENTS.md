@@ -71,6 +71,11 @@ lists the commands. Each covers what it names:
   bounded native for `barge maintain`, on one owned 64 MiB image under the same
   qualified supervisor. HELD for owner activation on the same terms: the
   declarations activate nothing, and each run is separately activated.
+- `effigy release:native:test` — F6-R1's release-effect apparatus self-check: its
+  case table, each case checked against the regression that carries it. No image,
+  no scratch and no child process. `effigy release:native:plan` prints the held
+  bounds and activation order. The native run itself is not built: until it is,
+  no release-effect receipt exists.
 
 RustQuality strict is active for the Rust source, manifests, tests and their
 documentation: `docs/knowledge/contracts/language-quality-activation.json` opts

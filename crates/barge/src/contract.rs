@@ -104,9 +104,11 @@ pub const MAINTAIN_PLAN_SCHEMA: &str = "barge.maintain.plan/1";
 /// The release plan command document: `barge.prune.plan/1` plus its digest.
 pub const PRUNE_SCHEMA: &str = "barge.prune/1";
 /// The release plan document `barge prune --plan` writes. Its canonical bytes are
-/// exactly what the digest covers; the effect that will present them is stage 4
-/// F4.
+/// exactly what the digest covers, and the release effect presents them.
 pub const PRUNE_PLAN_SCHEMA: &str = "barge.prune.plan/1";
+/// The release effect's command document: the presented plan's digest, the
+/// fresh gate's own reading, and one outcome per presented eligible row.
+pub const PRUNE_RUN_SCHEMA: &str = "barge.prune.run/1";
 /// The scratch grants report command document.
 pub const SCRATCH_GRANTS_SCHEMA: &str = "barge.scratch.grants/1";
 /// The scratch delegation declaration command document.
