@@ -52,6 +52,8 @@ alias = "barge"
 # restore guards, and the environment inventory. No image, no scratch and no
 # child process.
 "maintain:native:test" = "python3 scripts/native/s7-maintain-proof.py --self-check"
+"space:native:test" = "python3 scripts/native/space-proof.py --self-check"
+"space:native:plan" = "python3 scripts/native/space-proof.py --plan"
 
 [test.suites.rust]
 # The library and CLI suites. The budgets are the test route's timeout and
@@ -121,3 +123,14 @@ run = "python3 scripts/native/s7-maintain-proof.py counted"
 [tasks."maintain:native:diagnostic"]
 admission = "heavy"
 run = "python3 scripts/native/s7-maintain-proof.py diagnostic"
+
+# Stage 3's elevated space proof. Declarations do not activate a native run.
+# The owner supplies BARGE_PROOF_BIN and separately activates the diagnostic,
+# counted author and independent reviewer runs at the exact reviewed head.
+[tasks."space:native"]
+admission = "heavy"
+run = "python3 scripts/native/space-proof.py counted"
+
+[tasks."space:native:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/native/space-proof.py diagnostic"

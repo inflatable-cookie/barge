@@ -1820,9 +1820,9 @@ preview's exact plan through the stage 1 custody, intent and quarantine protocol
 flushes and re-measures once per batch, and stops on the policy or on a bound.
 There is no second delete path — the same `delete` sequence every other Barge
 deletion uses runs, with the pass's volume lock supplied instead of taken — and
-the guard and recheck are described in [slice T6](#implemented-space-guard-and-recheck-surface-slice-t6). **The stage's native proof is missing: T8 owns
-it. This surface is not qualified by any native receipt, and no real-drive action
-is claimed.**
+the guard and recheck are described in [slice T6](#implemented-space-guard-and-recheck-surface-slice-t6). The stage's native apparatus is described in [T8](#stage-3-native-proof-surface-t8).
+Qualification requires its separately activated receipts; no real-drive action
+is claimed.
 
 - **The effect form.** `barge space prune --volume <uuid> --plan <file>
   --plan-sha256 <hex>` replaces T4's usage refusal. A plan whose bytes do not
@@ -2054,7 +2054,7 @@ neither call makes more than four measurements.
 Attribution is bounded and uses complete scans for the roots it can establish.
 An uncountable or unenumerated component is `null`, not zero; the remaining
 non-Barge figure is labelled an estimate and is unknown if it cannot be formed.
-The stage native proof remains T8's; this surface has no native receipt.
+The [stage native apparatus](#stage-3-native-proof-surface-t8) requires separately activated receipts.
 
 
 ### Implemented maintenance space surface (slice T7)
@@ -2070,5 +2070,21 @@ refusals are per-volume rows. The stage uses the remaining maintenance window.
 `describe` and `space` report observed fallback roots without creating them;
 only an absent volume explains an active fallback, and one observed while the
 volume is present is a contract violation. Unknown observations remain unknown.
-The stage native is missing and belongs to T8. No real-drive qualification or
+The [stage native apparatus](#stage-3-native-proof-surface-t8) requires separately activated receipts. No real-drive qualification or
 host-job change is claimed; scheduled enablement is operator-gated T9.
+
+
+### Stage 3 native proof surface (T8)
+
+`effigy space:native:test` checks the effect-free apparatus and
+`effigy space:native:plan` prints its plan. `effigy space:native` and
+`effigy space:native:diagnostic` are held for separate owner activation with
+`BARGE_PROOF_BIN` naming the binary under test. The uncounted diagnostic is
+followed by one counted author run and one distinct independent reviewer run,
+each at the exact head. The supervisor and proof receipts are required for each:
+`space-native-receipt.json` and the qualified supervisor's `receipt.json` in the
+run's `OXIDE_PROOF_EVIDENCE`. A missing receipt is missing proof, not a pass.
+
+The proof does not claim real USB or Thunderbolt surprise removal, real-drive
+flush latency, internal SSD write savings, APFS purgeable behaviour under real
+pressure, or qualification of Oxide's stage 4 adoption.

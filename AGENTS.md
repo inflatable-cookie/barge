@@ -57,6 +57,11 @@ lists the commands. Each covers what it names:
   owner activation: the declarations activate nothing, `BARGE_PROOF_BIN` names
   the binary, and each run is separately activated (diagnostic first, then the
   counted pass at the exact head). A missing receipt is a missing proof.
+- `effigy space:native:test` — the stage 3 native proof's effect-free apparatus
+  self-check; `effigy space:native:plan` prints its effect-free plan.
+- `effigy space:native` and `effigy space:native:diagnostic` — the stage 3 space
+  proof under the qualified supervisor. HELD for owner activation: diagnostic,
+  counted author and independent reviewer runs are separately activated.
 - `effigy maintain:native:test` — the `barge maintain` native proof's own
   apparatus self-check: its case map and dispatch, the hash-pinned supervisor,
   the nine-premise trace and the environment inventory. No image, no scratch and

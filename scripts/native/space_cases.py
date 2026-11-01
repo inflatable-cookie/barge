@@ -1,0 +1,391 @@
+"""Stage 3 native scenarios. All effects target the owned image and state."""
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+import space_oracles as oracle
+
+MIB = 1024 * 1024
+
+
+class Cases:
+    def __init__(self, fixture):
+        self.fixture = fixture
+        self.first = None
+        self.second = None
+        self.filler = None
+
+    def case_1(self):
+        fixture = self.fixture
+        fixture.declare("first")
+        fixture.declare("second")
+        self.first = fixture.root_create("first")
+        self.second = fixture.root_create("second")
+        if fixture.free() <= 48 * MIB:
+            raise AssertionError("new fixture image is not above the reserve")
+        code, document = fixture.guard()
+        oracle.case_1(code, document)
+        if not os.path.isdir(self.first["path"]) or not os.path.isdir(self.second["path"]):
+            raise AssertionError("above-reserve guard removed a root")
+        return {"free_bytes": document["data"]["before"]["free_bytes"]}
+
+    def case_2(self):
+        fixture = self.fixture
+        # The second area's root is released first and thus has the older LRU
+        # key. Its size and the filler are derived from fresh Barge readings.
+        fixture.hold(self.second, "old", os.getpid())
+        free = fixture.free()
+        fixture.fill_to(os.path.join(self.second["path"], "payload"), free - 10 * MIB)
+        fixture.release(self.second, "old")
+        time.sleep(0.05)
+        fixture.idle(self.first, "new")
+        fixture.wait_until_idle()
+        self.filler = os.path.join(fixture.mount, "proof-filler")
+        measured = fixture.fill_to(self.filler, 40 * MIB)
+        if not 24 * MIB < measured < 48 * MIB:
+            raise AssertionError(f"case 2 setup is outside its measured band: {measured}")
+        code, document = fixture.guard()
+        oracle.case_2(code, document, self.second["root_id"])
+        if os.path.exists(self.second["path"]) or not os.path.isdir(self.first["path"]):
+            raise AssertionError("case 2 did not preserve the newer root")
+        return {"setup_free_bytes": measured, "after_free_bytes": document["data"]["after"]["free_bytes"]}
+
+    def case_3(self):
+        fixture = self.fixture
+        os.unlink(self.filler)
+        self.filler = None
+        held = fixture.root_create("first")
+        idle = fixture.root_create("second")
+        payload = os.path.join(held["path"], "writer")
+        with open(payload, "xb") as handle:
+            handle.write(os.urandom(4096))
+        before = os.stat(payload)
+        writer = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(__file__),
+                                  "space_writer.py"), payload], cwd=fixture.root, env=fixture.env,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+        fixture.images.children.add(writer)
+        try:
+            # A bounded poll of the child's pipe: never wait indefinitely for a
+            # child that failed before its readiness line.
+            import select
+            ready, _, _ = select.select([writer.stdout], [], [], min(10, fixture.images.remaining()))
+            if not ready or writer.stdout.readline().strip() != "ready":
+                raise AssertionError("writer did not become ready")
+            hold = fixture.hold(held, "writer", writer.pid)
+            if hold["hold"]["pid"] != writer.pid or not hold["hold"]["process_start"]:
+                raise AssertionError("writer hold lacks its process identity")
+            fixture.hold(idle, "idle", os.getpid())
+            free = fixture.free()
+            fixture.fill_to(os.path.join(idle["path"], "payload"), free - 12 * MIB)
+            fixture.release(idle, "idle")
+            fixture.wait_until_idle()
+            self.filler = os.path.join(fixture.mount, "proof-filler")
+            measured = fixture.fill_to(self.filler, 35 * MIB)
+            if not 24 * MIB < measured < 48 * MIB:
+                raise AssertionError("case 3 free space outside its band")
+            code, document = fixture.guard()
+            oracle.case_3(code, document, held["root_id"], [self.first["root_id"], idle["root_id"]])
+        finally:
+            if writer.poll() is None:
+                writer.send_signal(signal.SIGTERM)
+            try:
+                out, err = writer.communicate(timeout=min(10, fixture.images.remaining()))
+            except subprocess.TimeoutExpired as error:
+                fixture.images.unknown = True
+                raise AssertionError("writer could not be reaped") from error
+            fixture.images.children.remove(writer)
+        if writer.returncode != 0:
+            raise AssertionError(f"writer failed: {err[-400:]}")
+        last = int(out.strip())
+        after = os.stat(payload)
+        with open(payload, "rb") as handle:
+            record = handle.read()
+        if (before.st_ino != after.st_ino or before.st_size != after.st_size or last < 1
+                or record != f"{last:020d}".encode().ljust(4096, b".")):
+            raise AssertionError("held writer inode, size or final record changed unexpectedly")
+        fixture.release(held, "writer")
+        self.first = held
+        return {"writer_pid": writer.pid, "writer_start": hold["hold"]["process_start"],
+                "last_record": last, "setup_free_bytes": measured}
+
+    def case_4(self):
+        fixture = self.fixture
+        fixture.hold(self.first, "floor", os.getpid())
+        free = fixture.free()
+        if free <= 20 * MIB:
+            raise AssertionError("insufficient setup space for held root")
+        measured = fixture.fill_to(os.path.join(self.first["path"], "floor-payload"), 18 * MIB)
+        if measured > 24 * MIB:
+            raise AssertionError("case 4 did not cross the floor")
+        code, document = fixture.guard(expect=2)
+        oracle.case_4(code, document)
+        if not os.path.isdir(self.first["path"]):
+            raise AssertionError("held floor root disappeared")
+        return {"setup_free_bytes": measured}
+
+    def case_4b(self):
+        fixture = self.fixture
+        idle = fixture.root_create("second")
+        fixture.hold(idle, "short", os.getpid())
+        before = fixture.free()
+        if before <= 4 * MIB or 24 * MIB - before <= 4 * MIB:
+            raise AssertionError("case 4b lacks room below the floor")
+        measured = fixture.fill_to(os.path.join(idle["path"], "payload"), before - 2 * MIB)
+        fixture.release(idle, "short")
+        fixture.wait_until_idle()
+        code, document = fixture.guard()
+        oracle.case_4b(code, document, idle["root_id"])
+        if os.path.exists(idle["path"]):
+            raise AssertionError("case 4b idle root survived")
+        return {"setup_free_bytes": measured, "after_free_bytes": document["data"]["after"]["free_bytes"]}
+
+    def case_5(self):
+        fixture = self.fixture
+        os.unlink(self.filler)
+        self.filler = None
+        unknown_hold = fixture.root_create("first")
+        missing_activity = fixture.root_create("second")
+        activity = os.path.join(fixture.env["BARGE_STATE_DIR"], "activity",
+                                missing_activity["root_id"] + ".json")
+        os.unlink(activity)
+        hold = fixture.hold(unknown_hold, "unknown", os.getpid())
+        os.chmod(hold["path"], 0)
+        try:
+            with open(hold["path"], "rb"):
+                pass
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("fixture hold is readable under this account")
+        free = fixture.free()
+        fixture.fill_to(os.path.join(unknown_hold["path"], "payload"), free - 3 * MIB)
+        free = fixture.free()
+        fixture.fill_to(os.path.join(missing_activity["path"], "payload"), free - 3 * MIB)
+        self.filler = os.path.join(fixture.mount, "proof-filler")
+        measured = fixture.fill_to(self.filler, 35 * MIB)
+        if not 24 * MIB < measured < 48 * MIB:
+            raise AssertionError("case 5 free space outside its band")
+        code, document = fixture.guard()
+        oracle.case_5(code, document, unknown_hold["root_id"], missing_activity["root_id"])
+        if not os.path.isdir(unknown_hold["path"]) or not os.path.isdir(missing_activity["path"]):
+            raise AssertionError("case 5 removed a protected root")
+        return {"setup_free_bytes": measured}
+
+    def case_6(self):
+        fixture = self.fixture
+        images = fixture.images
+        first_uuid, first_mount = fixture.uuid, fixture.mount
+        images.detach()
+        if os.path.lexists(first_mount):
+            raise AssertionError("first mount was recreated after detach")
+        images.create(1)
+        second_mount = first_mount + "-second"
+        attachment = images.attach(1, second_mount)
+        second_uuid = fixture.register(second_mount, 16 * MIB, 32 * MIB, "second-plan.json")
+        if attachment["volume_uuid"] != second_uuid.lower() or second_uuid == first_uuid:
+            raise AssertionError("second registration did not name its own volume")
+        idle = fixture.root_create("first")
+        fixture.hold(idle, "second-idle", os.getpid())
+        free = fixture.free()
+        fixture.fill_to(os.path.join(idle["path"], "payload"), free - 2 * MIB)
+        fixture.release(idle, "second-idle")
+        fixture.wait_until_idle()
+        filler = os.path.join(second_mount, "proof-filler")
+        measured = fixture.fill_to(filler, 28 * MIB)
+        if not 16 * MIB < measured <= 30 * MIB:
+            raise AssertionError("case 6 free space outside its band")
+        code, document = fixture.guard()
+        oracle.case_6(code, document, idle["root_id"])
+        after = document["data"]["after"]["free_bytes"]
+        images.detach()
+        if os.path.lexists(second_mount):
+            raise AssertionError("second mount was recreated after detach")
+        attachment = images.attach(0, first_mount)
+        if attachment["volume_uuid"] != first_uuid.lower():
+            raise AssertionError("reattached primary image UUID changed")
+        fixture.uuid, fixture.mount = first_uuid, first_mount
+        return {"setup_free_bytes": measured, "after_free_bytes": after,
+                "second_uuid": second_uuid}
+
+    def case_7(self):
+        fixture = self.fixture
+        os.unlink(self.filler)
+        self.filler = None
+        root = fixture.root_create("second")
+        fixture.hold(root, "hardlink", os.getpid())
+        outside = os.path.join(fixture.mount, "proof-outside-link")
+        free = fixture.free()
+        fixture.fill_to(outside, free - 10 * MIB)
+        os.link(outside, os.path.join(root["path"], "payload"))
+        fixture.release(root, "hardlink")
+        fixture.wait_until_idle()
+        self.filler = os.path.join(fixture.mount, "proof-filler")
+        measured = fixture.fill_to(self.filler, 35 * MIB)
+        if not 24 * MIB < measured < 48 * MIB:
+            raise AssertionError("case 7 free space outside its band")
+        code, document = fixture.guard()
+        guard = oracle.case_7(code, document, root["root_id"])
+        if os.path.exists(root["path"]):
+            raise AssertionError("case 7 chosen root survived")
+        os.unlink(outside)
+        code, document = fixture.command("space", "recheck", "--guard", guard)
+        oracle.case_7_recheck(code, document)
+        return {"setup_free_bytes": measured,
+                "recheck_free_bytes": document["data"]["after"]["free_bytes"]}
+
+    def case_8(self):
+        fixture = self.fixture
+        images = fixture.images
+        root = fixture.root_create("second")
+        fixture.hold(root, "interrupted", os.getpid())
+        free = fixture.free()
+        if free <= 32 * MIB:
+            raise AssertionError("case 8 has insufficient setup space")
+        fixture.fill_to(os.path.join(root["path"], "payload"), free - 5 * MIB)
+        fixture.release(root, "interrupted")
+        fixture.wait_until_idle()
+        if fixture.free() > 48 * MIB:
+            raise AssertionError("case 8 is not below the reserve")
+        source = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scratch-enotempty-shim.c"))
+        library = os.path.join(fixture.root, "space-pause.dylib")
+        code, _, err = images.run(["/usr/bin/clang", "-dynamiclib", "-Wall", "-Wextra", "-Werror",
+                                   source, "-o", library], 30)
+        if code:
+            raise AssertionError(f"proof interposer compilation failed: {err[-400:]!r}")
+        log = os.path.join(images.evidence, "space-pause.log")
+        if os.path.lexists(log):
+            raise AssertionError("pause log already exists")
+        stat = os.stat(root["path"])
+        env = dict(fixture.env, DYLD_INSERT_LIBRARIES=library,
+                   BARGE_PROOF_PAUSE_PATH=root["path"], BARGE_PROOF_PAUSE_LOG=log)
+        child = subprocess.Popen([fixture.binary, "space", "guard", "--volume", fixture.uuid,
+                                  "--area", "proof/first", "--json"], env=env, cwd=fixture.root,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        images.children.add(child)
+        reaped = False
+        try:
+            until = time.monotonic() + min(30, images.remaining())
+            expected = f"{root['path']}\t{stat.st_dev}\t{stat.st_ino}"
+            reached = False
+            while time.monotonic() < until and child.poll() is None:
+                if os.path.isfile(log):
+                    with open(log, encoding="utf-8") as handle:
+                        reached = handle.read().splitlines() == [expected]
+                    if reached:
+                        break
+                time.sleep(0.01)
+            if not reached:
+                raise AssertionError("exact-root unlink pause was not reached")
+            child.send_signal(signal.SIGTERM)
+            out, err = child.communicate(timeout=min(10, images.remaining()))
+            images.children.remove(child)
+            reaped = True
+            if child.returncode != -signal.SIGTERM or out:
+                raise AssertionError(f"paused guard did not terminate without a document: {child.returncode}, {out!r}, {err[-200:]!r}")
+        finally:
+            if not reaped:
+                images.unknown = True
+        pending = self.pending_intents()
+        matching = [row for row in pending
+                    if (row.get("unit", {}).get("root_id") or row.get("unit", {}).get("name"))
+                    == root["root_id"]]
+        if len(matching) != 1:
+            raise AssertionError("interrupted root has no unique pending intent")
+        capture = matching[0]["unit"]["capture_name"]
+        if not capture.startswith(".barge-prune-") or os.path.basename(capture) != capture:
+            raise AssertionError("intent has an unsafe quarantine name")
+        quarantine = os.path.join(os.path.dirname(root["path"]), capture)
+        if not os.path.isdir(quarantine):
+            raise AssertionError("interrupted quarantine leaf is absent")
+        old_uuid, mount = fixture.uuid, fixture.mount
+        images.detach()
+        if os.path.lexists(mount):
+            raise AssertionError("mount recreated after interruption detach")
+        code, absent = fixture.guard(expect=2)
+        oracle.refusal(code, absent, "volume_absent")
+        if not self.pending_intents() or os.path.lexists(mount):
+            raise AssertionError("absence changed the intent or recreated the mount")
+        attachment = images.attach(0, mount)
+        if attachment["volume_uuid"] != old_uuid.lower():
+            raise AssertionError("reattached image UUID changed")
+        code, replay = fixture.guard()
+        measured = oracle.case_8(code, replay, root["root_id"])
+        def sha256(path):
+            digest = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+            return digest.hexdigest()
+        return {"free_bytes": measured, "root_id": root["root_id"],
+                "decision": replay["data"]["decision"], "source_sha256": sha256(source),
+                "interposer_sha256": sha256(library)}
+
+    def pending_intents(self):
+        directory = os.path.join(self.fixture.env["BARGE_STATE_DIR"], "intents")
+        if not os.path.isdir(directory):
+            return []
+        result = []
+        for name in sorted(os.listdir(directory)):
+            with open(os.path.join(directory, name), encoding="utf-8") as handle:
+                document = json.load(handle)
+            if document["phase"] != "deleted":
+                result.append(document)
+        return result
+
+    def case_9(self):
+        # Each successful Images.detach checks mount absence before returning.
+        # The stale mount-root seam itself is covered by the Rust unit test.
+        if self.fixture.images.current is None or self.fixture.images.unknown:
+            raise AssertionError("primary attachment is not positively restored")
+        return {"seam": "guard_refuses_absent_and_stale_mount_without_recreating_it"}
+
+    def case_10(self):
+        import hashlib
+        import tempfile
+        fixture = self.fixture
+        images = fixture.images
+        old_state = fixture.env["BARGE_STATE_DIR"]
+        private = tempfile.mkdtemp(prefix="registration-refusals-", dir=fixture.root)
+        fixture.env["BARGE_STATE_DIR"] = private
+        args = ["volume", "register", "--plan", "--mount", fixture.mount,
+                "--availability", "permanent", "--durability", "expendable",
+                "--root-dir", "", "--reserve", "48MiB", "--floor", "24MiB",
+                "--declared-by", "native-fixture"]
+        try:
+            _, preview = fixture.command(*args)
+            plan = json.loads(preview["data"]["plan"])
+            plan["record"]["volume_uuid"] = "A6AC3ED7-33EA-46B4-8082-7254CF291ED2"
+            if plan["record"]["volume_uuid"].lower() == fixture.uuid.lower():
+                raise AssertionError("tampered UUID unexpectedly names the fixture")
+            raw = json.dumps(plan, separators=(",", ":")).encode()
+            plan_file = os.path.join(fixture.root, "tampered-registration-plan.json")
+            with open(plan_file, "xb") as handle:
+                handle.write(raw)
+            code, doc = fixture.command("volume", "register", "--plan-file", plan_file,
+                                        "--plan-sha256", hashlib.sha256(raw).hexdigest(), expect=2)
+            oracle.refusal(code, doc, "volume_mismatch")
+            malformed = args.copy()
+            malformed[malformed.index("48MiB")] = "not-a-size"
+            code, doc = fixture.command(*malformed, expect=2)
+            oracle.refusal(code, doc, "usage")
+            too_large = args.copy()
+            too_large[too_large.index("24MiB")] = "1TiB"
+            code, doc = fixture.command(*too_large, expect=2)
+            oracle.refusal(code, doc, "usage")
+            if os.listdir(private):
+                raise AssertionError("registration refusals wrote fixture state")
+            images.detach()
+            if os.path.lexists(fixture.mount):
+                raise AssertionError("mount recreated after final detach")
+            code, doc = fixture.command(*args, expect=2)
+            oracle.refusal(code, doc, "volume_absent")
+            if os.listdir(private) or os.path.lexists(fixture.mount):
+                raise AssertionError("absent registration wrote state or recreated mount")
+            return {"unverified_uuid_kind": "volume_mismatch", "refusals": 4}
+        finally:
+            fixture.env["BARGE_STATE_DIR"] = old_state
