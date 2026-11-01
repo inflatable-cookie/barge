@@ -1198,7 +1198,7 @@ native, and a missing receipt from the slice that runs it is a missing proof.
 | # | Case | What it proves |
 | --- | --- | --- |
 | 1 | Register the image with `reserve 48 MiB`, `floor 24 MiB`; fill two areas with roots so free is above the reserve; guard | admission with no prune, no flush, nothing deleted |
-| 2 | Fill below the reserve with idle roots in two areas of different ages; guard | LRU across areas: the older-release root from the second area goes first; admission once free is back above the reserve |
+| 2 | Fill below the reserve with idle roots in two areas of different ages; guard | LRU across areas: the older-release root from the second area is pruned first (batch-granular target check); admission once free is back above the reserve |
 | 3 | Hold one root and keep writing to it in a second process while a guard prunes the rest | the held root's inode and bytes are unchanged, the writer's data is intact, the pass reports it as held |
 | 4 | Fill below the floor with every eligible root held | no-effect refusal `space_below_floor` at exit `2` (the pass deleted nothing); the message and detail carry free, floor, reserve, held bytes and cause; the fake internal pool is empty afterwards |
 | 4b | Fill below the floor again, this time with one large eligible idle root | the pass deletes it and the floor is still breached: a **completed stop** (`ok: true`, `decision: stop_below_floor`, exit `0`) listing the deleted root, and the fake internal pool is still empty |
@@ -2079,7 +2079,9 @@ host-job change is claimed; scheduled enablement is operator-gated T9.
 `effigy space:native:test` checks the effect-free apparatus and
 `effigy space:native:plan` prints its plan. `effigy space:native` and
 `effigy space:native:diagnostic` are held for separate owner activation with
-`BARGE_PROOF_BIN` naming the binary under test. The uncounted diagnostic is
+`BARGE_PROOF_BIN` naming the binary under test. Case 2 checks that the older
+second-area root is pruned first (batch-granular target check), and records
+planned and actual order with the measurements and policy. The uncounted diagnostic is
 followed by one counted author run and one distinct independent reviewer run,
 each at the exact head. The supervisor and proof receipts are required for each:
 `space-native-receipt.json` and the qualified supervisor's `receipt.json` in the

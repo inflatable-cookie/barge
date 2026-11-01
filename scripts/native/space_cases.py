@@ -83,10 +83,11 @@ class Cases:
         self.context["2"] = {"setup_free_bytes": measured, "older_root": self.second["root_id"],
                              "older_area": "proof/second", "candidates": candidates}
         code, document = fixture.guard()
-        oracle.case_2(code, document, self.second["root_id"])
-        if os.path.exists(self.second["path"]) or not os.path.isdir(self.first["path"]):
-            raise AssertionError("case 2 did not preserve the newer root")
-        return {"setup_free_bytes": measured, "after_free_bytes": document["data"]["after"]["free_bytes"]}
+        evidence = oracle.case_2(code, document, self.second["root_id"], self.first["root_id"],
+                                 candidates, preview["data"]["kept"])
+        if os.path.exists(self.second["path"]):
+            raise AssertionError("case 2 older root survived")
+        return evidence
 
     def case_3(self):
         fixture = self.fixture
@@ -122,8 +123,11 @@ class Cases:
             measured = fixture.fill_to(self.filler, 35 * MIB)
             if not 24 * MIB < measured < 48 * MIB:
                 raise AssertionError("case 3 free space outside its band")
+            idle_roots = [idle["root_id"]]
+            if os.path.isdir(self.first["path"]):
+                idle_roots.append(self.first["root_id"])
             code, document = fixture.guard()
-            oracle.case_3(code, document, held["root_id"], [self.first["root_id"], idle["root_id"]])
+            oracle.case_3(code, document, held["root_id"], idle_roots)
         finally:
             if writer.poll() is None:
                 writer.send_signal(signal.SIGTERM)

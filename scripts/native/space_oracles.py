@@ -37,10 +37,33 @@ def case_1(code, document):
     assert data["detail"]["other_estimate_bytes"] is None
 
 
-def case_2(code, document, older_root):
+def case_2(code, document, older_root, younger_root, candidates, kept):
     data = success(code, document)
-    assert data["decision"] == "admit" and root_ids(data) == [older_root]
+    planned = rows(candidates)
+    kept_rows = rows(kept)
+    planned_ids = [row["root_id"] for row in planned]
+    keys = [(row["last_release_ms"], row["first_created_ms"] or (2**64 - 1), row["root_id"])
+            for row in planned]
+    assert len(planned_ids) == len(set(planned_ids)) and keys == sorted(keys)
+    assert planned_ids and planned_ids[0] == older_root and younger_root in planned_ids
+    assert planned[0]["area"] == "proof/second"
+    assert next(row for row in planned if row["root_id"] == younger_root)["area"] == "proof/first"
+    pruned = root_ids(data)
+    assert data["decision"] == "admit" and pruned and pruned[0] == older_root
+    assert rows(data["pruned"])[0]["area"] == "proof/second"
+    assert len(pruned) == len(set(pruned)) and all(root in planned_ids for root in pruned)
+    assert [planned_ids.index(root) for root in pruned] == sorted(planned_ids.index(root) for root in pruned)
+    assert not set(pruned).intersection(row.get("root_id") for row in kept_rows)
+    if data["observed_kept"] is not None:
+        assert not set(pruned).intersection(row.get("root_id") for row in rows(data["observed_kept"]))
     assert data["detail"]["stop"] == "target_reached"
+    assert data["after"]["free_bytes"] > data["policy"]["reserve_bytes"]
+    return {"planned_lru": [{"root_id": row["root_id"], "area": row["area"],
+                             "last_release_ms": row["last_release_ms"],
+                             "first_created_ms": row["first_created_ms"]} for row in planned],
+            "pruned_order": pruned, "F": data["before"]["free_bytes"],
+            "F_prime": data["after"]["free_bytes"], "R": data["policy"]["reserve_bytes"],
+            "L": data["policy"]["floor_bytes"]}
 
 
 def case_3(code, document, held_root, idle_roots):
@@ -131,6 +154,26 @@ def self_check():
         pass
     else:
         problems.append("case 1 accepted attribution zero instead of null")
+    planned = rowset([
+        {"root_id": "older", "area": "proof/second", "last_release_ms": 1, "first_created_ms": 1},
+        {"root_id": "younger", "area": "proof/first", "last_release_ms": 2, "first_created_ms": 2},
+    ])
+    guard = {"schema": "barge.space.guard/1", "ok": True, "data": {
+        "decision": "admit", "pruned": rowset([{"root_id": "older", "area": "proof/second"},
+                            {"root_id": "younger", "area": "proof/first"}]),
+        "observed_kept": rowset([]), "before": {"free_bytes": 40}, "after": {"free_bytes": 50},
+        "policy": {"reserve_bytes": 48, "floor_bytes": 24}, "detail": {"stop": "target_reached"}}}
+    try:
+        case_2(0, guard, "older", "younger", planned, rowset([]))
+    except (AssertionError, KeyError, TypeError) as error:
+        problems.append(f"case 2 batch-order positive oracle refused: {error}")
+    guard["data"]["pruned"]["rows"].reverse()
+    try:
+        case_2(0, guard, "older", "younger", planned, rowset([]))
+    except AssertionError:
+        pass
+    else:
+        problems.append("case 2 accepted the younger root first")
     for code, document in ((0, {"schema": "barge.error/1", "ok": False,
                                 "error": {"kind": "volume_mismatch"}}),
                            (2, {"schema": "barge.error/1", "ok": False,
