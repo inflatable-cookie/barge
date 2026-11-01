@@ -80,7 +80,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::area::{self, HoldState, MarkerExpectation, MarkerState};
+use crate::area::{self, HoldState, MarkerExpectation, MarkerState, MountLookup};
 use crate::contract::{HOLD_ROWS, MARKER_CAP_BYTES};
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
@@ -385,11 +385,38 @@ pub fn take_custody(
     pending: &[PendingIntent],
     bounds: CustodyBounds,
 ) -> CustodyVerdict {
+    take_custody_by(
+        MountLookup::Hint,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        state_paths,
+        unit,
+        pending,
+        bounds,
+    )
+}
+
+/// [`take_custody`] through the given volume lookup.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn take_custody_by(
+    lookup: MountLookup<'_>,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    state_paths: &StatePaths,
+    unit: &DeletionUnit,
+    pending: &[PendingIntent],
+    bounds: CustodyBounds,
+) -> CustodyVerdict {
     match decide(
         dirs,
         facts,
         mounts,
         observer,
+        lookup,
         state_paths,
         unit,
         pending,
@@ -416,11 +443,40 @@ pub(crate) fn take_identity_custody(
     bounds: CustodyBounds,
     root_id: &str,
 ) -> CustodyVerdict {
+    take_identity_custody_by(
+        MountLookup::Hint,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        state,
+        unit,
+        pending,
+        bounds,
+        root_id,
+    )
+}
+
+/// [`take_identity_custody`] through the given volume lookup.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn take_identity_custody_by(
+    lookup: MountLookup<'_>,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    state: &StatePaths,
+    unit: &DeletionUnit,
+    pending: &[PendingIntent],
+    bounds: CustodyBounds,
+    root_id: &str,
+) -> CustodyVerdict {
     match decide(
         dirs,
         facts,
         mounts,
         observer,
+        lookup,
         state,
         unit,
         pending,
@@ -551,6 +607,7 @@ fn decide(
     facts: &dyn VolumeFacts,
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
+    lookup: MountLookup<'_>,
     state_paths: &StatePaths,
     unit: &DeletionUnit,
     pending: &[PendingIntent],
@@ -628,7 +685,8 @@ fn decide(
     if let Err(reason) = grant_still_recorded(&record, unit) {
         return Err(Refusal::refuse_unknown(reason));
     }
-    let opened = area::open_folder(
+    let opened = area::open_folder_by(
+        lookup,
         dirs,
         facts,
         mounts,
@@ -686,10 +744,23 @@ fn decide(
         )));
     }
 
+    // The marker names the mount it was written under. Under a census lookup that is
+    // the live mount the census found, never the stored point.
+    let mount_point = match lookup {
+        MountLookup::Hint => record.mount_hint.clone(),
+        MountLookup::ByUuid(_) => Some(
+            area::VolumeRoot::open_with(dirs, facts, mounts, lookup, &record)
+                .map_err(|error| {
+                    Refusal::refuse_unknown(format!("the live mount does not verify: {error}"))
+                })?
+                .mount_point()
+                .to_path_buf(),
+        ),
+    };
     let expectation = MarkerExpectation {
         volume_uuid: &unit.volume_uuid,
         resolved_path: &unit_path,
-        mount_point: record.mount_hint.as_deref(),
+        mount_point: mount_point.as_deref(),
         effective_uid: observer.effective_uid().map_err(|error| {
             Refusal::refuse_unknown(format!("the account uid is unreadable: {error}"))
         })?,

@@ -2124,6 +2124,10 @@ fn the_cli_names_every_reachable_decision_reason() {
 
 /// Write the state a `prune --plan` fixture needs: one registered volume whose
 /// mount point is not attached, and one declared area.
+/// A volume UUID no host mounts. The Builds drive carries `A6AC3ED7-…`, so an absence
+/// fixture that names it would find the live drive and stop being an absence.
+const ABSENT_VOLUME: &str = "5C3E7A10-2B4D-4F6A-9E8B-1D2C3B4A5F60";
+
 fn write_prune_state(state_dir: &Path, availability: &str) {
     use barge::os::VolumeUuid;
     use barge::registry::{
@@ -2137,7 +2141,7 @@ fn write_prune_state(state_dir: &Path, availability: &str) {
         _ => Availability::Ephemeral,
     };
     let record = VolumeRecord {
-        volume_uuid: VolumeUuid::parse("A6AC3ED7-33EA-46B4-8082-7254CF291ED2").expect("a UUID"),
+        volume_uuid: VolumeUuid::parse(ABSENT_VOLUME).expect("a UUID"),
         // A mount point nothing is attached at: the plan must report the volume
         // absent rather than recreate or read through the stale path.
         mount_hint: Some(PathBuf::from("/Volumes/Barge-Cli-Fixture-Absent-A6AC3ED7")),
@@ -2185,7 +2189,7 @@ fn prune_plans_one_area_and_only_writes_the_file_it_was_given() {
             "--area",
             "example/pool",
             "--volume",
-            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            ABSENT_VOLUME,
             "--plan-out",
             plan_out.to_str().unwrap(),
             "--json",
@@ -2234,7 +2238,7 @@ fn prune_plans_one_area_and_only_writes_the_file_it_was_given() {
             "--area",
             "example/pool",
             "--volume",
-            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            ABSENT_VOLUME,
             "--json",
         ],
         &other_state,
@@ -2435,7 +2439,7 @@ fn prune_refuses_the_effect_form_missing_arguments_and_an_unregistered_volume() 
             "--area",
             "example/elsewhere",
             "--volume",
-            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            ABSENT_VOLUME,
             "--json",
         ],
         &state_dir,

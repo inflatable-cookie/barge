@@ -1474,7 +1474,13 @@ this, in order. Each batch-wide refusal changes nothing.
    re-serialise to the same bytes. The plan's area and volume must be the
    command's.
 2. The gate runs again for the same area (F3's `plan`), with the presented plan's
-   own named roots, before the volume lock, because a plan takes that lock shared. A volume that is not attached, a volume
+   own named roots, before the volume lock, because a plan takes that lock shared.
+   The volume is found by its recorded UUID (`MountLookup::ByUuid`), not by its stored
+   mount point: a remount under another name is the same volume, one live mount is
+   verified and opened as the descriptor, a stored point that another volume occupies
+   is never trusted, zero live mounts is `volume_absent`, and two are `unknown` with
+   exit `3`. Custody, the area folder and the deletion itself resolve the same way,
+   so the effect re-proves the live volume. A volume that is not attached, a volume
    with an undeclared durability, or an incomplete Oxide reference set refuses the
    whole batch.
 3. Each presented eligible row must agree with the fresh row on identity verdict,
@@ -1535,7 +1541,11 @@ lock, replays, and calls `delete::delete_unit_under_volume_lock` with `reprove_r
 as its `authorize`; `reprove_row` is the effect-time re-proof. `delete.rs` is
 unchanged. `reference.rs` changes one detail string. `barge-cli` `prune_plan`
 dispatches bare `--plan` to the preview and `--plan <file>` with a digest to the
-run. The proof build's only seam is `os/macos.rs` `tool_account_home`, which reads
+run. `area.rs` `MountLookup` and `VolumeRoot::open_with` carry the lookup: the release
+gate, its custody and its deletion use `ByUuid`, and every other caller keeps `Hint`,
+the stored point, which is unchanged. `identify` still requires the stored point to
+match the census, because it is an explicit repair command, not the release path. The
+proof build's only seam is `os/macos.rs` `tool_account_home`, which reads
 `os/proof_account.rs` under its feature.
 
 **Case table.** Each case is carried by a named regression. The apparatus's

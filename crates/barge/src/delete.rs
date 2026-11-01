@@ -94,7 +94,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::area::{self, AreaDeclaration, MarkerExpectation};
+use crate::area::{self, AreaDeclaration, MarkerExpectation, MountLookup};
 use crate::contract::{INTENT_ROWS, LISTING_NAME_ROWS};
 use crate::custody::{self, CustodyBounds, CustodyEvidence, CustodyVerdict, PendingIntent};
 use crate::error::{Error, ErrorKind, Result};
@@ -405,6 +405,7 @@ pub(crate) fn delete_unit_authorized(
         facts,
         mounts,
         observer,
+        MountLookup::Hint,
         declaration,
         unit,
         bounds,
@@ -433,6 +434,7 @@ pub(crate) fn delete_unit_under_volume_lock(
     facts: &dyn VolumeFacts,
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
+    lookup: MountLookup<'_>,
     declaration: &AreaDeclaration,
     unit: &DeletionUnit,
     bounds: DeleteBounds,
@@ -455,6 +457,7 @@ pub(crate) fn delete_unit_under_volume_lock(
         facts,
         mounts,
         observer,
+        lookup,
         declaration,
         unit,
         bounds,
@@ -471,6 +474,7 @@ fn delete_unit_locked(
     facts: &dyn VolumeFacts,
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
+    lookup: MountLookup<'_>,
     declaration: &AreaDeclaration,
     unit: &DeletionUnit,
     bounds: DeleteBounds,
@@ -514,6 +518,7 @@ fn delete_unit_locked(
         facts,
         mounts,
         observer,
+        lookup,
         &volume_uuid,
         declaration,
     )?;
@@ -602,7 +607,8 @@ fn delete_unit_locked(
     if let Some(authorize) = authorize {
         authorize(&record)?;
     }
-    let Some((area_path, area_handle)) = area::open_folder(
+    let Some((area_path, area_handle)) = area::open_folder_by(
+        lookup,
         dirs,
         facts,
         mounts,
@@ -637,6 +643,7 @@ fn delete_unit_locked(
         facts,
         mounts,
         observer,
+        lookup,
         state_paths,
         unit,
         &pending,
@@ -700,6 +707,7 @@ fn delete_unit_locked(
         facts,
         mounts,
         observer,
+        lookup,
         state_paths,
         unit,
         &pending,
@@ -825,13 +833,15 @@ fn unit_custody(
     facts: &dyn VolumeFacts,
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
+    lookup: MountLookup<'_>,
     state_paths: &StatePaths,
     unit: &DeletionUnit,
     pending: &[PendingIntent],
     bounds: CustodyBounds,
 ) -> CustodyVerdict {
     match &unit.root_id {
-        Some(root_id) => custody::take_identity_custody(
+        Some(root_id) => custody::take_identity_custody_by(
+            lookup,
             dirs,
             facts,
             mounts,
@@ -842,7 +852,8 @@ fn unit_custody(
             bounds,
             root_id,
         ),
-        None => custody::take_custody(
+        None => custody::take_custody_by(
+            lookup,
             dirs,
             facts,
             mounts,
