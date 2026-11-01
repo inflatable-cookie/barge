@@ -1076,9 +1076,9 @@ data, marker and record are unchanged and reported.
 | Area declaration withdrawn mid-pass | declaration re-read with the registry snapshot | the root stops being a candidate; skip and report |
 | Floor or reserve edited while work runs | the recheck's fresh policy read | the new thresholds apply at that checkpoint; documented, not a race |
 | Volume's durability changed to `kept` mid-pass | registry generation compare | stop; delete nothing further; report `unknown_state`/`refused_boundary` at exit `3`, naming what was already deleted |
-| Pending intent from an earlier prune | intent directory | that root is skipped and reported; the guard `unknown_state` (exit `3`) with `detail.pending_intent`, rather than admitting over an unsettled delete |
+| Pending intent from an earlier prune | intent directory | keep the covered root with reason `pending_intent`, count its bytes as held or unknown, and decide on measured free space; an unreadable journal is `unknown_state` (exit `3`) |
 | `ENOSPC` on the state volume | intent or activity write | refuse before the effect; nothing deleted; report the state volume |
-| Signal during a batch (SIGINT/SIGTERM) | signal | finish the current durable step, leave the intent (never an unrecorded effect), release locks, exit non-zero |
+| Signal during a batch (SIGINT/SIGTERM) | signal | no handler: durable intent and phase ordering prevent an unrecorded effect; the intent remains pending for replay, the kernel releases flock locks on process exit, and termination is non-zero |
 | Prune budget exhausted mid-batch | per-root and per-pass deadlines | stop; decide from the last flushed measurement; report `budget_exhausted` and what was not reached, in the completed-stop or no-effect-refusal shape that matches whether anything was deleted |
 | Finder recreates `.DS_Store` during the delete | `ENOTEMPTY`/`EEXIST` | stage 1's three attempts, 1 s apart, then pending intent and exit `3`; never a wider delete |
 | Unknown entry inside a chosen root | the walk | stop, keep the root, report the name; the candidate is skipped for the rest of the pass |
