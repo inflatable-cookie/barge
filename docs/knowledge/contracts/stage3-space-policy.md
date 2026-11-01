@@ -1895,6 +1895,10 @@ is claimed.**
   the earlier preflight read is not pruning authority. Kept or unreadable durability
   stops the pass before replay touches a quarantine leaf or changes an intent.
   Registration shares this lock, so it cannot publish during the locked replay.
+  The shared ordinary deletion and replay paths also retain their volume lock
+  tokens for the whole operation. A `removed` intent whose folder or parent is
+  positively absent settles under the caller's existing volume lock rather than
+  trying to acquire it again.
   The pass replays **only the pending intents
   whose recorded volume is that volume**, under the lock it already holds, from
   their recorded identities only, after the volume re-verifies — never the account

@@ -2571,13 +2571,14 @@ mod tests {
         let (root, path) = harness.seed("pool", 1_000);
         let (_, bytes) = harness.preview();
         // Reserve 32, floor 8: the plan's target (16) is stale, and the new policy
-        // still needs the prune, so the pass adopts it and deletes.
+        // still needs the prune at free=20. The stale target would stop without
+        // deleting, so this distinguishes refreshing before the first decision.
         let record = Harness::register(&harness.fixture, 32, 8);
         assert_ne!(record.generation, harness.record.generation);
         let report = harness
             .run(
                 &bytes,
-                &Meter::new(&[4, 4, 40]),
+                &Meter::new(&[20, 20, 40]),
                 &Flusher::ok(),
                 SpacePruneBounds::design(),
             )
@@ -3481,6 +3482,29 @@ mod tests {
             "the second volume left an intent pending"
         );
 
+        // A requested-volume lock refusal must not replay another volume's
+        // intent either. Compare the entire journal before allowing the pass.
+        {
+            let mut locks = LockSet::new(harness.fixture.state.clone());
+            let _lock = locks
+                .lock_volume(&harness.record.volume_uuid)
+                .expect("hold requested volume");
+            let error = harness
+                .run(
+                    &bytes_a,
+                    &Meter::new(&[4]),
+                    &Flusher::ok(),
+                    SpacePruneBounds::design(),
+                )
+                .expect_err("requested volume is locked");
+            assert_eq!(error.kind(), ErrorKind::Locked);
+            let after = state::read_intents(&harness.fixture.state, INTENT_ROWS).expect("journal");
+            assert_eq!(
+                after.records, journal.records,
+                "lock refusal leaves other-volume journal untouched"
+            );
+            assert!(path_a.is_dir());
+        }
         // This volume's pass is neither blocked nor made to replay it.
         let report = harness
             .run(
@@ -3613,88 +3637,96 @@ mod tests {
     /// finishing the deletion. This is the reviewer's reproduced defect, pinned.
     #[test]
     fn a_replay_refuses_to_finish_a_deletion_a_live_hold_covers() {
-        let harness = Harness::new("space-prune-replay-hold", RESERVE, FLOOR);
-        let (root_id, path) = harness.seed("pool", 1_000);
-        let (_, bytes) = harness.preview();
+        for adopted in [false, true] {
+            let harness = Harness::new("space-prune-replay-hold", RESERVE, FLOOR);
+            let (root_id, path) = if adopted {
+                let (id, path, _) = harness.seed_adopted("pool", "adopted-name", 1_000);
+                (id, path)
+            } else {
+                harness.seed("pool", 1_000)
+            };
+            let (_, bytes) = harness.preview();
 
-        // Interrupt the pass mid-deletion: the root is captured, the intent pending.
-        let faults = Faults::new().with_device_shift(
-            "payload.bin",
-            crate::os::DeviceId::new(harness.fixture.device.get().saturating_add(1)),
-        );
-        harness
-            .run_with(
-                &faults,
-                &bytes,
-                &Meter::new(&[4]),
-                &Flusher::ok(),
-                SpacePruneBounds::design(),
+            // Interrupt the pass mid-deletion: the root is captured, the intent pending.
+            let faults = Faults::new().with_device_shift(
+                "payload.bin",
+                crate::os::DeviceId::new(harness.fixture.device.get().saturating_add(1)),
+            );
+            harness
+                .run_with(
+                    &faults,
+                    &bytes,
+                    &Meter::new(&[4]),
+                    &Flusher::ok(),
+                    SpacePruneBounds::design(),
+                )
+                .expect_err("the first run is interrupted");
+            assert!(!path.exists(), "the root is in its quarantine leaf");
+
+            // A consumer now records a live hold on the root by the id its marker
+            // proves. The root's directory is already captured, so the hold is written
+            // as account state, exactly as a hold that raced the capture would be.
+            let holds = harness.fixture.state.holds_dir().join(&root_id);
+            std::fs::create_dir_all(&holds).expect("the hold directory is made");
+            std::fs::set_permissions(&holds, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .expect("the hold directory is private");
+            let file = holds.join("consumer.json");
+            std::fs::write(
+                &file,
+                crate::testkit::VolumeFixture::hold_record(
+                    &root_id,
+                    "consumer",
+                    std::process::id(),
+                    7_000_000,
+                    crate::testkit::FIXTURE_BOOT,
+                ),
             )
-            .expect_err("the first run is interrupted");
-        assert!(!path.exists(), "the root is in its quarantine leaf");
+            .expect("the hold is written");
+            std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .expect("the hold is private");
 
-        // A consumer now records a live hold on the root by the id its marker
-        // proves. The root's directory is already captured, so the hold is written
-        // as account state, exactly as a hold that raced the capture would be.
-        let holds = harness.fixture.state.holds_dir().join(&root_id);
-        std::fs::create_dir_all(&holds).expect("the hold directory is made");
-        std::fs::set_permissions(&holds, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .expect("the hold directory is private");
-        let file = holds.join("consumer.json");
-        std::fs::write(
-            &file,
-            crate::testkit::VolumeFixture::hold_record(
-                &root_id,
-                "consumer",
-                std::process::id(),
-                7_000_000,
-                crate::testkit::FIXTURE_BOOT,
-            ),
-        )
-        .expect("the hold is written");
-        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-            .expect("the hold is private");
-
-        // The device fault is spent, so only the hold can stop the replay.
-        let report = harness
-            .run(
-                &bytes,
-                &Meter::new(&[4]),
-                &Flusher::ok(),
-                SpacePruneBounds::design(),
-            )
-            .expect("the pass runs");
-        let effect = report.effect.as_ref().expect("the effect");
-        let replay = effect.replay.expect("the replay is reported");
-        assert_eq!(replay.examined, 1);
-        assert_eq!(replay.resumed, 0, "the replay must not resume a held unit");
-        assert_eq!(replay.pending, 1, "the held intent stays pending");
-        assert_eq!(effect.pruned.count, 0, "nothing is deleted");
-        assert_eq!(
-            held_reason(&report, &root_id).as_deref(),
-            Some("pending_intent"),
-            "the root the held intent covers is kept and reported"
-        );
-        // The captured payload is still inside its quarantine leaf.
-        let leaf = std::fs::read_dir(path.parent().expect("the area"))
-            .expect("the area reads")
-            .flatten()
-            .map(|entry| entry.path())
-            .find(|entry| {
-                entry
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(crate::state::QUARANTINE_PREFIX))
-            })
-            .expect("the quarantine leaf is kept");
-        assert!(
-            leaf.join("payload.bin").is_file(),
-            "a live hold keeps the captured object"
-        );
-        let intents = state::read_intents(&harness.fixture.state, INTENT_ROWS).expect("journal");
-        let pending = PendingIntent::pending(&intents.records);
-        assert_eq!(pending.len(), 1);
-        assert!(pending[0].intent_id.len() == 32);
+            // The device fault is spent, so only the hold can stop the replay.
+            let report = harness
+                .run(
+                    &bytes,
+                    &Meter::new(&[4]),
+                    &Flusher::ok(),
+                    SpacePruneBounds::design(),
+                )
+                .expect("the pass runs");
+            let effect = report.effect.as_ref().expect("the effect");
+            let replay = effect.replay.expect("the replay is reported");
+            assert_eq!(replay.examined, 1);
+            assert_eq!(replay.resumed, 0, "the replay must not resume a held unit");
+            assert_eq!(replay.pending, 1, "the held intent stays pending");
+            assert_eq!(effect.pruned.count, 0, "nothing is deleted");
+            assert_eq!(
+                held_reason(&report, &root_id).as_deref(),
+                Some("pending_intent"),
+                "the root the held intent covers is kept and reported"
+            );
+            // The captured payload is still inside its quarantine leaf.
+            let leaf = std::fs::read_dir(path.parent().expect("the area"))
+                .expect("the area reads")
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(crate::state::QUARANTINE_PREFIX))
+                })
+                .expect("the quarantine leaf is kept");
+            assert!(
+                leaf.join("payload.bin").is_file(),
+                "a live hold keeps the captured object"
+            );
+            let intents =
+                state::read_intents(&harness.fixture.state, INTENT_ROWS).expect("journal");
+            let pending = PendingIntent::pending(&intents.records);
+            assert_eq!(pending.len(), 1);
+            assert!(pending[0].intent_id.len() == 32);
+        }
     }
 
     /// Publish a changed registry after preflight's read, before the prune takes

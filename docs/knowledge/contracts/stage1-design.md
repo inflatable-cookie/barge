@@ -1068,7 +1068,13 @@ descriptor-relative, and bounded:
    being removed by name. Then the `removed` phase is recorded, and the `deleted`
    phase settles the intent.
 7. On replay, a pending intent is resolved only from its recorded identity, and
-   replay's windows are conservative. It first restores every recorded mode, then
+   replay's windows are conservative. Ordinary deletion and replay retain the
+   volume lock token through their effect observations, custody scans, journal
+   changes and deletion walk; a remembered lock rank alone does not hold custody.
+   Volume-scoped replay uses the caller's token, including when a durable
+   `removed` intent settles after its area folder or unit parent is positively
+   absent. That settlement takes the unit locks without reacquiring the volume
+   lock the caller already holds. It first restores every recorded mode, then
    re-reads the unit's holds: while any hold is live or undecidable, the captured
    object stays where it is and the intent stays pending. A replay continues a
    deletion that was already authorised, so a hold recorded **after** the
