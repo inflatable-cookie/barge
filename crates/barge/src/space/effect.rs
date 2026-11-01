@@ -3756,6 +3756,8 @@ mod tests {
         ));
         let digest = sha256_hex(&bytes);
         let request = harness.request(&digest, &bytes, SpacePruneBounds::design());
+        let registry_bytes = std::fs::read(harness.fixture.state.registry_path())
+            .expect("save fixture registry before corruption");
         for invalid in [false, true] {
             harness.fixture.register_record(&harness.record);
             let error = prune(
@@ -3780,6 +3782,8 @@ mod tests {
             let after = state::read_intents(&harness.fixture.state, INTENT_ROWS).expect("journal");
             assert_eq!(after.records, intents.records, "intent remains unchanged");
         }
+        std::fs::write(harness.fixture.state.registry_path(), registry_bytes)
+            .expect("restore the corrupted fixture registry");
         harness.fixture.register_record(&harness.record);
         let error = prune(
             &harness.fixture.state,
