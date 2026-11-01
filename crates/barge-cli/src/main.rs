@@ -34,13 +34,16 @@ use barge::contract::{
     SCRATCH_CLAIM_SCHEMA, SCRATCH_CONCLUDE_SCHEMA, SCRATCH_DELEGATE_SCHEMA, SCRATCH_EXPIRE_SCHEMA,
     SCRATCH_GRANTS_SCHEMA, SCRATCH_REVOKE_SCHEMA,
 };
+use barge::delete::DeleteBounds;
 use barge::describe::{
     self, DescribeData, DescribeRequest, InspectData, InspectRequest, StateDirSource,
 };
 use barge::error::{Error, ErrorKind};
 use barge::os::{self, VolumeUuid};
 use barge::prune::{self, MaintainBounds, MaintainReport, MaintainRequest};
-use barge::release::{self, PruneReport, ReleaseBounds, ReleaseRequest};
+use barge::release::{
+    self, PruneReport, ReleaseBounds, ReleaseRequest, ReleaseRunReport, ReleaseRunRequest,
+};
 use barge::scratch::{
     self, AllocRequest, ConcludeRequest, ExpireReport, SweepBounds, SweepRequest,
 };
@@ -57,7 +60,8 @@ const USAGE: &str = "usage: barge <describe|inspect|space|volume|maintain|prune|
        barge space prune --volume <uuid> --plan <file> --plan-sha256 <hex>
        barge maintain [--space] [--plan-out <file>]
        barge maintain [--space] --plan <file> --plan-sha256 <hex>
-       barge prune --plan --area <namespace>/<area> --volume <uuid> [--plan-out <file>]
+       barge prune --plan --area <namespace>/<area> --volume <uuid> [--plan-out <file>] [--root <root-id>]...
+       barge prune --plan <file> --plan-sha256 <hex> --area <namespace>/<area> --volume <uuid>
        barge diagnostic descriptor-census --root <existing-directory>
        barge area declare --namespace <ns> --area <name> --folder <folder> [--override <uuid>=<folder>]... --absent <fail:drive|wait|fallback:path> --prune <none|oldest-idle:seconds|release-on-reference> --reserve <counts|excluded>
        barge area show --namespace <ns> --area <name>
@@ -1367,20 +1371,32 @@ fn space_prune_run_summary(report: &barge::space::SpacePruneReport) -> String {
     text
 }
 
-/// Run one `prune` verb (the release plan).
+/// Run one `prune` verb: the release plan, or the release run that presents one.
+///
+/// `--plan` is the design's spelling for both forms, as `space prune` uses it: bare
+/// it asks for the preview, and with a file and `--plan-sha256` it is the real run,
+/// which deletes only what the presented plan and a fresh gate both still allow.
 fn prune_plan(args: &[String]) -> Result<Report, Error> {
-    let Parsed { words, mut options } = parse_taking(args, &["area", "volume", "plan-out"])?;
+    let Parsed { words, mut options } = parse_taking_soft(
+        args,
+        &["area", "volume", "plan-out", "plan-sha256", "root"],
+        &["plan"],
+    )?;
     if let Some(word) = words.first() {
         return Err(usage(format!("unexpected argument: {word}")));
     }
-    let requested = one_option(&mut options, "plan")?;
+    let plan = one_option(&mut options, "plan")?;
+    let digest = one_option(&mut options, "plan-sha256")?;
     let area_ref = required(&mut options, "area")?;
     let volume = required(&mut options, "volume")?;
     let plan_out = one_option(&mut options, "plan-out")?.map(PathBuf::from);
+    // `--root` may repeat: each names one root the operator waives the age gate for.
+    let named_roots = options.remove("root").unwrap_or_default();
     refuse_unknown(options)?;
-    if requested.is_none() {
+    let bare_plan = plan.as_deref() == Some("true");
+    if !bare_plan && !named_roots.is_empty() {
         return Err(usage(
-            "barge prune is the release plan only in this build: give --plan. The real release run, its intent evidence and its replay are stage 4 F4; nothing was planned",
+            "--root belongs to the preview: a real run takes the named roots its presented plan states; nothing was changed",
         ));
     }
     let (namespace, area) = match area_ref.split_once('/') {
@@ -1398,8 +1414,73 @@ fn prune_plan(args: &[String]) -> Result<Report, Error> {
             .map_err(|error| usage(format!("--area {field}: {}", error.message())))?;
     }
     let volume_uuid = VolumeUuid::parse(&volume)?;
+    match (&plan, &digest) {
+        (None, _) => {
+            return Err(usage(
+                "barge prune needs --plan to preview, or --plan <file> --plan-sha256 <hex> for the real run; nothing was changed",
+            ))
+        }
+        (Some(_), None) if !bare_plan => {
+            return Err(usage(
+                "a real run needs the preview's exact plan bytes as --plan <file> and --plan-sha256 <hex>; nothing was changed",
+            ))
+        }
+        (Some(_), Some(_)) if bare_plan => {
+            return Err(usage(
+                "--plan-sha256 needs --plan <file> naming the preview's exact bytes; nothing was changed",
+            ))
+        }
+        _ => {}
+    }
     let state = state_paths()?;
     let platform = os::platform();
+    if !bare_plan {
+        if plan_out.is_some() {
+            return Err(usage(
+                "--plan-out writes a preview's plan and has no meaning on a real run; nothing was changed",
+            ));
+        }
+        let Some(path) = plan else {
+            return Err(usage("a real run needs --plan <file>; nothing was changed"));
+        };
+        let Some(digest) = digest else {
+            return Err(usage(
+                "a real run needs --plan-sha256 <hex>; nothing was changed",
+            ));
+        };
+        let bytes = read_plan_file(Path::new(&path))?;
+        let report = release::execute(
+            &state,
+            &platform,
+            &platform,
+            &platform,
+            &platform,
+            &platform,
+            &ReleaseRunRequest {
+                plan_bytes: &bytes,
+                plan_digest: &digest,
+                release: ReleaseRequest {
+                    namespace: &namespace,
+                    area: &area,
+                    volume_uuid: &volume_uuid,
+                    now_ms: state::now_ms(),
+                    bounds: ReleaseBounds::design(),
+                    // The run takes the presented plan's own named roots.
+                    named_roots: &[],
+                },
+                delete: DeleteBounds::default(),
+            },
+        )?;
+        let human = release_run_summary(&report);
+        let exit = if report.needs_human() { 3 } else { 0 };
+        return Report::outcome(
+            contract::PRUNE_RUN_SCHEMA,
+            "prune.run",
+            &report,
+            human,
+            exit,
+        );
+    }
     let report = release::plan(
         &state,
         &platform,
@@ -1413,6 +1494,7 @@ fn prune_plan(args: &[String]) -> Result<Report, Error> {
             volume_uuid: &volume_uuid,
             now_ms: state::now_ms(),
             bounds: ReleaseBounds::design(),
+            named_roots: &named_roots,
         },
     )?;
     if let Some(path) = &plan_out {
@@ -1422,6 +1504,33 @@ fn prune_plan(args: &[String]) -> Result<Report, Error> {
     let human = release_summary(&report);
     let exit = if report.needs_human() { 3 } else { 0 };
     Report::outcome(contract::PRUNE_SCHEMA, "prune", &report, human, exit)
+}
+
+/// The human summary of a release run.
+fn release_run_summary(report: &ReleaseRunReport) -> String {
+    let mut lines = vec![format!(
+        "released {} root(s) of {}/{} on {}: {} kept, {} replay-pending intent(s)",
+        report.released_count,
+        report.area.namespace,
+        report.area.area,
+        report.volume_uuid,
+        report.kept_count,
+        report.replay_pending
+    )];
+    if let Some(reason) = &report.stopped {
+        lines.push(format!("the batch stopped: {reason}"));
+    }
+    for row in report.rows.iter().filter(|row| row.outcome != "released") {
+        lines.push(format!(
+            "  {} {}: {}",
+            row.outcome,
+            row.root_id,
+            row.reason.as_deref().unwrap_or("no reason reported")
+        ));
+    }
+    let mut human = lines.join("\n");
+    human.push('\n');
+    human
 }
 
 /// The human summary of `barge.prune/1`.

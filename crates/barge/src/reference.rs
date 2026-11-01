@@ -328,7 +328,7 @@ impl BargeReferences {
                 declaration.namespace,
                 declaration.area,
                 if policy_permits_release {
-                    "permits releasing a root past its declared age"
+                    "permits releasing a root, by its declared age or by reference"
                 } else {
                     "declares a prune policy that never releases a root"
                 }

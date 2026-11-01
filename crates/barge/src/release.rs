@@ -16,14 +16,21 @@
 //! 6. every reference whose own rule requires absence has an `Absent` proof of
 //!    its consumer path, established now.
 //!
-//! This slice plans and never acts. `barge prune --plan` produces
-//! `barge.prune.plan/1`, one area on one volume, where condition 1 is the plan's
-//! own precondition and every row carries conditions 2 to 6 with their evidence
-//! whether or not it is eligible — which is what makes one plan a diagnostic as
-//! well as a permission. `barge.prune/1` is the command document
-//! around it, exactly as `barge.maintain/1` wraps the maintain plan: the plan,
-//! its SHA-256, the volume's state and the Oxide snapshot's own completeness.
-//! The effect, its intent evidence and its replay are stage 4 F4.
+//! `barge prune --plan` produces `barge.prune.plan/1`, one area on one volume,
+//! where condition 1 is the plan's own precondition and every row carries
+//! conditions 2 to 6 with their evidence whether or not it is eligible — which is
+//! what makes one plan a diagnostic as well as a permission. `barge.prune/1` is the
+//! command document around it, exactly as `barge.maintain/1` wraps the maintain
+//! plan: the plan, its SHA-256, the volume's state and the Oxide snapshot's own
+//! completeness.
+//!
+//! `barge prune --plan <file> --plan-sha256 <hex>` is the release effect (stage 4
+//! F6-R1). It presents the plan's exact bytes and digest, re-plans the area under
+//! the same gate, and deletes only the rows the presented plan and the fresh gate
+//! both still allow. Each deletion re-proves its references and absence under the
+//! unit's own lock before its `barge.intent/2` is published, and then runs S5's
+//! custody, whole-unit delete and replay. The verb releases nothing on its own:
+//! `maintain` and the space prune never reach it.
 //!
 //! Three rules the module keeps:
 //!
@@ -44,6 +51,7 @@
 //!   volume a live run is mutating, and a lock it cannot take inside its own
 //!   budget is a report rather than something waited out.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -52,6 +60,7 @@ use serde::{Deserialize, Serialize};
 use crate::area::{self, AreaDocument, PrunePolicy};
 use crate::contract::{RowSet, DOCUMENT_SIZE_CAP_BYTES, PRUNE_PLAN_SCHEMA};
 use crate::custody::{self, CustodyBounds, PendingIntent};
+use crate::delete::{self, DeleteBounds};
 use crate::digest::sha256_hex;
 use crate::error::{Error, ErrorKind, Result};
 pub use crate::evidence::{
@@ -199,6 +208,10 @@ pub struct PrunePlanRow {
     /// The bytes this plan's scan counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<BytesEvidence>,
+    /// Whether the named-root waiver stood in for condition 4's age gate. It is
+    /// stated in the plan so the digest covers it and an effect re-decides it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub age_waived: bool,
     /// Whether all six conditions hold.
     pub eligible: bool,
     /// The first condition that keeps the root, when one does.
@@ -239,6 +252,10 @@ pub struct PrunePlan {
     pub timed_out: bool,
     /// How many listed roots the wall clock stopped the plan before.
     pub unreached_count: usize,
+    /// The roots named explicitly, sorted and unique. Empty when none was named,
+    /// and then the field is absent from the document.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub named_roots: Vec<String>,
 }
 
 impl PrunePlan {
@@ -326,6 +343,9 @@ pub struct ReleaseRequest<'a> {
     pub now_ms: u64,
     /// The run's bounds.
     pub bounds: ReleaseBounds,
+    /// The roots an operator named explicitly. A named root waives only the
+    /// policy's age gate (`oldest-idle`); every other condition still applies.
+    pub named_roots: &'a [String],
 }
 
 /// Plan the release of one area's roots on one volume. Nothing is changed.
@@ -344,6 +364,35 @@ pub fn plan(
     account: &dyn crate::os::AccountFacts,
     request: &ReleaseRequest<'_>,
 ) -> Result<PruneReport> {
+    plan_observed(state_paths, dirs, facts, mounts, observer, account, request)
+        .map(|(report, _)| report)
+}
+
+/// One row's observed root, kept only inside the release effect: the deletion unit
+/// the row's identity was read from and the path that unit was found at.
+#[derive(Debug, Clone)]
+struct ObservedRoot {
+    unit: DeletionUnit,
+    path: PathBuf,
+    mount_point: PathBuf,
+    /// The area the row was resolved under, which identity is decided against.
+    identity_area: IdentityArea,
+    /// The listed name the row was found under.
+    root: area::RootName,
+}
+
+/// [`plan`], and the observed deletion unit of each row that observed one, in row
+/// order. The effect uses the units to delete; the report is what it presents.
+#[allow(clippy::too_many_arguments)]
+fn plan_observed(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn AbsenceVolume,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    account: &dyn crate::os::AccountFacts,
+    request: &ReleaseRequest<'_>,
+) -> Result<(PruneReport, Vec<Option<ObservedRoot>>)> {
     // The run's wall clock starts with the plan's own first work, not with the row
     // loop: setup — the registry, the volume, the resolve, the enumeration and the
     // reference snapshot — is part of the run the bound covers. No row is attempted
@@ -512,6 +561,7 @@ pub fn plan(
     let uid = observer.effective_uid()?;
 
     let mut rows = Vec::new();
+    let mut observed = Vec::new();
     let truncated = listing.truncated;
     let mut timed_out = false;
     let mut unreached = 0usize;
@@ -530,8 +580,10 @@ pub fn plan(
                     request.bounds.wall
                 ),
             ));
+            observed.push(None);
             continue;
         }
+        let mut observed_root = None;
         rows.push(decide_root(
             state_paths,
             dirs,
@@ -548,7 +600,9 @@ pub fn plan(
             uid,
             request,
             root,
+            &mut observed_root,
         ));
+        observed.push(observed_root);
     }
     // One root's shared lock at a time: every row took and released its own, so
     // the volume's observation lock is the only one still held here.
@@ -557,6 +611,7 @@ pub fn plan(
     let mut plan_rows = PlanRows::with_counts(rows, examined, truncated);
     plan_rows.timed_out = timed_out;
     plan_rows.unreached = unreached;
+    plan_rows.observed = observed;
     finish(volume, area_ref, request, plan_rows, oxide)
 }
 
@@ -567,6 +622,8 @@ struct PlanRows {
     truncated: bool,
     timed_out: bool,
     unreached: usize,
+    /// One entry per row, in row order, when the plan observed the root.
+    observed: Vec<Option<ObservedRoot>>,
 }
 
 impl PlanRows {
@@ -578,6 +635,7 @@ impl PlanRows {
             truncated: false,
             timed_out: false,
             unreached: 0,
+            observed: Vec::new(),
         }
     }
 
@@ -589,20 +647,43 @@ impl PlanRows {
             truncated,
             timed_out: false,
             unreached: 0,
+            observed: Vec::new(),
         }
     }
 }
 
-/// Assemble the report, its plan and its digest.
+/// Assemble the report, its plan and its digest, with the observed units.
 fn finish(
     volume: PlanVolume,
     area_ref: AreaRef,
     request: &ReleaseRequest<'_>,
     rows: PlanRows,
     oxide: OxideSnapshot,
-) -> Result<PruneReport> {
+) -> Result<(PruneReport, Vec<Option<ObservedRoot>>)> {
     let eligible_count = rows.rows.iter().filter(|row| row.eligible).count();
     let total = rows.rows.len();
+    let observed = rows.observed;
+    // A named root must be a root id and must be one the area lists: a name the plan
+    // cannot see would waive nothing, and it is refused rather than dropped.
+    let mut named_roots = request.named_roots.to_vec();
+    named_roots.sort();
+    named_roots.dedup();
+    for named in &named_roots {
+        if !state::is_identifier(named) {
+            return Err(Error::new(
+                ErrorKind::Usage,
+                format!("the named root `{named}` is not a root id, so nothing was planned"),
+            ));
+        }
+        if !rows.rows.iter().any(|row| &row.root_id == named) {
+            return Err(Error::new(
+                ErrorKind::Usage,
+                format!(
+                    "the named root `{named}` is not listed in the area, so nothing was planned"
+                ),
+            ));
+        }
+    }
     let plan = PrunePlan {
         schema: PRUNE_PLAN_SCHEMA.to_owned(),
         area: area_ref,
@@ -613,9 +694,10 @@ fn finish(
         truncated: rows.truncated || plan_rows_truncated(total),
         timed_out: rows.timed_out,
         unreached_count: rows.unreached,
+        named_roots,
     };
     let plan_digest = sha256_hex(&canonical_plan_bytes(&plan)?);
-    Ok(PruneReport {
+    let report = PruneReport {
         preview: true,
         plan_digest,
         planned_ms: request.now_ms,
@@ -626,7 +708,13 @@ fn finish(
             detail: oxide.detail.clone(),
         },
         volume,
-    })
+    };
+    Ok((report, observed))
+}
+
+/// The serde predicate that keeps a `false` flag out of the document.
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Whether the plan's own row cap cut the listing.
@@ -636,20 +724,10 @@ const fn plan_rows_truncated(total: usize) -> bool {
 
 /// Why condition 4 finds no age to decide, when the policy carries none.
 ///
-/// `release_on_reference` is the policy a release gate reads as "allowed by
-/// release". No release by reference exists yet, so this release plan states
-/// that it has no age to judge the root by rather than reading the policy as
-/// permission. A later slice that adds the release-by-reference effect changes
-/// this reading, and this plan is where it starts.
-const fn no_age_reason(policy: &PrunePolicy) -> &'static str {
-    match policy {
-        PrunePolicy::ReleaseOnReference => {
-            "the area's prune policy is `release_on_reference`: a release by reference is not part of this release plan, so no root is released"
-        }
-        PrunePolicy::None | PrunePolicy::OldestIdleAfter { .. } => {
-            "the area declares no prune age, so no root is released"
-        }
-    }
+/// Only `none` reaches this reason. `release_on_reference` permits a release by
+/// reference, so it has no age gate, and `oldest-idle` has its own age reason.
+const fn no_age_reason() -> &'static str {
+    "the area declares no prune policy that permits a release, so no root is released"
 }
 
 fn durability_name(durability: Durability) -> &'static str {
@@ -697,6 +775,7 @@ fn decide_root(
     uid: u32,
     request: &ReleaseRequest<'_>,
     root: &area::RootName,
+    observed_out: &mut Option<ObservedRoot>,
 ) -> PrunePlanRow {
     let mount_relative_path = relative_to_mount(&root.path, &resolved.mount_point);
     // One root's shared lock, taken before anything about the root is read and
@@ -857,12 +936,13 @@ fn decide_root(
     let mut blockers: Vec<(&'static str, String)> = Vec::new();
 
     // Condition 2: the durable identity.
+    let identity_area = IdentityArea::of(resolved);
     let identity = identity_evidence(
         dirs,
         facts,
         uid,
         root,
-        resolved,
+        &identity_area,
         &locked,
         stored.as_ref(),
         record_unreadable,
@@ -877,8 +957,19 @@ fn decide_root(
         ));
     }
 
-    // Condition 3: custody.
-    let (custody, custody_reason) = match unit_for(record, resolved, root, &locked) {
+    // Condition 3: custody. The observed unit is kept for the effect whatever custody
+    // says here, because the effect decides custody again under its own lock.
+    let unit = unit_for(record, resolved, root, &locked);
+    if let Some(unit) = &unit {
+        *observed_out = Some(ObservedRoot {
+            unit: unit.clone(),
+            path: root.path.clone(),
+            mount_point: resolved.mount_point.clone(),
+            identity_area: IdentityArea::of(resolved),
+            root: root.clone(),
+        });
+    }
+    let (custody, custody_reason) = match &unit {
         Some(unit) => {
             let verdict = custody::take_custody(
                 dirs,
@@ -886,7 +977,7 @@ fn decide_root(
                 mounts,
                 observer,
                 state_paths,
-                &unit,
+                unit,
                 pending,
                 request.bounds.custody,
             );
@@ -911,11 +1002,14 @@ fn decide_root(
         ));
     }
 
-    // Condition 4: policy, durability and age.
+    // Condition 4: policy, durability and age. `release_on_reference` permits a
+    // release by reference with no age gate; it still needs a known activity time,
+    // because an unknown activity keeps a root in every form of this gate.
     let declared_age = match &declaration.prune {
         PrunePolicy::None | PrunePolicy::ReleaseOnReference => None,
         PrunePolicy::OldestIdleAfter { age_seconds } => Some(*age_seconds),
     };
+    let permits_release = !matches!(declaration.prune, PrunePolicy::None);
     let scan = locked.activity.clone();
     // The age is measured against *this plan's* clock, so an activity time ahead of it
     // is unknown here even when the later scan — which compares against the clock it
@@ -923,12 +1017,21 @@ fn decide_root(
     // is exactly the case: it is not a known age of zero.
     let measured = scan.last_activity_ms.filter(|last| *last <= request.now_ms);
     let ahead_of_the_plan = scan.last_activity_ms.filter(|last| *last > request.now_ms);
+    // A named root waives the age comparison and nothing else. Its activity must still
+    // be known, so an unknown age keeps it.
+    let age_waived =
+        declared_age.is_some() && request.named_roots.iter().any(|named| named == &root_id);
     let idle = match (declared_age, measured, ahead_of_the_plan) {
         (None, _, last) => IdleEvidence {
             last_activity_ms: last.or(scan.last_activity_ms),
-            age_seconds: None,
+            age_seconds: measured.map(|last| request.now_ms.saturating_sub(last) / 1000),
             declared_age_seconds: None,
-            reason: Some(no_age_reason(&declaration.prune).to_owned()),
+            reason: match &declaration.prune {
+                PrunePolicy::ReleaseOnReference => scan.reason.clone(),
+                PrunePolicy::None | PrunePolicy::OldestIdleAfter { .. } => {
+                    Some(no_age_reason().to_owned())
+                }
+            },
         },
         (Some(declared), Some(last), _) => IdleEvidence {
             last_activity_ms: Some(last),
@@ -955,7 +1058,20 @@ fn decide_root(
         },
     };
     match declared_age {
-        None => blockers.push(("policy", no_age_reason(&declaration.prune).to_owned())),
+        None if !permits_release => {
+            blockers.push(("policy", no_age_reason().to_owned()));
+        }
+        None => {
+            if measured.is_none() {
+                blockers.push((
+                    "policy",
+                    format!(
+                        "the root's last activity could not be observed, so the release by reference keeps it: {}",
+                        idle.reason.as_deref().unwrap_or("no reason reported")
+                    ),
+                ));
+            }
+        }
         Some(declared) => match measured {
             None => blockers.push((
                 "policy",
@@ -966,7 +1082,7 @@ fn decide_root(
             )),
             Some(last) => {
                 let age_ms = request.now_ms.saturating_sub(last);
-                if age_ms < declared.saturating_mul(1000) {
+                if age_ms < declared.saturating_mul(1000) && !age_waived {
                     blockers.push((
                         "policy",
                         format!("idle for less than the declared {declared} s"),
@@ -979,7 +1095,7 @@ fn decide_root(
     // Condition 5 and 6: the references, then the absence proofs they need.
     let mut references = placements.references_for(
         document,
-        declared_age.is_some(),
+        permits_release,
         reference::RootRef {
             id: &root_id,
             path: &root.path,
@@ -1057,6 +1173,7 @@ fn decide_root(
         idle,
         references: reference_rows,
         references_complete: references.complete && !references_truncated,
+        age_waived,
         absence,
         bytes: Some(BytesEvidence {
             logical: scan.logical_bytes,
@@ -1133,7 +1250,7 @@ fn identity_evidence(
     facts: &dyn AbsenceVolume,
     uid: u32,
     root: &area::RootName,
-    resolved: &area::ResolvedArea,
+    identity_area: &IdentityArea,
     locked: &LockedObservation,
     stored: Option<&crate::identity::RootIdentity>,
     record_unreadable: bool,
@@ -1147,11 +1264,11 @@ fn identity_evidence(
     // area are all compared against what was just observed **at this path**. It is
     // never the verdict for whatever path the record happens to name — a copied
     // root that reuses an original's id in another area is kept, not verified.
-    let listed_relative = relative_to_mount(&root.path, &resolved.mount_point);
+    let listed_relative = relative_to_mount(&root.path, &identity_area.mount_point);
     // The area folder this plan resolved is on the verified volume; the root must be
     // on that same filesystem, which is a device comparison between two opened
     // descriptors rather than an assumption.
-    let same_volume = match dirs.open_path(&resolved.path) {
+    let same_volume = match dirs.open_path(&identity_area.path) {
         Ok(folder) => folder.identity().device == locked.identity.device,
         Err(_) => false,
     };
@@ -1215,15 +1332,18 @@ fn identity_evidence(
                         // The live volume is the one this plan verified and this root was
                         // found on, never the recorded UUID compared with itself: a record
                         // that names another volume is a mismatch, not a match.
-                        volume_uuid: resolved.volume_uuid.as_str().to_owned(),
-                        mount: resolved.mount_point.clone(),
+                        volume_uuid: identity_area.volume_uuid.as_str().to_owned(),
+                        mount: identity_area.mount_point.clone(),
                         device: locked.identity.device.get(),
                         inode: locked.identity.inode,
                         root_uid: owner,
                         effective_uid: uid,
                         root_id: marker.root_id.clone(),
                         nonce: marker.nonce.clone(),
-                        mount_relative_path: relative_to_mount(&root.path, &resolved.mount_point),
+                        mount_relative_path: relative_to_mount(
+                            &root.path,
+                            &identity_area.mount_point,
+                        ),
                         kind: marker.kind,
                         area: marker.area.clone(),
                     },
@@ -1339,6 +1459,7 @@ fn unobserved_row(
         references_complete: false,
         absence: None,
         bytes: None,
+        age_waived: false,
         eligible: false,
         blocked_by: Some(detail_blocked_by.to_owned()),
         reason: Some(detail),
@@ -1559,6 +1680,29 @@ pub fn read_prune_plan(bytes: &[u8]) -> Result<PrunePlan> {
         )
     })?;
     plan.rows.validate()?;
+    // A waiver is only ever a named root's, and every named root is a root id.
+    for named in &plan.named_roots {
+        if !state::is_identifier(named) {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("the plan names `{named}`, which is not a root id"),
+            ));
+        }
+    }
+    if let Some(row) = plan
+        .rows
+        .rows
+        .iter()
+        .find(|row| row.age_waived && !plan.named_roots.contains(&row.root_id))
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the plan waives the age of `{}`, which it does not name",
+                row.root_id
+            ),
+        ));
+    }
     // The two evidence documents are read strictly here too: a row's condition 2
     // and condition 6 evidence is what a later effect re-establishes, so a
     // document whose verdict and shape disagree is not one this reader understands.
@@ -1583,6 +1727,669 @@ pub fn read_prune_plan(bytes: &[u8]) -> Result<PrunePlan> {
         .with_detail("eligible_count", plan.eligible_count.into()));
     }
     Ok(plan)
+}
+
+/// The three facts of a resolved area that identity is decided against: the verified
+/// volume, its mount root and the area folder's path on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IdentityArea {
+    volume_uuid: crate::os::VolumeUuid,
+    mount_point: PathBuf,
+    path: PathBuf,
+}
+
+impl IdentityArea {
+    fn of(resolved: &area::ResolvedArea) -> Self {
+        Self {
+            volume_uuid: resolved.volume_uuid.clone(),
+            mount_point: resolved.mount_point.clone(),
+            path: resolved.path.clone(),
+        }
+    }
+}
+
+/// What one release run asks for: the presented plan's exact bytes and digest, and
+/// the area, volume and clock a plan takes.
+#[derive(Debug, Clone, Copy)]
+pub struct ReleaseRunRequest<'a> {
+    /// The plan bytes the run presents, exactly as `barge prune --plan` wrote them.
+    pub plan_bytes: &'a [u8],
+    /// The SHA-256 the caller presents for `plan_bytes`.
+    pub plan_digest: &'a str,
+    /// The area, volume, clock and plan bounds the fresh gate runs with.
+    pub release: ReleaseRequest<'a>,
+    /// The deletion bounds each unit's custody, delete and replay runs within.
+    pub delete: DeleteBounds,
+}
+
+/// One presented eligible row's outcome in a release run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseRunRow {
+    /// The root's id, as the presented plan named it.
+    pub root_id: String,
+    /// The root's path below its verified mount root.
+    pub mount_relative_path: String,
+    /// `released`, `kept`, `pending`, `error` or `not_attempted`.
+    pub outcome: String,
+    /// Why the row was kept, stopped or left pending, when it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The intent the row published, when it published one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_id: Option<String>,
+}
+
+impl ReleaseRunRow {
+    fn new(row: &PrunePlanRow, outcome: &str, reason: Option<String>) -> Self {
+        Self {
+            root_id: row.root_id.clone(),
+            mount_relative_path: row.mount_relative_path.clone(),
+            outcome: outcome.to_owned(),
+            reason,
+            intent_id: None,
+        }
+    }
+}
+
+/// The `barge.prune.run/1` body: the presented digest, the fresh gate's digest for
+/// the same area, the replay's pending count and one outcome per presented
+/// eligible row, in the plan's order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseRunReport {
+    /// The presented plan's digest.
+    pub plan_digest: String,
+    /// The digest of the fresh gate's plan for the same area, read at the run's start.
+    pub fresh_plan_digest: String,
+    /// When the run began.
+    pub run_ms: u64,
+    /// The area the plan named.
+    pub area: AreaRef,
+    /// The volume the plan named.
+    pub volume_uuid: String,
+    /// How many intents the replay left pending on this volume.
+    pub replay_pending: usize,
+    /// One outcome per presented eligible row.
+    pub rows: Vec<ReleaseRunRow>,
+    /// How many rows were released.
+    pub released_count: usize,
+    /// How many rows were kept by a refusal that changed nothing.
+    pub kept_count: usize,
+    /// Why the batch stopped, when an uncertain effect stopped it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<String>,
+}
+
+impl ReleaseRunReport {
+    /// Whether a human must look: an intent or a row is left in an unknown state, or
+    /// the batch stopped.
+    pub fn needs_human(&self) -> bool {
+        self.stopped.is_some()
+            || self.replay_pending > 0
+            || self
+                .rows
+                .iter()
+                .any(|row| matches!(row.outcome.as_str(), "pending" | "error"))
+    }
+}
+
+/// Release the presented plan's eligible roots, one whole root at a time.
+///
+/// Batch-wide refusals — a digest that does not match, bytes that are not a
+/// canonical plan, another area or volume, an unattached volume, an incomplete
+/// Oxide reference set — change nothing and return an error. The fresh gate then
+/// decides the same area again, and each presented eligible row must still match
+/// it on identity, marker, references and consumer path. The deletion re-proves
+/// those facts under the unit's own lock before its intent is written, and the
+/// rest is S5's custody, whole-unit delete and replay. An effect whose state is
+/// uncertain stops the batch; the rows it did not reach are `not_attempted`.
+#[allow(clippy::too_many_arguments)]
+pub fn execute(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn AbsenceVolume,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    account: &dyn crate::os::AccountFacts,
+    request: &ReleaseRunRequest<'_>,
+) -> Result<ReleaseRunReport> {
+    if !crate::unit::is_sha256(request.plan_digest)
+        || sha256_hex(request.plan_bytes) != request.plan_digest
+    {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "the plan file's bytes do not match --plan-sha256; nothing was changed",
+        )
+        .with_detail("plan_digest", request.plan_digest.into()));
+    }
+    let presented = read_prune_plan(request.plan_bytes).map_err(|error| {
+        Error::new(
+            error.kind(),
+            format!(
+                "the plan was refused, so nothing was changed: {}",
+                error.message()
+            ),
+        )
+    })?;
+    if canonical_plan_bytes(&presented)?.as_slice() != request.plan_bytes {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "the plan file is not the canonical plan bytes a plan writes; nothing was changed",
+        ));
+    }
+    if presented.area.namespace != request.release.namespace
+        || presented.area.area != request.release.area
+        || presented.volume_uuid != request.release.volume_uuid.as_str()
+    {
+        return Err(Error::new(
+            ErrorKind::VolumeMismatch,
+            "the plan names another area or volume than the run; nothing was changed",
+        )
+        .with_detail("plan_volume_uuid", presented.volume_uuid.as_str().into())
+        .with_detail("volume_uuid", request.release.volume_uuid.as_str().into()));
+    }
+
+    // The fresh gate runs before the effect's exclusive lock: a plan takes the volume
+    // lock shared, so the two cannot be held together by one process.
+    let run_ms = state::now_ms();
+    // The fresh gate plans with the presented plan's own named roots, so a waiver the
+    // plan stated is decided again, and a named root that is no longer listed refuses.
+    let fresh_request = ReleaseRequest {
+        named_roots: &presented.named_roots,
+        ..request.release
+    };
+    let (fresh, observed) = plan_observed(
+        state_paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        account,
+        &fresh_request,
+    )?;
+    if fresh.plan.named_roots != presented.named_roots {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "the plan's named roots are not in the canonical form a plan writes; nothing was changed",
+        ));
+    }
+    if fresh.volume.state != VolumeState::Present {
+        return Err(Error::new(
+            ErrorKind::VolumeAbsent,
+            format!(
+                "volume {} is not attached, so no root was released",
+                presented.volume_uuid
+            ),
+        ));
+    }
+    if fresh.volume.loud {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            fresh
+                .volume
+                .detail
+                .clone()
+                .unwrap_or_else(|| "the volume needs a human, so nothing was released".to_owned()),
+        ));
+    }
+    if !fresh.oxide.complete {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "Oxide's reference set is incomplete ({}), so the whole batch is kept and nothing was released",
+                fresh.oxide.detail.as_deref().unwrap_or("not read")
+            ),
+        ));
+    }
+
+    // One outcome per presented eligible row, in the plan's order. A row the fresh
+    // gate or the presented plan no longer agrees on is kept now; the rest wait for
+    // their own deletion.
+    let mut rows = Vec::new();
+    let mut candidates: Vec<(usize, &PrunePlanRow, &ObservedRoot, usize)> = Vec::new();
+    for (slot, row) in presented.eligible().enumerate() {
+        match matching_fresh_row(row, &fresh, &observed) {
+            Ok((index, observed_root)) => {
+                rows.push(ReleaseRunRow::new(row, "not_attempted", None));
+                candidates.push((slot, row, observed_root, index));
+            }
+            Err(reason) => rows.push(ReleaseRunRow::new(row, "kept", Some(reason))),
+        }
+    }
+
+    // Every run takes the volume's exclusive lock and settles pending intents, even
+    // when no row is a candidate: an intent left by an earlier run is settled by the
+    // next one, as S5's replay settles it, whatever this plan decides.
+    let (replay_pending, stopped) = delete_candidates(
+        state_paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        account,
+        request,
+        &fresh,
+        &candidates,
+        &mut rows,
+    )?;
+
+    let released_count = rows.iter().filter(|row| row.outcome == "released").count();
+    let kept_count = rows.iter().filter(|row| row.outcome == "kept").count();
+    Ok(ReleaseRunReport {
+        plan_digest: request.plan_digest.to_owned(),
+        fresh_plan_digest: sha256_hex(&canonical_plan_bytes(&fresh.plan)?),
+        run_ms,
+        area: AreaRef {
+            namespace: request.release.namespace.to_owned(),
+            area: request.release.area.to_owned(),
+        },
+        volume_uuid: request.release.volume_uuid.as_str().to_owned(),
+        replay_pending,
+        rows,
+        released_count,
+        kept_count,
+        stopped,
+    })
+}
+
+/// Take the volume's exclusive lock, settle any pending intents, then delete each
+/// candidate in turn. Returns the replay's pending count and why the batch stopped,
+/// when it did.
+#[allow(clippy::too_many_arguments)]
+fn delete_candidates(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn AbsenceVolume,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    account: &dyn crate::os::AccountFacts,
+    request: &ReleaseRunRequest<'_>,
+    fresh: &PruneReport,
+    candidates: &[(usize, &PrunePlanRow, &ObservedRoot, usize)],
+    rows: &mut [ReleaseRunRow],
+) -> Result<(usize, Option<String>)> {
+    let mut locks = state::LockSet::with_deadline(
+        state_paths.clone(),
+        Deadline::after(request.release.bounds.lock_wait),
+    );
+    let volume_lock = locks
+        .lock_volume(request.release.volume_uuid)
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::Locked,
+                format!(
+                    "volume {}'s lock could not be taken for this release: {}; nothing was changed",
+                    request.release.volume_uuid,
+                    error.message()
+                ),
+            )
+            .with_detail("volume_uuid", request.release.volume_uuid.as_str().into())
+        })?;
+    let deadline = Instant::now() + request.release.bounds.wall;
+    let replay = delete::replay_pending_on_volume(
+        state_paths,
+        dirs,
+        facts,
+        observer,
+        request.release.volume_uuid,
+        &volume_lock,
+        DeleteBounds {
+            deadline: Some(deadline),
+            ..request.delete
+        },
+        Some(deadline),
+    )?;
+    let replay_pending = replay.pending.len();
+    let document = area::show(state_paths, request.release.namespace, request.release.area)?
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::Usage,
+                "the area is no longer declared, so no root was released",
+            )
+        })?;
+    let declaration = document.declaration();
+    let uid = observer.effective_uid()?;
+    // Every deletion of this run stops at the run's own wall, as its replay does.
+    let bounds = DeleteBounds {
+        deadline: Some(deadline),
+        ..request.delete
+    };
+
+    let mut stopped = None;
+    for &(slot, row, observed_root, index) in candidates {
+        let fresh_row = &fresh.plan.rows.rows[index];
+        let mut unit = observed_root.unit.clone();
+        // The unit's authority is the presented plan's digest, never the zero digest
+        // a plan's observation carries.
+        unit.plan_digest = request.plan_digest.to_owned();
+        let evidence = state::IntentEvidence {
+            identity: Some(fresh_row.identity.clone()),
+            absence: fresh_row.absence.clone(),
+        };
+        let refusal: RefCell<Option<String>> = RefCell::new(None);
+        let reprove = |record: &VolumeRecord| -> Result<()> {
+            let context = Reprove {
+                state_paths,
+                dirs,
+                facts,
+                observer,
+                account,
+                document: &document,
+                row,
+                observed: observed_root,
+                volume_uuid: request.release.volume_uuid,
+                uid,
+                now_ms: request.release.now_ms,
+                reference_wall: request.release.bounds.reference_wall,
+            };
+            reprove_row(&context).map_err(|reason| {
+                *refusal.borrow_mut() = Some(reason.clone());
+                Error::new(
+                    ErrorKind::RefusedBoundary,
+                    format!("the root was kept before its intent was written: {reason}"),
+                )
+                .with_detail("volume_uuid", record.volume_uuid.as_str().into())
+            })
+        };
+        let authorize: &dyn Fn(&VolumeRecord) -> Result<()> = &reprove;
+        let outcome = delete::delete_unit_under_volume_lock(
+            state_paths,
+            dirs,
+            facts,
+            mounts,
+            observer,
+            &declaration,
+            &unit,
+            bounds,
+            &volume_lock,
+            Some(authorize),
+            &evidence,
+        );
+        match outcome {
+            Ok(report) if report.is_deleted() => {
+                rows[slot] = ReleaseRunRow {
+                    outcome: "released".to_owned(),
+                    intent_id: Some(report.intent_id),
+                    ..ReleaseRunRow::new(row, "released", None)
+                };
+            }
+            Ok(report) if report.is_pending() => {
+                let reason = report
+                    .reason
+                    .unwrap_or_else(|| "the deletion stopped with its intent pending".to_owned());
+                rows[slot] = ReleaseRunRow {
+                    intent_id: Some(report.intent_id),
+                    ..ReleaseRunRow::new(row, "pending", Some(reason.clone()))
+                };
+                stopped = Some(reason);
+                break;
+            }
+            Ok(report) => {
+                let reason = report
+                    .reason
+                    .unwrap_or_else(|| "the deletion was rolled back".to_owned());
+                rows[slot] = ReleaseRunRow::new(row, "kept", Some(reason));
+            }
+            Err(error) => {
+                // A refusal the re-proof made came before any intent, so it keeps the
+                // root and the batch goes on. Any other error may have written an
+                // intent, so its state is uncertain and the batch stops.
+                let refused = refusal.borrow().clone();
+                match refused {
+                    Some(reason) => rows[slot] = ReleaseRunRow::new(row, "kept", Some(reason)),
+                    None => {
+                        let reason = format!(
+                            "the deletion ended with an uncertain state, so the batch stops here: {}",
+                            error.message()
+                        );
+                        rows[slot] = ReleaseRunRow::new(row, "error", Some(reason.clone()));
+                        stopped = Some(reason);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    drop(volume_lock);
+    Ok((replay_pending, stopped))
+}
+
+/// The fresh gate's row for one presented eligible row, when it still agrees with
+/// the presented row on everything the release relies on, and the observed unit
+/// the deletion will use.
+fn matching_fresh_row<'a>(
+    row: &PrunePlanRow,
+    fresh: &PruneReport,
+    observed: &'a [Option<ObservedRoot>],
+) -> std::result::Result<(usize, &'a ObservedRoot), String> {
+    let Some(index) = fresh.plan.rows.rows.iter().position(|candidate| {
+        candidate.root_id == row.root_id && candidate.mount_relative_path == row.mount_relative_path
+    }) else {
+        return Err(
+            "the root is no longer listed in the area, so the presented row is stale".to_owned(),
+        );
+    };
+    let fresh_row = &fresh.plan.rows.rows[index];
+    if !fresh_row.eligible {
+        return Err(format!(
+            "the fresh gate keeps the root: {}",
+            fresh_row.reason.as_deref().unwrap_or("no reason reported")
+        ));
+    }
+    if fresh_row.identity.verdict != row.identity.verdict
+        || fresh_row.identity.inode != row.identity.inode
+        || fresh_row.identity.marker_digest != row.identity.marker_digest
+    {
+        return Err("the root's identity or marker changed after the plan was written".to_owned());
+    }
+    if fresh_row.age_waived != row.age_waived {
+        return Err("the named-root waiver changed after the plan was written".to_owned());
+    }
+    if fresh_row.references != row.references {
+        return Err("the root's references changed after the plan was written".to_owned());
+    }
+    let absence = |evidence: &Option<AbsenceEvidence>| {
+        evidence
+            .as_ref()
+            .map(|evidence| (evidence.verdict.clone(), evidence.path.clone()))
+    };
+    if absence(&fresh_row.absence) != absence(&row.absence) {
+        return Err("the consumer path's absence changed after the plan was written".to_owned());
+    }
+    match observed.get(index).and_then(Option::as_ref) {
+        Some(observed_root) => Ok((index, observed_root)),
+        None => Err("the root's deletion unit was not observed, so the root is kept".to_owned()),
+    }
+}
+
+/// What one deletion's effect-time re-proof reads. It is all observed under the
+/// unit's own lock, so no fact it compares can change behind the decision.
+struct Reprove<'a> {
+    state_paths: &'a StatePaths,
+    dirs: &'a dyn DirOps,
+    facts: &'a dyn AbsenceVolume,
+    observer: &'a dyn ProcessObserver,
+    account: &'a dyn crate::os::AccountFacts,
+    document: &'a AreaDocument,
+    row: &'a PrunePlanRow,
+    observed: &'a ObservedRoot,
+    volume_uuid: &'a VolumeUuid,
+    uid: u32,
+    now_ms: u64,
+    reference_wall: Duration,
+}
+
+/// Re-prove the release conditions the presented row relies on, before the intent
+/// is published. Identity is decided again under the lock, against the durable
+/// record's own contents and the root's marker and inode. The policy's age is read
+/// again, and a named root's waiver is the row's own flag. Every reference is
+/// re-read, and any consumer path's absence is proved again. The `String` is the
+/// reason the root is kept; nothing is written here.
+fn reprove_row(context: &Reprove<'_>) -> std::result::Result<(), String> {
+    let row = context.row;
+    let observed = context.observed;
+    let handle = context
+        .dirs
+        .open_path(&observed.path)
+        .map_err(|error| format!("the root could not be opened under its lock: {error}"))?;
+
+    // The marker is the one the row named, and the record is the one the row named.
+    let expectation = area::MarkerExpectation {
+        volume_uuid: context.volume_uuid,
+        resolved_path: &observed.path,
+        mount_point: Some(&observed.mount_point),
+        effective_uid: context.uid,
+        now_ms: state::now_ms(),
+    };
+    let (marker_state, marker_digest) =
+        area::read_marker_with_digest(context.dirs, &handle, &expectation);
+    if marker_digest != row.identity.marker_digest {
+        return Err("the root's marker changed after the plan was written".to_owned());
+    }
+    if marker_id(&marker_state).as_deref() != Some(row.root_id.as_str()) {
+        return Err("the root's marker no longer names the root the plan named".to_owned());
+    }
+    let (stored, record_unreadable) =
+        read_record(context.state_paths, context.dirs, &row.root_id, context.uid);
+
+    // The same locked observation a plan takes, read again now, so identity is decided
+    // by the same rule: the record's path, inode, volume, root id, nonce, kind and area
+    // against this directory, and the marker's own facts.
+    let entry_facts = context.dirs.dir_facts(&handle).map_err(|error| {
+        format!("the root directory's own facts cannot be read under its lock: {error}")
+    })?;
+    let activity = area::scan_activity(context.dirs, &handle, state::now_ms());
+    let (holds, holds_error) =
+        match area::read_holds(context.state_paths, context.observer, &row.root_id) {
+            Ok(reading) => (reading, None),
+            Err(error) => (area::HoldReading::empty(), Some(error.to_string())),
+        };
+    let locked = LockedObservation {
+        identity: handle.identity(),
+        facts: entry_facts,
+        marker_state,
+        marker_digest,
+        activity,
+        holds,
+        holds_error,
+    };
+    let identity = identity_evidence(
+        context.dirs,
+        context.facts,
+        context.uid,
+        &observed.root,
+        &observed.identity_area,
+        &locked,
+        stored.as_ref(),
+        record_unreadable,
+    );
+    if identity.verdict != "verified" {
+        return Err(format!(
+            "the root's identity is not verified now: {}",
+            identity
+                .reason
+                .as_deref()
+                .unwrap_or(identity.verdict.as_str())
+        ));
+    }
+    if identity.inode != row.identity.inode || identity.marker_digest != row.identity.marker_digest
+    {
+        return Err("the root's identity changed after the plan was written".to_owned());
+    }
+
+    // Policy and age: the area still permits a release, and the age gate is passed
+    // unless the row's own named-root waiver stands in for it. Activity must be known
+    // in every form, so an unknown age keeps the root.
+    let declaration = context.document.declaration();
+    let permits_release = !matches!(declaration.prune, PrunePolicy::None);
+    let measured = locked
+        .activity
+        .last_activity_ms
+        .filter(|last| *last <= context.now_ms);
+    match &declaration.prune {
+        PrunePolicy::None => {
+            return Err("the area's prune policy no longer permits a release".to_owned());
+        }
+        PrunePolicy::ReleaseOnReference => {
+            if measured.is_none() {
+                return Err("the root's last activity cannot be observed".to_owned());
+            }
+        }
+        PrunePolicy::OldestIdleAfter { age_seconds } => match measured {
+            None => return Err("the root's last activity cannot be observed".to_owned()),
+            Some(last) => {
+                if !row.age_waived
+                    && context.now_ms.saturating_sub(last) < age_seconds.saturating_mul(1000)
+                {
+                    return Err(format!(
+                        "the root is idle for less than the declared {age_seconds} s"
+                    ));
+                }
+            }
+        },
+    }
+
+    // References and absence: every reference is re-read, none names the root as
+    // current, the set is complete and unchanged, and any consumer path that a
+    // reference requires is absent now.
+    let placements = BargeReferences::read(context.state_paths);
+    let oxide = OxideSnapshot::read_within(context.account, context.reference_wall);
+    let (marker, marker_unknown) = match reference::read_oxide_marker(context.dirs, &handle) {
+        Ok(Some(marker)) => (Some(marker), None),
+        Ok(None) => (None, None),
+        Err(reason) => (None, Some(reason)),
+    };
+    let mut references = placements.references_for(
+        context.document,
+        permits_release,
+        reference::RootRef {
+            id: &row.root_id,
+            path: &observed.path,
+            mount_relative_path: &row.mount_relative_path,
+        },
+        &locked.holds,
+        locked.holds_error.as_deref(),
+    );
+    references.absorb(oxide.references_for(
+        &observed.path,
+        &row.mount_relative_path,
+        marker.as_ref(),
+        marker_unknown.as_deref(),
+    ));
+    if references.rows.len() > REFERENCE_ROWS {
+        return Err(format!(
+            "the root carries more than the {REFERENCE_ROWS} references a plan reports"
+        ));
+    }
+    if !references.complete {
+        return Err(format!(
+            "the reference set is not complete: {}",
+            references
+                .detail
+                .as_deref()
+                .unwrap_or("a source could not be read")
+        ));
+    }
+    if references.any_current() {
+        return Err("a reference still names this root".to_owned());
+    }
+    if references.rows != row.references {
+        return Err("the root's references changed after the plan was written".to_owned());
+    }
+    let (absence, reason) = prove_references(context.dirs, context.facts, &references.absence);
+    if let Some(reason) = reason {
+        return Err(reason);
+    }
+    let proof = |evidence: &Option<AbsenceEvidence>| {
+        evidence
+            .as_ref()
+            .map(|evidence| (evidence.verdict.clone(), evidence.path.clone()))
+    };
+    if proof(&absence) != proof(&row.absence) {
+        return Err("the consumer path's absence changed after the plan was written".to_owned());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1648,6 +2455,7 @@ mod tests {
                 volume_uuid: Box::leak(Box::new(self.volume.uuid.clone())),
                 now_ms,
                 bounds: ReleaseBounds::design(),
+                named_roots: &[],
             }
         }
 
@@ -1883,6 +2691,7 @@ mod tests {
             volume_uuid: &fixture.volume.uuid,
             now_ms: fixture.overdue(),
             bounds: ReleaseBounds::design(),
+            named_roots: &[],
         };
         let error = plan(
             &fixture.volume.state,
@@ -3954,5 +4763,706 @@ mod tests {
         let kept = row(&report, &other_root);
         assert!(!kept.eligible);
         assert!(!kept.references_complete);
+    }
+
+    /// One plan's canonical bytes and their digest, as `barge prune --plan --plan-out`
+    /// writes them and a real run presents them.
+    fn presented(report: &PruneReport) -> (Vec<u8>, String) {
+        let bytes = canonical_plan_bytes(&report.plan).expect("the plan is canonical");
+        let digest = sha256_hex(&bytes);
+        (bytes, digest)
+    }
+
+    /// One release run over the fixture's own platform, presenting `bytes` under
+    /// `digest` at `now_ms`.
+    fn release_with(
+        fixture: &Fixture,
+        observer: &FakeObserver,
+        facts: &FakeVolume,
+        now_ms: u64,
+        bytes: &[u8],
+        digest: &str,
+    ) -> Result<ReleaseRunReport> {
+        let platform = fixture.volume.platform();
+        let mounts = fixture.volume.mounts();
+        execute(
+            &fixture.volume.state,
+            &platform,
+            facts,
+            &mounts,
+            observer,
+            &fixture.account,
+            &ReleaseRunRequest {
+                plan_bytes: bytes,
+                plan_digest: digest,
+                release: fixture.request(now_ms),
+                delete: DeleteBounds::default(),
+            },
+        )
+    }
+
+    /// The intent journal's records, read the way a replay reads them.
+    fn intent_records(fixture: &Fixture) -> Vec<state::IntentRecord> {
+        state::read_intents(&fixture.volume.state, crate::contract::INTENT_ROWS)
+            .expect("the journal is read")
+            .records
+    }
+
+    #[test]
+    fn a_release_run_deletes_one_root_the_presented_plan_allows_and_replaying_it_releases_nothing()
+    {
+        let fixture = Fixture::new("release-run-positive");
+        let root = fixture.root();
+        let report = fixture.plan();
+        let (bytes, digest) = presented(&report);
+        assert!(row(&report, &root).eligible, "{report:?}");
+
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let run = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &digest,
+        )
+        .expect("the run is reported");
+        assert_eq!(run.released_count, 1, "{run:?}");
+        assert_eq!(run.kept_count, 0, "{run:?}");
+        assert!(!run.needs_human(), "{run:?}");
+        assert_eq!(run.rows[0].outcome, "released");
+        assert!(std::fs::metadata(&root.path).is_err(), "the root is gone");
+        assert_eq!(run.fresh_plan_digest.len(), 64);
+
+        // The settled intent keeps the evidence the plan proved: the durable identity
+        // and, for a root with no consumer reference, no absence document.
+        let records = intent_records(&fixture);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(!records[0].is_pending());
+        assert!(
+            records[0].identity.is_some(),
+            "the identity evidence is kept"
+        );
+        assert!(records[0].absence.is_none());
+
+        // The same bytes never release twice: the root is no longer listed.
+        let again = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &digest,
+        )
+        .expect("the second run is reported");
+        assert_eq!(again.released_count, 0, "{again:?}");
+        assert_eq!(again.kept_count, 1);
+        assert!(again.rows[0]
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("no longer listed"));
+        assert_eq!(intent_records(&fixture).len(), 1, "no second intent");
+    }
+
+    #[test]
+    fn a_changed_digest_a_non_canonical_plan_or_another_area_refuses_and_changes_nothing() {
+        let fixture = Fixture::new("release-run-refusals");
+        let root = fixture.root();
+        let report = fixture.plan();
+        let (bytes, digest) = presented(&report);
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+
+        // A digest that is not the bytes' digest.
+        let wrong = "0".repeat(64);
+        let error = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &wrong,
+        )
+        .expect_err("a digest that does not match refuses");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+
+        // The same plan, re-serialised with its digest recomputed: the bytes are not
+        // the canonical ones a plan writes, so the run refuses them too.
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("the plan is JSON");
+        let pretty = serde_json::to_vec_pretty(&value).expect("the plan encodes");
+        let pretty_digest = sha256_hex(&pretty);
+        let error = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &pretty,
+            &pretty_digest,
+        )
+        .expect_err("non-canonical bytes refuse");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+
+        // A plan for another area is refused before the gate runs.
+        let platform = fixture.volume.platform();
+        let mounts = fixture.volume.mounts();
+        let other = ReleaseRequest {
+            area: "elsewhere",
+            ..fixture.request(fixture.overdue())
+        };
+        let error = execute(
+            &fixture.volume.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.account,
+            &ReleaseRunRequest {
+                plan_bytes: &bytes,
+                plan_digest: &digest,
+                release: other,
+                delete: DeleteBounds::default(),
+            },
+        )
+        .expect_err("another area refuses");
+        assert_eq!(error.kind(), ErrorKind::VolumeMismatch);
+
+        assert!(std::fs::metadata(&root.path).is_ok(), "nothing was changed");
+        assert!(intent_records(&fixture).is_empty(), "no intent was written");
+    }
+
+    #[test]
+    fn a_run_keeps_a_root_whose_condition_changed_after_the_plan_was_written() {
+        // Each case plans an eligible root, changes one fact the gate reads, and runs
+        // the same bytes. The run keeps the root and writes no intent.
+        for case in [
+            "identity record removed",
+            "live hold",
+            "placement names the root",
+            "policy no longer permits a release",
+            "run clock before the declared age",
+            "marker removed",
+        ] {
+            let fixture = Fixture::new("release-run-changed");
+            let root = fixture.root();
+            let mut observer = fixture.volume.observer();
+            let mut now = fixture.overdue();
+            let report = fixture.plan();
+            assert!(row(&report, &root).eligible, "{case}: {report:?}");
+            let (bytes, digest) = presented(&report);
+            match case {
+                "identity record removed" => {
+                    std::fs::remove_file(identity_path(&fixture, &root)).expect("removed");
+                }
+                "live hold" => {
+                    observer
+                        .processes
+                        .insert(std::process::id(), Some(7_000_000));
+                    hold(&fixture, &observer, &root);
+                }
+                "placement names the root" => publish_placement(&fixture, &root),
+                "policy no longer permits a release" => {
+                    let mut declaration = fixture.declaration.clone();
+                    declaration.prune = PrunePolicy::None;
+                    area::declare(&fixture.volume.state, &declaration, 2_000)
+                        .expect("the policy changes");
+                }
+                "run clock before the declared age" => now = crate::state::now_ms(),
+                "marker removed" => {
+                    std::fs::remove_file(root.path.join(area::ROOT_MARKER_FILE)).expect("removed");
+                }
+                _ => unreachable!("every case names one fact"),
+            }
+            let facts = fixture.volume.facts();
+            let run = release_with(&fixture, &observer, &facts, now, &bytes, &digest)
+                .expect("the run is reported");
+            assert_eq!(run.released_count, 0, "{case}: {run:?}");
+            assert_eq!(run.rows.len(), 1, "{case}");
+            assert_eq!(run.rows[0].outcome, "kept", "{case}: {run:?}");
+            assert!(
+                std::fs::metadata(&root.path).is_ok(),
+                "{case}: the root is kept"
+            );
+            assert!(intent_records(&fixture).is_empty(), "{case}: no intent");
+        }
+    }
+
+    #[test]
+    fn an_oxide_reference_that_changes_after_the_plan_keeps_the_root_or_the_batch() {
+        // The registry becomes incomplete: Oxide's whole reference set is then
+        // unknown, so the run refuses the batch before any row is touched.
+        let fixture = Fixture::new("release-run-oxide-batch");
+        let root = fixture.root();
+        let checkout = fixture.account.home.join("checkout");
+        let settled = format!(
+            r#"{{"checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"external","recipe":"target-debug-v1","generation":1,"selected":false,"pending":false}}"#,
+            checkout.display(),
+            fixture.account.home.join("receipt.json").display(),
+            root.path.display(),
+        );
+        oxide_registry(&fixture, &settled, true);
+        let report = fixture.plan();
+        assert!(row(&report, &root).eligible, "{report:?}");
+        let (bytes, digest) = presented(&report);
+        oxide_registry(&fixture, &settled, false);
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let error = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &digest,
+        )
+        .expect_err("an incomplete registry keeps the whole batch");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(std::fs::metadata(&root.path).is_ok());
+        assert!(intent_records(&fixture).is_empty());
+
+        // The checkout reappears after the plan: the absence the row relied on is
+        // gone, and the fresh gate keeps the root.
+        let fixture = Fixture::new("release-run-oxide-reappears");
+        let root = fixture.root();
+        let checkout = fixture.account.home.join("checkout");
+        let settled = format!(
+            r#"{{"checkout_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","checkout":"{}","receipt":"{}","member":"target","root":"{}","root_kind":"external","recipe":"target-debug-v1","generation":1,"selected":false,"pending":false}}"#,
+            checkout.display(),
+            fixture.account.home.join("receipt.json").display(),
+            root.path.display(),
+        );
+        oxide_registry(&fixture, &settled, true);
+        let report = fixture.plan();
+        assert!(row(&report, &root).eligible, "{report:?}");
+        let (bytes, digest) = presented(&report);
+        std::fs::create_dir_all(&checkout).expect("the checkout reappears");
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let run = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &digest,
+        )
+        .expect("the run is reported");
+        assert_eq!(run.released_count, 0, "{run:?}");
+        assert!(std::fs::metadata(&root.path).is_ok(), "the root is kept");
+        assert!(intent_records(&fixture).is_empty());
+    }
+
+    #[test]
+    fn a_release_by_reference_policy_releases_a_root_without_an_age_gate() {
+        let fixture = Fixture::new("release-by-reference");
+        let mut declaration = fixture.declaration.clone();
+        declaration.prune = PrunePolicy::ReleaseOnReference;
+        area::declare(&fixture.volume.state, &declaration, 2_000).expect("the policy changes");
+        let root = fixture.root();
+        let report = fixture.plan_at(crate::state::now_ms());
+        assert!(row(&report, &root).eligible, "{report:?}");
+        let (bytes, digest) = presented(&report);
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let run = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            crate::state::now_ms(),
+            &bytes,
+            &digest,
+        )
+        .expect("the run is reported");
+        assert_eq!(run.released_count, 1, "{run:?}");
+        assert!(std::fs::metadata(&root.path).is_err());
+    }
+
+    #[test]
+    fn the_unit_lock_re_proof_refuses_each_condition_it_re_reads() {
+        // The effect re-reads the same facts under the unit's own lock before it writes
+        // an intent. Each mutation here stands in for a change between the fresh gate
+        // and that lock, and each must be refused by `reprove_row` alone.
+        for case in [
+            "identity record",
+            "identity record contents",
+            "marker",
+            "live hold",
+            "placement",
+        ] {
+            let fixture = Fixture::new("release-reprove");
+            let root = fixture.root();
+            let mut observer = fixture.volume.observer();
+            let platform = fixture.volume.platform();
+            let facts = fixture.volume.facts();
+            let mounts = fixture.volume.mounts();
+            let overdue = fixture.overdue();
+            let (report, observed) = plan_observed(
+                &fixture.volume.state,
+                &platform,
+                &facts,
+                &mounts,
+                &observer,
+                &fixture.account,
+                &fixture.request(overdue),
+            )
+            .expect("the plan is built");
+            let index = report
+                .plan
+                .rows
+                .rows
+                .iter()
+                .position(|candidate| candidate.root_id == root.root_id)
+                .expect("the plan names the root");
+            let planned = report.plan.rows.rows[index].clone();
+            let observed_root = observed[index].as_ref().expect("the root was observed");
+            match case {
+                "identity record" => {
+                    std::fs::remove_file(identity_path(&fixture, &root)).expect("removed");
+                }
+                "marker" => {
+                    std::fs::remove_file(root.path.join(area::ROOT_MARKER_FILE)).expect("removed");
+                }
+                "live hold" => {
+                    observer
+                        .processes
+                        .insert(std::process::id(), Some(7_000_000));
+                    hold(&fixture, &observer, &root);
+                }
+                "identity record contents" => {
+                    // The record is still there and still parses, but it names another
+                    // volume: identity is decided against the record's own contents.
+                    let record_path = identity_path(&fixture, &root);
+                    let mut record: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(&record_path).expect("the record is read"),
+                    )
+                    .expect("the record is JSON");
+                    record["volume_uuid"] =
+                        serde_json::Value::String(crate::testkit::OTHER_UUID.to_owned());
+                    std::fs::write(
+                        &record_path,
+                        serde_json::to_vec(&record).expect("the record encodes"),
+                    )
+                    .expect("the record is rewritten");
+                    std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o600))
+                        .expect("the record is private");
+                }
+                "placement" => publish_placement(&fixture, &root),
+                _ => unreachable!("every case names one fact"),
+            }
+            let document = area::show(&fixture.volume.state, "example", "pool")
+                .expect("the area is read")
+                .expect("the area is declared");
+            let uid = observer.effective_uid().expect("the uid is read");
+            let context = Reprove {
+                state_paths: &fixture.volume.state,
+                dirs: &platform,
+                facts: &facts,
+                observer: &observer,
+                account: &fixture.account,
+                document: &document,
+                row: &planned,
+                observed: observed_root,
+                volume_uuid: &fixture.volume.uuid,
+                uid,
+                now_ms: overdue,
+                reference_wall: ReleaseBounds::design().reference_wall,
+            };
+            let refused = reprove_row(&context).expect_err(case);
+            assert!(!refused.is_empty(), "{case}");
+        }
+
+        // The untouched root re-proves cleanly.
+        let fixture = Fixture::new("release-reprove-clean");
+        let root = fixture.root();
+        let observer = fixture.volume.observer();
+        let platform = fixture.volume.platform();
+        let facts = fixture.volume.facts();
+        let mounts = fixture.volume.mounts();
+        let overdue = fixture.overdue();
+        let (report, observed) = plan_observed(
+            &fixture.volume.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.account,
+            &fixture.request(overdue),
+        )
+        .expect("the plan is built");
+        let index = report
+            .plan
+            .rows
+            .rows
+            .iter()
+            .position(|candidate| candidate.root_id == root.root_id)
+            .expect("the plan names the root");
+        let document = area::show(&fixture.volume.state, "example", "pool")
+            .expect("the area is read")
+            .expect("the area is declared");
+        let context = Reprove {
+            state_paths: &fixture.volume.state,
+            dirs: &platform,
+            facts: &facts,
+            observer: &observer,
+            account: &fixture.account,
+            document: &document,
+            row: &report.plan.rows.rows[index],
+            observed: observed[index].as_ref().expect("observed"),
+            volume_uuid: &fixture.volume.uuid,
+            uid: observer.effective_uid().expect("the uid is read"),
+            now_ms: overdue,
+            reference_wall: ReleaseBounds::design().reference_wall,
+        };
+        reprove_row(&context).expect("an untouched root re-proves");
+    }
+
+    #[test]
+    fn an_intent_is_written_before_the_rename_and_a_remount_replays_it() {
+        let fixture = Fixture::new("release-intent-remount");
+        let root = fixture.root();
+        let report = fixture.plan();
+        let (bytes, digest) = presented(&report);
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+
+        // The area folder refuses the rename, so the deletion stops after its intent
+        // is published and before any unit moves.
+        let area_dir = root
+            .path
+            .parent()
+            .expect("the root sits in its area")
+            .to_path_buf();
+        std::fs::set_permissions(&area_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("the area is read-only");
+        let run = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &digest,
+        );
+        std::fs::set_permissions(&area_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("the area is writable again");
+        let run = run.expect("the run is reported");
+        assert_eq!(run.rows[0].outcome, "pending", "{run:?}");
+        assert!(run.needs_human());
+        assert!(
+            std::fs::metadata(&root.path).is_ok(),
+            "the unit did not move"
+        );
+
+        let records = intent_records(&fixture);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(records[0].is_pending());
+        assert!(
+            records[0].identity.is_some(),
+            "the evidence is on the intent"
+        );
+
+        // A reboot or a reconnect can give the volume another device number, so the
+        // device the intent recorded is stale. The replay settles by the recorded UUID
+        // and the unit's own identity, never by that number.
+        let intent_id = records[0].intent_id.clone();
+        let path = state::intent_path(&fixture.volume.state, &intent_id).expect("the intent path");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("the intent is read"))
+                .expect("the intent is JSON");
+        let device = document["unit"]["device"]
+            .as_u64()
+            .expect("the device is recorded");
+        document["unit"]["device"] = serde_json::Value::from(device.saturating_add(9));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&document).expect("the intent encodes"),
+        )
+        .expect("the intent is rewritten");
+        let platform = fixture.volume.platform();
+        let facts = fixture.volume.facts();
+        let mut locks = state::LockSet::with_deadline(
+            fixture.volume.state.clone(),
+            Deadline::after(state::LOCK_WAIT),
+        );
+        let volume_lock = locks
+            .lock_volume(&fixture.volume.uuid)
+            .expect("the volume lock is taken");
+        let replay = delete::replay_pending_on_volume(
+            &fixture.volume.state,
+            &platform,
+            &facts,
+            &observer,
+            &fixture.volume.uuid,
+            &volume_lock,
+            DeleteBounds::default(),
+            None,
+        )
+        .expect("the replay runs");
+        assert!(replay.is_settled(), "{replay:?}");
+        assert_eq!(replay.rolled_back, 1, "{replay:?}");
+        assert!(
+            std::fs::metadata(&root.path).is_ok(),
+            "the root is back in place"
+        );
+        assert!(
+            intent_records(&fixture).is_empty(),
+            "a rolled-back intent is settled and leaves the journal"
+        );
+    }
+
+    /// One plan at `now_ms`, naming the roots an operator waives the age gate for.
+    fn plan_naming(fixture: &Fixture, now_ms: u64, named: &[String]) -> Result<PruneReport> {
+        let platform = fixture.volume.platform();
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let mounts = fixture.volume.mounts();
+        let request = ReleaseRequest {
+            named_roots: named,
+            ..fixture.request(now_ms)
+        };
+        plan(
+            &fixture.volume.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.account,
+            &request,
+        )
+    }
+
+    #[test]
+    fn a_named_root_waives_only_the_age_gate_and_the_plan_says_so() {
+        // A young root under an age-gated area is kept, and a named root is released
+        // without its age. The waiver is stated in the plan, so the digest covers it.
+        let fixture = Fixture::new("release-named-root");
+        let root = fixture.root();
+        let now = crate::state::now_ms();
+        let unnamed = plan_naming(&fixture, now, &[]).expect("the plan is built");
+        assert!(!row(&unnamed, &root).eligible);
+        assert_eq!(row(&unnamed, &root).blocked_by.as_deref(), Some("policy"));
+
+        let named = vec![root.root_id.clone()];
+        let report = plan_naming(&fixture, now, &named).expect("the plan is built");
+        let waived = row(&report, &root);
+        assert!(waived.eligible, "{waived:?}");
+        assert!(waived.age_waived, "the waiver is stated on the row");
+        assert_eq!(report.plan.named_roots, named);
+        let (bytes, digest) = presented(&report);
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let run = release_with(&fixture, &observer, &facts, now, &bytes, &digest)
+            .expect("the run is reported");
+        assert_eq!(run.released_count, 1, "{run:?}");
+        assert!(std::fs::metadata(&root.path).is_err());
+
+        // A named root keeps every other condition: a live hold still keeps it.
+        let held = Fixture::new("release-named-root-hold");
+        let held_root = held.root();
+        let mut held_observer = held.volume.observer();
+        held_observer
+            .processes
+            .insert(std::process::id(), Some(7_000_000));
+        hold(&held, &held_observer, &held_root);
+        let report = plan_naming(
+            &held,
+            held.overdue(),
+            std::slice::from_ref(&held_root.root_id),
+        )
+        .expect("the plan is built");
+        let kept = row(&report, &held_root);
+        assert!(!kept.eligible);
+        assert_eq!(kept.blocked_by.as_deref(), Some("custody"));
+
+        // A policy that never releases is not waived by a name.
+        let never = Fixture::new("release-named-root-none");
+        let never_root = never.root();
+        let mut declaration = never.declaration.clone();
+        declaration.prune = PrunePolicy::None;
+        area::declare(&never.volume.state, &declaration, 2_000).expect("the policy changes");
+        let report = plan_naming(
+            &never,
+            never.overdue(),
+            std::slice::from_ref(&never_root.root_id),
+        )
+        .expect("the plan is built");
+        let kept = row(&report, &never_root);
+        assert!(!kept.eligible);
+        assert!(!kept.age_waived);
+        assert_eq!(kept.blocked_by.as_deref(), Some("policy"));
+    }
+
+    #[test]
+    fn a_named_root_must_be_listed_and_a_waiver_must_name_its_root() {
+        let fixture = Fixture::new("release-named-unlisted");
+        let root = fixture.root();
+        let now = crate::state::now_ms();
+
+        // A root id the area does not list is refused: a name the plan cannot see
+        // would waive nothing.
+        let unlisted = vec!["a".repeat(32)];
+        let error = plan_naming(&fixture, now, &unlisted).expect_err("an unlisted name refuses");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert!(std::fs::metadata(&root.path).is_ok(), "nothing was changed");
+
+        // A plan whose waiver names no root is not a plan this reader accepts.
+        let named = vec![root.root_id.clone()];
+        let report = plan_naming(&fixture, now, &named).expect("the plan is built");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&canonical_plan_bytes(&report.plan).expect("the plan encodes"))
+                .expect("the plan is JSON");
+        value["named_roots"] = serde_json::json!([]);
+        let forged = serde_json::to_vec(&value).expect("the forged plan encodes");
+        let error = read_prune_plan(&forged).expect_err("a waiver the plan does not name refuses");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+    }
+
+    #[test]
+    fn a_later_run_settles_a_pending_intent_even_when_nothing_is_a_candidate() {
+        // The first run stops at the rename, leaving its intent pending. The next run
+        // keeps the root, because its custody is not safe, and its replay settles the
+        // intent whether or not any row is a candidate.
+        let fixture = Fixture::new("release-settle-pending");
+        let root = fixture.root();
+        let report = fixture.plan();
+        let (bytes, digest) = presented(&report);
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let area_dir = root
+            .path
+            .parent()
+            .expect("the root sits in its area")
+            .to_path_buf();
+        std::fs::set_permissions(&area_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("the area is read-only");
+        let first = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &digest,
+        );
+        std::fs::set_permissions(&area_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("the area is writable again");
+        assert_eq!(
+            first.expect("the run is reported").rows[0].outcome,
+            "pending"
+        );
+        assert_eq!(intent_records(&fixture).len(), 1);
+
+        let second = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &digest,
+        )
+        .expect("the second run is reported");
+        assert_eq!(second.released_count, 0, "{second:?}");
+        assert_eq!(second.replay_pending, 0, "{second:?}");
+        assert!(std::fs::metadata(&root.path).is_ok(), "the root is kept");
+        assert!(intent_records(&fixture).is_empty(), "the intent is settled");
     }
 }

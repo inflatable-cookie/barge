@@ -41,7 +41,9 @@ registry, receipts and root markers strictly in place, and the intent, the
 effect and the replay remain F4.
 
 No part of this contract authorizes a native run, a real drive, a mount or host
-setting change, a data move, a deletion, or any change to Oxide.
+setting change, a data move, a deletion, or any change to Oxide. The one deletion
+path it defines is the release effect in [F6-R1](#f6-r1-landed-surface): it runs
+only when an operator runs it on a presented plan, and nothing in Barge calls it.
 
 ## Scope and authority
 
@@ -840,6 +842,8 @@ fields are understood by both.
 | `barge.describe` | `/1`, optional fields added | `barge describe` | adds `identity.capability` (what may be compared across a remount) and `volumes[].mounts` (how many live mounts carry each registered UUID) |
 | `barge.inspect` | `/1`, optional fields added | `barge inspect` | adds `oxide_census`: the Oxide output-registry observation, its per-row identity census and the drift summary |
 | `barge.prune` | `/1` | `barge prune --plan` | the command document around the plan, as `barge.maintain/1` wraps `barge.maintain.plan/1`: the plan, its SHA-256, when it was planned, the volume's state and whether the Oxide reference snapshot was complete |
+| `barge.prune.plan` (F6-R1 additions) | `/1`, optional fields | `barge prune --plan --root` | `named_roots` (sorted, unique root ids) and each row's `age_waived`, present only when a root was named; both covered by the digest |
+| `barge.prune.run` | `/1` | `barge prune --plan <file> --plan-sha256 <hex>` | new in F6-R1: the release effect's report, the presented digest, the fresh gate's digest for the same area, the replay's pending count and one outcome per presented eligible row |
 
 The versioning rules are stage 1's: adding an optional field stays inside a
 major; removing one, changing a type or a meaning is a new major.
@@ -1079,8 +1083,9 @@ prune or change any consumer's state.
 The release gate is planned, not performed: `barge prune --plan --area
 <namespace>/<area> --volume <uuid>` builds one `barge.prune.plan/1`, writes it
 where `--plan-out` asks, and prints it inside `barge.prune/1` with its SHA-256.
-The verb refuses every form that is not the plan, because the effect it would
-imply needs F4's intent evidence, its replay and its separate authorization.
+The verb refuses every form that is not the plan. (Historical, at F3: the effect
+needed F4's intent evidence, its replay and its own authorization. F6-R1 added the
+release form; see [F6-R1](#f6-r1-landed-surface).)
 
 Condition 1 is the plan's own precondition rather than a row field: a plan exists
 only for a volume that verified, the command document's `volume.state` records
@@ -1349,10 +1354,10 @@ detail.
 ### F4 landed surface
 
 `barge.intent/2` gained the two optional documents this contract gives it, and the
-reader, the writer seam and the replay know them. It did **not** gain an effect
-verb: `barge prune` still refuses every form that is not the plan, because a real
-release needs its own authorization, and this slice authorizes no delete of any
-root (`F3`'s refusal text is unchanged).
+reader, the writer seam and the replay know them. (Historical, at F4: it gained no
+effect verb, and the slice authorized no delete of any root. F6-R1 added the
+release form of `barge prune` and the first writer of those documents; see
+[F6-R1](#f6-r1-landed-surface).)
 
 What a record can now carry. `identity` is condition 2's evidence exactly as a plan
 row prints it — verdict, optional reason code, inode, both devices, the remount and
@@ -1453,6 +1458,143 @@ fields are the intent's two optional ones and, additively, the replay report's
 `remounted` count inside `barge.scratch.expire/1`, whose human summary names it only
 when it is not zero; the CLI's only other edit is the absence seam the replay's
 platform object already supplies.
+
+### F6-R1 landed surface
+
+The release effect exists: `barge prune --plan <file> --plan-sha256 <hex> --area
+<namespace>/<area> --volume <uuid>` runs it. It is the only path that deletes a
+whole owned root for release. Nothing calls it: `maintain` and the space prune
+never reach it, and no host job runs it. Oxide's `R1` slice, its adoption and its
+operator gates stay in Oxide's own project.
+
+**The run.** `release::execute` takes the presented bytes and digest and does
+this, in order. Each batch-wide refusal changes nothing.
+
+1. The bytes must hash to the digest, read through F4's strict reader, and
+   re-serialise to the same bytes. The plan's area and volume must be the
+   command's.
+2. The gate runs again for the same area (F3's `plan`), with the presented plan's
+   own named roots, before the volume lock, because a plan takes that lock shared. A volume that is not attached, a volume
+   with an undeclared durability, or an incomplete Oxide reference set refuses the
+   whole batch.
+3. Each presented eligible row must agree with the fresh row on identity verdict,
+   inode, marker digest, references and absence verdict, and the fresh row must
+   still be eligible. A row that does not is kept with its reason.
+4. The run takes the volume's exclusive lock and replays pending intents on the
+   volume (F4), whether or not any row is a candidate, so a later run settles an
+   intent an earlier run left. Then each candidate's deletion takes its unit's lock, and before
+   the intent is written, `reprove_row` re-reads under that lock: the marker and
+   inode the row named, the durable identity record's contents, the policy and its
+   age, every reference (holds, placements, Oxide's registry, receipts and marker),
+   and any consumer path's absence. Identity is decided again by the plan's own
+   rule, against the record's volume, root id, nonce, path, kind and area, so a
+   record that names another volume or another root keeps the root. Any change
+   keeps that root and writes no intent.
+5. The intent is `barge.intent/2` with the fresh identity and absence evidence.
+   Its `plan_digest` is the presented digest, which is the permission. The rest is
+   S5: custody after publish, the quarantine rename, the whole-unit delete and the
+   replay.
+6. An effect whose state is uncertain stops the batch. An error after an intent
+   could exist, or an intent left pending, stops it and reports the rest as
+   `not_attempted`. A refusal the re-proof made came before any intent, so the
+   batch goes on.
+
+**Condition 4 and `release_on_reference`.** `release_on_reference` now permits a
+release by reference, with no age gate. The area's reference (condition 5) is
+current only for `none`. A known last activity is still required, because an
+unknown activity keeps a root everywhere in this gate. `oldest-idle` keeps its age
+gate, and `none` releases nothing. `maintain` and the space path still never
+consider a `release_on_reference` root (slice R2, in the slices section above).
+
+**The named-root waiver.** `barge prune --plan --root <root-id>` (repeatable) names
+the roots an operator waives the age gate for. It waives that one condition and
+nothing else: custody, durability, identity, references, absence and the policy's
+own permission all still apply, and a named root's last activity must still be
+known. An `oldest-idle` area is the only one whose age gate it waives; a `none`
+area still releases nothing, and a `release_on_reference` area has no age gate to
+waive. The plan states the waiver: `named_roots` is the sorted, unique list of root
+ids the operator named, and each row the waiver stood in for carries
+`age_waived: true`. The digest covers both, and the effect plans with the presented
+plan's own named roots, so the same waiver is decided again. A name the area does
+not list refuses the plan, and a waived row whose root the plan does not name is a
+document the reader refuses. A real run takes no `--root`; the presented plan
+states its own. The run never reads a root that a plan did not list, and it never
+settles an Oxide intent.
+
+**Output.** `barge.prune.run/1`: `plan_digest`, `fresh_plan_digest`, `run_ms`,
+`area`, `volume_uuid`, `replay_pending`, `rows` (`released`, `kept`, `pending`,
+`error` or `not_attempted`, each with its reason and intent), `released_count`,
+`kept_count` and `stopped`. Exit `3` is a pending or errored row, a stopped batch,
+or a replay that left an intent pending.
+
+**Seams.** `release.rs`: `plan` wraps `plan_observed`, which returns each row's
+`ObservedRoot` (its unit, path and mount point) beside the report; `decide_root`
+keeps the unit and carries `permits_release` into condition 4 and the area
+reference; `execute` runs the checks above; `delete_candidates` holds the volume
+lock, replays, and calls `delete::delete_unit_under_volume_lock` with `reprove_row`
+as its `authorize`; `reprove_row` is the effect-time re-proof. `delete.rs` is
+unchanged. `reference.rs` changes one detail string. `barge-cli` `prune_plan`
+dispatches bare `--plan` to the preview and `--plan <file>` with a digest to the
+run.
+
+**Case table.** Each case is carried by a named regression. The apparatus's
+`release:native:test` checks every name against the source.
+
+| Case | Claim | Carried by |
+| --- | --- | --- |
+| C1 | volume verified and attached; an absent volume plans nothing | `an_absent_volume_plans_nothing_and_a_permanent_one_is_loud` |
+| C2 | identity verified and its record present; each one alone keeps | `all_six_conditions_release_a_root_and_each_one_alone_keeps_it` |
+| C2e | marker and inode re-proved under the unit lock | `the_unit_lock_re_proof_refuses_each_condition_it_re_reads` |
+| C3 | custody safe; a live hold keeps | `the_unit_lock_re_proof_refuses_each_condition_it_re_reads` |
+| C4 | policy permits; age passed; `release_on_reference` has no age gate | `a_release_by_reference_policy_releases_a_root_without_an_age_gate` |
+| C5 | no current reference from a complete set; a pending or unsettled Oxide row keeps | `an_oxide_reference_that_is_not_settled_keeps_the_root` |
+| C5c | an incomplete or divergent reference set keeps the batch | `an_incomplete_or_divergent_reference_source_keeps_the_whole_batch` |
+| C6 | consumer path absent; a reappeared path keeps | `an_oxide_reference_that_changes_after_the_plan_keeps_the_root_or_the_batch` |
+| X1 | one synthetic root released from the presented bytes; replaying the plan releases nothing | `a_release_run_deletes_one_root_the_presented_plan_allows_and_replaying_it_releases_nothing` |
+| X2 | a changed digest, non-canonical bytes or another area refuses | `a_changed_digest_a_non_canonical_plan_or_another_area_refuses_and_changes_nothing` |
+| X3 | a foreign or unknown marker kind cannot qualify | `a_marker_with_an_unknown_kind_cannot_qualify_its_root` |
+| X4 | each condition that changed after the plan keeps the root and writes no intent | `a_run_keeps_a_root_whose_condition_changed_after_the_plan_was_written` |
+| X5 | the intent is written before the rename; a remount replays it | `an_intent_is_written_before_the_rename_and_a_remount_replays_it` |
+| X6 | the CLI refuses a digest that is not the presented bytes' | `prune_run_refuses_a_plan_whose_digest_or_bytes_are_not_the_presented_ones` |
+| X7 | a named root waives only the age gate; custody and policy still keep, the plan states the waiver, and an unlisted name or an unnamed waiver refuses | `a_named_root_waives_only_the_age_gate_and_the_plan_says_so`, `a_named_root_must_be_listed_and_a_waiver_must_name_its_root` |
+| X8 | identity re-decided under the lock against the record's contents | `the_unit_lock_re_proof_refuses_each_condition_it_re_reads` (case `identity record contents`) |
+
+**Native proof: built, held for owner activation, not run.**
+`scripts/native/release-proof.py` carries the bounded native body. It runs under
+Oxide's qualified shared supervisor, pinned to the same bytes the S6, S7 and space
+proofs name, with a 300 s wall and 512 MiB of scratch. It creates one owned
+64 MiB sparse APFS image under the guard's scratch, attaches it with `-owners on`,
+and registers it as the only volume. Each of its twelve cases declares its own area,
+so one case's roots never reach another case's plan:
+
+| Case | Claim | Counterfactual of |
+| --- | --- | --- |
+| R1 | one aged, unreferenced root is released from its presented bytes; the replay releases nothing, and the settled intent keeps the identity | the positive case |
+| R2 | a missing identity record keeps the root | R1, identity |
+| R3 | a live hold keeps the root through custody | R1, custody |
+| R4 | a young root is kept; a named root is released with its waiver stated | R1, age |
+| R5 | a pending Oxide reference keeps the root | R1, references |
+| R6 | a settled row releases only once its consumer path is absent (release by reference) | the release-by-reference policy |
+| R7 | an incomplete Oxide set refuses the batch (`unknown_state`) and changes nothing | R1, complete reference set |
+| R8 | a marker whose kind is unknown keeps the root | R1, marker kind |
+| R9 | a changed digest refuses and changes nothing; the presented bytes then release | the digest |
+| R10 | a consumer path that reappears between plan and run keeps the root | the release-by-reference case |
+| R11 | a pending intent is written before the rename; after an ordinary detach and reattach, a later run settles it by UUID and the root releases after | the intent and remount |
+| R12 | a run releases only the rows its presented plan carries | the plan's scope |
+
+The receipt, `release-proof-receipt.json` under `OXIDE_PROOF_EVIDENCE`, records the
+head, the binary's and the supervisor's digests, the volume UUID and its device
+before and after the remount, the closure (ordinary detach, mount absent), the
+wall time, each case's status and evidence, the first fault, and the real-state
+premise. `qualified` is `true` only for a counted pass with every case passed, a
+closed image and an unchanged real state. The diagnostic is always `qualified:
+false`.
+
+What is not yet established: nothing in this repository has run the body. Its
+self-check (`release:native:test`) and its refusals before any effect are checked.
+The diagnostic pass, the counted author pass and a distinct reviewer pass each need
+owner activation at an exact head. Until those receipts exist, a missing receipt is
+a missing proof.
 
 ## Proposed validation
 

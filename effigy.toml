@@ -55,6 +55,25 @@ alias = "barge"
 "space:native:test" = "python3 scripts/native/space-proof.py --self-check"
 "space:native:plan" = "python3 scripts/native/space-proof.py --plan"
 
+# F6-R1's release effect (scripts/native/release-proof.py). The self-check and the
+# plan are effect-free: they check the pinned supervisor, the argv guard, the case
+# table and the source text, and start no image and no child process.
+"release:native:test" = "python3 scripts/native/release-proof.py --self-check"
+"release:native:plan" = "python3 scripts/native/release-proof.py --plan"
+
+# The elevated native run: one owned 64 MiB APFS image under the guard's scratch, the
+# qualified shared supervisor, 300 s wall and 512 MiB scratch. HELD for owner
+# activation: these declarations activate nothing, and each run is separately
+# activated at an exact head (the diagnostic first, then the counted author pass,
+# then a distinct reviewer pass). A missing receipt is a missing proof.
+[tasks."release:native"]
+admission = "heavy"
+run = "python3 scripts/native/release-proof.py counted"
+
+[tasks."release:native:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/native/release-proof.py diagnostic"
+
 [test.suites.rust]
 # The library and CLI suites. The budgets are the test route's timeout and
 # forced exit: an expired admission window starts no child, and an expired
