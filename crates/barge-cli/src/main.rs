@@ -55,8 +55,8 @@ const USAGE: &str = "usage: barge <describe|inspect|space|volume|maintain|prune|
        barge space recheck --guard <token> [--wall <seconds>]
        barge space prune --volume <uuid> --plan [--plan-out <file>]
        barge space prune --volume <uuid> --plan <file> --plan-sha256 <hex>
-       barge maintain [--plan-out <file>]
-       barge maintain --plan <file> --plan-sha256 <hex>
+       barge maintain [--space] [--plan-out <file>]
+       barge maintain [--space] --plan <file> --plan-sha256 <hex>
        barge prune --plan --area <namespace>/<area> --volume <uuid> [--plan-out <file>]
        barge diagnostic descriptor-census --root <existing-directory>
        barge area declare --namespace <ns> --area <name> --folder <folder> [--override <uuid>=<folder>]... --absent <fail:drive|wait|fallback:path> --prune <none|oldest-idle:seconds> --reserve <counts|excluded>
@@ -333,7 +333,13 @@ fn no_extra_arguments(rest: &[String]) -> Result<(), Error> {
 type Options = BTreeMap<String, Vec<String>>;
 
 /// The options that take no value.
-const FLAGS: [&str; 4] = ["plan", "write-setting", "adopt-existing-root", "revoke"];
+const FLAGS: [&str; 5] = [
+    "plan",
+    "write-setting",
+    "adopt-existing-root",
+    "revoke",
+    "space",
+];
 
 /// One command line's positional words and its `--key value` options.
 struct Parsed {
