@@ -251,8 +251,13 @@ impl StatePaths {
     ///
     /// Only a mutating call reaches this: every read-only command reports an
     /// absent directory instead of creating one. An existing directory is left
-    /// as it is, apart from being checked for being a real directory.
+    /// as it is, apart from being checked for being a real directory. The
+    /// account's default root also gets its `barge` parent created when that is
+    /// missing; an explicit `BARGE_STATE_DIR` never does.
     pub fn initialize(&self) -> Result<()> {
+        if self.source == StateDirSource::Account {
+            ensure_account_parent(&self.root)?;
+        }
         ensure_directory(&self.root)?;
         for directory in [
             self.areas_dir(),
@@ -266,6 +271,47 @@ impl StatePaths {
             ensure_directory(&directory)?;
         }
         Ok(())
+    }
+}
+
+/// Create the `barge` parent of the account's default state root, privately.
+///
+/// A fresh account has no `barge` folder yet, so the leaf alone cannot be
+/// created. Only that one level is made, and only when `Application Support`
+/// already exists: nothing above `barge` is ever created. An existing `barge`
+/// must be a real directory, so a symbolic link there is refused, not followed.
+fn ensure_account_parent(root: &Path) -> Result<()> {
+    let (Some(parent), Some(support)) = (root.parent(), root.parent().and_then(Path::parent))
+    else {
+        return Ok(());
+    };
+    match std::fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(Error::new(
+            ErrorKind::UnknownState,
+            format!("{} exists and is not a directory", parent.display()),
+        )
+        .with_detail("path", parent.display().to_string().into())),
+        Err(error) if error.kind() == IoErrorKind::NotFound => {
+            if !std::fs::metadata(support).is_ok_and(|metadata| metadata.is_dir()) {
+                return Err(Error::new(
+                    ErrorKind::Io,
+                    format!(
+                        "cannot create {}: {} is not an existing directory",
+                        parent.display(),
+                        support.display()
+                    ),
+                )
+                .with_detail("path", parent.display().to_string().into())
+                .with_detail("parent", support.display().to_string().into()));
+            }
+            ensure_directory(parent)
+        }
+        Err(error) => Err(Error::new(
+            ErrorKind::Io,
+            format!("cannot read {}: {error}", parent.display()),
+        )
+        .with_detail("path", parent.display().to_string().into())),
     }
 }
 
@@ -2546,6 +2592,88 @@ mod tests {
         // 2020-01-01 in milliseconds; a clock before that is reported as-is, not
         // corrected, but it must still be a real clock reading.
         assert!(now_ms() > 1_577_836_800_000);
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("the path exists")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    fn fixture_account_at(home: &Path) -> FakeAccount {
+        FakeAccount {
+            home: home.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn a_fresh_account_gets_its_barge_parent_privately() {
+        let fixture = TempDir::new("state-fresh-account");
+        std::fs::create_dir_all(fixture.path().join("Library/Application Support"))
+            .expect("the fixture's Application Support");
+        let state = StatePaths::resolve(&fixture_account_at(fixture.path()), None)
+            .expect("the account root resolves");
+        assert!(!state.is_initialized().expect("an absent root reads"));
+        state.initialize().expect("the barge parent and layout");
+        let parent = fixture.path().join("Library/Application Support/barge");
+        assert_eq!(mode_of(&parent), 0o700);
+        assert_eq!(mode_of(state.root()), 0o700);
+        assert!(state.is_initialized().expect("the root reads"));
+        assert!(state.locks_dir().is_dir());
+    }
+
+    #[test]
+    fn an_absent_application_support_is_refused_and_nothing_is_created() {
+        let fixture = TempDir::new("state-no-application-support");
+        let state = StatePaths::resolve(&fixture_account_at(fixture.path()), None)
+            .expect("the account root resolves");
+        let error = state
+            .initialize()
+            .expect_err("Application Support is never created");
+        assert!(error.to_string().contains("Application Support"), "{error}");
+        assert!(!fixture.path().join("Library").exists());
+    }
+
+    #[test]
+    fn a_symlinked_barge_parent_is_refused_and_not_followed() {
+        let fixture = TempDir::new("state-symlinked-parent");
+        std::fs::create_dir_all(fixture.path().join("Library/Application Support"))
+            .expect("the fixture's Application Support");
+        let target = fixture.path().join("elsewhere");
+        std::fs::create_dir(&target).expect("the link target");
+        std::os::unix::fs::symlink(
+            &target,
+            fixture.path().join("Library/Application Support/barge"),
+        )
+        .expect("the symbolic link");
+        let state = StatePaths::resolve(&fixture_account_at(fixture.path()), None)
+            .expect("the account root resolves");
+        let error = state.initialize().expect_err("a symbolic link is refused");
+        assert!(error.to_string().contains("not a directory"), "{error}");
+        assert!(
+            !target.join("state").exists(),
+            "nothing is written through the link"
+        );
+    }
+
+    #[test]
+    fn an_explicit_state_dir_with_an_absent_parent_still_refuses() {
+        let fixture = TempDir::new("state-explicit-absent-parent");
+        let state = StatePaths::resolve(&account(), Some(&fixture.path().join("absent/state")))
+            .expect("an absolute override resolves");
+        assert!(state.initialize().is_err());
+        assert!(!fixture.path().join("absent").exists());
+    }
+
+    #[test]
+    fn a_read_only_check_on_a_fresh_account_creates_nothing() {
+        let fixture = TempDir::new("state-read-only-fresh");
+        let state = StatePaths::resolve(&fixture_account_at(fixture.path()), None)
+            .expect("the account root resolves");
+        assert!(!state.is_initialized().expect("an absent root reads"));
+        assert!(!fixture.path().join("Library").exists());
     }
 
     fn initialized_state(fixture: &TempDir) -> StatePaths {

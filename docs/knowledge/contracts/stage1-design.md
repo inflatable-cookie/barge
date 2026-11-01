@@ -229,6 +229,12 @@ State is account-wide, not per `HOME` and not per checkout. Resolution:
    macOS. A test or proof may set `BARGE_STATE_DIR`; that variable is documented
    as fixture-only and never consulted in a normal run, so a stray environment
    cannot move the account's authority.
+   On a fresh account the `barge` parent is created on the first mutating
+   command, with mode `0700`, only when `Application Support` already exists;
+   nothing above `barge` is ever created, and an existing `barge` that is not a
+   real directory (for example a symbolic link) is refused. An explicit
+   `BARGE_STATE_DIR` keeps its own rule: its parent must already exist. Read-only
+   commands create nothing.
 3. Layout:
 
 ```text
