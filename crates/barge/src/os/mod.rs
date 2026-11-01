@@ -17,6 +17,11 @@ pub use absence::{prove_absence, AbsenceProof, AbsenceVolume, AncestorExpected};
 #[cfg(target_os = "macos")]
 mod macos;
 
+// The proof-only synthetic account: compiled only under its feature, which no
+// ordinary build enables (docs/knowledge/contracts/stage4-design.md, F6-R1).
+#[cfg(all(feature = "proof-synthetic-account", target_os = "macos"))]
+mod proof_account;
+
 pub use facts::{
     AccountFacts, BlindSpotEvidence, ChildEntry, ChildListing, ChildRemoval, DeadHandle,
     DeadHandleEvidence, DescriptorScan, DescriptorScanRequest, DeviceId, DirHandle, DirId,

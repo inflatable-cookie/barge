@@ -13,9 +13,12 @@ alias = "barge"
 # Ordinary Rust selectors run through the installed `oxide`, never raw `cargo`
 # (AGENTS.md). `rust:lint` is the RustQuality strict profile's mechanical set:
 # clippy::all plus the rustc lints the workspace manifests declare.
-"rust:compile" = "oxide check --workspace --all-targets --locked"
+# `--all-features` covers the proof-only `proof-synthetic-account` feature
+# (docs/knowledge/contracts/stage4-design.md, F6-R1), which no ordinary test or
+# build enables; compile and lint must still see its code.
+"rust:compile" = "oxide check --workspace --all-targets --all-features --locked"
 "rust:format" = "oxide fmt --all -- --check"
-"rust:lint" = "oxide clippy --workspace --all-targets --locked -- -D warnings"
+"rust:lint" = "oxide clippy --workspace --all-targets --all-features --locked -- -D warnings"
 # Read-only OS-layer diagnostic (crates/barge/examples/volume_probe.rs):
 # BARGE_OS_PROBE_PATH names one directory to read, and nothing is written.
 "os:volumes:probe" = "oxide run -p barge --locked --example volume_probe"
@@ -29,6 +32,9 @@ alias = "barge"
 "rust:test:volume-probe" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --example volume_probe"
 "rust:test:cli" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge-cli --bin barge"
 "rust:test:cli-contract" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge-cli --test cli_contract"
+# The proof-only account's own checks (os::proof_account), with its feature on. The
+# filter keeps the feature-off suite's tests out of this build.
+"rust:test:proof-account" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --features proof-synthetic-account --lib proof_account"
 
 
 # S6's elevated native proof (docs/knowledge/contracts/s6-native-proof.md).
@@ -57,12 +63,17 @@ alias = "barge"
 
 # F6-R1's release effect (scripts/native/release-proof.py). The self-check and the
 # plan are effect-free: they check the pinned supervisor, the argv guard, the case
-# table and the source text, and start no image and no child process.
+# table, the proof feature's declarations and the source text, and start no image
+# and no child process.
 "release:native:test" = "python3 scripts/native/release-proof.py --self-check"
 "release:native:plan" = "python3 scripts/native/release-proof.py --plan"
+# Builds the proof-feature binary of HEAD through Oxide, copies and hashes it into the
+# designated scratch, and writes its manifest. It runs no proof and touches no image.
+"release:native:stage" = "python3 scripts/native/release-proof.py stage"
 
 # The elevated native run: one owned 64 MiB APFS image under the guard's scratch, the
-# qualified shared supervisor, 300 s wall and 512 MiB scratch. HELD for owner
+# qualified shared supervisor, 300 s wall and 512 MiB scratch. Each run stages the
+# proof-feature build of HEAD first and runs only that staged file. HELD for owner
 # activation: these declarations activate nothing, and each run is separately
 # activated at an exact head (the diagnostic first, then the counted author pass,
 # then a distinct reviewer pass). A missing receipt is a missing proof.

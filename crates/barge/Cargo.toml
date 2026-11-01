@@ -16,5 +16,12 @@ serde_json = "=1.0.151"
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "=0.2.190"
 
+# The proof-only synthetic account (docs/knowledge/contracts/stage4-design.md,
+# "F6-R1 landed surface"). No ordinary build enables it. Under this feature alone,
+# Oxide's state and cache directories, which feed the reference set, come from one
+# validated private account home. Every other fact and rule is unchanged.
+[features]
+proof-synthetic-account = []
+
 [lints]
 workspace = true
