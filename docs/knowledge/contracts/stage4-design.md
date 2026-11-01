@@ -1474,7 +1474,13 @@ this, in order. Each batch-wide refusal changes nothing.
    re-serialise to the same bytes. The plan's area and volume must be the
    command's.
 2. The gate runs again for the same area (F3's `plan`), with the presented plan's
-   own named roots, before the volume lock, because a plan takes that lock shared. A volume that is not attached, a volume
+   own named roots, before the volume lock, because a plan takes that lock shared.
+   The volume is found by its recorded UUID (`MountLookup::ByUuid`), not by its stored
+   mount point: a remount under another name is the same volume, one live mount is
+   verified and opened as the descriptor, a stored point that another volume occupies
+   is never trusted, zero live mounts is `volume_absent`, and two are `unknown` with
+   exit `3`. Custody, the area folder and the deletion itself resolve the same way,
+   so the effect re-proves the live volume. A volume that is not attached, a volume
    with an undeclared durability, or an incomplete Oxide reference set refuses the
    whole batch.
 3. Each presented eligible row must agree with the fresh row on identity verdict,
@@ -1535,7 +1541,12 @@ lock, replays, and calls `delete::delete_unit_under_volume_lock` with `reprove_r
 as its `authorize`; `reprove_row` is the effect-time re-proof. `delete.rs` is
 unchanged. `reference.rs` changes one detail string. `barge-cli` `prune_plan`
 dispatches bare `--plan` to the preview and `--plan <file>` with a digest to the
-run.
+run. `area.rs` `MountLookup` and `VolumeRoot::open_with` carry the lookup: the release
+gate, its custody and its deletion use `ByUuid`, and every other caller keeps `Hint`,
+the stored point, which is unchanged. `identify` still requires the stored point to
+match the census, because it is an explicit repair command, not the release path. The
+proof build's only seam is `os/macos.rs` `tool_account_home`, which reads
+`os/proof_account.rs` under its feature.
 
 **Case table.** Each case is carried by a named regression. The apparatus's
 `release:native:test` checks every name against the source.
@@ -1559,13 +1570,46 @@ run.
 | X7 | a named root waives only the age gate; custody and policy still keep, the plan states the waiver, and an unlisted name or an unnamed waiver refuses | `a_named_root_waives_only_the_age_gate_and_the_plan_says_so`, `a_named_root_must_be_listed_and_a_waiver_must_name_its_root` |
 | X8 | identity re-decided under the lock against the record's contents | `the_unit_lock_re_proof_refuses_each_condition_it_re_reads` (case `identity record contents`) |
 
+**Proof build.** The first post-merge diagnostic, at PR #38's head `2ab52c7`, was
+unqualified: eleven of twelve cases failed. The ordinary CLI resolved Oxide's
+directories from the password database's home, so `BARGE_ACCOUNT_HOME` and the
+private `HOME` did not move them. It chose the real account control, whose version-1
+receipt makes the reference set incomplete. That result is historical and grants no
+native credit. The fix is a proof-only build, not a change to the ordinary one.
+
+The `proof-synthetic-account` feature (library and `barge-cli`) is off in every
+ordinary build. Under it alone, `os::macos` takes Oxide's state and cache directories
+from the synthetic account home, and only for the `oxide` tool. A `proof_account`
+module validates the bindings first. All five must be present, and any absent one
+refuses rather than falling back to the real home:
+
+- `OXIDE_TASK_SCRATCH_ROOT` and `OXIDE_PROOF_EVIDENCE` are real directories owned by
+  this account. The evidence directory need not sit inside the scratch root.
+- `BARGE_ACCOUNT_HOME`, `HOME` and `BARGE_STATE_DIR` are real directories owned by
+  this account, and each resolves strictly inside the scratch root. A symlink at any
+  of them, or an ancestor that resolves outside, refuses.
+- `HOME` resolves to the same directory as `BARGE_ACCOUNT_HOME`.
+- The synthetic home does not lie inside the password database's home.
+
+Nothing else changes in that build. Release gates, plan parsing, deletion, custody
+and the incomplete-reference rule are the ordinary code. The ordinary build ignores
+`BARGE_ACCOUNT_HOME` for Oxide's directories, and a unit test pins that.
+
 **Native proof: built, held for owner activation, not run.**
 `scripts/native/release-proof.py` carries the bounded native body. It runs under
 Oxide's qualified shared supervisor, pinned to the same bytes the S6, S7 and space
-proofs name, with a 300 s wall and 512 MiB of scratch. It creates one owned
+proofs name, with a 300 s wall and 512 MiB of scratch. It first stages the
+proof-feature build of HEAD through `oxide build --features proof-synthetic-account`,
+copies it under the designated scratch with a manifest of head, features and digest,
+and runs only that staged file. The inner half re-checks the manifest and the digest
+before any effect. It creates one owned
 64 MiB sparse APFS image under the guard's scratch, attaches it with `-owners on`,
-and registers it as the only volume. Each of its twelve cases declares its own area,
-so one case's roots never reach another case's plan:
+and registers it as the only volume. Its environment binds `HOME`,
+`BARGE_ACCOUNT_HOME` and `BARGE_STATE_DIR` inside the owned scratch, and it checks
+that each path resolves there. Each case's receipt records the reference control
+its previews chose, and a control outside the owned scratch faults the case. Each of
+its twelve cases declares its own area, so one case's roots never reach another
+case's plan:
 
 | Case | Claim | Counterfactual of |
 | --- | --- | --- |
@@ -1590,11 +1634,21 @@ premise. `qualified` is `true` only for a counted pass with every case passed, a
 closed image and an unchanged real state. The diagnostic is always `qualified:
 false`.
 
-What is not yet established: nothing in this repository has run the body. Its
-self-check (`release:native:test`) and its refusals before any effect are checked.
-The diagnostic pass, the counted author pass and a distinct reviewer pass each need
-owner activation at an exact head. Until those receipts exist, a missing receipt is
-a missing proof.
+The receipt's `limitation` field states what the proof does not establish. It runs a
+proof-only build whose Oxide directories come from one synthetic home. It tests the
+release logic over synthetic `AccountFacts`. It does not establish that the
+production account lookup is equivalent, and the production build is not run. The
+case table's regressions in the ordinary suite (`release.rs`, `cli_contract.rs`) carry
+the claims. The synthetic incomplete-registry case (R7, and the original incomplete
+reference) is carried by `an_incomplete_or_divergent_reference_source_keeps_the_whole_batch`,
+which uses a synthetic `FakeAccount`.
+
+What is not yet established: nothing in this repository has run the body against the
+proof build. Its self-check (`release:native:test`), its feature declarations and
+its pure counterfactuals (`release:native:test`, `rust:test:proof-account`) are
+checked. The diagnostic pass, the counted author pass and a distinct reviewer pass
+each need owner activation at an exact head. Until those receipts exist, a missing
+receipt is a missing proof.
 
 ## Proposed validation
 

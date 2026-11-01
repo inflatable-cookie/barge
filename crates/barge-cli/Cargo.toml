@@ -17,6 +17,10 @@ barge = { path = "../barge" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 
+# The proof-only build of the CLI: the library's `proof-synthetic-account`, which
+# no ordinary build enables.
+[features]
+proof-synthetic-account = ["barge/proof-synthetic-account"]
 
 [lints]
 workspace = true

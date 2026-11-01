@@ -694,15 +694,44 @@ impl AccountFacts for MacOs {
     }
 
     fn tool_state_dir(&self, tool: &str) -> Result<PathBuf> {
-        Ok(password_database_home()?
+        Ok(tool_account_home(tool)?
             .join(APPLICATION_SUPPORT_RELATIVE)
             .join(tool)
             .join("state"))
     }
 
     fn tool_cache_dir(&self, tool: &str) -> Result<PathBuf> {
-        Ok(password_database_home()?.join(CACHES_RELATIVE).join(tool))
+        Ok(tool_account_home(tool)?.join(CACHES_RELATIVE).join(tool))
     }
+}
+
+/// The home a foreign tool's account directories hang from.
+///
+/// An ordinary build takes the password database's home whatever the environment
+/// says. `BARGE_ACCOUNT_HOME` moves the account home for fixtures that read it, and
+/// never the Oxide control the reference set reads (stage 1 design, "Account-wide
+/// state directory").
+#[cfg(not(feature = "proof-synthetic-account"))]
+fn tool_account_home(_tool: &str) -> Result<PathBuf> {
+    password_database_home()
+}
+
+/// Under the proof-only feature, Oxide's directories come from the validated
+/// synthetic account home, and every other tool keeps the ordinary rule. A refused
+/// binding is an error, never a fallback to the real home.
+#[cfg(feature = "proof-synthetic-account")]
+fn tool_account_home(tool: &str) -> Result<PathBuf> {
+    let real_home = password_database_home()?;
+    if tool != crate::inspect::OXIDE_TOOL {
+        return Ok(real_home);
+    }
+    // SAFETY: `geteuid` takes no arguments, cannot fail and has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    super::proof_account::oxide_account_home(
+        &super::proof_account::Bindings::from_env(),
+        uid,
+        &real_home,
+    )
 }
 
 impl ProcessObserver for MacOs {
@@ -4391,6 +4420,44 @@ fn removal_error(name: &str, kind: RemoveKind, error: io::Error) -> Error {
     Error::new(error_kind, message)
         .with_detail("name", name.into())
         .with_detail("os_error", error.to_string().into())
+}
+
+/// The ordinary build's Oxide directories never read the account override, so a
+/// fixture home cannot move the reference set's control (stage 1 design).
+#[cfg(all(test, not(feature = "proof-synthetic-account")))]
+mod ordinary_account_tests {
+    // A failed fixture step is the test's failure, so these opt out of the shipped-path lints.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::{password_database_home, MacOs, APPLICATION_SUPPORT_RELATIVE, CACHES_RELATIVE};
+    use crate::os::AccountFacts;
+    use crate::state::ACCOUNT_HOME_ENV;
+    use crate::testkit::TempDir;
+
+    #[test]
+    fn an_ordinary_build_takes_oxide_directories_from_the_password_database_home() {
+        let fixture = TempDir::new("ordinary-oxide-home");
+        std::env::set_var(ACCOUNT_HOME_ENV, fixture.path());
+        let state = MacOs::new().tool_state_dir(crate::inspect::OXIDE_TOOL);
+        let cache = MacOs::new().tool_cache_dir(crate::inspect::OXIDE_TOOL);
+        std::env::remove_var(ACCOUNT_HOME_ENV);
+
+        let home = password_database_home().expect("the password database names the home");
+        let state = state.expect("the state directory resolves");
+        let cache = cache.expect("the cache directory resolves");
+        assert_eq!(
+            state,
+            home.join(APPLICATION_SUPPORT_RELATIVE)
+                .join(crate::inspect::OXIDE_TOOL)
+                .join("state")
+        );
+        assert_eq!(
+            cache,
+            home.join(CACHES_RELATIVE).join(crate::inspect::OXIDE_TOOL)
+        );
+        assert!(!state.starts_with(fixture.path()));
+        assert!(!cache.starts_with(fixture.path()));
+    }
 }
 
 #[cfg(test)]

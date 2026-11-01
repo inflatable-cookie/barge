@@ -1,26 +1,37 @@
 #!/usr/bin/env python3
 """Barge F6-R1's native proof: the release effect on one owned synthetic APFS image.
 
+  python3 scripts/native/release-proof.py stage         # build and stage the proof binary, effect-free
   python3 scripts/native/release-proof.py counted       # the author pass (owner-activated)
   python3 scripts/native/release-proof.py diagnostic    # the uncounted twin (owner-activated)
   python3 scripts/native/release-proof.py --self-check  # apparatus only, effect-free
   python3 scripts/native/release-proof.py --plan        # the plan, effect-free
 
 It is owner-activated. No ordinary Effigy selector runs a counted or diagnostic pass,
-and the declarations activate nothing. The binary under test is named by
-BARGE_PROOF_BIN, built from the head being proved.
+and the declarations activate nothing. The binary under test is never named by the
+caller: each counted or diagnostic run first stages a proof-feature build of HEAD
+through Oxide, hashes it, and runs only that staged file.
 
 What it does, in one sentence: under Oxide's qualified shared supervisor (pinned
 below, executed with the same interpreter), it creates one private run root inside
 the guard's owned scratch, attaches one owned APFS sparse image of 64 MiB with
 ownership enabled, registers that image as the only volume, and runs twelve release
-cases through the real `barge` CLI against a private HOME and state directory: each
-case declares its own area, so one case's roots never reach another case's plan.
+cases through the staged `barge` CLI against a private HOME, a private state
+directory and a synthetic account home (BARGE_ACCOUNT_HOME, equal to HOME). Each case
+declares its own area, so one case's roots never reach another case's plan.
+
+The staged binary is the `proof-synthetic-account` feature build. Under that feature
+alone, Oxide's reference directories come from the synthetic account home. The
+ordinary production build is a different binary and this proof does not run it. The
+receipt records that difference as a limitation (LIMITATION below).
 
 What it never does:
 
   - it never touches the real account home or the real Barge state directory, and it
     never registers a real drive (Builds included);
+  - it never reads or writes Oxide's real account control: the staged build resolves
+    Oxide's directories from the synthetic home only, and every case records the
+    reference control it chose, which must lie inside the owned scratch;
   - it never deletes anything but synthetic roots inside its own image;
   - it never force-detaches; detach is the ordinary `hdiutil detach`;
   - it never writes outside the guard's owned scratch and its evidence directory;
@@ -94,13 +105,33 @@ HOLDER = "release-native-holder"
 PROOF_RECEIPT = "release-proof-receipt.json"
 # Any holder or name that is not this proof's own is refused.
 NAMESPACE = "example"
+# The one Cargo feature the staged binary is built with. It is named here, in the
+# build command, the staged manifest and the self-check's manifest reading.
+PROOF_FEATURE = "proof-synthetic-account"
+BUILD_COMMAND = [
+    "oxide", "build", "-p", "barge-cli", "--locked",
+    "--features", PROOF_FEATURE, "--message-format", "json",
+]
+STAGE_ROOT = os.path.join(DESIGNATED_SCRATCH, "release-proof-stage")
+STAGE_MANIFEST = "proof-binary.json"
+STAGE_SCHEMA = "barge.release.proof-binary/1"
+# Oxide's account directories under the synthetic home, as the proof build resolves
+# them: the same relative layout the ordinary build uses under the password home.
+OXIDE_STATE_RELATIVE = os.path.join("Library", "Application Support", "oxide", "state")
+OXIDE_CACHE_RELATIVE = os.path.join("Library", "Caches", "oxide")
+LIMITATION = (
+    "The end-to-end receipt runs a proof-only build (feature `proof-synthetic-account`) "
+    "whose Oxide reference directories come from one synthetic account home. It tests "
+    "the release logic over synthetic AccountFacts. It does not establish that the "
+    "production account lookup is equivalent, and the production build is not run here."
+)
 
 ENVIRONMENT = {
     "TMPDIR": "the guard's owned scratch; every fixture directory is created here",
     "TMP": "the guard's owned scratch, kept equal to TMPDIR",
     "TEMP": "the guard's owned scratch, kept equal to TMPDIR",
     "BARGE_STATE_DIR": "the private fixture state directory this proof creates",
-    "BARGE_PROOF_BIN": "the barge binary this proof exercises",
+    "BARGE_ACCOUNT_HOME": "the synthetic account home, equal to HOME; Oxide's directories hang from it in the proof build",
     "BARGE_PROOF_SUPERVISOR": "the optional path to the hash-pinned Oxide supervisor",
     "OXIDE_PROOF_EVIDENCE": "the supervisor's evidence directory for the receipt",
     "OXIDE_TASK_SCRATCH_ROOT": "the supervisor's owned scratch root that TMPDIR must be inside",
@@ -344,13 +375,162 @@ def source_problems():
     return problems
 
 
+def fixture_environment(home, state, root):
+    """The variables this proof overrides, as a pure map. Pure: it touches nothing.
+
+    HOME and BARGE_ACCOUNT_HOME name one synthetic account home, so Oxide's
+    directories hang from it in the proof build. The state directory and the
+    temporary directories sit under the run root.
+    """
+    return {
+        "HOME": home,
+        "CARGO_HOME": os.path.join(home, "cargo"),
+        "BARGE_ACCOUNT_HOME": home,
+        "BARGE_STATE_DIR": state,
+        "TMPDIR": root,
+        "TMP": root,
+        "TEMP": root,
+    }
+
+
+def environment_problems(environment, scratch, home, state, root):
+    """Why the variables do not bind the synthetic account home inside the scratch. Pure."""
+    problems = []
+    if environment.get("BARGE_ACCOUNT_HOME") != environment.get("HOME"):
+        problems.append("BARGE_ACCOUNT_HOME is not the same path as HOME")
+    if environment.get("BARGE_ACCOUNT_HOME") != home:
+        problems.append("BARGE_ACCOUNT_HOME is not the synthetic home this run created")
+    if environment.get("BARGE_STATE_DIR") != state:
+        problems.append("BARGE_STATE_DIR is not the fixture state directory this run created")
+    for name in ("TMPDIR", "TMP", "TEMP"):
+        if environment.get(name) != root:
+            problems.append(f"{name} is not the run root")
+    problems += isolation_problems(scratch, {
+        "run root": root, "synthetic home": home, "state directory": state,
+    })
+    return problems
+
+
+def oxide_directories(home):
+    """Oxide's state and cache directories under a synthetic home. Pure."""
+    return {
+        "state": os.path.join(home, OXIDE_STATE_RELATIVE),
+        "cache": os.path.join(home, OXIDE_CACHE_RELATIVE),
+    }
+
+
+def isolation_problems(scratch, paths):
+    """Each named path must resolve strictly inside the owned scratch. Resolves names only.
+
+    A path that is absent still resolves by its literal parts, so the check holds
+    before anything is created. A symlink that leaves the scratch is caught here.
+    """
+    problems = []
+    owned = os.path.realpath(scratch)
+    for name, path in paths.items():
+        resolved = os.path.realpath(path)
+        if resolved == owned or not resolved.startswith(owned + os.sep):
+            problems.append(f"the {name} {path} resolves to {resolved}, outside the owned scratch {owned}")
+    return problems
+
+
+def executable_from_build(text):
+    """The staged binary's source and features from `oxide build --message-format json`. Pure.
+
+    Cargo reports one `compiler-artifact` per target. The `barge` binary's artifact
+    names its executable and the features it was built with, so the staged bytes
+    are checked against what cargo says it built, not against a guess.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            document = json.loads(line)
+        except ValueError:
+            continue
+        target = document.get("target") or {}
+        if document.get("reason") == "compiler-artifact" and target.get("name") == "barge" \
+                and "bin" in target.get("kind", []) and document.get("executable"):
+            return {"executable": document["executable"], "features": document.get("features", [])}
+    return None
+
+
+def staged_build_problems(binary, head):
+    """Why a binary is not the staged proof build of this head. Reads the manifest and the bytes."""
+    manifest_path = os.path.join(os.path.dirname(os.path.abspath(binary)), STAGE_MANIFEST)
+    try:
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, ValueError) as error:
+        return [f"the staged manifest {manifest_path} is unreadable: {error}"]
+    problems = []
+    if manifest.get("schema") != STAGE_SCHEMA:
+        problems.append("the staged manifest is not this proof's schema")
+    if manifest.get("path") != os.path.abspath(binary):
+        problems.append("the binary is not the path the staged manifest names")
+    if manifest.get("features") != [PROOF_FEATURE]:
+        problems.append(f"the staged build's features are {manifest.get('features')}, not [{PROOF_FEATURE!r}]")
+    if manifest.get("head") != head:
+        problems.append(f"the staged build is for head {manifest.get('head')}, not {head}")
+    try:
+        digest = sha256_file(binary)
+    except OSError as error:
+        return problems + [f"the staged binary is unreadable: {error}"]
+    if manifest.get("sha256") != digest:
+        problems.append("the staged binary's bytes no longer match the staged manifest's digest")
+    return problems
+
+
+def stage_proof_binary():
+    """Build the proof-feature binary of HEAD through Oxide and stage a hashed copy.
+
+    The copy sits in its own stage directory under the designated scratch. The
+    ordinary production build (target/debug/barge without the feature) is never
+    the one staged. Raises Infrastructure when the build or the copy cannot be made.
+    """
+    head = git_head()
+    if not head:
+        raise Infrastructure("stage", "HEAD is unreadable, so the staged build cannot be named")
+    build = subprocess.run(BUILD_COMMAND, cwd=REPO_ROOT, capture_output=True, text=True, timeout=1800)
+    if build.returncode != 0:
+        raise Infrastructure("stage", f"oxide build exited {build.returncode}: {build.stderr[-400:]}")
+    found = executable_from_build(build.stdout)
+    if found is None:
+        raise Infrastructure("stage", "the build reported no barge binary artifact")
+    if found["features"] != [PROOF_FEATURE]:
+        raise Infrastructure("stage", f"the barge artifact was built with features {found['features']}, not [{PROOF_FEATURE!r}]")
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    directory = os.path.join(STAGE_ROOT, f"{head}-{stamp}-{os.getpid()}")
+    os.makedirs(directory)
+    staged = os.path.join(directory, "barge")
+    shutil.copyfile(found["executable"], staged)
+    os.chmod(staged, 0o755)
+    manifest = {
+        "schema": STAGE_SCHEMA,
+        "head": head,
+        "features": found["features"],
+        "build_command": BUILD_COMMAND,
+        "source": found["executable"],
+        "path": staged,
+        "sha256": sha256_file(staged),
+    }
+    with open(os.path.join(directory, STAGE_MANIFEST), "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=1)
+        handle.write("\n")
+    return manifest
+
+
 class Proof:
     """One counted or diagnostic run: one image, one private HOME and state, many areas."""
 
-    def __init__(self, binary, receipt_path, diagnostic):
+    def __init__(self, binary, receipt_path, diagnostic, build):
         self.binary = binary
         self.receipt_path = receipt_path
         self.diagnostic = diagnostic
+        self.build = build
+        self.isolation = None
+        self.references = []
         self.root = None
         self.home = None
         self.state = None
@@ -383,15 +563,22 @@ class Proof:
         self.state = tempfile.mkdtemp(prefix="state-", dir=self.root)
         self.env = dict(os.environ)
         self.env.pop("DYLD_INSERT_LIBRARIES", None)
-        self.env.update(
-            HOME=self.home,
-            CARGO_HOME=os.path.join(self.home, "cargo"),
-            BARGE_STATE_DIR=self.state,
-            TMPDIR=self.root,
-            TMP=self.root,
-            TEMP=self.root,
-        )
+        self.env.update(fixture_environment(self.home, self.state, self.root))
         os.makedirs(self.env["CARGO_HOME"], exist_ok=True)
+        owned = os.environ["OXIDE_TASK_SCRATCH_ROOT"]
+        oxide = oxide_directories(self.home)
+        problems = environment_problems(self.env, owned, self.home, self.state, self.root)
+        self.isolation = {
+            "scratch": os.path.realpath(owned),
+            "run_root": os.path.realpath(self.root),
+            "synthetic_home": os.path.realpath(self.home),
+            "state_directory": os.path.realpath(self.state),
+            "oxide_state_directory": os.path.realpath(oxide["state"]),
+            "oxide_cache_directory": os.path.realpath(oxide["cache"]),
+            "problems": problems,
+        }
+        if problems:
+            raise Fault("premise", "; ".join(problems))
         for name in ("hdiutil", "diskutil"):
             if shutil.which(name) is None:
                 raise Infrastructure("host", f"{name} is not available")
@@ -495,7 +682,19 @@ class Proof:
                 "--plan-out", plan_file]
         for root_id in named:
             args += ["--root", root_id]
-        return self.barge(*args, expect=expect)
+        code, document = self.barge(*args, expect=expect)
+        self.record_reference(os.path.basename(plan_file), document)
+        return code, document
+
+    def record_reference(self, label, document):
+        """Record the reference control this preview chose; it must lie in the owned scratch."""
+        oxide = (document.get("data") or {}).get("oxide") or {}
+        control = oxide.get("control")
+        self.references.append({"plan": label, "complete": oxide.get("complete"), "control": control})
+        if control is not None:
+            problems = isolation_problems(self.root, {"reference control": control})
+            if problems:
+                raise Fault("isolation", "; ".join(problems))
 
     def real(self, plan_file, digest, expect=0):
         return self.barge(
@@ -581,9 +780,14 @@ class Proof:
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(document, handle)
 
-    def oxide_row(self, root, checkout, pending=False, selected=False):
+    def oxide_row(self, root, checkout, pending=False, selected=False, on_volume=False):
+        """One registry row. `on_volume` names the synthetic volume the checkout lives on.
+
+        Absence is proved against the volume a row names, so a consumer path on the
+        volume must say so; a row that does not name one cannot prove absence there.
+        """
         receipt = os.path.join(self.root, "receipts", os.path.basename(checkout) + ".json")
-        return {
+        row = {
             "checkout_id": OXIDE_CHECKOUT_ID,
             "checkout": checkout,
             "receipt": receipt,
@@ -595,6 +799,9 @@ class Proof:
             "selected": selected,
             "pending": pending,
         }
+        if on_volume:
+            row["checkout_volume_uuid"] = self.uuid
+        return row
 
     def pending_intents(self):
         directory = os.path.join(self.state, "intents")
@@ -688,7 +895,8 @@ class Proof:
         area = self.fresh_area("c04", f"oldest-idle:{AREA_AGE_SECONDS}")
         root = self.new_root(area, aged=False)
         _p, young, _f = self.plan_and_run("R4-young", area, root, expect_eligible=False)
-        if young["blocked_by"] != "policy" or young["age_waived"]:
+        # The plan omits `age_waived` when it is false, so an absent key is an unwaived row.
+        if young["blocked_by"] != "policy" or young.get("age_waived"):
             raise Fault("R4", "an unnamed young root was not kept by the age gate")
         preview, row, plan_file = self.plan_and_run(
             "R4-named", area, root, named=[root["root_id"]], expect_eligible=True
@@ -718,9 +926,12 @@ class Proof:
     def case_release_by_reference_needs_the_consumer_path_absent(self):
         area = self.fresh_area("c06", "release-on-reference")
         root = self.new_root(area, aged=False)
-        checkout = os.path.join(self.home, "checkouts", "settled")
+        # A consumer path on the synthetic volume: its absence is proved under that volume's
+        # mount, which the absence anchor finds by UUID. A path under /Volumes that no
+        # registered volume owns is unknown, and a consumer path must not be one of those.
+        checkout = os.path.join(self.mount, "checkouts", "settled")
         os.makedirs(checkout)
-        self.oxide_registry([self.oxide_row(root, checkout)], complete=True)
+        self.oxide_registry([self.oxide_row(root, checkout, on_volume=True)], complete=True)
         preview, row, plan_file = self.plan_and_run("R6-present", area, root, expect_eligible=False)
         if row["blocked_by"] != "absence" or (row.get("absence") or {}).get("verdict") != "present":
             raise Fault("R6", "a present consumer path did not keep the root")
@@ -779,8 +990,8 @@ class Proof:
     def case_reappeared_consumer_path_keeps_the_root(self):
         area = self.fresh_area("c10", "release-on-reference")
         root = self.new_root(area, aged=False)
-        checkout = os.path.join(self.home, "checkouts", "reappears")
-        self.oxide_registry([self.oxide_row(root, checkout)], complete=True)
+        checkout = os.path.join(self.mount, "checkouts", "reappears")
+        self.oxide_registry([self.oxide_row(root, checkout, on_volume=True)], complete=True)
         preview, row, plan_file = self.plan_and_run("R10", area, root, expect_eligible=True)
         os.makedirs(checkout)
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
@@ -845,13 +1056,15 @@ class Proof:
     def run_cases(self):
         for case in CASES:
             name = case["id"]
+            self.references = []
             try:
                 evidence = getattr(self, case["method"])()
                 self.results.append({"case": name, "status": "passed", "carried_by": case["carried_by"],
-                                     "evidence": evidence})
+                                     "evidence": evidence, "reference_controls": self.references})
             except Fault as error:
                 self.results.append({"case": name, "status": "failed", "kind": error.check,
-                                     "detail": error.detail, "carried_by": case["carried_by"]})
+                                     "detail": error.detail, "carried_by": case["carried_by"],
+                                     "reference_controls": self.references})
                 if self.first_fault is None:
                     self.first_fault = name
                 if not self.diagnostic:
@@ -861,7 +1074,8 @@ class Proof:
                 self.results.append({"case": name, "status": "failed", "kind": "exception",
                                      "detail": f"{type(error).__name__}: {error}",
                                      "trace": traceback.format_exc()[-800:],
-                                     "carried_by": case["carried_by"]})
+                                     "carried_by": case["carried_by"],
+                                     "reference_controls": self.references})
                 if self.first_fault is None:
                     self.first_fault = name
                 if not self.diagnostic:
@@ -885,6 +1099,9 @@ class Proof:
             "classification": None,
             "head": git_head(),
             "binary": {"path": self.binary, "sha256": sha256_file(self.binary)},
+            "build": self.build,
+            "isolation": self.isolation,
+            "limitation": LIMITATION,
             "supervisor": {"path": supervisor_path(), "sha256": SUPERVISOR_SHA256},
             "image": {"size_mib": IMAGE_MIB, "volume_uuid": self.uuid, "device": self.device,
                       "device_after_remount": self.device_after_remount,
@@ -931,7 +1148,15 @@ def inner_half(mode, binary, receipt_path):
         return 125
     if receipt_path is None:
         receipt_path = os.path.join(evidence, PROOF_RECEIPT)
-    proof = Proof(binary, receipt_path, mode == "diagnostic")
+    head = git_head()
+    build_problems = staged_build_problems(binary, head)
+    if build_problems:
+        print(json.dumps({"schema": SCHEMA, "ok": False,
+                          "refused": "; ".join(build_problems)}))
+        return 125
+    with open(os.path.join(os.path.dirname(os.path.abspath(binary)), STAGE_MANIFEST), encoding="utf-8") as handle:
+        build = json.load(handle)
+    proof = Proof(binary, receipt_path, mode == "diagnostic", build)
     cancelled = None
     try:
         proof.setup()
@@ -985,6 +1210,8 @@ def inner_half(mode, binary, receipt_path):
         and proof.closure is not None
         and proof.closure["mount_absent"]
         and premise_failure is None
+        and proof.isolation is not None
+        and not proof.isolation["problems"]
     )
     receipt["qualified"] = bool(qualified)
     if proof.infrastructure is not None:
@@ -1013,8 +1240,8 @@ def inner_half(mode, binary, receipt_path):
     return 3 if mode == "diagnostic" else 1
 
 
-def outer_half(mode, binary):
-    """Verify the pinned supervisor and hand this script to it as the command."""
+def outer_half(mode):
+    """Stage the proof build, verify the pinned supervisor, and hand this script to it."""
     supervisor = supervisor_path()
     if not os.path.isfile(supervisor) or not os.access(supervisor, os.R_OK):
         print(json.dumps({"schema": SCHEMA, "ok": False,
@@ -1025,30 +1252,96 @@ def outer_half(mode, binary):
         print(json.dumps({"schema": SCHEMA, "ok": False,
                           "refused": f"{supervisor} is sha256 {digest}, not the qualified {SUPERVISOR_SHA256}"}))
         return 125
-    if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
-        print(json.dumps({"schema": SCHEMA, "ok": False,
-                          "refused": f"{binary} is not an executable barge binary; build it with `oxide build -p barge-cli --locked`"}))
-        return 125
     if not os.path.isdir(DESIGNATED_SCRATCH):
         print(json.dumps({"schema": SCHEMA, "ok": False,
                           "refused": f"the designated scratch parent is not present: {DESIGNATED_SCRATCH}"}))
         return 125
+    try:
+        manifest = stage_proof_binary()
+    except Infrastructure as error:
+        print(json.dumps({"schema": SCHEMA, "ok": False,
+                          "refused": f"staging the proof build failed: {error.detail}"}))
+        return 125
+    binary = manifest["path"]
     env = dict(os.environ)
     env.pop("OXIDE_TASK_SCRATCH_ROOT", None)
     env.pop("DYLD_INSERT_LIBRARIES", None)
-    env["BARGE_PROOF_BIN"] = binary
     env["BARGE_PROOF_SUPERVISOR"] = supervisor
     result = subprocess.run(supervisor_command(supervisor, mode, binary), env=env)
     return result.returncode
 
 
+def feature_problems():
+    """The proof feature is declared, off by default, and the ordinary branch is pinned.
+
+    Reads manifests and one source file. Spawns nothing and builds nothing.
+    """
+    problems = []
+    barge_manifest = os.path.join(REPO_ROOT, "crates", "barge", "Cargo.toml")
+    cli_manifest = os.path.join(REPO_ROOT, "crates", "barge-cli", "Cargo.toml")
+    with open(barge_manifest, encoding="utf-8") as handle:
+        barge_text = handle.read()
+    with open(cli_manifest, encoding="utf-8") as handle:
+        cli_text = handle.read()
+    if f'{PROOF_FEATURE} = []' not in barge_text:
+        problems.append(f"crates/barge does not declare the feature {PROOF_FEATURE}")
+    if re.search(r"^default\s*=", barge_text, re.MULTILINE) or re.search(r"^default\s*=", cli_text, re.MULTILINE):
+        problems.append("a default feature is declared, which would enable the proof build by default")
+    if f'{PROOF_FEATURE} = ["barge/{PROOF_FEATURE}"]' not in cli_text:
+        problems.append(f"crates/barge-cli does not forward the feature {PROOF_FEATURE} to barge")
+    macos = os.path.join(REPO_ROOT, "crates", "barge", "src", "os", "macos.rs")
+    with open(macos, encoding="utf-8") as handle:
+        macos_text = handle.read()
+    if f'#[cfg(not(feature = "{PROOF_FEATURE}"))]\nfn tool_account_home(_tool: &str)' not in macos_text:
+        problems.append("macos.rs lacks the ordinary tool-home branch that ignores the environment")
+    if not os.path.isfile(os.path.join(REPO_ROOT, "crates", "barge", "src", "os", "proof_account.rs")):
+        problems.append("the proof-only account module is missing")
+    return problems
+
+
+def pure_self_check():
+    """The pure helpers, pinned on canned inputs. Touches nothing outside the arguments."""
+    problems = []
+    scratch = os.path.join(DESIGNATED_SCRATCH, "self-check-owned")
+    home = os.path.join(scratch, "home")
+    state = os.path.join(scratch, "state")
+    root = os.path.join(scratch, "run")
+    environment = fixture_environment(home, state, root)
+    if environment_problems(environment, scratch, home, state, root):
+        problems.append("the fixture environment does not bind the synthetic home inside the scratch")
+    if not environment_problems(dict(environment, BARGE_ACCOUNT_HOME="/Users/tom"), scratch, home, state, root):
+        problems.append("a real account home bound as BARGE_ACCOUNT_HOME is not refused")
+    if isolation_problems(scratch, {"escape": os.path.join(scratch, "..", "outside")}) == []:
+        problems.append("a path that leaves the scratch by '..' is not refused")
+    if isolation_problems(scratch, {"control": "/Users/tom/Dev/oxide/oxide-managed"}) == []:
+        problems.append("the real Oxide control is not refused as outside the scratch")
+    directories = oxide_directories(home)
+    if not directories["state"].startswith(home + os.sep) or not directories["cache"].startswith(home + os.sep):
+        problems.append("the Oxide directories do not hang from the synthetic home")
+    canned = "\n".join([
+        '{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"barge"},"executable":null,"features":["proof-synthetic-account"]}',
+        "not json",
+        '{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"barge"},"executable":"/x/target/debug/barge","features":["proof-synthetic-account"]}',
+    ])
+    found = executable_from_build(canned)
+    if found != {"executable": "/x/target/debug/barge", "features": [PROOF_FEATURE]}:
+        problems.append("the staged binary's artifact is not read from the build's JSON")
+    if executable_from_build('{"reason":"build-finished"}') is not None:
+        problems.append("a build with no barge binary artifact reports one")
+    if not staged_build_problems(os.path.join(scratch, "absent", "barge"), "0" * 40):
+        problems.append("a binary with no staged manifest is not refused")
+    return problems
+
+
 def self_check():
-    """The apparatus only: pins, the argv guard, the case table and the source text."""
+    """The apparatus only: pins, the argv guard, the case table, the feature and the source text."""
     problems = []
     problems += installed_supervisor_problems()
     problems += argv_guard_problems()
     problems += case_table_problems()
     problems += source_problems()
+    problems += feature_problems()
+    problems += pure_self_check()
     return problems
 
 
@@ -1057,6 +1350,19 @@ def plan_document():
         "schema": SELF_CHECK_SCHEMA,
         "status": "held: no owner activation; no receipt exists",
         "supervisor": {"name": SUPERVISOR_NAME, "sha256": SUPERVISOR_SHA256},
+        "build": {
+            "feature": PROOF_FEATURE,
+            "command": BUILD_COMMAND,
+            "staged_under": STAGE_ROOT,
+            "stage_selector": "release:native:stage",
+            "production_build": "not run by this proof",
+        },
+        "isolation": {
+            "fixture_bindings": sorted(fixture_environment("<home>", "<state>", "<run>")),
+            "oxide_directories": {"state": OXIDE_STATE_RELATIVE, "cache": OXIDE_CACHE_RELATIVE},
+            "rule": "every bound path resolves inside the supervisor's owned scratch; the reference control each case chose must too",
+        },
+        "limitation": LIMITATION,
         "bounds": {
             "admission": "heavy",
             "image_mib": IMAGE_MIB,
@@ -1066,12 +1372,13 @@ def plan_document():
             "may_delete": "synthetic fixture roots inside the owned image only",
         },
         "commands": {
-            "counted": supervisor_command("<supervisor>", "counted", "<BARGE_PROOF_BIN>"),
-            "diagnostic": supervisor_command("<supervisor>", "diagnostic", "<BARGE_PROOF_BIN>"),
+            "counted": supervisor_command("<supervisor>", "counted", "<staged proof binary>"),
+            "diagnostic": supervisor_command("<supervisor>", "diagnostic", "<staged proof binary>"),
         },
         "cases": [{"id": case["id"], "claim": case["claim"], "carried_by": case["carried_by"]}
                   for case in CASES],
         "activation_order": [
+            "0. release:native:stage builds and hashes the proof-feature binary of the exact head",
             "1. the owner activates one uncounted diagnostic at the exact head; it proves nothing alone",
             "2. the owner activates one counted author pass at the same head",
             "3. a distinct reviewer activates its own counted pass at the same head",
@@ -1081,7 +1388,7 @@ def plan_document():
 
 def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("mode", nargs="?", choices=["counted", "diagnostic"])
+    parser.add_argument("mode", nargs="?", choices=["counted", "diagnostic", "stage"])
     parser.add_argument("--self-check", action="store_true")
     parser.add_argument("--plan", action="store_true")
     parser.add_argument("--inner", choices=["counted", "diagnostic"])
@@ -1111,13 +1418,16 @@ def main(argv):
             parser.error("--inner needs --binary")
         return inner_half(args.inner, args.binary, args.receipt)
     if args.mode is None:
-        parser.error("name a mode: counted or diagnostic (or --self-check / --plan)")
-    binary = os.environ.get("BARGE_PROOF_BIN", "")
-    if not binary:
-        print(json.dumps({"schema": SCHEMA, "ok": False,
-                          "refused": "BARGE_PROOF_BIN names no barge binary"}))
-        return 125
-    return outer_half(args.mode, binary)
+        parser.error("name a mode: stage, counted or diagnostic (or --self-check / --plan)")
+    if args.mode == "stage":
+        try:
+            manifest = stage_proof_binary()
+        except Infrastructure as error:
+            print(json.dumps({"schema": SCHEMA, "ok": False, "refused": f"staging failed: {error.detail}"}))
+            return 125
+        print(json.dumps({"schema": STAGE_SCHEMA, "ok": True, **manifest}, indent=1))
+        return 0
+    return outer_half(args.mode)
 
 
 if __name__ == "__main__":

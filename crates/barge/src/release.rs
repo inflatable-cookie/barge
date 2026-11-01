@@ -446,7 +446,11 @@ fn plan_observed(
     // verify is a refusal of the command, not a plan: nothing about its roots
     // can be observed, and reporting them as merely "kept" would hide a
     // mismatched volume.
-    if let Err(error) = area::VolumeRoot::open(dirs, facts, mounts, record) {
+    // The live mount is found by the record's UUID, never by the stored point alone:
+    // a remount under another name is the same volume, and a stale point is not
+    // trusted (stage 4, "Finding the volume after a remount").
+    let lookup = area::MountLookup::ByUuid(facts);
+    if let Err(error) = area::VolumeRoot::open_with(dirs, facts, mounts, lookup, record) {
         if error.kind() != ErrorKind::VolumeAbsent {
             return Err(error);
         }
@@ -528,7 +532,8 @@ fn plan_observed(
             .with_detail("lock", path.display().to_string().into()));
         }
     };
-    let resolved = area::resolve(
+    let resolved = area::resolve_by(
+        lookup,
         dirs,
         facts,
         mounts,
@@ -971,7 +976,8 @@ fn decide_root(
     }
     let (custody, custody_reason) = match &unit {
         Some(unit) => {
-            let verdict = custody::take_custody(
+            let verdict = custody::take_custody_by(
+                area::MountLookup::ByUuid(facts),
                 dirs,
                 facts,
                 mounts,
@@ -2099,6 +2105,7 @@ fn delete_candidates(
             facts,
             mounts,
             observer,
+            area::MountLookup::ByUuid(facts),
             &declaration,
             &unit,
             bounds,
@@ -5464,5 +5471,108 @@ mod tests {
         assert_eq!(second.replay_pending, 0, "{second:?}");
         assert!(std::fs::metadata(&root.path).is_ok(), "the root is kept");
         assert!(intent_records(&fixture).is_empty(), "the intent is settled");
+    }
+
+    /// The fixture mount renamed to a new name, with the volume facts and the mount
+    /// proof that follow it. The record still names the old point.
+    fn moved_volume(fixture: &Fixture) -> (PathBuf, FakeVolume, crate::testkit::FakeMounts) {
+        let moved = fixture.volume.dir.join("moved");
+        std::fs::rename(&fixture.volume.root, &moved).expect("the mount moves to a new name");
+        let facts = FakeVolume {
+            root: moved.clone(),
+            uuid: fixture.volume.uuid.clone(),
+            device: fixture.volume.device,
+            present: std::cell::Cell::new(true),
+            shifted: std::cell::Cell::new(false),
+            duplicate: std::cell::Cell::new(false),
+        };
+        let mounts = crate::testkit::FakeMounts {
+            root: moved.clone(),
+        };
+        (moved, facts, mounts)
+    }
+
+    #[test]
+    fn a_volume_remounted_under_its_uuid_is_planned_and_released_at_its_live_mount() {
+        let fixture = Fixture::new("release-remounted");
+        let root = fixture.root();
+        let report = fixture.plan();
+        let (bytes, digest) = presented(&report);
+        assert!(row(&report, &root).eligible, "{report:?}");
+
+        // The mount moves after the plan is written, so the stored point is stale.
+        let (moved, facts, mounts) = moved_volume(&fixture);
+        let observer = fixture.volume.observer();
+        let platform = fixture.volume.platform();
+        let now = fixture.overdue();
+        let replanned = plan(
+            &fixture.volume.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.account,
+            &fixture.request(now),
+        )
+        .expect("the live mount is planned");
+        assert_eq!(
+            replanned.volume.state,
+            VolumeState::Present,
+            "{replanned:?}"
+        );
+        assert!(row(&replanned, &root).eligible, "{replanned:?}");
+
+        let run = execute(
+            &fixture.volume.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.account,
+            &ReleaseRunRequest {
+                plan_bytes: &bytes,
+                plan_digest: &digest,
+                release: fixture.request(now),
+                delete: DeleteBounds::default(),
+            },
+        )
+        .expect("the run is reported");
+        assert_eq!(run.released_count, 1, "{run:?}");
+        let live = moved.join(
+            root.path
+                .strip_prefix(&fixture.volume.root)
+                .expect("the root was under the old mount"),
+        );
+        assert!(
+            std::fs::metadata(&live).is_err(),
+            "the root at its live mount is gone"
+        );
+    }
+
+    #[test]
+    fn a_uuid_mounted_twice_refuses_the_release_plan_and_changes_nothing() {
+        let fixture = Fixture::new("release-duplicated-mount");
+        let root = fixture.root();
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        facts.duplicate_mounts();
+        let platform = fixture.volume.platform();
+        let mounts = fixture.volume.mounts();
+        let refused = plan(
+            &fixture.volume.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.account,
+            &fixture.request(fixture.overdue()),
+        )
+        .expect_err("two live mounts with the UUID are never chosen between");
+        assert_eq!(refused.kind(), ErrorKind::UnknownState);
+        assert_eq!(refused.detail()["reason"], "duplicate_volume_uuid");
+        assert!(
+            std::fs::metadata(&root.path).is_ok(),
+            "the root is untouched"
+        );
     }
 }

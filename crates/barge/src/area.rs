@@ -48,7 +48,7 @@ use crate::digest::sha256_hex;
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{
     self, DeviceId, DirHandle, DirId, DirOps, EntryKind, MountRoot, ProcessObserver, VolumeFacts,
-    VolumeIdentity, VolumeUuid,
+    VolumeIdentity, VolumeLocator, VolumeUuid,
 };
 use crate::registry::{self, VolumeRecord};
 use crate::state::{self, Bounds, Deadline, ReadOutcome, StatePaths, READ_DEADLINE};
@@ -644,6 +644,32 @@ pub struct RootSpec {
     pub kind: RootKind,
 }
 
+/// How a registered volume's live mount is found for one operation.
+///
+/// `Hint` verifies the stored mount point, the lookup every ordinary command uses.
+/// `ByUuid` finds the one live mount that carries the record's UUID through a
+/// complete census, as stage 4's "Finding the volume after a remount" requires. The
+/// stored point is never identity under `ByUuid`: a stale point that another volume
+/// now occupies is not the registered volume, and a UUID mounted twice is refused.
+/// Only the release gate and the deletion it authorises use `ByUuid`.
+#[derive(Clone, Copy)]
+pub(crate) enum MountLookup<'a> {
+    /// Verify the registry's stored mount point.
+    Hint,
+    /// Find the live mount that carries the record's UUID.
+    ByUuid(&'a dyn VolumeLocator),
+}
+
+impl std::fmt::Debug for MountLookup<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The locator is a trait object with no useful text, so only the choice shows.
+        match self {
+            Self::Hint => formatter.write_str("Hint"),
+            Self::ByUuid(_) => formatter.write_str("ByUuid"),
+        }
+    }
+}
+
 /// A verified volume root, opened as a descriptor.
 ///
 /// Holding one proves the volume's facts matched the record when it was opened.
@@ -657,7 +683,8 @@ pub struct VolumeRoot {
 }
 
 impl VolumeRoot {
-    /// Verify the record's volume and open its mount root as a descriptor.
+    /// Verify the record's volume and open its mount root as a descriptor, through the
+    /// stored mount point. Every ordinary command uses this lookup.
     ///
     /// This is the first step of containment: the identity is read through an
     /// opened descriptor, the kernel's mount root is proved, and the opened
@@ -669,39 +696,58 @@ impl VolumeRoot {
         mounts: &dyn MountRoot,
         record: &VolumeRecord,
     ) -> Result<Self> {
-        let mount_hint = record.mount_hint.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorKind::UnknownState,
-                format!(
-                    "volume {} has no recorded mount point, so Barge cannot find it",
-                    record.volume_uuid
-                ),
-            )
-            .with_detail("volume_uuid", record.volume_uuid.as_str().into())
-        })?;
-        let verified = os::verify_volume(facts, mounts, mount_hint, &record.expected_volume())?;
-        let handle = dirs.open_path(verified.path())?;
-        if handle.identity().device != verified.identity().device {
+        Self::open_with(dirs, facts, mounts, MountLookup::Hint, record)
+    }
+
+    /// [`VolumeRoot::open`] through the given lookup. The containment that follows is
+    /// the same for both: the descriptor's device must match the verified volume.
+    pub(crate) fn open_with(
+        dirs: &dyn DirOps,
+        facts: &dyn VolumeFacts,
+        mounts: &dyn MountRoot,
+        lookup: MountLookup<'_>,
+        record: &VolumeRecord,
+    ) -> Result<Self> {
+        let (mount, identity) = match lookup {
+            MountLookup::Hint => {
+                let mount_hint = record.mount_hint.as_ref().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::UnknownState,
+                        format!(
+                            "volume {} has no recorded mount point, so Barge cannot find it",
+                            record.volume_uuid
+                        ),
+                    )
+                    .with_detail("volume_uuid", record.volume_uuid.as_str().into())
+                })?;
+                let verified =
+                    os::verify_volume(facts, mounts, mount_hint, &record.expected_volume())?;
+                (verified.path().to_path_buf(), verified.identity().clone())
+            }
+            MountLookup::ByUuid(locator) => {
+                let located = os::locate_volume(locator, facts, mounts, &record.volume_uuid)?;
+                (located.path().to_path_buf(), located.identity().clone())
+            }
+        };
+        let handle = dirs.open_path(&mount)?;
+        if handle.identity().device != identity.device {
             return Err(Error::new(
                 ErrorKind::VolumeMismatch,
                 format!(
                     "the mount root {} opened on device {}, but the volume reported {}",
-                    verified.path().display(),
+                    mount.display(),
                     handle.identity().device,
-                    verified.identity().device
+                    identity.device
                 ),
             )
-            .with_detail("path", verified.path().display().to_string().into())
+            .with_detail("path", mount.display().to_string().into())
             .with_detail("opened_device", handle.identity().device.to_string().into())
-            .with_detail(
-                "volume_device",
-                verified.identity().device.to_string().into(),
-            ));
+            .with_detail("volume_device", identity.device.to_string().into()));
         }
         Ok(Self {
             handle,
-            identity: verified.identity().clone(),
-            mount_point: verified.path().to_path_buf(),
+            identity,
+            mount_point: mount,
         })
     }
 
@@ -1416,6 +1462,30 @@ pub fn resolve(
     caller: &AreaDeclaration,
     stored: Option<&AreaDocument>,
 ) -> Result<ResolvedArea> {
+    resolve_by(
+        MountLookup::Hint,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        record,
+        caller,
+        stored,
+    )
+}
+
+/// [`resolve`] through the given volume lookup.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_by(
+    lookup: MountLookup<'_>,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    record: &VolumeRecord,
+    caller: &AreaDeclaration,
+    stored: Option<&AreaDocument>,
+) -> Result<ResolvedArea> {
     caller.validate()?;
     let governing = if let Some(document) = stored {
         document.validate()?;
@@ -1445,7 +1515,7 @@ pub fn resolve(
     // An undeclared durability refuses every area use, before a byte is read or
     // written: expending data is never inferred.
     record.declared_durability()?;
-    let root = VolumeRoot::open(dirs, facts, mounts, record)?;
+    let root = VolumeRoot::open_with(dirs, facts, mounts, lookup, record)?;
     let effective_uid = observer.effective_uid()?;
     let device = root.identity().device;
     let base = root.mount_point().to_path_buf();
@@ -1514,8 +1584,32 @@ pub fn open_folder(
     root_dir: &str,
     folder: &str,
 ) -> Result<Option<(PathBuf, DirHandle)>> {
+    open_folder_by(
+        MountLookup::Hint,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        record,
+        root_dir,
+        folder,
+    )
+}
+
+/// [`open_folder`] through the given volume lookup.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_folder_by(
+    lookup: MountLookup<'_>,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    record: &VolumeRecord,
+    root_dir: &str,
+    folder: &str,
+) -> Result<Option<(PathBuf, DirHandle)>> {
     record.declared_durability()?;
-    let volume = VolumeRoot::open(dirs, facts, mounts, record)?;
+    let volume = VolumeRoot::open_with(dirs, facts, mounts, lookup, record)?;
     let effective_uid = observer.effective_uid()?;
     let device = volume.identity().device;
     let base = volume.mount_point().to_path_buf();
@@ -1710,6 +1804,31 @@ pub fn prepare(
     volume_uuid: &VolumeUuid,
     declaration: &AreaDeclaration,
 ) -> Result<VolumeArea> {
+    prepare_by(
+        MountLookup::Hint,
+        state,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        volume_uuid,
+        declaration,
+    )
+}
+
+/// [`prepare`] through the given volume lookup. Only the release path's deletion uses
+/// `ByUuid`; the public `prepare` keeps the stored-point lookup and its signature.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_by(
+    lookup: MountLookup<'_>,
+    state: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn VolumeFacts,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    volume_uuid: &VolumeUuid,
+    declaration: &AreaDeclaration,
+) -> Result<VolumeArea> {
     let record = registered_volume(state, volume_uuid)?;
     let stored = stored_declaration(state, declaration)?;
     prepare_with(
@@ -1718,6 +1837,7 @@ pub fn prepare(
         facts,
         mounts,
         observer,
+        lookup,
         declaration,
         stored.as_ref(),
     )
@@ -1732,10 +1852,20 @@ fn prepare_with(
     facts: &dyn VolumeFacts,
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
+    lookup: MountLookup<'_>,
     declaration: &AreaDeclaration,
     stored: Option<&AreaDocument>,
 ) -> Result<VolumeArea> {
-    let resolved = resolve(dirs, facts, mounts, observer, record, declaration, stored)?;
+    let resolved = resolve_by(
+        lookup,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        record,
+        declaration,
+        stored,
+    )?;
     Ok(VolumeArea {
         record: record.clone(),
         resolved,
@@ -1870,6 +2000,7 @@ fn create_root_on_volume_with(
         facts,
         mounts,
         observer,
+        MountLookup::Hint,
         declaration,
         stored.as_ref(),
     )?;
@@ -10924,5 +11055,132 @@ mod tests {
                 .is_some_and(|reason| reason.contains("modification time")),
             "{activity:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod mount_lookup_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::cell::Cell;
+    use std::path::PathBuf;
+
+    use super::{MountLookup, VolumeRoot};
+    use crate::error::{Error, ErrorKind, Result};
+    use crate::os::{MountPoint, VolumeLocator, VolumeUuid};
+    use crate::testkit::{FakeVolume, VolumeFixture};
+
+    /// The fixture volume, as the platform would report it at `root`.
+    fn volume_at(fixture: &VolumeFixture, root: PathBuf) -> FakeVolume {
+        FakeVolume {
+            root,
+            uuid: fixture.uuid.clone(),
+            device: fixture.device,
+            present: Cell::new(true),
+            shifted: Cell::new(false),
+            duplicate: Cell::new(false),
+        }
+    }
+
+    /// A locator whose mount table cannot be read.
+    struct UnreadableMounts;
+
+    impl VolumeLocator for UnreadableMounts {
+        fn mounts_for_uuid(&self, _uuid: &VolumeUuid) -> Result<Vec<MountPoint>> {
+            Err(Error::new(
+                ErrorKind::UnknownState,
+                "the mount table is unreadable",
+            ))
+        }
+    }
+
+    #[test]
+    fn a_remounted_volume_resolves_by_its_uuid_while_the_stored_point_refuses() {
+        let fixture = VolumeFixture::new("mount-lookup-moved");
+        let moved = fixture.dir.join("moved");
+        std::fs::rename(&fixture.root, &moved).expect("the mount moves to a new name");
+        let live = volume_at(&fixture, moved.clone());
+        let dirs = fixture.platform();
+
+        // The record still names the old point, which no longer holds the volume.
+        let found = VolumeRoot::open_with(
+            &dirs,
+            &live,
+            &live,
+            MountLookup::ByUuid(&live),
+            &fixture.record,
+        )
+        .expect("the one live mount with the UUID is the volume");
+        assert_eq!(found.mount_point(), moved.as_path());
+
+        let stored = VolumeRoot::open(&dirs, &live, &live, &fixture.record)
+            .expect_err("the stored point no longer holds the volume");
+        assert_eq!(stored.kind(), ErrorKind::VolumeMismatch);
+    }
+
+    #[test]
+    fn a_stored_point_is_never_trusted_when_the_census_finds_the_volume_elsewhere() {
+        let fixture = VolumeFixture::new("mount-lookup-occupied");
+        let occupant = fixture.dir.join("occupant");
+        std::fs::create_dir(&occupant).expect("the occupied point is created");
+        let mut record = fixture.record.clone();
+        record.mount_hint = Some(occupant.clone());
+        let live = fixture.facts();
+        let dirs = fixture.platform();
+
+        let found = VolumeRoot::open_with(&dirs, &live, &live, MountLookup::ByUuid(&live), &record)
+            .expect("the census finds the registered volume at its live mount");
+        assert_eq!(found.mount_point(), fixture.root.as_path());
+
+        VolumeRoot::open(&dirs, &live, &live, &record)
+            .expect_err("the stored point is occupied by something else and is not trusted");
+    }
+
+    #[test]
+    fn no_live_mount_is_volume_absent_and_a_mounted_twice_uuid_is_unknown() {
+        let fixture = VolumeFixture::new("mount-lookup-absent");
+        let live = fixture.facts();
+        let dirs = fixture.platform();
+
+        live.present.set(false);
+        let absent = VolumeRoot::open_with(
+            &dirs,
+            &live,
+            &live,
+            MountLookup::ByUuid(&live),
+            &fixture.record,
+        )
+        .expect_err("no live mount with the UUID is absent");
+        assert_eq!(absent.kind(), ErrorKind::VolumeAbsent);
+
+        live.present.set(true);
+        live.duplicate_mounts();
+        let duplicate = VolumeRoot::open_with(
+            &dirs,
+            &live,
+            &live,
+            MountLookup::ByUuid(&live),
+            &fixture.record,
+        )
+        .expect_err("two live mounts with the UUID are never chosen between");
+        assert_eq!(duplicate.kind(), ErrorKind::UnknownState);
+        assert_eq!(duplicate.detail()["reason"], "duplicate_volume_uuid");
+    }
+
+    #[test]
+    fn an_unreadable_mount_table_keeps_the_volume_unknown_and_is_not_absence() {
+        let fixture = VolumeFixture::new("mount-lookup-unreadable");
+        let live = fixture.facts();
+        let dirs = fixture.platform();
+
+        let unknown = VolumeRoot::open_with(
+            &dirs,
+            &live,
+            &live,
+            MountLookup::ByUuid(&UnreadableMounts),
+            &fixture.record,
+        )
+        .expect_err("an unreadable table is unknown, not an absent volume");
+        assert_eq!(unknown.kind(), ErrorKind::UnknownState);
     }
 }

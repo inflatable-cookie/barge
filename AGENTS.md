@@ -24,6 +24,11 @@ and the human summary. Toolchain `1.97.1`, edition 2021 and `rust-version`
 follow the first consumer's manifests and are pinned in `rust-toolchain.toml`;
 `Cargo.lock` is committed.
 
+The `proof-synthetic-account` feature (both crates) is proof-only. No ordinary build
+enables it, and under it alone Oxide's reference directories come from a validated
+synthetic account home ([stage 4 design](docs/knowledge/contracts/stage4-design.md),
+"Proof build").
+
 ## Validate
 
 Rust selectors run through `oxide`, never `cargo`; the `oxide:begin` block below
@@ -31,7 +36,8 @@ lists the commands. Each covers what it names:
 
 - `effigy barge:install:test` — synthetic installer refusal and receipt fixtures; no real build or install.
 - `effigy barge:install` / `effigy barge:reinstall` — planner only, after a reviewed merge; Tom's go-ahead is required for the first host install. Set `BARGE_INSTALL_PIN` and `BARGE_INSTALL_SCRATCH` as documented in the [consumer contract](docs/knowledge/contracts/consumption.md).
-- `effigy rust:compile` — `oxide check --workspace --all-targets --locked`.
+- `effigy rust:compile` — `oxide check --workspace --all-targets --all-features --locked`,
+  so the proof-only `proof-synthetic-account` feature is compiled too.
 - `effigy rust:format` — `oxide fmt --all -- --check`; run it when formatted
   Rust changed.
 - `effigy rust:lint` — clippy at the RustQuality strict profile. Every finding
@@ -71,15 +77,23 @@ lists the commands. Each covers what it names:
   bounded native for `barge maintain`, on one owned 64 MiB image under the same
   qualified supervisor. HELD for owner activation on the same terms: the
   declarations activate nothing, and each run is separately activated.
+- `effigy rust:test:proof-account` — the proof-only account's checks, with the
+  `proof-synthetic-account` feature on. The ordinary `rust:test` never enables it.
 - `effigy release:native:test` and `effigy release:native:plan` — F6-R1's native
   proof apparatus, effect-free: the pinned supervisor, the argv guard, the case
-  table checked against its named regressions, and the held bounds. No image, no
-  scratch and no child process.
+  table checked against its named regressions, the proof feature's declarations
+  and the held bounds. No image, no scratch and no child process.
+- `effigy release:native:stage` — builds the proof-feature binary of HEAD through
+  Oxide and stages a hashed copy under the designated scratch. It runs no proof.
 - `effigy release:native` and `effigy release:native:diagnostic` — F6-R1's one
   bounded native for the release effect, on one owned 64 MiB APFS image under the
-  qualified supervisor (300 s, 512 MiB). HELD for owner activation: the
-  declarations activate nothing; the diagnostic runs first, then the counted author
-  pass and a distinct reviewer pass, each separately activated at an exact head.
+  qualified supervisor (300 s, 512 MiB). Each run stages the proof-feature build
+  of HEAD and runs only that staged file; the ordinary production build is never
+  the one tested. The proof feature tests release logic over synthetic
+  AccountFacts and does not establish the production account lookup's
+  equivalence. HELD for owner activation: the declarations activate nothing; the
+  diagnostic runs first, then the counted author pass and a distinct reviewer pass,
+  each separately activated at an exact head.
 
 RustQuality strict is active for the Rust source, manifests, tests and their
 documentation: `docs/knowledge/contracts/language-quality-activation.json` opts

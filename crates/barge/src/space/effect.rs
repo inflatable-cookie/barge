@@ -1221,6 +1221,7 @@ impl Pass<'_> {
             self.facts,
             self.mounts,
             self.observer,
+            crate::area::MountLookup::Hint,
             &target.declaration,
             &unit,
             bounds,
