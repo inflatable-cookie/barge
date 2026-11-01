@@ -12,6 +12,35 @@ import space_oracles as oracle
 MIB = 1024 * 1024
 
 
+def case_4b_fill_target(free, floor):
+    """Size the idle payload from the measured free space and floor gap."""
+    if free <= 0 or free >= floor:
+        raise ValueError("case 4b requires positive free space below the floor")
+    payload = min(2 * MIB, (floor - free) // 2, free // 2)
+    if payload < MIB:
+        raise ValueError("case 4b lacks room for a measurable idle root below the floor")
+    return free - payload
+
+
+def case_4b_sizing_self_check():
+    """Exercise the case 4 setup and the floor and free-space boundaries."""
+    problems = []
+    floor = 24 * MIB
+    for free in (18 * MIB, 20 * MIB, 21 * MIB):
+        target = case_4b_fill_target(free, floor)
+        payload = free - target
+        if target <= 0 or not 0 < payload < floor - free:
+            problems.append(f"case 4b sizing is invalid for {free} free bytes")
+    for free in (0, MIB, 23 * MIB, floor, floor + MIB):
+        try:
+            case_4b_fill_target(free, floor)
+        except ValueError:
+            pass
+        else:
+            problems.append(f"case 4b accepted an unusable measurement: {free}")
+    return problems
+
+
 class Cases:
     def __init__(self, fixture):
         self.fixture = fixture
@@ -133,9 +162,8 @@ class Cases:
         idle = fixture.root_create("second")
         fixture.hold(idle, "short", os.getpid())
         before = fixture.free()
-        if before <= 4 * MIB or 24 * MIB - before <= 4 * MIB:
-            raise AssertionError("case 4b lacks room below the floor")
-        measured = fixture.fill_to(os.path.join(idle["path"], "payload"), before - 2 * MIB)
+        target = case_4b_fill_target(before, 24 * MIB)
+        measured = fixture.fill_to(os.path.join(idle["path"], "payload"), target)
         fixture.release(idle, "short")
         fixture.wait_until_idle()
         code, document = fixture.guard()
