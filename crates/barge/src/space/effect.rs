@@ -71,7 +71,7 @@ use crate::os::{
 };
 use crate::registry::{self, SpacePolicy, VolumeRecord};
 use crate::scratch;
-use crate::state::{self, LockSet, StatePaths};
+use crate::state::{self, Deadline, LockSet, StatePaths};
 use crate::unit::{self, DeletionUnit, MarkerFamily, UnitGrant, UnitKind, UnitMarker};
 
 /// One real prune pass's wall clock (design, "Bounded resources": the operator's
@@ -476,7 +476,11 @@ pub(super) fn prune_live(
     // Pre-flight, effect-free: the volume must be registered, its durability must
     // permit pruning and its declared policy must exist. A refusal here changes
     // nothing, so it is an ordinary refusal document.
-    let record = area::registered_volume(paths, request.volume_uuid)?;
+    let record = super::guard::registered_volume_with_budget(
+        paths,
+        request.volume_uuid,
+        deadline.saturating_duration_since(Instant::now()),
+    )?;
     let durability = record.declared_durability()?;
     if !durability.permits_pruning() {
         // The failure matrix's durability row: a volume that may not be pruned is
@@ -536,7 +540,11 @@ pub(super) fn prune_live(
     })?;
     // Registration takes this volume lock too. The preflight record may have
     // become stale while we waited, so no replay may use its pruning authority.
-    let current = area::registered_volume(paths, request.volume_uuid)?;
+    let current = super::guard::registered_volume_with_budget(
+        paths,
+        request.volume_uuid,
+        deadline.saturating_duration_since(Instant::now()),
+    )?;
     let durability = current.declared_durability()?;
     if !durability.permits_pruning() {
         return Err(Error::new(
@@ -1018,7 +1026,7 @@ impl Pass<'_> {
     /// different. An unreadable or invalid registry, an undeclared durability and a
     /// durability that became `kept` are the only things that stop the pass here.
     fn refresh_policy(&mut self) -> Result<bool> {
-        let registry = registry::read(self.paths).map_err(|error| {
+        let registry = registry::read_with_deadline(self.paths, Deadline::after(self.wall_deadline.saturating_duration_since(Instant::now()).min(state::READ_DEADLINE))).map_err(|error| {
             Error::new(
                 ErrorKind::UnknownState,
                 format!(
@@ -1145,7 +1153,7 @@ impl Pass<'_> {
         // quarantine leaf, and the operator needs to know a replay owes it. A
         // pending intent over another path is a different object's business (ruling
         // `698d9ba3`) and reaches no other candidate.
-        let pending = state::read_intents(self.paths, INTENT_ROWS).map_err(|error| {
+        let pending = state::read_intents_with_deadline(self.paths, INTENT_ROWS, Deadline::after(self.wall_deadline.saturating_duration_since(Instant::now()).min(state::READ_DEADLINE))).map_err(|error| {
             Outcome::Stop(
                 Error::new(
                     ErrorKind::UnknownState,
@@ -1566,7 +1574,12 @@ fn reverify_candidate(
     // read as "renamed or absent" and hide the fact an operator needs: a replay owes
     // this object. A pending intent over another path is a different object's
     // business and never reaches this candidate (ruling `698d9ba3`).
-    let intents = state::read_intents(paths, INTENT_ROWS).map_err(|error| {
+    let intents = state::read_intents_with_deadline(
+        paths,
+        INTENT_ROWS,
+        Deadline::after(wall.min(state::READ_DEADLINE)),
+    )
+    .map_err(|error| {
         Skip::new(
             "pending_intent",
             format!("the intent journal could not be read, so the root is kept: {error}"),

@@ -2055,14 +2055,18 @@ pub fn record_captures(
 
 /// Read one intent record strictly, bounded by its own cap.
 pub fn read_intent(state: &StatePaths, intent_id: &str) -> Result<IntentRecord> {
+    read_intent_with_deadline(state, intent_id, Deadline::after(READ_DEADLINE))
+}
+
+fn read_intent_with_deadline(
+    state: &StatePaths,
+    intent_id: &str,
+    deadline: Deadline,
+) -> Result<IntentRecord> {
     let path = intent_path(state, intent_id)?;
     let bytes = match read_bounded(
         &path,
-        &Bounds::new(
-            crate::contract::INTENT_CAP_BYTES,
-            1,
-            Deadline::after(READ_DEADLINE),
-        ),
+        &Bounds::new(crate::contract::INTENT_CAP_BYTES, 1, deadline),
     ) {
         ReadOutcome::Present(bytes) => bytes,
         ReadOutcome::Absent => {
@@ -2148,6 +2152,21 @@ pub fn read_intent(state: &StatePaths, intent_id: &str) -> Result<IntentRecord> 
 /// truncated directory are unknown state: a pending intent is never skipped
 /// because it was inconvenient to read.
 pub fn read_intents(state: &StatePaths, max: usize) -> Result<IntentSet> {
+    read_intents_with_deadline(state, max, Deadline::after(READ_DEADLINE))
+}
+
+/// Read a journal using the caller's remaining budget.
+pub(crate) fn read_intents_with_deadline(
+    state: &StatePaths,
+    max: usize,
+    deadline: Deadline,
+) -> Result<IntentSet> {
+    if deadline.expired() {
+        return Err(Error::new(
+            ErrorKind::ResourceBound,
+            "the intent journal read deadline expired",
+        ));
+    }
     let directory = state.intents_dir();
     let names = match std::fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -2160,7 +2179,12 @@ pub fn read_intents(state: &StatePaths, max: usize) -> Result<IntentSet> {
             .with_detail("path", directory.display().to_string().into()))
         }
     };
-    let deadline = Deadline::after(READ_DEADLINE);
+    if deadline.expired() {
+        return Err(Error::new(
+            ErrorKind::ResourceBound,
+            "the intent journal read deadline expired",
+        ));
+    }
     let mut records = Vec::new();
     let mut total = 0usize;
     for entry in names {
@@ -2192,7 +2216,7 @@ pub fn read_intents(state: &StatePaths, max: usize) -> Result<IntentSet> {
             )
             .with_detail("path", directory.display().to_string().into()));
         };
-        match read_intent(state, stem) {
+        match read_intent_with_deadline(state, stem, deadline) {
             Ok(record) => records.push(record),
             Err(error) if error.kind() == ErrorKind::UnknownState => {
                 // A record that vanished between the listing and the read was
@@ -3333,6 +3357,23 @@ mod intent_tests {
             .expect("the stray file is written");
         let error = read_intents(&state, 64).expect_err("a stray name is unknown");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
+    }
+
+    #[test]
+    fn an_expired_journal_deadline_is_never_empty() {
+        let dir = crate::testkit::TempDir::under_scratch("intent-deadline");
+        let account = crate::testkit::FakeAccount {
+            home: dir.path().to_path_buf(),
+        };
+        let state = super::StatePaths::resolve(&account, Some(&dir.join("state"))).unwrap();
+        let error = super::read_intents_with_deadline(
+            &state,
+            1,
+            super::Deadline::after(std::time::Duration::ZERO),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), crate::error::ErrorKind::ResourceBound);
+        assert!(!dir.join("state").exists());
     }
 
     #[test]

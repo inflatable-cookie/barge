@@ -540,7 +540,7 @@ pub(super) fn guard_with_bounds(
     })
 }
 
-fn registered_volume_with_budget(
+pub(super) fn registered_volume_with_budget(
     paths: &StatePaths,
     uuid: &VolumeUuid,
     budget: Duration,
@@ -623,7 +623,15 @@ pub(crate) fn decide_volume(
                 error
             }
         })?;
-    state::read_intents(paths, crate::contract::INTENT_ROWS).map_err(|error| {
+    state::read_intents_with_deadline(
+        paths,
+        crate::contract::INTENT_ROWS,
+        state::Deadline::after(
+            wall.saturating_sub(started.elapsed())
+                .min(state::READ_DEADLINE),
+        ),
+    )
+    .map_err(|error| {
         let mut unknown = Error::new(
             ErrorKind::UnknownState,
             format!("intent journal is unreadable: {error}"),
@@ -735,7 +743,15 @@ pub(crate) fn decide_volume(
             Err(error) => return Err(error),
         }
     }
-    let intents = state::read_intents(paths, crate::contract::INTENT_ROWS).map_err(|error| {
+    let intents = state::read_intents_with_deadline(
+        paths,
+        crate::contract::INTENT_ROWS,
+        state::Deadline::after(
+            wall.saturating_sub(started.elapsed())
+                .min(state::READ_DEADLINE),
+        ),
+    )
+    .map_err(|error| {
         Error::new(
             ErrorKind::UnknownState,
             format!("intent journal is unreadable: {error}"),
