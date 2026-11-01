@@ -26,6 +26,14 @@ SUPERVISOR = os.path.expanduser("~/Dev/projects/oxide/scripts/bounded-test.py")
 PARENT = "/Volumes/Builds/scratch/barge"
 SCRIPT = os.path.abspath(__file__)
 CASES = ("1", "2", "3", "4", "4b", "5", "6", "7", "8", "9", "10")
+# The first eight scenarios build on prior fixture contents; case 9 requires
+# case 6's successful detaches, and case 10 uses its own state and registration
+# plan. A separate runtime custody gate protects every continuation.
+CASE_NEEDS = {
+    "1": (), "2": ("1",), "3": ("2",), "4": ("3",), "4b": ("4",),
+    "5": ("4b",), "6": ("5",), "7": ("6",), "8": ("7",),
+    "9": ("6",), "10": (),
+}
 PREMISES = (
     "private HOME, CARGO_HOME and BARGE_STATE_DIR",
     "private account resolution; complete before and after real-state digest",
@@ -77,8 +85,79 @@ def command(supervisor, mode, binary):
             "--binary", binary]
 
 
+def run_cases(diagnostic, execute, ready, check_pool):
+    """Run each case whose dependencies and custody are positively established."""
+    results = []
+    passed = set()
+    fault = None
+    for name in CASES:
+        missing = [need for need in CASE_NEEDS[name] if need not in passed]
+        if fault and not diagnostic:
+            results.append({"case": name, "status": "skipped", "kind": "latched"})
+            continue
+        if missing:
+            results.append({"case": name, "status": "skipped", "kind": "dependency",
+                            "detail": "dependencies did not pass: " + ", ".join(missing)})
+            continue
+        reason = ready(name)
+        if reason is not None:
+            results.append({"case": name, "status": "skipped", "kind": "custody",
+                            "detail": reason})
+            continue
+        started = time.monotonic()
+        try:
+            evidence = execute(name)
+            check_pool()
+            passed.add(name)
+            results.append({"case": name, "status": "passed", "evidence": evidence,
+                            "ms": int((time.monotonic() - started) * 1000)})
+        except Exception as error:
+            fault = fault or name
+            results.append({"case": name, "status": "failed", "kind": type(error).__name__,
+                            "detail": str(error)[:500], "trace": traceback.format_exc()[-800:]})
+    return results, fault
+
+
+def diagnostic_self_check():
+    """Test the actual dispatcher with inert case callbacks and no I/O."""
+    problems = []
+    seen = set()
+    if set(CASE_NEEDS) != set(CASES):
+        problems.append("case dependencies do not match the case map")
+        return problems
+    for name in CASES:
+        if len(set(CASE_NEEDS[name])) != len(CASE_NEEDS[name]) or not set(CASE_NEEDS[name]) <= seen:
+            problems.append(f"case {name} has duplicate, unknown or unordered dependencies")
+        seen.add(name)
+    def run(failures, diagnostic=True, unavailable=()):
+        called = []
+        def execute(name):
+            called.append(name)
+            if name in failures:
+                raise AssertionError("injected fault")
+            return {}
+        results, fault = run_cases(diagnostic, execute,
+                                   lambda name: "unproven custody" if name in unavailable else None,
+                                   lambda: None)
+        return called, {row["case"]: row for row in results}, fault
+    called, results, fault = run({"1", "10"})
+    if called != ["1", "10"] or fault != "1" or results["2"]["kind"] != "dependency":
+        problems.append("diagnostic did not continue an independent case or latch the first fault")
+    called, results, fault = run({"7"})
+    if ("8" in called or "9" not in called or "10" not in called or fault != "7"
+            or results["8"]["kind"] != "dependency"):
+        problems.append("diagnostic did not distinguish dependent and independent cases")
+    called, results, fault = run({"1"}, diagnostic=False)
+    if called != ["1"] or fault != "1" or results["10"]["kind"] != "latched":
+        problems.append("counted mode did not stop after its first fault")
+    called, results, _ = run({"1"}, unavailable=("10",))
+    if "10" in called or results["10"]["kind"] != "custody":
+        problems.append("diagnostic continued without positive custody")
+    return problems
+
+
 def self_check():
-    problems = custody_self_check() + images_self_check() + oracles_self_check()
+    problems = custody_self_check() + images_self_check() + oracles_self_check() + diagnostic_self_check()
     if len(CASES) != 11 or len(set(CASES)) != 11:
         problems.append("case map must contain eleven distinct cases")
     for name in CASES:
@@ -191,26 +270,25 @@ def inner(mode, binary):
             raise ValueError("explicit registration did not land in the fixture state")
         preflight = fixture.custody_preflight()
         cases = Cases(fixture)
-        previous_failed = False
-        for name in CASES:
-            if previous_failed:
-                results.append({"case": name, "status": "skipped", "kind": "dependency"})
-                continue
-            started = time.monotonic()
-            try:
-                result = getattr(cases, "case_" + name)()
-                if os.listdir(pool):
-                    raise AssertionError("fake internal pool is not empty")
-                results.append({"case": name, "status": "passed", "evidence": result,
-                                "ms": int((time.monotonic() - started) * 1000)})
-            except Exception as error:
-                fault = fault or name
-                previous_failed = True
-                results.append({"case": name, "status": "failed", "kind": type(error).__name__,
-                                "detail": str(error)[:500], "trace": traceback.format_exc()[-800:]})
-                # Every later scenario mutates or depends on this one's image,
-                # registry, intent, or mount state. A diagnostic records each as
-                # dependency-skipped instead of using an unknown fixture.
+        def ready(name):
+            if images.unknown or images.children:
+                return "image or child custody is unknown"
+            # Case 10 uses fresh account state and is independent of the earlier
+            # scenarios, but may only operate on the registered primary image.
+            if name in ("9", "10"):
+                current = images.current
+                if (current is None or current["backing"] != images.backings[0]
+                        or current["mount"] != fixture.mount
+                        or current["volume_uuid"] != fixture.uuid.lower()):
+                    return "the registered primary image is not positively attached"
+            return None
+
+        def check_pool():
+            if os.listdir(pool):
+                raise AssertionError("fake internal pool is not empty")
+
+        results, fault = run_cases(diagnostic, lambda name: getattr(cases, "case_" + name)(),
+                                   ready, check_pool)
     except CensusUnavailable as error:
         infrastructure = {"check": "product_custody_census", "detail": str(error)[:500]}
         preflight = {"outcome": "infrastructure", "reason": str(error)[:500]}
@@ -268,7 +346,7 @@ def main(argv):
     problems = self_check()
     if options.self_check or options.plan:
         print(json.dumps({"schema": SCHEMA + ".plan", "cases": CASES, "premises": PREMISES,
-                          "premise_trace": PREMISE_TRACE, "environment": ENVIRONMENT, "supervisor": {"sha256": SUPERVISOR_SHA256,
+                          "premise_trace": PREMISE_TRACE, "dependencies": CASE_NEEDS, "environment": ENVIRONMENT, "supervisor": {"sha256": SUPERVISOR_SHA256,
                           "argv": command("<supervisor>", "counted", "<binary>")},
                           "problems": problems, "ok": not problems}, indent=1))
         return 0 if not problems else 1
