@@ -29,12 +29,13 @@ CASES = ("1", "2", "3", "4", "4b", "5", "6", "7", "8", "9", "10")
 # Case 3 consumes case 2's filler and resulting root state. Cases 4 and 4b use
 # case 3's held root and the floor it establishes; case 5 consumes that filler
 # and requires 4b's idle root settled. Case 6 is independent on a second image.
-# Case 7 uses case 5's filler after case 6 restores the primary image; case 8
-# requires case 7's hard link removed and its filler. Case 9 requires case 6's
-# detaches; case 10 uses fresh registration state. The custody gate applies to all.
+# Case 7 uses case 5's filler after case 6 restores the primary image. Case 8
+# establishes its own fill and protects any surviving case 7 root; both require
+# the settled cases 5 and 6. Case 9 requires case 6's detaches; case 10 uses
+# fresh registration state. The custody gate applies to all.
 CASE_NEEDS = {
     "1": (), "2": ("1",), "3": ("2",), "4": ("3",), "4b": ("4",),
-    "5": ("4b",), "6": ("1",), "7": ("5", "6"), "8": ("7",),
+    "5": ("4b",), "6": ("1",), "7": ("5", "6"), "8": ("5", "6"),
     "9": ("6",), "10": (),
 }
 PREMISES = (
@@ -176,9 +177,9 @@ def diagnostic_self_check():
             or fault != "2" or results["3"]["kind"] != "dependency"):
         problems.append("independent second-volume case did not continue after case 2 failed")
     called, results, fault = run({"7"})
-    if ("8" in called or "9" not in called or "10" not in called or fault != "7"
-            or results["8"]["kind"] != "dependency"):
-        problems.append("diagnostic did not distinguish dependent and independent cases")
+    if ("8" not in called or "9" not in called or "10" not in called or fault != "7"
+            or results["8"]["status"] != "passed"):
+        problems.append("diagnostic did not continue independent case 8 after case 7")
     called, results, fault = run({"1"}, diagnostic=False)
     if called != ["1"] or fault != "1" or results["10"]["kind"] != "latched":
         problems.append("counted mode did not stop after its first fault")
@@ -308,7 +309,7 @@ def inner(mode, binary):
                 return "image or child custody is unknown"
             # Case 10 uses fresh account state and is independent of the earlier
             # scenarios, but may only operate on the registered primary image.
-            if name in ("6", "9", "10"):
+            if name in ("6", "8", "9", "10"):
                 current = images.current
                 if (current is None or current["backing"] != images.backings[0]
                         or current["mount"] != fixture.mount
@@ -362,7 +363,9 @@ def inner(mode, binary):
                               "before": before, "after": after, "complete": complete, "unchanged": unchanged},
                "image": {"backings": images.backings if images else [], "mib": 128,
                          "events": images.events if images else [], "unknown": not safe},
-               "cases": results, "case_evidence": [], "infrastructure": infrastructure,
+               "cases": results, "case_evidence": [],
+               "not_claimed": ["exactly-zero space_not_reclaimed stop; covered by the fake-Meter unit test"],
+               "infrastructure": infrastructure,
                "fault": fault, "cancelled": None if safe else "image or child custody unknown"}
     path = os.path.join(evidence, "space-native-receipt.json")
     with open(path, "x", encoding="utf-8") as handle:

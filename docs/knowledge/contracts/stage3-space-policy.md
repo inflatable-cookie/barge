@@ -1204,8 +1204,8 @@ native, and a missing receipt from the slice that runs it is a missing proof.
 | 4b | Fill below the floor again, this time with one large eligible idle root | the pass deletes it and the floor is still breached: a **completed stop** (`ok: true`, `decision: stop_below_floor`, exit `0`) listing the deleted root, and the fake internal pool is still empty |
 | 5 | One root with an unreadable hold file and one with no activity record, both large | both survive, both are reported, and the pass never treats them as idle |
 | 6 | Register a second fixture volume with `reserve 16 MiB`, `floor 32 MiB`; fill so free sits between the two (above the reserve, below the floor), with nothing eligible left | the floor wins: the guard prunes, then stops at 32 MiB although free is above the 16 MiB reserve, in the completed-stop shape if its prune deleted anything |
-| 7 | Delete a chosen root whose file is still open by a same-uid process, so free does not rise | `space_not_reclaimed` after the flush, no further deletion, and after the writer exits a recheck sees the space |
-| 8 | Detach the image (ordinary, after the writers finish) mid-pass, then re-attach | pending intent with the quarantine leaf kept, exit `3`, replay completes after re-attach; no stale mount point written |
+| 7 | Delete a chosen root whose payload is hard-linked outside Barge's folders on the image | The root is deleted and measured reclaim is at most 1% of planned bytes, allowing APFS metadata; after removing the outside link, a recheck sees the space and returns `continue`. Exactly-zero `space_not_reclaimed` is covered by the fake-Meter unit test, not claimed by this native. |
+| 8 | Pause and terminate a guard mid-pass, ordinary-detach after reaping it, then re-attach | The absent guard refuses with a pending intent; after re-attach the measured free space selects replay or admission with the intent kept. No stale mount point is written. |
 | 9 | A stale `/Volumes/<name>` directory left after detach | never written to, never recreated; the decision refuses |
 | 10 | Registration refusals on the image: absent, unverified UUID, malformed size, floor above total | each refuses with nothing written and no mount created |
 
@@ -2081,7 +2081,11 @@ host-job change is claimed; scheduled enablement is operator-gated T9.
 `effigy space:native:diagnostic` are held for separate owner activation with
 `BARGE_PROOF_BIN` naming the binary under test. Case 2 checks that the older
 second-area root is pruned first (batch-granular target check), and records
-planned and actual order with the measurements and policy. The uncounted diagnostic is
+planned and actual order with the measurements and policy. Case 7 records the
+small measured APFS metadata reclaim and verifies the recheck after its outside
+hard link is removed. The native does not claim the exactly-zero
+`space_not_reclaimed` stop; the fake-Meter unit test covers that behavior. The
+uncounted diagnostic is
 followed by one counted author run and one distinct independent reviewer run,
 each at the exact head. The supervisor and proof receipts are required for each:
 `space-native-receipt.json` and the qualified supervisor's `receipt.json` in the

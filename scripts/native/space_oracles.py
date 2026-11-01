@@ -101,12 +101,23 @@ def case_6(code, document, root):
     assert detail["reserve_bytes"] < detail["free_bytes"] <= detail["floor_bytes"]
 
 
-def case_7(code, document, root):
+def case_7(code, document, root, planned_bytes):
     data = success(code, document)
     assert root_ids(data) == [root]
-    assert data["detail"]["stop"] == "space_not_reclaimed"
-    assert data["detail"]["cause"] == "budget_exhausted" and data["reclaimed_bytes"] == 0
-    return data["guard"]
+    reclaimed = data["reclaimed_bytes"]
+    before, after = data["before"]["free_bytes"], data["after"]["free_bytes"]
+    policy = data["policy"]
+    assert planned_bytes > 0 and 0 <= reclaimed * 100 <= planned_bytes
+    assert reclaimed == data["detail"]["reclaimed_bytes"]
+    assert reclaimed <= max(0, after - before)
+    assert data["detail"]["free_bytes"] == after
+    expected = ("stop_below_floor" if after <= policy["floor_bytes"] else
+                "admit_below_reserve" if after <= policy["reserve_bytes"] else "admit")
+    assert data["decision"] == expected
+    return {"guard": data["guard"], "planned_bytes": planned_bytes,
+            "reclaimed_bytes": reclaimed, "free_before": before, "free_after": after,
+            "decision": data["decision"], "stop": data["detail"]["stop"],
+            "strict_zero_reclaim": "proved by fake-Meter unit test; not claimed by this native"}
 
 
 def case_7_recheck(code, document):
@@ -174,6 +185,32 @@ def self_check():
         pass
     else:
         problems.append("case 2 accepted the younger root first")
+    case7 = {"schema": "barge.space.guard/1", "ok": True, "data": {
+        "decision": "admit_below_reserve", "guard": "token", "pruned": rowset([{"root_id": "held"}]),
+        "before": {"free_bytes": 35000000}, "after": {"free_bytes": 35020480},
+        "policy": {"reserve_bytes": 50331648, "floor_bytes": 25165824},
+        "reclaimed_bytes": 20480, "detail": {"reclaimed_bytes": 20480,
+        "free_bytes": 35020480, "stop": "nothing_eligible"}}}
+    try:
+        case_7(0, case7, "held", 10489856)
+    except (AssertionError, KeyError, TypeError) as error:
+        problems.append(f"case 7 metadata reclaim oracle refused: {error}")
+    for changed in ("excess", "decision", "overclaim"):
+        altered = copy.deepcopy(case7)
+        if changed == "excess":
+            altered["data"]["reclaimed_bytes"] = 104899
+            altered["data"]["detail"]["reclaimed_bytes"] = 104899
+        elif changed == "decision":
+            altered["data"]["decision"] = "admit"
+        else:
+            altered["data"]["reclaimed_bytes"] = 20481
+            altered["data"]["detail"]["reclaimed_bytes"] = 20481
+        try:
+            case_7(0, altered, "held", 10489856)
+        except AssertionError:
+            pass
+        else:
+            problems.append(f"case 7 accepted {changed}")
     for code, document in ((0, {"schema": "barge.error/1", "ok": False,
                                 "error": {"kind": "volume_mismatch"}}),
                            (2, {"schema": "barge.error/1", "ok": False,

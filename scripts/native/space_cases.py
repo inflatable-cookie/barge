@@ -120,6 +120,7 @@ class Cases:
         self.second = None
         self.filler = None
         self.context = {}
+        self.case7_root = None
 
     def case_1(self):
         fixture = self.fixture
@@ -360,6 +361,7 @@ class Cases:
         os.unlink(self.filler)
         self.filler = None
         root = fixture.root_create("second")
+        self.case7_root = root
         fixture.hold(root, "hardlink", os.getpid())
         outside = os.path.join(fixture.mount, "proof-outside-link")
         free = fixture.free()
@@ -371,19 +373,44 @@ class Cases:
         measured = fixture.fill_to(self.filler, 35 * MIB)
         if not 24 * MIB < measured < 48 * MIB:
             raise AssertionError("case 7 free space outside its band")
+        _, preview = fixture.command("space", "prune", "--volume", fixture.uuid, "--plan")
+        candidates = oracle.rows(preview["data"]["plan"]["candidates"])
+        matching = [row for row in candidates if row["root_id"] == root["root_id"]]
+        if len(matching) != 1:
+            raise AssertionError("case 7 root is not a unique planned candidate")
+        planned_bytes = matching[0]["bytes"]
+        self.context["7"] = {"root_id": root["root_id"], "planned_bytes": planned_bytes,
+                             "setup_free_bytes": measured}
         code, document = fixture.guard()
-        guard = oracle.case_7(code, document, root["root_id"])
+        evidence = oracle.case_7(code, document, root["root_id"], planned_bytes)
+        guard = evidence["guard"]
         if os.path.exists(root["path"]):
             raise AssertionError("case 7 chosen root survived")
         os.unlink(outside)
         code, document = fixture.command("space", "recheck", "--guard", guard)
         oracle.case_7_recheck(code, document)
-        return {"setup_free_bytes": measured,
-                "recheck_free_bytes": document["data"]["after"]["free_bytes"]}
+        rechecked = document["data"]["after"]["free_bytes"]
+        if rechecked <= evidence["free_after"]:
+            raise AssertionError("case 7 recheck did not measure space from the removed outside link")
+        evidence.update({"setup_free_bytes": measured, "recheck_free_bytes": rechecked})
+        return evidence
 
     def case_8(self):
         fixture = self.fixture
         images = fixture.images
+        # A failed case 7 may have left its root eligible. Hold it so replay
+        # exercises only this case's root; never infer cleanup from a failure.
+        if self.case7_root is not None and os.path.isdir(self.case7_root["path"]):
+            fixture.hold(self.case7_root, "case8-protect", os.getpid())
+        if self.pending_intents():
+            raise AssertionError("case 8 requires a settled intent journal")
+        # Reset only the proof's known filler, then create case 8's own fill.
+        if self.filler is not None and os.path.lexists(self.filler):
+            expected = os.path.join(fixture.mount, "proof-filler")
+            if self.filler != expected or not os.path.isfile(expected) or os.path.islink(expected):
+                raise AssertionError("case 8 filler identity is not established")
+            os.unlink(expected)
+        self.filler = None
         root = fixture.root_create("second")
         fixture.hold(root, "interrupted", os.getpid())
         free = fixture.free()
@@ -392,8 +419,12 @@ class Cases:
         fixture.fill_to(os.path.join(root["path"], "payload"), free - 5 * MIB)
         fixture.release(root, "interrupted")
         fixture.wait_until_idle()
-        if fixture.free() > 48 * MIB:
-            raise AssertionError("case 8 is not below the reserve")
+        current = fixture.free()
+        if current > 48 * MIB:
+            self.filler = os.path.join(fixture.mount, "case8-filler")
+            current = fixture.fill_to(self.filler, 35 * MIB)
+        if not 24 * MIB < current <= 48 * MIB:
+            raise AssertionError("case 8 free space is outside its floor/reserve band")
         source = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scratch-enotempty-shim.c"))
         library = os.path.join(fixture.root, "space-pause.dylib")
         code, _, err = images.run(["/usr/bin/clang", "-dynamiclib", "-Wall", "-Wextra", "-Werror",
