@@ -653,6 +653,9 @@ fn delete_unit_locked(
             device: unit.device.get(),
             inode: unit.inode,
             marker: unit.marker.clone(),
+            // The root id a hold takes, so a replay of an adopted root's intent
+            // takes that lock too.
+            root_id: unit.root_id.clone(),
             capture_name,
             grant: unit.grant.clone(),
         },
@@ -4494,6 +4497,7 @@ mod tests {
                 device,
                 inode: unit.inode,
                 marker: unit.marker.clone(),
+                root_id: None,
                 capture_name: format!("{QUARANTINE_PREFIX}{intent_id}"),
                 grant: unit.grant.clone(),
             },

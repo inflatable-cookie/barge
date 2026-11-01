@@ -7139,6 +7139,7 @@ mod tests {
                     device,
                     inode,
                     marker: None,
+                    root_id: None,
                     capture_name: quarantine_name.clone(),
                     grant: crate::unit::UnitGrant::claim("top_level_adhoc"),
                 },

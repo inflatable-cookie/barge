@@ -1863,7 +1863,11 @@ Choices S5 made where this design left the mechanic to the slice:
   object carries exactly the unit's `parent`, `name`, `kind` (`directory` or
   `file`), its expected `device` and `inode`, an optional `marker` (filename,
   family and digest), the planned private `capture_name` and the `grant`
-  (kind and reference). The capture name is the
+  (kind and reference). Stage 3's T5 added one optional member inside this major,
+  `unit.root_id`: the marker's root id when the unit's directory name is not it
+  (an adopted root), so a replay and an effect can take the `root-<root-id>` lock
+  a consumer's `hold` takes as well as the name's. A record written before it
+  carries none, and its name is its root id. The capture name is the
   `.barge-prune-<intent-id>` leaf in the unit's parent, recorded **before** the
   capture and re-derived and checked on every read, never trusted as free text.
   The phases are `intent`, `renamed`, `marker_last`, `removed` and `deleted`.

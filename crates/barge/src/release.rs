@@ -3284,6 +3284,7 @@ mod tests {
                     crate::unit::MarkerFamily::Barge,
                     "0".repeat(64),
                 )),
+                root_id: None,
                 capture_name: format!(".barge-prune-{}", "9".repeat(32)),
                 grant: crate::unit::UnitGrant::native_root(root_id.to_owned()),
             },

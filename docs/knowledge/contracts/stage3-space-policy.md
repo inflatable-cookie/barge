@@ -845,7 +845,7 @@ rows, `unknown` never read as absent or default.
 | `barge.error/1` | report | the only envelope for a refusal, including this command's: one new `kind`, `space_below_floor`, used only for a no-effect refusal; an unsettled delete is `unknown_state` at exit `3`. |
 | `barge.describe/1` | report | optional additions: a `space` row set and the new format names in `formats`; absent in an older document is valid. |
 | `barge.root/1`, `barge.hold/1` | authoritative | unchanged. This stage adds no field to a marker or a hold. |
-| `barge.intent/2` | authoritative | unchanged by this stage, and **not** `barge.intent/1` as first drafted here: stage 4's F4 landed the `/2` record with its optional `identity` and `absence` evidence, and `barge.intent/1` stays readable for records written before it (stage 4 design, "The intent record"; stage 1 design, "Durable custody of captured objects"). A space prune writes the same `/2` record and reads both. |
+| `barge.intent/2` | authoritative | **not** `barge.intent/1` as first drafted here: stage 4's F4 landed the `/2` record with its optional `identity` and `absence` evidence, and `barge.intent/1` stays readable for records written before it (stage 4 design, "The intent record"; stage 1 design, "Durable custody of captured objects"). A space prune writes the same `/2` record and reads both, and T5 adds one optional `unit.root_id` member inside the major (stage 1 design, "The intent record"), so a replay of an adopted root's intent takes the lock a `hold` takes. |
 
 ### `barge.space/1`
 
@@ -1840,10 +1840,13 @@ is claimed.**
   re-reads the registry again and compares the generation. A changed generation is
   adopted: the new policy's `max(reserve, floor)` becomes the target, a fresh
   measurement decides, and a candidate the new policy no longer needs is skipped
-  as `policy_changed`. Only these stop the pass, with `unknown_state`/`unknown
-  state` at exit `3` and anything already deleted in `detail.pruned_root_ids`: an
-  unreadable or invalid registry, a volume that left the registry, an undeclared
-  durability, and a durability that became `kept`.
+  as `policy_changed`. Only these stop the pass, with `unknown_state` at exit `3`
+  and anything already deleted in `detail.pruned_root_ids`: an unreadable or
+  invalid registry, a volume that left the registry, an undeclared durability, and
+  a durability that became `kept`. A durability that does not permit pruning — at
+  the pass's start or mid-pass — is exit `3`, never a no-effect refusal at exit `2`:
+  the operator asked for a real prune of data the volume no longer says is
+  expendable, which needs their decision.
 - **The effect step's re-verification (the frozen custody set).** Each candidate is
   re-proved inside the deletion, under the volume and root locks it holds, before
   its intent: the registry generation adopted above; the area's declaration still
@@ -1868,11 +1871,15 @@ is claimed.**
   effect. The per-root deadline is `min(120 s, remaining - 5 s)`, and the
   deletion's own bound is checked at each of its durable boundaries.
 - **Flush and reclaim.** One flush per batch, bounded at 30 s, then the volume is
-  re-verified around it and re-measured. The pass stops when free space is
-  strictly greater than `max(reserve, floor)` (`target_reached`), when nothing
-  eligible remains (`nothing_eligible`), when a batch that deleted something
-  measured no reclaim (`space_not_reclaimed`), or when a bound is reached
-  (`budget_exhausted`). `reclaimed_bytes` is the measured difference across the
+  re-verified around it and re-measured. A batch a bound cuts short is still
+  flushed when it deleted something, so no deletion is ever reported from an
+  unflushed measurement; a batch that deleted nothing has no reclaim to measure and
+  is not flushed. The pass stops when free space is strictly greater than
+  `max(reserve, floor)` (`target_reached`), when nothing eligible remains
+  (`nothing_eligible`), when a batch that deleted something measured no reclaim
+  (`space_not_reclaimed`), or when a bound is reached (`budget_exhausted`); a bound
+  keeps its `budget_exhausted` answer even when the flush beside it shows the target
+  reached, because the pass still ended on the bound. `reclaimed_bytes` is the measured difference across the
   pass, never a sum of the plan's recorded sizes; `deleted_bytes` is that sum and
   is named separately so the two are never confused. A failed flush, a failed
   post-flush reverify and an unreadable measurement are `unknown_state` at exit
@@ -1882,16 +1889,21 @@ is claimed.**
   wall clock and no new option (the design delegate's ruling). No effect starts
   inside the last 5 s. Every bound reports what it did not reach, with counts, and
   a pass that ends on one exits `3` rather than presenting itself as complete.
-- **Replay is this volume's, under this pass's lock.** The pass takes the volume's
-  exclusive lock first and replays **only the pending intents whose recorded volume
-  is that volume**, under the lock it already holds, from their recorded identities
-  only, after the volume re-verifies — never the account journal's other volumes'
-  intents, which are a different object's business and cannot block, delay or be
-  acted on by this pass. A replay that settles or resumes everything continues, and
-  one that cannot settle one of this volume's intents stops the pass before its
-  first effect with `detail.pending_intent`. The report carries this volume's
-  replay counts in `effect.replay`. The per-phase replay rules themselves are
-  `delete`'s and are pinned there.
+- **Replay is this volume's and each pending intent is that object's.** The pass
+  takes the volume's exclusive lock first and replays **only the pending intents
+  whose recorded volume is that volume**, under the lock it already holds, from
+  their recorded identities only, after the volume re-verifies — never the account
+  journal's other volumes' intents, which are a different object's business and
+  cannot block, delay or be acted on by this pass. An intent it cannot settle keeps
+  **its own object** and nothing else: every candidate the intent covers is skipped
+  and reported as `pending_intent` (checked before the candidate's folder is read,
+  because that delete has already renamed the root into its quarantine leaf), and
+  the pass still prunes the roots the intent does not cover. That is ruling
+  `698d9ba3`'s per-object rule applied to the operator's pass, and it is why an
+  unsettled intent is not a pass-wide stop; only a journal that cannot be read at
+  all is, because then no candidate's custody can be proven. The report carries
+  this volume's replay counts in `effect.replay`, including what stayed pending.
+  The per-phase replay rules themselves are `delete`'s and are pinned there.
 - **Failure matrix rows this slice owns.** Drive pulled before the run
   (`volume_absent`, nothing changed); a root renamed or absent since the plan
   (`identity_changed`, no delete); `ENOSPC` or an unreadable state volume at the

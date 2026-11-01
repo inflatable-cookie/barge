@@ -1109,6 +1109,15 @@ pub struct IntentUnit {
     /// The marker the plan read, when the unit carries one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marker: Option<crate::unit::UnitMarker>,
+    /// The marker's root id, when the unit's directory name is not it.
+    ///
+    /// An optional addition inside this major: a `hold` takes the root-id lock,
+    /// while a unit whose name is not a Barge root id takes its own key, so a
+    /// replay of an **adopted** root's intent must take the root-id lock as well or
+    /// it could act on a root its holder believes it holds. A record written before
+    /// this field existed carries none, and its name is its root id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_id: Option<String>,
     /// The private `.barge-prune-<intent-id>` name the unit was captured to
     /// inside its parent, recorded before the capture.
     pub capture_name: String,
@@ -1145,6 +1154,35 @@ impl IntentUnit {
             .with_detail("intent_id", intent_id.to_owned().into()));
         }
         self.grant.validate()?;
+        if let Some(root_id) = &self.root_id {
+            if !is_identifier(root_id) {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "the intent's marker root id is not 32 lowercase hex digits".to_owned(),
+                )
+                .with_detail("intent_id", intent_id.to_owned().into()));
+            }
+            if *root_id == self.name {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "the intent records a marker root id equal to its unit name, which is one lock, not two"
+                        .to_owned(),
+                )
+                .with_detail("intent_id", intent_id.to_owned().into()));
+            }
+            if self.kind != crate::unit::UnitKind::Directory
+                || !matches!(
+                    self.marker.as_ref().map(|marker| marker.family),
+                    Some(crate::unit::MarkerFamily::Barge)
+                )
+            {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "only a Barge-marked directory root can name a marker root id".to_owned(),
+                )
+                .with_detail("intent_id", intent_id.to_owned().into()));
+            }
+        }
         match (&self.marker, self.kind) {
             (Some(marker), crate::unit::UnitKind::Directory) => marker.validate()?,
             (Some(_), crate::unit::UnitKind::File) => {
@@ -1274,11 +1312,11 @@ impl IntentRecord {
             folder: self.folder.clone(),
             parent: self.unit.parent.clone(),
             name: self.unit.name.clone(),
-            root_id: None,
             kind: self.unit.kind,
             device: crate::os::DeviceId::new(self.unit.device),
             inode: self.unit.inode,
             marker: self.unit.marker.clone(),
+            root_id: self.unit.root_id.clone(),
             grant: self.unit.grant.clone(),
             plan_digest: self.plan_digest.clone(),
         }
@@ -1496,6 +1534,7 @@ impl IntentV1 {
                 crate::unit::MarkerFamily::Barge,
                 self.marker_digest,
             )),
+            root_id: None,
             capture_name: self.quarantine_name,
             grant: crate::unit::UnitGrant::native_root(self.root_id.clone()),
         };
@@ -2636,6 +2675,7 @@ mod intent_tests {
                     crate::unit::MarkerFamily::Barge,
                     "a".repeat(64),
                 )),
+                root_id: None,
                 capture_name: format!("{QUARANTINE_PREFIX}{intent_id}"),
                 grant: crate::unit::UnitGrant::native_root(format!("{:032x}", 8)),
             },

@@ -439,10 +439,14 @@ pub fn prune(
     let record = area::registered_volume(paths, request.volume_uuid)?;
     let durability = record.declared_durability()?;
     if !durability.permits_pruning() {
+        // The failure matrix's durability row: a volume that may not be pruned is
+        // unknown state at exit 3, not a no-effect refusal at exit 2. The operator
+        // asked for a real prune of data the volume no longer says is expendable, so
+        // the answer names the durability and needs their decision.
         return Err(Error::new(
-            ErrorKind::RefusedBoundary,
+            ErrorKind::UnknownState,
             format!(
-                "volume {} is declared `{}`, so nothing on it may be pruned for space; nothing was changed",
+                "volume {} is declared `{}`, which never permits pruning, so nothing was changed",
                 record.volume_uuid,
                 super::durability_name(durability)
             ),
@@ -507,36 +511,11 @@ pub fn prune(
         },
         Some(deadline),
     )?;
-    if !replay.is_settled() {
-        let ids: Vec<&str> = replay
-            .pending
-            .iter()
-            .map(|row| row.intent_id.as_str())
-            .collect();
-        let rows: Vec<serde_json::Value> = replay
-            .pending
-            .iter()
-            .map(|row| {
-                serde_json::json!({
-                    "intent_id": row.intent_id,
-                    "unit_name": row.unit_name,
-                    "unit_kind": row.unit_kind,
-                    "phase": row.phase,
-                    "reason": row.reason,
-                })
-            })
-            .collect();
-        return Err(Error::new(
-            ErrorKind::UnknownState,
-            format!(
-                "an earlier space prune of volume {} left {} intent(s) pending and this run could not settle them, so nothing was deleted; a later run replays them",
-                request.volume_uuid,
-                replay.pending.len()
-            ),
-        )
-        .with_detail("pending_intent", serde_json::json!(ids))
-        .with_detail("pending", serde_json::json!(rows)));
-    }
+    // An intent this run could not settle is **that object's** business (ruling
+    // `698d9ba3`): the pass continues, and every candidate the intent covers is
+    // skipped and reported as `pending_intent`. It never stops a pass over
+    // unrelated paths, and the report carries the replay's own counts so the
+    // operator can see what stayed pending.
     let before = space.measure_space(&verified)?;
     // The plan's own snapshot is what authorizes the run. A policy published between
     // the plan and this pass is the first generation change an effect step
@@ -684,15 +663,18 @@ impl Pass<'_> {
             self.batches = self.batches.saturating_add(1);
             let batch_start = self.current.free_bytes;
             let mut batch_deleted = 0usize;
+            let mut cut_short = false;
             for candidate in &batch {
                 if self.stop.is_some() || Instant::now() >= self.effect_deadline {
                     // The bound stops this batch where it is; the rows it did not
                     // attempt are reported as unreached below.
                     self.stop = Some("budget_exhausted");
+                    cut_short = true;
                     break;
                 }
                 if self.pruned.len() >= self.bounds.roots {
                     self.stop = Some("budget_exhausted");
+                    cut_short = true;
                     break;
                 }
                 match self.effect(candidate) {
@@ -712,18 +694,21 @@ impl Pass<'_> {
                 }
                 cursor = cursor.saturating_add(1);
             }
-            if self.stop.is_some() {
-                break;
-            }
             // One flush per batch, then re-measure: the reclaim check is a measured
-            // fact, never a sum of the sizes the plan recorded.
-            if let Err(error) = self.flush_and_measure() {
-                return Err(self.annotate(error));
+            // fact, never a sum of the sizes the plan recorded. A batch a bound cut
+            // short is still flushed when it deleted something, so no deletion is
+            // ever reported from an unflushed measurement; a batch that deleted
+            // nothing has no reclaim to measure.
+            if !cut_short || batch_deleted > 0 {
+                if let Err(error) = self.flush_and_measure() {
+                    return Err(self.annotate(error));
+                }
+                self.rounds = self.rounds.saturating_add(1);
             }
-            self.rounds = self.rounds.saturating_add(1);
             if self.stop.is_some() {
-                // A flush that outlived its own bound is a reached bound, and the
-                // measurement beside it is still the one the report carries.
+                // A bound ended the pass; a flush that outlived its own bound is a
+                // reached bound too, and the measurement beside it is still the one
+                // the report carries.
                 break;
             }
             if self.current.free_bytes > self.target() {
@@ -903,6 +888,39 @@ impl Pass<'_> {
             ResolvedTarget::Stop(error) => return Outcome::Stop(error),
         };
         let unit = deletion_unit(&self.record, &target, candidate, &self.plan_sha256);
+        // A pending intent covering **this** object keeps it and is reported as
+        // `pending_intent`, before the deletion's own preflight could describe it as
+        // merely absent: an unsettled delete has already renamed the root into its
+        // quarantine leaf, and the operator needs to know a replay owes it. A
+        // pending intent over another path is a different object's business (ruling
+        // `698d9ba3`) and reaches no other candidate.
+        let pending = state::read_intents(self.paths, INTENT_ROWS).map_err(|error| {
+            Outcome::Stop(
+                Error::new(
+                    ErrorKind::UnknownState,
+                    format!(
+                        "the intent journal could not be read, so this pass stopped before an effect: {error}"
+                    ),
+                ),
+            )
+        });
+        match pending {
+            Err(outcome) => return outcome,
+            Ok(intents) => {
+                if PendingIntent::pending(&intents.records)
+                    .iter()
+                    .any(|pending| pending.overlaps(&unit))
+                {
+                    return Outcome::Skipped(Skip::new(
+                        "pending_intent",
+                        format!(
+                            "a pending intent covers the root `{}`, so it is kept until a replay settles it",
+                            candidate.name
+                        ),
+                    ));
+                }
+            }
+        }
         let remaining = self
             .effect_deadline
             .saturating_duration_since(Instant::now());
@@ -1280,6 +1298,30 @@ fn reverify_candidate(
     now_ms: u64,
     wall: Duration,
 ) -> std::result::Result<(), Skip> {
+    // No pending intent may cover this root, and that is decided **before** anything
+    // about the root's current shape. An earlier run's unsettled delete of this
+    // object has already renamed it into its quarantine leaf, so its folder would
+    // read as "renamed or absent" and hide the fact an operator needs: a replay owes
+    // this object. A pending intent over another path is a different object's
+    // business and never reaches this candidate (ruling `698d9ba3`).
+    let intents = state::read_intents(paths, INTENT_ROWS).map_err(|error| {
+        Skip::new(
+            "pending_intent",
+            format!("the intent journal could not be read, so the root is kept: {error}"),
+        )
+    })?;
+    if PendingIntent::pending(&intents.records)
+        .iter()
+        .any(|pending| pending.overlaps(unit))
+    {
+        return Err(Skip::new(
+            "pending_intent",
+            format!(
+                "a pending intent covers the root `{}`, so it is kept until a replay settles it",
+                candidate.name
+            ),
+        ));
+    }
     if fresh.generation != generation {
         return Err(Skip::new(
             "policy_changed",
@@ -1588,26 +1630,6 @@ fn reverify_candidate(
                 ),
             ));
         }
-    }
-    // No pending intent may cover this root: the deletion's own custody reads them
-    // too, and this check names the fact the report carries.
-    let intents = state::read_intents(paths, INTENT_ROWS).map_err(|error| {
-        Skip::new(
-            "pending_intent",
-            format!("the intent journal could not be read, so the root is kept: {error}"),
-        )
-    })?;
-    if PendingIntent::pending(&intents.records)
-        .iter()
-        .any(|pending| pending.overlaps(unit))
-    {
-        return Err(Skip::new(
-            "pending_intent",
-            format!(
-                "a pending intent covers the root `{}`, so it is kept until a replay settles it",
-                candidate.name
-            ),
-        ));
     }
     Ok(())
 }
@@ -2672,7 +2694,11 @@ mod tests {
                 SpacePruneBounds::design(),
             )
             .expect_err("a kept volume is refused before any effect");
-        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        // The failure matrix's durability row: exit 3, not a no-effect refusal at
+        // exit 2 — the operator asked for a real prune of data the volume no longer
+        // says is expendable, which needs their decision.
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert_eq!(error.kind().exit_code(), 3);
         assert!(error.message().contains("kept"));
         assert!(path.is_dir(), "nothing was deleted");
         harness.no_pending_intent();
@@ -3469,6 +3495,103 @@ mod tests {
             1,
             "the other volume's intent is still pending, untouched"
         );
+    }
+
+    /// A pending intent is per object (ruling `698d9ba3`): one this run cannot
+    /// settle keeps **its** root and is reported, while the pass deletes the roots
+    /// the intent does not cover.
+    #[test]
+    fn an_unsettled_intent_keeps_its_own_root_and_the_pass_still_prunes_the_rest() {
+        let harness = Harness::new("space-prune-per-object-intent", RESERVE, FLOOR);
+        let (first, first_path) = harness.seed("pool", 1_000);
+        let (second, second_path) = harness.seed("pool", 2_000);
+        // The injected fault names one payload, so it stays with the root that owns
+        // it and the other root's deletion is not poisoned by the same shift.
+        std::fs::rename(
+            second_path.join("payload.bin"),
+            second_path.join("second.bin"),
+        )
+        .expect("the second root's payload is renamed");
+        let (preview, bytes) = harness.preview();
+        assert_eq!(preview.plan.candidates.rows[0].root_id, first);
+
+        // Interrupt the pass on the older root; the fault stays armed, so the next
+        // run's replay of that one intent cannot settle it either.
+        let faults = Faults::new().with_device_shift(
+            "payload.bin",
+            crate::os::DeviceId::new(harness.fixture.device.get().saturating_add(1)),
+        );
+        harness
+            .run_with(
+                &faults,
+                &bytes,
+                &Meter::new(&[4]),
+                &Flusher::ok(),
+                SpacePruneBounds::design(),
+            )
+            .expect_err("the first run is interrupted");
+        assert!(
+            !first_path.exists(),
+            "the first root is in its quarantine leaf"
+        );
+
+        let report = harness
+            .run_with(
+                &faults,
+                &bytes,
+                &Meter::new(&[4, 20]),
+                &Flusher::ok(),
+                SpacePruneBounds::design(),
+            )
+            .expect("the second run prunes the roots the intent does not cover");
+        let effect = report.effect.as_ref().expect("the effect");
+        let replay = effect.replay.expect("the replay is reported");
+        assert_eq!(
+            replay.examined, 1,
+            "the volume's one pending intent was replayed"
+        );
+        assert_eq!(replay.pending, 1, "and it is still unsettled");
+        assert_eq!(
+            held_reason(&report, &first).as_deref(),
+            Some("pending_intent"),
+            "the root the intent covers is kept and reported"
+        );
+        assert_eq!(effect.pruned.count, 1);
+        assert_eq!(effect.pruned.rows[0].root_id, second);
+        assert!(!second_path.exists(), "an unrelated root still yields");
+    }
+
+    /// A bound can cut a batch short; the batch is still flushed when it deleted
+    /// something, so no deletion is reported from an unflushed measurement.
+    #[test]
+    fn a_batch_a_bound_cut_short_is_still_flushed() {
+        // A 30-byte target with one root per batch and a two-root batch: the roots
+        // bound stops the batch after one deletion, and that batch is flushed.
+        let harness = Harness::new("space-prune-partial-flush", 30, FLOOR);
+        harness.seed("pool", 1_000);
+        harness.seed("pool", 2_000);
+        let (_, bytes) = harness.preview();
+        let bounds = SpacePruneBounds {
+            roots: 1,
+            ..SpacePruneBounds::design()
+        };
+        let flusher = Flusher::ok();
+        let report = harness
+            .run(&bytes, &Meter::new(&[4, 10]), &flusher, bounds)
+            .expect("the pass runs");
+        let effect = report.effect.as_ref().expect("the effect");
+        assert_eq!(effect.stop, "budget_exhausted");
+        assert_eq!(effect.pruned.count, 1);
+        assert_eq!(
+            effect.flush.attempts, 1,
+            "the partial batch is flushed, not skipped"
+        );
+        assert_eq!(flusher.calls(), 1);
+        assert_eq!(
+            effect.after.free_bytes, 10,
+            "the report's measurement is the flushed one"
+        );
+        assert_eq!(effect.not_reached.count, 1);
     }
 
     #[test]
