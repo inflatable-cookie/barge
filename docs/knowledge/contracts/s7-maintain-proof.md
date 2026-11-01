@@ -129,7 +129,7 @@ carries the same trace (`premise_trace`).
 | 8 | `mktemp -d` per fixture, never a shared name | `tempfile.mkdtemp` for the run root's children; no fixed path anywhere |
 | 9 | the pinned supervisor, no second harness | `outer_half` verifies the digest and executes those bytes; the self-check pins it |
 
-## The six cases
+## The seven cases
 
 Each case asserts the design's observable and fails on a missing fact. The
 counted mode stops at the first fault; the diagnostic keeps going, latches the
@@ -137,9 +137,10 @@ first fault, and skips only the cases that depend on a failed one.
 
 The order is the one the case bodies need, not the order the brief lists them in:
 the four cases that plan deletions run first against the quiet one-volume
-registry, the absent-volume case then adds its two records and restores them, and
-the pending-intent case runs last because it leaves an intent that any later real
-run would replay.
+registry, the absent-volume case then adds its two records and restores them, the
+release-class case declares its second area and proves that area yields no
+candidate, and the pending-intent case runs last because it leaves an intent that
+any later real run would replay.
 
 1. **`preview_then_real_deletes_exactly_the_planned_units`.** One aged owned
    area root, one fresh one, and one concluded-then-aged native scratch run. The
@@ -176,7 +177,19 @@ run would replay.
    real run both exit `3`; the real run still deletes the attached volume's
    planned root, so the other volumes are maintained. The one-volume registry is
    restored in a `finally` block, so the last case's plan is quiet again.
-6. **`exit_3_with_a_pending_intent`.** An owned root holding a symlink, with the
+6. **`a_release_on_reference_area_keeps_its_root`.** The case declares a second
+   area with the R2 release-class policy `release_on_reference` (`reserve:
+   excluded`), through the same area verb, so the plan reads the stored
+   `barge.area/1` record. It creates and ages a root there and creates and ages a
+   root in the age area. Both are equally old, so age cannot be what tells them
+   apart: the preview must report the release-class area as an excluded step
+   whose `policy.kind` is `release_on_reference`, with its `excluded_reason`
+   naming the policy, `candidates` and `kept` both zero, and its root absent from
+   every candidate list, while the age area's root is still planned. The real run
+   authorised by that plan deletes exactly the age area's unit and leaves the
+   release-class root and its marker in place, so the deletion set can only
+   shrink from declaring the policy, never grow.
+7. **`exit_3_with_a_pending_intent`.** An owned root holding a symlink, with the
    entry created **before** the root is aged (adding an entry refreshes the
    directory mtime, so aging first would plan nothing — the arrangement defect the
    first `9a573a9` diagnostic exposed), and the symlink pointing at a fixture file
@@ -218,7 +231,7 @@ outcome, the environment inventory and the child-environment check, the nine
 premises and their trace, the preflight census, the real-state before/after
 observations, each case's status with its evidence, any infrastructure
 classification, any latched fault, and any cleanup failure. `qualified` is true
-only for a counted run in which all six cases passed, no case was skipped, no
+only for a counted run in which all seven cases passed, no case was skipped, no
 fault was latched, cleanup completed, and the real-state premise held.
 
 ## Activation order
@@ -349,3 +362,54 @@ half.
   dead-handle re-read closed descriptor settles through the same bounded re-listing,
   and case 6 records and retries environmental skips. Evidence is in
   `/Volumes/Builds/scratch/barge/evidence-s7-22a3af1-20261029T112812Z`.
+
+### 2026-11-01: head `7850685`, maintain diagnostic: case 1 arrangement defect, not R2 and not a product regression
+
+- **Selector and mode:** `effigy maintain:native:diagnostic` at
+  `78506856d691e94a057966e2b21a9dedfe72b9ed`, one invocation; exit `3`,
+  `qualified: false` (an uncounted diagnostic is never promoted).
+- **What executed:** the repinned supervisor `fcfda2b0…` verified and ran; the
+  preflight descriptor census passed; the owned image attached `-owners on` and
+  detached ordinarily; the nine premises traced with no premise failure; the real
+  account state was observed unchanged; 8.0 MiB of the 512 MiB scratch budget.
+- **Failed (apparatus arrangement, not product):**
+  `preview_then_real_deletes_exactly_the_planned_units` found only the aged
+  native scratch run in the plan's candidates, not its aged area root
+  (`assert planned["root_id"] in candidates`, candidates `['f22fbf32…']`). Three
+  facts settle the classification:
+  - **Not R2's `release_on_reference`.** The area is declared
+    `--prune oldest-idle:60`, and R2's exclusion is the `release_on_reference`
+    branch of `prune.rs`'s `area_plan` only, so the age step is planned.
+  - **Not the stored-wins ruling.** The fixture wrote the `barge.area/1` record
+    itself through `barge area declare`, and `area root create` reads that same
+    record (`crates/barge-cli/src/main.rs`, `require_declaration`), so no caller
+    declaration could differ.
+  - **The marker's own mtime.** `age_area_root` backdated the tree and *then*
+    rewrote the marker to record an older `created_ms`, so the marker file's mtime
+    stayed at "now". Since stage 4 F3 a maintain candidate's age is the newest
+    modification time found by a bounded scan of the root's subtree
+    (`crates/barge/src/prune.rs` `area_plan`; `crates/barge/src/area.rs`
+    `scan_activity_within` and `walk_activity`), and the marker is one of those
+    entries, so the root read as "idle for less than the declared 60 s" and was
+    kept. The aged scratch run was a candidate because its aging rewrites the
+    activity record in the state directory, not an entry inside the root. This is
+    the same arrangement rule the pending-intent case records for its symlink;
+    the marker is its other instance. Earlier runs that passed this case
+    (`9a573a9`, `22a3af1`) predate the scan: at `22a3af1` a root's activity was
+    `max(created_ms, root directory mtime)` in `area.rs`, which this edit did not
+    refresh, so the fixture passed then.
+- **Why the deletion set shrank:** it did not shrink by policy. The plan named one
+  unit fewer because the fixture's own aging step left the root fresh; nothing in
+  R2 or the stored-wins ruling narrowed a planned deletion.
+- **Evidence:** selector log
+  `/Volumes/Builds/scratch/barge/r2-logs/diag-s7-maintain-proof-7850685.log`;
+  receipt
+  `/Volumes/Builds/scratch/barge/oxide-proof.0xqa5aa9/evidence/s7-maintain-receipt.json`;
+  binary `/Volumes/Builds/scratch/barge/r2-bin/barge-7850685`, sha256
+  `e48582604f43b50579cff922dc64db299a66901129e4243f981b5c4951c35705`.
+- **Corrected by:** `age_area_root` now rewrites the marker first and backdates
+  the tree second, and `maintain:native:test` refuses the reversed order. The
+  release-class case above is added in the same head, so a clean diagnostic also
+  proves the R2 policy keeps its root on the real image. No product change; a
+  fresh, separately owner-activated diagnostic at the final head is still
+  required.

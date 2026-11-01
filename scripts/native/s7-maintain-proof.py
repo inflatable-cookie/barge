@@ -119,7 +119,7 @@ ENVIRONMENT = {
     "CARGO_HOME": "a private fixture Cargo home; this proof builds nothing",
 }
 
-# The six cases, in the brief's order. `needs` names the cases that must have
+# The seven cases, in the brief's order. `needs` names the cases that must have
 # passed before this one is meaningful, so a diagnostic run skips dependents
 # instead of cascading.
 CASES = [
@@ -130,15 +130,19 @@ CASES = [
     # The absent-volume case rewrites this proof's registry, so it runs only after
     # the planned-deletion cases: a record for a volume that is not attached makes
     # every plan loud (exit 3), which would confuse a case that expects a quiet
-    # exit 0. It restores the one-volume registry in a finally block, and the
+    # exit 0. It restores the one-volume registry in a finally block. The
+    # release-class case declares a second area, which later plans report as an
+    # excluded step with no candidate, so it changes no candidate count. The
     # pending-intent case stays last because its intent is replayed by any later
     # real run.
     ("an_oxide_output_root_and_receipt_fixture_are_untouched",
      ["a_hold_between_preview_and_real_stops_that_unit"]),
     ("an_absent_ephemeral_volume_is_skipped_and_a_permanent_one_is_reported",
      ["an_oxide_output_root_and_receipt_fixture_are_untouched"]),
-    ("exit_3_with_a_pending_intent",
+    ("a_release_on_reference_area_keeps_its_root",
      ["an_absent_ephemeral_volume_is_skipped_and_a_permanent_one_is_reported"]),
+    ("exit_3_with_a_pending_intent",
+     ["a_release_on_reference_area_keeps_its_root"]),
 ]
 
 PREMISES = [
@@ -570,6 +574,21 @@ class Proof:
             expect=0,
         )
 
+    def declare_release_area(self):
+        """Declare the area whose roots only the release gate may release.
+
+        `release_on_reference` is R2's policy and `reserve: excluded` is the F6
+        declaration's own shape. The area verb writes the `barge.area/1` record,
+        so the plan that keeps its root later reads the stored declaration rather
+        than a caller's object.
+        """
+        self.barge(
+            "area", "declare", "--namespace", "example", "--area", "outputs",
+            "--folder", "outputs", "--absent", "wait",
+            "--prune", "release-on-reference", "--reserve", "excluded",
+            expect=0,
+        )
+
     # -- the CLI ----------------------------------------------------------
 
     def barge(self, *args, expect=None, timeout=120):
@@ -613,6 +632,13 @@ class Proof:
         _code, document = self.barge(
             "area", "root", "create", "--namespace", "example", "--area", "pool",
             "--volume", self.uuid, "--kind", kind, expect=0,
+        )
+        return document["data"]["root"]
+
+    def create_release_area_root(self):
+        _code, document = self.barge(
+            "area", "root", "create", "--namespace", "example", "--area", "outputs",
+            "--volume", self.uuid, "--kind", "area_root", expect=0,
         )
         return document["data"]["root"]
 
@@ -665,14 +691,25 @@ class Proof:
         os.chmod(marker, info.st_mode & 0o777)
 
     def age_area_root(self, root_path):
-        """Backdate an owned root: its directory mtime and its recorded creation."""
-        self.tree_age(root_path, AGED_DAYS)
+        """Backdate an owned root: its recorded creation, then its whole tree.
+
+        The marker is rewritten **before** the tree is backdated, and the order is
+        the point. An owned root's last activity is the newest modification time
+        found by a bounded scan of its subtree, and the marker file is one of those
+        entries: writing it to record an older `created_ms` leaves its own mtime at
+        "now", so a root aged the other way round reads as "idle for less than the
+        declared age" and is never planned. This is the arrangement rule the
+        pending-intent case records for its symlink, for the marker: the 7850685
+        diagnostic failed exactly here, and the self-check refuses the reversed
+        order.
+        """
         stamp = now_ms() - AGED_DAYS * 86400 * 1000
 
         def change(document):
             document["created_ms"] = stamp
 
         self.edit_marker(root_path, change)
+        self.tree_age(root_path, AGED_DAYS)
 
     def age_native_run(self, root_path):
         """Age a concluded scratch run past S4's seven-day native policy."""
@@ -713,6 +750,27 @@ class Proof:
         if not volume.get("areas", {}).get("rows"):
             raise Fault("case", "the plan has no area step")
         return volume["areas"]["rows"][0]
+
+    def area_row_named(self, document, area_name):
+        """One named area's step, so a plan with several areas is never read by position."""
+        volume = self.volume_row(document, self.uuid)
+        for row in volume.get("areas", {}).get("rows", []):
+            if row["area"] == area_name:
+                return row
+        raise Fault("case", f"the plan has no step for area {area_name}")
+
+    def area_stage(self, document, area_name):
+        """One named area's stage from a real run, never a stage by position.
+
+        Once the release-class case declares its second area, every later plan and
+        report holds two area stages, and their order is the state directory's, so
+        a stage is read by name.
+        """
+        for volume in document["data"]["volumes"]["rows"]:
+            for stage in volume.get("areas", []):
+                if stage.get("area") == area_name:
+                    return stage
+        raise Fault("case", f"the run reports no stage for area {area_name}")
 
     def candidate_names(self, document):
         names = []
@@ -777,7 +835,7 @@ class Proof:
         assert real["data"]["pending"]["count"] == 0, real["data"]["pending"]
         volume = real["data"]["volumes"]["rows"][0]
         assert volume["scratch"]["deleted"]["count"] == 1, volume["scratch"]
-        assert volume["areas"][0]["deleted"]["count"] == 1, volume["areas"][0]
+        assert self.area_stage(real, "pool")["deleted"]["count"] == 1, real["data"]
         assert not os.path.exists(planned["path"]), "the planned root is gone"
         assert not os.path.exists(scratch_run["path"]), "the planned scratch run is gone"
         assert os.path.isdir(kept["path"]), "the kept root stays"
@@ -835,7 +893,7 @@ class Proof:
         # the held root is kept and the other planned root is still deleted: the
         # hold stops that unit only, and the run completes with exit 0.
         code, real = self.real(digest, plan_file, expect=0)
-        stage = real["data"]["volumes"]["rows"][0]["areas"][0]
+        stage = self.area_stage(real, "pool")
         assert stage["deleted"]["count"] == 1, stage
         assert stage["skipped"]["count"] == 1, stage
         assert stage["skipped"]["rows"][0]["name"] == held["root_id"], stage
@@ -889,7 +947,7 @@ class Proof:
         assert root["root_id"] in self.candidate_names(preview), self.candidate_names(preview)
 
         code_real, real = self.real(preview["data"]["plan_digest"], plan_file, expect=3)
-        assert real["data"]["volumes"]["rows"][0]["areas"][0]["deleted"]["count"] == 1, real["data"]
+        assert self.area_stage(real, "pool")["deleted"]["count"] == 1, real["data"]
         assert not os.path.exists(root["path"]), "the other volume was still maintained"
         assert not os.path.exists(self.absent_ephemeral), "an absent mount point stays absent"
         assert not os.path.exists(self.absent_permanent), "an absent mount point stays absent"
@@ -933,6 +991,51 @@ class Proof:
             "oxide_root": after_root,
             "oxide_receipts": after_receipt,
             "deleted": root["root_id"],
+        }
+
+    def case_a_release_on_reference_area_keeps_its_root(self):
+        """A stored release_on_reference area never yields a maintain candidate.
+
+        Both roots are aged the same way, so age cannot be what tells them apart:
+        the area's stored `release_on_reference` policy is. The plan reports the
+        area as an excluded step with its reason and no candidate, and the age
+        area's unit is still planned, so the real run deletes exactly that unit
+        and the release-class root and its marker survive. The deletion set can
+        only shrink from adding the policy, never grow.
+        """
+        self.declare_release_area()
+        released = self.create_release_area_root()
+        self.age_area_root(released["path"])
+        aged = self.create_area_root()
+        self.age_area_root(aged["path"])
+
+        plan_file = self.plan_path("release-class")
+        _code, preview = self.preview(expect=0, plan_out=plan_file)
+        release_step = self.area_row_named(preview, "outputs")
+        assert release_step["policy"]["kind"] == "release_on_reference", release_step["policy"]
+        assert release_step["candidates"]["count"] == 0, release_step["candidates"]
+        assert release_step["kept"]["count"] == 0, release_step["kept"]
+        reason = release_step.get("excluded_reason") or ""
+        assert "release_on_reference" in reason, reason
+        age_step = self.area_row_named(preview, "pool")
+        assert age_step["policy"]["kind"] == "oldest_idle_after", age_step["policy"]
+        candidates = self.candidate_names(preview)
+        assert released["root_id"] not in candidates, candidates
+        assert aged["root_id"] in candidates, candidates
+        assert preview["data"]["candidates"] == len(candidates), preview["data"]["candidates"]
+
+        code, real = self.real(preview["data"]["plan_digest"], plan_file, expect=0)
+        assert not os.path.exists(aged["path"]), "the age area's planned root went"
+        assert os.path.isdir(released["path"]), "a release_on_reference root is never maintained"
+        assert os.path.isfile(os.path.join(released["path"], ".barge-root.json")), released
+        assert real["data"]["pending"]["count"] == 0, real["data"]["pending"]
+        return {
+            "exit": code,
+            "release_area": "example/outputs",
+            "release_root": released["root_id"],
+            "aged_root": aged["root_id"],
+            "excluded_reason": reason,
+            "candidates": len(candidates),
         }
 
     def case_exit_3_with_a_pending_intent(self):
@@ -1013,7 +1116,7 @@ class Proof:
                 f"{CASE6_ATTEMPTS} attempts each kept the unit for an environmental reason: {skips}",
             )
         assert real["data"]["pending"]["count"] == 1, real["data"]["pending"]
-        assert real["data"]["volumes"]["rows"][0]["areas"][0]["pending"]["count"] == 1, real["data"]
+        assert self.area_stage(real, "pool")["pending"]["count"] == 1, real["data"]
         pending = self.pending_intents()
         assert len(pending) == 1, pending
         phase = pending[0]["phase"]
@@ -1424,6 +1527,47 @@ def preflight_problems():
             problems.append(
                 "the pending-intent case does not assert the unit its preview planned"
             )
+    # The release-class case must run after the absent-volume case restores the
+    # registry and before the pending-intent case, whose intent is replayed by any
+    # later real run.
+    release_name = "a_release_on_reference_area_keeps_its_root"
+    if release_name not in positions:
+        problems.append(f"the case map is missing the release-class case: {release_name}")
+    elif not (
+        positions[absent_name] < positions[release_name] < positions[pending_name]
+    ):
+        problems.append(
+            "the release-class case does not run after the absent-volume case and "
+            "before the pending-intent case"
+        )
+    # Aging a root must leave every entry of it old. `age_area_root` rewrites the
+    # marker, which refreshes that entry's own mtime, so the tree backdating has to
+    # come after the marker write: the 7850685 diagnostic failed exactly here, with
+    # an aged root kept as "idle for less than the declared age".
+    aging = methods.get("age_area_root")
+    if aging is None:
+        problems.append("`age_area_root` is missing")
+    else:
+        def aging_lines(attribute):
+            return [
+                call.lineno
+                for call in ast.walk(aging)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == attribute
+            ]
+
+        marker_lines = aging_lines("edit_marker")
+        tree_lines = aging_lines("tree_age")
+        if not marker_lines or not tree_lines:
+            problems.append(
+                "`age_area_root` no longer rewrites the marker and backdates the tree"
+            )
+        elif min(marker_lines) > min(tree_lines):
+            problems.append(
+                "`age_area_root` backdates the tree before rewriting the marker, so the "
+                "marker's own fresh mtime keeps the root from being idle"
+            )
     adders = sorted(
         name
         for name, method in methods.items()
@@ -1455,8 +1599,8 @@ def self_check():
     """The proof's own apparatus: the case map and its dispatch, pins, premises."""
     problems = preflight_problems()
     names = [name for name, _ in CASES]
-    if len(names) != 6 or len(set(names)) != 6:
-        problems.append("the case map does not name six distinct cases")
+    if len(names) != 7 or len(set(names)) != 7:
+        problems.append("the case map does not name seven distinct cases")
     known = set(names)
     seen = set()
     for index, (name, needs) in enumerate(CASES):
