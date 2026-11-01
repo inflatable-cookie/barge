@@ -57,6 +57,7 @@ def self_check():
             continue
         raise AssertionError(args)
     assert allowed(['space', '--json'])
+    assert allowed(['volume', 'register', '--mount', str(MOUNT), '--availability', 'permanent', '--durability', 'expendable', '--root-dir', 'barge', '--reserve', '123', '--floor', str(10 * 1024**3), '--declared-by', 't9-qualification', '--plan'])
     print('effect forms refused')
 
 
@@ -75,6 +76,10 @@ def main():
         raise RuntimeError('expected existing, direct Builds scratch/barge directory')
     packet = Path(tempfile.mkdtemp(prefix='t9-preview-', dir=PARENT))
     results = {}
+    # Fixture-only overrides must never redirect a real-drive preflight.
+    for key in ('BARGE_STATE_DIR', 'BARGE_ACCOUNT_HOME'):
+        if key in os.environ:
+            raise RuntimeError(f'{key} must be unset')
     def record(name, value):
         (packet / (name + '.json')).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
     try:
@@ -109,6 +114,9 @@ def main():
         results['thresholds'] = {'reserve_bytes': reserve, 'floor_bytes': floor,
                                  'rationale': 'reserve is the lesser of 100 GiB and half measured available bytes; floor is the 10 GiB default'}
         results['register_plan'] = barge(opts.binary, ['volume', 'register', '--mount', str(MOUNT), '--availability', 'permanent', '--durability', 'expendable', '--root-dir', 'barge', '--reserve', str(reserve), '--floor', str(floor), '--declared-by', 't9-qualification', '--plan'])
+        verify = subprocess.run(['/usr/sbin/diskutil', 'info', '-plist', str(MOUNT)], capture_output=True, timeout=60, check=True)
+        if plistlib.loads(verify.stdout).get('VolumeUUID') != facts['VolumeUUID']:
+            raise RuntimeError('volume identity changed during preflight')
     except Exception as exc:
         results['failure'] = {'error': str(exc)}
     for name, value in results.items():
