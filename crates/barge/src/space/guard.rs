@@ -93,6 +93,33 @@ mod tests {
     }
 
     #[test]
+    fn guard_golden_document_unchanged() {
+        let golden = concat!(
+            r#"{"schema":"barge.space.guard/1","command":"space guard","ok":true,"data":{"decision":"admit","volume_uuid":"A6AC3ED7-0A5B-4E6D-8BA0-813B8DD4C99A","mount_hint":"/fixture","area":{"namespace":"oxide","area":"pool"},"#,
+            r#""before":{"free_bytes":30,"free_blocks_total_bytes":30,"total_bytes":100,"source":"fstatfs.f_bavail*bsize","purgeable":"unknown","observed_ms":1,"device":1},"#,
+            r#""after":{"free_bytes":30,"free_blocks_total_bytes":30,"total_bytes":100,"source":"fstatfs.f_bavail*bsize","purgeable":"unknown","observed_ms":1,"device":1},"#,
+            r#""policy":{"reserve_bytes":20,"floor_bytes":10,"declared_by":"operator","declared_ms":1},"#,
+            r#""pruned":{"rows":[],"count":0,"total":0,"truncated":false},"not_reached":{"rows":[],"count":0,"total":0,"truncated":false},"kept":{"rows":[],"count":0,"total":0,"truncated":false},"observed_kept":null,"reclaimed_bytes":0,"rounds":0,"decided_after_wait":false,"message":"ok","#,
+            r#""detail":{"cause":"unknown","excluded_bytes":null,"floor_bytes":10,"free_bytes":30,"held_or_unknown_bytes":null,"measurement_source":"fstatfs.f_bavail*bsize","observed_ms":1,"other_estimate_bytes":null,"other_estimate_label":"estimate","owned_prunable_bytes":null,"pruned_root_ids":[],"reclaimed_bytes":0,"replay_partial_root_ids":[],"replay_settled_root_ids":[],"replayed_root_ids":[],"reserve_bytes":20},"#,
+            r#""guard":"A6AC3ED7-0A5B-4E6D-8BA0-813B8DD4C99A:oxide/pool:1:1"}}"#,
+            "\n"
+        );
+        let report = read_guard_document(golden.as_bytes()).expect("golden reads");
+        let encoded = crate::contract::success_bytes(SPACE_GUARD_SCHEMA, "space guard", &report)
+            .expect("encode");
+        assert_eq!(encoded, golden.as_bytes());
+    }
+
+    #[test]
+    fn shared_core_is_only_live_effect_caller() {
+        let source = include_str!("guard.rs");
+        assert_eq!(
+            source.matches(concat!("effect::", "prune_live(")).count(),
+            1
+        );
+    }
+
+    #[test]
     fn checkpoint_token_round_trips_and_rejects_malformed_values() {
         let token = "A6AC3ED7-0A5B-4E6D-8BA0-813B8DD4C99A:oxide/pool:7:123";
         let guard = SpaceGuard::parse(token).unwrap();
@@ -513,6 +540,23 @@ pub(super) fn guard_with_bounds(
     })
 }
 
+fn registered_volume_with_budget(
+    paths: &StatePaths,
+    uuid: &VolumeUuid,
+    budget: Duration,
+) -> Result<crate::registry::VolumeRecord> {
+    let registry = crate::registry::read_with_deadline(
+        paths,
+        state::Deadline::after(budget.min(state::READ_DEADLINE)),
+    )?;
+    registry.volume(uuid).cloned().ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!("volume {uuid} is not registered"),
+        )
+    })
+}
+
 /// Volume-wide decision shared by consumer guards and maintenance.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct VolumeDecision {
@@ -554,7 +598,7 @@ pub(crate) fn decide_volume(
         ));
     }
     let started = Instant::now();
-    let record = area::registered_volume(paths, volume_uuid)?;
+    let record = registered_volume_with_budget(paths, volume_uuid, wall)?;
     if !record.declared_durability()?.permits_pruning() {
         return Err(Error::new(
             ErrorKind::RefusedBoundary,
@@ -671,7 +715,11 @@ pub(crate) fn decide_volume(
             }
             Err(error) if error.kind() == ErrorKind::Locked => {
                 after_wait = true;
-                let current = area::registered_volume(paths, volume_uuid)?;
+                let current = registered_volume_with_budget(
+                    paths,
+                    volume_uuid,
+                    wall.saturating_sub(started.elapsed()),
+                )?;
                 if !current.declared_durability()?.permits_pruning() {
                     return Err(Error::new(
                         ErrorKind::UnknownState,

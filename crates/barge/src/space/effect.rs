@@ -3486,6 +3486,90 @@ mod tests {
     }
 
     #[test]
+    fn maintain_space_decision_table() {
+        for (free, expected) in [
+            (30, "admit"),
+            (8, "admit_below_reserve"),
+            (1, "space_below_floor"),
+        ] {
+            let harness = Harness::new("maintain-space-decision", RESERVE, FLOOR);
+            let request = crate::prune::MaintainRequest {
+                preview: true,
+                plan_digest: None,
+                plan_bytes: None,
+                sweep_bounds: crate::scratch::SweepBounds::default(),
+                delete_bounds: DeleteBounds::default(),
+                maintain_bounds: crate::prune::MaintainBounds::design(),
+                now_ms: harness.now_ms,
+            };
+            let preview = crate::prune::maintain_with_space(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &Meter::new(&[free]),
+                &Flusher::ok(),
+                &request,
+                true,
+            )
+            .expect("preview");
+            let bytes = crate::prune::canonical_plan_bytes(&preview.plan).unwrap();
+            let real = crate::prune::MaintainRequest {
+                preview: false,
+                plan_digest: Some(&preview.plan_digest),
+                plan_bytes: Some(&bytes),
+                ..request
+            };
+            let report = crate::prune::maintain_with_space(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &Meter::new(&[free]),
+                &Flusher::ok(),
+                &real,
+                true,
+            )
+            .expect("real");
+            assert_eq!(report.space_rows.unwrap().rows[0]["decision"], expected);
+        }
+    }
+
+    #[test]
+    fn maintain_space_remaining_budget() {
+        let harness = Harness::new("maintain-space-deadline", RESERVE, FLOOR);
+        let meter = Meter::new(&[8]);
+        let request = crate::prune::MaintainRequest {
+            preview: true,
+            plan_digest: None,
+            plan_bytes: None,
+            sweep_bounds: crate::scratch::SweepBounds::default(),
+            delete_bounds: DeleteBounds::default(),
+            maintain_bounds: crate::prune::MaintainBounds {
+                wall: Duration::ZERO,
+                stop_margin: Duration::ZERO,
+            },
+            now_ms: harness.now_ms,
+        };
+        let report = crate::prune::maintain_with_space(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &meter,
+            &Flusher::ok(),
+            &request,
+            true,
+        )
+        .expect("preview");
+        assert!(report.timed_out);
+        assert_eq!(meter.calls(), 0);
+    }
+
+    #[test]
     fn maintain_space_excludes_kept_and_undeclared() {
         for kept in [false, true] {
             let fixture = VolumeFixture::under_scratch("maintain-space-policy");
@@ -3525,7 +3609,7 @@ mod tests {
             assert_eq!(report.space_triggered, Some(0));
             assert_eq!(meter.calls(), 0);
             assert_eq!(
-                report.space_rows.unwrap()[0]["decision"],
+                report.space_rows.unwrap().rows[0]["decision"],
                 if kept {
                     "skipped_kept"
                 } else {

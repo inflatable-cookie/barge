@@ -104,7 +104,7 @@ pub(crate) fn fallback_roots(
                 return Ok(RowSet::bounded(rows, total.saturating_add(1), ROOT_ROWS));
             }
             let observation = match std::fs::symlink_metadata(path) {
-                Ok(_) => true,
+                Ok(metadata) => metadata.is_dir() && !metadata.file_type().is_symlink(),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(_) => false,
             };
@@ -3021,7 +3021,7 @@ mod tests {
         .expect("real");
         assert!(!root.path.exists());
         assert_eq!(
-            result.space_rows.unwrap()[0]["pruned_root_ids"][0],
+            result.space_rows.unwrap().rows[0]["pruned_root_ids"][0],
             root.root_id
         );
     }

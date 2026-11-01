@@ -1977,14 +1977,14 @@ mod tests {
             uuid,
             device,
         };
+        let fallback = fixture.dir.join("fallback");
+        std::fs::create_dir(&fallback).expect("fallback fixture");
         let declaration = crate::area::AreaDeclaration {
             namespace: "example".to_owned(),
             area: "pool".to_owned(),
             folder: "example/pool".to_owned(),
             overrides: std::collections::BTreeMap::new(),
-            absent: crate::area::AbsentPolicy::Fail {
-                attach: "the build volume".to_owned(),
-            },
+            absent: crate::area::AbsentPolicy::FallbackLocal { path: fallback },
             prune: crate::area::PrunePolicy::None,
             reserve: crate::area::ReserveParticipation::Counts,
         };
@@ -2034,6 +2034,10 @@ mod tests {
             })
         );
         assert_eq!(data.areas.count, 1, "the declared area is reported");
+        assert_eq!(
+            data.fallback_roots.as_ref().unwrap().rows[0].reason,
+            "fallback_while_present"
+        );
         assert_eq!(data.roots.count, 1, "the owned root is reported");
         let row = &data.roots.rows[0];
         assert_eq!(row.state, crate::area::MarkerStateName::Owned);

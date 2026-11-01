@@ -385,7 +385,7 @@ pub struct MaintainReport {
     pub space_stage: String,
     /// Per-volume space previews or decisions, outside the canonical plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub space_rows: Option<Vec<serde_json::Value>>,
+    pub space_rows: Option<RowSet<serde_json::Value>>,
     /// Number of volumes whose preview crossed its declared trigger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_triggered: Option<usize>,
@@ -611,20 +611,34 @@ pub fn maintain_with_space(
     }
     report.space_stage = "enabled".to_owned();
     if report.timed_out || report.stopped.is_some() {
-        report.space_rows = Some(
-            report
-                .plan
-                .volumes
-                .rows
-                .iter()
-                .map(|v| space_empty_row(&v.volume_uuid, "unreached"))
-                .collect(),
-        );
+        let rows: Vec<_> = report
+            .plan
+            .volumes
+            .rows
+            .iter()
+            .map(|v| space_empty_row(&v.volume_uuid, "unreached"))
+            .collect();
+        let total = rows.len();
+        report.space_rows = Some(RowSet::bounded(rows, total, VOLUME_ROWS));
         return Ok(report);
     }
     let mut rows = Vec::new();
     let mut triggered = 0;
-    let records = match read_registry(state_paths) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        report.timed_out = true;
+        let rows: Vec<_> = report
+            .plan
+            .volumes
+            .rows
+            .iter()
+            .map(|v| space_empty_row(&v.volume_uuid, "unreached"))
+            .collect();
+        let total = rows.len();
+        report.space_rows = Some(RowSet::bounded(rows, total, VOLUME_ROWS));
+        return Ok(report);
+    }
+    let records = match read_registry_with_budget(state_paths, remaining) {
         Ok(records) => records,
         Err(error) => {
             report.stopped = Some(error.message().to_owned());
@@ -636,14 +650,15 @@ pub fn maintain_with_space(
             .iter()
             .find(|record| record.volume_uuid.as_str() == planned.volume_uuid)
         else {
-            rows.push(space_empty_row(&planned.volume_uuid, "identity_changed"));
+            rows.push(space_empty_row(&planned.volume_uuid, "unknown_state"));
             continue;
         };
-        if record.generation != planned.record_generation
-            || record.root_dir != planned.root_dir
-            || planned.state != VolumeState::Present
-        {
-            rows.push(space_empty_row(&planned.volume_uuid, "identity_changed"));
+        if planned.state == VolumeState::Absent {
+            rows.push(space_empty_row(&planned.volume_uuid, "volume_absent"));
+            continue;
+        }
+        if record.generation != planned.record_generation || record.root_dir != planned.root_dir {
+            rows.push(space_empty_row(&planned.volume_uuid, "unknown_state"));
             continue;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -729,7 +744,31 @@ pub fn maintain_with_space(
     if request.preview {
         report.space_triggered = Some(triggered);
     }
-    report.space_rows = Some(rows);
+    let total = rows.len();
+    report.space_rows = Some(RowSet::bounded(rows, total, VOLUME_ROWS));
+    // Keep the enclosing command within its document bound. Each omitted volume
+    // is counted, rather than turning an incomplete report into an empty one.
+    loop {
+        let size = serde_json::to_vec(&report)
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Io,
+                    format!("cannot encode maintenance report: {error}"),
+                )
+            })?
+            .len();
+        if size <= DOCUMENT_SIZE_CAP_BYTES.saturating_sub(1024) {
+            break;
+        }
+        let Some(rowset) = report.space_rows.as_mut() else {
+            break;
+        };
+        if rowset.rows.pop().is_none() {
+            break;
+        }
+        rowset.count = rowset.rows.len();
+        rowset.truncated = rowset.total > rowset.count;
+    }
     Ok(report)
 }
 
@@ -761,6 +800,18 @@ fn read_registry(state_paths: &StatePaths) -> Result<Vec<VolumeRecord>> {
     let mut locks = state::LockSet::new(state_paths.clone());
     let _lock = locks.observe_registry()?;
     Ok(registry::read(state_paths)?.volumes().to_vec())
+}
+
+fn read_registry_with_budget(
+    state_paths: &StatePaths,
+    budget: Duration,
+) -> Result<Vec<VolumeRecord>> {
+    let deadline = state::Deadline::after(budget.min(state::READ_DEADLINE));
+    let mut locks = state::LockSet::with_deadline(state_paths.clone(), deadline);
+    let _lock = locks.observe_registry()?;
+    Ok(registry::read_with_deadline(state_paths, deadline)?
+        .volumes()
+        .to_vec())
 }
 
 /// The plan's canonical bytes: one compact JSON document, exactly the bytes the
