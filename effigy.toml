@@ -48,9 +48,9 @@ alias = "barge"
 ]
 
 # The proof's own apparatus self-check: the case map and its dispatch, the pinned
-# supervisor digest, the nine-premise trace, the case ordering and registry
-# restore guards, and the environment inventory. No image, no scratch and no
-# child process.
+# supervisor digest and the installed bytes behind it, the nine-premise trace, the
+# case ordering and registry restore guards, and the environment inventory. No
+# image, no scratch and no child process.
 "maintain:native:test" = "python3 scripts/native/s7-maintain-proof.py --self-check"
 "space:native:test" = "python3 scripts/native/space-proof.py --self-check"
 "space:native:plan" = "python3 scripts/native/space-proof.py --plan"

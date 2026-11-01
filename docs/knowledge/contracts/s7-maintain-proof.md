@@ -42,16 +42,27 @@ verifies and then executes Oxide's qualified shared supervisor:
 | Fact | Value |
 | --- | --- |
 | Path | `~/Dev/projects/oxide/scripts/bounded-test.py` |
-| SHA-256 | `bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924` |
-| Invocation | `/usr/bin/python3 <supervisor> --limit 300 --scratch-budget-mib 512 --root-parent /Volumes/Builds/scratch/barge -- <script> --inner <mode> <binary>` |
+| SHA-256 | `fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b` |
+| Invocation | `/usr/bin/python3 <supervisor> --limit 300 --scratch-budget-mib 512 --root-parent /Volumes/Builds/scratch/barge -- <script> --inner <mode> --binary <binary>` |
 | Mode | a Python file Oxide keeps mode `0644`: a readable regular file is the gate and the digest is the identity; the execute bit is never required and its mode is never changed |
 | Refusal | an unreadable or non-regular file, different bytes, a missing CLI or a missing designated scratch parent → exit `125`, nothing run |
+
+The digest is current main's `scripts/bounded-test.py`, the `#195` writer-custody
+chain, and it is the same file and pin `scripts/native/space-proof.py` names. The
+S4 and S6 proofs still pin the historical `#151`-era bytes: they are separate
+slices with their own briefs, and this proof moves only its own pin. The first
+activated maintain diagnostic refused before any effect because this pin still
+named the `#151`-era bytes; the pin moves only with a brief that names the head
+it verified.
 
 `maintain:native:test` proves the same pins without an image: the case map
 resolves every case name to a `case_<name>` method, no case method is
 undispatched, each dependency is evaluated first, the nine premises are recorded
 and traced, the environment inventory covers every hook the source reads or sets,
-and the script contains no force detach. It also parses the argv the outer half
+and the script contains no force detach. It also reads the supervisor file the
+outer half will verify and compares its bytes with the pin, so a stale pin fails
+the effect-free selector before an owner activation instead of refusing a native
+run; it spawns nothing to do it. It parses the argv the outer half
 hands the guard — `argument_parser().parse_args(inner[2:])` for both `counted` and
 `diagnostic` — and requires `--inner <mode>` and `--binary <path>` to come back
 unchanged, with the counterfactual that an executable in the positional `mode`

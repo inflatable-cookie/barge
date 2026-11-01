@@ -66,9 +66,11 @@ SCHEMA = "barge.maintain.native/1"
 SELF_CHECK_SCHEMA = "barge.maintain.native.self-check/1"
 SUPERVISOR_NAME = "scripts/bounded-test.py"
 DEFAULT_SUPERVISOR = os.path.expanduser("~/Dev/projects/oxide/scripts/bounded-test.py")
-# The qualified supervisor's bytes at this proof's authoring head (S4's and S6's
-# pin, unchanged: Barge writes no second supervisor).
-SUPERVISOR_SHA256 = "bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924"
+# The qualified supervisor's bytes at this proof's authoring head: current main's
+# `scripts/bounded-test.py` (the #195 custody chain), the same file and pin
+# `space-proof.py` names. Barge writes no second supervisor. The pin is exact
+# bytes, so it moves only with a brief that names the head it verified.
+SUPERVISOR_SHA256 = "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b"
 SCRIPT_PATH = os.path.abspath(__file__)
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(SCRIPT_PATH)))
 DESIGNATED_SCRATCH = "/Volumes/Builds/scratch/barge"
@@ -1497,6 +1499,28 @@ def supervisor_path():
     return os.environ.get("BARGE_PROOF_SUPERVISOR", DEFAULT_SUPERVISOR)
 
 
+def installed_supervisor_problems():
+    """Why the pin and the installed supervisor's own bytes disagree.
+
+    This is the effect-free selector's drift guard. The first activated maintain
+    diagnostic refused before any effect because the pin still named the
+    #151-era supervisor while the qualified file had moved on; a selector that
+    only checked the pin's length could not see that. The self-check therefore
+    reads the same file the outer half will verify and compares its bytes with
+    the pin. It spawns nothing, creates nothing and writes nothing.
+    """
+    path = supervisor_path()
+    try:
+        digest = sha256_file(path)
+    except OSError as error:
+        return [f"the pinned supervisor is unreadable: {error}"]
+    if digest != SUPERVISOR_SHA256:
+        return [
+            f"the supervisor at {path} is sha256 {digest}, not the pinned {SUPERVISOR_SHA256}"
+        ]
+    return []
+
+
 def ownership_state(info_text):
     """What `diskutil info <volume>`'s text says about ownership, explicitly.
 
@@ -1759,7 +1783,7 @@ def main(argv):
     options = parser.parse_args(argv)
 
     if options.self_check:
-        problems = self_check()
+        problems = self_check() + installed_supervisor_problems()
         print(json.dumps({
             "schema": SELF_CHECK_SCHEMA,
             "cases": [name for name, _ in CASES],
