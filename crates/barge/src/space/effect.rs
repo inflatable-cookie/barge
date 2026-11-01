@@ -3486,6 +3486,56 @@ mod tests {
     }
 
     #[test]
+    fn maintain_space_excludes_kept_and_undeclared() {
+        for kept in [false, true] {
+            let fixture = VolumeFixture::under_scratch("maintain-space-policy");
+            let mut record = fixture.record.clone();
+            if kept {
+                record.durability = Durability::Kept;
+                record.space = Some(SpacePolicy {
+                    reserve_bytes: RESERVE,
+                    floor_bytes: FLOOR,
+                    declared_by: "fixture".to_owned(),
+                    declared_ms: 1,
+                });
+            }
+            fixture.register_record(&record);
+            let meter = Meter::new(&[1]);
+            let request = crate::prune::MaintainRequest {
+                preview: true,
+                plan_digest: None,
+                plan_bytes: None,
+                sweep_bounds: crate::scratch::SweepBounds::default(),
+                delete_bounds: DeleteBounds::default(),
+                maintain_bounds: crate::prune::MaintainBounds::design(),
+                now_ms: state::now_ms(),
+            };
+            let report = crate::prune::maintain_with_space(
+                &fixture.state,
+                &fixture.platform(),
+                &fixture.facts(),
+                &fixture.mounts(),
+                &fixture.observer(),
+                &meter,
+                &Flusher::ok(),
+                &request,
+                true,
+            )
+            .expect("preview");
+            assert_eq!(report.space_triggered, Some(0));
+            assert_eq!(meter.calls(), 0);
+            assert_eq!(
+                report.space_rows.unwrap()[0]["decision"],
+                if kept {
+                    "skipped_kept"
+                } else {
+                    "space_undeclared"
+                }
+            );
+        }
+    }
+
+    #[test]
     fn future_host_job_space_trigger_runs_once() {
         let harness = Harness::new("future-host-space", RESERVE, FLOOR);
         let request = crate::prune::MaintainRequest {

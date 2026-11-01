@@ -611,6 +611,15 @@ pub fn maintain_with_space(
     }
     report.space_stage = "enabled".to_owned();
     if report.timed_out || report.stopped.is_some() {
+        report.space_rows = Some(
+            report
+                .plan
+                .volumes
+                .rows
+                .iter()
+                .map(|v| space_empty_row(&v.volume_uuid, "unreached"))
+                .collect(),
+        );
         return Ok(report);
     }
     let mut rows = Vec::new();
@@ -627,31 +636,29 @@ pub fn maintain_with_space(
             .iter()
             .find(|record| record.volume_uuid.as_str() == planned.volume_uuid)
         else {
-            rows.push(serde_json::json!({"volume_uuid": planned.volume_uuid, "decision": "identity_changed"}));
+            rows.push(space_empty_row(&planned.volume_uuid, "identity_changed"));
             continue;
         };
         if record.generation != planned.record_generation
             || record.root_dir != planned.root_dir
             || planned.state != VolumeState::Present
         {
-            rows.push(serde_json::json!({"volume_uuid": planned.volume_uuid, "decision": "identity_changed"}));
+            rows.push(space_empty_row(&planned.volume_uuid, "identity_changed"));
             continue;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             report.timed_out = true;
-            rows.push(
-                serde_json::json!({"volume_uuid": record.volume_uuid, "decision": "unreached"}),
-            );
+            rows.push(space_empty_row(record.volume_uuid.as_str(), "unreached"));
             continue;
         }
         let uuid = &record.volume_uuid;
         if record.durability == Durability::Kept {
-            rows.push(serde_json::json!({"volume_uuid": uuid, "decision": "skipped_kept"}));
+            rows.push(space_empty_row(uuid.as_str(), "skipped_kept"));
             continue;
         }
         if record.space.is_none() {
-            rows.push(serde_json::json!({"volume_uuid": uuid, "decision": "space_undeclared"}));
+            rows.push(space_empty_row(uuid.as_str(), "space_undeclared"));
             continue;
         }
         if request.preview {
@@ -724,6 +731,14 @@ pub fn maintain_with_space(
     }
     report.space_rows = Some(rows);
     Ok(report)
+}
+
+fn space_empty_row(uuid: &str, decision: &str) -> serde_json::Value {
+    serde_json::json!({"volume_uuid": uuid, "decision": decision, "F": null, "R": null, "L": null,
+        "measurement_source": null, "pruned_root_ids": null, "replayed_root_ids": null,
+        "replay_partial_root_ids": null, "replay_settled_root_ids": null, "cause": null,
+        "owned_prunable_bytes": null, "held_or_unknown_bytes": null, "excluded_bytes": null,
+        "other_estimate_bytes": null})
 }
 
 fn space_error_row(uuid: &crate::os::VolumeUuid, error: &Error) -> serde_json::Value {
