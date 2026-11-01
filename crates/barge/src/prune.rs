@@ -4418,6 +4418,12 @@ mod tests {
             .iter()
             .find(|row| row.area == "outputs")
             .expect("the release area is reported, never omitted");
+        // The step's policy is the state directory's own record, which is what
+        // decides deletion: `maintain` takes no declaration from a caller.
+        let stored = area::show(&harness.fixture.state, "example", "outputs")
+            .expect("the declarations read")
+            .expect("the stored declaration is there");
+        assert_eq!(release_row.policy, stored.declaration().prune);
         assert_eq!(release_row.policy, PrunePolicy::ReleaseOnReference);
         assert_eq!(
             release_row.candidates.count, 0,

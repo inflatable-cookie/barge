@@ -7094,6 +7094,69 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_release_on_reference_policy_cannot_be_traded_for_an_age_by_a_caller() {
+        let fixture = Fixture::new("area-release-on-reference-authority");
+        fixture.register(&fixture.record);
+        // The state directory holds the release-class policy the area declared.
+        let mut declared = fixture.declaration("example/outputs");
+        declared.area = "outputs".to_owned();
+        declared.prune = super::PrunePolicy::ReleaseOnReference;
+        declared.reserve = super::ReserveParticipation::Excluded;
+        let stored = declare(&fixture.state, &declared, 1_000).expect("the declaration writes");
+        assert_eq!(
+            stored.declaration().prune,
+            super::PrunePolicy::ReleaseOnReference
+        );
+        let platform = fixture.platform();
+        let facts = fixture.facts();
+        let mounts = fixture.mounts();
+        let observer = fixture.observer();
+
+        // A caller that presents an age policy — the one that would let
+        // `maintain` and the reserve consider the area — is refused on the
+        // pre-flight every deletion takes, so a caller object can never widen
+        // what the stored release-class policy allows.
+        let mut caller = stored.declaration();
+        caller.prune = super::PrunePolicy::OldestIdleAfter { age_seconds: 60 };
+        let before = snapshot(fixture.dir.path());
+        let error = super::prepare(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.uuid,
+            &caller,
+        )
+        .expect_err("the stored release-class policy governs");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert_eq!(error.detail()["fields"], serde_json::json!(["prune"]));
+        assert!(
+            error.message().contains("the stored declaration governs"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(snapshot(fixture.dir.path()), before);
+
+        // The stored declaration itself resolves with the stored policy, so the
+        // reading that decides deletion is the state directory's own record.
+        let volume = super::prepare(
+            &fixture.state,
+            &platform,
+            &facts,
+            &mounts,
+            &observer,
+            &fixture.uuid,
+            &stored.declaration(),
+        )
+        .expect("the stored declaration resolves");
+        assert_eq!(
+            volume.resolved.declaration.prune,
+            super::PrunePolicy::ReleaseOnReference
+        );
+    }
+
+    #[test]
     fn the_first_declaration_is_written_once_and_then_matched() {
         let fixture = Fixture::new("area-ensure-declared");
         fixture.register(&fixture.record);
