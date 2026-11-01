@@ -161,6 +161,13 @@ measurement used for a decision must not be a stale one.
   with its PID and observed start identity (unknown if the kernel could not
   supply it). A timeout, killed child or nonzero exit is never successful flush
   evidence and no further root is deleted by the pass.
+- Replay is part of the effect surface. After any scoped replay that examined
+  intents, the pass flushes before its first measurement or any new deletion.
+  This is conservative even for a replay that reports only pending intents:
+  it may already have removed entries without completing a unit, so zero
+  completed deletions is not evidence of zero effect. A replay-free pass adds
+  no preliminary flush. Replay uses the same deadline, helper supervision,
+  post-flush identity verification and failure outcome as a prune batch.
 - A prune batch flushes the volume once after its deletions and before its
   post-batch measurement. A decision never admits on an unflushed measurement it
   caused itself; a measurement nothing changed needs no flush.
@@ -1922,6 +1929,16 @@ is claimed.**
   unsettled intent is not a pass-wide stop; only a journal that cannot be read at
   all is, because then no candidate's custody can be proven. The report carries
   this volume's replay counts in `effect.replay`, including what stayed pending.
+  Before the first measurement or any new candidate deletion, any replay with
+  examined intents is flushed, including an interrupted replay that remains
+  pending after removing entries. A failed replay flush is `unknown_state` at
+  exit `3` with zero deciding measurements and no further deletion; error detail
+  retains the full replay accounting and the flush attempt/failure record.
+  `effect.flush.attempts` includes this preliminary replay flush as well as
+  candidate-batch flushes. `effect.batches` counts candidate batches only.
+  The first measurement (`effect.before`) is taken after replay and its flush;
+  measured reclaim and planned deleted bytes for subsequent candidate batches
+  remain separate from replay's completion and pending-intent accounting.
   Errors after replay include `detail.replay` with its counts and
   `resumed_root_ids` (recorded unit names for older intents without a root id),
   including an error in the first measurement after replay. These are separate

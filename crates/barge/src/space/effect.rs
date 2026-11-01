@@ -225,7 +225,8 @@ pub struct SpaceUnreachedRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpaceFlushRow {
-    /// How many flushes the pass asked for, one per batch.
+    /// How many flushes the pass asked for: one after scoped replay work,
+    /// followed by one per batch.
     pub attempts: usize,
     /// How many failed. A failure stops the pass, so this is `0` or `1`.
     pub failures: usize,
@@ -277,8 +278,8 @@ pub struct SpacePruneEffect {
     pub stop: String,
     /// The pass's flush accounting.
     pub flush: SpaceFlushRow,
-    /// What the run replayed before its first effect, when it had anything to
-    /// replay or settle.
+    /// What the run replayed and flushed before its first measurement, when it
+    /// had any scoped intents to examine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay: Option<SpaceReplayRow>,
     /// The planned roots the pass never attempted, with counts.
@@ -309,7 +310,7 @@ pub struct SpaceReplayRow {
     pub rolled_back: usize,
     /// How many resumed a deletion and completed it.
     pub resumed: usize,
-    /// How many are still pending, which stops the pass.
+    /// How many are still pending, keeping only their covered objects.
     pub pending: usize,
 }
 
@@ -527,9 +528,36 @@ pub fn prune(
     // skipped and reported as `pending_intent`. It never stops a pass over
     // unrelated paths, and the report carries the replay's own counts so the
     // operator can see what stayed pending.
-    let before = space
-        .measure_space(&verified)
-        .map_err(|error| error.with_detail("replay", serde_json::json!(&replay)))?;
+    let mut flush_row = SpaceFlushRow {
+        attempts: 0,
+        failures: 0,
+        last_ms: 0,
+        bound_ms: u64::try_from(request.bounds.flush_deadline.as_millis()).unwrap_or(u64::MAX),
+    };
+    // A pending replay can have removed entries without completing the unit.
+    // Its completion counters therefore cannot prove that nothing was deleted.
+    // Conservatively flush any scoped replay work before the first measurement
+    // or a new deletion. A replay-free pass needs no preliminary flush.
+    if replay.examined > 0 {
+        flush_verified_volume(
+            flush,
+            facts,
+            &verified,
+            deadline,
+            request.bounds.flush_deadline,
+            &mut flush_row,
+        )
+        .map_err(|error| {
+            error
+                .with_detail("replay", serde_json::json!(&replay))
+                .with_detail("flush", serde_json::json!(&flush_row))
+        })?;
+    }
+    let before = space.measure_space(&verified).map_err(|error| {
+        error
+            .with_detail("replay", serde_json::json!(&replay))
+            .with_detail("flush", serde_json::json!(&flush_row))
+    })?;
     // The plan's own snapshot is what authorizes the run. A policy published between
     // the plan and this pass is the first generation change an effect step
     // re-evaluates, never a silent upgrade of what the plan meant.
@@ -563,12 +591,7 @@ pub fn prune(
         held: Vec::new(),
         deleted_bytes: 0,
         unreached: Vec::new(),
-        flush_row: SpaceFlushRow {
-            attempts: 0,
-            failures: 0,
-            last_ms: 0,
-            bound_ms: u64::try_from(request.bounds.flush_deadline.as_millis()).unwrap_or(u64::MAX),
-        },
+        flush_row,
         replay,
         stop: None,
         batches: 0,
@@ -577,6 +600,51 @@ pub fn prune(
     };
     pass.run()?;
     Ok(pass.into_report(started))
+}
+
+/// The shared replay/batch flush boundary. A failed flush never authorizes a
+/// measurement, and uses exactly the same deadline, reap and identity rules.
+fn flush_verified_volume(
+    flush: &dyn Flush,
+    facts: &dyn AbsenceVolume,
+    volume: &VerifiedVolume,
+    wall_deadline: Instant,
+    bound: Duration,
+    row: &mut SpaceFlushRow,
+) -> Result<()> {
+    row.attempts = row.attempts.saturating_add(1);
+    let began = Instant::now();
+    // Reserve the helper's bounded reap window inside the pass wall clock.
+    let deadline = (began + bound).min(
+        wall_deadline
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or(began),
+    );
+    let flushed = flush.flush_volume(volume, deadline);
+    let elapsed = began.elapsed();
+    row.last_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    if let Err(error) = flushed {
+        row.failures = row.failures.saturating_add(1);
+        let mut failure = Error::new(
+            ErrorKind::UnknownState,
+            format!("the volume flush failed; post-prune space is unknown: {error}"),
+        );
+        for (key, value) in error.detail() {
+            failure = failure.with_detail(key, value.clone());
+        }
+        return Err(failure.with_detail("flush_failed", true.into()));
+    }
+    // A drive pulled during the flush is a reverify failure, not a measurement
+    // of zero: the post-prune state is unknown and the pass says so.
+    volume.reverify(facts).map_err(|error| {
+            Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "the volume could not be re-verified after the flush, so the post-prune measurement is unknown: {error}"
+                ),
+            )
+        })?;
+    Ok(())
 }
 
 /// One real pass's state, so the loop, the effect step and the report all read the
@@ -840,43 +908,18 @@ impl Pass<'_> {
         Ok(())
     }
 
-    /// One batch's flush (30 s bound), the volume reverify around it, and the
-    /// re-measurement the reclaim check reads.
+    /// Flush the batch before the reclaim measurement, using the same boundary
+    /// that protects the first measurement after replay.
     fn flush_and_measure(&mut self) -> Result<()> {
-        self.flush_row.attempts = self.flush_row.attempts.saturating_add(1);
-        let began = Instant::now();
-        // Reserve the helper's bounded reap window inside the pass wall clock.
-        let deadline = (began + self.bounds.flush_deadline).min(
-            self.wall_deadline
-                .checked_sub(Duration::from_secs(1))
-                .unwrap_or(began),
-        );
-        let flushed = self.flush.flush_volume(&self.verified, deadline);
-        let elapsed = began.elapsed();
-        self.flush_row.last_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-        if let Err(error) = flushed {
-            self.flush_row.failures = self.flush_row.failures.saturating_add(1);
-            let mut failure = Error::new(
-                ErrorKind::UnknownState,
-                format!("the batch flush failed; post-prune space is unknown: {error}"),
-            );
-            for (key, value) in error.detail() {
-                failure = failure.with_detail(key, value.clone());
-            }
-            return Err(failure.with_detail("flush_failed", true.into()));
-        }
-        // A drive pulled during the flush is a reverify failure, not a measurement
-        // of zero: the post-prune state is unknown and the pass says so.
-        self.verified.reverify(self.facts).map_err(|error| {
-            Error::new(
-                ErrorKind::UnknownState,
-                format!(
-                    "the volume could not be re-verified after the flush, so the post-prune measurement is unknown: {error}"
-                ),
-            )
-        })?;
-        self.measure()?;
-        Ok(())
+        flush_verified_volume(
+            self.flush,
+            self.facts,
+            &self.verified,
+            self.wall_deadline,
+            self.bounds.flush_deadline,
+            &mut self.flush_row,
+        )?;
+        self.measure()
     }
 
     /// One candidate's effect: re-read the policy, re-resolve its folder, build the
@@ -2997,6 +3040,158 @@ mod tests {
         drop(root);
     }
 
+    /// Replay's completion counters omit removals from a replay that stays
+    /// pending. Both outcomes must flush before any measurement or new delete.
+    #[test]
+    fn completed_and_partial_replay_flush_before_measurement_or_new_deletion() {
+        struct ReplayFlush<'a> {
+            leaf: &'a std::path::Path,
+            next_root: &'a std::path::Path,
+            partial: bool,
+            fail: bool,
+            calls: Cell<usize>,
+        }
+        impl Flush for ReplayFlush<'_> {
+            fn flush_volume(&self, _: &VerifiedVolume, _: Instant) -> crate::error::Result<()> {
+                assert_eq!(self.calls.get(), 0, "replay flush is never retried");
+                assert!(self.next_root.is_dir(), "flush must precede new deletion");
+                assert_eq!(self.leaf.is_dir(), self.partial);
+                assert!(
+                    !self.leaf.join("payload.bin").exists(),
+                    "replay already removed payload"
+                );
+                self.calls.set(1);
+                if self.fail {
+                    Err(crate::error::Error::new(
+                        ErrorKind::UnknownState,
+                        "replay flush failed",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        struct AfterFlush<'a> {
+            flush: &'a ReplayFlush<'a>,
+            meter: Meter,
+        }
+        impl SpaceFacts for AfterFlush<'_> {
+            fn measure_space(
+                &self,
+                volume: &VerifiedVolume,
+            ) -> crate::error::Result<SpaceMeasurement> {
+                assert_eq!(
+                    self.flush.calls.get(),
+                    1,
+                    "no deciding measurement before replay flush"
+                );
+                assert!(!self.flush.fail, "failed replay flush forbids measurement");
+                assert!(
+                    self.flush.next_root.is_dir(),
+                    "no new delete precedes the deciding measurement"
+                );
+                self.meter.measure_space(volume)
+            }
+        }
+        for partial in [false, true] {
+            for fail in [false, true] {
+                let harness = Harness::new("space-prune-replay-flush", RESERVE, FLOOR);
+                let (first, first_path) = harness.seed("pool", 1_000);
+                let (_, next_path) = harness.seed("pool", 2_000);
+                let (_, bytes) = harness.preview();
+                let faults = Faults::new().with_device_shift(
+                    "payload.bin",
+                    crate::os::DeviceId::new(harness.fixture.device.get().saturating_add(1)),
+                );
+                harness
+                    .run_with(
+                        &faults,
+                        &bytes,
+                        &Meter::new(&[4]),
+                        &Flusher::ok(),
+                        SpacePruneBounds::design(),
+                    )
+                    .expect_err("interrupt after capture, before unlink");
+                let journal =
+                    state::read_intents(&harness.fixture.state, INTENT_ROWS).expect("journal");
+                let leaf = first_path
+                    .parent()
+                    .expect("area")
+                    .join(journal.records[0].capture_name());
+                assert!(leaf.join("payload.bin").is_file());
+                if partial {
+                    state::fail_next_phase_publish(state::IntentPhase::MarkerLast);
+                }
+                let flush = ReplayFlush {
+                    leaf: &leaf,
+                    next_root: &next_path,
+                    partial,
+                    fail,
+                    calls: Cell::new(0),
+                };
+                let space = AfterFlush {
+                    flush: &flush,
+                    meter: Meter::new(&[20]),
+                };
+                let digest = sha256_hex(&bytes);
+                let request = harness.request(&digest, &bytes, SpacePruneBounds::design());
+                let result = prune(
+                    &harness.fixture.state,
+                    &harness.fixture.platform(),
+                    &harness.facts,
+                    &harness.fixture.mounts(),
+                    &harness.observer,
+                    &space,
+                    &flush,
+                    &request,
+                );
+                assert_eq!(flush.calls.get(), 1);
+                assert!(next_path.is_dir());
+                assert_eq!(leaf.is_dir(), partial);
+                assert!(!leaf.join("payload.bin").exists());
+                if fail {
+                    let error = result.expect_err("failed replay flush stops the pass");
+                    assert_eq!(error.kind(), ErrorKind::UnknownState);
+                    assert_eq!(error.kind().exit_code(), 3);
+                    assert_eq!(space.meter.calls(), 0);
+                    assert_eq!(error.detail()["replay"]["examined"], 1);
+                    assert_eq!(error.detail()["replay"]["resumed"], usize::from(!partial));
+                    assert_eq!(
+                        error.detail()["replay"]["pending"]
+                            .as_array()
+                            .expect("pending")
+                            .len(),
+                        usize::from(partial)
+                    );
+                    assert_eq!(
+                        error.detail()["replay"]["resumed_root_ids"],
+                        if partial {
+                            serde_json::json!([])
+                        } else {
+                            serde_json::json!([first])
+                        }
+                    );
+                    assert_eq!(error.detail()["flush"]["attempts"], 1);
+                    assert_eq!(error.detail()["flush"]["failures"], 1);
+                } else {
+                    let report = result.expect("flushed replay decides from fresh measurement");
+                    let effect = report.effect.as_ref().expect("effect");
+                    assert_eq!(space.meter.calls(), 1);
+                    assert_eq!(
+                        effect.replay.expect("replay").resumed,
+                        usize::from(!partial)
+                    );
+                    assert_eq!(effect.replay.expect("replay").pending, usize::from(partial));
+                    assert_eq!(effect.flush.attempts, 1);
+                    assert_eq!(effect.pruned.count, 0, "replay alone satisfied the target");
+                    assert_eq!(effect.batches, 0);
+                    assert_eq!(effect.before.free_bytes, 20);
+                    read_prune_report(&encode(&report)).expect("replay flush report reads back");
+                }
+            }
+        }
+    }
+
     /// A device fault leaves a journal the next run can replay. The actual
     /// signal row has its own subprocess regression below.
     #[test]
@@ -3040,6 +3235,10 @@ mod tests {
         assert_eq!(replay.pending, 0);
         assert!(replay.resumed + replay.settled == 1, "the intent settled");
         assert_eq!(effect.pruned.count, 1);
+        assert_eq!(
+            effect.flush.attempts, 2,
+            "replay and the new candidate batch each flush"
+        );
         assert_eq!(
             effect.pruned.rows[0].root_id, second,
             "the replayed root settled through the journal, so the next planned root is this batch's deletion"
@@ -4127,6 +4326,7 @@ mod tests {
         std::fs::write(harness.fixture.state.registry_path(), registry_bytes)
             .expect("restore the corrupted fixture registry");
         harness.fixture.register_record(&harness.record);
+        let replay_flush = Flusher::ok();
         let error = prune(
             &harness.fixture.state,
             &harness.fixture.platform(),
@@ -4134,11 +4334,17 @@ mod tests {
             &harness.fixture.mounts(),
             &harness.observer,
             &FailedMeasurement,
-            &Flusher::ok(),
+            &replay_flush,
             &request,
         )
         .expect_err("measurement fails after replay completes");
         assert!(!leaf.exists(), "replay completed the captured deletion");
+        assert_eq!(
+            replay_flush.calls(),
+            1,
+            "completed replay flush precedes even a failed measurement"
+        );
+        assert_eq!(error.detail()["flush"]["attempts"], 1);
         assert_eq!(error.detail()["replay"]["resumed"], 1);
         assert_eq!(
             error.detail()["replay"]["resumed_root_ids"],
