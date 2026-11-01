@@ -380,6 +380,19 @@ pub struct MaintainReport {
     pub pending: RowSet<PendingRow>,
     /// The stages the wall clock stopped before.
     pub unreached: RowSet<UnreachedRow>,
+    /// Whether the optional space stage ran.
+    #[serde(default = "disabled_space_stage")]
+    pub space_stage: String,
+    /// Per-volume space previews or decisions, outside the canonical plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_rows: Option<Vec<serde_json::Value>>,
+    /// Number of volumes whose preview crossed its declared trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_triggered: Option<usize>,
+}
+
+fn disabled_space_stage() -> String {
+    "disabled".to_owned()
 }
 
 impl MaintainReport {
@@ -500,6 +513,9 @@ pub fn maintain(
             // replays it.
             pending: preview_pending(state_paths)?,
             unreached: RowSet::empty(),
+            space_stage: disabled_space_stage(),
+            space_rows: None,
+            space_triggered: None,
         });
     }
 
@@ -572,6 +588,157 @@ pub fn maintain(
         request.maintain_bounds.deadline(started),
         request,
     )
+}
+
+/// Run maintenance with an optional, non-persisted space stage.
+#[allow(clippy::too_many_arguments)]
+pub fn maintain_with_space(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn AbsenceVolume,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    space: &dyn crate::os::SpaceFacts,
+    flush: &dyn crate::os::Flush,
+    request: &MaintainRequest<'_>,
+    enabled: bool,
+) -> Result<MaintainReport> {
+    let started = Instant::now();
+    let deadline = request.maintain_bounds.deadline(started);
+    let mut report = maintain(state_paths, dirs, facts, mounts, observer, request)?;
+    if !enabled {
+        return Ok(report);
+    }
+    report.space_stage = "enabled".to_owned();
+    if report.timed_out || report.stopped.is_some() {
+        return Ok(report);
+    }
+    let mut rows = Vec::new();
+    let mut triggered = 0;
+    let records = match read_registry(state_paths) {
+        Ok(records) => records,
+        Err(error) => {
+            report.stopped = Some(error.message().to_owned());
+            return Ok(report);
+        }
+    };
+    for planned in &report.plan.volumes.rows {
+        let Some(record) = records
+            .iter()
+            .find(|record| record.volume_uuid.as_str() == planned.volume_uuid)
+        else {
+            rows.push(serde_json::json!({"volume_uuid": planned.volume_uuid, "decision": "identity_changed"}));
+            continue;
+        };
+        if record.generation != planned.record_generation
+            || record.root_dir != planned.root_dir
+            || planned.state != VolumeState::Present
+        {
+            rows.push(serde_json::json!({"volume_uuid": planned.volume_uuid, "decision": "identity_changed"}));
+            continue;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            report.timed_out = true;
+            rows.push(
+                serde_json::json!({"volume_uuid": record.volume_uuid, "decision": "unreached"}),
+            );
+            continue;
+        }
+        let uuid = &record.volume_uuid;
+        if record.durability == Durability::Kept {
+            rows.push(serde_json::json!({"volume_uuid": uuid, "decision": "skipped_kept"}));
+            continue;
+        }
+        if record.space.is_none() {
+            rows.push(serde_json::json!({"volume_uuid": uuid, "decision": "space_undeclared"}));
+            continue;
+        }
+        if request.preview {
+            let preview = crate::space::plan(
+                state_paths,
+                dirs,
+                facts,
+                mounts,
+                observer,
+                space,
+                &crate::space::SpacePruneRequest {
+                    volume_uuid: uuid,
+                    now_ms: request.now_ms,
+                    wall: remaining.min(crate::space::SPACE_PLAN_WALL),
+                    lock_wait: remaining.min(Duration::from_secs(5)),
+                },
+            );
+            match preview {
+                Ok(preview) => {
+                    if preview.measurement.free_bytes <= preview.target_bytes {
+                        triggered += 1;
+                    }
+                    rows.push(serde_json::json!({"volume_uuid": uuid, "preview": {"schema": crate::space::SPACE_PRUNE_SCHEMA, "command": "space prune", "ok": true, "data": preview}}));
+                }
+                Err(error) => {
+                    if matches!(error.kind(), ErrorKind::UnknownState | ErrorKind::Io) {
+                        report.stopped = Some(error.message().to_owned());
+                    }
+                    rows.push(space_error_row(uuid, &error));
+                }
+            }
+        } else {
+            let result = crate::space::decide_volume(
+                state_paths,
+                dirs,
+                facts,
+                mounts,
+                observer,
+                space,
+                flush,
+                uuid,
+                remaining.min(Duration::from_secs(120)),
+                false,
+                crate::space::SpacePruneBounds::design(),
+            );
+            match result {
+                Ok(decision) => rows.push(serde_json::json!({
+                    "volume_uuid": uuid, "decision": decision.decision,
+                    "F": decision.after.free_bytes, "R": decision.policy.reserve_bytes, "L": decision.policy.floor_bytes,
+                    "measurement_source": decision.after.source,
+                    "pruned_root_ids": decision.pruned.rows.iter().map(|row| &row.root_id).collect::<Vec<_>>(),
+                    "replayed_root_ids": decision.detail["replayed_root_ids"],
+                    "replay_partial_root_ids": decision.detail["replay_partial_root_ids"],
+                    "replay_settled_root_ids": decision.detail["replay_settled_root_ids"],
+                    "cause": decision.detail["cause"], "owned_prunable_bytes": decision.detail["owned_prunable_bytes"],
+                    "held_or_unknown_bytes": decision.detail["held_or_unknown_bytes"],
+                    "excluded_bytes": decision.detail["excluded_bytes"], "other_estimate_bytes": decision.detail["other_estimate_bytes"]
+                })),
+                Err(error) => {
+                    if matches!(error.kind(), ErrorKind::UnknownState | ErrorKind::Io) {
+                        report.stopped = Some(error.message().to_owned());
+                    }
+                    rows.push(space_error_row(uuid, &error));
+                }
+            }
+        }
+    }
+    if request.preview {
+        report.space_triggered = Some(triggered);
+    }
+    report.space_rows = Some(rows);
+    Ok(report)
+}
+
+fn space_error_row(uuid: &crate::os::VolumeUuid, error: &Error) -> serde_json::Value {
+    let detail = error.detail();
+    serde_json::json!({
+        "volume_uuid": uuid, "decision": error.kind().as_str(), "message": error.message(),
+        "F": detail.get("free_bytes"), "R": detail.get("reserve_bytes"), "L": detail.get("floor_bytes"),
+        "measurement_source": detail.get("measurement_source"),
+        "pruned_root_ids": detail.get("pruned_root_ids"), "replayed_root_ids": detail.get("replayed_root_ids"),
+        "replay_partial_root_ids": detail.get("replay_partial_root_ids"),
+        "replay_settled_root_ids": detail.get("replay_settled_root_ids"), "cause": detail.get("cause"),
+        "owned_prunable_bytes": detail.get("owned_prunable_bytes"),
+        "held_or_unknown_bytes": detail.get("held_or_unknown_bytes"),
+        "excluded_bytes": detail.get("excluded_bytes"), "other_estimate_bytes": detail.get("other_estimate_bytes")
+    })
 }
 
 /// Read the registry under the shared observation lock. Nothing is created.
@@ -1484,6 +1651,9 @@ fn run(
         volumes: RowSet::bounded(volumes, volume_total, VOLUME_ROWS),
         pending: RowSet::bounded(pending, pending_total, ROOT_ROWS),
         unreached: RowSet::bounded(unreached, unreached_total, ROOT_ROWS),
+        space_stage: disabled_space_stage(),
+        space_rows: None,
+        space_triggered: None,
     })
 }
 

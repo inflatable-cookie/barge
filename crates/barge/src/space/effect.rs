@@ -3396,6 +3396,170 @@ mod tests {
     }
 
     #[test]
+    fn maintain_space_disabled_preview_and_real() {
+        let harness = Harness::new("maintain-space-disabled", RESERVE, FLOOR);
+        let meter = Meter::new(&[1]);
+        let flusher = Flusher::ok();
+        let request = crate::prune::MaintainRequest {
+            preview: true,
+            plan_digest: None,
+            plan_bytes: None,
+            sweep_bounds: crate::scratch::SweepBounds::default(),
+            delete_bounds: DeleteBounds::default(),
+            maintain_bounds: crate::prune::MaintainBounds::design(),
+            now_ms: harness.now_ms,
+        };
+        let preview = crate::prune::maintain_with_space(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &meter,
+            &flusher,
+            &request,
+            false,
+        )
+        .expect("preview");
+        assert_eq!(preview.space_stage, "disabled");
+        assert!(preview.space_triggered.is_none());
+        let bytes = crate::prune::canonical_plan_bytes(&preview.plan).expect("plan");
+        let real_request = crate::prune::MaintainRequest {
+            preview: false,
+            plan_digest: Some(&preview.plan_digest),
+            plan_bytes: Some(&bytes),
+            ..request
+        };
+        let real = crate::prune::maintain_with_space(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &meter,
+            &flusher,
+            &real_request,
+            false,
+        )
+        .expect("real");
+        assert_eq!(real.space_stage, "disabled");
+        assert_eq!(meter.calls(), 0);
+        assert_eq!(flusher.calls(), 0);
+    }
+
+    #[test]
+    fn maintain_space_preview_and_trigger() {
+        let harness = Harness::new("maintain-space-preview", RESERVE, FLOOR);
+        let request = crate::prune::MaintainRequest {
+            preview: true,
+            plan_digest: None,
+            plan_bytes: None,
+            sweep_bounds: crate::scratch::SweepBounds::default(),
+            delete_bounds: DeleteBounds::default(),
+            maintain_bounds: crate::prune::MaintainBounds::design(),
+            now_ms: harness.now_ms,
+        };
+        let run = |enabled| {
+            crate::prune::maintain_with_space(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &Meter::new(&[8]),
+                &Flusher::ok(),
+                &request,
+                enabled,
+            )
+            .expect("preview")
+        };
+        let disabled = run(false);
+        let enabled = run(true);
+        assert_eq!(disabled.plan_digest, enabled.plan_digest);
+        assert_eq!(
+            crate::prune::canonical_plan_bytes(&disabled.plan).unwrap(),
+            crate::prune::canonical_plan_bytes(&enabled.plan).unwrap()
+        );
+        assert_eq!(enabled.candidates, 0);
+        assert_eq!(enabled.space_triggered, Some(1));
+        assert!(disabled.space_triggered.is_none());
+    }
+
+    #[test]
+    fn future_host_job_space_trigger_runs_once() {
+        let harness = Harness::new("future-host-space", RESERVE, FLOOR);
+        let request = crate::prune::MaintainRequest {
+            preview: true,
+            plan_digest: None,
+            plan_bytes: None,
+            sweep_bounds: crate::scratch::SweepBounds::default(),
+            delete_bounds: DeleteBounds::default(),
+            maintain_bounds: crate::prune::MaintainBounds::design(),
+            now_ms: harness.now_ms,
+        };
+        let preview = crate::prune::maintain_with_space(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &Meter::new(&[8]),
+            &Flusher::ok(),
+            &request,
+            true,
+        )
+        .expect("preview");
+        let bytes = crate::prune::canonical_plan_bytes(&preview.plan).expect("plan");
+        let mut calls = 0;
+        if preview.candidates > 0 || preview.space_triggered.unwrap_or(0) > 0 {
+            calls += 1;
+            let real = crate::prune::MaintainRequest {
+                preview: false,
+                plan_digest: Some(&preview.plan_digest),
+                plan_bytes: Some(&bytes),
+                ..request
+            };
+            crate::prune::maintain_with_space(
+                &harness.fixture.state,
+                &harness.fixture.platform(),
+                &harness.facts,
+                &harness.fixture.mounts(),
+                &harness.observer,
+                &Meter::new(&[30]),
+                &Flusher::ok(),
+                &real,
+                true,
+            )
+            .expect("real");
+        }
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn guard_undeclared_area_never_enters_core() {
+        let harness = Harness::new("guard-missing-area", RESERVE, FLOOR);
+        let meter = Meter::new(&[8]);
+        let result = crate::space::guard(
+            &harness.fixture.state,
+            &harness.fixture.platform(),
+            &harness.facts,
+            &harness.fixture.mounts(),
+            &harness.observer,
+            &meter,
+            &Flusher::ok(),
+            &crate::space::GuardRequest {
+                volume_uuid: &harness.record.volume_uuid,
+                namespace: "missing",
+                area: "missing",
+                wall: Duration::from_secs(30),
+                recheck: false,
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::UnknownState);
+        assert_eq!(meter.calls(), 0);
+    }
+
+    #[test]
     fn guard_decision_table_and_recheck_use_fresh_measurements() {
         for (reserve, floor, free) in [
             (10, 20, 10),

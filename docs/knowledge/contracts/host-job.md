@@ -62,6 +62,16 @@ pending-only preview therefore records its `3` and runs no real step: the next
 night the same report appears until a run with a candidate replays the intent, or
 the operator settles it deliberately.
 
+## Future space enablement
+
+After real-drive qualification, T9 may separately authorize an operator to add
+`--space` to both the preview and real invocations. At that future enablement,
+the job runs the real step exactly once when `data.candidates > 0` **or**
+`data.space_triggered > 0`, passing the same flags, exact plan bytes and digest.
+It never retries. A volume that no longer triggers is remeasured in the real run.
+Until T9 the current commands and candidate-only trigger above stay in force;
+Oxide's prune entry stays until stage 4.
+
 ## Exit codes and what the job records
 
 | Exit | Document | Meaning for the job |

@@ -157,6 +157,9 @@ pub struct DescribeData {
     /// Per-volume space measurements and declared policies.
     #[serde(default)]
     pub space: RowSet<crate::space::SpaceRow>,
+    /// Report-only fallback observations, absent in older documents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_roots: Option<RowSet<crate::space::FallbackRoot>>,
     /// Foreign observations, bounded to the observation row cap.
     pub observations: RowSet<ObservationRow>,
     /// Identity facts used across a remount.
@@ -547,6 +550,12 @@ pub fn describe(request: &DescribeRequest<'_>) -> Result<DescribeData> {
         placements,
         roots,
         space,
+        fallback_roots: Some(crate::space::fallback_roots(
+            &paths,
+            request.facts,
+            request.mounts,
+            registry.volumes(),
+        )?),
         observations: RowSet::bounded(observation_rows, observation_total, OBSERVATION_ROWS),
         custody: crate::custody::capability_report(),
         identity: IdentityCapability::default(),

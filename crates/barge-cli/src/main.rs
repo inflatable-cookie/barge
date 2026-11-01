@@ -972,6 +972,7 @@ fn maintain(args: &[String]) -> Result<Report, Error> {
             "--plan and --plan-out name different files; give one",
         ));
     }
+    let space_enabled = flag(&mut options, "space")?;
     refuse_unknown(options)?;
     let plan_bytes = match &plan_file {
         Some(path) => Some(read_plan_file(path)?),
@@ -979,8 +980,10 @@ fn maintain(args: &[String]) -> Result<Report, Error> {
     };
     let state = state_paths()?;
     let platform = os::platform();
-    let report = prune::maintain(
+    let report = prune::maintain_with_space(
         &state,
+        &platform,
+        &platform,
         &platform,
         &platform,
         &platform,
@@ -994,6 +997,7 @@ fn maintain(args: &[String]) -> Result<Report, Error> {
             maintain_bounds: MaintainBounds::design(),
             now_ms: state::now_ms(),
         },
+        space_enabled,
     )?;
     if preview {
         if let Some(path) = &plan_out {

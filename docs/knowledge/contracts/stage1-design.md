@@ -1251,7 +1251,8 @@ Barge owns no timer, daemon or hook. A host launchd job calls one command:
 ```
 
 - `maintain` performs scratch expiry for every registered, present volume, then
-  each area's declared prune policy, in a fixed order, and nothing else. It
+  each area's declared prune policy, in a fixed order, except the optional `--space`
+  stage (T7) and its `data.space_triggered`, off unless `--space` is passed. It
   reads the registry, verifies volumes, and writes only the intents and results
   its rules allow.
 - Preview then real, like Oxide's prune: `--plan` prints one bounded canonical
@@ -2495,7 +2496,8 @@ Choices S4 made where this design left the mechanic to the slice:
   codes, the completion of `describe`, and the host-job hand-off. `maintain`
   sweeps every registered, present volume's scratch folder through S4's sweep and
   then applies each declared area's prune policy, in registry order and then
-  declaration order, and does nothing else. It reads no Oxide receipt, runs no
+  declaration order, except the optional `--space` stage (T7) and its
+  `data.space_triggered`, off unless `--space` is passed. It reads no Oxide receipt, runs no
   Oxide prune and deletes no Oxide root: every effect goes through S4's
   grant-checked sweep or S5's custody and delete path on a root whose
   `barge.root/1` marker Barge wrote. The job file itself, its schedule and the
