@@ -14,7 +14,7 @@ import traceback
 import uuid
 
 sys.dont_write_bytecode = True
-from space_cases import Cases, case_4b_sizing_self_check
+from space_cases import Cases, case_2_sizing_self_check, case_4b_sizing_self_check
 from space_custody import self_check as custody_self_check
 from space_fixture import CensusUnavailable, Fixture
 from space_images import Images, self_check as images_self_check
@@ -26,9 +26,12 @@ SUPERVISOR = os.path.expanduser("~/Dev/projects/oxide/scripts/bounded-test.py")
 PARENT = "/Volumes/Builds/scratch/barge"
 SCRIPT = os.path.abspath(__file__)
 CASES = ("1", "2", "3", "4", "4b", "5", "6", "7", "8", "9", "10")
-# The first eight scenarios build on prior fixture contents; case 9 requires
-# case 6's successful detaches, and case 10 uses its own state and registration
-# plan. A separate runtime custody gate protects every continuation.
+# Case 3 consumes case 2's filler and resulting root state. Cases 4 and 4b use
+# case 3's held root and the floor it establishes; case 5 consumes that filler
+# and requires 4b's idle root settled. Case 6 is independent on a second image.
+# Case 7 uses case 5's filler after case 6 restores the primary image; case 8
+# requires case 7's hard link removed and its filler. Case 9 requires case 6's
+# detaches; case 10 uses fresh registration state. The custody gate applies to all.
 CASE_NEEDS = {
     "1": (), "2": ("1",), "3": ("2",), "4": ("3",), "4b": ("4",),
     "5": ("4b",), "6": ("1",), "7": ("5", "6"), "8": ("7",),
@@ -173,7 +176,7 @@ def diagnostic_self_check():
 
 def self_check():
     problems = (custody_self_check() + images_self_check() + oracles_self_check()
-                + diagnostic_self_check() + case_4b_sizing_self_check())
+                + diagnostic_self_check() + case_2_sizing_self_check() + case_4b_sizing_self_check())
     if len(CASES) != 11 or len(set(CASES)) != 11:
         problems.append("case map must contain eleven distinct cases")
     for name in CASES:

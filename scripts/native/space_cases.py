@@ -12,6 +12,35 @@ import space_oracles as oracle
 MIB = 1024 * 1024
 
 
+def case_2_sizing(free, reserve, older_bytes):
+    """Record the measured reclaim needed and refuse an undersized candidate."""
+    if free <= 0 or free >= reserve or older_bytes <= 0:
+        raise ValueError("case 2 sizing needs positive free bytes below reserve and a nonempty root")
+    result = {"setup_free_bytes": free, "older_bytes": older_bytes,
+              "reserve_bytes": reserve, "reclaim_margin_bytes": free + older_bytes - reserve,
+              "desired_older_bytes": reserve - free + 4 * MIB}
+    if free + older_bytes <= reserve:
+        raise ValueError(f"case 2 measured sizing cannot reach reserve: {result}")
+    return result
+
+
+def case_2_sizing_self_check():
+    """Reject the measured failing diagnostic and accept a sized candidate."""
+    problems = []
+    reserve = 48 * MIB
+    free = int(37.3 * MIB)
+    try:
+        case_2_sizing(free, reserve, int(10.49 * MIB))
+    except ValueError:
+        pass
+    else:
+        problems.append("case 2 accepted the diagnostic's undersized root")
+    result = case_2_sizing(free, reserve, reserve - free + 4 * MIB)
+    if result["reclaim_margin_bytes"] != 4 * MIB:
+        problems.append("case 2 did not record the four MiB sizing margin")
+    return problems
+
+
 def case_4b_fill_target(free, floor):
     """Size the idle payload from the measured free space and floor gap."""
     if free <= 0 or free >= floor:
@@ -67,26 +96,46 @@ class Cases:
         fixture = self.fixture
         # The second area's root is released first and thus has the older LRU
         # key. Its size and the filler are derived from fresh Barge readings.
+        # Lay down the non-Barge filler first, then size the older root from
+        # the measured remaining free bytes and a 40 MiB setup target. The
+        # filler target leaves room for metadata and a reclaim margin.
+        self.filler = os.path.join(fixture.mount, "proof-filler")
+        fixture.fill_to(self.filler, 58 * MIB)
         fixture.hold(self.second, "old", os.getpid())
         free = fixture.free()
-        fixture.fill_to(os.path.join(self.second["path"], "payload"), free - 10 * MIB)
+        reserve_target = 48 * MIB
+        setup_target = 40 * MIB
+        required_payload = reserve_target - setup_target + 4 * MIB
+        payload = free - setup_target
+        if payload < required_payload:
+            raise AssertionError("case 2 lacks measured space for the reserve gap and reclaim margin")
+        fixture.fill_to(os.path.join(self.second["path"], "payload"), free - payload)
         fixture.release(self.second, "old")
         time.sleep(0.05)
         fixture.idle(self.first, "new")
         fixture.wait_until_idle()
-        self.filler = os.path.join(fixture.mount, "proof-filler")
-        measured = fixture.fill_to(self.filler, 40 * MIB)
+        measured = fixture.free()
         if not 24 * MIB < measured < 48 * MIB:
             raise AssertionError(f"case 2 setup is outside its measured band: {measured}")
         _, preview = fixture.command("space", "prune", "--volume", fixture.uuid, "--plan")
         candidates = preview["data"]["plan"]["candidates"]
-        self.context["2"] = {"setup_free_bytes": measured, "older_root": self.second["root_id"],
+        candidate_rows = oracle.rows(candidates)
+        older = [row for row in candidate_rows if row["root_id"] == self.second["root_id"]]
+        if len(older) != 1:
+            raise AssertionError("case 2 older root is not a unique eligible candidate")
+        reserve = preview["data"]["policy"]["reserve_bytes"]
+        older_bytes = older[0]["bytes"]
+        self.context["2"] = {"setup_free_bytes": measured, "older_bytes": older_bytes,
+                             "reserve_bytes": reserve, "older_root": self.second["root_id"],
                              "older_area": "proof/second", "candidates": candidates}
+        sizing = case_2_sizing(measured, reserve, older_bytes)
+        self.context["2"]["sizing"] = sizing
         code, document = fixture.guard()
         evidence = oracle.case_2(code, document, self.second["root_id"], self.first["root_id"],
                                  candidates, preview["data"]["kept"])
         if os.path.exists(self.second["path"]):
             raise AssertionError("case 2 older root survived")
+        evidence["sizing"] = sizing
         return evidence
 
     def case_3(self):
