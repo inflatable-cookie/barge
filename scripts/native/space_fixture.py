@@ -17,13 +17,20 @@ class Fixture:
         self.pool = pool
         self.uuid = None
         self.mount = None
+        self.last_observation = None
 
     def command(self, *args, expect=0):
         code, out, err = self.images.run([self.binary, *args, "--json"], 30)
+        self.last_observation = {"command": list(args), "exit": code,
+                                 "stderr": err.decode("utf-8", "replace")[-2048:],
+                                 "document": None,
+                                 "stdout": out.decode("utf-8", "replace")[:8192]}
         try:
             document = json.loads(out)
         except (ValueError, UnicodeDecodeError) as error:
             raise FixtureFault(f"no JSON from {args!r}: exit {code}, {err[-400:]!r}") from error
+        self.last_observation["document"] = json.dumps(document, ensure_ascii=True)[:8192]
+        self.last_observation.pop("stdout")
         if expect is not None and code != expect:
             raise FixtureFault(f"{args!r}: exit {code}, expected {expect}: {document!r}")
         return code, document

@@ -47,6 +47,7 @@ class Cases:
         self.first = None
         self.second = None
         self.filler = None
+        self.context = {}
 
     def case_1(self):
         fixture = self.fixture
@@ -77,6 +78,10 @@ class Cases:
         measured = fixture.fill_to(self.filler, 40 * MIB)
         if not 24 * MIB < measured < 48 * MIB:
             raise AssertionError(f"case 2 setup is outside its measured band: {measured}")
+        _, preview = fixture.command("space", "prune", "--volume", fixture.uuid, "--plan")
+        candidates = preview["data"]["plan"]["candidates"]
+        self.context["2"] = {"setup_free_bytes": measured, "older_root": self.second["root_id"],
+                             "older_area": "proof/second", "candidates": candidates}
         code, document = fixture.guard()
         oracle.case_2(code, document, self.second["root_id"])
         if os.path.exists(self.second["path"]) or not os.path.isdir(self.first["path"]):

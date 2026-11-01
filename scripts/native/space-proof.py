@@ -31,7 +31,7 @@ CASES = ("1", "2", "3", "4", "4b", "5", "6", "7", "8", "9", "10")
 # plan. A separate runtime custody gate protects every continuation.
 CASE_NEEDS = {
     "1": (), "2": ("1",), "3": ("2",), "4": ("3",), "4b": ("4",),
-    "5": ("4b",), "6": ("5",), "7": ("6",), "8": ("7",),
+    "5": ("4b",), "6": ("1",), "7": ("5", "6"), "8": ("7",),
     "9": ("6",), "10": (),
 }
 PREMISES = (
@@ -85,7 +85,7 @@ def command(supervisor, mode, binary):
             "--binary", binary]
 
 
-def run_cases(diagnostic, execute, ready, check_pool):
+def run_cases(diagnostic, execute, ready, check_pool, observation=lambda name: None):
     """Run each case whose dependencies and custody are positively established."""
     results = []
     passed = set()
@@ -113,8 +113,11 @@ def run_cases(diagnostic, execute, ready, check_pool):
                             "ms": int((time.monotonic() - started) * 1000)})
         except Exception as error:
             fault = fault or name
+            actual = observation(name)
+            details = {"error": str(error)[:500], "actual": actual}
             results.append({"case": name, "status": "failed", "kind": type(error).__name__,
-                            "detail": str(error)[:500], "trace": traceback.format_exc()[-800:]})
+                            "detail": json.dumps(details, ensure_ascii=True)[:24000],
+                            "trace": traceback.format_exc()[-800:]})
     return results, fault
 
 
@@ -140,9 +143,21 @@ def diagnostic_self_check():
                                    lambda name: "unproven custody" if name in unavailable else None,
                                    lambda: None)
         return called, {row["case"]: row for row in results}, fault
+    def failing(_name):
+        raise AssertionError("oracle failed")
+    sample = {"exit": 2, "stderr": "fixture stderr", "document": '{"ok":false}'}
+    failures, _ = run_cases(True, failing, lambda name: None, lambda: None,
+                            lambda name: sample)
+    recorded = json.loads(failures[0]["detail"])["actual"]
+    if recorded != sample or len(failures[0]["detail"]) > 24000:
+        problems.append("oracle failure does not retain bounded exit, stderr and document")
     called, results, fault = run({"1", "10"})
     if called != ["1", "10"] or fault != "1" or results["2"]["kind"] != "dependency":
         problems.append("diagnostic did not continue an independent case or latch the first fault")
+    called, results, fault = run({"2"})
+    if ("3" in called or "6" not in called or "9" not in called or "10" not in called
+            or fault != "2" or results["3"]["kind"] != "dependency"):
+        problems.append("independent second-volume case did not continue after case 2 failed")
     called, results, fault = run({"7"})
     if ("8" in called or "9" not in called or "10" not in called or fault != "7"
             or results["8"]["kind"] != "dependency"):
@@ -276,7 +291,7 @@ def inner(mode, binary):
                 return "image or child custody is unknown"
             # Case 10 uses fresh account state and is independent of the earlier
             # scenarios, but may only operate on the registered primary image.
-            if name in ("9", "10"):
+            if name in ("6", "9", "10"):
                 current = images.current
                 if (current is None or current["backing"] != images.backings[0]
                         or current["mount"] != fixture.mount
@@ -288,8 +303,12 @@ def inner(mode, binary):
             if os.listdir(pool):
                 raise AssertionError("fake internal pool is not empty")
 
+        def observation(name):
+            context = json.dumps(cases.context.get(name), ensure_ascii=True)[:4096]
+            return {"case_context": context, "last_command": fixture.last_observation}
+
         results, fault = run_cases(diagnostic, lambda name: getattr(cases, "case_" + name)(),
-                                   ready, check_pool)
+                                   ready, check_pool, observation)
     except CensusUnavailable as error:
         infrastructure = {"check": "product_custody_census", "detail": str(error)[:500]}
         preflight = {"outcome": "infrastructure", "reason": str(error)[:500]}
