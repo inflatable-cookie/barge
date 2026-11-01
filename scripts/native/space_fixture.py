@@ -111,6 +111,30 @@ class Fixture:
             os.fsync(handle.fileno())
         return self.free()
 
+    def adjust_filler(self, path, action, amount, previous_size):
+        """Change only this run's filler and return Barge's fresh free measurement."""
+        if action not in ("append", "shorten") or amount <= 0:
+            raise CaseInfrastructure("invalid filler adjustment")
+        mode = ("xb" if previous_size == 0 and action == "append" and not os.path.lexists(path)
+                else "r+b")
+        with open(path, mode, buffering=0) as handle:
+            if os.fstat(handle.fileno()).st_size != previous_size:
+                raise CaseInfrastructure("filler size changed unexpectedly")
+            if action == "shorten":
+                if amount > previous_size:
+                    raise CaseInfrastructure("filler shortening exceeds its size")
+                handle.truncate(previous_size - amount)
+            else:
+                handle.seek(0, os.SEEK_END)
+                remaining = amount
+                while remaining:
+                    block = min(remaining, 1024 * 1024)
+                    if handle.write(os.urandom(block)) != block:
+                        raise CaseInfrastructure("filler append made a short write")
+                    remaining -= block
+            os.fsync(handle.fileno())
+        return self.free()
+
     def guard(self, area="first", expect=0):
         return self.command("space", "guard", "--volume", self.uuid,
                             "--area", "proof/" + area, expect=expect)

@@ -14,13 +14,25 @@ from space_fixture import CaseInfrastructure
 MIB = 1024 * 1024
 
 
-def case_2_filler_size(free, reserve, payload):
-    """Size filler after the older payload from Barge's measured free bytes."""
+def case_2_filler_step(free, reserve, payload, size):
+    """Choose one bounded adjustment from Barge's latest measured free bytes."""
     target = reserve - payload + 4 * MIB
-    amount = free - target
-    if target <= 0 or amount <= 0 or amount > 128 * MIB:
-        raise CaseInfrastructure("case 2 measured filler size is not positive and image-bounded")
-    return amount
+    if free <= 0 or target <= 0 or size < 0 or size > 128 * MIB:
+        raise CaseInfrastructure("case 2 filler observation is outside the image bounds")
+    if target <= free < reserve and size > 0:
+        return ("done", 0)
+    if free < target:
+        amount = min(size, target - free + MIB)
+        if amount <= 0:
+            raise CaseInfrastructure("case 2 cannot shorten the filler to recover free space")
+        return ("shorten", amount)
+    # A probe and subsequent bounded top-ups prevent a large unexplained drop
+    # from being repeated before Barge can measure it.
+    gap = free - target
+    amount = min(4 * MIB, max(64 * 1024, gap // 2))
+    if size + amount > 128 * MIB or amount >= free:
+        raise CaseInfrastructure("case 2 filler would exceed its owned image bound")
+    return ("append", amount)
 
 
 def case_2_sizing(free, reserve, payload):
@@ -33,44 +45,42 @@ def case_2_sizing(free, reserve, payload):
 
 
 def case_2_sizing_self_check():
-    """Model the required payload-first order on the observed fixture image."""
+    """Model real image bounds and both historical measured post-filler values."""
     problems = []
-    total = 134176768
-    initial_free = 132763648
+    total, initial_free = 134176768, 132763648
     reserve, payload = 48 * MIB, 12 * MIB
-    # Both historical diagnostics recorded this case-1 free measurement. Model
-    # payload first, then a Barge reading, then the filler, with and without a
-    # three MiB metadata cost before that reading and a one MiB filler cost.
-    for observed_free, overhead, filler_overhead in (
-            (initial_free, 0, 0), (initial_free, 3 * MIB, MIB)):
-        if not 0 < observed_free <= total:
-            problems.append("case 2 model's measured free exceeds the image")
-            continue
-        after_payload = observed_free - payload - overhead
-        try:
-            filler = case_2_filler_size(after_payload, reserve, payload)
-            setup = after_payload - filler - filler_overhead
-            if filler <= 0 or filler + payload > total:
-                problems.append("case 2 model exceeds the owned image")
-            case_2_sizing(setup, reserve, payload)
-        except (CaseInfrastructure, AssertionError) as error:
-            problems.append(f"case 2 payload-first model refused: {error}")
-    # The 4ed7d8d filler-first reading made its old payload gate impossible.
-    # It is not used as the starting measurement for the corrected sequence.
-    if 47820800 - 40 * MIB >= payload:
-        problems.append("case 2 model does not reproduce the 4ed7d8d setup failure")
+    if not 0 < initial_free <= total or initial_free - payload <= reserve:
+        problems.append("case 2 model's image or case-1 reading is invalid")
+    # A zero-size first filler is a bounded probe, followed by measured steps.
+    action, amount = case_2_filler_step(initial_free - payload, reserve, payload, 0)
+    if action != "append" or not 0 < amount <= 4 * MIB:
+        problems.append("case 2 did not start with a bounded filler probe")
+    # The two failed receipts' actual post-filler free readings are the inputs,
+    # not assumptions about their metadata overhead. Model a positive measured
+    # result after shortening only where the first reading is below target.
+    for label, observed in (("f73230b", 37343232), ("4ed7d8d", 47820800)):
+        size = 40 * MIB
+        action, amount = case_2_filler_step(observed, reserve, payload, size)
+        if action == "shorten":
+            if amount <= 0 or amount > size:
+                problems.append(f"{label}: invalid shortening amount")
+                continue
+            observed += amount  # synthetic measured reclaim, not an APFS guarantee
+            size -= amount
+            action, _ = case_2_filler_step(observed, reserve, payload, size)
+        if action != "done":
+            problems.append(f"{label}: measured correction did not reach the target band")
+        else:
+            try:
+                case_2_sizing(observed, reserve, payload)
+            except AssertionError as error:
+                problems.append(f"{label}: corrected measurement refused: {error}")
     try:
-        case_2_filler_size(reserve - payload + 4 * MIB, reserve, payload)
+        case_2_filler_step(1, reserve, payload, 0)
     except CaseInfrastructure:
         pass
     else:
-        problems.append("case 2 model accepted a nonpositive filler size")
-    try:
-        case_2_sizing(37343232, reserve, 10489856)
-    except AssertionError:
-        pass
-    else:
-        problems.append("case 2 accepted the f73230b shortfall")
+        problems.append("case 2 accepted an unrecoverable filler shortfall")
     return problems
 
 
@@ -141,17 +151,30 @@ class Cases:
             fixture.idle(self.first, "new")
             fixture.wait_until_idle()
             free_before_filler = fixture.free()
-            filler_bytes = case_2_filler_size(free_before_filler, reserve_target, payload)
             self.filler = os.path.join(fixture.mount, "proof-filler")
-            measured = fixture.fill_bytes(self.filler, filler_bytes)
+            measured, filler_bytes = free_before_filler, 0
+            adjustments = []
+            self.context["2"] = {"free_before_filler": free_before_filler,
+                                 "older_root": self.second["root_id"], "older_area": "proof/second",
+                                 "adjustments": adjustments}
+            for _ in range(32):
+                action, amount = case_2_filler_step(measured, reserve_target, payload, filler_bytes)
+                adjustments.append({"free_bytes": measured, "filler_bytes": filler_bytes,
+                                    "action": action, "bytes": amount})
+                if action == "done":
+                    break
+                measured = fixture.adjust_filler(self.filler, action, amount, filler_bytes)
+                filler_bytes += amount if action == "append" else -amount
+            else:
+                raise CaseInfrastructure("case 2 measured filler adjustment did not converge")
         except OSError as error:
             if error.errno == errno.ENOSPC:
                 raise CaseInfrastructure("case 2 fixture write ran out of image space") from error
             raise
         sizing = case_2_sizing(measured, reserve_target, payload)
-        sizing.update({"free_before_filler": free_before_filler, "filler_bytes": filler_bytes})
-        self.context["2"] = {"sizing": sizing, "older_root": self.second["root_id"],
-                             "older_area": "proof/second"}
+        sizing.update({"free_before_filler": free_before_filler, "filler_bytes": filler_bytes,
+                       "adjustments": adjustments})
+        self.context["2"]["sizing"] = sizing
         _, preview = fixture.command("space", "prune", "--volume", fixture.uuid, "--plan")
         candidates = preview["data"]["plan"]["candidates"]
         candidate_rows = oracle.rows(candidates)
