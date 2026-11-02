@@ -16,9 +16,15 @@
 //!
 //! ## Manifest fields this harness reads
 //!
-//! The manifest is `oxide.capture.manifest/1`, owned by the orchestrator. The
-//! harness reads exactly these members and binds the whole document's SHA-256;
-//! every other member is the orchestrator's and is ignored here:
+//! The manifest is `oxide.capture.manifest/1`, owned by the orchestrator. No
+//! machine-readable schema is accepted yet: Oxide #240 proposes
+//! `oxide-capture-manifest.schema.json` under the same semantic contract, and
+//! that reviewed shape is the wire contract. The members below are this
+//! harness's consumption requirements, not a canonical layout; the reads are
+//! cfg(test)-only apparatus, so reconciling them to the reviewed schema is a
+//! harness change and nothing production depends on them. The harness reads
+//! exactly these members and binds the whole document's SHA-256; every other
+//! member is the orchestrator's and is ignored here:
 //!
 //! - `case`: the case name carried into the transcript;
 //! - `barge.volume_uuid`: the fixture volume's UUID, as registered;

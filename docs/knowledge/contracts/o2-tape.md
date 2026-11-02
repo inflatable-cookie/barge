@@ -109,10 +109,17 @@ actual `PruneReport` under `result` when completed, `effects` (empty for the
 read-only plan), `reads`, `clocks`, and `caps`. Serialization is deterministic
 for the same window.
 
-The harness reads exactly these manifest members (`oxide.capture.manifest/1`,
-owned by the orchestrator): `case`, `barge.volume_uuid`, `barge.namespace`,
-`barge.area`, and the optional `barge.named_roots`; it binds the whole
-document's SHA-256 and ignores the orchestrator's other members. A missing or
+No machine-readable manifest schema is accepted yet: Oxide #240 proposes
+`oxide-capture-manifest.schema.json` under the same semantic contract, and
+that reviewed shape is the wire contract for B-S1 and the later X-S2
+orchestration. What this harness has today is a consumption surface, not a
+canonical layout. It reads exactly these manifest members
+(`oxide.capture.manifest/1`, owned by the orchestrator): `case`,
+`barge.volume_uuid`, `barge.namespace`, `barge.area`, and the optional
+`barge.named_roots`; it binds the whole document's SHA-256 and ignores the
+orchestrator's other members. The reads are cfg(test)-only apparatus, so
+reconciling them to the reviewed schema is a harness change and nothing
+production depends on them. A missing or
 mistyped member is an apparatus error: exit 2, the reason on stderr, no
 transcript — there is no engine outcome to record. The engine's own refusals
 are engine outcomes: the transcript is written and the process exits with the
