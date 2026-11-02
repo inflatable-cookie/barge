@@ -232,9 +232,28 @@ rustc, Oxide origin, rustup home and toolchain via the launcher inputs; its
 allowlisted child environment explicitly sets private `HOME`, `CARGO_HOME`,
 `TMPDIR`, `OXIDE_CONFIG`, `OXIDE_POOL`, `OXIDE_SCRATCH_ROOT`,
 `OXIDE_TASK_SCRATCH_ROOT`, and debug `OXIDE_TEST_HOME_FROM_ENV`. No inherited
-Oxide, XDG, compiler-flag or dynamic-loader setting is forwarded. The block is
+Oxide, XDG, compiler-flag or dynamic-loader setting is forwarded. The host-wide
+`EFFIGY_ADMISSION_HOOK` and `QUEUE_ADMISSION_SOCKET` are forwarded only when
+they exactly match the independently digested source audit, which must bind
+the actual hook executables and their source and child paths. Missing or
+changed bindings refuse before the dry gate. `BARGE_VALIDATION_EFFIGY` names
+the directly executed, audited Effigy binary; a shell launcher is refused and
+the child PATH must resolve to that same binary. The block is
 claimed once even on refusal. It starts a new prospective allowance only; the
 historical 1200 + 600 + 600 seconds remain charged and exhausted.
+
+Operator decision `578e728a-6322-4143-b1ea-c9ad2a67e7b2`, version 2,
+answered by the operator on 2026-11-02, approves one additional prospective
+1,200-second block for the reviewed private route. The block includes setup,
+at most one 300-second debug-Oxide bootstrap, one inventory-bracketed status
+gate and named safe selectors; it does not renew the historical charges or
+increase the 2 GiB private scratch cap. A changed live inventory ends the
+block without repair, retry or attribution. The planner must still bind and
+issue the one-use block and the independently reviewed inputs. The decision
+does not authorize a full live-reading suite, native/image proof, installation,
+production redirect, parity or merge. The host-admission correction after the
+decision requires exact-head source review and planner binding; no execution
+is inferred from this record.
 
 Within the prospective block, the launcher brackets source verification and
 each actual Effigy child with bounded live before/after inventories. A changed

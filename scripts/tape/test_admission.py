@@ -2,6 +2,7 @@
 """Effect-free refusal controls. No process, inventory, build or fixture."""
 import copy
 import unittest
+from unittest import mock
 import admission
 
 
@@ -54,12 +55,40 @@ class AdmissionControls(unittest.TestCase):
         private = admission.Path('/Volumes/Builds/scratch/barge/private')
         env = admission.child_environment(inherited, private=private, oxide=private / 'bin/oxide',
                                           rustc=admission.Path('/rustup/rustc'),
-                                          wrapper_hash=self.hash, pool_cap=4096)
+                                          wrapper_hash=self.hash, pool_cap=4096,
+                                          admission_env={'EFFIGY_ADMISSION_HOOK': 'audited-hook',
+                                                         'QUEUE_ADMISSION_SOCKET': '/queue/socket'})
         self.assertEqual(env['OXIDE_POOL'], str(private / 'scratch/pool'))
         self.assertEqual(env['OXIDE_SCRATCH_ROOT'], str(private / 'scratch'))
         self.assertEqual(env['OXIDE_POOL_BACKEND'], 'directory-budget')
+        self.assertEqual(env['EFFIGY_ADMISSION_HOOK'], 'audited-hook')
+        self.assertEqual(env['QUEUE_ADMISSION_SOCKET'], '/queue/socket')
         for key in ('XDG_STATE_HOME', 'BARGE_STATE_DIR', 'RUSTFLAGS', 'DYLD_INSERT_LIBRARIES'):
             self.assertNotIn(key, env)
+
+    def test_host_admission_refuses_missing_or_changed_hook(self):
+        inherited = {'EFFIGY_ADMISSION_HOOK': 'audited-hook', 'QUEUE_ADMISSION_SOCKET': '/queue/socket'}
+        audit = {'admission_hook': 'audited-hook', 'admission_socket': '/queue/socket',
+                 'admission_executables': [{'path': '/audited/hook', 'sha256': self.hash}],
+                 'admission_runtime_files': [{'path': '/audited/loader', 'sha256': self.hash}]}
+        with mock.patch.object(admission.Path, 'resolve', lambda self, strict=True: self), \
+                mock.patch.object(admission.Path, 'is_symlink', return_value=False), \
+                mock.patch.object(admission.Path, 'is_file', return_value=True), \
+                mock.patch.object(admission.Path, 'read_bytes', return_value=b'audited'), \
+                mock.patch.object(admission, 'digest', return_value=self.hash):
+            self.assertEqual(admission.host_admission(inherited, audit), inherited)
+            for changes in ({'EFFIGY_ADMISSION_HOOK': ''},
+                            {'EFFIGY_ADMISSION_HOOK': 'different'},
+                            {'QUEUE_ADMISSION_SOCKET': '/different'}):
+                with self.assertRaises(ValueError):
+                    admission.host_admission({**inherited, **changes}, audit)
+            with self.assertRaises(ValueError):
+                admission.host_admission(inherited, {**audit, 'admission_executables': []})
+            with self.assertRaises(ValueError):
+                admission.host_admission(inherited, {**audit, 'admission_runtime_files': []})
+            with mock.patch.object(admission, 'digest', return_value='b' * 64):
+                with self.assertRaises(ValueError):
+                    admission.host_admission(inherited, audit)
 
     def test_same_content_replaced_inode_still_fails(self):
         before = [('./state/pools.json', (1, 11, 0o100600, 4, 7), 'same-digest')]
@@ -67,6 +96,15 @@ class AdmissionControls(unittest.TestCase):
         with self.assertRaises(ValueError):
             admission.verify_inventory(before, after)
         admission.verify_inventory(before, before)
+
+    def test_script_launcher_cannot_stand_in_for_effigy_binary(self):
+        path = admission.Path('/audited/effigy')
+        with mock.patch.object(admission.Path, 'resolve', lambda self, strict=True: self), \
+                mock.patch.object(admission.Path, 'is_file', return_value=True), \
+                mock.patch.object(admission.os, 'access', return_value=True), \
+                mock.patch.object(admission.Path, 'read_bytes', return_value=b'#!/bin/sh\nexec other'):
+            with self.assertRaises(ValueError):
+                admission.direct_effigy(path)
 
     def test_audit_does_not_accept_boolean_or_missing_source(self):
         audit = {'schema': 'barge.validation-source-audit/1',

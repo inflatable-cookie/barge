@@ -356,11 +356,45 @@ def verify_inventory(before, after):
         raise ValueError('live inventory changed; isolation failed')
 
 
-def child_environment(inherited, *, private, oxide, rustc, wrapper_hash, pool_cap):
+def host_admission(inherited, audit):
+    """Preserve only the independently audited host admission route."""
+    hook = inherited.get('EFFIGY_ADMISSION_HOOK')
+    socket = inherited.get('QUEUE_ADMISSION_SOCKET')
+    if (not isinstance(hook, str) or not hook.strip()
+            or not isinstance(socket, str) or not Path(socket).is_absolute()
+            or hook != audit.get('admission_hook') or socket != audit.get('admission_socket')):
+        raise ValueError('audited host admission hook and socket required')
+    for name in ('admission_executables', 'admission_runtime_files'):
+        files = audit.get(name)
+        if not isinstance(files, list) or not files:
+            raise ValueError(f'{name} bindings missing')
+        for item in files:
+            if not isinstance(item, dict) or set(item) != {'path', 'sha256'}:
+                raise ValueError(f'invalid {name} binding')
+            path = Path(item['path'])
+            if (not path.is_absolute() or path.is_symlink() or path.resolve(strict=True) != path
+                    or not path.is_file() or not isinstance(item['sha256'], str)
+                    or not HEX64.fullmatch(item['sha256']) or digest(path.read_bytes()) != item['sha256']):
+                raise ValueError(f'{name} is missing or changed')
+    return {'EFFIGY_ADMISSION_HOOK': hook, 'QUEUE_ADMISSION_SOCKET': socket}
+
+
+def direct_effigy(path):
+    """Bind the executable itself instead of an unbound script target."""
+    resolved = path.resolve(strict=True)
+    if not resolved.is_file() or not os.access(resolved, os.X_OK) or resolved.read_bytes().startswith(b'#!'):
+        raise ValueError('direct audited Effigy executable required, not a script launcher')
+    return resolved
+
+
+def child_environment(inherited, *, private, oxide, rustc, wrapper_hash, pool_cap, admission_env):
     """Construct an allowlisted environment; never inherit OXIDE/XDG controls."""
     if inherited.get('RUSTUP_TOOLCHAIN') != '1.97.1' or not inherited.get('RUSTUP_HOME'):
         raise ValueError('declared Rust toolchain binding missing')
     env = {key: inherited[key] for key in ('RUSTUP_HOME', 'RUSTUP_TOOLCHAIN', 'PATH') if key in inherited}
+    if set(admission_env) != {'EFFIGY_ADMISSION_HOOK', 'QUEUE_ADMISSION_SOCKET'}:
+        raise ValueError('host admission environment missing')
+    env.update(admission_env)
     env.update({'HOME': str(private / 'home'), 'CARGO_HOME': str(private / 'cache'),
                 'TMPDIR': str(private / 'tmp'), 'TMP': str(private / 'tmp'),
                 'TEMP': str(private / 'tmp'), 'OXIDE_CONFIG': str(private / 'config.toml'),

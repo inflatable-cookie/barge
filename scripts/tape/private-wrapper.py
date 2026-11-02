@@ -212,7 +212,7 @@ def main():
     supervisor = Path(os.environ['BARGE_VALIDATION_SUPERVISOR']).resolve(strict=True)
     if not supervisor.is_relative_to(private) or sha(supervisor.read_bytes()) != admission.SUPERVISOR_SHA256:
         raise RuntimeError('qualified supervisor binding missing')
-    effigy = Path(shutil.which('effigy') or '/nonexistent').resolve(strict=True)
+    effigy = admission.direct_effigy(Path(os.environ['BARGE_VALIDATION_EFFIGY']))
     git = Path(os.environ['BARGE_VALIDATION_GIT']).resolve(strict=True)
     audit_path = Path(os.environ['BARGE_VALIDATION_SOURCE_AUDIT'])
     if audit_path.is_symlink() or audit_path.resolve(strict=True) != audit_path or not audit_path.is_relative_to(SCRATCH):
@@ -239,9 +239,10 @@ def main():
             or (mode == 'validate' and (len(block['selectors']) < 2 or 'rust:test:tape-export' in block['selectors']))
             or (mode == 'export' and block['selectors'][-1] != 'rust:test:tape-export')):
         raise RuntimeError('mode and authorized selector sequence disagree')
+    admission_env = admission.host_admission(os.environ, audit)
     env = admission.child_environment(os.environ, private=private, oxide=oxide, rustc=rustc,
                                       wrapper_hash=sha(Path(__file__).read_bytes()),
-                                      pool_cap=block['pool_cap_bytes'])
+                                      pool_cap=block['pool_cap_bytes'], admission_env=admission_env)
     build_env = build.get('environment')
     expected_build_env = {key: env[key] for key in ('HOME', 'CARGO_HOME', 'TMPDIR', 'RUSTUP_HOME',
                           'RUSTUP_TOOLCHAIN', 'RUSTC', 'OXIDE_CONFIG', 'OXIDE_POOL',
