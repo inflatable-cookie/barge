@@ -92,6 +92,9 @@ pub(crate) fn parse_manifest(bytes: &[u8]) -> Result<ManifestRequest, String> {
             .get(key)
             .ok_or_else(|| format!("the manifest has no `{key}` member"))
     }
+    if member(&document, "schema")?.as_str() != Some("oxide.capture.manifest/1") {
+        return Err("the manifest schema is not oxide.capture.manifest/1".to_owned());
+    }
     let case = member(&document, "case")?
         .as_str()
         .ok_or_else(|| "the manifest's `case` is not a string".to_owned())?
@@ -108,6 +111,9 @@ pub(crate) fn parse_manifest(bytes: &[u8]) -> Result<ManifestRequest, String> {
         .as_str()
         .ok_or_else(|| "the manifest's `barge.area` is not a string".to_owned())?
         .to_owned();
+    if case.is_empty() || namespace.is_empty() || area.is_empty() {
+        return Err("the manifest case, namespace and area must be nonempty".to_owned());
+    }
     let named_roots = match member(barge, "named_roots") {
         Ok(value) => value
             .as_array()
@@ -123,6 +129,9 @@ pub(crate) fn parse_manifest(bytes: &[u8]) -> Result<ManifestRequest, String> {
     };
     let volume_uuid = VolumeUuid::parse(uuid_text)
         .map_err(|error| format!("the manifest's volume UUID is not a UUID: {error}"))?;
+    if named_roots.len() > 64 || named_roots.iter().any(String::is_empty) {
+        return Err("the manifest named roots are empty or exceed the 64-root bound".to_owned());
+    }
     Ok(ManifestRequest {
         case,
         volume_uuid,
@@ -240,10 +249,20 @@ pub(crate) fn verify_export(receipt: &Path, expected: &str) -> Result<String, St
     }
     let files = doc["files"].as_object().ok_or_else(|| "missing source files".to_owned())?;
     if files.is_empty() { return Err("empty source inventory".to_owned()); }
+    let mut expected_files = std::collections::BTreeSet::new();
+    let mut expected_dirs = std::collections::BTreeSet::new();
     for (name, record) in files {
         let rel = Path::new(name);
-        if rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+        if rel.as_os_str().is_empty()
+            || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
             return Err("invalid source path".to_owned());
+        }
+        expected_files.insert(rel.to_path_buf());
+        let mut parent = rel.parent();
+        while let Some(path) = parent {
+            if path.as_os_str().is_empty() { break; }
+            expected_dirs.insert(path.to_path_buf());
+            parent = path.parent();
         }
         let mut path = root.clone();
         let mut components = rel.components().peekable();
@@ -266,11 +285,76 @@ pub(crate) fn verify_export(receipt: &Path, expected: &str) -> Result<String, St
         };
         if crate::digest::sha256_hex(&content) != expected_file { return Err(format!("source digest mismatch: {name}")); }
     }
+    let mut pending = vec![PathBuf::new()];
+    let mut seen = 0_usize;
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(root.join(&dir)).map_err(|e| format!("source listing: {e}"))? {
+            let entry = entry.map_err(|e| format!("source entry: {e}"))?;
+            seen = seen.saturating_add(1);
+            if seen > 100_000 { return Err("source inventory exceeds its bound".to_owned()); }
+            let relative = dir.join(entry.file_name());
+            let kind = entry.file_type().map_err(|e| format!("source type: {e}"))?;
+            if kind.is_dir() && !kind.is_symlink() {
+                if !expected_dirs.remove(&relative) { return Err("unexpected source directory".to_owned()); }
+                pending.push(relative);
+            } else if !expected_files.remove(&relative) {
+                return Err("unexpected source entry".to_owned());
+            }
+        }
+    }
+    if !expected_files.is_empty() || !expected_dirs.is_empty() {
+        return Err("source inventory is incomplete".to_owned());
+    }
     if files.get("Cargo.lock").and_then(|v| v["sha256"].as_str()) != Some(lock)
         || files.get("rust-toolchain.toml").and_then(|v| v["sha256"].as_str()) != Some(toolchain) {
         return Err("lockfile or toolchain binding mismatch".to_owned());
     }
     Ok(format!("sha256:{expected}"))
+}
+
+/// Compare the fixed Barge source obligations in the provisional manifest
+/// proposal with the independently verified receipt. This does not validate
+/// the rest of the shared schema or establish observation coverage.
+pub(crate) fn verify_manifest_binding(
+    manifest: &[u8], receipt: &Path, expected: &str,
+) -> Result<(), String> {
+    use std::io::Read;
+    let mut receipt_bytes = Vec::new();
+    std::fs::File::open(receipt).map_err(|e| format!("cannot reopen receipt: {e}"))?
+        .take(8 * 1024 * 1024 + 1).read_to_end(&mut receipt_bytes)
+        .map_err(|e| format!("cannot reread receipt: {e}"))?;
+    if receipt_bytes.len() > 8 * 1024 * 1024 || crate::digest::sha256_hex(&receipt_bytes) != expected {
+        return Err("receipt changed while binding the manifest".to_owned());
+    }
+    let export: serde_json::Value = serde_json::from_slice(&receipt_bytes)
+        .map_err(|e| format!("invalid export receipt: {e}"))?;
+    let doc: serde_json::Value = serde_json::from_slice(manifest)
+        .map_err(|e| format!("invalid manifest: {e}"))?;
+    let source = doc.get("source").ok_or_else(|| "manifest source binding is missing".to_owned())?;
+    if source["barge_pin"] != "4af9360bd09629e970c143080ca159de8eef2562"
+        || source["barge_slice_commit"] != export["commit"]
+        || source["staged_lock_sha256"] != export["lock_sha256"]
+        || source["barge_executable_sha256"] != export["executable_sha256"]
+    {
+        return Err("manifest and staged source binding disagree".to_owned());
+    }
+    let version = source["barge_toolchain"].as_str().unwrap_or_default();
+    if version != "1.97.1" && version != export["rustc_version"].as_str().unwrap_or_default() {
+        return Err("manifest toolchain binding disagrees".to_owned());
+    }
+    let recorded = source["barge_files"].as_object()
+        .ok_or_else(|| "manifest Barge file binding is missing".to_owned())?;
+    let exported = export["files"].as_object()
+        .ok_or_else(|| "export file binding is missing".to_owned())?;
+    let expected_files: Vec<_> = exported.iter()
+        .filter(|(path, _)| path.starts_with("crates/barge/src/"))
+        .collect();
+    if expected_files.is_empty() || expected_files.len() != recorded.len()
+        || expected_files.iter().any(|(path, entry)| recorded.get(*path) != entry.get("sha256"))
+    {
+        return Err("manifest Barge source files disagree with the export".to_owned());
+    }
+    Ok(())
 }
 
 /// Run one window: open the tape, call the actual `release::plan` with the
@@ -324,6 +408,7 @@ pub(crate) fn run_bound(
         write_apparatus_refusal(transcript_out, Some(manifest_bytes), &reason)?;
         return Err(reason);
     }
+    crate::tape::attach_obligations(manifest_bytes);
 
     // The caller clock is a real reading; the tape records it as the window's
     // first clock row through state::now_ms's own leaf statement.
@@ -356,8 +441,22 @@ pub(crate) fn run_bound(
             let exit_code = if report.needs_human() { 3 } else { 0 };
             let eligible = report.plan.eligible_count;
             let engine_truncated = report.plan.timed_out || report.plan.truncated;
-            let result = serde_json::to_value(&report)
-                .map_err(|error| format!("the engine's report cannot be serialized: {error}"))?;
+            let result = match serde_json::to_value(&report) {
+                Ok(result) => result,
+                Err(error) => {
+                    let reason = format!("the engine's report cannot be serialized: {error}");
+                    let document = crate::tape::finish_omitted(crate::tape::EngineOutcome {
+                        status: "completed",
+                        exit_code,
+                        refusal_kind: None,
+                        refusal_message: None,
+                        refusal_detail: Vec::new(),
+                        engine_truncated,
+                    })?;
+                    write_transcript(transcript_out, &document)?;
+                    return Err(reason);
+                }
+            };
             write_transcript(
                 transcript_out,
                 &finish(
@@ -430,7 +529,7 @@ pub(crate) fn write_apparatus_refusal(
     manifest: Option<&[u8]>,
     reason: &str,
 ) -> Result<(), String> {
-    let document = serde_json::json!({
+    let mut document = serde_json::json!({
         "schema": crate::tape::TRANSCRIPT_SCHEMA,
         "engine": "barge",
         "manifest_sha256": manifest.map(crate::digest::sha256_hex),
@@ -443,9 +542,14 @@ pub(crate) fn write_apparatus_refusal(
             "occurrences_per_key": CAP_OCCURRENCES, "process_rows": 0,
             "dropped_rows": 0 }
     });
-    let bytes = serde_json::to_string(&document)
-        .map_err(|error| format!("the apparatus refusal cannot be serialized: {error}"))?;
-    write_transcript(path, &bytes)
+    loop {
+        let bytes = serde_json::to_string(&document)
+            .map_err(|error| format!("the apparatus refusal cannot be serialized: {error}"))?;
+        if document["caps"]["document_bytes"].as_u64() == Some(bytes.len() as u64) {
+            return write_transcript(path, &bytes);
+        }
+        document["caps"]["document_bytes"] = bytes.len().into();
+    }
 }
 
 /// Write the transcript document to the caller's path.
@@ -458,8 +562,15 @@ fn write_transcript(path: &Path, transcript: &str) -> Result<(), String> {
         .map_err(|error| format!("the transcript cannot be written: {error}"))?;
     let document: serde_json::Value = serde_json::from_str(transcript)
         .map_err(|error| format!("the transcript cannot be inspected: {error}"))?;
-    if document["outcome"]["refusal_kind"] == "document_cap" {
-        return Err("the transcript exceeded its document cap".to_owned());
+    let caps = &document["caps"];
+    if document["outcome"]["refusal_kind"] == "document_cap"
+        || caps["document_truncated"] == true
+        || caps["read_rows_exhausted"] == true
+        || caps["occurrences_exhausted"] == true
+        || caps["process_rows_exhausted"] == true
+        || caps["dropped_rows"].as_u64().unwrap_or(0) != 0
+    {
+        return Err("the transcript was truncated or a capture cap was exhausted".to_owned());
     }
     Ok(())
 }
@@ -843,6 +954,24 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_capture_is_written_then_refused() {
+        let fixture = crate::testkit::TempDir::new("tape-cap-refusal");
+        let path = fixture.path().join("cap.json");
+        let document = serde_json::json!({
+            "schema": crate::tape::TRANSCRIPT_SCHEMA,
+            "outcome": { "status": "completed", "exit_code": 0 },
+            "caps": { "occurrences_exhausted": true, "dropped_rows": 1 }
+        });
+        let bytes = serde_json::to_string(&document).expect("JSON");
+        assert!(write_transcript(&path, &bytes).is_err());
+        let actual: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(path).expect("written transcript"),
+        ).expect("JSON");
+        assert_eq!(actual["outcome"]["status"], "completed");
+        assert_eq!(actual["caps"]["dropped_rows"], 1);
+    }
+
+    #[test]
     fn export_binding_refuses_missing_and_mismatched_receipts() {
         let fixture = crate::testkit::TempDir::new("tape-export-binding");
         let receipt = fixture.path().join("export.json");
@@ -877,6 +1006,9 @@ mod tests {
         let bytes = serde_json::to_vec(&doc).expect("receipt JSON");
         std::fs::write(&receipt, &bytes).expect("receipt");
         assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes)).is_ok());
+        std::fs::write(source.join("unexpected"), b"extra").expect("extra source");
+        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes)).is_err());
+        std::fs::remove_file(source.join("unexpected")).expect("remove fixture file");
         std::fs::write(source.join("Cargo.lock"), b"changed").expect("changed source");
         assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes)).is_err());
         std::fs::write(source.join("Cargo.lock"), b"lock").expect("restored source");
@@ -884,6 +1016,36 @@ mod tests {
         let changed = serde_json::to_vec(&doc).expect("changed receipt JSON");
         std::fs::write(&receipt, &changed).expect("changed receipt");
         assert!(verify_export(&receipt, &crate::digest::sha256_hex(&changed)).is_err());
+    }
+
+    #[test]
+    fn manifest_binding_requires_the_exported_commit_and_each_source_file() {
+        let fixture = crate::testkit::TempDir::new("tape-manifest-binding");
+        let receipt = fixture.path().join("export.json");
+        let commit = "a".repeat(40);
+        let lock = "b".repeat(64);
+        let executable = "c".repeat(64);
+        let file = "d".repeat(64);
+        let export = serde_json::json!({
+            "commit": commit, "lock_sha256": lock, "executable_sha256": executable,
+            "rustc_version": "rustc 1.97.1 example",
+            "files": {"crates/barge/src/lib.rs": {"sha256": file}}
+        });
+        let bytes = serde_json::to_vec(&export).expect("receipt JSON");
+        std::fs::write(&receipt, &bytes).expect("receipt");
+        let mut manifest = serde_json::json!({"source": {
+            "barge_pin": "4af9360bd09629e970c143080ca159de8eef2562",
+            "barge_slice_commit": commit, "staged_lock_sha256": lock,
+            "barge_executable_sha256": executable, "barge_toolchain": "1.97.1",
+            "barge_files": {"crates/barge/src/lib.rs": file}
+        }});
+        let digest = crate::digest::sha256_hex(&bytes);
+        assert!(verify_manifest_binding(&serde_json::to_vec(&manifest).unwrap(), &receipt, &digest).is_ok());
+        manifest["source"]["barge_files"]["crates/barge/src/lib.rs"] = "e".repeat(64).into();
+        assert!(verify_manifest_binding(&serde_json::to_vec(&manifest).unwrap(), &receipt, &digest).is_err());
+        manifest["source"]["barge_files"]["crates/barge/src/lib.rs"] = file.into();
+        manifest["source"]["barge_slice_commit"] = "f".repeat(40).into();
+        assert!(verify_manifest_binding(&serde_json::to_vec(&manifest).unwrap(), &receipt, &digest).is_err());
     }
 
     #[test]
@@ -927,6 +1089,7 @@ mod tests {
     #[test]
     fn the_manifest_parse_binds_its_members() {
         let manifest = serde_json::json!({
+            "schema": "oxide.capture.manifest/1",
             "case": "LEG-LISTED",
             "barge": {
                 "volume_uuid": "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
@@ -942,6 +1105,12 @@ mod tests {
         assert_eq!(request.namespace, "oxide");
         assert_eq!(request.area, "outputs");
         assert_eq!(request.named_roots, vec!["root-a".to_owned()]);
+        let mut wrong_schema = manifest.clone();
+        wrong_schema["schema"] = "unknown".into();
+        assert!(parse_manifest(&serde_json::to_vec(&wrong_schema).unwrap()).is_err());
+        let mut too_many = manifest.clone();
+        too_many["barge"]["named_roots"] = serde_json::json!(vec!["root-a"; 65]);
+        assert!(parse_manifest(&serde_json::to_vec(&too_many).unwrap()).is_err());
         let broken = serde_json::json!({"case": "X"});
         assert!(parse_manifest(&serde_json::to_vec(&broken).unwrap()).is_err());
     }

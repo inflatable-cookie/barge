@@ -124,6 +124,12 @@ def main():
                 if p.is_file() or p.is_symlink()}
     if observed != set(members):
         raise RuntimeError('source gained or lost files during build')
+    expected_dirs = {parent.as_posix() for name in members
+                     for parent in Path(name).parents if parent != Path('.')}
+    actual_dirs = {p.relative_to(source).as_posix() for p in source.rglob('*')
+                   if p.is_dir() and not p.is_symlink()}
+    if actual_dirs != expected_dirs:
+        raise RuntimeError('source gained or lost directories during build')
     artifacts = []
     for line in output.splitlines():
         try:

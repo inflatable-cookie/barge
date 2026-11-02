@@ -142,7 +142,12 @@ builds through the stage selector, refuses changed source or a missing unique
 default-feature executable, and records the executable, compiler and private
 Oxide digests. The external harness requires the receipt and its independently
 supplied digest; it checks the executable and every listed source byte before
-the engine window. Its binding is the receipt digest, not an evaluator leaf.
+the engine window. It also compares the provisional manifest's Barge pin,
+slice commit, complete `crates/barge/src/` file digest map, staged lock,
+toolchain and Barge executable digest to that receipt, refusing missing or
+mismatched fields. This prepares the proposed source binding; it is not
+validation of the complete shared schema. Its binding is the receipt digest,
+not an evaluator leaf.
 `scripts/tape/private-wrapper.py` is source for a private launcher with a dry
 inventory and before/after gate. It currently refuses before either mode:
 admission subprocess isolation and aggregate scratch accounting have not been
@@ -230,19 +235,45 @@ characters in names do not merge distinct observations. These source changes
 and their regression controls have not yet been compiled or executed.
 
 There are additional known apparatus gaps. `missing_obligations` can compare
-an internal source-site, kind and identity tuple to proven rows, and refuses
-to satisfy one with an unproven or refused row. It is not connected to the
-manifest parser and does not reconcile extra reads, dynamic facts, effects or
-exhausted caps. The pending shared schema must supply that adapter; this helper
-does not establish obligation coverage. The provisional harness emits a
+an internal source-site and identity tuple to proven rows, and refuses
+to satisfy one with an unproven or refused row. A provisional projection of
+`mandatory_observations` reports missing and unmapped manifest indices after
+capture, while its status remains `insufficient` regardless of matches. Unknown
+identity fields, unsupported volume binding, missing input and the 256-key cap
+are explicit; no field is dropped to produce a positive match. This projection
+does not reconcile extra reads, dynamic facts or effects and has not been
+approved as the shared schema. It does not establish obligation coverage. The
+provisional harness emits a
 bounded apparatus-refusal document for manifest parse, case-mismatch,
 unreadable manifest, state-path resolution and window-open failures once an
-output path is known. It records that the engine did not run; an unwritable
+output path is known. Malformed argv also writes one when it identifies exactly
+one unambiguous transcript destination. It records that the engine did not run; an unwritable
 output or missing output argument cannot carry a document. Its wire fields are
 provisional pending shared-schema review. If
 effects, clocks and the result exceed the document cap after all read rows are
 dropped, `finish` emits a bounded refusal with omitted counts and original
-engine status; those provisional fields still require shared-schema review.
+engine status. It carries the original outcome when that fits within a
+64-KiB summary bound; otherwise it records its digest and explicitly marks it
+omitted. Those provisional fields still require shared-schema review.
+Any exhausted capture cap or dropped read causes an apparatus error after the
+transcript is written, retaining the actual engine outcome. If a completed
+report cannot be serialized, the document records its omission and the real
+engine status and exit code; it does not invent a report.
+The document byte count is the serialized document's actual length, including
+the length field itself. When a document is too large, deterministic tail
+batches are omitted and counted rather than reserializing once per row; the
+result is explicitly truncated and is not coverage.
+
+Oxide PR #230 at `6e8ca1f07a3e26be9e96ff55fd774b0f8185165a` remained open
+without a retained approval when inspected. Its proposal represents an
+obligation as engine, site and identity, with no `kind` field; the internal
+matcher consequently uses site and identity after the caller has selected the
+Barge engine. The proposed volume identity also carries a string device and
+window identity, while this recorder has neither field in that shape. A
+future adapter must refuse those unbound keys rather than discard fields or
+claim a match. The harness checks the fixed schema name and 64 named-root bound,
+but does not validate that proposal or its other aggregate obligations.
+
 Other apparatus-error cases still require review against the eventual shared
 schema; that schema must not be treated as already settled. No successful
 comparison follows from any of these gaps.
@@ -290,8 +321,8 @@ The current source map against that O1 pin, for reviewer inspection, is:
 | `registry.rs` | `read_with_deadline` | The complete original `let bytes = match state::read_bounded(...)` and `let document = serde_json::from_slice(...).map_err(...)?` statements remain verbatim in `cfg(not(test))`. Test branches use the same read and parser once, record their consumed outcomes, and return the same named errors. Validation follows both branches unchanged. |
 | `state.rs` | `read_bounded_inner`, `publish_atomic_with`, `publish_open_file`, `sync_directory`, `now_ms`, `StateLock`, `wait_for_lock`, `read_intents_with_deadline` | The O1 NotFound arms of bounded read, shared lock and intent directory read remain verbatim in non-test branches; test arms return the same absent values after recording. Other read and lock additions observe existing values or error branches. Publication retains the original create, cleanup unlink, write, rename and directory-sync statements in non-test branches; test branches execute each original operation once through the recorder and retain its error handling. `file.sync_all` remains the original statement. `now_ms` retains its original expression under `cfg(not(test))`; the test branch evaluates it once and returns the recorded value. Intent enumeration uses the existing entry name and preserves its sorted result. |
 | `release.rs` | no tape delta against O1 | Caller clock observations come from `state::now_ms`; release's original calls remain in place. |
-| `lib.rs`, `Cargo.toml`, `tests/tape_eval.rs`, `tape.rs`, `tape_harness.rs` | test-only modules, harness target and recorder | Test surface and target declarations only; release compile-away and per-statement review remain missing. |
-| `effect.rs`, `guard.rs`, `undo_capture.rs` | source-link shadows for the included test target | These links require target/build review; no production module declarations are added. |
+| `lib.rs`, `Cargo.toml`, `tests/tape_eval.rs`, `tape.rs`, `tape_harness.rs` | test-only modules, harness target and recorder | The O1 library declarations remain intact; `lib.rs` adds only `cfg(test)` crate-private tape and harness modules. The Cargo addition is a `[[test]]` target, with no dependency or feature change. `tests/tape_eval.rs` includes the existing library source as test-target modules; the two new recorder modules are test-only. Release compile-away remains unverified. |
+| `effect.rs`, `guard.rs`, `undo_capture.rs` | source-link shadows for the included test target | These are Git symlinks respectively to `space/effect.rs`, `space/guard.rs` and `cache/undo_capture.rs`. The original production child-module declarations remain in their original parents; `lib.rs` adds no top-level declarations for these shadows. They resolve the same existing bytes for the included test-target parent modules. Their actual target/build reachability remains unverified until compilation. |
 
 This map identifies the changes for review; it is not a completed proof that
 every newly added item compiles away. In particular, a textual diff cannot
@@ -334,6 +365,52 @@ the state publication helpers. Root custody goes through
 marker, identity and process-observer checks. The method-level trace still
 needs to account for every platform leaf and error branch before it can be
 called a complete transitive write proof.
+
+Within `custody::decide` (custody.rs:644), the state operations are hold and
+registry reads. It opens the area and parent, obtains child facts and a
+directory handle, reads the marker, asks for the current pid/start and scans
+descriptors; it does not call a `DirOps` create, publish, rename, unlink or
+sync operation. Its early returns do not run cleanup writes. The area folder
+walk is `walk_folder_chain` → `walk_folder`, using child facts and directory
+opens (area.rs:1041); it reports the remainder when absent, it does not create
+it. `StatePaths::resolve` also constructs paths without initialization
+(state.rs, `StatePaths::resolve`); its separate `initialize` method is not
+called from the harness or plan. At the macOS `DirOps` boundary, `open_path`
+opens a directory; `path_facts` uses `lstat`; `open_child_dir` uses `openat`
+with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW`; `child_facts` uses no-follow
+`fstatat`; `read_child_file` uses read-only no-follow `openat` and reads; and
+`list_children`/`list_names` duplicate the descriptor and use `readdir`
+(os/macos.rs:3647–4263). `dir_facts` and `recheck_dir` only query the open
+descriptor (os/macos.rs:4342, 4383). The mutation methods in that implementation
+are separate: create/publish/remove/rename (os/macos.rs:3803, 3831, 4264,
+4296), plus `set_dir_mode` and `create_child_symlink` (os/macos.rs:4362, 4403).
+The concrete harness supplies `MacOs` for every platform trait, rather than a
+caller-provided mutation callback. Its descriptor scan starts with
+`process_table` and `scan_processes` (os/macos.rs:958, 1015, 2817); the
+production call supplies an empty fault list. Its process table and individual
+identity `sysctl` calls pass a null new-value pointer and zero new-value size,
+and descriptor enumeration uses `proc_pidinfo`/`proc_pidfdinfo` and
+`csops(CS_OPS_STATUS)`. Retry paths re-observe or sleep; they do not write a
+fixture. The process-table allocation before the cap remains separately
+unbounded and is not qualified by this source review. Volume identification
+uses read-only directory opens, `getfsstat`, `fstatfs`, `fstat` and volume UUID
+attribute reads (os/macos.rs:176–415, 445–505, 4480–4680). The volume-flush
+fork and sync path (os/macos.rs:552 onward) is a separate operation, not called
+by those identification methods or `release::plan`.
+
+For this concrete `release::plan` window, the reviewed branches therefore do
+not call a data-mutating operation: its effect set is empty if that source
+trace holds at execution. The excluded publication/effect entry points still
+record their attempts and outcomes when exercised by tests; an attempted write
+is never removed to make a transcript empty. This is a static source finding,
+not a runtime receipt or proof that the fixed tape captures every read.
+
+Effect rows carry the call-site file and line separately from the closed
+effect kind. A failed operation records its actual error and
+`partial_effect_possible`; in particular, `write_all` does not report whether
+earlier writes succeeded before an error. This preserves uncertainty instead of claiming
+either a successful full save or no mutation. The row and field are provisional
+wire details pending shared-schema review.
 
 The ordinary test suite includes
 `ordinary_account_tests::an_ordinary_build_takes_oxide_directories_from_the_password_database_home`.

@@ -70,7 +70,7 @@ use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::digest::sha256_hex;
 
@@ -89,7 +89,8 @@ pub(crate) const CAP_PROCESS_ROWS: usize = 512;
 
 /// Facts actually supplied for an observation. Missing fields remain absent;
 /// a lexical path alone is not a complete object identity.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Identity {
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
@@ -300,7 +301,6 @@ pub(crate) struct ReadRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Obligation {
     pub(crate) site: String,
-    pub(crate) kind: String,
     pub(crate) identity: Identity,
 }
 
@@ -312,7 +312,6 @@ pub(crate) fn missing_obligations(obligations: &[Obligation], rows: &[ReadRow]) 
         let duplicate = obligations[..index].contains(obligation);
         let matched = !duplicate && rows.iter().any(|row| {
             row.site == obligation.site
-                && row.kind == obligation.kind
                 && row.identity == obligation.identity
                 && row.observation_proven
                 && !matches!(&row.outcome, Outcome::Refused { .. })
@@ -326,6 +325,7 @@ pub(crate) fn missing_obligations(obligations: &[Obligation], rows: &[ReadRow]) 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct EffectRow {
     kind: &'static str,
+    site: String,
     path: Option<String>,
     // Retain the exact path only for matching the result to its attempt. The
     // provisional wire representation still refuses to invent UTF-8 text.
@@ -337,6 +337,8 @@ pub(crate) struct EffectRow {
     inode: Option<u64>,
     destination: Option<String>,
     outcome: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    partial_effect_possible: bool,
     epoch: u64,
 }
 
@@ -412,6 +414,9 @@ pub(crate) struct Transcript<'a> {
     /// The engine's own result in its own document, when it completed.
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    result_omitted: bool,
+    obligations: ObligationReport,
     effects: &'a [EffectRow],
     reads: &'a [ReadRow],
     clocks: &'a [ClockRow],
@@ -423,6 +428,21 @@ pub(crate) struct Transcript<'a> {
 struct Entrypoint<'a> {
     symbol: &'static str,
     source_binding: &'a str,
+}
+
+/// Provisional diagnostics only: this is never an assertion of parity or
+/// complete reconciliation, even if no missing index is listed.
+#[derive(Debug, Serialize)]
+struct ObligationReport {
+    status: &'static str,
+    input_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_unavailable_reason: Option<&'static str>,
+    unmapped: usize,
+    unmapped_indices: Vec<usize>,
+    missing: Vec<usize>,
+    extra_reads_unchecked: bool,
+    effects_unchecked: bool,
 }
 
 /// The per-thread recorder state. The plan is single-threaded, so one
@@ -441,6 +461,11 @@ struct Tape {
     occurrences_exhausted: bool,
     process_rows_exhausted: bool,
     dropped_rows: u64,
+    obligations: Option<Vec<Obligation>>,
+    obligation_input_error: Option<&'static str>,
+    obligation_indices: Vec<usize>,
+    unmapped_obligations: usize,
+    unmapped_indices: Vec<usize>,
 }
 
 impl Tape {
@@ -464,8 +489,75 @@ impl Tape {
             occurrences_exhausted: false,
             process_rows_exhausted: false,
             dropped_rows: 0,
+            obligations: None,
+            obligation_input_error: None,
+            obligation_indices: Vec::new(),
+            unmapped_obligations: 0,
+            unmapped_indices: Vec::new(),
         }
     }
+}
+
+/// Attach a provisional manifest projection. Unsupported identity fields are
+/// retained as unmapped rather than being dropped to manufacture a match.
+pub(crate) fn attach_obligations(manifest: &[u8]) {
+    fn unavailable(reason: &'static str) {
+        TAPE.with(|tape| {
+            let mut tape = tape.borrow_mut();
+            if tape.config.is_some() { tape.obligation_input_error = Some(reason); }
+        });
+    }
+    let document: serde_json::Value = match serde_json::from_slice(manifest) {
+        Ok(document) => document,
+        Err(_) => { unavailable("invalid_manifest"); return; },
+    };
+    let Some(rows) = document.get("mandatory_observations").and_then(serde_json::Value::as_array) else {
+        unavailable("mandatory_observations_missing_or_invalid");
+        return;
+    };
+    if rows.len() > 256 { unavailable("mandatory_observations_cap"); return; }
+    let mut obligations = Vec::new();
+    let mut indices = Vec::new();
+    let mut unmapped = 0_usize;
+    let mut unmapped_indices = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let Some(object) = row.as_object() else { unmapped += 1; unmapped_indices.push(index); continue; };
+        if object.keys().any(|key| !matches!(key.as_str(), "engine" | "site" | "identity")) {
+            unmapped += 1;
+            unmapped_indices.push(index);
+            continue;
+        }
+        match object.get("engine").and_then(serde_json::Value::as_str) {
+            Some("oxide") => continue,
+            Some("barge") => {},
+            _ => { unmapped += 1; unmapped_indices.push(index); continue; }
+        }
+        let Some(site) = object.get("site").and_then(serde_json::Value::as_str).filter(|site| !site.is_empty()) else {
+            unmapped += 1;
+            unmapped_indices.push(index);
+            continue;
+        };
+        let identity = object.get("identity").cloned().and_then(|identity| serde_json::from_value::<Identity>(identity).ok());
+        match identity {
+            Some(identity) if (identity.fd.is_none_or(|fd| fd >= 0)) && ((identity.path.as_deref().is_some_and(|path| !path.is_empty()) && identity.parent_device.is_some()
+                && identity.parent_inode.is_some() && identity.device.is_some() && identity.inode.is_some())
+                || (identity.component.as_deref().is_some_and(|component| !component.is_empty()) && identity.parent_device.is_some() && identity.parent_inode.is_some())
+                || (identity.pid.is_some_and(|pid| pid != 0) && identity.start.is_some_and(|start| start != 0) && identity.uid.is_some())) => {
+                    obligations.push(Obligation { site: site.to_owned(), identity });
+                    indices.push(index);
+                }
+            _ => { unmapped += 1; unmapped_indices.push(index); },
+        }
+    }
+    TAPE.with(|tape| {
+        let mut tape = tape.borrow_mut();
+        if tape.config.is_some() {
+            tape.obligations = Some(obligations);
+            tape.obligation_indices = indices;
+            tape.unmapped_obligations = unmapped;
+            tape.unmapped_indices = unmapped_indices;
+        }
+    });
 }
 
 thread_local! {
@@ -505,6 +597,20 @@ pub(crate) fn finish(
     outcome: EngineOutcome,
     result: Option<&serde_json::Value>,
 ) -> Result<String, String> {
+    finish_inner(outcome, result, false)
+}
+
+/// The evaluator returned a report but the apparatus could not serialize it.
+/// Preserve its real status, exit code and observed rows; do not invent a report.
+pub(crate) fn finish_omitted(outcome: EngineOutcome) -> Result<String, String> {
+    finish_inner(outcome, None, true)
+}
+
+fn finish_inner(
+    outcome: EngineOutcome,
+    result: Option<&serde_json::Value>,
+    result_omitted: bool,
+) -> Result<String, String> {
     TAPE.with(|tape| {
         let mut tape = tape.borrow_mut();
         let config = tape
@@ -514,8 +620,11 @@ pub(crate) fn finish(
         if result.is_some() && outcome.status != "completed" {
             return Err("a refused window carries no engine result".to_owned());
         }
-        if result.is_none() && outcome.status != "refused" {
+        if result.is_none() && outcome.status != "refused" && !result_omitted {
             return Err("a completed window carries the engine result".to_owned());
+        }
+        if result_omitted && (outcome.status != "completed" || result.is_some()) {
+            return Err("only an unavailable completed result can be omitted".to_owned());
         }
         let mut caps = Caps {
             read_rows: tape.reads.len(),
@@ -544,6 +653,20 @@ pub(crate) fn finish(
                 outcome: &outcome,
                 observation_complete: false,
                 result,
+                result_omitted,
+                obligations: ObligationReport {
+                    status: "insufficient",
+                    input_available: tape.obligations.is_some(),
+                    input_unavailable_reason: tape.obligation_input_error,
+                    unmapped: tape.unmapped_obligations,
+                    unmapped_indices: tape.unmapped_indices.clone(),
+                    missing: tape.obligations.as_ref().map_or_else(Vec::new, |keys| {
+                        missing_obligations(keys, &reads).into_iter()
+                            .map(|index| tape.obligation_indices[index]).collect()
+                    }),
+                    extra_reads_unchecked: true,
+                    effects_unchecked: true,
+                },
                 effects: &tape.effects,
                 reads: &reads,
                 clocks: &tape.clocks,
@@ -551,18 +674,27 @@ pub(crate) fn finish(
             };
             let bytes = serde_json::to_string(&document)
                 .map_err(|error| format!("the transcript cannot be serialized: {error}"))?;
+            // The decimal length field itself contributes to the encoded size.
+            // Iterate to a fixed point before deciding whether it fits.
+            if caps.document_bytes != bytes.len() {
+                caps.document_bytes = bytes.len();
+                continue;
+            }
             if bytes.len() <= CAP_DOCUMENT_BYTES {
                 tape.reset_without_window();
                 return Ok(bytes);
             }
-            let Some(dropped) = reads.pop() else {
+            if reads.is_empty() {
                 // The result, effects, clocks or even invocation strings may
                 // exceed the cap on their own. Do not emit an apparently
                 // complete empty effect set or pretend the engine refused.
                 let omitted_effects = tape.effects.len();
                 let omitted_clocks = tape.clocks.len();
                 caps.document_truncated = true;
-                let refusal = serde_json::json!({
+                caps.document_bytes = 0;
+                let original = serde_json::to_vec(&outcome)
+                    .map_err(|error| format!("the engine outcome cannot be serialized: {error}"))?;
+                let mut refusal = serde_json::json!({
                     "schema": TRANSCRIPT_SCHEMA,
                     "engine": ENGINE,
                     "case_sha256": sha256_hex(config.case.as_bytes()),
@@ -572,22 +704,46 @@ pub(crate) fn finish(
                         "refusal_kind": "document_cap", "refusal_message": "transcript payload exceeds document cap" },
                     "original_engine_status": outcome.status,
                     "original_engine_exit_code": outcome.exit_code,
-                    "result_omitted": result.is_some(),
+                    "original_engine_outcome_sha256": sha256_hex(&original),
+                    "original_engine_outcome_omitted": original.len() > 65536,
+                    "result_omitted": result.is_some() || result_omitted,
                     "effects_omitted": omitted_effects,
                     "clocks_omitted": omitted_clocks,
+                    "obligations_omitted": true,
+                    "obligation_input_available": tape.obligations.is_some(),
+                    "obligation_input_error": tape.obligation_input_error,
+                    "obligation_count": tape.obligations.as_ref().map_or(0, Vec::len),
+                    "unmapped_obligations": tape.unmapped_obligations,
                     "observation_complete": false,
                     "caps": caps,
                 });
+                if original.len() <= 65536 {
+                    refusal["original_engine_outcome"] = serde_json::from_slice(&original)
+                        .map_err(|error| format!("the engine outcome cannot be inspected: {error}"))?;
+                }
                 tape.reset_without_window();
-                return serde_json::to_string(&refusal)
-                    .map_err(|error| format!("the cap refusal cannot be serialized: {error}"));
-            };
-            if matches!(dropped.kind, "process-row" | "process-observation") {
-                caps.process_rows = caps.process_rows.saturating_sub(1);
+                loop {
+                    let bytes = serde_json::to_string(&refusal)
+                        .map_err(|error| format!("the cap refusal cannot be serialized: {error}"))?;
+                    if refusal["caps"]["document_bytes"].as_u64() == Some(bytes.len() as u64) {
+                        return Ok(bytes);
+                    }
+                    refusal["caps"]["document_bytes"] = bytes.len().into();
+                }
             }
-            caps.dropped_rows = caps.dropped_rows.saturating_add(1);
+            // Remove a deterministic tail in batches: serializing the whole
+            // 8 MiB document once per dropped row is quadratic at the row cap.
+            let keep = reads.len() / 2;
+            let dropped_count = reads.len() - keep;
+            let dropped_processes = reads[keep..].iter()
+                .filter(|row| matches!(row.kind, "process-row" | "process-observation"))
+                .count();
+            reads.truncate(keep);
+            caps.process_rows = caps.process_rows.saturating_sub(dropped_processes);
+            caps.dropped_rows = caps.dropped_rows.saturating_add(dropped_count as u64);
             caps.document_truncated = true;
             caps.read_rows = reads.len();
+            caps.document_bytes = 0;
         }
     })
 }
@@ -698,7 +854,9 @@ fn clock(kind: &'static str, site: String, value_ms: u64) {
 }
 
 /// Record one effect row on this thread's window.
+#[track_caller]
 fn effect(kind: &'static str, path: &Path) {
+    let caller = std::panic::Location::caller();
     TAPE.with(|tape| {
         let mut tape = tape.borrow_mut();
         if tape.config.is_none() {
@@ -708,6 +866,7 @@ fn effect(kind: &'static str, path: &Path) {
         tape.next_epoch = tape.next_epoch.saturating_add(1);
         tape.effects.push(EffectRow {
             kind,
+            site: format!("{}:{}", caller.file(), caller.line()),
             path: path.to_str().map(str::to_owned),
             match_path: path.to_path_buf(),
             parent_device: None,
@@ -716,13 +875,16 @@ fn effect(kind: &'static str, path: &Path) {
             inode: None,
             destination: None,
             outcome: None,
+            partial_effect_possible: false,
             epoch,
         });
     });
 }
 
 /// Bind an attempt to its already-open parent and, for rename, its destination.
+#[track_caller]
 pub(crate) fn child_effect(kind: &'static str, parent: (u64, u64), name: &str, destination: Option<&str>) {
+    let caller = std::panic::Location::caller();
     TAPE.with(|tape| {
         let mut tape = tape.borrow_mut();
         if tape.config.is_none() { return; }
@@ -730,6 +892,7 @@ pub(crate) fn child_effect(kind: &'static str, parent: (u64, u64), name: &str, d
         tape.next_epoch = tape.next_epoch.saturating_add(1);
         tape.effects.push(EffectRow {
             kind,
+            site: format!("{}:{}", caller.file(), caller.line()),
             path: Some(name.to_owned()),
             match_path: PathBuf::from(name),
             parent_device: Some(parent.0),
@@ -738,6 +901,7 @@ pub(crate) fn child_effect(kind: &'static str, parent: (u64, u64), name: &str, d
             inode: None,
             destination: destination.map(str::to_owned),
             outcome: None,
+            partial_effect_possible: false,
             epoch,
         });
     });
@@ -767,6 +931,7 @@ pub(crate) fn effect_outcome(kind: &str, path: &Path, error: Option<&std::io::Er
             row.kind == kind && row.match_path == path && row.outcome.is_none()
         }) {
             row.outcome = Some(error.map_or_else(|| "succeeded".to_owned(), errno_class));
+            row.partial_effect_possible = error.is_some();
         }
     });
 }
@@ -1107,6 +1272,7 @@ pub(crate) fn custody_record(site: &'static str, pool: &Path, record_id: &str, c
 }
 
 /// Observe the exact I/O result without changing it or repeating the operation.
+#[track_caller]
 pub(crate) fn io_effect<T>(kind: &'static str, path: &Path, operation: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
     write_effect(kind, path);
     let result = operation();
@@ -1115,6 +1281,7 @@ pub(crate) fn io_effect<T>(kind: &'static str, path: &Path, operation: impl FnOn
 }
 
 /// Record an attempted rename, including its destination, then bind its result.
+#[track_caller]
 pub(crate) fn io_rename(source: &Path, destination: &Path, operation: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
     write_effect("rename", source);
     TAPE.with(|tape| {
@@ -1145,6 +1312,7 @@ pub(crate) fn now_ms_at(value_ms: u64, caller: &'static std::panic::Location<'st
 }
 
 /// Record a real or attempted effect from the contract's closed set.
+#[track_caller]
 pub(crate) fn write_effect(kind: &'static str, path: &Path) {
     effect(kind, path);
 }
@@ -1155,11 +1323,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provisional_obligations_report_missing_and_unmapped_without_parity() {
+        begin_window(WindowConfig {
+            case: "obligations".to_owned(), manifest_sha256: "m".to_owned(),
+            entrypoint_symbol: "barge::release::plan", source_binding: "test".to_owned(),
+        }).expect("window");
+        let manifest = serde_json::json!({"mandatory_observations": [
+            {"engine": "barge", "site": "descriptor", "identity": {"pid": 42, "start": 123, "uid": 501, "fd": 4}},
+            {"engine": "barge", "site": "volume", "identity": {"volume_uuid": "uuid", "mount": "/mount", "device": "disk", "window_identity": "epoch"}},
+            {"engine": "oxide", "site": "other", "identity": {"pid": 1, "start": 2, "uid": 3}}
+        ]});
+        attach_obligations(&serde_json::to_vec(&manifest).expect("manifest"));
+        process_context(42, 123, Some(501));
+        fd_entry("descriptor", 42, 4, 1);
+        let transcript = finish(EngineOutcome {
+            status: "completed", exit_code: 0, refusal_kind: None,
+            refusal_message: None, refusal_detail: Vec::new(), engine_truncated: false,
+        }, Some(&serde_json::json!({}))).expect("transcript");
+        let doc: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
+        assert_eq!(doc["obligations"]["status"], "insufficient");
+        assert_eq!(doc["obligations"]["input_available"], true);
+        assert_eq!(doc["obligations"]["unmapped"], 1);
+        assert_eq!(doc["obligations"]["unmapped_indices"], serde_json::json!([1]));
+        assert_eq!(doc["obligations"]["missing"], serde_json::json!([]));
+        assert_eq!(doc["observation_complete"], false);
+    }
+
+    #[test]
+    fn provisional_obligation_missing_index_is_from_the_manifest() {
+        begin_window(WindowConfig {
+            case: "missing".to_owned(), manifest_sha256: "m".to_owned(),
+            entrypoint_symbol: "barge::release::plan", source_binding: "test".to_owned(),
+        }).expect("window");
+        let manifest = serde_json::json!({"mandatory_observations": [
+            {"engine": "oxide", "site": "other", "identity": {"pid": 1, "start": 2, "uid": 3}},
+            {"engine": "barge", "site": "descriptor", "identity": {"pid": 42, "start": 123, "uid": 501, "fd": 4}}
+        ]});
+        attach_obligations(&serde_json::to_vec(&manifest).expect("manifest"));
+        let transcript = finish(EngineOutcome {
+            status: "completed", exit_code: 0, refusal_kind: None,
+            refusal_message: None, refusal_detail: Vec::new(), engine_truncated: false,
+        }, Some(&serde_json::json!({}))).expect("transcript");
+        let doc: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
+        assert_eq!(doc["obligations"]["missing"], serde_json::json!([1]));
+        assert_eq!(doc["obligations"]["status"], "insufficient");
+    }
+
+    #[test]
+    fn provisional_obligation_cap_is_explicitly_insufficient() {
+        begin_window(WindowConfig {
+            case: "cap".to_owned(), manifest_sha256: "m".to_owned(),
+            entrypoint_symbol: "barge::release::plan", source_binding: "test".to_owned(),
+        }).expect("window");
+        let manifest = serde_json::json!({"mandatory_observations": vec![serde_json::json!({}); 257]});
+        attach_obligations(&serde_json::to_vec(&manifest).expect("manifest"));
+        let transcript = finish(EngineOutcome {
+            status: "completed", exit_code: 0, refusal_kind: None,
+            refusal_message: None, refusal_detail: Vec::new(), engine_truncated: false,
+        }, Some(&serde_json::json!({}))).expect("transcript");
+        let doc: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
+        assert_eq!(doc["obligations"]["input_unavailable_reason"], "mandatory_observations_cap");
+        assert_eq!(doc["obligations"]["input_available"], false);
+        assert_eq!(doc["obligations"]["status"], "insufficient");
+    }
+
+    #[test]
+    fn omitted_report_preserves_completed_engine_outcome() {
+        begin_window(WindowConfig {
+            case: "omitted".to_owned(), manifest_sha256: "m".to_owned(),
+            entrypoint_symbol: "barge::release::plan", source_binding: "test".to_owned(),
+        }).expect("window");
+        let bytes = finish_omitted(EngineOutcome {
+            status: "completed", exit_code: 3, refusal_kind: None,
+            refusal_message: None, refusal_detail: Vec::new(), engine_truncated: false,
+        }).expect("transcript");
+        let document: serde_json::Value = serde_json::from_str(&bytes).expect("JSON");
+        assert_eq!(document["outcome"]["status"], "completed");
+        assert_eq!(document["outcome"]["exit_code"], 3);
+        assert_eq!(document["result_omitted"], true);
+        assert!(document.get("result").is_none());
+        assert_eq!(document["observation_complete"], false);
+    }
+
+    #[test]
     fn obligations_require_the_exact_proven_source_and_identity() {
         let identity = Identity::process(42, 123, Some(501), Some(4));
         let obligation = Obligation {
             site: "descriptor".to_owned(),
-            kind: "fd-entry".to_owned(),
             identity: identity.clone(),
         };
         let mut row = ReadRow {
@@ -1413,6 +1663,7 @@ mod tests {
         let document: serde_json::Value =
             serde_json::from_str(&transcript).expect("the transcript parses");
         assert_eq!(document["caps"]["document_truncated"], true);
+        assert_eq!(document["caps"]["document_bytes"], transcript.len());
         assert_eq!(document["caps"]["process_rows"], 0);
         assert!(document["caps"]["dropped_rows"].as_u64().unwrap_or(0) > 0);
     }
@@ -1424,7 +1675,10 @@ mod tests {
         assert!(transcript.len() <= CAP_DOCUMENT_BYTES);
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         assert_eq!(document["outcome"]["refusal_kind"], "document_cap");
+        assert_eq!(document["caps"]["document_bytes"], transcript.len());
         assert_eq!(document["original_engine_status"], "completed");
+        assert_eq!(document["original_engine_outcome"]["status"], "completed");
+        assert_eq!(document["original_engine_outcome_omitted"], false);
         assert_eq!(document["effects_omitted"], 1);
         assert_eq!(document["caps"]["document_truncated"], true);
         assert_eq!(document["observation_complete"], false);
@@ -1532,6 +1786,7 @@ mod tests {
         assert_eq!(caps["occurrences_per_key"], CAP_OCCURRENCES);
         assert_eq!(caps["process_rows"], 0);
         assert_eq!(caps["read_rows"], 0);
+        assert_eq!(caps["document_bytes"], transcript.len());
         // The document cap is enforced at serialization; its bound is stated
         // here as the constant the serializer uses.
         assert_eq!(CAP_DOCUMENT_BYTES, 8 * 1024 * 1024);
@@ -1754,6 +2009,28 @@ mod tests {
         assert_eq!(effects[1]["destination"], "target");
         assert_eq!(effects[1]["outcome"], "succeeded");
         assert_eq!(document["reads"][0]["outcome"]["refused"]["class"], "EIO");
+    }
+
+    #[test]
+    fn failed_save_does_not_claim_that_no_bytes_were_written() {
+        let transcript = window(|| {
+            let _ = io_effect("save", Path::new("file"), || -> std::io::Result<()> {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            });
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        let row = &document["effects"][0];
+        assert_eq!(row["kind"], "save");
+        assert_eq!(row["outcome"], "EIO");
+        assert_eq!(row["partial_effect_possible"], true);
+        assert!(row["site"].as_str().is_some_and(|site| site.contains("tape.rs:")));
+        let other = window(|| {
+            let _ = io_effect("create", Path::new("file"), || -> std::io::Result<()> {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            });
+        });
+        let document: serde_json::Value = serde_json::from_str(&other).expect("transcript");
+        assert_eq!(document["effects"][0]["partial_effect_possible"], true);
     }
 
     #[test]

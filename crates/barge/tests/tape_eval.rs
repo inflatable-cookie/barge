@@ -137,19 +137,22 @@ struct Invocation {
 }
 
 /// Parse the fixed argv contract, or return the usage reason.
-fn parse_args() -> Result<Invocation, String> {
+fn parse_args(arguments: &[String]) -> Result<Invocation, String> {
     let mut fixture_root = None;
     let mut manifest = None;
     let mut transcript_out = None;
     let mut case = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = arguments.iter();
     while let Some(name) = args.next() {
-        let mut value = |name: &str| args.next().ok_or_else(|| format!("--{name} needs a value"));
+        let mut value = |name: &str| args.next().cloned().ok_or_else(|| format!("--{name} needs a value"));
         match name.as_str() {
-            "--fixture-root" => fixture_root = Some(value("fixture-root")?),
-            "--manifest" => manifest = Some(value("manifest")?),
-            "--transcript-out" => transcript_out = Some(value("transcript-out")?),
-            "--case" => case = Some(value("case")?),
+            "--fixture-root" if fixture_root.is_none() => fixture_root = Some(value("fixture-root")?),
+            "--manifest" if manifest.is_none() => manifest = Some(value("manifest")?),
+            "--transcript-out" if transcript_out.is_none() => transcript_out = Some(value("transcript-out")?),
+            "--case" if case.is_none() => case = Some(value("case")?),
+            "--fixture-root" | "--manifest" | "--transcript-out" | "--case" => {
+                return Err(format!("duplicate argument `{name}`"));
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -167,9 +170,26 @@ fn parse_args() -> Result<Invocation, String> {
     })
 }
 
+/// A malformed invocation may still name exactly one unambiguous destination.
+/// Never guess among duplicates or interpret another option as a path.
+fn refusal_destination(arguments: &[std::ffi::OsString]) -> Option<std::path::PathBuf> {
+    if arguments.iter().filter(|arg| *arg == "--transcript-out").count() != 1 {
+        return None;
+    }
+    let mut destinations = arguments.windows(2).filter_map(|pair| {
+        if pair[0] != "--transcript-out" || pair[1].to_string_lossy().starts_with("--") {
+            return None;
+        }
+        Some(std::path::PathBuf::from(&pair[1]))
+    });
+    let first = destinations.next()?;
+    destinations.next().is_none().then_some(first)
+}
+
 fn main() -> std::process::ExitCode {
     // No arguments: the embedded end-to-end exercise over its own fixture.
-    if std::env::args().count() == 1 {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments.is_empty() {
         return match tape_harness::embedded_exercise() {
             Ok(summary) => std::process::ExitCode::from(summary.exit_code),
             Err(reason) => {
@@ -178,9 +198,16 @@ fn main() -> std::process::ExitCode {
             }
         };
     }
-    let invocation = match parse_args() {
+    let decoded = arguments.iter().map(|arg| arg.to_str().map(str::to_owned)
+        .ok_or_else(|| "arguments must be UTF-8".to_owned())).collect::<Result<Vec<_>, _>>();
+    let invocation = match decoded.and_then(|args| parse_args(&args)) {
         Ok(invocation) => invocation,
         Err(reason) => {
+            if let Some(path) = refusal_destination(&arguments) {
+                if let Err(error) = tape_harness::write_apparatus_refusal(&path, None, &reason) {
+                    eprintln!("barge.tape.harness/1: {error}");
+                }
+            }
             eprintln!(
                 "barge.tape.harness/1: {reason}; the argv contract is \
                  --fixture-root <dir> --manifest <file> --transcript-out <file> --case <name>"
@@ -240,7 +267,10 @@ fn main() -> std::process::ExitCode {
         .and_then(|path| {
             let expected = std::env::var("BARGE_TAPE_EXPORT_SHA256")
                 .map_err(|_| "BARGE_TAPE_EXPORT_SHA256 is required".to_owned())?;
-            tape_harness::verify_export(std::path::Path::new(&path), &expected)
+            let receipt = std::path::Path::new(&path);
+            let binding = tape_harness::verify_export(receipt, &expected)?;
+            tape_harness::verify_manifest_binding(&manifest_bytes, receipt, &expected)?;
+            Ok(binding)
         });
     let binding = match binding {
         Ok(binding) => binding,
