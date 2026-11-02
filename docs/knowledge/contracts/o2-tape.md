@@ -223,3 +223,10 @@ Tom authorized that one test's read-only password-database lookup by decision
 `d130b2b6-04b0-4e25-b21c-4a6b4b71ec9d`, under the private wrapper and live-state
 inventory gate. The ordinary suite keeps the proof feature off; the ruling does
 not authorize other live account reads or redirect production account lookup.
+
+`MacOs::process_table` first takes the kernel's process-table byte count, adds
+slack and allocates its buffer; its `SCAN_PID_CAP` check follows the second
+sysctl. The tape's 512-row cap and the scan's deadline do not bound that prior
+allocation. Consequently the process-census capture does not establish the
+accepted allocation bound. A bounded production allocation requires separate
+design and review; the tape does not inject a limit or alter evaluator flow.
