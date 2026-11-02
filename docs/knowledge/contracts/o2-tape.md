@@ -307,6 +307,17 @@ library evaluator; there is no additional change to that script between the
 planning base and this branch. Those historical changes are not evidence for
 this tape or permission to execute a native proof.
 
+Those script deltas are executable: staging drops inherited Rust flags and
+disables automatic toolchain installation; fixture startup scrubs inherited
+Oxide, XDG and Barge variables and explicitly selects the synthetic account;
+attach marks custody before invoking `hdiutil`. R11 now saves content, marker
+and identity, validates remount-relative rebinding and rollback, and stops on
+unknown detach custody. R12 first creates a fresh private registration only
+after R11 passes. Dispatch marks dependent cases skipped, distinguishes
+unknown or unexecuted cases, retains unknown custody without repair, and adds
+pure controls for the rebind and dispatcher. These are prior proof-apparatus
+behavior changes, not non-test library statement equivalence.
+
 The current source map against that O1 pin, for reviewer inspection, is:
 
 | File | Source sites changed | Non-test basis and remaining review |
