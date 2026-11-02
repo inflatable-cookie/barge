@@ -92,14 +92,27 @@ pub fn prove_absence(
     path: &Path,
     expected: AncestorExpected<'_>,
 ) -> Result<AbsenceProof> {
+    #[cfg(not(test))]
     let proof = prove_absence_inner(dirs, volumes, path, expected)?;
+    #[cfg(test)]
+    let proof = match prove_absence_inner(dirs, volumes, path, expected) {
+        Ok(proof) => proof,
+        Err(error) => {
+            crate::tape::read_refused("os::prove_absence", path, error.kind().as_str());
+            return Err(error);
+        }
+    };
     let encoded = serde_json::to_vec(&proof).map_err(|_| {
+        #[cfg(test)]
+        crate::tape::read_refused("os::prove_absence", path, "encode_error");
         Error::new(
             ErrorKind::UnknownState,
             "absence evidence cannot be encoded",
         )
     })?;
     if encoded.len() > 4096 {
+        #[cfg(test)]
+        crate::tape::read_refused("os::prove_absence", path, "document_cap");
         return Err(Error::new(
             ErrorKind::UnknownState,
             "absence evidence exceeds 4 KiB",

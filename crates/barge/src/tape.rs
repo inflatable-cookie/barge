@@ -62,8 +62,8 @@
 //! path.
 //!
 //! Nothing here is public and nothing here feeds a production decision; the
-//! no-public-surface test below pins the declaration shape, and the statement
-//! discipline test pins the `#[cfg(test)]` form of every call site.
+//! no-public-surface test below pins the declaration shape. The source-count
+//! check does not prove per-site cfg reachability or complete coverage.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -1017,11 +1017,16 @@ pub(crate) fn vnode_observed(site: &'static str, pid: u32, fd: i32, device: u64,
 
 /// Record one code-signing status answer for a classified identity.
 pub(crate) fn platform(site: &'static str, pid: u32, start: u64, uid: Option<u32>, answer: &str) {
+    let outcome = if matches!(answer, "not_verified:gone" | "not_verified:start_changed") {
+        Outcome::refused(answer)
+    } else {
+        Outcome::answer(answer)
+    };
     record(
         "platform-status",
         site,
         Identity::process(pid, start, uid, None),
-        Outcome::answer(answer),
+        outcome,
         None,
     );
 }
@@ -1470,7 +1475,9 @@ mod tests {
     #[test]
     fn recorder_does_not_reopen_or_stat_a_parent() {
         let source = include_str!("tape.rs");
-        let implementation = source.split("#[cfg(test)]").next().expect("implementation");
+        let marker = "\n#[cfg(test)]\n#[allow(clippy::unwrap_used";
+        let implementation = source.split_once(marker).expect("test module boundary").0;
+        assert!(implementation.contains("fn effect("), "the guard must inspect the recorder implementation");
         assert!(!implementation.contains("symlink_metadata"));
         assert!(!implementation.contains("fn parent_identity"));
     }
@@ -1587,6 +1594,15 @@ mod tests {
         assert_eq!(row["identity"]["start"], 100);
         assert_eq!(row["identity"]["uid"], 501);
         assert_eq!(row["observation_proven"], true);
+    }
+
+    #[test]
+    fn unverified_platform_is_never_positive_coverage() {
+        let transcript = window(|| platform("platform", 42, 100, Some(501), "not_verified:gone"));
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        let row = &document["reads"][0];
+        assert_eq!(row["outcome"]["refused"]["class"], "not_verified:gone");
+        assert_eq!(row["observation_proven"], false);
     }
 
     #[test]
