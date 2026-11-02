@@ -945,7 +945,7 @@ pub(crate) fn platform(site: &'static str, pid: u32, start: u64, uid: Option<u32
 pub(crate) fn platform_unidentified(site: &'static str, pid: u32, answer: &str) {
     let identity = process_identity(pid, None);
     PROCESS_CONTEXT.with(|slot| *slot.borrow_mut() = None);
-    record("platform-status", site, identity, Outcome::answer(answer), None);
+    record("code-signing-status", site, identity, Outcome::answer(answer), None);
 }
 
 /// Record a scalar fact: the effective uid, the boot identity, a start.
