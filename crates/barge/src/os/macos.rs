@@ -1350,6 +1350,7 @@ impl MacOs {
                 "MacOs::platform_status",
                 pid,
                 classified.start,
+                classified.effective_uid,
                 "not_verified:gone",
             );
             return Ok(PlatformStatus::NotVerified {
@@ -1362,6 +1363,7 @@ impl MacOs {
                 "MacOs::platform_status",
                 pid,
                 classified.start,
+                classified.effective_uid,
                 "not_verified:start_changed",
             );
             return Ok(PlatformStatus::NotVerified {
@@ -1378,6 +1380,7 @@ impl MacOs {
                 "MacOs::platform_status",
                 pid,
                 classified.start,
+                classified.effective_uid,
                 "not_verified:gone",
             );
             return Ok(PlatformStatus::NotVerified {
@@ -1390,6 +1393,7 @@ impl MacOs {
                 "MacOs::platform_status",
                 pid,
                 classified.start,
+                classified.effective_uid,
                 "not_verified:start_changed",
             );
             return Ok(PlatformStatus::NotVerified {
@@ -1405,6 +1409,7 @@ impl MacOs {
                 "MacOs::platform_status",
                 pid,
                 classified.start,
+                classified.effective_uid,
                 "not_verified:not_platform",
             );
             return Ok(PlatformStatus::NotVerified {
@@ -1419,6 +1424,7 @@ impl MacOs {
             "MacOs::platform_status",
             pid,
             classified.start,
+            classified.effective_uid,
             "platform_binary",
         );
         Ok(PlatformStatus::PlatformBinary {

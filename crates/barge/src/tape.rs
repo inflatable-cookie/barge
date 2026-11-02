@@ -861,11 +861,11 @@ pub(crate) fn vnode(
 }
 
 /// Record one code-signing status answer for a classified identity.
-pub(crate) fn platform(site: &'static str, pid: u32, start: u64, answer: &str) {
+pub(crate) fn platform(site: &'static str, pid: u32, start: u64, uid: Option<u32>, answer: &str) {
     record(
         "platform-status",
         site,
-        Identity::process(pid, start, None, None),
+        Identity::process(pid, start, uid, None),
         Outcome::answer(answer),
         None,
     );
@@ -1291,6 +1291,17 @@ mod tests {
         let implementation = source.split("#[cfg(test)]").next().expect("implementation");
         assert!(!implementation.contains("symlink_metadata"));
         assert!(!implementation.contains("fn parent_identity"));
+    }
+
+    #[test]
+    fn platform_row_preserves_observed_process_identity() {
+        let transcript = window(|| platform("platform", 42, 100, Some(501), "platform_binary"));
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        let row = &document["reads"][0];
+        assert_eq!(row["identity"]["pid"], 42);
+        assert_eq!(row["identity"]["start"], 100);
+        assert_eq!(row["identity"]["uid"], 501);
+        assert_eq!(row["observation_proven"], false);
     }
 
     #[test]
