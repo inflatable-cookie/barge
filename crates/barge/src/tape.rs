@@ -551,11 +551,14 @@ pub(crate) fn finish(
                 tape.reset_without_window();
                 return Ok(bytes);
             }
-            if reads.pop().is_none() {
+            let Some(dropped) = reads.pop() else {
                 tape.reset_without_window();
                 return Err(
                     "the transcript exceeds its document cap with no rows to drop".to_owned(),
                 );
+            };
+            if matches!(dropped.kind, "process-row" | "process-observation") {
+                caps.process_rows = caps.process_rows.saturating_sub(1);
             }
             caps.dropped_rows = caps.dropped_rows.saturating_add(1);
             caps.document_truncated = true;
@@ -1308,7 +1311,7 @@ mod tests {
             source_binding: "t".to_owned(),
         })
         .expect("the window opens");
-        for index in 0..CAP_READ_ROWS {
+        for index in 0..CAP_READ_ROWS - 1 {
             let path = PathBuf::from(format!("{bound}-{index}"));
             record(
                 "file",
@@ -1318,6 +1321,7 @@ mod tests {
                 None,
             );
         }
+        process_row("cap-test", 42, Some(501), 123);
         let transcript = finish(
             EngineOutcome {
                 status: "completed",
@@ -1334,6 +1338,7 @@ mod tests {
         let document: serde_json::Value =
             serde_json::from_str(&transcript).expect("the transcript parses");
         assert_eq!(document["caps"]["document_truncated"], true);
+        assert_eq!(document["caps"]["process_rows"], 0);
         assert!(document["caps"]["dropped_rows"].as_u64().unwrap_or(0) > 0);
     }
 

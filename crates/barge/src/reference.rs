@@ -2285,19 +2285,23 @@ pub fn read_oxide_marker(
         Ok(Some(facts)) => facts,
         Ok(None) => {
             #[cfg(test)]
-            crate::tape::dir_entry(
+            crate::tape::child_stat(
                 "reference::read_oxide_marker",
-                Some((root.identity().device.get(), root.identity().inode)),
-                std::ffi::OsStr::new(OXIDE_MARKER_FILE),
+                (root.identity().device.get(), root.identity().inode),
+                OXIDE_MARKER_FILE,
+                None,
+                None,
             );
             return Ok(None);
         }
         Err(error) => {
             #[cfg(test)]
-            crate::tape::listing_refused(
+            crate::tape::child_stat(
                 "reference::read_oxide_marker",
-                std::path::Path::new(OXIDE_MARKER_FILE),
-                &format!("{error}"),
+                (root.identity().device.get(), root.identity().inode),
+                OXIDE_MARKER_FILE,
+                None,
+                Some(error.kind().as_str()),
             );
             return Err(format!("the marker cannot be read: {error}"));
         }
