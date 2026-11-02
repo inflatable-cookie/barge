@@ -74,8 +74,22 @@ def main():
         raise RuntimeError('Oxide is not inside the owned private root')
     if not root.is_relative_to(private_root):
         raise RuntimeError('export is not inside the owned private root')
-    if os.environ.get('BARGE_PRIVATE_WRAPPER_QUALIFIED') != '1':
-        raise RuntimeError('qualified private wrapper is required')
+    dry_path = Path(os.environ['BARGE_TAPE_DRY_RECEIPT']).resolve(strict=True)
+    if not dry_path.is_relative_to(private_root) or dry_path.name != 'tape-dry-inventory.json':
+        raise RuntimeError('private dry receipt is missing')
+    dry_bytes = dry_path.read_bytes()
+    if digest(dry_bytes) != os.environ['BARGE_TAPE_DRY_SHA256']:
+        raise RuntimeError('private dry receipt changed')
+    dry = json.loads(dry_bytes)
+    if (dry.get('schema') != 'barge.validation-dry/1' or dry.get('head') != commit
+            or dry.get('private') != str(private_root) or dry.get('oxide') != digest(oxide.read_bytes())
+            or dry.get('live_before_sha256') != dry.get('live_after_sha256')
+            or not dry.get('block_sha256') or not dry.get('audit_sha256') or not dry.get('ledger_sha256')):
+        raise RuntimeError('private dry gate is incomplete or mismatched')
+    for key in ('live_before_sha256', 'live_after_sha256', 'status_sha256',
+                'block_sha256', 'audit_sha256', 'ledger_sha256'):
+        if not isinstance(dry.get(key), str) or not re.fullmatch(r'[0-9a-f]{64}', dry[key]):
+            raise RuntimeError('private dry gate evidence digest missing')
     env = dict(os.environ)
     if (Path(shutil.which('oxide') or '/nonexistent').resolve() != oxide or
             Path(env.get('RUSTC', '/nonexistent')).resolve() != rustc or

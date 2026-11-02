@@ -98,8 +98,11 @@ lists the commands. Each covers what it names:
   held until its private wrapper's admission and resource gates are established.
 - `effigy rust:test:tape-export:pure` — pure Git blob identity controls; no
   build, fixture or export.
+- `effigy rust:test:tape-admission:pure` — mocked admission refusal controls;
+  no inventory, child process, fixture or build.
 - `effigy rust:test:tape-private-export` — source-defined private wrapper; it
-  currently refuses while admission isolation and resource accounting are unproved.
+  requires independently reviewed admission and resource evidence and a new
+  authorized block. Neither is established for the retained failed route.
 - `effigy release:native:test` and `effigy release:native:plan` — F6-R1's native
   proof apparatus, effect-free: the pinned supervisor, the argv guard, the case
   table checked against its named regressions, the proof feature's declarations

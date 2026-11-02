@@ -150,11 +150,16 @@ toolchain and Barge executable digest to that receipt, refusing missing or
 mismatched fields. This prepares the proposed source binding; it is not
 validation of the complete shared schema. Its binding is the receipt digest,
 not an evaluator leaf.
-`scripts/tape/private-wrapper.py` is source for a private launcher with a dry
-inventory and before/after gate. It currently refuses before either mode:
-admission subprocess isolation and aggregate scratch accounting have not been
-established. This source has not been executed or qualified; its receipt inputs
-and every child/admission destination still need independent isolation proof.
+`scripts/tape/private-wrapper.py` and `admission.py` describe a private launcher
+with one-use, externally authorized `dry`, `validate` and `export` blocks. A
+missing block, source audit, retained-root ledger, debug-build evidence, or
+binding refuses. These documents and their expected SHA-256 values must be
+provided through an authenticated independent channel; a digest or a string
+inside a self-authored document is not authorization or independent review.
+No block has been authorized and the route has not been executed or qualified.
+Admission subprocess isolation and aggregate scratch accounting remain
+unproved until the required evidence is independently reviewed and the real
+gate is run under a new covering block.
 The closure document is written only after a successful child and equal live
 inventories; it binds their digests, the export receipt and the wrapper source.
 Its scope is explicitly only that inventory comparison: it does not attest
@@ -165,6 +170,84 @@ registry, root or account outside the given fixture root is read or written,
 and `BARGE_STATE_DIR`/`BARGE_ACCOUNT_HOME` are never consulted: fixture
 selection is explicit `StatePaths` and an `AccountFacts` implementation inside
 the harness only.
+
+### Private admission source map and preparation
+
+The source map is a preparation guide, not an isolation finding. At pinned
+Oxide `3de241325dd286ae44a5759fa6825b05a81c7b4e`, tree
+`452a9c2dc6b1432c643c5053655e029955977754`, `src/bin/oxide/config.rs`
+163–187 and 261–275 implement the debug test-home control and home selection;
+328–345 and 467–541 resolve configuration and storage roots, and 1232–1255
+read the state pool registry. `src/bin/oxide/main.rs` `run_status`,
+`print_settings`, and `print_other_pools` implement the recorded status probe.
+`src/bin/oxide/scratch_io.rs` resolves `OXIDE_SCRATCH_ROOT` for the actual
+execution path. The pinned `scripts/bounded-test.py` adopts
+`OXIDE_TASK_SCRATCH_ROOT` and passes its effective environment to its leader;
+the retained `isolation-source-audit.md` identifies the relevant source and
+the build-script paths that require further independent analysis. Effigy
+admission, Cargo/rustup, compiler/linker, every invoked build script and Git
+remain separate audit boundaries: the launcher binds their bytes and requires
+source paths, digests, line references, analysis and an independent review
+reference for each boundary. A conclusion field alone cannot establish that
+analysis or verify the reviewer.
+
+For a future authorized run, prepare a fresh owner-only root under
+`/Volumes/Builds/scratch/barge/`, with distinct `home`, `cache`, `tmp`,
+`scratch`, `bin`, `oxide-source` and `barge-source` directories and a private
+`config.toml`. Prepare source archives from the exact named commits; the
+launcher compares their complete file sets, modes and Git blob identities to
+the commit trees. Supply a separately qualified debug Oxide built from the
+pinned source and lock with Rust 1.97.1, together with its build log, raw
+supervisor closure, source and executable hashes, and equal independently
+bound live inventories. The earlier failed bootstrap is not such evidence.
+The executable, evidence and the pinned supervisor are inside the private
+root. The required audit must trace actual admission and build child paths,
+including the executable PATH, and identify where all subprocesses resolve
+config, state, registry, cache, pool, scratch and home. Missing evidence is a
+runtime refusal, not a claim of isolation.
+
+Provide a `barge.private-roots/1` ledger naming every retained task-private root
+and the new root, with source-bound root-discovery evidence and independent
+review reference. The launcher checks the historical ledger's named log paths,
+known retained roots and current task PR-body roots, rejects overlaps and
+missing paths, and counts allocated blocks once per inode without following
+symlinks. The accounting includes retained evidence as well as the new root;
+it cannot determine an earlier peak or establish that an unlisted root does not
+exist. Discovery completeness is an independent review obligation. Shared live
+pool and output roots are not counted as private scratch and their sizes remain
+unknown. The private root is supervised against the 2 GiB ceiling less other
+retained private allocations. Because the supervisor monitors the new root,
+the independently reviewed `retained_roots` audit must also establish that all
+other counted roots remain quiescent for the block; before/after counts alone
+cannot prove an intervening aggregate peak. No cleanup or refund follows.
+
+An externally authenticated `barge.validation-block/1` document binds the
+task, exact Barge head and tree, wrapper, debug Oxide, source audit and root
+ledger hashes, operator authorization reference, unique block ID, finite
+seconds, 2 GiB scratch cap, private pool cap and ordered selectors. Its digest,
+the audit and ledger digests, and paths are supplied independently via
+`BARGE_VALIDATION_BLOCK[_SHA256]`, `BARGE_VALIDATION_SOURCE_AUDIT[_SHA256]`,
+and `BARGE_VALIDATION_ROOT_LEDGER[_SHA256]`. Set the pinned supervisor, Git,
+rustc, Oxide origin, rustup home and toolchain via the launcher inputs; its
+allowlisted child environment explicitly sets private `HOME`, `CARGO_HOME`,
+`TMPDIR`, `OXIDE_CONFIG`, `OXIDE_POOL`, `OXIDE_SCRATCH_ROOT`,
+`OXIDE_TASK_SCRATCH_ROOT`, and debug `OXIDE_TEST_HOME_FROM_ENV`. No inherited
+Oxide, XDG, compiler-flag or dynamic-loader setting is forwarded. The block is
+claimed once even on refusal. It starts a new prospective allowance only; the
+historical 1200 + 600 + 600 seconds remain charged and exhausted.
+
+Within the prospective block, the launcher brackets source verification and
+each actual Effigy child with bounded live before/after inventories. A changed
+inode, contents or other recorded metadata refuses without repair or causal
+claim. The first selector is `rust:test:tape-private-status`, which invokes
+the debug Oxide's real `status` through Effigy and the pinned supervisor. It
+must show the selected private config, home and pool and unique private state
+registry and cache sentinels. Only then can the explicitly authorized safe
+selectors run. `dry` admits only status; `validate` runs named safe checks;
+`export` requires export last. Full `rust:test`, live-reading CLI paths and
+the unbounded process-scan exercise are not admitted by this source. They need
+their own disposition. The independently reviewed source route and a future
+positive gate are prerequisites, not current validation evidence.
 
 ## Selectors
 
