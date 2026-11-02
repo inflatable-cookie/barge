@@ -584,7 +584,7 @@ fn record(
             tape.dropped_rows = tape.dropped_rows.saturating_add(1);
             return;
         }
-        if kind == "process-row" && tape.process_rows >= CAP_PROCESS_ROWS {
+        if matches!(kind, "process-row" | "process-observation") && tape.process_rows >= CAP_PROCESS_ROWS {
             tape.process_rows_exhausted = true;
             tape.dropped_rows = tape.dropped_rows.saturating_add(1);
             return;
@@ -600,7 +600,7 @@ fn record(
         let occurrence = *slot;
         let epoch = tape.next_epoch;
         tape.next_epoch = tape.next_epoch.saturating_add(1);
-        if kind == "process-row" {
+        if matches!(kind, "process-row" | "process-observation") {
             tape.process_rows = tape.process_rows.saturating_add(1);
         }
         let observation_proven = observation_proven(kind, &identity, &outcome);
@@ -724,17 +724,21 @@ pub(crate) fn effect_outcome(kind: &str, path: &Path, error: Option<&std::io::Er
 /// The io error's errno class, as the transcript binds it.
 pub(crate) fn errno_class(error: &std::io::Error) -> String {
     match error.raw_os_error() {
-        Some(1) => "EPERM".to_owned(),
-        Some(2) => "ENOENT".to_owned(),
-        Some(3) => "ESRCH".to_owned(),
-        Some(9) => "EBADF".to_owned(),
-        Some(13) => "EACCES".to_owned(),
-        Some(20) => "ENOTDIR".to_owned(),
-        Some(36) => "ENAMETOOLONG".to_owned(),
-        Some(5) => "EIO".to_owned(),
-        Some(19) => "ENODEV".to_owned(),
-        Some(6) => "ENXIO".to_owned(),
-        Some(40) => "ELOOP".to_owned(),
+        Some(libc::EPERM) => "EPERM".to_owned(),
+        Some(libc::ENOENT) => "ENOENT".to_owned(),
+        Some(libc::ESRCH) => "ESRCH".to_owned(),
+        Some(libc::EBADF) => "EBADF".to_owned(),
+        Some(libc::EACCES) => "EACCES".to_owned(),
+        Some(libc::ENOTDIR) => "ENOTDIR".to_owned(),
+        Some(libc::ENAMETOOLONG) => "ENAMETOOLONG".to_owned(),
+        Some(libc::EIO) => "EIO".to_owned(),
+        Some(libc::ENODEV) => "ENODEV".to_owned(),
+        Some(libc::ENXIO) => "ENXIO".to_owned(),
+        Some(libc::ELOOP) => "ELOOP".to_owned(),
+        Some(libc::EEXIST) => "EEXIST".to_owned(),
+        Some(libc::ENOTEMPTY) => "ENOTEMPTY".to_owned(),
+        Some(libc::EXDEV) => "EXDEV".to_owned(),
+        Some(libc::ENOSPC) => "ENOSPC".to_owned(),
         Some(errno) => format!("errno_{errno}"),
         None => error.kind().to_string(),
     }
@@ -1574,6 +1578,18 @@ mod tests {
     }
 
     #[test]
+    fn errno_classes_follow_the_build_platform_constants() {
+        for (code, expected) in [
+            (libc::ELOOP, "ELOOP"),
+            (libc::ENAMETOOLONG, "ENAMETOOLONG"),
+            (libc::ENOTDIR, "ENOTDIR"),
+            (libc::EACCES, "EACCES"),
+        ] {
+            assert_eq!(errno_class(&std::io::Error::from_raw_os_error(code)), expected);
+        }
+    }
+
+    #[test]
     fn effect_outcome_uses_captured_error_after_errno_changes() {
         let transcript = window(|| {
             write_effect("create", Path::new("child"));
@@ -1598,6 +1614,21 @@ mod tests {
         assert_eq!(document["clocks"][0]["value_ms"], returned);
         let site = document["clocks"][0]["site"].as_str().expect("caller site");
         assert!(site.ends_with(&format!("tape.rs:{expected_line}")), "{site}");
+    }
+
+    #[test]
+    fn process_cap_includes_retry_identity_observations() {
+        let transcript = window(|| {
+            for pid in 1..CAP_PROCESS_ROWS as u32 {
+                process_row("table", pid, Some(501), u64::from(pid));
+            }
+            observed_process("retry", 1, 1000, Some(501), "classified");
+            observed_process("retry", 1, 1001, Some(501), "retry_identity");
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        assert_eq!(document["caps"]["process_rows"], CAP_PROCESS_ROWS);
+        assert_eq!(document["caps"]["dropped_rows"], 1);
+        assert_eq!(document["caps"]["process_rows_exhausted"], true);
     }
 
     #[test]
