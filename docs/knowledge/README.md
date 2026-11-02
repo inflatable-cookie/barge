@@ -26,6 +26,11 @@ Contracts own durable interfaces and formats:
   read-only Oxide output-registry census and its drift report, the stage 4
   matrix and bounds, the Oxide compatibility reading of the absence rule, the
   stage 4 slices and the proposed validation.
+- [Descriptor-bound parent observations](contracts/oxide-capture-parent-identity.md) owns
+  the design for binding parent identity, child component, descriptor identity
+  and observed bytes to one attributable operation at the release planner's read
+  sites: the provenance classes, the site inventory, the binding limits and
+  counterfactuals, and the implementation slices for the capture apparatus.
 - [Host-job hand-off](contracts/host-job.md) owns how a host job calls
   `barge maintain`: the preview-then-real protocol, the digest it passes, the
   exit codes it records, what it must never do, and one example plist under
