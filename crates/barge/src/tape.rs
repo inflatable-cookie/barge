@@ -2,10 +2,9 @@
 //!
 //! This module is compiled only under `cfg(test)` (`lib.rs` declares it as a
 //! `pub(crate)` `cfg(test)` module), so a production build compiles none of it
-//! and the covering release-profile check proves that. Every call into it from
-//! a production function body is a separate `#[cfg(test)]`-attributed
-//! statement, so every preexisting production statement stays byte-for-byte
-//! unchanged. The tape is one-sided: it records what the real syscalls and
+//! and the covering release-profile check is intended to prove that. Calls use
+//! test-only statements or narrow test/non-test splits that retain the original
+//! non-test statement. The tape is one-sided: it records what the real syscalls and
 //! parsers returned and feeds nothing back — no policy is copied, no custody,
 //! absence or eligible verdict is injected, and no fixture fact is invented.
 //!
@@ -327,6 +326,10 @@ pub(crate) struct ReadRow {
 pub(crate) struct EffectRow {
     kind: &'static str,
     path: Option<String>,
+    // Retain the exact path only for matching the result to its attempt. The
+    // provisional wire representation still refuses to invent UTF-8 text.
+    #[serde(skip)]
+    match_path: PathBuf,
     parent_device: Option<u64>,
     parent_inode: Option<u64>,
     device: Option<u64>,
@@ -677,6 +680,7 @@ fn effect(kind: &'static str, path: &Path) {
         tape.effects.push(EffectRow {
             kind,
             path: path.to_str().map(str::to_owned),
+            match_path: path.to_path_buf(),
             parent_device: None,
             parent_inode: None,
             device: None,
@@ -698,6 +702,7 @@ pub(crate) fn child_effect(kind: &'static str, parent: (u64, u64), name: &str, d
         tape.effects.push(EffectRow {
             kind,
             path: Some(name.to_owned()),
+            match_path: PathBuf::from(name),
             parent_device: Some(parent.0),
             parent_inode: Some(parent.1),
             device: None,
@@ -724,7 +729,7 @@ pub(crate) fn effect_outcome(kind: &str, path: &Path, error: Option<&std::io::Er
     TAPE.with(|tape| {
         let mut tape = tape.borrow_mut();
         if let Some(row) = tape.effects.iter_mut().rev().find(|row| {
-            row.kind == kind && path.to_str().is_some() && row.path.as_deref() == path.to_str() && row.outcome.is_none()
+            row.kind == kind && row.match_path == path && row.outcome.is_none()
         }) {
             row.outcome = Some(error.map_or_else(|| "succeeded".to_owned(), errno_class));
         }
@@ -1079,7 +1084,7 @@ pub(crate) fn io_rename(source: &Path, destination: &Path, operation: impl FnOnc
     write_effect("rename", source);
     TAPE.with(|tape| {
         if let Some(row) = tape.borrow_mut().effects.last_mut() {
-            if row.kind == "rename" && row.path.as_deref() == source.to_str() && row.outcome.is_none() {
+            if row.kind == "rename" && row.match_path == source && row.outcome.is_none() {
                 row.destination = destination.to_str().map(str::to_owned);
             }
         }
@@ -1662,6 +1667,26 @@ mod tests {
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         assert_eq!(document["effects"].as_array().map(Vec::len), Some(1));
         assert_eq!(document["effects"][0]["outcome"], "EACCES");
+    }
+
+    #[test]
+    fn non_utf8_effect_results_bind_to_the_exact_attempt() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let first = Path::new(std::ffi::OsStr::from_bytes(b"first\xff"));
+        let second = Path::new(std::ffi::OsStr::from_bytes(b"second\xff"));
+        let transcript = window(|| {
+            write_effect("create", first);
+            write_effect("create", second);
+            let error = std::io::Error::from_raw_os_error(libc::EACCES);
+            effect_outcome("create", first, Some(&error));
+            effect_outcome("create", second, None);
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        assert!(document["effects"][0]["path"].is_null());
+        assert!(document["effects"][1]["path"].is_null());
+        assert_eq!(document["effects"][0]["outcome"], "EACCES");
+        assert_eq!(document["effects"][1]["outcome"], "succeeded");
     }
 
     #[test]

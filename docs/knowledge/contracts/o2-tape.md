@@ -206,6 +206,12 @@ observations rather than fabricated write effects. Remaining reached write
 sites and effect completeness still require a source audit. The
 source-count test is not a complete inventory or a compile-away proof.
 
+The recorder keeps the original path privately to bind a syscall result to its
+attempt, including when the path is not UTF-8. It does not serialize that
+private matching value: an unrepresentable effect path remains absent from the
+provisional document and cannot establish a complete effect identity. The
+non-UTF-8 outcome regression is source only until the covering checks run.
+
 ## Production statement audit
 
 The O1 pin `4af9360bd09629e970c143080ca159de8eef2562` and the planning
