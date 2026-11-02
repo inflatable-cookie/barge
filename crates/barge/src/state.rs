@@ -941,7 +941,7 @@ impl StateLock {
             .map_err(|error| lock_open_error(path, &error))?;
         wait_for_lock(&file, path, LockMode::Exclusive, deadline)?;
         #[cfg(test)]
-        crate::tape::lock("state::StateLock::exclusive", path, lock_file_facts(&file));
+        crate::tape::lock("state::StateLock::exclusive", path, crate::tape::LockOutcome::Held(None));
         Ok(Self {
             path: path.to_path_buf(),
             rank,
@@ -991,7 +991,7 @@ impl StateLock {
         crate::tape::lock(
             "state::StateLock::shared_if_present",
             path,
-            lock_file_facts(&file),
+            crate::tape::LockOutcome::Held(None),
         );
         Ok(Some(Self {
             path: path.to_path_buf(),
@@ -1085,27 +1085,6 @@ fn lock_open_error(path: &Path, error: &std::io::Error) -> Error {
     )
     .with_detail("path", path.display().to_string().into())
     .with_detail("os_error", error.to_string().into())
-}
-
-/// The lock file's own identity, as the cfg(test) tape records it: a
-/// best-effort read of the opened descriptor's device and inode.
-#[cfg(test)]
-fn lock_file_facts(file: &File) -> crate::tape::LockOutcome {
-    match file.metadata() {
-        Ok(metadata) => crate::tape::LockOutcome::Held(Some((metadata.dev(), metadata.ino()))),
-        Err(_) => crate::tape::LockOutcome::Held(None),
-    }
-}
-
-/// The directory's own device and inode, as the cfg(test) tape binds an
-/// enumeration's parent identity. A directory that cannot be stated binds no
-/// parent, which never reconciles against a manifest entry.
-#[cfg(test)]
-fn dir_facts(path: &Path) -> Option<(u64, u64)> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => Some((metadata.dev(), metadata.ino())),
-        Err(_) => None,
-    }
 }
 
 /// The token a mutating command holds while it writes an intent.
@@ -2461,7 +2440,7 @@ pub(crate) fn read_intents_with_deadline(
         #[cfg(test)]
         crate::tape::dir_entry(
             "state::read_intents_with_deadline",
-            dir_facts(&directory),
+            None,
             &name,
         );
         let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {

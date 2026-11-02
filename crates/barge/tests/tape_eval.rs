@@ -56,9 +56,8 @@
 //! Build from the exact staged commit offline, default features only, pinned
 //! toolchain 1.97.1, committed `Cargo.lock`:
 //!
-//! ```text
-//! cargo test --locked --no-run --test tape_eval
-//! ```
+//! A locked default-feature Effigy staging selector remains to be supplied;
+//! the repository does not authorize invoking Cargo directly.
 //!
 //! The produced executable under the managed target directory is the one a
 //! window invokes; its digest and the toolchain are the orchestrator's to

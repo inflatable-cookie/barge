@@ -89,7 +89,7 @@ pub(crate) const CAP_PROCESS_ROWS: usize = 512;
 
 /// Facts actually supplied for an observation. Missing fields remain absent;
 /// a lexical path alone is not a complete object identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub(crate) struct Identity {
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
@@ -202,31 +202,6 @@ impl Identity {
         }
     }
 
-    /// The reconciliation key: every set field, in fixed order.
-    fn key(&self) -> String {
-        let mut key = String::new();
-        let mut push = |label: &str, value: Option<String>| {
-            if let Some(value) = value {
-                key.push('|');
-                key.push_str(label);
-                key.push('=');
-                key.push_str(&value);
-            }
-        };
-        push("path", self.path.clone());
-        push("component", self.component.clone());
-        push("pdev", self.parent_device.map(|value| value.to_string()));
-        push("pino", self.parent_inode.map(|value| value.to_string()));
-        push("dev", self.device.map(|value| value.to_string()));
-        push("ino", self.inode.map(|value| value.to_string()));
-        push("pid", self.pid.map(|value| value.to_string()));
-        push("start", self.start.map(|value| value.to_string()));
-        push("uid", self.uid.map(|value| value.to_string()));
-        push("fd", self.fd.map(|value| value.to_string()));
-        push("uuid", self.volume_uuid.clone());
-        push("mount", self.mount.clone());
-        key
-    }
 }
 
 /// What one observation returned.
@@ -433,7 +408,7 @@ struct Tape {
     reads: Vec<ReadRow>,
     clocks: Vec<ClockRow>,
     effects: Vec<EffectRow>,
-    occurrences: HashMap<String, u32>,
+    occurrences: HashMap<(&'static str, &'static str, Identity), u32>,
     process_rows: usize,
     next_epoch: u64,
     read_rows_exhausted: bool,
@@ -595,7 +570,7 @@ fn record(
             tape.dropped_rows = tape.dropped_rows.saturating_add(1);
             return;
         }
-        let key = format!("{kind}|{site}{}", identity.key());
+        let key = (kind, site, identity.clone());
         let slot = tape.occurrences.entry(key).or_insert(0);
         if *slot >= CAP_OCCURRENCES {
             tape.occurrences_exhausted = true;
@@ -1099,6 +1074,11 @@ pub(crate) fn now_ms(value_ms: u64) {
     clock("now_ms", "test".to_owned(), value_ms);
 }
 
+/// Record a clock value already stored in an evaluator result at its site.
+pub(crate) fn now_ms_site(value_ms: u64, site: &'static str) {
+    clock("now_ms", site.to_owned(), value_ms);
+}
+
 /// Record the single value returned to its actual call site.
 pub(crate) fn now_ms_at(value_ms: u64, caller: &'static std::panic::Location<'static>) {
     clock("now_ms", format!("{}:{}", caller.file(), caller.line()), value_ms);
@@ -1478,6 +1458,20 @@ mod tests {
     }
 
     #[test]
+    fn occurrences_do_not_merge_delimiter_containing_identities() {
+        let transcript = window(|| {
+            let first = Identity::file(Path::new("a|component=b"), None);
+            let mut second = Identity::file(Path::new("a"), None);
+            second.component = Some("b".to_owned());
+            record("file", "site", first, Outcome::answer("one"), None);
+            record("file", "site", second, Outcome::answer("two"), None);
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        assert_eq!(document["reads"][0]["occurrence"], 1);
+        assert_eq!(document["reads"][1]["occurrence"], 1);
+    }
+
+    #[test]
     fn recorder_does_not_reopen_or_stat_a_parent() {
         let source = include_str!("tape.rs");
         let marker = "\n#[cfg(test)]\n#[allow(clippy::unwrap_used";
@@ -1485,6 +1479,28 @@ mod tests {
         assert!(implementation.contains("fn effect("), "the guard must inspect the recorder implementation");
         assert!(!implementation.contains("symlink_metadata"));
         assert!(!implementation.contains("fn parent_identity"));
+        let state = include_str!("state.rs");
+        let area = include_str!("area.rs");
+        assert!(!state.contains("fn lock_file_facts("));
+        assert!(!state.contains("fn dir_facts(path:"));
+        assert!(!area.contains("fn dir_facts(path:"));
+    }
+
+    #[test]
+    fn held_lock_without_observed_descriptor_identity_stays_unproven() {
+        let transcript = window(|| lock("state::StateLock", Path::new("lock"), LockOutcome::Held(None)));
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        let row = &document["reads"][0];
+        assert_eq!(row["observation_proven"], false);
+        assert!(row["identity"].get("inode").is_none());
+    }
+
+    #[test]
+    fn stored_absence_clock_keeps_its_site_and_value() {
+        let transcript = window(|| now_ms_site(1234, "os::prove_absence_inner"));
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        assert_eq!(document["clocks"][0]["site"], "os::prove_absence_inner");
+        assert_eq!(document["clocks"][0]["value_ms"], 1234);
     }
 
     #[test]

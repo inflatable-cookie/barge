@@ -43,9 +43,9 @@
 //!
 //! The orchestrator stages this exact commit's tree, builds the harness
 //! offline from the committed `Cargo.lock` with default features only — no
-//! feature is enabled, and the proof feature must stay off — through its own
-//! Cargo front door (`cargo test --locked --no-run --test tape_eval` under the
-//! pinned toolchain 1.97.1), and invokes the staged executable with the argv
+//! feature is enabled, and the proof feature must stay off — through a
+//! locked Effigy staging selector under the pinned toolchain 1.97.1. That
+//! staging selector is still missing. The orchestrator invokes the executable with the argv
 //! contract `--fixture-root --manifest --transcript-out --case`. The binary
 //! digests, toolchain version and lockfile digest are the orchestrator's to
 //! verify before any window; nothing here reads the live pool, root,

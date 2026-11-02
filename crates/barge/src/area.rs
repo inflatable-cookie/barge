@@ -3023,7 +3023,7 @@ pub(crate) fn read_directory(path: &Path) -> Result<Option<Vec<String>>> {
             .with_detail("path", path.display().to_string().into())
         })?;
         #[cfg(test)]
-        crate::tape::dir_entry("area::read_directory", dir_facts(path), &entry.file_name());
+        crate::tape::dir_entry("area::read_directory", None, &entry.file_name());
         names.push(entry.file_name().to_string_lossy().into_owned());
     }
     names.sort();
@@ -3036,18 +3036,6 @@ pub(crate) fn read_directory(path: &Path) -> Result<Option<Vec<String>>> {
         false,
     );
     Ok(Some(names))
-}
-
-/// The directory's own device and inode, as the cfg(test) tape binds an
-/// enumeration's parent identity. A directory that cannot be stated binds no
-/// parent, which never reconciles against a manifest entry.
-#[cfg(test)]
-fn dir_facts(path: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => Some((metadata.dev(), metadata.ino())),
-        Err(_) => None,
-    }
 }
 
 /// Why one declaration write happens.

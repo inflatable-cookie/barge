@@ -84,7 +84,7 @@ flush path.
 
 ## Caps and the honest finding about real hosts
 
-The accepted contract's transcript caps are fixed and implemented as written:
+The accepted contract's transcript caps are fixed; the provisional recorder tracks:
 8192 read rows, 8 MiB of document, 64 occurrences per identity key, 512
 process rows. An exhausted cap is recorded in the transcript's `caps` block
 (`read_rows_exhausted`, `occurrences_exhausted`, `process_rows_exhausted`,
@@ -134,11 +134,9 @@ engine's own code (`ErrorKind::exit_code`, or `PruneReport::needs_human`'s
 From the exact staged Barge commit, offline, committed `Cargo.lock`, default
 features only — no feature enabled, the proof feature off, toolchain 1.97.1:
 
-```sh
-cargo test --locked --no-run --test tape_eval
-```
-
-The produced executable under the managed target directory is the one a window
+An Effigy selector for a locked, default-feature `tape_eval` test build is
+still needed for staging. Do not invoke Cargo directly. The produced executable
+under the managed target directory is the one a window
 invokes under the argv contract above; its digest, the toolchain and the
 lockfile are the orchestrator's to verify before any run. No fixture, pool,
 registry, root or account outside the given fixture root is read or written,
@@ -211,6 +209,27 @@ attempt, including when the path is not UTF-8. It does not serialize that
 private matching value: an unrepresentable effect path remains absent from the
 provisional document and cannot establish a complete effect identity. The
 non-UTF-8 outcome regression is source only until the covering checks run.
+
+The lock recorder no longer calls `File::metadata` solely to fill identity,
+and the area and intent directory entry recorders no longer stat a pathname
+after the listing. The unchanged evaluator does not bind those parent and lock
+identities at those sites, so their rows remain unproven. The absence proof's
+already-stored `proved_ms` is recorded after construction without another
+clock read. Occurrence counting uses structured identity fields, so delimiter
+characters in names do not merge distinct observations. These source changes
+and their regression controls have not yet been compiled or executed.
+
+There are additional known apparatus gaps. The manifest parser does not match
+mandatory obligations against observations. The provisional harness exits
+without a transcript for parse, case-mismatch and some setup failures, and
+`finish` returns an error if effects, clocks and the result exceed the document
+cap after all read rows are dropped. These cases do not satisfy the required
+refusal-document contract; the pending shared schema must not be treated as
+already settled. No successful comparison follows from any of these gaps.
+The current `staged_binding` is only a package version and build directory,
+not a source or executable hash. The later staging workflow must bind the
+actual source tree, lockfile, toolchain and executable before that field can
+serve as provenance.
 
 ## Production statement audit
 

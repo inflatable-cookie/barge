@@ -162,6 +162,8 @@ fn prove_absence_inner(
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
         reason: None,
     };
+    #[cfg(test)]
+    crate::tape::now_ms_site(proof.proved_ms, "os::prove_absence_inner");
     let registered = match expected {
         AncestorExpected::BootData => None,
         AncestorExpected::Registered {
