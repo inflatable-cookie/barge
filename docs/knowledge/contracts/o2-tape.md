@@ -321,6 +321,19 @@ declarations (area.rs:2867, 3167), while `resolve_by` uses
 `walk_folder_chain` (area.rs:1041, 1509); neither call selects a creation
 entry point. These observations delimit those individual branches; they do not
 yet close the transitive audit of every descendant, partial write, or callback.
+The placement census branch goes from `BargeReferences::read` to
+`cache::read_placements` (reference.rs:277; cache.rs:676), which enumerates
+via `area::read_directory`, reads bounded placement documents, validates and
+returns the set; it does not call the cache adoption or publication methods.
+The Oxide snapshot branch (reference.rs:628) calls `control_directory`,
+`read_registry`, `read_receipts`, `pools_holding` and `PoolCustody::read`;
+the latter reads pool records through `read_pool` and `read_document`
+(pool_custody.rs:129, 192, 394). This branch is observational and does not call
+the state publication helpers. Root custody goes through
+`custody::take_custody_by` → `decide` (custody.rs:403, 644), including hold,
+marker, identity and process-observer checks. The method-level trace still
+needs to account for every platform leaf and error branch before it can be
+called a complete transitive write proof.
 
 The ordinary test suite includes
 `ordinary_account_tests::an_ordinary_build_takes_oxide_directories_from_the_password_database_home`.
