@@ -171,7 +171,9 @@ result. Fully identified process rows and classified/retry process observations,
 and scalar uid, boot and complete process-table observations can be marked proven; refused rows and families without audited
 identity rules remain unproven. It cannot satisfy mandatory
 coverage or establish parity. Path observations do not infer a parent with a
-later filesystem lookup. Handle listings and descriptor facts carry the device
+later filesystem lookup. The macOS child-file reader records its checked
+parent and opened-file device/inode with the bytes digest after its existing
+stability checks. Handle listings and descriptor facts carry the device
 and inode actually supplied by the handle or descriptor; a pathname and parent
 identity are not invented. A non-UTF-8 path is not converted to a lossy
 identity; an unrepresentable component is refused. Refusals are not successful

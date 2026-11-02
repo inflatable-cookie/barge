@@ -4045,10 +4045,11 @@ impl DirOps for MacOs {
                     ));
                 }
                 #[cfg(test)]
-                crate::tape::read_present_component(
+                crate::tape::read_present_component_bound(
                     "MacOs::read_child_file",
                     (parent.identity().device.get(), parent.identity().inode),
                     name,
+                    (facts.device.get(), facts.inode),
                     &buffer,
                     Some(cap as u64),
                 );

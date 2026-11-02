@@ -624,6 +624,10 @@ fn observation_proven(kind: &str, identity: &Identity, outcome: &Outcome) -> boo
         return false;
     }
     match kind {
+        "file" if matches!(outcome, Outcome::Digest { .. }) => {
+            identity.parent_device.is_some() && identity.parent_inode.is_some()
+                && identity.device.is_some() && identity.inode.is_some()
+        }
         "process-row" | "process-observation" | "platform-status" => {
             identity.pid.is_some() && identity.start.is_some() && identity.uid.is_some()
         }
@@ -768,6 +772,21 @@ pub(crate) fn read_present_component(
         Outcome::digest(bytes, cap),
         cap,
     );
+}
+
+/// Record bytes read from a descriptor whose parent and own facts were checked.
+pub(crate) fn read_present_component_bound(
+    site: &'static str,
+    parent: (u64, u64),
+    name: &str,
+    own: (u64, u64),
+    bytes: &[u8],
+    cap: Option<u64>,
+) {
+    let mut identity = Identity::component(Some(parent), name);
+    identity.device = Some(own.0);
+    identity.inode = Some(own.1);
+    record("file", site, identity, Outcome::digest(bytes, cap), cap);
 }
 
 /// Record a positive absence at a path.
@@ -1474,6 +1493,19 @@ mod tests {
         assert_eq!(row["identity"]["start"], 123);
         assert_eq!(row["outcome"]["answer"]["answer"], "1");
         assert_eq!(row["observation_proven"], false);
+    }
+
+    #[test]
+    fn descriptor_bound_read_records_parent_and_own_facts() {
+        let transcript = window(|| {
+            read_present_component_bound("read", (1, 2), "entry", (1, 3), b"data", Some(16));
+            read_present_component("read", (1, 2), "entry", b"data", Some(16));
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        assert_eq!(document["reads"][0]["identity"]["parent_inode"], 2);
+        assert_eq!(document["reads"][0]["identity"]["inode"], 3);
+        assert_eq!(document["reads"][0]["observation_proven"], true);
+        assert_eq!(document["reads"][1]["observation_proven"], false);
     }
 
     #[test]
