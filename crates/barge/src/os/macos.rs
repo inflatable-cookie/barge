@@ -3509,14 +3509,16 @@ fn descriptor_path(pid: u32, descriptor: i32) -> DescriptorPath {
         return DescriptorPath::Closed;
     }
     #[cfg(test)]
-    crate::tape::vnode(
-        "macos::descriptor_path",
-        pid,
-        descriptor,
-        "vnode-path",
-        crate::tape::Outcome::answer("path"),
-        Some(path.to_string_lossy().into_owned()),
-    );
+    match path.to_str() {
+        Ok(text) => crate::tape::vnode(
+            "macos::descriptor_path", pid, descriptor, "vnode-path",
+            crate::tape::Outcome::answer("path"), Some(text.to_owned()),
+        ),
+        Err(_) => crate::tape::vnode(
+            "macos::descriptor_path", pid, descriptor, "vnode-path",
+            crate::tape::Outcome::refused("non_utf8_path"), None,
+        ),
+    }
     DescriptorPath::Path(PathBuf::from(OsStr::from_bytes(path.to_bytes())))
 }
 

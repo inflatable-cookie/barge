@@ -142,7 +142,7 @@ impl Identity {
     /// No parent is inferred from a separate lookup.
     pub(crate) fn file(path: &Path, facts: Option<(u64, u64)>) -> Self {
         Self {
-            path: Some(path.display().to_string()),
+            path: path.to_str().map(str::to_owned),
             component: None,
             device: facts.map(|(device, _)| device),
             inode: facts.map(|(_, inode)| inode),
@@ -181,7 +181,7 @@ impl Identity {
     pub(crate) fn volume(volume_uuid: Option<&str>, mount: Option<&Path>) -> Self {
         Self {
             volume_uuid: volume_uuid.map(str::to_owned),
-            mount: mount.map(|mount| mount.display().to_string()),
+            mount: mount.and_then(Path::to_str).map(str::to_owned),
             ..Self::none()
         }
     }
@@ -195,10 +195,10 @@ impl Identity {
         mount: Option<&Path>,
     ) -> Self {
         Self {
-            path: Some(path.display().to_string()),
+            path: path.to_str().map(str::to_owned),
             device: Some(device),
             volume_uuid: volume_uuid.map(str::to_owned),
-            mount: mount.map(|mount| mount.display().to_string()),
+            mount: mount.and_then(Path::to_str).map(str::to_owned),
             ..Self::none()
         }
     }
@@ -326,7 +326,7 @@ pub(crate) struct ReadRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct EffectRow {
     kind: &'static str,
-    path: String,
+    path: Option<String>,
     parent_device: Option<u64>,
     parent_inode: Option<u64>,
     destination: Option<String>,
@@ -660,7 +660,7 @@ fn effect(kind: &'static str, path: &Path) {
         tape.next_epoch = tape.next_epoch.saturating_add(1);
         tape.effects.push(EffectRow {
             kind,
-            path: path.display().to_string(),
+            path: path.to_str().map(str::to_owned),
             parent_device: None,
             parent_inode: None,
             destination: None,
@@ -679,7 +679,7 @@ pub(crate) fn child_effect(kind: &'static str, parent: (u64, u64), name: &str, d
         tape.next_epoch = tape.next_epoch.saturating_add(1);
         tape.effects.push(EffectRow {
             kind,
-            path: name.to_owned(),
+            path: Some(name.to_owned()),
             parent_device: Some(parent.0),
             parent_inode: Some(parent.1),
             destination: destination.map(str::to_owned),
@@ -694,7 +694,7 @@ pub(crate) fn effect_outcome(kind: &str, path: &Path, error: Option<&std::io::Er
     TAPE.with(|tape| {
         let mut tape = tape.borrow_mut();
         if let Some(row) = tape.effects.iter_mut().rev().find(|row| {
-            row.kind == kind && row.path == path.display().to_string() && row.outcome.is_none()
+            row.kind == kind && path.to_str().is_some() && row.path.as_deref() == path.to_str() && row.outcome.is_none()
         }) {
             row.outcome = Some(error.map_or_else(|| "succeeded".to_owned(), errno_class));
         }
@@ -823,13 +823,15 @@ pub(crate) fn io_stat(
 
 /// Record one entry seen in an enumeration, bound to the observed parent.
 pub(crate) fn dir_entry(site: &'static str, parent: Option<(u64, u64)>, name: &std::ffi::OsStr) {
-    record(
-        "dir-entry",
-        site,
-        Identity::component(parent, &name.to_string_lossy()),
-        Outcome::facts("entry"),
-        None,
-    );
+    match name.to_str() {
+        Some(name) => record("dir-entry", site, Identity::component(parent, name), Outcome::facts("entry"), None),
+        None => {
+            let mut identity = Identity::none();
+            identity.parent_device = parent.map(|(device, _)| device);
+            identity.parent_inode = parent.map(|(_, inode)| inode);
+            record("dir-entry", site, identity, Outcome::refused("non_utf8_component"), None);
+        }
+    }
 }
 
 /// Record an enumeration call's outcome.
@@ -1432,6 +1434,17 @@ mod tests {
         assert_eq!(row["identity"]["fd"], 7);
         assert_eq!(row["identity"]["start"], 123);
         assert_eq!(row["outcome"]["answer"]["answer"], "1");
+        assert_eq!(row["observation_proven"], false);
+    }
+
+    #[test]
+    fn non_utf8_component_is_refused_without_a_lossy_identity() {
+        use std::os::unix::ffi::OsStrExt;
+        let transcript = window(|| dir_entry("listing", Some((1, 2)), std::ffi::OsStr::from_bytes(b"x\xff")));
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        let row = &document["reads"][0];
+        assert!(row["identity"].get("component").is_none());
+        assert_eq!(row["outcome"]["refused"]["class"], "non_utf8_component");
         assert_eq!(row["observation_proven"], false);
     }
 

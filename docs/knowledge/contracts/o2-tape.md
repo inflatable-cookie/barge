@@ -173,7 +173,9 @@ identity rules remain unproven. It cannot satisfy mandatory
 coverage or establish parity. Path observations do not infer a parent with a
 later filesystem lookup. Handle listings and descriptor facts carry the device
 and inode actually supplied by the handle or descriptor; a pathname and parent
-identity are not invented. Refusals are not successful observations.
+identity are not invented. A non-UTF-8 path is not converted to a lossy
+identity; an unrepresentable component is refused. Refusals are not successful
+observations.
 
 The unchanged `state::read_bounded_inner` reads metadata and opens the target by
 path; it does not expose an observed parent descriptor. `StateLock::shared_if_present`
