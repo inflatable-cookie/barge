@@ -873,6 +873,11 @@ pub(crate) fn process_row(site: &'static str, pid: u32, uid: Option<u32>, start:
     );
 }
 
+/// Preserve classified and retry identities as separate ordered observations.
+pub(crate) fn observed_process(site: &'static str, pid: u32, start: u64, uid: Option<u32>, label: &str) {
+    record("process-observation", site, Identity::process(pid, start, uid, None), Outcome::answer(label), None);
+}
+
 /// Record the process-table read's own outcome.
 pub(crate) fn process_table(site: &'static str, outcome: Outcome) {
     record("process-table", site, Identity::none(), outcome, None);
@@ -895,10 +900,7 @@ pub(crate) fn vnode(
     outcome: Outcome,
     path: Option<String>,
 ) {
-    let mut identity = process_identity(pid, Some(fd));
-    if which == "vnode-facts" {
-        PROCESS_CONTEXT.with(|slot| *slot.borrow_mut() = None);
-    }
+    let mut identity = Identity::unidentified_process(pid, Some(fd));
     identity.path = path;
     record(which, site, identity, outcome, None);
 }
@@ -1353,6 +1355,23 @@ mod tests {
         assert!(document["reads"][1]["identity"].get("start").is_none());
         assert_eq!(document["reads"][1]["observation_proven"], false);
         assert!(document["reads"][2]["identity"].get("start").is_none());
+    }
+
+    #[test]
+    fn changed_retry_identity_does_not_relabel_later_vnode() {
+        let transcript = window(|| {
+            observed_process("settle", 42, 10, Some(501), "classified");
+            observed_process("settle", 42, 11, Some(501), "retry_identity");
+            vnode("vnode", 42, 3, "vnode-facts", Outcome::answer("readable"), None);
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        let rows = document["reads"].as_array().expect("reads");
+        assert_eq!(rows[0]["identity"]["start"], 10);
+        assert_eq!(rows[1]["identity"]["start"], 11);
+        assert!(rows[0]["epoch"].as_u64() < rows[1]["epoch"].as_u64());
+        assert!(rows[1]["epoch"].as_u64() < rows[2]["epoch"].as_u64());
+        assert!(rows[2]["identity"].get("start").is_none());
+        assert_eq!(rows[2]["observation_proven"], false);
     }
 
     #[test]

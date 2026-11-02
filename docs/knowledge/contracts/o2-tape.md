@@ -187,9 +187,10 @@ an already opened parent descriptor and its identity through these existing
 operations, binding each child observation to that descriptor and recording
 its actual result, without a second lookup; no such change is authorized here.
 Tom's decision d2c34987 scopes parent-descriptor instrumentation to separate,
-independently reviewed work. Descriptor leaf rows carry the evaluator's most recent classified process
-identity where available, but remain unproven: the retry path can switch process
-start identities while the caller retains its original classification. The
+independently reviewed work. The tape records the evaluator's classified identity and each retry identity
+as separate ordered rows. Vnode rows remain unproven and do not inherit either:
+the retry path can switch process identities while the caller retains its
+original classification, and neither identity proves the later observation. The
 write-side recorder captures attempts and outcomes for the four reviewed
 DirOps verbs, including publish writes, syncs, rename and cleanup. Effect parent
 identities and the remaining reached write sites still require a source audit. The

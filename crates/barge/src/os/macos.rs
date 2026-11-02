@@ -1459,6 +1459,8 @@ impl MacOs {
         faults: &mut [StatedListing],
     ) -> Settled {
         let pid = classified.pid;
+        #[cfg(test)]
+        crate::tape::observed_process("MacOs::settle_descriptors", pid, classified.start, classified.effective_uid, "classified");
         let settle_started = Instant::now();
         let mut start = classified.start;
         let mut retries = 0usize;
@@ -1549,6 +1551,8 @@ impl MacOs {
                             }
                         }
                     };
+                    #[cfg(test)]
+                    crate::tape::observed_process("MacOs::settle_descriptors", pid, now.identity.start, now.identity.effective_uid, "retry_identity");
                     if record.command.is_none() {
                         record.command = Some(now.command);
                     }
@@ -1650,7 +1654,7 @@ impl MacOs {
         faults: &mut [StatedListing],
     ) -> Observed {
         #[cfg(test)]
-        crate::tape::process_context(identity.pid, identity.start, identity.effective_uid);
+        crate::tape::observed_process("MacOs::observe_descriptor", identity.pid, identity.start, identity.effective_uid, "classified");
         let stated = stated_vnode_read(faults, identity.pid, vnode_index);
         match read_descriptor(identity.pid, descriptor, stated) {
             Ok(DescriptorReading::Path(path)) => Observed::Path(path),
@@ -1738,8 +1742,6 @@ impl MacOs {
                 Ok(Some(())) => {}
                 Err(reason) => return Observed::Unreadable(reason),
             }
-            #[cfg(test)]
-            crate::tape::process_context(pid, classified.start, classified.effective_uid);
             let stated = stated_vnode_read(faults, pid, vnode_index);
             let mut reading = match read_descriptor(pid, descriptor, stated) {
                 Ok(reading) => reading,
@@ -1995,8 +1997,6 @@ impl MacOs {
                 "when the dead descriptor was re-observed",
             ));
         }
-        #[cfg(test)]
-        crate::tape::process_context(pid, before.identity.start, before.identity.effective_uid);
         let stated = stated_vnode_read(faults, pid, vnode_index);
         let reading = read_descriptor(pid, descriptor, stated);
         // A failed observation is never discarded, and never settled by a process
