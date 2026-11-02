@@ -692,6 +692,7 @@ where
     let mut before_rename = Some(before_rename);
     for _ in 0..TEMP_ATTEMPTS {
         let temporary = parent.join(temporary_name(name));
+        #[cfg(not(test))]
         let mut file = match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -712,16 +713,40 @@ where
                 .with_detail("os_error", error.to_string().into()));
             }
         };
+        #[cfg(test)]
+        let mut file = match crate::tape::io_effect("create", &temporary, || {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(FILE_MODE)
+                .open(&temporary)
+        })
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == IoErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(Error::new(
+                    ErrorKind::Io,
+                    format!(
+                        "cannot create a temporary file in {}: {error}",
+                        parent.display()
+                    ),
+                )
+                .with_detail("path", parent.display().to_string().into())
+                .with_detail("os_error", error.to_string().into()));
+            }
+        };
 
         let written = write_and_publish(&mut file, &temporary, target, bytes, &mut before_rename);
         if written.is_err() {
             // Best effort: a leftover temporary file is never read as the target,
             // and reporting the original failure matters more than this cleanup.
+            #[cfg(not(test))]
             let _ = std::fs::remove_file(&temporary);
+            #[cfg(test)]
+            let _ = crate::tape::io_effect("unlink", &temporary, || std::fs::remove_file(&temporary));
         }
         written?;
-        #[cfg(test)]
-        crate::tape::write_effect("save", target);
         return sync_directory(parent);
     }
 
@@ -745,7 +770,17 @@ fn write_and_publish<F>(
 where
     F: FnOnce(&Path) -> Result<()>,
 {
+    #[cfg(not(test))]
     file.write_all(bytes).map_err(|error| {
+        Error::new(
+            ErrorKind::Io,
+            format!("cannot write {}: {error}", temporary.display()),
+        )
+        .with_detail("path", temporary.display().to_string().into())
+        .with_detail("os_error", error.to_string().into())
+    })?;
+    #[cfg(test)]
+    crate::tape::io_effect("save", temporary, || file.write_all(bytes)).map_err(|error| {
         Error::new(
             ErrorKind::Io,
             format!("cannot write {}: {error}", temporary.display()),
@@ -763,6 +798,22 @@ where
     if let Some(seam) = before_rename.take() {
         seam(temporary)?;
     }
+    #[cfg(test)]
+    {
+        crate::tape::io_rename(temporary, target, || std::fs::rename(temporary, target)).map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!(
+                    "cannot publish {} over {}: {error}",
+                    temporary.display(),
+                    target.display()
+                ),
+            )
+            .with_detail("path", target.display().to_string().into())
+            .with_detail("os_error", error.to_string().into())
+        })
+    }
+    #[cfg(not(test))]
     std::fs::rename(temporary, target).map_err(|error| {
         Error::new(
             ErrorKind::Io,
@@ -870,6 +921,7 @@ impl StateLock {
     /// Creation needs its directory, which only [`StatePaths::initialize`]
     /// makes; a missing directory is reported rather than created here.
     pub fn exclusive(path: &Path, rank: LockRank, deadline: Deadline) -> Result<Self> {
+        #[cfg(not(test))]
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -879,7 +931,16 @@ impl StateLock {
             .open(path)
             .map_err(|error| lock_open_error(path, &error))?;
         #[cfg(test)]
-        crate::tape::write_effect("lock-create", path);
+        let file = crate::tape::io_effect("lock-create", path, || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(FILE_MODE)
+                .open(path)
+        })
+            .map_err(|error| lock_open_error(path, &error))?;
         wait_for_lock(&file, path, LockMode::Exclusive, deadline)?;
         #[cfg(test)]
         crate::tape::lock("state::StateLock::exclusive", path, lock_file_facts(&file));

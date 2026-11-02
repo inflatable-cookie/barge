@@ -695,35 +695,14 @@ pub(crate) fn child_effect(kind: &'static str, parent: (u64, u64), name: &str, d
     });
 }
 
-/// Record a write attempt against an already-open directory itself.
-pub(crate) fn handle_effect(kind: &'static str, directory: (u64, u64)) {
-    TAPE.with(|tape| {
-        let mut tape = tape.borrow_mut();
-        if tape.config.is_none() { return; }
-        let epoch = tape.next_epoch;
-        tape.next_epoch = tape.next_epoch.saturating_add(1);
-        tape.effects.push(EffectRow {
-            kind,
-            path: None,
-            parent_device: None,
-            parent_inode: None,
-            device: Some(directory.0),
-            inode: Some(directory.1),
-            destination: None,
-            outcome: None,
-            epoch,
-        });
-    });
-}
-
-/// Complete a directory-handle attempt without inventing a pathname.
-pub(crate) fn handle_effect_outcome(kind: &str, error: Option<&std::io::Error>) {
-    TAPE.with(|tape| {
-        let mut tape = tape.borrow_mut();
-        if let Some(row) = tape.effects.iter_mut().rev().find(|row| row.kind == kind && row.path.is_none() && row.outcome.is_none()) {
-            row.outcome = Some(error.map_or_else(|| "succeeded".to_owned(), errno_class));
-        }
-    });
+/// Record a sync result separately from the effect set; sync is not a write effect.
+pub(crate) fn sync_observation(site: &'static str, directory: (u64, u64), component: Option<&str>, error: Option<&std::io::Error>) {
+    let identity = match component {
+        Some(name) => Identity::component(Some(directory), name),
+        None => Identity { device: Some(directory.0), inode: Some(directory.1), ..Identity::none() },
+    };
+    let outcome = error.map_or_else(|| Outcome::answer("succeeded"), |error| Outcome::refused(errno_class(error)));
+    record("sync", site, identity, outcome, None);
 }
 
 /// Bind the syscall result to its existing attempt row, without a second effect.
@@ -1032,6 +1011,29 @@ pub(crate) fn custody_record(site: &'static str, pool: &Path, record_id: &str, c
         Outcome::answer(class),
         None,
     );
+}
+
+/// Observe the exact I/O result without changing it or repeating the operation.
+pub(crate) fn io_effect<T>(kind: &'static str, path: &Path, operation: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+    write_effect(kind, path);
+    let result = operation();
+    effect_outcome(kind, path, result.as_ref().err());
+    result
+}
+
+/// Record an attempted rename, including its destination, then bind its result.
+pub(crate) fn io_rename(source: &Path, destination: &Path, operation: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+    write_effect("rename", source);
+    TAPE.with(|tape| {
+        if let Some(row) = tape.borrow_mut().effects.last_mut() {
+            if row.kind == "rename" && row.path.as_deref() == source.to_str() && row.outcome.is_none() {
+                row.destination = destination.to_str().map(str::to_owned);
+            }
+        }
+    });
+    let result = operation();
+    effect_outcome("rename", source, result.as_ref().err());
+    result
 }
 
 /// Record the caller clock: the value the engine passed or read.
@@ -1508,24 +1510,10 @@ mod tests {
     }
 
     #[test]
-    fn directory_sync_uses_descriptor_identity_without_a_fake_path() {
-        let transcript = window(|| {
-            handle_effect("sync", (12, 34));
-            handle_effect_outcome("sync", None);
-        });
-        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
-        let row = &document["effects"][0];
-        assert!(row["path"].is_null());
-        assert_eq!(row["device"], 12);
-        assert_eq!(row["inode"], 34);
-        assert_eq!(row["outcome"], "succeeded");
-    }
-
-    #[test]
     fn child_effect_preserves_parent_and_both_rename_components() {
         let transcript = window(|| {
-            child_effect("rename_attempt", (12, 34), "old", Some("new"));
-            effect_outcome("rename_attempt", Path::new("old"), None);
+            child_effect("rename", (12, 34), "old", Some("new"));
+            effect_outcome("rename", Path::new("old"), None);
         });
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         let row = &document["effects"][0];
@@ -1537,14 +1525,31 @@ mod tests {
     }
 
     #[test]
+    fn successful_rename_remains_an_effect_when_later_sync_fails() {
+        let transcript = window(|| {
+            io_effect("create", Path::new("tmp"), || Ok(())).expect("create");
+            io_rename(Path::new("tmp"), Path::new("target"), || Ok(())).expect("rename");
+            let error = std::io::Error::from_raw_os_error(libc::EIO);
+            sync_observation("directory_sync", (1, 2), None, Some(&error));
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        let effects = document["effects"].as_array().expect("effects");
+        assert_eq!(effects.len(), 2);
+        assert_eq!(effects[1]["kind"], "rename");
+        assert_eq!(effects[1]["destination"], "target");
+        assert_eq!(effects[1]["outcome"], "succeeded");
+        assert_eq!(document["reads"][0]["outcome"]["refused"]["class"], "EIO");
+    }
+
+    #[test]
     fn effect_outcome_uses_captured_error_after_errno_changes() {
         let transcript = window(|| {
-            write_effect("mkdir_attempt", Path::new("child"));
+            write_effect("create", Path::new("child"));
             let captured = std::io::Error::from_raw_os_error(libc::EACCES);
             #[cfg(target_os = "macos")]
             // SAFETY: __error points to this thread's writable errno cell.
             unsafe { *libc::__error() = libc::ENOENT; }
-            effect_outcome("mkdir_attempt", Path::new("child"), Some(&captured));
+            effect_outcome("create", Path::new("child"), Some(&captured));
         });
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         assert_eq!(document["effects"].as_array().map(Vec::len), Some(1));

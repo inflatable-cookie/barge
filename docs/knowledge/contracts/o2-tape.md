@@ -194,10 +194,12 @@ as separate ordered rows, and records each returned descriptor number and type. 
 but remain unproven and do not inherit either process identity: the retry path can switch process identities while the caller retains its
 original classification, and neither identity proves the later observation. The
 write-side recorder captures attempts and outcomes for the four reviewed
-DirOps verbs, including publish writes, syncs, rename and cleanup. Child effects
-carry the already-open parent handle identity; directory sync records the
-handle's own identity without a fabricated pathname. Remaining reached write sites and
-effect completeness still require a source audit. The
+DirOps verbs, including publish writes, rename and cleanup. Atomic state
+publication also records its create, write, rename and cleanup attempts, and
+exclusive lock opens are recorded as attempts without inferring creation. Child effects
+carry the already-open parent handle identity. Sync results are separate
+observations rather than fabricated write effects. Remaining reached write
+sites and effect completeness still require a source audit. The
 source-count test is not a complete inventory or a compile-away proof.
 
 ## Production statement audit

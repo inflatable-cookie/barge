@@ -3815,7 +3815,7 @@ impl DirOps for MacOs {
         let directory = parent_descriptor(parent, name)?;
         let raw = name_cstring(name)?;
         #[cfg(test)]
-        crate::tape::child_effect("mkdir_attempt", (parent.identity().device.get(), parent.identity().inode), name, None);
+        crate::tape::child_effect("create", (parent.identity().device.get(), parent.identity().inode), name, None);
         // SAFETY: `directory` is open for this call, `raw` is one NUL-terminated
         // component, and `mode` is passed with the default argument promotion a
         // variadic C function expects.
@@ -3831,7 +3831,7 @@ impl DirOps for MacOs {
         {
             let answer = unsafe { libc::mkdirat(directory, raw.as_ptr(), mode as libc::mode_t) };
             let error = (answer != 0).then(io::Error::last_os_error);
-            crate::tape::effect_outcome("mkdir_attempt", Path::new(name), error.as_ref());
+            crate::tape::effect_outcome("create", Path::new(name), error.as_ref());
             if let Some(error) = error {
                 return Err(child_error(name, "cannot create the child directory", error));
             }
@@ -3852,7 +3852,7 @@ impl DirOps for MacOs {
         let temporary = format!(".barge-tmp-{}-{sequence}", std::process::id());
         let temporary_raw = name_cstring(&temporary)?;
         #[cfg(test)]
-        crate::tape::child_effect("publish_attempt", (parent.identity().device.get(), parent.identity().inode), &temporary, None);
+        crate::tape::child_effect("create", (parent.identity().device.get(), parent.identity().inode), &temporary, None);
         // SAFETY: `directory` is open, `temporary_raw` is one NUL-terminated
         // component, the flags are libc's own constants and the variadic mode is
         // passed with the promotion C expects. The result is either -1 or a
@@ -3876,7 +3876,7 @@ impl DirOps for MacOs {
         #[cfg(test)]
         {
             let error = (descriptor < 0).then(io::Error::last_os_error);
-            crate::tape::effect_outcome("publish_attempt", Path::new(&temporary), error.as_ref());
+            crate::tape::effect_outcome("create", Path::new(&temporary), error.as_ref());
             if let Some(error) = error {
                 return Err(child_error(name, "cannot create a temporary file", error));
             }
@@ -3890,9 +3890,9 @@ impl DirOps for MacOs {
                 .map_err(|error| child_error(name, "cannot write the temporary file", error))?;
             #[cfg(test)]
             {
-                crate::tape::child_effect("publish_write_attempt", (parent.identity().device.get(), parent.identity().inode), &temporary, None);
+                crate::tape::child_effect("save", (parent.identity().device.get(), parent.identity().inode), &temporary, None);
                 let result = file.write_all(bytes);
-                crate::tape::effect_outcome("publish_write_attempt", Path::new(&temporary), result.as_ref().err());
+                crate::tape::effect_outcome("save", Path::new(&temporary), result.as_ref().err());
                 result.map_err(|error| child_error(name, "cannot write the temporary file", error))?;
             }
             #[cfg(not(test))]
@@ -3900,15 +3900,14 @@ impl DirOps for MacOs {
                 .map_err(|error| child_error(name, "cannot sync the temporary file", error))?;
             #[cfg(test)]
             {
-                crate::tape::child_effect("publish_sync_attempt", (parent.identity().device.get(), parent.identity().inode), &temporary, None);
                 let result = file.sync_all();
-                crate::tape::effect_outcome("publish_sync_attempt", Path::new(&temporary), result.as_ref().err());
+                crate::tape::sync_observation("publish_file_sync", (parent.identity().device.get(), parent.identity().inode), Some(&temporary), result.as_ref().err());
                 result.map_err(|error| child_error(name, "cannot sync the temporary file", error))?;
             }
             // SAFETY: both names are NUL-terminated components inside the same
             // open directory, which is what makes the rename atomic.
             #[cfg(test)]
-            crate::tape::child_effect("publish_rename_attempt", (parent.identity().device.get(), parent.identity().inode), &temporary, Some(name));
+            crate::tape::child_effect("rename", (parent.identity().device.get(), parent.identity().inode), &temporary, Some(name));
             #[cfg(not(test))]
             if unsafe {
                 libc::renameat(
@@ -3931,7 +3930,7 @@ impl DirOps for MacOs {
                     libc::renameat(directory, temporary_raw.as_ptr(), directory, target.as_ptr())
                 };
                 let error = (answer != 0).then(io::Error::last_os_error);
-                crate::tape::effect_outcome("publish_rename_attempt", Path::new(&temporary), error.as_ref());
+                crate::tape::effect_outcome("rename", Path::new(&temporary), error.as_ref());
                 if let Some(error) = error {
                     return Err(child_error(name, "cannot publish the file", error));
                 }
@@ -3947,10 +3946,9 @@ impl DirOps for MacOs {
             }
             #[cfg(test)]
             {
-                crate::tape::handle_effect("publish_dir_sync_attempt", (parent.identity().device.get(), parent.identity().inode));
                 let answer = unsafe { libc::fsync(directory) };
                 let error = (answer != 0).then(io::Error::last_os_error);
-                crate::tape::handle_effect_outcome("publish_dir_sync_attempt", error.as_ref());
+                crate::tape::sync_observation("publish_directory_sync", (parent.identity().device.get(), parent.identity().inode), None, error.as_ref());
                 if let Some(error) = error {
                     return Err(child_error(name, "cannot sync the directory", error));
                 }
@@ -3967,10 +3965,10 @@ impl DirOps for MacOs {
             }
             #[cfg(test)]
             {
-                crate::tape::child_effect("publish_cleanup_attempt", (parent.identity().device.get(), parent.identity().inode), &temporary, None);
+                crate::tape::child_effect("unlink", (parent.identity().device.get(), parent.identity().inode), &temporary, None);
                 let answer = unsafe { libc::unlinkat(directory, temporary_raw.as_ptr(), 0) };
                 let error = (answer != 0).then(io::Error::last_os_error);
-                crate::tape::effect_outcome("publish_cleanup_attempt", Path::new(&temporary), error.as_ref());
+                crate::tape::effect_outcome("unlink", Path::new(&temporary), error.as_ref());
             }
         }
         published
@@ -4292,18 +4290,18 @@ impl DirOps for MacOs {
             RemoveKind::Directory => libc::AT_REMOVEDIR,
         };
         #[cfg(test)]
-        crate::tape::child_effect("unlink_attempt", (parent.identity().device.get(), parent.identity().inode), name, None);
+        crate::tape::child_effect("unlink", (parent.identity().device.get(), parent.identity().inode), name, None);
         // SAFETY: `directory` is open for this call, `raw` is one NUL-terminated
         // component and `flags` is either zero or libc's own directory flag, so
         // no symbolic link at the leaf is ever followed.
         if unsafe { libc::unlinkat(directory, raw.as_ptr(), flags) } == 0 {
             #[cfg(test)]
-            crate::tape::effect_outcome("unlink_attempt", Path::new(name), None);
+            crate::tape::effect_outcome("unlink", Path::new(name), None);
             return Ok(ChildRemoval::Removed);
         }
         let error = io::Error::last_os_error();
         #[cfg(test)]
-        crate::tape::effect_outcome("unlink_attempt", Path::new(name), Some(&error));
+        crate::tape::effect_outcome("unlink", Path::new(name), Some(&error));
         match error.raw_os_error() {
             Some(libc::ENOENT) => Ok(ChildRemoval::Absent),
             Some(libc::ENOTEMPTY | libc::EEXIST) => Ok(ChildRemoval::NotEmpty),
@@ -4316,7 +4314,7 @@ impl DirOps for MacOs {
         let source = name_cstring(from)?;
         let target = name_cstring(to)?;
         #[cfg(test)]
-        crate::tape::child_effect("rename_attempt", (parent.identity().device.get(), parent.identity().inode), from, Some(to));
+        crate::tape::child_effect("rename", (parent.identity().device.get(), parent.identity().inode), from, Some(to));
         // SAFETY: both names are NUL-terminated components inside the same open
         // directory, which is what makes the rename atomic, and `RENAME_EXCL` is
         // libc's own flag for the platform's exclusive rename. The exclusive
@@ -4332,12 +4330,12 @@ impl DirOps for MacOs {
         } == 0
         {
             #[cfg(test)]
-            crate::tape::effect_outcome("rename_attempt", Path::new(from), None);
+            crate::tape::effect_outcome("rename", Path::new(from), None);
             return Ok(RenameOutcome::Renamed);
         }
         let error = io::Error::last_os_error();
         #[cfg(test)]
-        crate::tape::effect_outcome("rename_attempt", Path::new(from), Some(&error));
+        crate::tape::effect_outcome("rename", Path::new(from), Some(&error));
         if error.raw_os_error() == Some(libc::EEXIST) {
             // The target name is taken. Nothing was renamed, so the caller
             // decides: a capture retries with a fresh private name, and a
