@@ -295,6 +295,32 @@ pub(crate) struct ReadRow {
     occurrence: u32,
 }
 
+/// Semantic obligation independent of the still-provisional wire schema.
+/// Only Barge obligations are passed here by a future schema adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Obligation {
+    pub(crate) site: String,
+    pub(crate) kind: String,
+    pub(crate) identity: Identity,
+}
+
+/// Return missing obligations by index. An unproven or refused row cannot
+/// satisfy a key. This alone does not reconcile extra reads, dynamic facts,
+/// effects, cap exhaustion, or the not-yet-approved manifest wire schema.
+pub(crate) fn missing_obligations(obligations: &[Obligation], rows: &[ReadRow]) -> Vec<usize> {
+    obligations.iter().enumerate().filter_map(|(index, obligation)| {
+        let duplicate = obligations[..index].contains(obligation);
+        let matched = !duplicate && rows.iter().any(|row| {
+            row.site == obligation.site
+                && row.kind == obligation.kind
+                && row.identity == obligation.identity
+                && row.observation_proven
+                && !matches!(&row.outcome, Outcome::Refused { .. })
+        });
+        (!matched).then_some(index)
+    }).collect()
+}
+
 /// One observed or attempted effect. The plan's own window records none; a
 /// non-empty set is the honest record of an attempted write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1127,6 +1153,31 @@ pub(crate) fn write_effect(kind: &'static str, path: &Path) {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn obligations_require_the_exact_proven_source_and_identity() {
+        let identity = Identity::process(42, 123, Some(501), Some(4));
+        let obligation = Obligation {
+            site: "descriptor".to_owned(),
+            kind: "fd-entry".to_owned(),
+            identity: identity.clone(),
+        };
+        let mut row = ReadRow {
+            kind: "fd-entry", site: "descriptor", identity,
+            outcome: Outcome::answer("vnode"), observation_proven: true,
+            cap: None, epoch: 0, occurrence: 1,
+        };
+        assert!(missing_obligations(std::slice::from_ref(&obligation), &[row.clone()]).is_empty());
+        assert_eq!(missing_obligations(&[obligation.clone(), obligation.clone()], &[row.clone()]), vec![1]);
+        row.observation_proven = false;
+        assert_eq!(missing_obligations(std::slice::from_ref(&obligation), &[row.clone()]), vec![0]);
+        row.observation_proven = true;
+        row.identity.start = Some(124);
+        assert_eq!(missing_obligations(std::slice::from_ref(&obligation), &[row.clone()]), vec![0]);
+        row.identity.start = Some(123);
+        row.outcome = Outcome::refused("gone");
+        assert_eq!(missing_obligations(&[obligation], &[row]), vec![0]);
+    }
 
     /// Open a window, run `body`, and return the finished transcript string.
     fn window(body: impl FnOnce()) -> String {
