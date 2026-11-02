@@ -87,6 +87,9 @@ lists the commands. Each covers what it names:
   end-to-end fixture exercise of the actual release-plan harness
   ([o2-tape](docs/knowledge/contracts/o2-tape.md)). Read-only: fixtures live in the
   run root and the plan changes nothing.
+- `effigy rust:test:tape:pure` — the recorder's in-memory self-tests only;
+  excludes the harness exercise and its real process scan. It does not replace
+  the required end-to-end exercise or establish capture qualification.
 - `effigy rust:test:tape-eval` — the harness executable's own run with no arguments,
   which is its embedded exercise; with the argv contract it runs one manifest window.
 - `effigy release:native:test` and `effigy release:native:plan` — F6-R1's native

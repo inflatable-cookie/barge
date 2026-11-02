@@ -37,6 +37,8 @@ alias = "barge"
 # document, statement discipline) plus the embedded end-to-end fixture
 # exercise of the actual harness (docs/knowledge/contracts/o2-tape.md).
 "rust:test:tape" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib tape"
+# Recorder-only tests: excludes the harness exercise and its real process scan.
+"rust:test:tape:pure" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib tape::tests"
 "rust:test:tape-eval" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --test tape_eval"
 "rust:test:native-harness" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --test native_proof_harness"
 "rust:test:volume-probe" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --example volume_probe"
