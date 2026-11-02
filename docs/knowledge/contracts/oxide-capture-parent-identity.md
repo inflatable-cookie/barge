@@ -84,7 +84,7 @@ X-S2's, separately dispatched).
 
 ### The discovered defect
 
-The first B-S1 tape commit `c458116` carried, in `crates/barge/src/tape.rs`:
+The first B-S1 tape commit `f54fd37` carried, in `crates/barge/src/tape.rs`:
 
 ```rust
 fn parent_identity(path: &Path) -> (Option<u64>, Option<u64>) {
@@ -158,7 +158,7 @@ site.
 | `inflatable-cookie/barge` O1 pin | `4af9360bd09629e970c143080ca159de8eef2562` | every production source claim; this worktree at `39064ba` has no `crates/` diff from it |
 | B-S1 PR41 checkpoint 1 | `226da715f6b9dc8b7c7f93eb584aa6a6b083495a` | the helper removal, `observation_proven`/`observation_complete`, the recorder no-reopen test |
 | B-S1 PR41 checkpoint 2 | `227a76da71366cb1f132dba279397eba40fef4ff` | the clock sites, platform uid, the surviving `dir_facts`/`lock_file_facts` helpers, the current row shapes |
-| B-S1 first tape commit | `c458116` (parent of `19cafe2` chain) | the `parent_identity` defect itself |
+| B-S1 first tape commit | `f54fd37` (ancestor of `19cafe2`) | the `parent_identity` defect itself |
 | `inflatable-cookie/oxide` | sibling pin `9339a01` | `docs/knowledge/contracts/barge-adoption.md`: the accepted shared capture contract, schema names, caps, reconciliation oracle, X-S1/X-S2 slice boundaries |
 
 Oxide's PR230 (#240) manifest schema proposal is cited as pending review, not
@@ -196,26 +196,24 @@ A row's parent and identity fields each carry exactly one provenance class:
 - **`handle`** — the operation resolved the child *through a directory
   descriptor whose identity the engine observed when it opened that
   descriptor* (`DirHandle::identity()`, captured at open by
-  `read_dir_identity`). This is the only class that proves the parent of the
-  actual read without any additional premise; the kernel resolves
-  `openat(fd, name)` inside the directory object the fd names. Discharges a
-  parent obligation as **proven**.
+  `read_dir_identity`). This is the only class that binds the parent object of the
+  actual read directly, subject to the numeric identity premise below; the kernel resolves
+  `openat(fd, name)` inside the directory object the fd names. Can discharge a
+  parent obligation only after the numeric identity premise is qualified.
 - **`extracted`** — read from a fact the same operation, or its production
   prefix in the same function body, already fetched: `MetadataExt::dev()`/
   `ino()` on a `Metadata` the site already holds. Zero additional syscalls.
   The parent variant (an enumeration's parent taken from that site's own
   preceding production stat) is the observation of an *earlier* resolution,
-  not of the operation's own; it discharges a parent obligation only as
-  **derived** (below).
+  not of the operation's own; it provides only contextual **derived** evidence (below).
 - **`context`** — carried from an earlier observation of the same object in
   the same window (for example, the resolved area handle beside a
   `open_path` call whose absolute path names a child of that area).
-  Discharges only as **derived**.
+  Provides contextual **derived** evidence only.
 - **`derived`** (reconciliation-side label, not a row field) — a parent
-  binding whose row provenance is `extracted` or `context`, accepted only
-  when the case declares STATIC custody and the binding agrees with the
-  manifest entry's parent identity; the derivation argument is section
-  "Limits". Absent that premise it leaves the obligation **unproven**.
+  binding whose row provenance is `extracted` or `context`, a contextual inference under declared STATIC custody and manifest agreement.
+  It is not the observed parent required by the shared contract and leaves
+  that obligation **unproven**.
 - **`none`** — the field is absent. A parent obligation flagged mandatory
   cannot be discharged by a `none` row.
 
@@ -271,7 +269,7 @@ occurrences of the same keys, and this inventory covers them identically).
 | # | Site | Kind | Observed | Free | Parent availability | Selection |
 | --- | --- | --- | --- | --- | --- | --- |
 | R1 | `locks.observe_unit` / `observe_root` → `shared_if_present` | lock | as S1 | as S1 | none | L1; each root's lock is its own key |
-| R2 | `dirs.open_path(&root.path)` → `MacOs::open_path` | path open + fstat | opened handle identity (`read_dir_identity`) | — | none for the opened dir itself; **`context`** available: the caller holds the resolved area handle (`ResolvedArea::dirs`) whose child the listed name is | opened-identity row as today, plus an optional `context` parent field naming the area handle's identity and its open epoch; provenance `context`, discharge derived-only |
+| R2 | `dirs.open_path(&root.path)` → `MacOs::open_path` | path open + fstat | opened handle identity (`read_dir_identity`) | — | none for the opened dir itself; **`context`** available: the caller holds the resolved area handle (`ResolvedArea::dirs`) whose child the listed name is | opened-identity row as today, plus an optional `context` parent field naming the area handle's identity and its open epoch; provenance `context`, mandatory parent unproven |
 | R3 | `area::read_marker_with_digest` → `read_marker_bytes` → `dirs.child_facts` + `dirs.read_child_file` | handle-child reads (K1) | child facts (twice), opened fd fstat ×2, bytes, final child re-check | — | `handle` (the root handle) at every step | already bound at the checkpoint for present rows; **repair refusals** to carry the same handle parent; the internal before/after fstat pairs are distinct occurrences of the child key whose outcomes must agree under STATIC |
 | R4 | second `read_marker_with_digest` after `locks.observe_root(id)` | K1 reread | as R3 | — | `handle` | second occurrence of the same key, plus the identity reread comparison the engine itself performs (locked_by vs now) recorded as its verdict row |
 | R5 | `area::read_holds` → `read_hold_directory` | K4 (`area::read_directory`) + K3 per hold + K2 per hold | dir precheck stat + `read_dir`; per-hold `symlink_metadata`; per-hold `state::read_bounded`; per-hold process classification | as S3/S2 | dir entries `extracted` (precheck); hold files: none (the hold stat is of the file, not its parent) | as S3 for the listing; hold-file rows as S2/K3 |
@@ -284,10 +282,10 @@ occurrences of the same keys, and this inventory covers them identically).
 ### Site classes referenced above
 
 - **K1 (handle-child):** every `DirOps` child operation on a held
-  `DirHandle`. Parent = `handle`. Proven, no premise.
+  `DirHandle`. Parent = `handle`. Descriptor-relative binding; numeric identity lifetime remains subject to the K1 premise below.
 - **K2 (bounded path read):** `state::read_bounded_inner`'s precheck stat +
   open + fstat + read. Two-to-three occurrences of one key; own identities
-  `extracted` (free); parent `none`; derived-only under custody.
+  `extracted` (free); parent `none`; mandatory parent remains unproven even under custody.
 - **K3 (path stat):** `symlink_metadata`/`metadata` prechecks. One
   occurrence; own identity `extracted`; parent `none`.
 - **K4 (path enumeration):** `std::fs::read_dir`. Entry rows bind the
@@ -295,8 +293,7 @@ occurrences of the same keys, and this inventory covers them identically).
   one exists (S3, S11, R5); otherwise `none` (S14). **K4b** (only if a case
   ever flags it mandatory): one taped cfg(test) `parent-candidate`
   pre-observation before the `read_dir`, its own row, cost one
-  `fstatat`, failure ⇒ no parent field; discharge derived-only. No current
-  case requires it, so nothing adds it today.
+  `fstatat`, failure ⇒ no parent field; remain insufficient for mandatory parent coverage. It cannot satisfy the shared mandatory parent requirement, so nothing adds it today.
 
 ## Selected design
 
@@ -372,9 +369,8 @@ definition):
 - every parent and own-identity field carries its provenance class;
 - every row carries site, kind, epoch, occurrence and the cap that bound it;
 - a case's `mandatory_observations` entries gain a `parent_required` flag:
-  `handle`-provenance discharges it; `extracted`/`context` discharge it only
-  as `derived` under the case's declared STATIC custody with manifest
-  agreement; `none` never discharges it;
+  `handle`-provenance discharges it only with the qualified K1 premise; `extracted`/`context` are contextual evidence only and do not discharge
+  the shared contract’s mandatory parent identity; `none` never discharges it;
 - effects, clocks, process leaves and the caps block are unchanged from the
   shared contract.
 
@@ -382,11 +378,12 @@ definition):
 
 The shared contract's oracle is unchanged; parent binding adds to step (3):
 
-- a read row whose parent provenance is `handle` proves its parent obligation;
+- a `handle` parent binds the directory object; its numeric identity satisfies the
+  obligation only when the K1 identity premise is independently qualified;
 - `extracted`/`context` parents are compared against the manifest entry's
   `parent_dev`/`parent_ino`: agreement under declared STATIC custody records
-  the obligation as derived-proven; disagreement, or agreement claimed
-  without a STATIC declaration, is **insufficient** with the row named;
+  context only, never satisfaction of a mandatory parent obligation; disagreement
+  or missing binding is **insufficient** with the row named;
 - an own-descriptor identity that disagrees with the manifest entry under
   the same bytes is CF-3's replaced-object detection and is insufficient;
 - two occurrences of one key within one engine's window whose outcomes
@@ -405,9 +402,9 @@ prefix already observed: `DirHandle::identity()` for handle-child rows,
 for `open_path` context, the site's own precheck stat for enumeration
 parents. Zero or near-zero added syscalls (L1 only), zero production shape
 change, refusal and error semantics untouched because the code under test is
-untouched. The cost is honesty about provenance: parent bindings outside K1
-are `extracted`/`context`, discharge derived-only under STATIC custody, and
-the window must actually hold custody for them to mean anything.
+untouched. The cost is honesty about provenance: parent bindings outside K1 are at best `extracted`/`context` evidence;
+they do not satisfy the shared contract’s mandatory direct-state parent identity.
+Those rows remain unproven even under STATIC custody.
 
 **Route B — private handle/type instrumentation (rejected).** Carry an
 already-opened parent descriptor through the direct reads: open the state
@@ -417,28 +414,28 @@ root once, resolve children by `openat`, or pass parent handles into
 intermediate-symlink handling and errno classes differ between
 `File::open(path)` and a handle-relative open chain, so the reader would
 either be a duplicated policy (forbidden — the audit's "no policy copies")
-or a production change to the actual readers. It is also strictly more
-apparatus for the same reconciliation value under custody, since derived
-bindings are already sound there. **Not authorized by this design.** If a
+or a production change to the actual readers. It may be necessary to satisfy mandatory direct-state parent obligations,
+but its behavioral equivalence has not been established. **Not authorized by this design.** If a
 future proof ever needs *proven* (premise-free) parent identity for the
 boot-volume state files themselves, the minimal source-backed option is a
 descriptor-relative state-reader seam in the production readers — a
 production semantics change (intermediate-component resolution and refusal
 behaviour), which is an operator scope question for Tom with the file, symbol
-and behaviour named, never a silent inference. This design raises no such
-question: no current obligation requires proven parents outside the volume
-fixture, where K1 already proves them.
+and behaviour named, never a silent inference. The shared contract expressly requires parent identity at direct state reads
+(`barge-adoption.md`, Direct state reads and identity definition). Therefore
+this design cannot establish complete coverage there; a future scoped brief
+must evaluate that seam and seek Tom’s ruling if semantics or public API change.
 
 ## Limits of descriptor-relative binding
 
 **The theorem (K1).** For an operation `openat(parent_fd, name)` with
 `O_NOFOLLOW` at the leaf, where `parent_fd`'s identity `(dev_p, ino_p)` was
 read by `fstat` when the descriptor was opened: the child object resolved is
-a child of the directory object `parent_fd` names, at call time. A directory
-object's `(st_dev, st_ino)` is fixed for the object's lifetime; a vnode
-stays alive while any descriptor references it, and APFS does not reassign an
-inode number while a live vnode holds it; renaming the directory changes
-neither number. Therefore `(dev_p, ino_p, name, fstat(child), bytes)` is one
+a child of the directory object `parent_fd` names, at call time. The descriptor identifies the directory object at the operation, including
+after a rename. However, the cited sources do not establish APFS inode
+non-reuse or `(dev, ino)` stability over a live descriptor lifetime. Treat
+those properties as unverified premises, not a theorem. Subject to their
+independent qualification, `(dev_p, ino_p, name, fstat(child), bytes)` is one
 attributable operation whose parent is the actual parent of the read, for the
 descriptor's whole lifetime — **regardless of renames, sibling replacement,
 or path replacement elsewhere in the tree**. The recorded path string is
@@ -452,7 +449,7 @@ binds identities and treats paths as capture-time labels.
    resolution traversed; the precheck stat, the open and the read are
    separate resolutions. The bytes are bound to the opened descriptor's
    identity (occurrence 2), which is the object actually read — that much is
-   descriptor fact. The parent is derived only under the window's custody.
+   descriptor fact. No mandatory parent is established, including under custody.
 2. **The fstat pair is not a stable namespace interval.** The precheck→open
    pair does not establish that the namespace was stable between them; it
    establishes that the bytes came from the object occurrence 2 names.
@@ -478,9 +475,8 @@ binds identities and treats paths as capture-time labels.
 5. **Device and inode reuse.** Within one STATIC window under custody there
    is no deletion actor, so no reuse. Across remounts the device changes and
    is a declared DYNAMIC fact; a same-UUID remount must reconcile as the
-   declared remount, never as a fresh identity. An undeclared reuse — same
-   key, different generation of object — surfaces as an occurrence outcome
-   conflicting with the manifest and is insufficient.
+   declared remount, never as a fresh identity. Reuse with identical observed outcomes may be invisible; it cannot be
+   assumed to surface as a conflict. The affected identity remains insufficient.
 6. **Renamed parents.** Identity survives; the path label does not. A row
    whose path string no longer resolves is not wrong; a row whose identity
    no longer matches any manifest entry is.
@@ -511,8 +507,8 @@ They extend the shared contract's seven:
   (X-S2, later): CF-1 unchanged.
 - **PCF-2 (same bytes, changed parent).** Replace a fixture file with
   identical bytes under a different parent (new directory, new inode): K2/K4
-  rows carry `extracted` parents that disagree with the manifest ⇒
-  insufficient, named; K1 rows are unaffected (their parent is the handle),
+  K2 has no parent and K4 may have an earlier `extracted` parent;
+  both remain insufficient for mandatory parent coverage, named; K1 rows are unaffected (their parent is the handle),
   which is the demonstration that handle binding survives parent
   replacement — the case must run both site classes.
 - **PCF-3 (renamed parent, handle held).** Rename a fixture directory while
@@ -599,9 +595,11 @@ tests, doc updates and its own scoped brief; none authorizes a real run.
   PCF-6/PCF-7 self-tests, the provenance serialization, refusal-row binding,
   and the caps; the harness's embedded exercise extended to assert parent
   provenance on the marker, enumeration and lock rows it already produces.
-  Validation: the repository's covering selectors for touched Rust (compile
-  including the cfg(test)-inactive proof, format, lint at the strict
-  profile, the test suites) plus `effigy docs:check` for the doc updates.
+  Validation: `effigy rust:compile`, `effigy rust:format`,
+  `effigy rust:lint`, `effigy rust:test`, and `effigy docs:check`.
+  A future native capture proof is needed to exercise actual descriptor and
+  namespace behavior; its separate brief must specify owned fixture, supervisor,
+  bounds and activation. No native run is authorized here.
   Source binding: the O1 pin; the diff discipline of the shared contract.
   Stopping criteria: all green, production statements byte-unchanged, no
   hidden tape-side read remains.
@@ -625,7 +623,7 @@ proposed validation above belongs to the implementation slices.
 
 ## Open design issues
 
-None open for this design. The named future option — a descriptor-relative
+Mandatory parent coverage for direct state reads remains unresolved. The named future option — a descriptor-relative
 state-reader seam for proven parents on boot-volume state files — is recorded
 where it is rejected (section "Test-only context carrying versus private
 handle/type instrumentation") as an operator scope question for a future
