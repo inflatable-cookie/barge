@@ -2190,6 +2190,10 @@ impl MacOs {
         }
         fds.truncate(written / std::mem::size_of::<libc::proc_fdinfo>());
         #[cfg(test)]
+        for fd in &fds {
+            crate::tape::fd_entry("MacOs::list_descriptors", pid, fd.proc_fd, fd.proc_fdtype);
+        }
+        #[cfg(test)]
         crate::tape::fd_list(
             "MacOs::list_descriptors",
             pid,
@@ -3534,13 +3538,12 @@ fn descriptor_vnode_facts(pid: u32, descriptor: i32) -> VnodeFacts {
     };
     if written as usize == size {
         #[cfg(test)]
-        crate::tape::vnode(
+        crate::tape::vnode_observed(
             "macos::descriptor_vnode_facts",
             pid,
             descriptor,
-            "vnode-facts",
-            crate::tape::Outcome::answer("readable"),
-            None,
+            u64::from(info.pvi.vi_stat.vst_dev),
+            info.pvi.vi_stat.vst_ino,
         );
         return VnodeFacts::Readable;
     }

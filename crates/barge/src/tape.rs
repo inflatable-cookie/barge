@@ -622,7 +622,7 @@ fn observation_proven(kind: &str, identity: &Identity, outcome: &Outcome) -> boo
         return false;
     }
     match kind {
-        "process-row" | "platform-status" => {
+        "process-row" | "process-observation" | "platform-status" => {
             identity.pid.is_some() && identity.start.is_some() && identity.uid.is_some()
         }
         "uid" | "boot" => matches!(outcome, Outcome::Answer { .. }),
@@ -915,6 +915,17 @@ pub(crate) fn fd_list(site: &'static str, pid: u32, outcome: Outcome) {
     record("fd-list", site, identity, outcome, None);
 }
 
+/// Record one descriptor returned by the process listing.
+pub(crate) fn fd_entry(site: &'static str, pid: u32, fd: i32, fd_type: u32) {
+    record(
+        "fd-entry",
+        site,
+        process_identity(pid, Some(fd)),
+        Outcome::answer(fd_type.to_string()),
+        None,
+    );
+}
+
 /// Record one per-descriptor vnode answer: `which` is `vnode-path` or
 /// `vnode-facts`, and a readable path names itself.
 pub(crate) fn vnode(
@@ -928,6 +939,14 @@ pub(crate) fn vnode(
     let mut identity = Identity::unidentified_process(pid, Some(fd));
     identity.path = path;
     record(which, site, identity, outcome, None);
+}
+
+/// Record vnode facts from the syscall's returned descriptor buffer.
+pub(crate) fn vnode_observed(site: &'static str, pid: u32, fd: i32, device: u64, inode: u64) {
+    let mut identity = Identity::unidentified_process(pid, Some(fd));
+    identity.device = Some(device);
+    identity.inode = Some(inode);
+    record("vnode-facts", site, identity, Outcome::answer("readable"), None);
 }
 
 /// Record one code-signing status answer for a classified identity.
@@ -1393,10 +1412,38 @@ mod tests {
         let rows = document["reads"].as_array().expect("reads");
         assert_eq!(rows[0]["identity"]["start"], 10);
         assert_eq!(rows[1]["identity"]["start"], 11);
+        assert_eq!(rows[0]["observation_proven"], true);
+        assert_eq!(rows[1]["observation_proven"], true);
         assert!(rows[0]["epoch"].as_u64() < rows[1]["epoch"].as_u64());
         assert!(rows[1]["epoch"].as_u64() < rows[2]["epoch"].as_u64());
         assert!(rows[2]["identity"].get("start").is_none());
         assert_eq!(rows[2]["observation_proven"], false);
+    }
+
+    #[test]
+    fn fd_entries_retain_returned_number_type_and_classified_identity() {
+        let transcript = window(|| {
+            process_context(42, 123, Some(501));
+            fd_entry("list", 42, 7, 1);
+            fd_list("list", 42, Outcome::listed(1, 1, false));
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        let row = &document["reads"][0];
+        assert_eq!(row["identity"]["fd"], 7);
+        assert_eq!(row["identity"]["start"], 123);
+        assert_eq!(row["outcome"]["answer"]["answer"], "1");
+        assert_eq!(row["observation_proven"], false);
+    }
+
+    #[test]
+    fn vnode_buffer_facts_do_not_manufacture_process_binding() {
+        let transcript = window(|| vnode_observed("vnode", 42, 3, 12, 34));
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        let row = &document["reads"][0];
+        assert_eq!(row["identity"]["device"], 12);
+        assert_eq!(row["identity"]["inode"], 34);
+        assert!(row["identity"].get("start").is_none());
+        assert_eq!(row["observation_proven"], false);
     }
 
     #[test]

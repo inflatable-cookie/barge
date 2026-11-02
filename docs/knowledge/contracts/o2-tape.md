@@ -167,8 +167,8 @@ a deletion, a custody conclusion or a live Builds comparison.
 
 The provisional transcript marks individual observations according to their
 available identity; the window remains incomplete independently of the engine
-result. Fully identified process rows and scalar uid, boot and process-table
-observations can be marked proven; refused rows and families without audited
+result. Fully identified process rows and classified/retry process observations,
+and scalar uid, boot and complete process-table observations can be marked proven; refused rows and families without audited
 identity rules remain unproven. It cannot satisfy mandatory
 coverage or establish parity. Path observations do not infer a parent with a
 later filesystem lookup. Handle listings and descriptor facts carry the device
@@ -188,8 +188,8 @@ operations, binding each child observation to that descriptor and recording
 its actual result, without a second lookup; no such change is authorized here.
 Tom's decision d2c34987 scopes parent-descriptor instrumentation to separate,
 independently reviewed work. The tape records the evaluator's classified identity and each retry identity
-as separate ordered rows. Vnode rows remain unproven and do not inherit either:
-the retry path can switch process identities while the caller retains its
+as separate ordered rows, and records each returned descriptor number and type. Vnode rows preserve the device and inode returned in the descriptor buffer,
+but remain unproven and do not inherit either process identity: the retry path can switch process identities while the caller retains its
 original classification, and neither identity proves the later observation. The
 write-side recorder captures attempts and outcomes for the four reviewed
 DirOps verbs, including publish writes, syncs, rename and cleanup. Child effects
