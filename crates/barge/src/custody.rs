@@ -423,9 +423,39 @@ pub(crate) fn take_custody_by(
         bounds,
         None,
     ) {
-        Ok(evidence) => CustodyVerdict::Safe(Box::new(evidence)),
-        Err(Refusal::Unsafe { reason, retry }) => CustodyVerdict::Unsafe { reason, retry },
-        Err(Refusal::Unknown { reason, retry }) => CustodyVerdict::Unknown { reason, retry },
+        Ok(evidence) => {
+            #[cfg(test)]
+            crate::tape::verdict(
+                "custody::take_custody_by",
+                crate::tape::Identity::file(std::path::Path::new(&unit.name), None),
+                "custody_safe",
+            );
+            CustodyVerdict::Safe(Box::new(evidence))
+        }
+        Err(Refusal::Unsafe { reason, retry }) => {
+            #[cfg(test)]
+            {
+                let _ = &retry;
+                crate::tape::verdict(
+                    "custody::take_custody_by",
+                    crate::tape::Identity::none(),
+                    "custody_unsafe",
+                );
+            }
+            CustodyVerdict::Unsafe { reason, retry }
+        }
+        Err(Refusal::Unknown { reason, retry }) => {
+            #[cfg(test)]
+            {
+                let _ = &retry;
+                crate::tape::verdict(
+                    "custody::take_custody_by",
+                    crate::tape::Identity::none(),
+                    "custody_unknown",
+                );
+            }
+            CustodyVerdict::Unknown { reason, retry }
+        }
     }
 }
 
@@ -887,6 +917,12 @@ fn decide(
         }
     };
 
+    #[cfg(test)]
+    crate::tape::verdict(
+        "custody::decide",
+        crate::tape::Identity::file(std::path::Path::new(&unit.name), None),
+        "custody_safe",
+    );
     Ok(CustodyEvidence {
         unit_name: unit.name.clone(),
         unit_kind: unit.kind.as_str().to_owned(),

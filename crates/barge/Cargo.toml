@@ -25,3 +25,16 @@ proof-synthetic-account = []
 
 [lints]
 workspace = true
+
+# The F6-O2 B-S1 capture harness (docs/knowledge/contracts/o2-tape.md): a
+# standalone executable whose argv contract is
+# `--fixture-root --manifest --transcript-out --case`. `harness = false` keeps
+# libtest out of the way, and the target compiles the library's own sources
+# through `#[path]` includes with `cfg(test)` set, so the cfg(test)-only leaf
+# record statements are active in exactly this target and in no production
+# build. `oxide test --test tape_eval` runs its embedded end-to-end fixture
+# exercise; the exported binary is the one a later Oxide-side orchestrator
+# invokes under the manifest.
+[[test]]
+name = "tape_eval"
+harness = false

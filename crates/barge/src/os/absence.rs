@@ -105,6 +105,12 @@ pub fn prove_absence(
             "absence evidence exceeds 4 KiB",
         ));
     }
+    #[cfg(test)]
+    crate::tape::verdict(
+        "os::prove_absence",
+        crate::tape::Identity::file(path, None),
+        proof.verdict,
+    );
     Ok(proof)
 }
 

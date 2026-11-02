@@ -242,6 +242,21 @@ impl PoolCustody {
         let mut by_project: BTreeMap<PathBuf, &RawRecord> = BTreeMap::new();
         let mut record_ids = BTreeSet::new();
         for record in records {
+            #[cfg(test)]
+            crate::tape::custody_record(
+                "pool_custody::classify",
+                pool,
+                &record.id.to_string(),
+                &format!(
+                    "{:?}{}",
+                    record.phase,
+                    if record.checkout.is_some() {
+                        ""
+                    } else {
+                        ":no-checkout"
+                    }
+                ),
+            );
             if !record_ids.insert(record.id) {
                 self.pool_unknown(pool, &format!("record id {} appears twice", record.id));
                 return;
@@ -378,12 +393,43 @@ impl PoolCustody {
 /// is an error that keeps the pool.
 fn read_document(path: &Path, cap: usize, deadline: Deadline) -> Result<Option<Vec<u8>>, String> {
     let before = identity(path)?;
+    #[cfg(test)]
+    crate::tape::stat(
+        "pool_custody::read_document",
+        path,
+        before.map(|observed| (observed.device, observed.inode, "document")),
+    );
     let bytes = match state::read_bounded(path, &Bounds::new(cap, MAX_RECORDS, deadline)) {
-        ReadOutcome::Absent => None,
-        ReadOutcome::Present(bytes) => Some(bytes),
-        ReadOutcome::Refused(error) => return Err(error.message().to_owned()),
+        ReadOutcome::Absent => {
+            #[cfg(test)]
+            crate::tape::read_absent("pool_custody::read_document", path);
+            None
+        }
+        ReadOutcome::Present(bytes) => {
+            #[cfg(test)]
+            crate::tape::read_present(
+                "pool_custody::read_document",
+                path,
+                None,
+                &bytes,
+                Some(cap as u64),
+            );
+            Some(bytes)
+        }
+        ReadOutcome::Refused(error) => {
+            #[cfg(test)]
+            crate::tape::read_refused("pool_custody::read_document", path, error.kind().as_str());
+            return Err(error.message().to_owned());
+        }
     };
-    if identity(path)? != before {
+    let after = identity(path)?;
+    #[cfg(test)]
+    crate::tape::stat(
+        "pool_custody::read_document",
+        path,
+        after.map(|observed| (observed.device, observed.inode, "document")),
+    );
+    if after != before {
         return Err(format!("{} changed while it was read", path.display()));
     }
     Ok(bytes)

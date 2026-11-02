@@ -59,3 +59,15 @@ pub mod volume;
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) mod testkit;
+
+// The F6-O2 B-S1 observation tape and its in-crate release-plan harness
+// (contracts in Oxide's barge-adoption.md): compiled only under cfg(test),
+// never public, and never enabled in any production build. Every leaf record
+// statement in the sources below is a separate #[cfg(test)] statement, so a
+// production build compiles none of it.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) mod tape;
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) mod tape_harness;

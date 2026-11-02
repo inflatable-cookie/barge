@@ -39,6 +39,11 @@ Contracts own durable interfaces and formats:
   supervisor, the nine premises, the seven cases (the release-class policy's
   included), the receipt shape and the activation order. It is a plan, not a
   receipt.
+- [O2 capture tape](contracts/o2-tape.md) owns the F6-O2 B-S1 apparatus: the
+  `cfg(test)`-only leaf observation tape, the release-plan harness executable
+  and its argv contract, the transcript schema and fixed caps, the embedded
+  end-to-end fixture exercise, the staging commands the later Oxide-side
+  orchestration uses, and what the apparatus does not prove.
 
 Rust quality policy owns the strict profile for the Rust workspace:
 [activation](contracts/language-quality-activation.json) records the

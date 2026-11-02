@@ -32,6 +32,10 @@
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind as IoErrorKind, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+// The metadata facts the cfg(test) tape rows record; nothing else in this
+// module names the trait.
+#[cfg(test)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -472,6 +476,8 @@ pub fn read_bounded(path: &Path, bounds: &Bounds) -> ReadOutcome {
 
 fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
     if bounds.deadline.expired() {
+        #[cfg(test)]
+        crate::tape::read_refused("state::read_bounded_inner", path, "deadline_expired");
         return Err(bound_error(
             path,
             "the read deadline had already expired before the file was opened".to_owned(),
@@ -479,8 +485,18 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
     }
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == IoErrorKind::NotFound => return Ok(ReadOutcome::Absent),
+        Err(error) if error.kind() == IoErrorKind::NotFound => {
+            #[cfg(test)]
+            crate::tape::read_absent("state::read_bounded_inner", path);
+            return Ok(ReadOutcome::Absent);
+        }
         Err(error) => {
+            #[cfg(test)]
+            crate::tape::stat_refused(
+                "state::read_bounded_inner",
+                path,
+                &crate::tape::errno_class(&error),
+            );
             return Err(Error::new(
                 ErrorKind::Io,
                 format!("cannot read {}: {error}", path.display()),
@@ -490,6 +506,8 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
         }
     };
     if metadata.file_type().is_symlink() {
+        #[cfg(test)]
+        crate::tape::read_refused("state::read_bounded_inner", path, "symlink");
         return Err(Error::new(
             ErrorKind::UnknownState,
             format!(
@@ -500,6 +518,8 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
         .with_detail("path", path.display().to_string().into()));
     }
     if !metadata.is_file() {
+        #[cfg(test)]
+        crate::tape::read_refused("state::read_bounded_inner", path, "not_regular_file");
         return Err(Error::new(
             ErrorKind::UnknownState,
             format!("{} is not a regular file", path.display()),
@@ -507,6 +527,8 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
         .with_detail("path", path.display().to_string().into()));
     }
     if metadata.len() > bounds.max_bytes as u64 {
+        #[cfg(test)]
+        crate::tape::read_refused("state::read_bounded_inner", path, "over_size_cap");
         return Err(bound_error(
             path,
             format!(
@@ -537,6 +559,8 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
         .with_detail("path", path.display().to_string().into())
     })?;
     if !opened.is_file() {
+        #[cfg(test)]
+        crate::tape::read_refused("state::read_bounded_inner", path, "changed_non_file");
         return Err(Error::new(
             ErrorKind::UnknownState,
             format!(
@@ -546,7 +570,15 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
         )
         .with_detail("path", path.display().to_string().into()));
     }
+    #[cfg(test)]
+    crate::tape::stat(
+        "state::read_bounded_inner",
+        path,
+        Some((opened.dev(), opened.ino(), "file")),
+    );
     if opened.len() > bounds.max_bytes as u64 {
+        #[cfg(test)]
+        crate::tape::read_refused("state::read_bounded_inner", path, "over_size_cap");
         return Err(bound_error(
             path,
             format!(
@@ -563,6 +595,8 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
     let mut chunk = [0u8; READ_CHUNK_BYTES];
     loop {
         if bounds.deadline.expired() {
+            #[cfg(test)]
+            crate::tape::read_refused("state::read_bounded_inner", path, "deadline_expired");
             return Err(bound_error(
                 path,
                 "the read deadline expired before the file was read".to_owned(),
@@ -580,6 +614,8 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
             break;
         }
         if buffer.len() + read > bounds.max_bytes {
+            #[cfg(test)]
+            crate::tape::read_refused("state::read_bounded_inner", path, "grew_past_cap");
             return Err(bound_error(
                 path,
                 format!(
@@ -591,6 +627,14 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
         }
         buffer.extend_from_slice(&chunk[..read]);
     }
+    #[cfg(test)]
+    crate::tape::read_present(
+        "state::read_bounded_inner",
+        path,
+        Some((opened.dev(), opened.ino())),
+        &buffer,
+        Some(bounds.max_bytes as u64),
+    );
     Ok(ReadOutcome::Present(buffer))
 }
 
@@ -674,6 +718,8 @@ where
             let _ = std::fs::remove_file(&temporary);
         }
         written?;
+        #[cfg(test)]
+        crate::tape::write_effect("save", target);
         return sync_directory(parent);
     }
 
@@ -751,6 +797,19 @@ fn temporary_name(name: &str) -> String {
 
 /// Milliseconds since the Unix epoch, as every record's timestamp uses.
 pub fn now_ms() -> u64 {
+    #[cfg(test)]
+    crate::tape::now_ms(clock_now_ms());
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// [`now_ms`] read once, for the cfg(test) tape statement above, so the clock
+/// leaf is observed without touching the production statement below it.
+#[cfg(test)]
+fn clock_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| {
@@ -816,7 +875,11 @@ impl StateLock {
             .mode(FILE_MODE)
             .open(path)
             .map_err(|error| lock_open_error(path, &error))?;
+        #[cfg(test)]
+        crate::tape::write_effect("lock-create", path);
         wait_for_lock(&file, path, LockMode::Exclusive, deadline)?;
+        #[cfg(test)]
+        crate::tape::lock("state::StateLock::exclusive", path, lock_file_facts(&file));
         Ok(Self {
             path: path.to_path_buf(),
             rank,
@@ -836,10 +899,32 @@ impl StateLock {
     ) -> Result<Option<Self>> {
         let file = match OpenOptions::new().read(true).open(path) {
             Ok(file) => file,
-            Err(error) if error.kind() == IoErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(lock_open_error(path, &error)),
+            Err(error) if error.kind() == IoErrorKind::NotFound => {
+                #[cfg(test)]
+                crate::tape::lock(
+                    "state::StateLock::shared_if_present",
+                    path,
+                    crate::tape::LockOutcome::Absent,
+                );
+                return Ok(None);
+            }
+            Err(error) => {
+                #[cfg(test)]
+                crate::tape::lock(
+                    "state::StateLock::shared_if_present",
+                    path,
+                    crate::tape::LockOutcome::Refused(crate::tape::errno_class(&error)),
+                );
+                return Err(lock_open_error(path, &error));
+            }
         };
         wait_for_lock(&file, path, LockMode::Shared, deadline)?;
+        #[cfg(test)]
+        crate::tape::lock(
+            "state::StateLock::shared_if_present",
+            path,
+            lock_file_facts(&file),
+        );
         Ok(Some(Self {
             path: path.to_path_buf(),
             rank,
@@ -882,6 +967,12 @@ fn wait_for_lock(file: &File, path: &Path, mode: LockMode, deadline: Deadline) -
             Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::WouldBlock) => {
                 if deadline.expired() {
+                    #[cfg(test)]
+                    crate::tape::lock(
+                        "state::wait_for_lock",
+                        path,
+                        crate::tape::LockOutcome::Refused("locked".to_owned()),
+                    );
                     return Err(Error::new(
                         ErrorKind::Locked,
                         format!(
@@ -895,6 +986,12 @@ fn wait_for_lock(file: &File, path: &Path, mode: LockMode, deadline: Deadline) -
                 std::thread::sleep(LOCK_POLL);
             }
             Err(std::fs::TryLockError::Error(error)) => {
+                #[cfg(test)]
+                crate::tape::lock(
+                    "state::wait_for_lock",
+                    path,
+                    crate::tape::LockOutcome::Refused(crate::tape::errno_class(&error)),
+                );
                 return Err(Error::new(
                     ErrorKind::Io,
                     format!("cannot lock {}: {error}", path.display()),
@@ -920,6 +1017,27 @@ fn lock_open_error(path: &Path, error: &std::io::Error) -> Error {
     )
     .with_detail("path", path.display().to_string().into())
     .with_detail("os_error", error.to_string().into())
+}
+
+/// The lock file's own identity, as the cfg(test) tape records it: a
+/// best-effort read of the opened descriptor's device and inode.
+#[cfg(test)]
+fn lock_file_facts(file: &File) -> crate::tape::LockOutcome {
+    match file.metadata() {
+        Ok(metadata) => crate::tape::LockOutcome::Held(Some((metadata.dev(), metadata.ino()))),
+        Err(_) => crate::tape::LockOutcome::Held(None),
+    }
+}
+
+/// The directory's own device and inode, as the cfg(test) tape binds an
+/// enumeration's parent identity. A directory that cannot be stated binds no
+/// parent, which never reconciles against a manifest entry.
+#[cfg(test)]
+fn dir_facts(path: &Path) -> Option<(u64, u64)> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Some((metadata.dev(), metadata.ino())),
+        Err(_) => None,
+    }
 }
 
 /// The token a mutating command holds while it writes an intent.
@@ -2216,13 +2334,23 @@ pub(crate) fn read_intents_with_deadline(
     let directory = state.intents_dir();
     let names = match std::fs::read_dir(&directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == IoErrorKind::NotFound => return Ok(IntentSet::empty()),
+        Err(error) if error.kind() == IoErrorKind::NotFound => {
+            #[cfg(test)]
+            crate::tape::read_absent("state::read_intents_with_deadline", &directory);
+            return Ok(IntentSet::empty());
+        }
         Err(error) => {
+            #[cfg(test)]
+            crate::tape::listing_refused(
+                "state::read_intents_with_deadline",
+                &directory,
+                &crate::tape::errno_class(&error),
+            );
             return Err(Error::new(
                 ErrorKind::UnknownState,
                 format!("cannot read the intent journal: {error}"),
             )
-            .with_detail("path", directory.display().to_string().into()))
+            .with_detail("path", directory.display().to_string().into()));
         }
     };
     if deadline.expired() {
@@ -2252,6 +2380,12 @@ pub(crate) fn read_intents_with_deadline(
             .with_detail("cap", max.into()));
         }
         let name = entry.file_name();
+        #[cfg(test)]
+        crate::tape::dir_entry(
+            "state::read_intents_with_deadline",
+            dir_facts(&directory),
+            &name,
+        );
         let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
             return Err(Error::new(
                 ErrorKind::UnknownState,
@@ -2275,6 +2409,14 @@ pub(crate) fn read_intents_with_deadline(
         }
     }
     records.sort_by(|left, right| left.intent_id.cmp(&right.intent_id));
+    #[cfg(test)]
+    crate::tape::listing(
+        "state::read_intents_with_deadline",
+        &directory,
+        total,
+        records.len(),
+        false,
+    );
     Ok(IntentSet {
         records,
         total,

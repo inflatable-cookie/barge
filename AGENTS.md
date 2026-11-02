@@ -38,6 +38,10 @@ lists the commands. Each covers what it names:
 - `effigy barge:install` / `effigy barge:reinstall` — planner only, after a reviewed merge; Tom's go-ahead is required for the first host install. Set `BARGE_INSTALL_PIN` and `BARGE_INSTALL_SCRATCH` as documented in the [consumer contract](docs/knowledge/contracts/consumption.md).
 - `effigy rust:compile` — `oxide check --workspace --all-targets --all-features --locked`,
   so the proof-only `proof-synthetic-account` feature is compiled too.
+- `effigy rust:compile:release` — `oxide check --release --workspace --bins --locked`,
+  the default-feature release profile: the mechanical proof that the cfg(test)-only
+  capture tape ([o2-tape](docs/knowledge/contracts/o2-tape.md)) compiles away, since a
+  production build names none of it.
 - `effigy rust:format` — `oxide fmt --all -- --check`; run it when formatted
   Rust changed.
 - `effigy rust:lint` — clippy at the RustQuality strict profile. Every finding
@@ -79,6 +83,12 @@ lists the commands. Each covers what it names:
   declarations activate nothing, and each run is separately activated.
 - `effigy rust:test:proof-account` — the proof-only account's checks, with the
   `proof-synthetic-account` feature on. The ordinary `rust:test` never enables it.
+- `effigy rust:test:tape` — the capture tape's pure self-tests and the embedded
+  end-to-end fixture exercise of the actual release-plan harness
+  ([o2-tape](docs/knowledge/contracts/o2-tape.md)). Read-only: fixtures live in the
+  run root and the plan changes nothing.
+- `effigy rust:test:tape-eval` — the harness executable's own run with no arguments,
+  which is its embedded exercise; with the argv contract it runs one manifest window.
 - `effigy release:native:test` and `effigy release:native:plan` — F6-R1's native
   proof apparatus, effect-free: the pinned supervisor, the argv guard, the case
   table checked against its named regressions, the proof feature's declarations

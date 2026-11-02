@@ -193,6 +193,12 @@ impl VolumeFacts for MacOs {
         // allocated for the duration of the call.
         let count = unsafe { libc::getfsstat(table.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
         if count < 0 {
+            #[cfg(test)]
+            crate::tape::volume(
+                "MacOs::mount_census",
+                crate::tape::Identity::none(),
+                crate::tape::Outcome::refused("getfsstat_failed"),
+            );
             return Err(Error::new(
                 ErrorKind::UnknownState,
                 format!("mount census failed: {}", io::Error::last_os_error()),
@@ -201,6 +207,12 @@ impl VolumeFacts for MacOs {
         let count = usize::try_from(count)
             .map_err(|_| Error::new(ErrorKind::UnknownState, "invalid mount count"))?;
         if count > LIMIT {
+            #[cfg(test)]
+            crate::tape::volume(
+                "MacOs::mount_census",
+                crate::tape::Identity::none(),
+                crate::tape::Outcome::refused("census_bound"),
+            );
             return Err(Error::new(
                 ErrorKind::ResourceBound,
                 "mount census exceeded its bound",
@@ -231,12 +243,33 @@ impl VolumeFacts for MacOs {
                 self.mount_root(&candidate)?;
                 found.push(candidate);
                 if found.len() > 64 {
+                    #[cfg(test)]
+                    crate::tape::volume(
+                        "MacOs::mount_census",
+                        crate::tape::Identity::none(),
+                        crate::tape::Outcome::refused("duplicate_bound"),
+                    );
                     return Err(Error::new(
                         ErrorKind::ResourceBound,
                         "too many mounts for UUID",
                     ));
                 }
             }
+        }
+        #[cfg(test)]
+        {
+            for mount in &found {
+                crate::tape::volume(
+                    "MacOs::mount_census",
+                    crate::tape::Identity::volume(Some(uuid.as_str()), Some(mount)),
+                    crate::tape::Outcome::facts("mount"),
+                );
+            }
+            crate::tape::volume(
+                "MacOs::mount_census",
+                crate::tape::Identity::none(),
+                crate::tape::Outcome::listed(found.len(), found.len(), false),
+            );
         }
         Ok(found)
     }
@@ -249,6 +282,12 @@ impl VolumeLocator for MacOs {
         let mut matches = Vec::new();
         for entry in &table {
             if Instant::now() >= deadline {
+                #[cfg(test)]
+                crate::tape::volume(
+                    "MacOs::mounts_for_uuid",
+                    crate::tape::Identity::none(),
+                    crate::tape::Outcome::refused("deadline"),
+                );
                 return Err(Error::new(
                     ErrorKind::UnknownState,
                     "mount enumeration deadline reached",
@@ -295,6 +334,12 @@ impl VolumeLocator for MacOs {
             if &candidate_uuid == uuid {
                 matches.push(MountPoint::new(path));
                 if matches.len() > 64 {
+                    #[cfg(test)]
+                    crate::tape::volume(
+                        "MacOs::mounts_for_uuid",
+                        crate::tape::Identity::none(),
+                        crate::tape::Outcome::refused("candidate_bound"),
+                    );
                     return Err(Error::new(
                         ErrorKind::UnknownState,
                         "mount candidate bound reached",
@@ -311,10 +356,31 @@ impl VolumeLocator for MacOs {
                     || a.f_flags != b.f_flags
             })
         {
+            #[cfg(test)]
+            crate::tape::volume(
+                "MacOs::mounts_for_uuid",
+                crate::tape::Identity::none(),
+                crate::tape::Outcome::refused("table_changed"),
+            );
             return Err(Error::new(
                 ErrorKind::UnknownState,
                 "mount table changed during enumeration",
             ));
+        }
+        #[cfg(test)]
+        {
+            for mount in &matches {
+                crate::tape::volume(
+                    "MacOs::mounts_for_uuid",
+                    crate::tape::Identity::volume(Some(uuid.as_str()), Some(mount.as_path())),
+                    crate::tape::Outcome::facts("mount"),
+                );
+            }
+            crate::tape::volume(
+                "MacOs::mounts_for_uuid",
+                crate::tape::Identity::none(),
+                crate::tape::Outcome::listed(table.len(), matches.len(), false),
+            );
         }
         Ok(matches)
     }
@@ -339,6 +405,12 @@ fn mount_table() -> Result<Vec<libc::statfs>> {
     let after = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
     check_mount_count(before, count, after)?;
     entries.truncate(count);
+    #[cfg(test)]
+    crate::tape::volume(
+        "macos::mount_table",
+        crate::tape::Identity::none(),
+        crate::tape::Outcome::listed(count, entries.len(), false),
+    );
     Ok(entries)
 }
 
@@ -377,6 +449,12 @@ impl super::AbsenceVolume for MacOs {
         let path = Path::new("opened ancestor");
         let stat = read_statfs(file.as_raw_fd(), path)?;
         if stat.f_flags & (libc::MNT_LOCAL as u32) == 0 {
+            #[cfg(test)]
+            crate::tape::volume(
+                "MacOs::identify_directory",
+                crate::tape::Identity::file(path, None),
+                crate::tape::Outcome::refused("not_local"),
+            );
             return Err(Error::new(
                 ErrorKind::UnknownState,
                 "ancestor volume is not local",
@@ -395,11 +473,28 @@ impl super::AbsenceVolume for MacOs {
             || identity.filesystem != FileSystem::Apfs
             || identity.volume_uuid.is_none()
         {
+            #[cfg(test)]
+            crate::tape::volume(
+                "MacOs::boot_data",
+                crate::tape::Identity::file(path, None),
+                crate::tape::Outcome::refused("unverified"),
+            );
             return Err(Error::new(
                 ErrorKind::UnknownState,
                 "boot Data volume is unverified",
             ));
         }
+        #[cfg(test)]
+        crate::tape::volume(
+            "MacOs::boot_data",
+            crate::tape::Identity::volume_at(
+                path,
+                identity.device.get(),
+                identity.volume_uuid.as_ref().map(|uuid| uuid.as_str()),
+                Some(&identity.mount_point),
+            ),
+            crate::tape::Outcome::facts("boot_data"),
+        );
         Ok(identity)
     }
 }
@@ -641,6 +736,12 @@ impl MountRoot for MacOs {
         let descriptor = open_directory(path)?;
         let identity = read_identity(&descriptor, path)?;
         if identity.boot_volume {
+            #[cfg(test)]
+            crate::tape::volume(
+                "MacOs::mount_root",
+                crate::tape::Identity::file(path, None),
+                crate::tape::Outcome::refused("boot_volume"),
+            );
             return Err(Error::new(
                 ErrorKind::RefusedBoundary,
                 format!(
@@ -666,6 +767,12 @@ impl MountRoot for MacOs {
             ));
         }
         if !is_under_volumes_parent(&identity.mount_point) {
+            #[cfg(test)]
+            crate::tape::volume(
+                "MacOs::mount_root",
+                crate::tape::Identity::file(path, None),
+                crate::tape::Outcome::refused("mount_parent"),
+            );
             return Err(Error::new(
                 ErrorKind::VolumeMismatch,
                 format!(
@@ -677,6 +784,15 @@ impl MountRoot for MacOs {
             .with_detail("path", path.display().to_string().into())
             .with_detail("expected_mount_parent", VOLUMES_PARENT.into()));
         }
+        #[cfg(test)]
+        crate::tape::volume(
+            "MacOs::mount_root",
+            crate::tape::Identity::volume(
+                identity.volume_uuid.as_ref().map(|uuid| uuid.as_str()),
+                Some(&identity.mount_point),
+            ),
+            crate::tape::Outcome::facts("mount_root"),
+        );
         Ok(MountPoint::new(identity.mount_point))
     }
 }
@@ -736,6 +852,18 @@ fn tool_account_home(tool: &str) -> Result<PathBuf> {
 
 impl ProcessObserver for MacOs {
     fn effective_uid(&self) -> Result<u32> {
+        #[cfg(test)]
+        {
+            // SAFETY: `geteuid` takes no arguments, cannot fail and has no
+            // preconditions. The tape reads it independently of the production
+            // read below, as its own recorded occurrence.
+            crate::tape::scalar(
+                "MacOs::effective_uid",
+                "uid",
+                crate::tape::Identity::none(),
+                &unsafe { libc::geteuid() }.to_string(),
+            );
+        }
         // SAFETY: `geteuid` takes no arguments, cannot fail and has no
         // preconditions.
         Ok(unsafe { libc::geteuid() })
@@ -761,6 +889,13 @@ impl ProcessObserver for MacOs {
             )
         };
         if status != 0 || size != std::mem::size_of::<libc::timeval>() {
+            #[cfg(test)]
+            crate::tape::scalar(
+                "MacOs::boot_identity",
+                "boot",
+                crate::tape::Identity::none(),
+                "refused",
+            );
             return Err(Error::new(
                 ErrorKind::UnknownState,
                 format!(
@@ -770,11 +905,25 @@ impl ProcessObserver for MacOs {
             )
             .with_detail("fact", "boot identity".into()));
         }
+        #[cfg(test)]
+        crate::tape::scalar(
+            "MacOs::boot_identity",
+            "boot",
+            crate::tape::Identity::none(),
+            &format!("{}.{}", value.tv_sec, value.tv_usec),
+        );
         Ok(format!("{}.{}", value.tv_sec, value.tv_usec))
     }
 
     fn process_start(&self, pid: u32) -> Result<Option<u64>> {
         if pid == 0 {
+            #[cfg(test)]
+            crate::tape::scalar(
+                "MacOs::process_start",
+                "process-start",
+                crate::tape::Identity::process(pid, 0, None, None),
+                "refused",
+            );
             return Err(Error::new(
                 ErrorKind::UnknownState,
                 "pid 0 has no process start identity",
@@ -782,8 +931,22 @@ impl ProcessObserver for MacOs {
             .with_detail("pid", u64::from(pid).into()));
         }
         let Some(info) = bsd_info(pid)? else {
+            #[cfg(test)]
+            crate::tape::scalar(
+                "MacOs::process_start",
+                "process-start",
+                crate::tape::Identity::process(pid, 0, None, None),
+                "gone",
+            );
             return Ok(None);
         };
+        #[cfg(test)]
+        crate::tape::scalar(
+            "MacOs::process_start",
+            "process-start",
+            crate::tape::Identity::process(pid, bsd_start(&info), None, None),
+            &bsd_start(&info).to_string(),
+        );
         Ok(Some(bsd_start(&info)))
     }
 
@@ -859,6 +1022,13 @@ impl MacOs {
         // later failure is an answer, so the bounded retry record reaches the
         // refusal that carries it.
         let uid = self.effective_uid()?;
+        #[cfg(test)]
+        crate::tape::scalar(
+            "MacOs::scan_processes",
+            "uid",
+            crate::tape::Identity::none(),
+            &uid.to_string(),
+        );
         let mut retry = RetryEvidence::default();
         self.scan_table(request, table, backoffs, faults, uid, &mut retry)
     }
@@ -1172,11 +1342,25 @@ impl MacOs {
         }
         let pid = classified.pid;
         let Some(before) = kinfo_process(pid)? else {
+            #[cfg(test)]
+            crate::tape::platform(
+                "MacOs::platform_status",
+                pid,
+                classified.start,
+                "not_verified:gone",
+            );
             return Ok(PlatformStatus::NotVerified {
                 reason: format!("the kernel reports no process at pid {pid}"),
             });
         };
         if before.identity.start != classified.start {
+            #[cfg(test)]
+            crate::tape::platform(
+                "MacOs::platform_status",
+                pid,
+                classified.start,
+                "not_verified:start_changed",
+            );
             return Ok(PlatformStatus::NotVerified {
                 reason: format!(
                     "the kernel reports start identity {} for pid {pid}, not the classified {}",
@@ -1186,11 +1370,25 @@ impl MacOs {
         }
         let status = code_signing_status(pid)?;
         let Some(after) = kinfo_process(pid)? else {
+            #[cfg(test)]
+            crate::tape::platform(
+                "MacOs::platform_status",
+                pid,
+                classified.start,
+                "not_verified:gone",
+            );
             return Ok(PlatformStatus::NotVerified {
                 reason: format!("the kernel reports no process at pid {pid} any more"),
             });
         };
         if after.identity.start != classified.start {
+            #[cfg(test)]
+            crate::tape::platform(
+                "MacOs::platform_status",
+                pid,
+                classified.start,
+                "not_verified:start_changed",
+            );
             return Ok(PlatformStatus::NotVerified {
                 reason: format!(
                     "the start identity of pid {pid} changed from {} to {} around the code-signing read, so nothing that read says is evidence about the descriptors just listed",
@@ -1199,6 +1397,13 @@ impl MacOs {
             });
         }
         if status & CS_PLATFORM_BINARY == 0 {
+            #[cfg(test)]
+            crate::tape::platform(
+                "MacOs::platform_status",
+                pid,
+                classified.start,
+                "not_verified:not_platform",
+            );
             return Ok(PlatformStatus::NotVerified {
                 reason: format!(
                     "`{}` (pid {pid}) does not carry the platform binary flag",
@@ -1206,6 +1411,13 @@ impl MacOs {
                 ),
             });
         }
+        #[cfg(test)]
+        crate::tape::platform(
+            "MacOs::platform_status",
+            pid,
+            classified.start,
+            "platform_binary",
+        );
         Ok(PlatformStatus::PlatformBinary {
             command: after.command,
         })
@@ -1911,6 +2123,24 @@ impl MacOs {
         };
         if written <= 0 {
             let error = io::Error::last_os_error();
+            #[cfg(test)]
+            match error.raw_os_error() {
+                Some(libc::ESRCH) => crate::tape::fd_list(
+                    "MacOs::list_descriptors",
+                    pid,
+                    crate::tape::Outcome::answer("gone"),
+                ),
+                Some(0) | None => crate::tape::fd_list(
+                    "MacOs::list_descriptors",
+                    pid,
+                    crate::tape::Outcome::listed(0, 0, false),
+                ),
+                _ => crate::tape::fd_list(
+                    "MacOs::list_descriptors",
+                    pid,
+                    crate::tape::Outcome::refused(crate::tape::errno_class(&error)),
+                ),
+            }
             return match error.raw_os_error() {
                 // The kernel reports no such process: it is positively gone, so
                 // nothing it held is open.
@@ -1926,9 +2156,21 @@ impl MacOs {
         if written >= fds_bytes {
             // The buffer filled, so the listing cannot be complete. The caller
             // answers the per-process bound.
+            #[cfg(test)]
+            crate::tape::fd_list(
+                "MacOs::list_descriptors",
+                pid,
+                crate::tape::Outcome::refused("buffer_bound"),
+            );
             return DescriptorListing::Listed(fds);
         }
         fds.truncate(written / std::mem::size_of::<libc::proc_fdinfo>());
+        #[cfg(test)]
+        crate::tape::fd_list(
+            "MacOs::list_descriptors",
+            pid,
+            crate::tape::Outcome::listed(fds.len(), fds.len(), false),
+        );
         DescriptorListing::Listed(fds)
     }
 }
@@ -2605,6 +2847,11 @@ impl MacOs {
         }
         let count = written / KINFO_PROC_SIZE;
         if count > SCAN_PID_CAP {
+            #[cfg(test)]
+            crate::tape::process_table(
+                "MacOs::process_table",
+                crate::tape::Outcome::answer("over_pid_cap"),
+            );
             return Ok(None);
         }
         let mut rows = Vec::with_capacity(count);
@@ -2622,6 +2869,21 @@ impl MacOs {
             rows.push(row);
         }
         verify_own_row(&rows, self.effective_uid()?)?;
+        #[cfg(test)]
+        {
+            for row in &rows {
+                crate::tape::process_row(
+                    "MacOs::process_table",
+                    row.identity.pid,
+                    row.identity.effective_uid,
+                    row.identity.start,
+                );
+            }
+            crate::tape::process_table(
+                "MacOs::process_table",
+                crate::tape::Outcome::listed(rows.len(), rows.len(), false),
+            );
+        }
         Ok(Some(rows))
     }
 
@@ -2839,6 +3101,13 @@ fn bsd_info(pid: u32) -> Result<Option<libc::proc_bsdinfo>> {
         )
     };
     if written as usize == size {
+        #[cfg(test)]
+        crate::tape::scalar(
+            "macos::bsd_info",
+            "process-start",
+            crate::tape::Identity::process(pid, bsd_start(&info), Some(info.pbi_uid), None),
+            &bsd_start(&info).to_string(),
+        );
         return Ok(Some(info));
     }
     let error = io::Error::last_os_error();
@@ -3155,6 +3424,33 @@ fn descriptor_path(pid: u32, descriptor: i32) -> DescriptorPath {
     };
     if written as usize != size {
         let error = io::Error::last_os_error();
+        #[cfg(test)]
+        match error.raw_os_error() {
+            Some(libc::ESRCH | libc::EBADF) => crate::tape::vnode(
+                "macos::descriptor_path",
+                pid,
+                descriptor,
+                "vnode-path",
+                crate::tape::Outcome::answer("closed"),
+                None,
+            ),
+            Some(libc::ENOENT) => crate::tape::vnode(
+                "macos::descriptor_path",
+                pid,
+                descriptor,
+                "vnode-path",
+                crate::tape::Outcome::answer("absent"),
+                None,
+            ),
+            _ => crate::tape::vnode(
+                "macos::descriptor_path",
+                pid,
+                descriptor,
+                "vnode-path",
+                crate::tape::Outcome::refused(crate::tape::errno_class(&error)),
+                None,
+            ),
+        }
         return match error.raw_os_error() {
             Some(libc::ESRCH | libc::EBADF) => DescriptorPath::Closed,
             Some(libc::ENOENT) => DescriptorPath::Absent,
@@ -3173,8 +3469,26 @@ fn descriptor_path(pid: u32, descriptor: i32) -> DescriptorPath {
         return DescriptorPath::Failed(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
     };
     if path.to_bytes().is_empty() {
+        #[cfg(test)]
+        crate::tape::vnode(
+            "macos::descriptor_path",
+            pid,
+            descriptor,
+            "vnode-path",
+            crate::tape::Outcome::answer("closed"),
+            None,
+        );
         return DescriptorPath::Closed;
     }
+    #[cfg(test)]
+    crate::tape::vnode(
+        "macos::descriptor_path",
+        pid,
+        descriptor,
+        "vnode-path",
+        crate::tape::Outcome::answer("path"),
+        Some(path.to_string_lossy().into_owned()),
+    );
     DescriptorPath::Path(PathBuf::from(OsStr::from_bytes(path.to_bytes())))
 }
 
@@ -3195,9 +3509,53 @@ fn descriptor_vnode_facts(pid: u32, descriptor: i32) -> VnodeFacts {
         )
     };
     if written as usize == size {
+        #[cfg(test)]
+        crate::tape::vnode(
+            "macos::descriptor_vnode_facts",
+            pid,
+            descriptor,
+            "vnode-facts",
+            crate::tape::Outcome::answer("readable"),
+            None,
+        );
         return VnodeFacts::Readable;
     }
     let error = io::Error::last_os_error();
+    #[cfg(test)]
+    match error.raw_os_error() {
+        Some(libc::EPERM) => crate::tape::vnode(
+            "macos::descriptor_vnode_facts",
+            pid,
+            descriptor,
+            "vnode-facts",
+            crate::tape::Outcome::answer("hidden"),
+            None,
+        ),
+        Some(libc::ENOENT) => crate::tape::vnode(
+            "macos::descriptor_vnode_facts",
+            pid,
+            descriptor,
+            "vnode-facts",
+            crate::tape::Outcome::answer("absent"),
+            None,
+        ),
+        Some(libc::ESRCH | libc::EBADF) => crate::tape::vnode(
+            "macos::descriptor_vnode_facts",
+            pid,
+            descriptor,
+            "vnode-facts",
+            crate::tape::Outcome::answer("closed"),
+            None,
+        ),
+        _ => crate::tape::vnode(
+            "macos::descriptor_vnode_facts",
+            pid,
+            descriptor,
+            "vnode-facts",
+            crate::tape::Outcome::refused(crate::tape::errno_class(&error)),
+            None,
+        ),
+    }
     match error.raw_os_error() {
         Some(libc::EPERM) => VnodeFacts::Hidden,
         Some(libc::ENOENT) => VnodeFacts::Absent,
@@ -3225,6 +3583,13 @@ fn code_signing_status(pid: u32) -> Result<u32> {
     };
     if answer != 0 {
         let error = io::Error::last_os_error();
+        #[cfg(test)]
+        crate::tape::platform(
+            "macos::code_signing_status",
+            pid,
+            0,
+            &format!("unreadable:{}", crate::tape::errno_class(&error)),
+        );
         return Err(Error::new(
             ErrorKind::UnknownState,
             format!("the code-signing status of pid {pid} is unreadable: {error}"),
@@ -3232,6 +3597,8 @@ fn code_signing_status(pid: u32) -> Result<u32> {
         .with_detail("pid", u64::from(pid).into())
         .with_detail("os_error", error.to_string().into()));
     }
+    #[cfg(test)]
+    crate::tape::platform("macos::code_signing_status", pid, 0, &status.to_string());
     Ok(status)
 }
 
@@ -3254,6 +3621,12 @@ impl DirOps for MacOs {
     fn open_path(&self, path: &Path) -> Result<DirHandle> {
         let descriptor = open_directory(path)?;
         let identity = read_dir_identity(&descriptor, path)?;
+        #[cfg(test)]
+        crate::tape::stat(
+            "MacOs::open_path",
+            path,
+            Some((identity.device.get(), identity.inode, "directory")),
+        );
         Ok(DirHandle::from_descriptor(descriptor, identity))
     }
 
@@ -3265,8 +3638,29 @@ impl DirOps for MacOs {
         // SAFETY: `raw` is a NUL-terminated path that outlives the call and
         // `status` is a writable `stat` of exactly the size the call expects.
         if unsafe { libc::lstat(raw.as_ptr(), &mut status) } != 0 {
-            return entry_result(path, "entry", io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            #[cfg(test)]
+            if error.kind() == std::io::ErrorKind::NotFound {
+                crate::tape::stat("MacOs::path_facts", path, None);
+            } else {
+                crate::tape::stat_refused(
+                    "MacOs::path_facts",
+                    path,
+                    &crate::tape::errno_class(&error),
+                );
+            }
+            return entry_result(path, "entry", error);
         }
+        #[cfg(test)]
+        crate::tape::stat(
+            "MacOs::path_facts",
+            path,
+            Some((
+                u64::try_from(status.st_dev).unwrap_or(0),
+                status.st_ino,
+                entry_facts(&status).kind.as_str(),
+            )),
+        );
         Ok(Some(entry_facts(&status)))
     }
 
@@ -3294,6 +3688,19 @@ impl DirOps for MacOs {
         // and no other owner exists, so `File` may take ownership of it.
         let file = unsafe { File::from_raw_fd(descriptor) };
         let identity = read_dir_identity(&file, Path::new(name))?;
+        #[cfg(test)]
+        {
+            crate::tape::dir_entry(
+                "MacOs::open_child_dir",
+                Some((parent.identity().device.get(), parent.identity().inode)),
+                std::ffi::OsStr::new(name),
+            );
+            crate::tape::stat(
+                "MacOs::open_child_dir",
+                Path::new(name),
+                Some((identity.device.get(), identity.inode, "directory")),
+            );
+        }
         Ok(DirHandle::from_descriptor(file, identity))
     }
 
@@ -3333,7 +3740,39 @@ impl DirOps for MacOs {
             )
         } != 0
         {
-            return child_entry_result(name, io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            #[cfg(test)]
+            if error.kind() == std::io::ErrorKind::NotFound {
+                crate::tape::dir_entry(
+                    "MacOs::child_facts",
+                    Some((parent.identity().device.get(), parent.identity().inode)),
+                    std::ffi::OsStr::new(name),
+                );
+            } else {
+                crate::tape::listing_refused(
+                    "MacOs::child_facts",
+                    std::path::Path::new(name),
+                    &crate::tape::errno_class(&error),
+                );
+            }
+            return child_entry_result(name, error);
+        }
+        #[cfg(test)]
+        {
+            crate::tape::dir_entry(
+                "MacOs::child_facts",
+                Some((parent.identity().device.get(), parent.identity().inode)),
+                std::ffi::OsStr::new(name),
+            );
+            crate::tape::stat(
+                "MacOs::child_facts",
+                std::path::Path::new(name),
+                Some((
+                    u64::try_from(status.st_dev).unwrap_or(0),
+                    status.st_ino,
+                    entry_facts(&status).kind.as_str(),
+                )),
+            );
         }
         Ok(Some(entry_facts(&status)))
     }
@@ -3438,6 +3877,12 @@ impl DirOps for MacOs {
         cap: usize,
     ) -> Result<Option<Vec<u8>>> {
         let Some(before) = self.child_facts(parent, name)? else {
+            #[cfg(test)]
+            crate::tape::dir_entry(
+                "MacOs::read_child_file",
+                Some((parent.identity().device.get(), parent.identity().inode)),
+                std::ffi::OsStr::new(name),
+            );
             return Ok(None);
         };
         let directory = parent_descriptor(parent, name)?;
@@ -3484,14 +3929,34 @@ impl DirOps for MacOs {
             if read == 0 {
                 let after = entry_facts(&fstat(&file, Path::new(name))?);
                 if after != facts || self.child_facts(parent, name)?.as_ref() != Some(&facts) {
+                    #[cfg(test)]
+                    crate::tape::read_refused(
+                        "MacOs::read_child_file",
+                        Path::new(name),
+                        "changed_while_read",
+                    );
                     return Err(Error::new(
                         ErrorKind::UnknownState,
                         format!("`{name}` changed while it was read"),
                     ));
                 }
+                #[cfg(test)]
+                crate::tape::read_present_component(
+                    "MacOs::read_child_file",
+                    (parent.identity().device.get(), parent.identity().inode),
+                    name,
+                    &buffer,
+                    Some(cap as u64),
+                );
                 return Ok(Some(buffer));
             }
             if buffer.len() + read > cap {
+                #[cfg(test)]
+                crate::tape::read_refused(
+                    "MacOs::read_child_file",
+                    Path::new(name),
+                    "over_size_cap",
+                );
                 return Err(child_bound_error(name, (buffer.len() + read) as u64, cap));
             }
             buffer.extend_from_slice(&chunk[..read]);
@@ -3574,6 +4039,23 @@ impl DirOps for MacOs {
         unsafe {
             libc::closedir(stream);
         }
+        #[cfg(test)]
+        {
+            for entry in &entries {
+                crate::tape::dir_entry(
+                    "MacOs::list_children",
+                    Some((parent.identity().device.get(), parent.identity().inode)),
+                    std::ffi::OsStr::new(&entry.name),
+                );
+            }
+            crate::tape::listing(
+                "MacOs::list_children",
+                Path::new("listed"),
+                total,
+                entries.len(),
+                truncated,
+            );
+        }
         Ok(ChildListing {
             entries,
             total,
@@ -3653,6 +4135,23 @@ impl DirOps for MacOs {
         // SAFETY: `stream` is owned by this function and is not used again.
         unsafe {
             libc::closedir(stream);
+        }
+        #[cfg(test)]
+        {
+            for name in &names {
+                crate::tape::dir_entry(
+                    "MacOs::list_names",
+                    Some((parent.identity().device.get(), parent.identity().inode)),
+                    std::ffi::OsStr::new(name),
+                );
+            }
+            crate::tape::listing(
+                "MacOs::list_names",
+                Path::new("listed"),
+                total,
+                names.len(),
+                truncated,
+            );
         }
         Ok(DirNames {
             names,
@@ -3753,7 +4252,14 @@ impl DirOps for MacOs {
                 "the handle has no open descriptor to read".to_owned(),
             )
         })?;
-        Ok(entry_facts(&fstat(descriptor, Path::new("facts"))?))
+        let facts = entry_facts(&fstat(descriptor, Path::new("facts"))?);
+        #[cfg(test)]
+        crate::tape::stat(
+            "MacOs::dir_facts",
+            Path::new("facts"),
+            Some((facts.device.get(), facts.inode, facts.kind.as_str())),
+        );
+        Ok(facts)
     }
 
     fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> Result<()> {
@@ -3784,7 +4290,14 @@ impl DirOps for MacOs {
                 "the handle has no open descriptor to re-read".to_owned(),
             )
         })?;
-        read_dir_identity(descriptor, Path::new("recheck"))
+        let identity = read_dir_identity(descriptor, Path::new("recheck"))?;
+        #[cfg(test)]
+        crate::tape::stat(
+            "MacOs::recheck_dir",
+            Path::new("recheck"),
+            Some((identity.device.get(), identity.inode, "directory")),
+        );
+        Ok(identity)
     }
 
     fn create_child_symlink(&self, parent: &DirHandle, name: &str, target: &Path) -> Result<()> {
@@ -3876,7 +4389,14 @@ fn open_directory(path: &Path) -> Result<File> {
         )
     };
     if descriptor < 0 {
-        return Err(open_error(path, io::Error::last_os_error()));
+        let error = io::Error::last_os_error();
+        #[cfg(test)]
+        crate::tape::stat_refused(
+            "macos::open_directory",
+            path,
+            &crate::tape::errno_class(&error),
+        );
+        return Err(open_error(path, error));
     }
     // SAFETY: `descriptor` is a fresh non-negative descriptor from `open` and no
     // other owner exists, so `File` may take ownership of it.
@@ -3923,15 +4443,37 @@ fn read_identity(descriptor: &File, path: &Path) -> Result<VolumeIdentity> {
     let filesystem = read_filesystem(&status, path)?;
     let volume_uuid = read_volume_uuid(descriptor_fd);
     if volume_uuid.is_none() && filesystem == FileSystem::Apfs {
+        #[cfg(test)]
+        crate::tape::volume(
+            "macos::read_identity",
+            crate::tape::Identity::file(path, None),
+            crate::tape::Outcome::refused("uuid_unreadable"),
+        );
         return Err(unreadable_fact(path, "volume UUID"));
     }
-    Ok(VolumeIdentity {
+    let identity = VolumeIdentity {
         filesystem,
         device: read_device(descriptor_fd, path)?,
-        volume_uuid,
+        volume_uuid: volume_uuid.clone(),
         boot_volume: is_boot_volume(&mount_point),
-        mount_point,
-    })
+        mount_point: mount_point.clone(),
+    };
+    #[cfg(test)]
+    crate::tape::volume(
+        "macos::read_identity",
+        crate::tape::Identity::volume_at(
+            path,
+            identity.device.get(),
+            identity.volume_uuid.as_ref().map(|uuid| uuid.as_str()),
+            Some(&identity.mount_point),
+        ),
+        crate::tape::Outcome::answer(format!(
+            "fs={} boot={}",
+            identity.filesystem.as_str(),
+            identity.boot_volume
+        )),
+    );
+    Ok(identity)
 }
 
 /// A failed read of a fact on an otherwise open descriptor: a vanished volume

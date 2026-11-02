@@ -556,19 +556,42 @@ pub(crate) fn read_with_deadline(state: &StatePaths, deadline: Deadline) -> Resu
     let path = state.registry_path();
     let bounds = Bounds::new(REGISTRY_SIZE_CAP_BYTES, REGISTRY_VOLUME_ROWS, deadline);
     let bytes = match state::read_bounded(&path, &bounds) {
-        ReadOutcome::Absent => return Ok(Registry::Absent),
-        ReadOutcome::Present(bytes) => bytes,
-        ReadOutcome::Refused(error) => return Err(named(error, &path)),
+        ReadOutcome::Absent => {
+            #[cfg(test)]
+            crate::tape::read_absent("registry::read", &path);
+            return Ok(Registry::Absent);
+        }
+        ReadOutcome::Present(bytes) => {
+            #[cfg(test)]
+            crate::tape::read_present(
+                "registry::read",
+                &path,
+                None,
+                &bytes,
+                Some(REGISTRY_SIZE_CAP_BYTES as u64),
+            );
+            bytes
+        }
+        ReadOutcome::Refused(error) => {
+            #[cfg(test)]
+            crate::tape::read_refused("registry::read", &path, error.kind().as_str());
+            return Err(named(error, &path));
+        }
     };
-    let document: RegistryDocument = serde_json::from_slice(&bytes).map_err(|error| {
-        named(
-            Error::new(
-                ErrorKind::UnknownState,
-                format!("`{REGISTRY_SCHEMA}` refused the registry: {error}"),
-            ),
-            &path,
-        )
-    })?;
+    let document: RegistryDocument = match serde_json::from_slice(&bytes) {
+        Ok(document) => document,
+        Err(error) => {
+            #[cfg(test)]
+            crate::tape::read_refused("registry::read", &path, "registry_parse");
+            return Err(named(
+                Error::new(
+                    ErrorKind::UnknownState,
+                    format!("`{REGISTRY_SCHEMA}` refused the registry: {error}"),
+                ),
+                &path,
+            ));
+        }
+    };
     document
         .validate(bounds.max_entries)
         .map_err(|error| named(error, &path))?;
