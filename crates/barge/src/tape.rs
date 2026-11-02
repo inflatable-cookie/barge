@@ -624,6 +624,13 @@ fn observation_proven(kind: &str, identity: &Identity, outcome: &Outcome) -> boo
         return false;
     }
     match kind {
+        "child-stat" if matches!(outcome, Outcome::Absent) => {
+            identity.parent_device.is_some() && identity.parent_inode.is_some() && identity.component.is_some()
+        }
+        "child-stat" if matches!(outcome, Outcome::Facts { .. }) => {
+            identity.parent_device.is_some() && identity.parent_inode.is_some()
+                && identity.component.is_some() && identity.device.is_some() && identity.inode.is_some()
+        }
         "file" if matches!(outcome, Outcome::Digest { .. }) => {
             identity.parent_device.is_some() && identity.parent_inode.is_some()
                 && identity.device.is_some() && identity.inode.is_some()
@@ -871,6 +878,21 @@ pub(crate) fn dir_entry(site: &'static str, parent: Option<(u64, u64)>, name: &s
             record("dir-entry", site, identity, Outcome::refused("non_utf8_component"), None);
         }
     }
+}
+
+/// Record one `fstatat` result against the already-open parent.
+pub(crate) fn child_stat(site: &'static str, parent: (u64, u64), name: &str, facts: Option<(u64, u64, &str)>, error: Option<&str>) {
+    let mut identity = Identity::component(Some(parent), name);
+    let outcome = if let Some(error) = error {
+        Outcome::refused(error)
+    } else if let Some((device, inode, kind)) = facts {
+        identity.device = Some(device);
+        identity.inode = Some(inode);
+        Outcome::facts(kind)
+    } else {
+        Outcome::absent()
+    };
+    record("child-stat", site, identity, outcome, None);
 }
 
 /// Record an enumeration call's outcome.
@@ -1497,6 +1519,23 @@ mod tests {
         assert_eq!(row["identity"]["start"], 123);
         assert_eq!(row["outcome"]["answer"]["answer"], "1");
         assert_eq!(row["observation_proven"], false);
+    }
+
+    #[test]
+    fn child_stat_has_one_bound_row_for_present_absent_and_refusal() {
+        let transcript = window(|| {
+            child_stat("stat", (1, 2), "present", Some((1, 3, "file")), None);
+            child_stat("stat", (1, 2), "absent", None, None);
+            child_stat("stat", (1, 2), "unreadable", None, Some("EACCES"));
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        let rows = document["reads"].as_array().expect("reads");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["identity"]["inode"], 3);
+        assert_eq!(rows[0]["observation_proven"], true);
+        assert_eq!(rows[1]["outcome"], "absent");
+        assert_eq!(rows[1]["observation_proven"], true);
+        assert_eq!(rows[2]["observation_proven"], false);
     }
 
     #[test]

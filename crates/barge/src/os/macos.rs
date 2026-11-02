@@ -3773,17 +3773,12 @@ impl DirOps for MacOs {
             #[cfg(test)]
             let error = io::Error::last_os_error();
             #[cfg(test)]
-            if error.kind() == std::io::ErrorKind::NotFound {
-                crate::tape::dir_entry(
-                    "MacOs::child_facts",
-                    Some((parent.identity().device.get(), parent.identity().inode)),
-                    std::ffi::OsStr::new(name),
-                );
-            } else {
-                crate::tape::listing_refused(
-                    "MacOs::child_facts",
-                    std::path::Path::new(name),
-                    &crate::tape::errno_class(&error),
+            {
+                let class = crate::tape::errno_class(&error);
+                let refusal = (error.kind() != std::io::ErrorKind::NotFound).then_some(class.as_str());
+                crate::tape::child_stat(
+                    "MacOs::child_facts", (parent.identity().device.get(), parent.identity().inode),
+                    name, None, refusal,
                 );
             }
             #[cfg(test)]
@@ -3791,18 +3786,14 @@ impl DirOps for MacOs {
         }
         #[cfg(test)]
         {
-            crate::tape::dir_entry(
-                "MacOs::child_facts",
-                Some((parent.identity().device.get(), parent.identity().inode)),
-                std::ffi::OsStr::new(name),
-            );
+            let parent_id = (parent.identity().device.get(), parent.identity().inode);
             match u64::try_from(status.st_dev) {
-                Ok(device) => crate::tape::stat(
-                    "MacOs::child_facts", std::path::Path::new(name),
-                    Some((device, status.st_ino, entry_facts(&status).kind.as_str())),
+                Ok(device) => crate::tape::child_stat(
+                    "MacOs::child_facts", parent_id, name,
+                    Some((device, status.st_ino, entry_facts(&status).kind.as_str())), None,
                 ),
-                Err(_) => crate::tape::stat_refused(
-                    "MacOs::child_facts", std::path::Path::new(name), "invalid_device",
+                Err(_) => crate::tape::child_stat(
+                    "MacOs::child_facts", parent_id, name, None, Some("invalid_device"),
                 ),
             }
         }
@@ -3979,12 +3970,6 @@ impl DirOps for MacOs {
         cap: usize,
     ) -> Result<Option<Vec<u8>>> {
         let Some(before) = self.child_facts(parent, name)? else {
-            #[cfg(test)]
-            crate::tape::dir_entry(
-                "MacOs::read_child_file",
-                Some((parent.identity().device.get(), parent.identity().inode)),
-                std::ffi::OsStr::new(name),
-            );
             return Ok(None);
         };
         let directory = parent_descriptor(parent, name)?;
