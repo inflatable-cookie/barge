@@ -24,6 +24,12 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def git_blob(data):
+    """Git's object identity binds the exact bytes to the named tree entry."""
+    header = b'blob ' + str(len(data)).encode('ascii') + b'\0'
+    return hashlib.sha1(header + data).hexdigest()
+
+
 def command(args, cwd, env):
     result = subprocess.run(args, cwd=cwd, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, check=False)
@@ -46,6 +52,8 @@ def inventory(root, members):
                 raise RuntimeError(f'changed source type: {name}')
             data = path.read_bytes()
         result[name] = {'kind': kind, 'sha256': digest(data)}
+        if kind == 'file':
+            result[name]['executable'] = bool(path.stat().st_mode & 0o111)
     return result
 
 
@@ -77,6 +85,18 @@ def main():
     resolved = command(['git', 'rev-parse', commit + '^{commit}'], repo, env).decode().strip()
     if resolved != commit or not HEX40.fullmatch(tree):
         raise RuntimeError('commit or tree resolution mismatch')
+    tree_output = command(['git', 'ls-tree', '-rz', '--full-tree', commit], repo, env)
+    tree_files = {}
+    for entry in tree_output.split(b'\0'):
+        if not entry:
+            continue
+        metadata, raw_name = entry.split(b'\t', 1)
+        mode, object_type, object_id = metadata.decode('ascii').split(' ')
+        name = raw_name.decode('utf-8')
+        if (object_type != 'blob' or mode not in ('100644', '100755', '120000')
+                or not HEX40.fullmatch(object_id) or name in tree_files):
+            raise RuntimeError('unsupported or duplicate Git tree entry')
+        tree_files[name] = (mode, object_id)
     archive = command(['git', 'archive', '--format=tar', commit], repo, env)
     source = root / 'source'
     source.mkdir()
@@ -90,6 +110,8 @@ def main():
             if item.isdir():
                 path.mkdir(parents=True, exist_ok=True)
             elif item.isfile():
+                if item.name in members:
+                    raise RuntimeError('duplicate archive member')
                 path.parent.mkdir(parents=True, exist_ok=True)
                 stream = tar.extractfile(item)
                 if stream is None or item.size > 64 * 1024 * 1024:
@@ -98,6 +120,8 @@ def main():
                 os.chmod(path, item.mode & 0o777)
                 members[item.name] = 'file'
             elif item.issym():
+                if item.name in members:
+                    raise RuntimeError('duplicate archive member')
                 target = Path(item.linkname)
                 if target.is_absolute() or '..' in target.parts:
                     raise RuntimeError('unsafe source symlink')
@@ -107,6 +131,22 @@ def main():
             else:
                 raise RuntimeError('unsupported archive member')
     before = inventory(source, members)
+    if set(before) != set(tree_files):
+        raise RuntimeError('archive membership differs from the Git tree')
+    for name, (mode, object_id) in tree_files.items():
+        path = source / name
+        if mode == '120000':
+            if not path.is_symlink():
+                raise RuntimeError(f'Git tree symlink differs: {name}')
+            content = os.fsencode(os.readlink(path))
+        else:
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError(f'Git tree file differs: {name}')
+            if bool(path.stat().st_mode & 0o111) != (mode == '100755'):
+                raise RuntimeError(f'Git tree mode differs: {name}')
+            content = path.read_bytes()
+        if git_blob(content) != object_id:
+            raise RuntimeError(f'archive bytes differ from the Git tree: {name}')
     if (before.get('scripts/tape/export.py', {}).get('sha256') != digest(Path(__file__).read_bytes()) or
             before.get('scripts/tape/private-wrapper.py', {}).get('sha256') !=
             env.get('BARGE_PRIVATE_WRAPPER_SHA256')):
@@ -138,6 +178,8 @@ def main():
             continue
         if (item.get('reason') == 'compiler-artifact' and
                 item.get('target', {}).get('name') == 'tape_eval' and
+                'test' in item.get('target', {}).get('kind', []) and
+                item.get('target', {}).get('src_path') == str(source / 'crates/barge/tests/tape_eval.rs') and
                 item.get('executable') and not item.get('features')):
             artifacts.append(Path(item['executable']).resolve(strict=True))
     if len(artifacts) != 1 or not artifacts[0].is_relative_to(private_root):

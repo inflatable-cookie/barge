@@ -96,6 +96,8 @@ lists the commands. Each covers what it names:
   a separately verified export must bind source, lockfile, toolchain and executable.
 - `effigy rust:test:tape-export` — source-defined archive/build/export producer;
   held until its private wrapper's admission and resource gates are established.
+- `effigy rust:test:tape-export:pure` — pure Git blob identity controls; no
+  build, fixture or export.
 - `effigy rust:test:tape-private-export` — source-defined private wrapper; it
   currently refuses while admission isolation and resource accounting are unproved.
 - `effigy release:native:test` and `effigy release:native:plan` — F6-R1's native

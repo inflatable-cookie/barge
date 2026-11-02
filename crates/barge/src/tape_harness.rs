@@ -52,6 +52,7 @@
 
 use std::path::{Path, PathBuf};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 
 use crate::area::{AreaDeclaration, PrunePolicy, ReserveParticipation};
 use crate::error::{Error, ErrorKind};
@@ -238,6 +239,11 @@ pub(crate) fn verify_export(receipt: &Path, expected: &str) -> Result<String, St
     let toolchain = field(&doc, "toolchain_sha256", 64)?;
     field(&doc, "rustc_sha256", 64)?;
     field(&doc, "oxide_sha256", 64)?;
+    let rustc_version = doc["rustc_version"].as_str()
+        .ok_or_else(|| "export binding lacks rustc version".to_owned())?;
+    if !rustc_version.starts_with("rustc 1.97.1 ") {
+        return Err("export used a different Rust toolchain".to_owned());
+    }
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate executable: {e}"))?;
     let exe_bytes = read_bounded(&exe, 256 * 1024 * 1024)?;
     if crate::digest::sha256_hex(&exe_bytes) != executable { return Err("executable digest mismatch".to_owned()); }
@@ -277,8 +283,14 @@ pub(crate) fn verify_export(receipt: &Path, expected: &str) -> Result<String, St
         let expected_file = field(record, "sha256", 64)?;
         let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("source {name}: {e}"))?;
         let content = match kind {
-            "file" if meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= 64 * 1024 * 1024 =>
-                read_bounded(&path, 64 * 1024 * 1024)?,
+            "file" if meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= 64 * 1024 * 1024 => {
+                let executable = record["executable"].as_bool()
+                    .ok_or_else(|| format!("missing source mode: {name}"))?;
+                if (meta.permissions().mode() & 0o111 != 0) != executable {
+                    return Err(format!("source mode mismatch: {name}"));
+                }
+                read_bounded(&path, 64 * 1024 * 1024)?
+            },
             "symlink" if meta.file_type().is_symlink() => std::fs::read_link(&path)
                 .map_err(|e| format!("source {name}: {e}"))?.as_os_str().as_bytes().to_vec(),
             _ => return Err(format!("source kind or size mismatch: {name}")),
@@ -996,16 +1008,24 @@ mod tests {
             "schema": "barge.tape.export/1", "commit": "a".repeat(40),
             "tree": "b".repeat(40), "executable_sha256": crate::digest::sha256_hex(&exe),
             "lock_sha256": lock, "toolchain_sha256": toolchain,
-            "rustc_sha256": "c".repeat(64), "oxide_sha256": "d".repeat(64),
+            "rustc_sha256": "c".repeat(64), "rustc_version": "rustc 1.97.1 example",
+            "oxide_sha256": "d".repeat(64),
             "files": {
-                "Cargo.lock": {"kind": "file", "sha256": lock},
-                "rust-toolchain.toml": {"kind": "file", "sha256": toolchain}
+                "Cargo.lock": {"kind": "file", "sha256": lock, "executable": false},
+                "rust-toolchain.toml": {"kind": "file", "sha256": toolchain, "executable": false}
             }
         });
         let receipt = fixture.path().join("export.json");
         let bytes = serde_json::to_vec(&doc).expect("receipt JSON");
         std::fs::write(&receipt, &bytes).expect("receipt");
         assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes)).is_ok());
+        let lock_path = source.join("Cargo.lock");
+        let original_permissions = std::fs::metadata(&lock_path).expect("lock metadata").permissions();
+        let mut executable_permissions = original_permissions.clone();
+        executable_permissions.set_mode(original_permissions.mode() | 0o100);
+        std::fs::set_permissions(&lock_path, executable_permissions).expect("change fixture mode");
+        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes)).is_err());
+        std::fs::set_permissions(&lock_path, original_permissions).expect("restore fixture mode");
         std::fs::write(source.join("unexpected"), b"extra").expect("extra source");
         assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes)).is_err());
         std::fs::remove_file(source.join("unexpected")).expect("remove fixture file");

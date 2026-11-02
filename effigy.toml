@@ -43,6 +43,7 @@ alias = "barge"
 # Build only; the exporter consumes the compiler's artifact record.
 "rust:test:tape-stage" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --test tape_eval --no-run --message-format json"
 "rust:test:tape-export" = "python3 scripts/tape/export.py"
+"rust:test:tape-export:pure" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/tape/test_export.py"
 "rust:test:tape-private-export" = "python3 scripts/tape/private-wrapper.py"
 "rust:test:native-harness" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --test native_proof_harness"
 "rust:test:volume-probe" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --example volume_probe"

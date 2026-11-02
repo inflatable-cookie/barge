@@ -138,11 +138,13 @@ features only — no feature enabled, the proof feature off, toolchain 1.97.1:
 `effigy rust:test:tape-stage` declares a locked, default-feature `tape_eval`
 build without running it. `rust:test:tape-export` declares the source exporter:
 it archives an exact Git commit, hashes its tree members and lock/toolchain,
-builds through the stage selector, refuses changed source or a missing unique
+compares the archive's complete file set, Git blob identities and executable
+modes against `git ls-tree`, builds through the stage selector, refuses changed source or a missing unique
 default-feature executable, and records the executable, compiler and private
 Oxide digests. The external harness requires the receipt and its independently
 supplied digest; it checks the executable and every listed source byte before
-the engine window. It also compares the provisional manifest's Barge pin,
+the engine window, including the recorded executable mode and absence of
+extra entries. It also compares the provisional manifest's Barge pin,
 slice commit, complete `crates/barge/src/` file digest map, staged lock,
 toolchain and Barge executable digest to that receipt, refusing missing or
 mismatched fields. This prepares the proposed source binding; it is not
