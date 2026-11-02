@@ -417,6 +417,7 @@ pub(crate) struct Transcript<'a> {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     result_omitted: bool,
     obligations: ObligationReport,
+    effect_check: EffectReport,
     effects: &'a [EffectRow],
     reads: &'a [ReadRow],
     clocks: &'a [ClockRow],
@@ -445,6 +446,16 @@ struct ObligationReport {
     effects_unchecked: bool,
 }
 
+/// Only an explicitly empty shared expected-effect set has an unambiguous
+/// meaning for both engines. A nonempty proposal has no per-engine field.
+#[derive(Debug, Serialize)]
+struct EffectReport {
+    status: &'static str,
+    input: &'static str,
+    unexpected_attempts: Vec<usize>,
+    unexpected_attempts_omitted: usize,
+}
+
 /// The per-thread recorder state. The plan is single-threaded, so one
 /// thread-local window holds every leaf the plan reaches; a lib test that
 /// never opens a window records nothing.
@@ -466,6 +477,7 @@ struct Tape {
     obligation_indices: Vec<usize>,
     unmapped_obligations: usize,
     unmapped_indices: Vec<usize>,
+    expected_effects_input: &'static str,
 }
 
 impl Tape {
@@ -494,8 +506,27 @@ impl Tape {
             obligation_indices: Vec::new(),
             unmapped_obligations: 0,
             unmapped_indices: Vec::new(),
+            expected_effects_input: "unavailable",
         }
     }
+}
+
+/// Prepare diagnostics without changing the evaluator request. Nonempty
+/// sets are not assigned to Barge while the shared proposal lacks an engine.
+pub(crate) fn attach_effect_expectations(manifest: &[u8]) {
+    let input = match serde_json::from_slice::<serde_json::Value>(manifest) {
+        Ok(document) => match document.get("expected_effects").and_then(serde_json::Value::as_array) {
+            Some(effects) if effects.is_empty() => "empty",
+            Some(effects) if effects.len() <= 8192 => "nonempty_unassigned",
+            Some(_) => "cap_exceeded",
+            None => "unavailable",
+        },
+        Err(_) => "unavailable",
+    };
+    TAPE.with(|tape| {
+        let mut tape = tape.borrow_mut();
+        if tape.config.is_some() { tape.expected_effects_input = input; }
+    });
 }
 
 /// Attach a provisional manifest projection. Unsupported identity fields are
@@ -667,6 +698,20 @@ fn finish_inner(
                     extra_reads_unchecked: true,
                     effects_unchecked: true,
                 },
+                effect_check: EffectReport {
+                    status: "insufficient",
+                    input: tape.expected_effects_input,
+                    unexpected_attempts: if tape.expected_effects_input == "empty" {
+                        (0..tape.effects.len().min(8192)).collect()
+                    } else {
+                        Vec::new()
+                    },
+                    unexpected_attempts_omitted: if tape.expected_effects_input == "empty" {
+                        tape.effects.len().saturating_sub(8192)
+                    } else {
+                        0
+                    },
+                },
                 effects: &tape.effects,
                 reads: &reads,
                 clocks: &tape.clocks,
@@ -714,6 +759,8 @@ fn finish_inner(
                     "obligation_input_error": tape.obligation_input_error,
                     "obligation_count": tape.obligations.as_ref().map_or(0, Vec::len),
                     "unmapped_obligations": tape.unmapped_obligations,
+                    "effect_check_omitted": true,
+                    "expected_effects_input": tape.expected_effects_input,
                     "observation_complete": false,
                     "caps": caps,
                 });
@@ -1321,6 +1368,42 @@ pub(crate) fn write_effect(kind: &'static str, path: &Path) {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_effect_expectation_flags_every_attempt_without_claiming_parity() {
+        begin_window(WindowConfig {
+            case: "static".to_owned(), manifest_sha256: "m".to_owned(),
+            entrypoint_symbol: "barge::release::plan", source_binding: "test".to_owned(),
+        }).expect("window");
+        attach_effect_expectations(br#"{"expected_effects":[]}"#);
+        write_effect("create", Path::new("child"));
+        effect_outcome("create", Path::new("child"), Some(&std::io::Error::from_raw_os_error(libc::EIO)));
+        let transcript = finish(EngineOutcome {
+            status: "completed", exit_code: 0, refusal_kind: None,
+            refusal_message: None, refusal_detail: Vec::new(), engine_truncated: false,
+        }, Some(&serde_json::json!({}))).expect("transcript");
+        let doc: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
+        assert_eq!(doc["effect_check"]["input"], "empty");
+        assert_eq!(doc["effect_check"]["unexpected_attempts"], serde_json::json!([0]));
+        assert_eq!(doc["effect_check"]["status"], "insufficient");
+        assert_eq!(doc["effects"][0]["outcome"], "EIO");
+    }
+
+    #[test]
+    fn nonempty_effect_expectations_are_not_assigned_to_an_engine() {
+        begin_window(WindowConfig {
+            case: "dynamic".to_owned(), manifest_sha256: "m".to_owned(),
+            entrypoint_symbol: "barge::release::plan", source_binding: "test".to_owned(),
+        }).expect("window");
+        attach_effect_expectations(br#"{"expected_effects":[{"kind":"save"}]}"#);
+        let transcript = finish(EngineOutcome {
+            status: "completed", exit_code: 0, refusal_kind: None,
+            refusal_message: None, refusal_detail: Vec::new(), engine_truncated: false,
+        }, Some(&serde_json::json!({}))).expect("transcript");
+        let doc: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
+        assert_eq!(doc["effect_check"]["input"], "nonempty_unassigned");
+        assert_eq!(doc["effect_check"]["status"], "insufficient");
+    }
 
     #[test]
     fn provisional_obligations_report_missing_and_unmapped_without_parity() {

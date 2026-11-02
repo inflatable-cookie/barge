@@ -282,6 +282,14 @@ future adapter must refuse those unbound keys rather than discard fields or
 claim a match. The harness checks the fixed schema name and 64 named-root bound,
 but does not validate that proposal or its other aggregate obligations.
 
+The proposal's `expected_effects` entries have kind, site, path and attempted
+but no engine. A provisional diagnostic treats only an explicitly empty
+array as unambiguous: every observed Barge write attempt, including a failed
+one, is listed as unexpected. Missing input, a set beyond 8192 entries, and a
+nonempty set are reported separately; a nonempty set is not silently assigned
+to Barge. All these diagnostics remain insufficient and are not dynamic effect
+reconciliation or proof that no unrecorded write occurred.
+
 Other apparatus-error cases still require review against the eventual shared
 schema; that schema must not be treated as already settled. No successful
 comparison follows from any of these gaps.

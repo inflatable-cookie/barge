@@ -442,6 +442,7 @@ pub(crate) fn run_bound(
         return Err(reason);
     }
     crate::tape::attach_obligations(manifest_bytes);
+    crate::tape::attach_effect_expectations(manifest_bytes);
 
     // The caller clock is a real reading; the tape records it as the window's
     // first clock row through state::now_ms's own leaf statement.
