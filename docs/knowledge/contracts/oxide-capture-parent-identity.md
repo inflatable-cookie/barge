@@ -597,16 +597,21 @@ tests, doc updates and its own scoped brief; none authorizes a real run.
   provenance on the marker, enumeration and lock rows it already produces.
   Validation: `effigy rust:compile`, `effigy rust:format`,
   `effigy rust:lint`, `effigy rust:test`, and `effigy docs:check`.
-  A future native capture proof is needed to exercise actual descriptor and
-  namespace behavior; its separate brief must specify owned fixture, supervisor,
-  bounds and activation. No native run is authorized here.
+  The native capture proof belongs to the Oxide X-S2 slice below, after this
+  instrumentation is available. No native run is authorized here.
   Source binding: the O1 pin; the diff discipline of the shared contract.
   Stopping criteria: all green, production statements byte-unchanged, no
   hidden tape-side read remains.
 - **X-S2 obligation extension (Oxide repository, Oxide's own slice):** the
   reconciler consumes the provenance classes and the `parent_required`
   obligation flags; PCF-2's fixture case and the K1-vs-K4 demonstration live
-  there. Coordination point only: the required members and semantics are
+  there. Its separately activated native capture proof exercises actual
+  descriptor and namespace behavior under the shared contract’s qualified
+  supervisor and default Builds routing: 300 s, 512 MiB, at most one owned
+  128 MiB image and one ordinary detach, with separate real image custody.
+  Time and disk fit remain unmeasured; the implementation brief must specify
+  staging, fixture and activation and assess fit before a counted run. These
+  bounds grant no execution or cleanup authority. Coordination point only: the required members and semantics are
   this contract's sections above; the wire shape is PR230's reviewed schema.
   Nothing in Barge changes for it beyond B-S1b.
 - **Schema coordination (both, no code):** the provenance enum and the
