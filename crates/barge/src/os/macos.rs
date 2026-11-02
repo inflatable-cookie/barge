@@ -924,7 +924,7 @@ impl ProcessObserver for MacOs {
             crate::tape::scalar(
                 "MacOs::process_start",
                 "process-start",
-                crate::tape::Identity::process(pid, 0, None, None),
+                crate::tape::Identity::unidentified_process(pid, None),
                 "refused",
             );
             return Err(Error::new(
@@ -938,7 +938,7 @@ impl ProcessObserver for MacOs {
             crate::tape::scalar(
                 "MacOs::process_start",
                 "process-start",
-                crate::tape::Identity::process(pid, 0, None, None),
+                crate::tape::Identity::unidentified_process(pid, None),
                 "gone",
             );
             return Ok(None);
@@ -3587,10 +3587,9 @@ fn code_signing_status(pid: u32) -> Result<u32> {
     if answer != 0 {
         let error = io::Error::last_os_error();
         #[cfg(test)]
-        crate::tape::platform(
+        crate::tape::platform_unidentified(
             "macos::code_signing_status",
             pid,
-            0,
             &format!("unreadable:{}", crate::tape::errno_class(&error)),
         );
         return Err(Error::new(
@@ -3601,7 +3600,7 @@ fn code_signing_status(pid: u32) -> Result<u32> {
         .with_detail("os_error", error.to_string().into()));
     }
     #[cfg(test)]
-    crate::tape::platform("macos::code_signing_status", pid, 0, &status.to_string());
+    crate::tape::platform_unidentified("macos::code_signing_status", pid, &status.to_string());
     Ok(status)
 }
 
@@ -3783,6 +3782,8 @@ impl DirOps for MacOs {
     fn create_child_dir(&self, parent: &DirHandle, name: &str, mode: u32) -> Result<DirId> {
         let directory = parent_descriptor(parent, name)?;
         let raw = name_cstring(name)?;
+        #[cfg(test)]
+        crate::tape::write_effect("mkdir_attempt", Path::new(name));
         // SAFETY: `directory` is open for this call, `raw` is one NUL-terminated
         // component, and `mode` is passed with the default argument promotion a
         // variadic C function expects.
@@ -3808,6 +3809,8 @@ impl DirOps for MacOs {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let temporary = format!(".barge-tmp-{}-{sequence}", std::process::id());
         let temporary_raw = name_cstring(&temporary)?;
+        #[cfg(test)]
+        crate::tape::write_effect("publish_attempt", Path::new(name));
         // SAFETY: `directory` is open, `temporary_raw` is one NUL-terminated
         // component, the flags are libc's own constants and the variadic mode is
         // passed with the promotion C expects. The result is either -1 or a
@@ -4051,12 +4054,9 @@ impl DirOps for MacOs {
                     std::ffi::OsStr::new(&entry.name),
                 );
             }
-            crate::tape::listing(
-                "MacOs::list_children",
-                Path::new("listed"),
-                total,
-                entries.len(),
-                truncated,
+            crate::tape::handle_observation(
+                "MacOs::list_children", "dir-list", parent.identity().device.get(),
+                parent.identity().inode, crate::tape::Outcome::listed(total, entries.len(), truncated),
             );
         }
         Ok(ChildListing {
@@ -4148,12 +4148,9 @@ impl DirOps for MacOs {
                     std::ffi::OsStr::new(name),
                 );
             }
-            crate::tape::listing(
-                "MacOs::list_names",
-                Path::new("listed"),
-                total,
-                names.len(),
-                truncated,
+            crate::tape::handle_observation(
+                "MacOs::list_names", "dir-list", parent.identity().device.get(),
+                parent.identity().inode, crate::tape::Outcome::listed(total, names.len(), truncated),
             );
         }
         Ok(DirNames {
@@ -4194,6 +4191,8 @@ impl DirOps for MacOs {
             RemoveKind::File => 0,
             RemoveKind::Directory => libc::AT_REMOVEDIR,
         };
+        #[cfg(test)]
+        crate::tape::write_effect("unlink_attempt", Path::new(name));
         // SAFETY: `directory` is open for this call, `raw` is one NUL-terminated
         // component and `flags` is either zero or libc's own directory flag, so
         // no symbolic link at the leaf is ever followed.
@@ -4212,6 +4211,8 @@ impl DirOps for MacOs {
         let directory = parent_descriptor(parent, from)?;
         let source = name_cstring(from)?;
         let target = name_cstring(to)?;
+        #[cfg(test)]
+        crate::tape::write_effect("rename_attempt", Path::new(from));
         // SAFETY: both names are NUL-terminated components inside the same open
         // directory, which is what makes the rename atomic, and `RENAME_EXCL` is
         // libc's own flag for the platform's exclusive rename. The exclusive
@@ -4257,10 +4258,9 @@ impl DirOps for MacOs {
         })?;
         let facts = entry_facts(&fstat(descriptor, Path::new("facts"))?);
         #[cfg(test)]
-        crate::tape::stat(
-            "MacOs::dir_facts",
-            Path::new("facts"),
-            Some((facts.device.get(), facts.inode, facts.kind.as_str())),
+        crate::tape::handle_observation(
+            "MacOs::dir_facts", "stat", facts.device.get(), facts.inode,
+            crate::tape::Outcome::facts(facts.kind.as_str()),
         );
         Ok(facts)
     }
@@ -4295,10 +4295,9 @@ impl DirOps for MacOs {
         })?;
         let identity = read_dir_identity(descriptor, Path::new("recheck"))?;
         #[cfg(test)]
-        crate::tape::stat(
-            "MacOs::recheck_dir",
-            Path::new("recheck"),
-            Some((identity.device.get(), identity.inode, "directory")),
+        crate::tape::handle_observation(
+            "MacOs::recheck_dir", "stat", identity.device.get(), identity.inode,
+            crate::tape::Outcome::facts("directory"),
         );
         Ok(identity)
     }

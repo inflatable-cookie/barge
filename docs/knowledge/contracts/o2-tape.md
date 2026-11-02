@@ -45,7 +45,8 @@ does not prove.
 
 ## What the tape records
 
-The B-S1 leaf table, at its source symbols. Process leaves (`MacOs::process_table`,
+The provisional instrumentation includes the following source symbols; it is
+not a complete source-site audit. Process leaves (`MacOs::process_table`,
 per-fd `PROC_PIDLISTFDS` listings, per-descriptor
 `PROC_PIDFDVNODEPATHINFO`/`PROC_PIDFDVNODEINFO` answers including every
 bounded retry, `csops` code-signing status, effective uid, boot identity,
@@ -60,16 +61,15 @@ declaration reads — `area::read_holds`, `reference::read_registry`,
 `reference::BargeReferences::read`, `pool_custody::read_document` with its
 pre- and post-read stats, `identity::read`); lock outcomes
 (`StateLock::shared_if_present`, held/absent/refused; `StateLock::exclusive`
-and `state::publish_atomic_with` record effect rows, so an attempted write can
-never pass as a read-only pass); enumeration and activity
+and `state::publish_atomic_with` record effect rows; write coverage remains
+incomplete); enumeration and activity
 (`area::scan_activity_within`, `area::list_names`, `area::resolve_by`,
 `area::VolumeRoot::open_with`); custody (`custody::take_custody_by` verdicts,
 `custody::decide`'s safe terminal, `pool_custody::classify` record
 classifications, `os::prove_absence` verdicts); and the caller clock (every
-`state::now_ms` reading, as clock rows). Read-row identity is the complete
-object identity — absolute path, parent device and inode, own device and
-inode; component plus observed parent; `(pid, start, uid)` for processes, never
-a pid alone; UUID plus mount for volumes. Epochs are engine-local, monotonic,
+`state::now_ms` reading, as clock rows). Required identity includes parent and
+own device/inode, process start and uid, and volume UUID; many current rows do
+not yet bind all of these facts and are explicitly unproven. Epochs are engine-local, monotonic,
 assigned at the leaf; occurrences are counted per identity key, so a root-lock
 reread is a second bound occurrence.
 
@@ -161,3 +161,26 @@ Oxide exists; that is the X-S2 slice's separately dispatched work at a
 source-approved implementation head, with the counted native its own
 separately activated Queue proof. A recorded transcript here never authorizes
 a deletion, a custody conclusion or a live Builds comparison.
+
+## Observation identity limits
+
+The current provisional transcript marks observations unproven and the window
+incomplete independently of the engine result. It cannot satisfy mandatory
+coverage or establish parity. Path observations do not infer a parent with a
+later filesystem lookup. Handle listings and descriptor facts carry the device
+and inode actually supplied by the handle or descriptor; a pathname and parent
+identity are not invented. Refusals are not successful observations.
+
+The unchanged `state::read_bounded_inner` reads metadata and opens the target by
+path; it does not expose an observed parent descriptor. `StateLock::shared_if_present`
+opens its target by path and an absent open supplies no parent identity.
+`reference::read_receipts_with` receives a `ReadDir` and entries but does not
+expose a parent descriptor identity for those entries. `MacOs::dir_facts` and
+`recheck_dir` observe a descriptor's own identity but `DirHandle` carries no
+path or parent identity. These sites cannot establish the required binding by a
+later stat or a lexical path. A separately reviewed change would need to carry
+an already opened parent descriptor and its identity through these existing
+operations, binding each child observation to that descriptor and recording
+its actual result, without a second lookup; no such change is authorized here.
+Process leaf identity and write-effect coverage also remain incomplete. The
+source-count test is not a complete inventory or a compile-away proof.

@@ -16,10 +16,8 @@
 //! engine, the case and the manifest digest it is bound to, the entrypoint
 //! identity, the engine's own result or refusal, the effect rows (empty for the
 //! read-only plan, which is the STATIC effect set), the read rows and the clock
-//! rows. Read-row identity is the complete object identity: absolute path,
-//! parent device and inode, own device and inode for files; component name plus
-//! observed parent identity for path components; `(pid, start, uid)` for
-//! processes; UUID plus mount for volumes. An outcome is a bytes digest, an
+//! rows. Identity fields contain only available observations; every row and
+//! window is explicitly unproven until source coverage and binding are audited. An outcome is a bytes digest, an
 //! explicit absent, a listed count, or a refusal class — never a defaulted
 //! verdict.
 //!
@@ -57,8 +55,8 @@
 //! declaration file's path, bytes digest and cap. The write-side `DirOps`
 //! verbs that the plan never reaches (`create_child_dir`,
 //! `publish_child_file`, `remove_child`, `rename_child`) record effect rows,
-//! so an attempted write can never pass as a read-only pass; the effect kinds
-//! are the contract's closed set. Not recorded, because the plan never calls
+//! as attempts. Their individual syscall outcomes and parent identities remain
+//! incomplete, so they cannot establish an exact effect set. Not recorded, because the plan never calls
 //! them and they read no fixture object: `random_bytes` (entropy, not fixture
 //! state), `set_dir_mode`, `create_child_symlink`, `sync_dir` and the flush
 //! path.
@@ -90,8 +88,8 @@ pub(crate) const CAP_OCCURRENCES: u32 = 64;
 /// The transcript's process-row cap.
 pub(crate) const CAP_PROCESS_ROWS: usize = 512;
 
-/// One observation's complete object identity. Only the fields that apply to
-/// the observed object are set, and the serialized field order is fixed.
+/// Facts actually supplied for an observation. Missing fields remain absent;
+/// a lexical path alone is not a complete object identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Identity {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -140,15 +138,12 @@ impl Identity {
         }
     }
 
-    /// A file or directory identity: its absolute path, best-effort parent
-    /// identity, and its own device and inode when the caller read them.
+    /// A path and its own device and inode when the caller read them.
+    /// No parent is inferred from a separate lookup.
     pub(crate) fn file(path: &Path, facts: Option<(u64, u64)>) -> Self {
-        let (parent_device, parent_inode) = parent_identity(path);
         Self {
             path: Some(path.display().to_string()),
             component: None,
-            parent_device,
-            parent_inode,
             device: facts.map(|(device, _)| device),
             inode: facts.map(|(_, inode)| inode),
             ..Self::none()
@@ -166,11 +161,16 @@ impl Identity {
         }
     }
 
+    /// A pid whose process identity was not observed; never a positive identity.
+    pub(crate) fn unidentified_process(pid: u32, fd: Option<i32>) -> Self {
+        Self { pid: Some(pid), fd, ..Self::none() }
+    }
+
     /// A process identity: never a pid alone.
     pub(crate) fn process(pid: u32, start: u64, uid: Option<u32>, fd: Option<i32>) -> Self {
         Self {
             pid: Some(pid),
-            start: Some(start),
+            start: (start != 0).then_some(start),
             uid,
             fd,
             ..Self::none()
@@ -194,11 +194,8 @@ impl Identity {
         volume_uuid: Option<&str>,
         mount: Option<&Path>,
     ) -> Self {
-        let (parent_device, parent_inode) = parent_identity(path);
         Self {
             path: Some(path.display().to_string()),
-            parent_device,
-            parent_inode,
             device: Some(device),
             volume_uuid: volume_uuid.map(str::to_owned),
             mount: mount.map(|mount| mount.display().to_string()),
@@ -230,16 +227,6 @@ impl Identity {
         push("uuid", self.volume_uuid.clone());
         push("mount", self.mount.clone());
         key
-    }
-}
-
-/// The best-effort device and inode of a path's parent directory, read by the
-/// tape itself. A parent the tape cannot stat leaves both unset; the row still
-/// carries the path.
-fn parent_identity(path: &Path) -> (Option<u64>, Option<u64>) {
-    match path.parent().map(std::fs::symlink_metadata) {
-        Some(Ok(metadata)) => (Some(metadata.dev()), Some(metadata.ino())),
-        _ => (None, None),
     }
 }
 
@@ -326,6 +313,9 @@ pub(crate) struct ReadRow {
     site: &'static str,
     identity: Identity,
     outcome: Outcome,
+    // Until each source is audited and bound to its actual parent and object,
+    // no row is eligible as a positive mandatory obligation.
+    observation_proven: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     cap: Option<u64>,
     epoch: u64,
@@ -407,6 +397,8 @@ pub(crate) struct Transcript<'a> {
     manifest_sha256: &'a str,
     entrypoint: Entrypoint<'a>,
     outcome: &'a EngineOutcome,
+    /// This provisional recorder has not established complete source coverage.
+    observation_complete: bool,
     /// The engine's own result in its own document, when it completed.
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<&'a serde_json::Value>,
@@ -526,6 +518,7 @@ pub(crate) fn finish(
                     source_binding: &config.source_binding,
                 },
                 outcome: &outcome,
+                observation_complete: false,
                 result,
                 effects: &tape.effects,
                 reads: &reads,
@@ -595,6 +588,7 @@ fn record(
             site,
             identity,
             outcome,
+            observation_proven: false,
             cap,
             epoch,
             occurrence,
@@ -778,6 +772,18 @@ pub(crate) fn listing(site: &'static str, path: &Path, total: usize, kept: usize
     );
 }
 
+/// Record an observation from an already opened directory descriptor.
+pub(crate) fn handle_observation(
+    site: &'static str,
+    kind: &'static str,
+    device: u64,
+    inode: u64,
+    outcome: Outcome,
+) {
+    let identity = Identity { device: Some(device), inode: Some(inode), ..Identity::none() };
+    record(kind, site, identity, outcome, None);
+}
+
 /// Record an enumeration refusal.
 pub(crate) fn listing_refused(site: &'static str, path: &Path, class: &str) {
     record(
@@ -831,7 +837,7 @@ pub(crate) fn fd_list(site: &'static str, pid: u32, outcome: Outcome) {
     record(
         "fd-list",
         site,
-        Identity::process(pid, 0, None, None),
+        Identity::unidentified_process(pid, None),
         outcome,
         None,
     );
@@ -847,7 +853,7 @@ pub(crate) fn vnode(
     outcome: Outcome,
     path: Option<String>,
 ) {
-    let mut identity = Identity::process(pid, 0, None, Some(fd));
+    let mut identity = Identity::unidentified_process(pid, Some(fd));
     identity.path = path;
     record(which, site, identity, outcome, None);
 }
@@ -861,6 +867,11 @@ pub(crate) fn platform(site: &'static str, pid: u32, start: u64, answer: &str) {
         Outcome::answer(answer),
         None,
     );
+}
+
+/// Record a platform observation whose process identity was not bound.
+pub(crate) fn platform_unidentified(site: &'static str, pid: u32, answer: &str) {
+    record("platform-status", site, Identity::unidentified_process(pid, None), Outcome::answer(answer), None);
 }
 
 /// Record a scalar fact: the effective uid, the boot identity, a start.
@@ -1248,6 +1259,31 @@ mod tests {
         // here as the constant the serializer uses.
         assert_eq!(CAP_DOCUMENT_BYTES, 8 * 1024 * 1024);
         assert_eq!(CAP_PROCESS_ROWS, 512);
+    }
+
+    #[test]
+    fn missing_and_replaced_parent_are_not_inferred_from_a_path() {
+        let transcript = window(|| {
+            read_present("first", Path::new("/fixture/root/item"), Some((1, 2)), b"a", None);
+            read_present("second", Path::new("/fixture/root/item"), Some((1, 3)), b"b", None);
+            dir_entry("component", None, std::ffi::OsStr::new("item"));
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        for row in document["reads"].as_array().expect("reads") {
+            assert_eq!(row["observation_proven"], false);
+            assert!(row["identity"].get("parent_inode").is_none());
+        }
+        assert_ne!(document["reads"][0]["identity"]["inode"], document["reads"][1]["identity"]["inode"]);
+        assert_eq!(document["outcome"]["status"], "completed");
+        assert_eq!(document["observation_complete"], false);
+    }
+
+    #[test]
+    fn recorder_does_not_reopen_or_stat_a_parent() {
+        let source = include_str!("tape.rs");
+        let implementation = source.split("#[cfg(test)]").next().expect("implementation");
+        assert!(!implementation.contains("symlink_metadata"));
+        assert!(!implementation.contains("fn parent_identity"));
     }
 
     #[test]
