@@ -788,6 +788,7 @@ where
         .with_detail("path", temporary.display().to_string().into())
         .with_detail("os_error", error.to_string().into())
     })?;
+    #[cfg(not(test))]
     file.sync_all().map_err(|error| {
         Error::new(
             ErrorKind::Io,
@@ -795,6 +796,18 @@ where
         )
         .with_detail("path", temporary.display().to_string().into())
     })?;
+    #[cfg(test)]
+    {
+        let result = file.sync_all();
+        crate::tape::sync_path("state::write_and_publish", temporary, result.as_ref().err());
+        result.map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("cannot sync {}: {error}", temporary.display()),
+            )
+            .with_detail("path", temporary.display().to_string().into())
+        })?;
+    }
     if let Some(seam) = before_rename.take() {
         seam(temporary)?;
     }

@@ -61,8 +61,7 @@ declaration reads — `area::read_holds`, `reference::read_registry`,
 `reference::BargeReferences::read`, `pool_custody::read_document` with its
 pre- and post-read stats, `identity::read`); lock outcomes
 (`StateLock::shared_if_present`, held/absent/refused; `StateLock::exclusive`
-and `state::publish_atomic_with` record effect rows; write coverage remains
-incomplete); enumeration and activity
+and `state::publish_atomic_with` record effect rows); enumeration and activity
 (`area::scan_activity_within`, `area::list_names`, `area::resolve_by`,
 `area::VolumeRoot::open_with`); custody (`custody::take_custody_by` verdicts,
 `custody::decide`'s safe terminal, `pool_custody::classify` record
@@ -222,10 +221,11 @@ write-side recorder captures attempts and outcomes for the four reviewed
 DirOps verbs, including publish writes, rename and cleanup. Atomic state
 publication also records its create, write, rename and cleanup attempts, and
 exclusive lock opens are recorded as attempts without inferring creation. Child effects
-carry the already-open parent handle identity. Sync results are separate
-observations rather than fabricated write effects. Remaining reached write
-sites and effect completeness still require a source audit. The
-source-count test is not a complete inventory or a compile-away proof.
+carry the already-open parent handle identity. File and directory sync results
+are separate observations rather than fabricated write effects. The concrete
+plan and publication paths are inventoried below; unbound effect identities
+remain insufficient for comparison. The source-count test is not a
+compile-away proof.
 
 The recorder keeps the original path privately to bind a syscall result to its
 attempt, including when the path is not UTF-8. It does not serialize that
@@ -346,7 +346,7 @@ The current source map against that O1 pin, for reviewer inspection, is:
 | `pool_custody.rs` | `classify`, `read_document` | The classification loop adds a test-only row before the original duplicate check. The three O1 `read_bounded` arms remain verbatim under `cfg(not(test))`; test arms record the consumed outcome then return the same value. The original `if identity(path)? != before` remains verbatim in the non-test branch; the test branch evaluates `identity(path)?` once, records it, then makes the same comparison and return. |
 | `reference.rs` | `BargeReferences::read`, `control_directory_with`, `pools_holding`, `read_registry`, `read_receipts_with`, `read_oxide_marker` | Original placement-read, removable-pool metadata match, registry read and parse matches, and both marker child-facts/read matches remain verbatim under `cfg(not(test))`. Their test counterparts perform each original call once and return the same values and errors, adding observations. `control_directory_with` records its stored inspect result. The receipt `Ok(Some(receipt))` push remains verbatim in the non-test arm; the test arm records then pushes the same receipt. Other receipt additions read the already obtained path's component and add no filesystem operation. |
 | `registry.rs` | `read_with_deadline` | The complete original `let bytes = match state::read_bounded(...)` and `let document = serde_json::from_slice(...).map_err(...)?` statements remain verbatim in `cfg(not(test))`. Test branches use the same read and parser once, record their consumed outcomes, and return the same named errors. Validation follows both branches unchanged. |
-| `state.rs` | `read_bounded_inner`, `publish_atomic_with`, `publish_open_file`, `sync_directory`, `now_ms`, `StateLock`, `wait_for_lock`, `read_intents_with_deadline` | The O1 NotFound arms of bounded read, shared lock and intent directory read remain verbatim in non-test branches; test arms return the same absent values after recording. Other read and lock additions observe existing values or error branches. Publication retains the original create, cleanup unlink, write, rename and directory-sync statements in non-test branches; test branches execute each original operation once through the recorder and retain its error handling. `file.sync_all` remains the original statement. `now_ms` retains its original expression under `cfg(not(test))`; the test branch evaluates it once and returns the recorded value. Intent enumeration uses the existing entry name and preserves its sorted result. |
+| `state.rs` | `read_bounded_inner`, `publish_atomic_with`, `write_and_publish`, `sync_directory`, `now_ms`, `StateLock`, `wait_for_lock`, `read_intents_with_deadline` | The O1 NotFound arms of bounded read, shared lock and intent directory read remain verbatim in non-test branches; test arms return the same absent values after recording. Other read and lock additions observe existing values or error branches. Publication retains the original create, cleanup unlink, write, file sync, rename and directory-sync statements in non-test branches; test branches execute each original operation once through the recorder and retain its error handling. `now_ms` retains its original expression under `cfg(not(test))`; the test branch evaluates it once and returns the recorded value. Intent enumeration uses the existing entry name and preserves its sorted result. |
 | `release.rs` | no tape delta against O1 | Caller clock observations come from `state::now_ms`; release's original calls remain in place. |
 | `lib.rs`, `Cargo.toml`, `tests/tape_eval.rs`, `tape.rs`, `tape_harness.rs` | test-only modules, harness target and recorder | The O1 library declarations remain intact; `lib.rs` adds only `cfg(test)` crate-private tape and harness modules. The Cargo addition is a `[[test]]` target, with no dependency or feature change. `tests/tape_eval.rs` includes the existing library source as test-target modules; the two new recorder modules are test-only. Release compile-away remains unverified. |
 | `effect.rs`, `guard.rs`, `undo_capture.rs` | source-link shadows for the included test target | These are Git symlinks respectively to `space/effect.rs`, `space/guard.rs` and `cache/undo_capture.rs`. The original production child-module declarations remain in their original parents; `lib.rs` adds no top-level declarations for these shadows. They resolve the same existing bytes for the included test-target parent modules. Their actual target/build reachability remains unverified until compilation. |
@@ -361,9 +361,8 @@ The named write helpers are outside the direct plan body: `release::plan` calls
 `area.rs:1297,1745,2259,2261,2361` locate random and sync operations in
 identity creation and area mutation paths, rather than by themselves proving
 plan reachability. `set_dir_mode` and `create_child_symlink` are DirOps mutation
-implementations in `os/macos.rs:4362,4403`. Full transitive reachability and
-all reached effect identities still require review; these pointers are not a
-proof that a method can never be reached.
+implementations in `os/macos.rs:4362,4403`. Their absence from the concrete
+plan call path follows from the trace below, not merely from their names.
 
 The observed lock branch is narrower than the exclusive mutation branch:
 `release::read_registry` calls `LockSet::observe_registry`, and
@@ -377,8 +376,9 @@ helpers. `release::plan_observed` calls `area::show`, `resolve_by`,
 `pending_intents` and `decide_root` (release.rs:404–550). `area::show` reads
 declarations (area.rs:2867, 3167), while `resolve_by` uses
 `walk_folder_chain` (area.rs:1041, 1509); neither call selects a creation
-entry point. These observations delimit those individual branches; they do not
-yet close the transitive audit of every descendant, partial write, or callback.
+entry point. Their descendants and the concrete platform callbacks are traced
+below; the tape records a failed write as possibly partial rather than asserting
+that it changed nothing.
 The placement census branch goes from `BargeReferences::read` to
 `cache::read_placements` (reference.rs:277; cache.rs:676), which enumerates
 via `area::read_directory`, reads bounded placement documents, validates and
@@ -389,9 +389,8 @@ the latter reads pool records through `read_pool` and `read_document`
 (pool_custody.rs:129, 192, 394). This branch is observational and does not call
 the state publication helpers. Root custody goes through
 `custody::take_custody_by` → `decide` (custody.rs:403, 644), including hold,
-marker, identity and process-observer checks. The method-level trace still
-needs to account for every platform leaf and error branch before it can be
-called a complete transitive write proof.
+marker, identity and process-observer checks. The platform leaves are traced
+below; refusals return from these read paths without a cleanup write.
 
 Within `custody::decide` (custody.rs:644), the state operations are hold and
 registry reads. It opens the area and parent, obtains child facts and a
@@ -431,6 +430,24 @@ trace holds at execution. The excluded publication/effect entry points still
 record their attempts and outcomes when exercised by tests; an attempted write
 is never removed to make a transcript empty. This is a static source finding,
 not a runtime receipt or proof that the fixed tape captures every read.
+
+The separate state publication path is `publish_atomic` →
+`publish_atomic_with` → `write_and_publish` (state.rs:654, 660, 763). It
+records temporary-file create, `write_all`, and rename attempts with their
+actual outcomes; a failed save retains possible partial effects. Between the
+save and rename, the test branch calls `file.sync_all()` once and records its
+returned result at `state::write_and_publish`, without a path stat or inferred
+descriptor identity. The original non-test statement remains verbatim. A
+successful rename remains an effect even if `sync_directory` subsequently
+fails (state.rs:750, 843); the directory sync result is recorded separately.
+Before rename, an error triggers a recorded best-effort temporary-file unlink;
+its failure does not replace the original publication error. `StateLock::exclusive`
+(state.rs:946) records the create/open attempt and outcome; the concrete plan
+uses only shared observation locks. The corresponding descriptor-relative
+publish path records temporary create, save, file sync, rename, directory sync
+and any cleanup unlink in `MacOs::publish_child_file` (os/macos.rs:3831–3963).
+These are source findings; the new file-sync control and the required
+current-head selectors have not been executed.
 
 Effect rows carry the call-site file and line separately from the closed
 effect kind. A failed operation records its actual error and

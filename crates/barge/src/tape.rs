@@ -2095,6 +2095,33 @@ mod tests {
     }
 
     #[test]
+    fn atomic_publication_records_file_sync_before_rename_and_directory_sync() {
+        let fixture = crate::testkit::TempDir::new("tape-state-publication");
+        let target = fixture.path().join("record.json");
+        let transcript = window(|| {
+            crate::state::publish_atomic(&target, b"record").expect("publication succeeds");
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        let effects = document["effects"].as_array().expect("effects");
+        let reads = document["reads"].as_array().expect("reads");
+        let file_sync = reads.iter().find(|row| row["site"] == "state::write_and_publish")
+            .expect("file sync was recorded");
+        let directory_sync = reads.iter().find(|row| row["site"] == "state::sync_directory")
+            .expect("directory sync was recorded");
+        let rename = effects.iter().find(|row| row["kind"] == "rename")
+            .expect("rename was recorded");
+        assert_eq!(file_sync["outcome"]["answer"]["answer"], "succeeded");
+        assert_eq!(directory_sync["outcome"]["answer"]["answer"], "succeeded");
+        assert_eq!(rename["outcome"], "succeeded");
+        let file_epoch = file_sync["epoch"].as_u64().expect("file sync epoch");
+        let rename_epoch = rename["epoch"].as_u64().expect("rename epoch");
+        let directory_epoch = directory_sync["epoch"].as_u64().expect("directory sync epoch");
+        assert!(file_epoch < rename_epoch);
+        assert!(rename_epoch < directory_epoch);
+        assert_eq!(file_sync["observation_proven"], false);
+    }
+
+    #[test]
     fn failed_save_does_not_claim_that_no_bytes_were_written() {
         let transcript = window(|| {
             let _ = io_effect("save", Path::new("file"), || -> std::io::Result<()> {
@@ -2121,11 +2148,17 @@ mod tests {
         let transcript = window(|| {
             sync_path("state::sync_directory", Path::new("parent"), None);
             let error = std::io::Error::from_raw_os_error(libc::EIO);
+            #[cfg(target_os = "macos")]
+            // SAFETY: __error points to this thread's writable errno cell.
+            unsafe { *libc::__error() = libc::ENOENT; }
             sync_path("state::sync_directory", Path::new("parent"), Some(&error));
+            sync_path("state::write_and_publish", Path::new("temporary"), Some(&error));
         });
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         assert_eq!(document["reads"][0]["outcome"]["answer"]["answer"], "succeeded");
         assert_eq!(document["reads"][1]["outcome"]["refused"]["class"], "EIO");
+        assert_eq!(document["reads"][2]["site"], "state::write_and_publish");
+        assert_eq!(document["reads"][2]["outcome"]["refused"]["class"], "EIO");
         assert_eq!(document["reads"][0]["observation_proven"], false);
     }
 
