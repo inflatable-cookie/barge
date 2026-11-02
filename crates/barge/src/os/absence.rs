@@ -379,6 +379,29 @@ mod tests {
         }
     }
     #[test]
+    fn invalid_path_refusal_is_recorded_without_a_platform_read() {
+        use crate::tape::{begin_window, finish, EngineOutcome, WindowConfig};
+        let facts = Facts { device: DeviceId::new(1), removable: false, located: RefCell::new(Vec::new()) };
+        begin_window(WindowConfig {
+            case: "invalid".to_owned(),
+            manifest_sha256: "test".to_owned(),
+            entrypoint_symbol: "os::prove_absence",
+            source_binding: "test".to_owned(),
+        }).unwrap();
+        let error = prove_absence(&MacOs::new(), &facts, Path::new("relative"), AncestorExpected::BootData).unwrap_err();
+        let transcript = finish(EngineOutcome {
+            status: "refused", exit_code: error.kind().exit_code(),
+            refusal_kind: Some(error.kind().as_str().to_owned()),
+            refusal_message: Some(error.message().to_owned()),
+            refusal_detail: Vec::new(), engine_truncated: false,
+        }, None).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&transcript).unwrap();
+        assert_eq!(document["reads"][0]["site"], "os::prove_absence");
+        assert_eq!(document["reads"][0]["observation_proven"], false);
+        assert!(document["reads"][0]["outcome"].get("refused").is_some());
+    }
+
+    #[test]
     fn missing_leaf_requires_verified_ancestor_and_missing_parent_is_unknown() {
         let fixture = TempDir::new("absence");
         let dirs = MacOs::new();
