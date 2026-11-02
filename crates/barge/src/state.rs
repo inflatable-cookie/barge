@@ -796,6 +796,7 @@ fn temporary_name(name: &str) -> String {
 }
 
 /// Milliseconds since the Unix epoch, as every record's timestamp uses.
+#[cfg_attr(test, track_caller)]
 pub fn now_ms() -> u64 {
     #[cfg(test)]
     {
@@ -804,7 +805,7 @@ pub fn now_ms() -> u64 {
             .map_or(0, |elapsed| {
                 u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
             });
-        crate::tape::now_ms(value);
+        crate::tape::now_ms_at(value, std::panic::Location::caller());
         value
     }
     #[cfg(not(test))]

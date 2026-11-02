@@ -335,6 +335,7 @@ pub(crate) struct EffectRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ClockRow {
     kind: &'static str,
+    site: String,
     value_ms: u64,
     epoch: u64,
 }
@@ -597,7 +598,7 @@ fn record(
 }
 
 /// Record one clock reading on this thread's window.
-fn clock(kind: &'static str, value_ms: u64) {
+fn clock(kind: &'static str, site: String, value_ms: u64) {
     TAPE.with(|tape| {
         let mut tape = tape.borrow_mut();
         if tape.config.is_none() {
@@ -607,6 +608,7 @@ fn clock(kind: &'static str, value_ms: u64) {
         tape.next_epoch = tape.next_epoch.saturating_add(1);
         tape.clocks.push(ClockRow {
             kind,
+            site,
             value_ms,
             epoch,
         });
@@ -904,7 +906,12 @@ pub(crate) fn custody_record(site: &'static str, pool: &Path, record_id: &str, c
 
 /// Record the caller clock: the value the engine passed or read.
 pub(crate) fn now_ms(value_ms: u64) {
-    clock("now_ms", value_ms);
+    clock("now_ms", "test".to_owned(), value_ms);
+}
+
+/// Record the single value returned to its actual call site.
+pub(crate) fn now_ms_at(value_ms: u64, caller: &'static std::panic::Location<'static>) {
+    clock("now_ms", format!("{}:{}", caller.file(), caller.line()), value_ms);
 }
 
 /// Record a real or attempted effect from the contract's closed set.
@@ -1293,6 +1300,8 @@ mod tests {
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         assert_eq!(document["clocks"].as_array().map(Vec::len), Some(1));
         assert_eq!(document["clocks"][0]["value_ms"], returned);
+        let site = document["clocks"][0]["site"].as_str().expect("caller site");
+        assert!(site.ends_with(&format!("tape.rs:{}", line!() - 5)), "{site}");
     }
 
     #[test]

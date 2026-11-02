@@ -67,7 +67,8 @@ incomplete); enumeration and activity
 `area::VolumeRoot::open_with`); custody (`custody::take_custody_by` verdicts,
 `custody::decide`'s safe terminal, `pool_custody::classify` record
 classifications, `os::prove_absence` verdicts); and the caller clock (every
-`state::now_ms` reading, as clock rows). Required identity includes parent and
+`state::now_ms` reading, as clock rows with the test build's caller location).
+Required identity includes parent and
 own device/inode, process start and uid, and volume UUID; many current rows do
 not yet bind all of these facts and are explicitly unproven. Epochs are engine-local, monotonic,
 assigned at the leaf; occurrences are counted per identity key, so a root-lock
