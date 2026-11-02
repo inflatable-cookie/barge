@@ -865,11 +865,9 @@ impl ProcessObserver for MacOs {
             Ok(uid)
         }
         #[cfg(not(test))]
-        {
-            // SAFETY: `geteuid` takes no arguments, cannot fail and has no
-            // preconditions.
-            Ok(unsafe { libc::geteuid() })
-        }
+        // SAFETY: `geteuid` takes no arguments, cannot fail and has no
+        // preconditions.
+        Ok(unsafe { libc::geteuid() })
     }
 
     fn boot_identity(&self) -> Result<String> {

@@ -209,10 +209,11 @@ source-count test is not a complete inventory or a compile-away proof.
 The O1 pin `4af9360bd09629e970c143080ca159de8eef2562` and the planning
 base `39064bafbc14b2ba7bd876e286e9752f12583dd1` have no diff under `crates/`,
 workspace manifests, lockfile or toolchain. Source review at this branch restores
-non-test match arms and expressions at the instrumented read sites. Clock and
-UID expressions remain inside test/non-test branches. This is a source audit,
-not a completed per-statement equivalence proof or a release compile; those
-checks remain required before acceptance.
+non-test match arms and expressions at the instrumented read sites. A line-level
+O1 diff has no removed source lines after these splits; that check alone does
+not prove that newly added statements compile away or preserve behavior. A
+per-statement equivalence review and release compile remain required before
+acceptance.
 
 The ordinary test suite includes
 `ordinary_account_tests::an_ordinary_build_takes_oxide_directories_from_the_password_database_home`.
