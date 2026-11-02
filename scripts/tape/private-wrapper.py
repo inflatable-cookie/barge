@@ -41,6 +41,8 @@ def inventory():
         with os.scandir(fd) as entries:
             names = sorted(entry.name for entry in entries)
         for name in names:
+            if time.monotonic() - started > 30 or len(rows) >= 50000:
+                raise RuntimeError('inventory bound reached')
             st = os.stat(name, dir_fd=fd, follow_symlinks=False)
             child = rel + '/' + name
             if stat.S_ISDIR(st.st_mode):
@@ -61,6 +63,8 @@ def inventory():
                         raise RuntimeError('inventory file replaced')
                     h = hashlib.sha256()
                     while True:
+                        if time.monotonic() - started > 30:
+                            raise RuntimeError('inventory time bound reached')
                         data = os.read(sub, 1048576)
                         if not data:
                             break
@@ -151,7 +155,8 @@ def main():
         save_inventory('tape-dry-after.json', after)
         if after != before:
             raise RuntimeError('dry inventory changed')
-        dry_path.write_text(json.dumps(identity, sort_keys=True), encoding='utf-8')
+        with dry_path.open('x', encoding='utf-8') as out:
+            json.dump(identity, out, sort_keys=True)
         return
     if json.loads(dry_path.read_text(encoding='utf-8')) != identity:
         raise RuntimeError('dry isolation gate is missing or changed')
