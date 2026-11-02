@@ -192,6 +192,7 @@ as separate ordered rows. Vnode rows remain unproven and do not inherit either:
 the retry path can switch process identities while the caller retains its
 original classification, and neither identity proves the later observation. The
 write-side recorder captures attempts and outcomes for the four reviewed
-DirOps verbs, including publish writes, syncs, rename and cleanup. Effect parent
-identities and the remaining reached write sites still require a source audit. The
+DirOps verbs, including publish writes, syncs, rename and cleanup. Child effects
+carry the already-open parent handle identity; remaining reached write sites and
+effect completeness still require a source audit. The
 source-count test is not a complete inventory or a compile-away proof.

@@ -327,6 +327,9 @@ pub(crate) struct ReadRow {
 pub(crate) struct EffectRow {
     kind: &'static str,
     path: String,
+    parent_device: Option<u64>,
+    parent_inode: Option<u64>,
+    destination: Option<String>,
     outcome: Option<String>,
     epoch: u64,
 }
@@ -658,6 +661,28 @@ fn effect(kind: &'static str, path: &Path) {
         tape.effects.push(EffectRow {
             kind,
             path: path.display().to_string(),
+            parent_device: None,
+            parent_inode: None,
+            destination: None,
+            outcome: None,
+            epoch,
+        });
+    });
+}
+
+/// Bind an attempt to its already-open parent and, for rename, its destination.
+pub(crate) fn child_effect(kind: &'static str, parent: (u64, u64), name: &str, destination: Option<&str>) {
+    TAPE.with(|tape| {
+        let mut tape = tape.borrow_mut();
+        if tape.config.is_none() { return; }
+        let epoch = tape.next_epoch;
+        tape.next_epoch = tape.next_epoch.saturating_add(1);
+        tape.effects.push(EffectRow {
+            kind,
+            path: name.to_owned(),
+            parent_device: Some(parent.0),
+            parent_inode: Some(parent.1),
+            destination: destination.map(str::to_owned),
             outcome: None,
             epoch,
         });
@@ -1383,6 +1408,21 @@ mod tests {
         assert_eq!(row["identity"]["start"], 100);
         assert_eq!(row["identity"]["uid"], 501);
         assert_eq!(row["observation_proven"], true);
+    }
+
+    #[test]
+    fn child_effect_preserves_parent_and_both_rename_components() {
+        let transcript = window(|| {
+            child_effect("rename_attempt", (12, 34), "old", Some("new"));
+            effect_outcome("rename_attempt", Path::new("old"), None);
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        let row = &document["effects"][0];
+        assert_eq!(row["parent_device"], 12);
+        assert_eq!(row["parent_inode"], 34);
+        assert_eq!(row["path"], "old");
+        assert_eq!(row["destination"], "new");
+        assert_eq!(row["outcome"], "succeeded");
     }
 
     #[test]

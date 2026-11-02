@@ -1463,6 +1463,8 @@ impl MacOs {
         crate::tape::observed_process("MacOs::settle_descriptors", pid, classified.start, classified.effective_uid, "classified");
         let settle_started = Instant::now();
         let mut start = classified.start;
+        #[cfg(test)]
+        let mut last_observed = classified;
         let mut retries = 0usize;
         let mut record = RetriedUnreadable {
             pid,
@@ -1474,7 +1476,7 @@ impl MacOs {
         };
         loop {
             #[cfg(test)]
-            crate::tape::process_context(pid, start, Some(uid));
+            crate::tape::process_context(pid, last_observed.start, last_observed.effective_uid);
             let listing = match stated_errno(faults, pid) {
                 Some(errno) => DescriptorListing::from_errno(errno),
                 None => self.list_descriptors(pid),
@@ -1552,7 +1554,10 @@ impl MacOs {
                         }
                     };
                     #[cfg(test)]
-                    crate::tape::observed_process("MacOs::settle_descriptors", pid, now.identity.start, now.identity.effective_uid, "retry_identity");
+                    {
+                        last_observed = now.identity;
+                        crate::tape::observed_process("MacOs::settle_descriptors", pid, now.identity.start, now.identity.effective_uid, "retry_identity");
+                    }
                     if record.command.is_none() {
                         record.command = Some(now.command);
                     }
@@ -3799,7 +3804,7 @@ impl DirOps for MacOs {
         let directory = parent_descriptor(parent, name)?;
         let raw = name_cstring(name)?;
         #[cfg(test)]
-        crate::tape::write_effect("mkdir_attempt", Path::new(name));
+        crate::tape::child_effect("mkdir_attempt", (parent.identity().device.get(), parent.identity().inode), name, None);
         // SAFETY: `directory` is open for this call, `raw` is one NUL-terminated
         // component, and `mode` is passed with the default argument promotion a
         // variadic C function expects.
@@ -3836,7 +3841,7 @@ impl DirOps for MacOs {
         let temporary = format!(".barge-tmp-{}-{sequence}", std::process::id());
         let temporary_raw = name_cstring(&temporary)?;
         #[cfg(test)]
-        crate::tape::write_effect("publish_attempt", Path::new(&temporary));
+        crate::tape::child_effect("publish_attempt", (parent.identity().device.get(), parent.identity().inode), &temporary, None);
         // SAFETY: `directory` is open, `temporary_raw` is one NUL-terminated
         // component, the flags are libc's own constants and the variadic mode is
         // passed with the promotion C expects. The result is either -1 or a
@@ -3874,7 +3879,7 @@ impl DirOps for MacOs {
                 .map_err(|error| child_error(name, "cannot write the temporary file", error))?;
             #[cfg(test)]
             {
-                crate::tape::write_effect("publish_write_attempt", Path::new(&temporary));
+                crate::tape::child_effect("publish_write_attempt", (parent.identity().device.get(), parent.identity().inode), &temporary, None);
                 let result = file.write_all(bytes);
                 crate::tape::effect_outcome("publish_write_attempt", Path::new(&temporary), result.as_ref().err());
                 result.map_err(|error| child_error(name, "cannot write the temporary file", error))?;
@@ -3884,7 +3889,7 @@ impl DirOps for MacOs {
                 .map_err(|error| child_error(name, "cannot sync the temporary file", error))?;
             #[cfg(test)]
             {
-                crate::tape::write_effect("publish_sync_attempt", Path::new(&temporary));
+                crate::tape::child_effect("publish_sync_attempt", (parent.identity().device.get(), parent.identity().inode), &temporary, None);
                 let result = file.sync_all();
                 crate::tape::effect_outcome("publish_sync_attempt", Path::new(&temporary), result.as_ref().err());
                 result.map_err(|error| child_error(name, "cannot sync the temporary file", error))?;
@@ -3892,7 +3897,7 @@ impl DirOps for MacOs {
             // SAFETY: both names are NUL-terminated components inside the same
             // open directory, which is what makes the rename atomic.
             #[cfg(test)]
-            crate::tape::write_effect("publish_rename_attempt", Path::new(name));
+            crate::tape::child_effect("publish_rename_attempt", (parent.identity().device.get(), parent.identity().inode), &temporary, Some(name));
             #[cfg(not(test))]
             if unsafe {
                 libc::renameat(
@@ -3915,7 +3920,7 @@ impl DirOps for MacOs {
                     libc::renameat(directory, temporary_raw.as_ptr(), directory, target.as_ptr())
                 };
                 let error = (answer != 0).then(io::Error::last_os_error);
-                crate::tape::effect_outcome("publish_rename_attempt", Path::new(name), error.as_ref());
+                crate::tape::effect_outcome("publish_rename_attempt", Path::new(&temporary), error.as_ref());
                 if let Some(error) = error {
                     return Err(child_error(name, "cannot publish the file", error));
                 }
@@ -3951,7 +3956,7 @@ impl DirOps for MacOs {
             }
             #[cfg(test)]
             {
-                crate::tape::write_effect("publish_cleanup_attempt", Path::new(&temporary));
+                crate::tape::child_effect("publish_cleanup_attempt", (parent.identity().device.get(), parent.identity().inode), &temporary, None);
                 let answer = unsafe { libc::unlinkat(directory, temporary_raw.as_ptr(), 0) };
                 let error = (answer != 0).then(io::Error::last_os_error);
                 crate::tape::effect_outcome("publish_cleanup_attempt", Path::new(&temporary), error.as_ref());
@@ -4276,7 +4281,7 @@ impl DirOps for MacOs {
             RemoveKind::Directory => libc::AT_REMOVEDIR,
         };
         #[cfg(test)]
-        crate::tape::write_effect("unlink_attempt", Path::new(name));
+        crate::tape::child_effect("unlink_attempt", (parent.identity().device.get(), parent.identity().inode), name, None);
         // SAFETY: `directory` is open for this call, `raw` is one NUL-terminated
         // component and `flags` is either zero or libc's own directory flag, so
         // no symbolic link at the leaf is ever followed.
@@ -4300,7 +4305,7 @@ impl DirOps for MacOs {
         let source = name_cstring(from)?;
         let target = name_cstring(to)?;
         #[cfg(test)]
-        crate::tape::write_effect("rename_attempt", Path::new(from));
+        crate::tape::child_effect("rename_attempt", (parent.identity().device.get(), parent.identity().inode), from, Some(to));
         // SAFETY: both names are NUL-terminated components inside the same open
         // directory, which is what makes the rename atomic, and `RENAME_EXCL` is
         // libc's own flag for the platform's exclusive rename. The exclusive
@@ -4545,29 +4550,40 @@ fn read_identity(descriptor: &File, path: &Path) -> Result<VolumeIdentity> {
         );
         return Err(unreadable_fact(path, "volume UUID"));
     }
-    let identity = VolumeIdentity {
+    #[cfg(test)]
+    {
+        let identity = VolumeIdentity {
+            filesystem,
+            device: read_device(descriptor_fd, path)?,
+            volume_uuid,
+            boot_volume: is_boot_volume(&mount_point),
+            mount_point,
+        };
+        #[cfg(test)]
+        crate::tape::volume(
+            "macos::read_identity",
+            crate::tape::Identity::volume_at(
+                path,
+                identity.device.get(),
+                identity.volume_uuid.as_ref().map(|uuid| uuid.as_str()),
+                Some(&identity.mount_point),
+            ),
+            crate::tape::Outcome::answer(format!(
+                "fs={} boot={}",
+                identity.filesystem.as_str(),
+                identity.boot_volume
+            )),
+        );
+        Ok(identity)
+    }
+    #[cfg(not(test))]
+    Ok(VolumeIdentity {
         filesystem,
         device: read_device(descriptor_fd, path)?,
         volume_uuid,
         boot_volume: is_boot_volume(&mount_point),
         mount_point,
-    };
-    #[cfg(test)]
-    crate::tape::volume(
-        "macos::read_identity",
-        crate::tape::Identity::volume_at(
-            path,
-            identity.device.get(),
-            identity.volume_uuid.as_ref().map(|uuid| uuid.as_str()),
-            Some(&identity.mount_point),
-        ),
-        crate::tape::Outcome::answer(format!(
-            "fs={} boot={}",
-            identity.filesystem.as_str(),
-            identity.boot_volume
-        )),
-    );
-    Ok(identity)
+    })
 }
 
 /// A failed read of a fact on an otherwise open descriptor: a vanished volume
