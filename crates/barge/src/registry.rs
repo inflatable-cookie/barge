@@ -555,6 +555,13 @@ pub fn read(state: &StatePaths) -> Result<Registry> {
 pub(crate) fn read_with_deadline(state: &StatePaths, deadline: Deadline) -> Result<Registry> {
     let path = state.registry_path();
     let bounds = Bounds::new(REGISTRY_SIZE_CAP_BYTES, REGISTRY_VOLUME_ROWS, deadline);
+    #[cfg(not(test))]
+    let bytes = match state::read_bounded(&path, &bounds) {
+        ReadOutcome::Absent => return Ok(Registry::Absent),
+        ReadOutcome::Present(bytes) => bytes,
+        ReadOutcome::Refused(error) => return Err(named(error, &path)),
+    };
+    #[cfg(test)]
     let bytes = match state::read_bounded(&path, &bounds) {
         ReadOutcome::Absent => {
             #[cfg(test)]
@@ -578,6 +585,17 @@ pub(crate) fn read_with_deadline(state: &StatePaths, deadline: Deadline) -> Resu
             return Err(named(error, &path));
         }
     };
+    #[cfg(not(test))]
+    let document: RegistryDocument = serde_json::from_slice(&bytes).map_err(|error| {
+        named(
+            Error::new(
+                ErrorKind::UnknownState,
+                format!("`{REGISTRY_SCHEMA}` refused the registry: {error}"),
+            ),
+            &path,
+        )
+    })?;
+    #[cfg(test)]
     let document: RegistryDocument = match serde_json::from_slice(&bytes) {
         Ok(document) => document,
         Err(error) => {

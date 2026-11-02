@@ -400,13 +400,17 @@ fn read_document(path: &Path, cap: usize, deadline: Deadline) -> Result<Option<V
         before.map(|observed| (observed.device, observed.inode, "document")),
     );
     let bytes = match state::read_bounded(path, &Bounds::new(cap, MAX_RECORDS, deadline)) {
+        #[cfg(not(test))]
+        ReadOutcome::Absent => None,
+        #[cfg(test)]
         ReadOutcome::Absent => {
-            #[cfg(test)]
             crate::tape::read_absent("pool_custody::read_document", path);
             None
         }
+        #[cfg(not(test))]
+        ReadOutcome::Present(bytes) => Some(bytes),
+        #[cfg(test)]
         ReadOutcome::Present(bytes) => {
-            #[cfg(test)]
             crate::tape::read_present(
                 "pool_custody::read_document",
                 path,
@@ -416,21 +420,29 @@ fn read_document(path: &Path, cap: usize, deadline: Deadline) -> Result<Option<V
             );
             Some(bytes)
         }
+        #[cfg(not(test))]
+        ReadOutcome::Refused(error) => return Err(error.message().to_owned()),
+        #[cfg(test)]
         ReadOutcome::Refused(error) => {
-            #[cfg(test)]
             crate::tape::read_refused("pool_custody::read_document", path, error.kind().as_str());
             return Err(error.message().to_owned());
         }
     };
-    let after = identity(path)?;
-    #[cfg(test)]
-    crate::tape::stat(
-        "pool_custody::read_document",
-        path,
-        after.map(|observed| (observed.device, observed.inode, "document")),
-    );
-    if after != before {
+    #[cfg(not(test))]
+    if identity(path)? != before {
         return Err(format!("{} changed while it was read", path.display()));
+    }
+    #[cfg(test)]
+    {
+        let after = identity(path)?;
+        crate::tape::stat(
+            "pool_custody::read_document",
+            path,
+            after.map(|observed| (observed.device, observed.inode, "document")),
+        );
+        if after != before {
+            return Err(format!("{} changed while it was read", path.display()));
+        }
     }
     Ok(bytes)
 }

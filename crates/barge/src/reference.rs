@@ -275,6 +275,23 @@ pub struct BargeReferences {
 impl BargeReferences {
     /// Read every placement record once for one plan.
     pub fn read(state: &StatePaths) -> Self {
+        #[cfg(not(test))]
+        match cache::read_placements(state) {
+            Ok(placements) => Self {
+                placements_detail: placements.truncated.then(|| {
+                    format!(
+                        "the placement census holds more than {} records, so it was truncated",
+                        placements.records.len()
+                    )
+                }),
+                placements,
+            },
+            Err(error) => Self {
+                placements: PlacementSet::empty(),
+                placements_detail: Some(format!("the placement census could not be read: {error}")),
+            },
+        }
+        #[cfg(test)]
         match cache::read_placements(state) {
             Ok(placements) => {
                 #[cfg(test)]
@@ -1102,6 +1119,22 @@ fn pools_holding(control: &Path) -> std::result::Result<Vec<PathBuf>, String> {
         ));
     };
     let removable = control.join(REMOVABLE_POOL_DIR);
+    #[cfg(not(test))]
+    match std::fs::symlink_metadata(&removable) {
+        Ok(metadata) if metadata.is_dir() => Ok(vec![internal.to_path_buf(), removable]),
+        Ok(_) => Err(format!(
+            "{} exists and is not a directory, so the removable pool's writers are unknown",
+            removable.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(vec![internal.to_path_buf()])
+        }
+        Err(error) => Err(format!(
+            "{} cannot be inspected, so the removable pool's writers are unknown: {error}",
+            removable.display()
+        )),
+    }
+    #[cfg(test)]
     match std::fs::symlink_metadata(&removable) {
         Ok(metadata) if metadata.is_dir() => {
             #[cfg(test)]
@@ -1143,6 +1176,17 @@ fn pools_holding(control: &Path) -> std::result::Result<Vec<PathBuf>, String> {
 /// Read Oxide's outputs registry strictly.
 fn read_registry(path: &Path, deadline: Deadline) -> OxideRegistry {
     let bounds = Bounds::new(REGISTRY_CAP_BYTES, REGISTRY_ROWS, deadline);
+    #[cfg(not(test))]
+    let bytes = match state::read_bounded(path, &bounds) {
+        ReadOutcome::Absent => return OxideRegistry::Absent,
+        ReadOutcome::Refused(error) => {
+            return OxideRegistry::Unknown {
+                reason: format!("{}: {error}", path.display()),
+            }
+        }
+        ReadOutcome::Present(bytes) => bytes,
+    };
+    #[cfg(test)]
     let bytes = match state::read_bounded(path, &bounds) {
         ReadOutcome::Absent => {
             #[cfg(test)]
@@ -1168,6 +1212,14 @@ fn read_registry(path: &Path, deadline: Deadline) -> OxideRegistry {
             bytes
         }
     };
+    #[cfg(not(test))]
+    match parse_registry(&bytes) {
+        Ok(reading) => reading,
+        Err(error) => OxideRegistry::Unknown {
+            reason: format!("{}: {error}", path.display()),
+        },
+    }
+    #[cfg(test)]
     match parse_registry(&bytes) {
         Ok(reading) => reading,
         Err(error) => {
@@ -1660,8 +1712,10 @@ fn read_receipts_with(
             };
         }
         match read_one(&path, checkout_id, deadline) {
+            #[cfg(not(test))]
+            Ok(Some(receipt)) => receipts.push(receipt),
+            #[cfg(test)]
             Ok(Some(receipt)) => {
-                #[cfg(test)]
                 crate::tape::verdict(
                     "reference::read_receipts_with",
                     crate::tape::Identity::file(&path, None),
@@ -2220,6 +2274,13 @@ pub fn read_oxide_marker(
     dirs: &dyn DirOps,
     root: &DirHandle,
 ) -> std::result::Result<Option<OxideMarker>, String> {
+    #[cfg(not(test))]
+    let facts = match dirs.child_facts(root, OXIDE_MARKER_FILE) {
+        Ok(Some(facts)) => facts,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(format!("the marker cannot be read: {error}")),
+    };
+    #[cfg(test)]
     let facts = match dirs.child_facts(root, OXIDE_MARKER_FILE) {
         Ok(Some(facts)) => facts,
         Ok(None) => {
@@ -2244,6 +2305,19 @@ pub fn read_oxide_marker(
     if facts.kind != crate::os::EntryKind::File {
         return Err("the Oxide marker is not a regular file".to_owned());
     }
+    #[cfg(not(test))]
+    let bytes =
+        match dirs.read_child_file(root, OXIDE_MARKER_FILE, MARKER_CAP_BYTES) {
+            Ok(Some(bytes)) => bytes,
+            // The marker was observed a moment ago; a read that finds nothing is a
+            // change under the observation, never "this root has no Oxide marker".
+            Ok(None) => return Err(
+                "the Oxide marker was observed and is no longer there, so the observation changed"
+                    .to_owned(),
+            ),
+            Err(error) => return Err(format!("the marker cannot be read: {error}")),
+        };
+    #[cfg(test)]
     let bytes =
         match dirs.read_child_file(root, OXIDE_MARKER_FILE, MARKER_CAP_BYTES) {
             Ok(Some(bytes)) => {

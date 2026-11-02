@@ -3666,6 +3666,9 @@ impl DirOps for MacOs {
         // SAFETY: `raw` is a NUL-terminated path that outlives the call and
         // `status` is a writable `stat` of exactly the size the call expects.
         if unsafe { libc::lstat(raw.as_ptr(), &mut status) } != 0 {
+            #[cfg(not(test))]
+            return entry_result(path, "entry", io::Error::last_os_error());
+            #[cfg(test)]
             let error = io::Error::last_os_error();
             #[cfg(test)]
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -3677,6 +3680,7 @@ impl DirOps for MacOs {
                     &crate::tape::errno_class(&error),
                 );
             }
+            #[cfg(test)]
             return entry_result(path, "entry", error);
         }
         #[cfg(test)]
@@ -3768,6 +3772,9 @@ impl DirOps for MacOs {
             )
         } != 0
         {
+            #[cfg(not(test))]
+            return child_entry_result(name, io::Error::last_os_error());
+            #[cfg(test)]
             let error = io::Error::last_os_error();
             #[cfg(test)]
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -3783,6 +3790,7 @@ impl DirOps for MacOs {
                     &crate::tape::errno_class(&error),
                 );
             }
+            #[cfg(test)]
             return child_entry_result(name, error);
         }
         #[cfg(test)]
@@ -4358,13 +4366,17 @@ impl DirOps for MacOs {
                 "the handle has no open descriptor to read".to_owned(),
             )
         })?;
-        let facts = entry_facts(&fstat(descriptor, Path::new("facts"))?);
         #[cfg(test)]
-        crate::tape::handle_observation(
-            "MacOs::dir_facts", "stat", facts.device.get(), facts.inode,
-            crate::tape::Outcome::facts(facts.kind.as_str()),
-        );
-        Ok(facts)
+        {
+            let facts = entry_facts(&fstat(descriptor, Path::new("facts"))?);
+            crate::tape::handle_observation(
+                "MacOs::dir_facts", "stat", facts.device.get(), facts.inode,
+                crate::tape::Outcome::facts(facts.kind.as_str()),
+            );
+            Ok(facts)
+        }
+        #[cfg(not(test))]
+        Ok(entry_facts(&fstat(descriptor, Path::new("facts"))?))
     }
 
     fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> Result<()> {
@@ -4395,13 +4407,17 @@ impl DirOps for MacOs {
                 "the handle has no open descriptor to re-read".to_owned(),
             )
         })?;
-        let identity = read_dir_identity(descriptor, Path::new("recheck"))?;
         #[cfg(test)]
-        crate::tape::handle_observation(
-            "MacOs::recheck_dir", "stat", identity.device.get(), identity.inode,
-            crate::tape::Outcome::facts("directory"),
-        );
-        Ok(identity)
+        {
+            let identity = read_dir_identity(descriptor, Path::new("recheck"))?;
+            crate::tape::handle_observation(
+                "MacOs::recheck_dir", "stat", identity.device.get(), identity.inode,
+                crate::tape::Outcome::facts("directory"),
+            );
+            Ok(identity)
+        }
+        #[cfg(not(test))]
+        read_dir_identity(descriptor, Path::new("recheck"))
     }
 
     fn create_child_symlink(&self, parent: &DirHandle, name: &str, target: &Path) -> Result<()> {
@@ -4493,6 +4509,9 @@ fn open_directory(path: &Path) -> Result<File> {
         )
     };
     if descriptor < 0 {
+        #[cfg(not(test))]
+        return Err(open_error(path, io::Error::last_os_error()));
+        #[cfg(test)]
         let error = io::Error::last_os_error();
         #[cfg(test)]
         crate::tape::stat_refused(
@@ -4500,6 +4519,7 @@ fn open_directory(path: &Path) -> Result<File> {
             path,
             &crate::tape::errno_class(&error),
         );
+        #[cfg(test)]
         return Err(open_error(path, error));
     }
     // SAFETY: `descriptor` is a fresh non-negative descriptor from `open` and no

@@ -423,6 +423,13 @@ pub(crate) fn take_custody_by(
         bounds,
         None,
     ) {
+        #[cfg(not(test))]
+        Ok(evidence) => CustodyVerdict::Safe(Box::new(evidence)),
+        #[cfg(not(test))]
+        Err(Refusal::Unsafe { reason, retry }) => CustodyVerdict::Unsafe { reason, retry },
+        #[cfg(not(test))]
+        Err(Refusal::Unknown { reason, retry }) => CustodyVerdict::Unknown { reason, retry },
+        #[cfg(test)]
         Ok(evidence) => {
             #[cfg(test)]
             crate::tape::verdict(
@@ -432,6 +439,7 @@ pub(crate) fn take_custody_by(
             );
             CustodyVerdict::Safe(Box::new(evidence))
         }
+        #[cfg(test)]
         Err(Refusal::Unsafe { reason, retry }) => {
             #[cfg(test)]
             {
@@ -444,6 +452,7 @@ pub(crate) fn take_custody_by(
             }
             CustodyVerdict::Unsafe { reason, retry }
         }
+        #[cfg(test)]
         Err(Refusal::Unknown { reason, retry }) => {
             #[cfg(test)]
             {

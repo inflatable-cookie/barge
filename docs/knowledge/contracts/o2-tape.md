@@ -199,3 +199,13 @@ carry the already-open parent handle identity; directory sync records the
 handle's own identity without a fabricated pathname. Remaining reached write sites and
 effect completeness still require a source audit. The
 source-count test is not a complete inventory or a compile-away proof.
+
+## Production statement audit
+
+The O1 pin `4af9360bd09629e970c143080ca159de8eef2562` and the planning
+base `39064bafbc14b2ba7bd876e286e9752f12583dd1` have no diff under `crates/`,
+workspace manifests, lockfile or toolchain. Source review at this branch restores
+non-test match arms and expressions at the instrumented read sites. Clock and
+UID expressions remain inside test/non-test branches. This is a source audit,
+not a completed per-statement equivalence proof or a release compile; those
+checks remain required before acceptance.

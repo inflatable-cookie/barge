@@ -609,8 +609,10 @@ pub fn verify(
     let unknown = |reason| IdentityVerdict::Unknown { reason };
     let record = match read(state, dirs, root_id, uid) {
         Ok(Some(record)) => record,
+        #[cfg(not(test))]
+        Ok(None) => return unknown(IdentityReason::IdentityRecordMissing),
+        #[cfg(test)]
         Ok(None) => {
-            #[cfg(test)]
             crate::tape::verdict(
                 "identity::verify",
                 crate::tape::Identity::file(std::path::Path::new(root_id), None),
@@ -618,8 +620,10 @@ pub fn verify(
             );
             return unknown(IdentityReason::IdentityRecordMissing);
         }
+        #[cfg(not(test))]
+        Err(_) => return unknown(IdentityReason::IdentityRecordInvalid),
+        #[cfg(test)]
         Err(_) => {
-            #[cfg(test)]
             crate::tape::verdict(
                 "identity::verify",
                 crate::tape::Identity::file(std::path::Path::new(root_id), None),

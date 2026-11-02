@@ -485,8 +485,10 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
     }
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
+        #[cfg(not(test))]
+        Err(error) if error.kind() == IoErrorKind::NotFound => return Ok(ReadOutcome::Absent),
+        #[cfg(test)]
         Err(error) if error.kind() == IoErrorKind::NotFound => {
-            #[cfg(test)]
             crate::tape::read_absent("state::read_bounded_inner", path);
             return Ok(ReadOutcome::Absent);
         }
@@ -900,6 +902,9 @@ impl StateLock {
     ) -> Result<Option<Self>> {
         let file = match OpenOptions::new().read(true).open(path) {
             Ok(file) => file,
+            #[cfg(not(test))]
+            Err(error) if error.kind() == IoErrorKind::NotFound => return Ok(None),
+            #[cfg(test)]
             Err(error) if error.kind() == IoErrorKind::NotFound => {
                 #[cfg(test)]
                 crate::tape::lock(
@@ -909,6 +914,9 @@ impl StateLock {
                 );
                 return Ok(None);
             }
+            #[cfg(not(test))]
+            Err(error) => return Err(lock_open_error(path, &error)),
+            #[cfg(test)]
             Err(error) => {
                 #[cfg(test)]
                 crate::tape::lock(
@@ -2335,6 +2343,9 @@ pub(crate) fn read_intents_with_deadline(
     let directory = state.intents_dir();
     let names = match std::fs::read_dir(&directory) {
         Ok(entries) => entries,
+        #[cfg(not(test))]
+        Err(error) if error.kind() == IoErrorKind::NotFound => return Ok(IntentSet::empty()),
+        #[cfg(test)]
         Err(error) if error.kind() == IoErrorKind::NotFound => {
             #[cfg(test)]
             crate::tape::read_absent("state::read_intents_with_deadline", &directory);
@@ -2347,11 +2358,18 @@ pub(crate) fn read_intents_with_deadline(
                 &directory,
                 &crate::tape::errno_class(&error),
             );
+            #[cfg(test)]
             return Err(Error::new(
                 ErrorKind::UnknownState,
                 format!("cannot read the intent journal: {error}"),
             )
             .with_detail("path", directory.display().to_string().into()));
+            #[cfg(not(test))]
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("cannot read the intent journal: {error}"),
+            )
+            .with_detail("path", directory.display().to_string().into()))
         }
     };
     if deadline.expired() {
