@@ -329,6 +329,8 @@ pub(crate) struct EffectRow {
     path: Option<String>,
     parent_device: Option<u64>,
     parent_inode: Option<u64>,
+    device: Option<u64>,
+    inode: Option<u64>,
     destination: Option<String>,
     outcome: Option<String>,
     epoch: u64,
@@ -663,6 +665,8 @@ fn effect(kind: &'static str, path: &Path) {
             path: path.to_str().map(str::to_owned),
             parent_device: None,
             parent_inode: None,
+            device: None,
+            inode: None,
             destination: None,
             outcome: None,
             epoch,
@@ -682,10 +686,43 @@ pub(crate) fn child_effect(kind: &'static str, parent: (u64, u64), name: &str, d
             path: Some(name.to_owned()),
             parent_device: Some(parent.0),
             parent_inode: Some(parent.1),
+            device: None,
+            inode: None,
             destination: destination.map(str::to_owned),
             outcome: None,
             epoch,
         });
+    });
+}
+
+/// Record a write attempt against an already-open directory itself.
+pub(crate) fn handle_effect(kind: &'static str, directory: (u64, u64)) {
+    TAPE.with(|tape| {
+        let mut tape = tape.borrow_mut();
+        if tape.config.is_none() { return; }
+        let epoch = tape.next_epoch;
+        tape.next_epoch = tape.next_epoch.saturating_add(1);
+        tape.effects.push(EffectRow {
+            kind,
+            path: None,
+            parent_device: None,
+            parent_inode: None,
+            device: Some(directory.0),
+            inode: Some(directory.1),
+            destination: None,
+            outcome: None,
+            epoch,
+        });
+    });
+}
+
+/// Complete a directory-handle attempt without inventing a pathname.
+pub(crate) fn handle_effect_outcome(kind: &str, error: Option<&std::io::Error>) {
+    TAPE.with(|tape| {
+        let mut tape = tape.borrow_mut();
+        if let Some(row) = tape.effects.iter_mut().rev().find(|row| row.kind == kind && row.path.is_none() && row.outcome.is_none()) {
+            row.outcome = Some(error.map_or_else(|| "succeeded".to_owned(), errno_class));
+        }
     });
 }
 
@@ -1468,6 +1505,20 @@ mod tests {
         assert_eq!(row["identity"]["start"], 100);
         assert_eq!(row["identity"]["uid"], 501);
         assert_eq!(row["observation_proven"], true);
+    }
+
+    #[test]
+    fn directory_sync_uses_descriptor_identity_without_a_fake_path() {
+        let transcript = window(|| {
+            handle_effect("sync", (12, 34));
+            handle_effect_outcome("sync", None);
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        let row = &document["effects"][0];
+        assert!(row["path"].is_null());
+        assert_eq!(row["device"], 12);
+        assert_eq!(row["inode"], 34);
+        assert_eq!(row["outcome"], "succeeded");
     }
 
     #[test]

@@ -3941,10 +3941,10 @@ impl DirOps for MacOs {
             }
             #[cfg(test)]
             {
-                crate::tape::write_effect("publish_dir_sync_attempt", Path::new(name));
+                crate::tape::handle_effect("publish_dir_sync_attempt", (parent.identity().device.get(), parent.identity().inode));
                 let answer = unsafe { libc::fsync(directory) };
                 let error = (answer != 0).then(io::Error::last_os_error);
-                crate::tape::effect_outcome("publish_dir_sync_attempt", Path::new(name), error.as_ref());
+                crate::tape::handle_effect_outcome("publish_dir_sync_attempt", error.as_ref());
                 if let Some(error) = error {
                     return Err(child_error(name, "cannot sync the directory", error));
                 }

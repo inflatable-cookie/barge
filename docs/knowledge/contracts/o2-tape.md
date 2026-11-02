@@ -195,6 +195,7 @@ but remain unproven and do not inherit either process identity: the retry path c
 original classification, and neither identity proves the later observation. The
 write-side recorder captures attempts and outcomes for the four reviewed
 DirOps verbs, including publish writes, syncs, rename and cleanup. Child effects
-carry the already-open parent handle identity; remaining reached write sites and
+carry the already-open parent handle identity; directory sync records the
+handle's own identity without a fabricated pathname. Remaining reached write sites and
 effect completeness still require a source audit. The
 source-count test is not a complete inventory or a compile-away proof.
