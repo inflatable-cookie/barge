@@ -1554,12 +1554,13 @@ mod tests {
     #[test]
     fn clock_row_is_the_value_returned_to_the_caller() {
         let mut returned = 0;
+        let expected_line = line!() + 1;
         let transcript = window(|| returned = crate::state::now_ms());
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         assert_eq!(document["clocks"].as_array().map(Vec::len), Some(1));
         assert_eq!(document["clocks"][0]["value_ms"], returned);
         let site = document["clocks"][0]["site"].as_str().expect("caller site");
-        assert!(site.ends_with(&format!("tape.rs:{}", line!() - 5)), "{site}");
+        assert!(site.ends_with(&format!("tape.rs:{expected_line}")), "{site}");
     }
 
     #[test]

@@ -209,3 +209,10 @@ non-test match arms and expressions at the instrumented read sites. Clock and
 UID expressions remain inside test/non-test branches. This is a source audit,
 not a completed per-statement equivalence proof or a release compile; those
 checks remain required before acceptance.
+
+The ordinary test suite includes
+`ordinary_account_tests::an_ordinary_build_takes_oxide_directories_from_the_password_database_home`.
+Tom authorized that one test's read-only password-database lookup by decision
+`d130b2b6-04b0-4e25-b21c-4a6b4b71ec9d`, under the private wrapper and live-state
+inventory gate. The ordinary suite keeps the proof feature off; the ruling does
+not authorize other live account reads or redirect production account lookup.

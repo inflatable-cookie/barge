@@ -3684,15 +3684,13 @@ impl DirOps for MacOs {
             return entry_result(path, "entry", error);
         }
         #[cfg(test)]
-        crate::tape::stat(
-            "MacOs::path_facts",
-            path,
-            Some((
-                u64::try_from(status.st_dev).unwrap_or(0),
-                status.st_ino,
-                entry_facts(&status).kind.as_str(),
-            )),
-        );
+        match u64::try_from(status.st_dev) {
+            Ok(device) => crate::tape::stat(
+                "MacOs::path_facts", path,
+                Some((device, status.st_ino, entry_facts(&status).kind.as_str())),
+            ),
+            Err(_) => crate::tape::stat_refused("MacOs::path_facts", path, "invalid_device"),
+        }
         Ok(Some(entry_facts(&status)))
     }
 
@@ -3800,15 +3798,15 @@ impl DirOps for MacOs {
                 Some((parent.identity().device.get(), parent.identity().inode)),
                 std::ffi::OsStr::new(name),
             );
-            crate::tape::stat(
-                "MacOs::child_facts",
-                std::path::Path::new(name),
-                Some((
-                    u64::try_from(status.st_dev).unwrap_or(0),
-                    status.st_ino,
-                    entry_facts(&status).kind.as_str(),
-                )),
-            );
+            match u64::try_from(status.st_dev) {
+                Ok(device) => crate::tape::stat(
+                    "MacOs::child_facts", std::path::Path::new(name),
+                    Some((device, status.st_ino, entry_facts(&status).kind.as_str())),
+                ),
+                Err(_) => crate::tape::stat_refused(
+                    "MacOs::child_facts", std::path::Path::new(name), "invalid_device",
+                ),
+            }
         }
         Ok(Some(entry_facts(&status)))
     }
