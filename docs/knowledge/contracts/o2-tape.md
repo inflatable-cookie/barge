@@ -136,10 +136,19 @@ From the exact staged Barge commit, offline, committed `Cargo.lock`, default
 features only — no feature enabled, the proof feature off, toolchain 1.97.1:
 
 `effigy rust:test:tape-stage` declares a locked, default-feature `tape_eval`
-build without running it. It does not yet export or attest a binary. The produced executable
-under the managed target directory is the one a window
-invokes under the argv contract above; its digest, the toolchain and the
-lockfile are the orchestrator's to verify before any run. No fixture, pool,
+build without running it. `rust:test:tape-export` declares the source exporter:
+it archives an exact Git commit, hashes its tree members and lock/toolchain,
+builds through the stage selector, refuses changed source or a missing unique
+default-feature executable, and records the executable, compiler and private
+Oxide digests. The external harness requires the receipt and its independently
+supplied digest; it checks the executable and every listed source byte before
+the engine window. Its binding is the receipt digest, not an evaluator leaf.
+`scripts/tape/private-wrapper.py` is source for a private launcher with a dry
+inventory and before/after gate. It currently refuses before either mode:
+admission subprocess isolation and aggregate scratch accounting have not been
+established. This source has not been executed or qualified; its receipt inputs
+and every child/admission destination still need independent isolation proof.
+The retained failed inventory remains a failure. No fixture, pool,
 registry, root or account outside the given fixture root is read or written,
 and `BARGE_STATE_DIR`/`BARGE_ACCOUNT_HOME` are never consulted: fixture
 selection is explicit `StatePaths` and an `AccountFacts` implementation inside
@@ -233,10 +242,9 @@ engine status; those provisional fields still require shared-schema review.
 Other apparatus-error cases still require review against the eventual shared
 schema; that schema must not be treated as already settled. No successful
 comparison follows from any of these gaps.
-The current `staged_binding` is only a package version and build directory,
-not a source or executable hash. The later staging workflow must bind the
-actual source tree, lockfile, toolchain and executable before that field can
-serve as provenance.
+The export receipt and binding checks are source only: until the private route
+is qualified and the exact-head export is built and independently checked,
+they are not evidence of an actual staged executable or source binding.
 
 Descriptor listing and entry rows can be proven when the actual process
 identity has pid, nonzero start and uid, and the listing is complete or the
@@ -256,19 +264,27 @@ not prove that newly added statements compile away or preserve behavior. A
 per-statement equivalence review and release compile remain required before
 acceptance.
 
+The O1-to-planning difference is not empty across the entire repository:
+`scripts/native/release-proof.py` changed in commits `56b067b`, `b966777` and
+`3a21036` for the native release-proof dependency guard, remount replay and R12
+fixture thresholds. It is a separate executable proof apparatus, not the
+library evaluator; there is no additional change to that script between the
+planning base and this branch. Those historical changes are not evidence for
+this tape or permission to execute a native proof.
+
 The current source map against that O1 pin, for reviewer inspection, is:
 
 | File | Source sites changed | Non-test basis and remaining review |
 | --- | --- | --- |
-| `area.rs` | volume resolution, directory and hold enumeration, activity | Test rows and split error arms; original non-test directory-read arms retained. Audit all additions for cfg reachability. |
-| `custody.rs` | custody and decision observations | Test-only verdict rows and split match arms; review the unchanged original non-test arms. |
-| `identity.rs` | read and verification observations | Test-only rows; verify the pre-existing reads and errors remain in their original order. |
-| `os/absence.rs` | refusal and stored proof clock | Test-only recorder statements and test; the original proof clock expression remains in its struct. |
+| `area.rs` | `VolumeRoot::open_with`, `resolve_by`, `read_directory`, `read_hold_directory`, `list_names`, `scan_activity_within` | Volume verification/open and resolution keep the O1 calls and returns, with test-only observations after results. In `read_directory`, the original NotFound arm and original error return are retained in `cfg(not(test))`; the test arms retain the same return and error, and other additions only record already obtained results. `read_hold_directory` records the existing uid and metadata results. `list_names` preserves the original missing-directory return in its non-test arm and reconstructs the same return in its test arm; the completed-list observation precedes the unchanged result. `scan_activity_within` records immediately before its existing incomplete and final returns. |
+| `custody.rs` | `take_custody_by`, `decide` | The O1 `Ok(evidence)` and two `Err(Refusal::...)` match arms remain verbatim in `cfg(not(test))`; test arms record then return the same constructors. `decide` adds one test-only call before its original `Ok(CustodyEvidence { ... })`. |
+| `identity.rs` | `read`, `verify` | The original `read_child_file` result is recorded after its `?` and before the original `child_facts`. The O1 `Ok(None)` and `Err(_)` arms remain verbatim under `cfg(not(test))`; the test arms return the same unknown reasons. Duplicate UUID, missing mount and final compare retain their original order with test-only calls immediately before their existing statements. |
+| `os/absence.rs` | `prove_absence`, `prove_absence_inner` | The O1 `let proof = prove_absence_inner(...)?` remains verbatim in the non-test branch; the test branch calls it once and returns the same error. Serialization and cap checks remain in their original order, with test-only refusal records. The original proof clock expression remains in the struct; the test row reads the already stored `proved_ms`. The added regression is test-only. |
 | `os/macos.rs` | volume, process, descriptor and DirOps leaves | Test rows and narrow splits; verify original non-test syscall/error arms, including `read_identity`, writes and descriptor reads. |
-| `pool_custody.rs` | classification, metadata and document reads | Test-only observations and split match arms; verify original non-test arms and read order. |
-| `reference.rs` | directory, receipt, marker, pool and child reads | Test rows and split match arms; verify original non-test arms and reads. |
-| `registry.rs` | registry read and parse outcomes | Test-only rows and split match arms; verify original non-test arms. |
-| `state.rs` | bounded reads, locks, publication, directory sync and clocks | Original non-test open/write/rename/sync and `now_ms` statements are retained in non-test branches; test branches bind each actual result once. Verify all remaining read arms. |
+| `pool_custody.rs` | `classify`, `read_document` | The classification loop adds a test-only row before the original duplicate check. The three O1 `read_bounded` arms remain verbatim under `cfg(not(test))`; test arms record the consumed outcome then return the same value. The original `if identity(path)? != before` remains verbatim in the non-test branch; the test branch evaluates `identity(path)?` once, records it, then makes the same comparison and return. |
+| `reference.rs` | `BargeReferences::read`, `control_directory_with`, `pools_holding`, `read_registry`, `read_receipts_with`, `read_oxide_marker` | Original placement-read, removable-pool metadata match, registry read and parse matches, and both marker child-facts/read matches remain verbatim under `cfg(not(test))`. Their test counterparts perform each original call once and return the same values and errors, adding observations. `control_directory_with` records its stored inspect result. The receipt `Ok(Some(receipt))` push remains verbatim in the non-test arm; the test arm records then pushes the same receipt. Other receipt additions read the already obtained path's component and add no filesystem operation. |
+| `registry.rs` | `read_with_deadline` | The complete original `let bytes = match state::read_bounded(...)` and `let document = serde_json::from_slice(...).map_err(...)?` statements remain verbatim in `cfg(not(test))`. Test branches use the same read and parser once, record their consumed outcomes, and return the same named errors. Validation follows both branches unchanged. |
+| `state.rs` | `read_bounded_inner`, `publish_atomic_with`, `publish_open_file`, `sync_directory`, `now_ms`, `StateLock`, `wait_for_lock`, `read_intents_with_deadline` | The O1 NotFound arms of bounded read, shared lock and intent directory read remain verbatim in non-test branches; test arms return the same absent values after recording. Other read and lock additions observe existing values or error branches. Publication retains the original create, cleanup unlink, write, rename and directory-sync statements in non-test branches; test branches execute each original operation once through the recorder and retain its error handling. `file.sync_all` remains the original statement. `now_ms` retains its original expression under `cfg(not(test))`; the test branch evaluates it once and returns the recorded value. Intent enumeration uses the existing entry name and preserves its sorted result. |
 | `release.rs` | no tape delta against O1 | Caller clock observations come from `state::now_ms`; release's original calls remain in place. |
 | `lib.rs`, `Cargo.toml`, `tests/tape_eval.rs`, `tape.rs`, `tape_harness.rs` | test-only modules, harness target and recorder | Test surface and target declarations only; release compile-away and per-statement review remain missing. |
 | `effect.rs`, `guard.rs`, `undo_capture.rs` | source-link shadows for the included test target | These links require target/build review; no production module declarations are added. |
@@ -286,6 +302,21 @@ plan reachability. `set_dir_mode` and `create_child_symlink` are DirOps mutation
 implementations in `os/macos.rs:4362,4403`. Full transitive reachability and
 all reached effect identities still require review; these pointers are not a
 proof that a method can never be reached.
+
+The observed lock branch is narrower than the exclusive mutation branch:
+`release::read_registry` calls `LockSet::observe_registry`, and
+`plan_observed`/`decide_root` call `observe_volume`, `observe_root` or
+`observe_unit` (release.rs:747, 514, 800). Those methods lead to
+`StateLock::shared_if_present` (state.rs:970, 1182–1225), whose `OpenOptions`
+has `read(true)` and no create/write flags; an absent lock returns `None`.
+That does not reach `StateLock::exclusive`'s create/open or the publication
+helpers. `release::plan_observed` calls `area::show`, `resolve_by`,
+`list_names`, `BargeReferences::read`, `OxideSnapshot::read_within`,
+`pending_intents` and `decide_root` (release.rs:404–550). `area::show` reads
+declarations (area.rs:2867, 3167), while `resolve_by` uses
+`walk_folder_chain` (area.rs:1041, 1509); neither call selects a creation
+entry point. These observations delimit those individual branches; they do not
+yet close the transitive audit of every descendant, partial write, or callback.
 
 The ordinary test suite includes
 `ordinary_account_tests::an_ordinary_build_takes_oxide_directories_from_the_password_database_home`.

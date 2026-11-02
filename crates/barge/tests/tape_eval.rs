@@ -57,8 +57,10 @@
 //! Build from the exact staged commit offline, default features only, pinned
 //! toolchain 1.97.1, committed `Cargo.lock`:
 //!
-//! `effigy rust:test:tape-stage` declares the locked default-feature build;
-//! verified export and provenance remain to be supplied.
+//! `effigy rust:test:tape-stage` declares the locked default-feature build.
+//! The provisional exporter records source and executable hashes, and an
+//! external invocation must supply the receipt and its independently verified
+//! digest in `BARGE_TAPE_EXPORT_RECEIPT` and `BARGE_TAPE_EXPORT_SHA256`.
 //!
 //! The produced executable under the managed target directory is the one a
 //! window invokes; its digest and the toolchain are the orchestrator's to
@@ -233,10 +235,32 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     }
-    match tape_harness::run(
+    let binding = std::env::var_os("BARGE_TAPE_EXPORT_RECEIPT")
+        .ok_or_else(|| "BARGE_TAPE_EXPORT_RECEIPT is required".to_owned())
+        .and_then(|path| {
+            let expected = std::env::var("BARGE_TAPE_EXPORT_SHA256")
+                .map_err(|_| "BARGE_TAPE_EXPORT_SHA256 is required".to_owned())?;
+            tape_harness::verify_export(std::path::Path::new(&path), &expected)
+        });
+    let binding = match binding {
+        Ok(binding) => binding,
+        Err(reason) => {
+            if let Err(error) = tape_harness::write_apparatus_refusal(
+                &invocation.transcript_out,
+                Some(&manifest_bytes),
+                &reason,
+            ) {
+                eprintln!("barge.tape.harness/1: {error}");
+            }
+            eprintln!("barge.tape.harness/1: {reason}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    match tape_harness::run_bound(
         &manifest_bytes,
         &invocation.fixture_root,
         &invocation.transcript_out,
+        &binding,
     ) {
         Ok(summary) => std::process::ExitCode::from(summary.exit_code),
         Err(reason) => {

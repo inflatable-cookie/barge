@@ -44,14 +44,14 @@
 //! The orchestrator stages this exact commit's tree, builds the harness
 //! offline from the committed `Cargo.lock` with default features only — no
 //! feature is enabled, and the proof feature must stay off — through a
-//! locked Effigy build-only selector under the pinned toolchain 1.97.1. A
-//! verified export and binding are still missing. The orchestrator invokes the executable with the argv
+//! locked Effigy build-only selector under the pinned toolchain 1.97.1. The
+//! provisional export receipt is checked before a window. The orchestrator invokes the executable with the argv
 //! contract `--fixture-root --manifest --transcript-out --case`. The binary
-//! digests, toolchain version and lockfile digest are the orchestrator's to
-//! verify before any window; nothing here reads the live pool, root,
+//! receipt digest must be supplied independently; nothing here reads the live pool, root,
 //! registry or account.
 
 use std::path::{Path, PathBuf};
+use std::os::unix::ffi::OsStrExt;
 
 use crate::area::{AreaDeclaration, PrunePolicy, ReserveParticipation};
 use crate::error::{Error, ErrorKind};
@@ -193,6 +193,86 @@ pub(crate) struct RunSummary {
     pub(crate) caps: (usize, usize, u32, usize),
 }
 
+/// Check the export receipt and its actual source and executable bytes before
+/// opening the observation window. The orchestrator independently supplies the
+/// expected receipt digest; a receipt beside a substituted binary is not trust.
+pub(crate) fn verify_export(receipt: &Path, expected: &str) -> Result<String, String> {
+    fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        let file = std::fs::File::open(path).map_err(|e| format!("cannot open binding input: {e}"))?;
+        let mut bytes = Vec::new();
+        file.take(limit + 1).read_to_end(&mut bytes)
+            .map_err(|e| format!("cannot read binding input: {e}"))?;
+        if bytes.len() as u64 > limit { return Err("binding input exceeds its bound".to_owned()); }
+        Ok(bytes)
+    }
+    fn hex(value: &str, len: usize) -> bool {
+        value.len() == len && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+    fn field<'a>(value: &'a serde_json::Value, key: &str, len: usize) -> Result<&'a str, String> {
+        let text = value.get(key).and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("export binding lacks {key}"))?;
+        if !hex(text, len) { return Err(format!("invalid {key}")); }
+        Ok(text)
+    }
+    if !hex(expected, 64) { return Err("invalid expected receipt digest".to_owned()); }
+    let bytes = read_bounded(receipt, 8 * 1024 * 1024)?;
+    if crate::digest::sha256_hex(&bytes) != expected {
+        return Err("export receipt digest or size mismatch".to_owned());
+    }
+    let doc: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("invalid export receipt: {e}"))?;
+    if doc["schema"] != "barge.tape.export/1" { return Err("invalid export schema".to_owned()); }
+    field(&doc, "commit", 40)?;
+    field(&doc, "tree", 40)?;
+    let executable = field(&doc, "executable_sha256", 64)?;
+    let lock = field(&doc, "lock_sha256", 64)?;
+    let toolchain = field(&doc, "toolchain_sha256", 64)?;
+    field(&doc, "rustc_sha256", 64)?;
+    field(&doc, "oxide_sha256", 64)?;
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate executable: {e}"))?;
+    let exe_bytes = read_bounded(&exe, 256 * 1024 * 1024)?;
+    if crate::digest::sha256_hex(&exe_bytes) != executable { return Err("executable digest mismatch".to_owned()); }
+    let root = receipt.parent().ok_or_else(|| "receipt has no parent".to_owned())?.join("source");
+    let root_meta = std::fs::symlink_metadata(&root)
+        .map_err(|e| format!("cannot inspect source root: {e}"))?;
+    if !root_meta.is_dir() || root_meta.file_type().is_symlink() {
+        return Err("source root is not a directory".to_owned());
+    }
+    let files = doc["files"].as_object().ok_or_else(|| "missing source files".to_owned())?;
+    if files.is_empty() { return Err("empty source inventory".to_owned()); }
+    for (name, record) in files {
+        let rel = Path::new(name);
+        if rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            return Err("invalid source path".to_owned());
+        }
+        let mut path = root.clone();
+        let mut components = rel.components().peekable();
+        while let Some(component) = components.next() {
+            path.push(component.as_os_str());
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("source {name}: {e}"))?;
+            if components.peek().is_some() && (!meta.is_dir() || meta.file_type().is_symlink()) {
+                return Err(format!("source parent is not a directory: {name}"));
+            }
+        }
+        let kind = record["kind"].as_str().ok_or_else(|| "missing source kind".to_owned())?;
+        let expected_file = field(record, "sha256", 64)?;
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("source {name}: {e}"))?;
+        let content = match kind {
+            "file" if meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= 64 * 1024 * 1024 =>
+                read_bounded(&path, 64 * 1024 * 1024)?,
+            "symlink" if meta.file_type().is_symlink() => std::fs::read_link(&path)
+                .map_err(|e| format!("source {name}: {e}"))?.as_os_str().as_bytes().to_vec(),
+            _ => return Err(format!("source kind or size mismatch: {name}")),
+        };
+        if crate::digest::sha256_hex(&content) != expected_file { return Err(format!("source digest mismatch: {name}")); }
+    }
+    if files.get("Cargo.lock").and_then(|v| v["sha256"].as_str()) != Some(lock)
+        || files.get("rust-toolchain.toml").and_then(|v| v["sha256"].as_str()) != Some(toolchain) {
+        return Err("lockfile or toolchain binding mismatch".to_owned());
+    }
+    Ok(format!("sha256:{expected}"))
+}
+
 /// Run one window: open the tape, call the actual `release::plan` with the
 /// real platform object, and always write the transcript. Returns the
 /// summary and the exit code.
@@ -200,6 +280,17 @@ pub(crate) fn run(
     manifest_bytes: &[u8],
     fixture_root: &Path,
     transcript_out: &Path,
+) -> Result<RunSummary, String> {
+    run_bound(manifest_bytes, fixture_root, transcript_out, "embedded-unverified")
+}
+
+/// Run a window with the externally checked export binding. The embedded
+/// exercise deliberately uses an unverified label and cannot qualify export.
+pub(crate) fn run_bound(
+    manifest_bytes: &[u8],
+    fixture_root: &Path,
+    transcript_out: &Path,
+    source_binding: &str,
 ) -> Result<RunSummary, String> {
     let request = match parse_manifest(manifest_bytes) {
         Ok(request) => request,
@@ -227,7 +318,7 @@ pub(crate) fn run(
         case: request.case.clone(),
         manifest_sha256,
         entrypoint_symbol: "barge::release::plan",
-        source_binding: staged_binding(),
+        source_binding: source_binding.to_owned(),
     }) {
         let reason = format!("the tape window cannot open: {error}");
         write_apparatus_refusal(transcript_out, Some(manifest_bytes), &reason)?;
@@ -330,16 +421,6 @@ pub(crate) fn run(
         }
     };
     Ok(summary)
-}
-
-/// A provisional label only; it is not a source or executable attestation.
-/// The window remains observation-incomplete until independently bound.
-fn staged_binding() -> String {
-    format!(
-        "unverified: barge {} at {}",
-        env!("CARGO_PKG_VERSION"),
-        env!("CARGO_MANIFEST_DIR")
-    )
 }
 
 /// Write a bounded provisional protocol document when no engine ran. Hashing
@@ -759,6 +840,50 @@ mod tests {
         assert_eq!(document["outcome"]["status"], "apparatus_refused");
         assert_eq!(document["engine_ran"], false);
         assert_eq!(document["observation_complete"], false);
+    }
+
+    #[test]
+    fn export_binding_refuses_missing_and_mismatched_receipts() {
+        let fixture = crate::testkit::TempDir::new("tape-export-binding");
+        let receipt = fixture.path().join("export.json");
+        assert!(verify_export(&receipt, &"0".repeat(64)).is_err());
+        std::fs::write(&receipt, b"{}").expect("receipt fixture");
+        assert!(verify_export(&receipt, &"0".repeat(64)).is_err());
+        assert!(verify_export(&receipt, &crate::digest::sha256_hex(b"{}")).is_err());
+    }
+
+    #[test]
+    fn export_binding_checks_source_and_running_executable() {
+        let fixture = crate::testkit::TempDir::new("tape-export-source");
+        let source = fixture.path().join("source");
+        std::fs::create_dir(&source).expect("source fixture");
+        std::fs::write(source.join("Cargo.lock"), b"lock").expect("lock");
+        std::fs::write(source.join("rust-toolchain.toml"), b"toolchain").expect("toolchain");
+        let lock = crate::digest::sha256_hex(b"lock");
+        let toolchain = crate::digest::sha256_hex(b"toolchain");
+        let exe = std::fs::read(std::env::current_exe().expect("executable path"))
+            .expect("executable bytes");
+        let mut doc = serde_json::json!({
+            "schema": "barge.tape.export/1", "commit": "a".repeat(40),
+            "tree": "b".repeat(40), "executable_sha256": crate::digest::sha256_hex(&exe),
+            "lock_sha256": lock, "toolchain_sha256": toolchain,
+            "rustc_sha256": "c".repeat(64), "oxide_sha256": "d".repeat(64),
+            "files": {
+                "Cargo.lock": {"kind": "file", "sha256": lock},
+                "rust-toolchain.toml": {"kind": "file", "sha256": toolchain}
+            }
+        });
+        let receipt = fixture.path().join("export.json");
+        let bytes = serde_json::to_vec(&doc).expect("receipt JSON");
+        std::fs::write(&receipt, &bytes).expect("receipt");
+        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes)).is_ok());
+        std::fs::write(source.join("Cargo.lock"), b"changed").expect("changed source");
+        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes)).is_err());
+        std::fs::write(source.join("Cargo.lock"), b"lock").expect("restored source");
+        doc["executable_sha256"] = "0".repeat(64).into();
+        let changed = serde_json::to_vec(&doc).expect("changed receipt JSON");
+        std::fs::write(&receipt, &changed).expect("changed receipt");
+        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&changed)).is_err());
     }
 
     #[test]
