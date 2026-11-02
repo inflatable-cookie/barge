@@ -16,8 +16,8 @@
 //! engine, the case and the manifest digest it is bound to, the entrypoint
 //! identity, the engine's own result or refusal, the effect rows (empty for the
 //! read-only plan, which is the STATIC effect set), the read rows and the clock
-//! rows. Identity fields contain only available observations; every row and
-//! window is explicitly unproven until source coverage and binding are audited. An outcome is a bytes digest, an
+//! rows. Identity fields contain only available observations. Rows without
+//! audited identity binding remain unproven, and the window remains incomplete. An outcome is a bytes digest, an
 //! explicit absent, a listed count, or a refusal class — never a defaulted
 //! verdict.
 //!
@@ -313,8 +313,7 @@ pub(crate) struct ReadRow {
     site: &'static str,
     identity: Identity,
     outcome: Outcome,
-    // Until each source is audited and bound to its actual parent and object,
-    // no row is eligible as a positive mandatory obligation.
+    // Whether this row has the identity required for its observation family.
     observation_proven: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     cap: Option<u64>,
@@ -328,6 +327,7 @@ pub(crate) struct ReadRow {
 pub(crate) struct EffectRow {
     kind: &'static str,
     path: String,
+    outcome: Option<String>,
     epoch: u64,
 }
 
@@ -461,6 +461,19 @@ impl Tape {
 
 thread_local! {
     static TAPE: RefCell<Tape> = RefCell::new(Tape::empty());
+    static PROCESS_CONTEXT: RefCell<Option<(u32, u64, Option<u32>)>> = const { RefCell::new(None) };
+}
+
+/// Bind subsequent descriptor observations to the evaluator's existing identity.
+pub(crate) fn process_context(pid: u32, start: u64, uid: Option<u32>) {
+    PROCESS_CONTEXT.with(|slot| *slot.borrow_mut() = Some((pid, start, uid)));
+}
+
+fn process_identity(pid: u32, fd: Option<i32>) -> Identity {
+    PROCESS_CONTEXT.with(|slot| match *slot.borrow() {
+        Some((bound_pid, start, uid)) if bound_pid == pid => Identity::process(pid, start, uid, fd),
+        _ => Identity::unidentified_process(pid, fd),
+    })
 }
 
 /// Open this thread's window. A window that is already open is refused: one
@@ -471,6 +484,7 @@ pub(crate) fn begin_window(config: WindowConfig) -> Result<(), String> {
         if tape.config.is_some() {
             return Err("a tape window is already open on this thread".to_owned());
         }
+        PROCESS_CONTEXT.with(|slot| *slot.borrow_mut() = None);
         tape.config = Some(config);
         Ok(())
     })
@@ -584,17 +598,34 @@ fn record(
         if kind == "process-row" {
             tape.process_rows = tape.process_rows.saturating_add(1);
         }
+        let observation_proven = observation_proven(kind, &identity, &outcome);
         tape.reads.push(ReadRow {
             kind,
             site,
             identity,
             outcome,
-            observation_proven: false,
+            observation_proven,
             cap,
             epoch,
             occurrence,
         });
     });
+}
+
+/// Only families with an explicit, observed identity can satisfy an obligation.
+/// Unknown families stay unproven until their source sites have been audited.
+fn observation_proven(kind: &str, identity: &Identity, outcome: &Outcome) -> bool {
+    if matches!(outcome, Outcome::Refused { .. }) {
+        return false;
+    }
+    match kind {
+        "process-row" | "platform-status" => {
+            identity.pid.is_some() && identity.start.is_some() && identity.uid.is_some()
+        }
+        "uid" | "boot" => matches!(outcome, Outcome::Answer { .. }),
+        "process-table" => matches!(outcome, Outcome::Listed { truncated: false, .. }),
+        _ => false,
+    }
 }
 
 /// Record one clock reading on this thread's window.
@@ -627,8 +658,21 @@ fn effect(kind: &'static str, path: &Path) {
         tape.effects.push(EffectRow {
             kind,
             path: path.display().to_string(),
+            outcome: None,
             epoch,
         });
+    });
+}
+
+/// Bind the syscall result to its existing attempt row, without a second effect.
+pub(crate) fn effect_outcome(kind: &str, path: &Path, error: Option<&std::io::Error>) {
+    TAPE.with(|tape| {
+        let mut tape = tape.borrow_mut();
+        if let Some(row) = tape.effects.iter_mut().rev().find(|row| {
+            row.kind == kind && row.path == path.display().to_string() && row.outcome.is_none()
+        }) {
+            row.outcome = Some(error.map_or_else(|| "succeeded".to_owned(), errno_class));
+        }
     });
 }
 
@@ -836,13 +880,9 @@ pub(crate) fn process_table(site: &'static str, outcome: Outcome) {
 
 /// Record one per-pid descriptor listing.
 pub(crate) fn fd_list(site: &'static str, pid: u32, outcome: Outcome) {
-    record(
-        "fd-list",
-        site,
-        Identity::unidentified_process(pid, None),
-        outcome,
-        None,
-    );
+    let identity = process_identity(pid, None);
+    PROCESS_CONTEXT.with(|slot| *slot.borrow_mut() = None);
+    record("fd-list", site, identity, outcome, None);
 }
 
 /// Record one per-descriptor vnode answer: `which` is `vnode-path` or
@@ -855,7 +895,10 @@ pub(crate) fn vnode(
     outcome: Outcome,
     path: Option<String>,
 ) {
-    let mut identity = Identity::unidentified_process(pid, Some(fd));
+    let mut identity = process_identity(pid, Some(fd));
+    if which == "vnode-facts" {
+        PROCESS_CONTEXT.with(|slot| *slot.borrow_mut() = None);
+    }
     identity.path = path;
     record(which, site, identity, outcome, None);
 }
@@ -873,7 +916,9 @@ pub(crate) fn platform(site: &'static str, pid: u32, start: u64, uid: Option<u32
 
 /// Record a platform observation whose process identity was not bound.
 pub(crate) fn platform_unidentified(site: &'static str, pid: u32, answer: &str) {
-    record("platform-status", site, Identity::unidentified_process(pid, None), Outcome::answer(answer), None);
+    let identity = process_identity(pid, None);
+    PROCESS_CONTEXT.with(|slot| *slot.borrow_mut() = None);
+    record("platform-status", site, identity, Outcome::answer(answer), None);
 }
 
 /// Record a scalar fact: the effective uid, the boot identity, a start.
@@ -1294,6 +1339,23 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_context_is_bound_to_the_observed_pid_and_consumed() {
+        let transcript = window(|| {
+            process_context(42, 123, Some(501));
+            fd_list("list", 42, Outcome::listed(1, 1, false));
+            fd_list("list", 42, Outcome::listed(0, 0, false));
+            process_context(42, 124, Some(501));
+            vnode("vnode", 43, 5, "vnode-facts", Outcome::answer("readable"), None);
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        assert_eq!(document["reads"][0]["identity"]["start"], 123);
+        assert_eq!(document["reads"][0]["observation_proven"], false);
+        assert!(document["reads"][1]["identity"].get("start").is_none());
+        assert_eq!(document["reads"][1]["observation_proven"], false);
+        assert!(document["reads"][2]["identity"].get("start").is_none());
+    }
+
+    #[test]
     fn platform_row_preserves_observed_process_identity() {
         let transcript = window(|| platform("platform", 42, 100, Some(501), "platform_binary"));
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
@@ -1301,7 +1363,22 @@ mod tests {
         assert_eq!(row["identity"]["pid"], 42);
         assert_eq!(row["identity"]["start"], 100);
         assert_eq!(row["identity"]["uid"], 501);
-        assert_eq!(row["observation_proven"], false);
+        assert_eq!(row["observation_proven"], true);
+    }
+
+    #[test]
+    fn effect_outcome_uses_captured_error_after_errno_changes() {
+        let transcript = window(|| {
+            write_effect("mkdir_attempt", Path::new("child"));
+            let captured = std::io::Error::from_raw_os_error(libc::EACCES);
+            #[cfg(target_os = "macos")]
+            // SAFETY: __error points to this thread's writable errno cell.
+            unsafe { *libc::__error() = libc::ENOENT; }
+            effect_outcome("mkdir_attempt", Path::new("child"), Some(&captured));
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        assert_eq!(document["effects"].as_array().map(Vec::len), Some(1));
+        assert_eq!(document["effects"][0]["outcome"], "EACCES");
     }
 
     #[test]

@@ -1373,6 +1373,8 @@ impl MacOs {
                 ),
             });
         }
+        #[cfg(test)]
+        crate::tape::process_context(pid, before.identity.start, before.identity.effective_uid);
         let status = code_signing_status(pid)?;
         let Some(after) = kinfo_process(pid)? else {
             #[cfg(test)]
@@ -1469,6 +1471,8 @@ impl MacOs {
             resolution: RetryResolution::Unreadable,
         };
         loop {
+            #[cfg(test)]
+            crate::tape::process_context(pid, start, Some(uid));
             let listing = match stated_errno(faults, pid) {
                 Some(errno) => DescriptorListing::from_errno(errno),
                 None => self.list_descriptors(pid),
@@ -1645,6 +1649,8 @@ impl MacOs {
         backoffs: &[Duration],
         faults: &mut [StatedListing],
     ) -> Observed {
+        #[cfg(test)]
+        crate::tape::process_context(identity.pid, identity.start, identity.effective_uid);
         let stated = stated_vnode_read(faults, identity.pid, vnode_index);
         match read_descriptor(identity.pid, descriptor, stated) {
             Ok(DescriptorReading::Path(path)) => Observed::Path(path),
@@ -1732,6 +1738,8 @@ impl MacOs {
                 Ok(Some(())) => {}
                 Err(reason) => return Observed::Unreadable(reason),
             }
+            #[cfg(test)]
+            crate::tape::process_context(pid, classified.start, classified.effective_uid);
             let stated = stated_vnode_read(faults, pid, vnode_index);
             let mut reading = match read_descriptor(pid, descriptor, stated) {
                 Ok(reading) => reading,
@@ -1987,6 +1995,8 @@ impl MacOs {
                 "when the dead descriptor was re-observed",
             ));
         }
+        #[cfg(test)]
+        crate::tape::process_context(pid, before.identity.start, before.identity.effective_uid);
         let stated = stated_vnode_read(faults, pid, vnode_index);
         let reading = read_descriptor(pid, descriptor, stated);
         // A failed observation is never discarded, and never settled by a process
@@ -3793,12 +3803,22 @@ impl DirOps for MacOs {
         // SAFETY: `directory` is open for this call, `raw` is one NUL-terminated
         // component, and `mode` is passed with the default argument promotion a
         // variadic C function expects.
+        #[cfg(not(test))]
         if unsafe { libc::mkdirat(directory, raw.as_ptr(), mode as libc::mode_t) } != 0 {
             return Err(child_error(
                 name,
                 "cannot create the child directory",
                 io::Error::last_os_error(),
             ));
+        }
+        #[cfg(test)]
+        {
+            let answer = unsafe { libc::mkdirat(directory, raw.as_ptr(), mode as libc::mode_t) };
+            let error = (answer != 0).then(io::Error::last_os_error);
+            crate::tape::effect_outcome("mkdir_attempt", Path::new(name), error.as_ref());
+            if let Some(error) = error {
+                return Err(child_error(name, "cannot create the child directory", error));
+            }
         }
         Ok(self.open_child_dir(parent, name)?.identity())
     }
@@ -3816,7 +3836,7 @@ impl DirOps for MacOs {
         let temporary = format!(".barge-tmp-{}-{sequence}", std::process::id());
         let temporary_raw = name_cstring(&temporary)?;
         #[cfg(test)]
-        crate::tape::write_effect("publish_attempt", Path::new(name));
+        crate::tape::write_effect("publish_attempt", Path::new(&temporary));
         // SAFETY: `directory` is open, `temporary_raw` is one NUL-terminated
         // component, the flags are libc's own constants and the variadic mode is
         // passed with the promotion C expects. The result is either -1 or a
@@ -3829,6 +3849,7 @@ impl DirOps for MacOs {
                 mode as libc::c_int,
             )
         };
+        #[cfg(not(test))]
         if descriptor < 0 {
             return Err(child_error(
                 name,
@@ -3836,16 +3857,43 @@ impl DirOps for MacOs {
                 io::Error::last_os_error(),
             ));
         }
+        #[cfg(test)]
+        {
+            let error = (descriptor < 0).then(io::Error::last_os_error);
+            crate::tape::effect_outcome("publish_attempt", Path::new(&temporary), error.as_ref());
+            if let Some(error) = error {
+                return Err(child_error(name, "cannot create a temporary file", error));
+            }
+        }
         // SAFETY: `descriptor` is a fresh non-negative descriptor from `openat`
         // and no other owner exists, so `File` may take ownership of it.
         let mut file = unsafe { File::from_raw_fd(descriptor) };
         let published = (|| -> Result<()> {
+            #[cfg(not(test))]
             file.write_all(bytes)
                 .map_err(|error| child_error(name, "cannot write the temporary file", error))?;
+            #[cfg(test)]
+            {
+                crate::tape::write_effect("publish_write_attempt", Path::new(&temporary));
+                let result = file.write_all(bytes);
+                crate::tape::effect_outcome("publish_write_attempt", Path::new(&temporary), result.as_ref().err());
+                result.map_err(|error| child_error(name, "cannot write the temporary file", error))?;
+            }
+            #[cfg(not(test))]
             file.sync_all()
                 .map_err(|error| child_error(name, "cannot sync the temporary file", error))?;
+            #[cfg(test)]
+            {
+                crate::tape::write_effect("publish_sync_attempt", Path::new(&temporary));
+                let result = file.sync_all();
+                crate::tape::effect_outcome("publish_sync_attempt", Path::new(&temporary), result.as_ref().err());
+                result.map_err(|error| child_error(name, "cannot sync the temporary file", error))?;
+            }
             // SAFETY: both names are NUL-terminated components inside the same
             // open directory, which is what makes the rename atomic.
+            #[cfg(test)]
+            crate::tape::write_effect("publish_rename_attempt", Path::new(name));
+            #[cfg(not(test))]
             if unsafe {
                 libc::renameat(
                     directory,
@@ -3861,7 +3909,19 @@ impl DirOps for MacOs {
                     io::Error::last_os_error(),
                 ));
             }
+            #[cfg(test)]
+            {
+                let answer = unsafe {
+                    libc::renameat(directory, temporary_raw.as_ptr(), directory, target.as_ptr())
+                };
+                let error = (answer != 0).then(io::Error::last_os_error);
+                crate::tape::effect_outcome("publish_rename_attempt", Path::new(name), error.as_ref());
+                if let Some(error) = error {
+                    return Err(child_error(name, "cannot publish the file", error));
+                }
+            }
             // SAFETY: `directory` is the open directory the rename happened in.
+            #[cfg(not(test))]
             if unsafe { libc::fsync(directory) } != 0 {
                 return Err(child_error(
                     name,
@@ -3869,14 +3929,32 @@ impl DirOps for MacOs {
                     io::Error::last_os_error(),
                 ));
             }
+            #[cfg(test)]
+            {
+                crate::tape::write_effect("publish_dir_sync_attempt", Path::new(name));
+                let answer = unsafe { libc::fsync(directory) };
+                let error = (answer != 0).then(io::Error::last_os_error);
+                crate::tape::effect_outcome("publish_dir_sync_attempt", Path::new(name), error.as_ref());
+                if let Some(error) = error {
+                    return Err(child_error(name, "cannot sync the directory", error));
+                }
+            }
             Ok(())
         })();
         if published.is_err() {
             // Best effort: a leftover temporary file is never read as the
             // target, and reporting the original failure matters more.
             // SAFETY: `temporary_raw` names the file this call created.
+            #[cfg(not(test))]
             unsafe {
                 libc::unlinkat(directory, temporary_raw.as_ptr(), 0);
+            }
+            #[cfg(test)]
+            {
+                crate::tape::write_effect("publish_cleanup_attempt", Path::new(&temporary));
+                let answer = unsafe { libc::unlinkat(directory, temporary_raw.as_ptr(), 0) };
+                let error = (answer != 0).then(io::Error::last_os_error);
+                crate::tape::effect_outcome("publish_cleanup_attempt", Path::new(&temporary), error.as_ref());
             }
         }
         published
@@ -4203,9 +4281,13 @@ impl DirOps for MacOs {
         // component and `flags` is either zero or libc's own directory flag, so
         // no symbolic link at the leaf is ever followed.
         if unsafe { libc::unlinkat(directory, raw.as_ptr(), flags) } == 0 {
+            #[cfg(test)]
+            crate::tape::effect_outcome("unlink_attempt", Path::new(name), None);
             return Ok(ChildRemoval::Removed);
         }
         let error = io::Error::last_os_error();
+        #[cfg(test)]
+        crate::tape::effect_outcome("unlink_attempt", Path::new(name), Some(&error));
         match error.raw_os_error() {
             Some(libc::ENOENT) => Ok(ChildRemoval::Absent),
             Some(libc::ENOTEMPTY | libc::EEXIST) => Ok(ChildRemoval::NotEmpty),
@@ -4233,9 +4315,13 @@ impl DirOps for MacOs {
             )
         } == 0
         {
+            #[cfg(test)]
+            crate::tape::effect_outcome("rename_attempt", Path::new(from), None);
             return Ok(RenameOutcome::Renamed);
         }
         let error = io::Error::last_os_error();
+        #[cfg(test)]
+        crate::tape::effect_outcome("rename_attempt", Path::new(from), Some(&error));
         if error.raw_os_error() == Some(libc::EEXIST) {
             // The target name is taken. Nothing was renamed, so the caller
             // decides: a capture retries with a fresh private name, and a

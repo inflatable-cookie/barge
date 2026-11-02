@@ -165,8 +165,11 @@ a deletion, a custody conclusion or a live Builds comparison.
 
 ## Observation identity limits
 
-The current provisional transcript marks observations unproven and the window
-incomplete independently of the engine result. It cannot satisfy mandatory
+The provisional transcript marks individual observations according to their
+available identity; the window remains incomplete independently of the engine
+result. Fully identified process rows and scalar uid, boot and process-table
+observations can be marked proven; refused rows and families without audited
+identity rules remain unproven. It cannot satisfy mandatory
 coverage or establish parity. Path observations do not infer a parent with a
 later filesystem lookup. Handle listings and descriptor facts carry the device
 and inode actually supplied by the handle or descriptor; a pathname and parent
@@ -183,5 +186,11 @@ later stat or a lexical path. A separately reviewed change would need to carry
 an already opened parent descriptor and its identity through these existing
 operations, binding each child observation to that descriptor and recording
 its actual result, without a second lookup; no such change is authorized here.
-Process leaf identity and write-effect coverage also remain incomplete. The
+Tom's decision d2c34987 scopes parent-descriptor instrumentation to separate,
+independently reviewed work. Descriptor leaf rows carry the evaluator's most recent classified process
+identity where available, but remain unproven: the retry path can switch process
+start identities while the caller retains its original classification. The
+write-side recorder captures attempts and outcomes for the four reviewed
+DirOps verbs, including publish writes, syncs, rename and cleanup. Effect parent
+identities and the remaining reached write sites still require a source audit. The
 source-count test is not a complete inventory or a compile-away proof.
