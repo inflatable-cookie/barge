@@ -206,7 +206,7 @@ pub(crate) struct RunSummary {
 /// Check the export receipt and its actual source and executable bytes before
 /// opening the observation window. The orchestrator independently supplies the
 /// expected receipt digest; a receipt beside a substituted binary is not trust.
-pub(crate) fn verify_export(receipt: &Path, expected: &str) -> Result<String, String> {
+pub(crate) fn verify_export(receipt: &Path, expected: &str, expected_closure: &str) -> Result<String, String> {
     fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
         use std::io::Read;
         let file = std::fs::File::open(path).map_err(|e| format!("cannot open binding input: {e}"))?;
@@ -226,12 +226,29 @@ pub(crate) fn verify_export(receipt: &Path, expected: &str) -> Result<String, St
         Ok(text)
     }
     if !hex(expected, 64) { return Err("invalid expected receipt digest".to_owned()); }
+    if !hex(expected_closure, 64) { return Err("invalid expected closure digest".to_owned()); }
     let bytes = read_bounded(receipt, 8 * 1024 * 1024)?;
     if crate::digest::sha256_hex(&bytes) != expected {
         return Err("export receipt digest or size mismatch".to_owned());
     }
     let doc: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("invalid export receipt: {e}"))?;
     if doc["schema"] != "barge.tape.export/1" { return Err("invalid export schema".to_owned()); }
+    let closure_path = receipt.parent().ok_or_else(|| "receipt has no parent".to_owned())?.join("export-closure.json");
+    let closure_bytes = read_bounded(&closure_path, 1024 * 1024)?;
+    if crate::digest::sha256_hex(&closure_bytes) != expected_closure {
+        return Err("export closure digest mismatch".to_owned());
+    }
+    let closure: serde_json::Value = serde_json::from_slice(&closure_bytes)
+        .map_err(|e| format!("invalid export closure: {e}"))?;
+    if closure["schema"] != "barge.tape.export-closure/1"
+        || closure["status"] != "passed"
+        || closure["scope"] != "live-inventory-comparison-only"
+        || closure["receipt_sha256"] != expected
+        || closure["live_before_sha256"] != closure["live_after_sha256"]
+    {
+        return Err("export closure is incomplete or disagrees".to_owned());
+    }
+    field(&closure, "live_before_sha256", 64)?;
     field(&doc, "commit", 40)?;
     field(&doc, "tree", 40)?;
     let executable = field(&doc, "executable_sha256", 64)?;
@@ -255,6 +272,10 @@ pub(crate) fn verify_export(receipt: &Path, expected: &str) -> Result<String, St
     }
     let files = doc["files"].as_object().ok_or_else(|| "missing source files".to_owned())?;
     if files.is_empty() { return Err("empty source inventory".to_owned()); }
+    if files.get("scripts/tape/private-wrapper.py").and_then(|v| v["sha256"].as_str())
+        != Some(field(&closure, "wrapper_sha256", 64)?) {
+        return Err("export closure names a different wrapper".to_owned());
+    }
     let mut expected_files = std::collections::BTreeSet::new();
     let mut expected_dirs = std::collections::BTreeSet::new();
     for (name, record) in files {
@@ -987,10 +1008,10 @@ mod tests {
     fn export_binding_refuses_missing_and_mismatched_receipts() {
         let fixture = crate::testkit::TempDir::new("tape-export-binding");
         let receipt = fixture.path().join("export.json");
-        assert!(verify_export(&receipt, &"0".repeat(64)).is_err());
+        assert!(verify_export(&receipt, &"0".repeat(64), &"0".repeat(64)).is_err());
         std::fs::write(&receipt, b"{}").expect("receipt fixture");
-        assert!(verify_export(&receipt, &"0".repeat(64)).is_err());
-        assert!(verify_export(&receipt, &crate::digest::sha256_hex(b"{}")).is_err());
+        assert!(verify_export(&receipt, &"0".repeat(64), &"0".repeat(64)).is_err());
+        assert!(verify_export(&receipt, &crate::digest::sha256_hex(b"{}"), &"0".repeat(64)).is_err());
     }
 
     #[test]
@@ -1000,6 +1021,9 @@ mod tests {
         std::fs::create_dir(&source).expect("source fixture");
         std::fs::write(source.join("Cargo.lock"), b"lock").expect("lock");
         std::fs::write(source.join("rust-toolchain.toml"), b"toolchain").expect("toolchain");
+        std::fs::create_dir_all(source.join("scripts/tape")).expect("wrapper directory");
+        std::fs::write(source.join("scripts/tape/private-wrapper.py"), b"wrapper").expect("wrapper");
+        let wrapper = crate::digest::sha256_hex(b"wrapper");
         let lock = crate::digest::sha256_hex(b"lock");
         let toolchain = crate::digest::sha256_hex(b"toolchain");
         let exe = std::fs::read(std::env::current_exe().expect("executable path"))
@@ -1012,30 +1036,45 @@ mod tests {
             "oxide_sha256": "d".repeat(64),
             "files": {
                 "Cargo.lock": {"kind": "file", "sha256": lock, "executable": false},
-                "rust-toolchain.toml": {"kind": "file", "sha256": toolchain, "executable": false}
+                "rust-toolchain.toml": {"kind": "file", "sha256": toolchain, "executable": false},
+                "scripts/tape/private-wrapper.py": {"kind": "file", "sha256": wrapper, "executable": false}
             }
         });
         let receipt = fixture.path().join("export.json");
         let bytes = serde_json::to_vec(&doc).expect("receipt JSON");
         std::fs::write(&receipt, &bytes).expect("receipt");
-        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes)).is_ok());
+        let closure_path = fixture.path().join("export-closure.json");
+        let mut closure = serde_json::json!({
+            "schema": "barge.tape.export-closure/1", "status": "passed",
+            "scope": "live-inventory-comparison-only",
+            "receipt_sha256": crate::digest::sha256_hex(&bytes), "wrapper_sha256": wrapper,
+            "live_before_sha256": "e".repeat(64), "live_after_sha256": "e".repeat(64)
+        });
+        let closure_bytes = serde_json::to_vec(&closure).expect("closure JSON");
+        std::fs::write(&closure_path, &closure_bytes).expect("closure");
+        let closure_digest = crate::digest::sha256_hex(&closure_bytes);
+        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes), &closure_digest).is_ok());
+        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes), &"0".repeat(64)).is_err());
         let lock_path = source.join("Cargo.lock");
         let original_permissions = std::fs::metadata(&lock_path).expect("lock metadata").permissions();
         let mut executable_permissions = original_permissions.clone();
         executable_permissions.set_mode(original_permissions.mode() | 0o100);
         std::fs::set_permissions(&lock_path, executable_permissions).expect("change fixture mode");
-        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes)).is_err());
+        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes), &closure_digest).is_err());
         std::fs::set_permissions(&lock_path, original_permissions).expect("restore fixture mode");
         std::fs::write(source.join("unexpected"), b"extra").expect("extra source");
-        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes)).is_err());
+        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes), &closure_digest).is_err());
         std::fs::remove_file(source.join("unexpected")).expect("remove fixture file");
         std::fs::write(source.join("Cargo.lock"), b"changed").expect("changed source");
-        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes)).is_err());
+        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&bytes), &closure_digest).is_err());
         std::fs::write(source.join("Cargo.lock"), b"lock").expect("restored source");
         doc["executable_sha256"] = "0".repeat(64).into();
         let changed = serde_json::to_vec(&doc).expect("changed receipt JSON");
         std::fs::write(&receipt, &changed).expect("changed receipt");
-        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&changed)).is_err());
+        closure["receipt_sha256"] = crate::digest::sha256_hex(&changed).into();
+        let changed_closure = serde_json::to_vec(&closure).expect("changed closure");
+        std::fs::write(&closure_path, &changed_closure).expect("changed closure file");
+        assert!(verify_export(&receipt, &crate::digest::sha256_hex(&changed), &crate::digest::sha256_hex(&changed_closure)).is_err());
     }
 
     #[test]

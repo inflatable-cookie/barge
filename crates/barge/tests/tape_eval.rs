@@ -60,7 +60,8 @@
 //! `effigy rust:test:tape-stage` declares the locked default-feature build.
 //! The provisional exporter records source and executable hashes, and an
 //! external invocation must supply the receipt and its independently verified
-//! digest in `BARGE_TAPE_EXPORT_RECEIPT` and `BARGE_TAPE_EXPORT_SHA256`.
+//! digest in `BARGE_TAPE_EXPORT_RECEIPT` and `BARGE_TAPE_EXPORT_SHA256`, plus
+//! the independently supplied `BARGE_TAPE_EXPORT_CLOSURE_SHA256`.
 //!
 //! The produced executable under the managed target directory is the one a
 //! window invokes; its digest and the toolchain are the orchestrator's to
@@ -267,8 +268,10 @@ fn main() -> std::process::ExitCode {
         .and_then(|path| {
             let expected = std::env::var("BARGE_TAPE_EXPORT_SHA256")
                 .map_err(|_| "BARGE_TAPE_EXPORT_SHA256 is required".to_owned())?;
+            let expected_closure = std::env::var("BARGE_TAPE_EXPORT_CLOSURE_SHA256")
+                .map_err(|_| "BARGE_TAPE_EXPORT_CLOSURE_SHA256 is required".to_owned())?;
             let receipt = std::path::Path::new(&path);
-            let binding = tape_harness::verify_export(receipt, &expected)?;
+            let binding = tape_harness::verify_export(receipt, &expected, &expected_closure)?;
             tape_harness::verify_manifest_binding(&manifest_bytes, receipt, &expected)?;
             Ok(binding)
         });

@@ -142,7 +142,8 @@ compares the archive's complete file set, Git blob identities and executable
 modes against `git ls-tree`, builds through the stage selector, refuses changed source or a missing unique
 default-feature executable, and records the executable, compiler and private
 Oxide digests. The external harness requires the receipt and its independently
-supplied digest; it checks the executable and every listed source byte before
+supplied digest and an independently supplied export-closure digest; it checks
+the executable and every listed source byte before
 the engine window, including the recorded executable mode and absence of
 extra entries. It also compares the provisional manifest's Barge pin,
 slice commit, complete `crates/barge/src/` file digest map, staged lock,
@@ -155,6 +156,11 @@ inventory and before/after gate. It currently refuses before either mode:
 admission subprocess isolation and aggregate scratch accounting have not been
 established. This source has not been executed or qualified; its receipt inputs
 and every child/admission destination still need independent isolation proof.
+The closure document is written only after a successful child and equal live
+inventories; it binds their digests, the export receipt and the wrapper source.
+Its scope is explicitly only that inventory comparison: it does not attest
+admission isolation, elapsed budget or scratch accounting. A missing or changed
+closure refuses before the engine runs.
 The retained failed inventory remains a failure. No fixture, pool,
 registry, root or account outside the given fixture root is read or written,
 and `BARGE_STATE_DIR`/`BARGE_ACCOUNT_HOME` are never consulted: fixture

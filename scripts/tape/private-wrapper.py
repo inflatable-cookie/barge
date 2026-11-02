@@ -167,6 +167,24 @@ def main():
             raise RuntimeError('live inventory changed; isolation failed')
     if result.returncode:
         raise RuntimeError(f'export selector exited {result.returncode}')
+    export_root = Path(export).resolve(strict=True)
+    if not export_root.is_relative_to(private):
+        raise RuntimeError('export root escaped the private root')
+    export_receipt = (export_root / 'export.json').read_bytes()
+    closure = {
+        'schema': 'barge.tape.export-closure/1', 'status': 'passed',
+        'scope': 'live-inventory-comparison-only',
+        'receipt_sha256': sha(export_receipt),
+        'wrapper_sha256': sha(Path(__file__).read_bytes()),
+        'live_before_sha256': sha((private / 'tape-export-before.json').read_bytes()),
+        'live_after_sha256': sha((private / 'tape-export-after.json').read_bytes()),
+    }
+    if closure['live_before_sha256'] != closure['live_after_sha256']:
+        raise RuntimeError('serialized live inventories differ')
+    closure_bytes = (json.dumps(closure, sort_keys=True, separators=(',', ':')) + '\n').encode()
+    with (export_root / 'export-closure.json').open('xb') as out:
+        out.write(closure_bytes)
+    print(f'export-closure-sha256={sha(closure_bytes)}')
 
 
 if __name__ == '__main__':
