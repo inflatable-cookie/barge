@@ -134,8 +134,8 @@ engine's own code (`ErrorKind::exit_code`, or `PruneReport::needs_human`'s
 From the exact staged Barge commit, offline, committed `Cargo.lock`, default
 features only — no feature enabled, the proof feature off, toolchain 1.97.1:
 
-An Effigy selector for a locked, default-feature `tape_eval` test build is
-still needed for staging. Do not invoke Cargo directly. The produced executable
+`effigy rust:test:tape-stage` declares a locked, default-feature `tape_eval`
+build without running it. It does not yet export or attest a binary. The produced executable
 under the managed target directory is the one a window
 invokes under the argv contract above; its digest, the toolchain and the
 lockfile are the orchestrator's to verify before any run. No fixture, pool,
@@ -221,15 +221,24 @@ and their regression controls have not yet been compiled or executed.
 
 There are additional known apparatus gaps. The manifest parser does not match
 mandatory obligations against observations. The provisional harness exits
-without a transcript for parse, case-mismatch and some setup failures, and
-`finish` returns an error if effects, clocks and the result exceed the document
-cap after all read rows are dropped. These cases do not satisfy the required
+without a transcript for parse, case-mismatch and some setup failures. If
+effects, clocks and the result exceed the document cap after all read rows are
+dropped, `finish` emits a bounded refusal with omitted counts and original
+engine status; those provisional fields still require shared-schema review.
+The apparatus-error cases do not satisfy the required
 refusal-document contract; the pending shared schema must not be treated as
 already settled. No successful comparison follows from any of these gaps.
 The current `staged_binding` is only a package version and build directory,
 not a source or executable hash. The later staging workflow must bind the
 actual source tree, lockfile, toolchain and executable before that field can
 serve as provenance.
+
+Descriptor listing and entry rows can be proven when the actual process
+identity has pid, nonzero start and uid, and the listing is complete or the
+entry names its descriptor. Retry vnode rows remain unproven. The existing
+`state::sync_directory` open-and-sync result is recorded without another stat;
+its identity remains unbound, and an earlier publish stays an effect if sync
+fails. These source controls have not been executed.
 
 ## Production statement audit
 
@@ -241,6 +250,37 @@ O1 diff has no removed source lines after these splits; that check alone does
 not prove that newly added statements compile away or preserve behavior. A
 per-statement equivalence review and release compile remain required before
 acceptance.
+
+The current source map against that O1 pin, for reviewer inspection, is:
+
+| File | Source sites changed | Non-test basis and remaining review |
+| --- | --- | --- |
+| `area.rs` | volume resolution, directory and hold enumeration, activity | Test rows and split error arms; original non-test directory-read arms retained. Audit all additions for cfg reachability. |
+| `custody.rs` | custody and decision observations | Test-only verdict rows and split match arms; review the unchanged original non-test arms. |
+| `identity.rs` | read and verification observations | Test-only rows; verify the pre-existing reads and errors remain in their original order. |
+| `os/absence.rs` | refusal and stored proof clock | Test-only recorder statements and test; the original proof clock expression remains in its struct. |
+| `os/macos.rs` | volume, process, descriptor and DirOps leaves | Test rows and narrow splits; verify original non-test syscall/error arms, including `read_identity`, writes and descriptor reads. |
+| `pool_custody.rs` | classification, metadata and document reads | Test-only observations and split match arms; verify original non-test arms and read order. |
+| `reference.rs` | directory, receipt, marker, pool and child reads | Test rows and split match arms; verify original non-test arms and reads. |
+| `registry.rs` | registry read and parse outcomes | Test-only rows and split match arms; verify original non-test arms. |
+| `state.rs` | bounded reads, locks, publication, directory sync and clocks | Original non-test open/write/rename/sync and `now_ms` statements are retained in non-test branches; test branches bind each actual result once. Verify all remaining read arms. |
+| `release.rs` | no tape delta against O1 | Caller clock observations come from `state::now_ms`; release's original calls remain in place. |
+| `lib.rs`, `Cargo.toml`, `tests/tape_eval.rs`, `tape.rs`, `tape_harness.rs` | test-only modules, harness target and recorder | Test surface and target declarations only; release compile-away and per-statement review remain missing. |
+| `effect.rs`, `guard.rs`, `undo_capture.rs` | source-link shadows for the included test target | These links require target/build review; no production module declarations are added. |
+
+This map identifies the changes for review; it is not a completed proof that
+every newly added item compiles away. In particular, a textual diff cannot
+prove cfg reachability, and no current-head release compile has run.
+
+The named write helpers are outside the direct plan body: `release::plan` calls
+`plan_observed` (release.rs:358, 387), while effect execution starts at
+`release::execute` (release.rs:1854). `identity.rs:122,284,318` and
+`area.rs:1297,1745,2259,2261,2361` locate random and sync operations in
+identity creation and area mutation paths, rather than by themselves proving
+plan reachability. `set_dir_mode` and `create_child_symlink` are DirOps mutation
+implementations in `os/macos.rs:4362,4403`. Full transitive reachability and
+all reached effect identities still require review; these pointers are not a
+proof that a method can never be reached.
 
 The ordinary test suite includes
 `ordinary_account_tests::an_ordinary_build_takes_oxide_directories_from_the_password_database_home`.

@@ -530,10 +530,31 @@ pub(crate) fn finish(
                 return Ok(bytes);
             }
             let Some(dropped) = reads.pop() else {
+                // The result, effects, clocks or even invocation strings may
+                // exceed the cap on their own. Do not emit an apparently
+                // complete empty effect set or pretend the engine refused.
+                let omitted_effects = tape.effects.len();
+                let omitted_clocks = tape.clocks.len();
+                caps.document_truncated = true;
+                let refusal = serde_json::json!({
+                    "schema": TRANSCRIPT_SCHEMA,
+                    "engine": ENGINE,
+                    "case_sha256": sha256_hex(config.case.as_bytes()),
+                    "manifest_sha256_sha256": sha256_hex(config.manifest_sha256.as_bytes()),
+                    "entrypoint_binding_sha256": sha256_hex(config.source_binding.as_bytes()),
+                    "outcome": { "status": "refused", "exit_code": 2,
+                        "refusal_kind": "document_cap", "refusal_message": "transcript payload exceeds document cap" },
+                    "original_engine_status": outcome.status,
+                    "original_engine_exit_code": outcome.exit_code,
+                    "result_omitted": result.is_some(),
+                    "effects_omitted": omitted_effects,
+                    "clocks_omitted": omitted_clocks,
+                    "observation_complete": false,
+                    "caps": caps,
+                });
                 tape.reset_without_window();
-                return Err(
-                    "the transcript exceeds its document cap with no rows to drop".to_owned(),
-                );
+                return serde_json::to_string(&refusal)
+                    .map_err(|error| format!("the cap refusal cannot be serialized: {error}"));
             };
             if matches!(dropped.kind, "process-row" | "process-observation") {
                 caps.process_rows = caps.process_rows.saturating_sub(1);
@@ -619,6 +640,13 @@ fn observation_proven(kind: &str, identity: &Identity, outcome: &Outcome) -> boo
         "process-row" | "process-observation" | "platform-status" => {
             identity.pid.is_some() && identity.start.is_some() && identity.uid.is_some()
         }
+        "fd-list" if matches!(outcome, Outcome::Listed { truncated: false, .. }) => {
+            identity.pid.is_some() && identity.start.is_some() && identity.uid.is_some()
+        }
+        "fd-entry" if matches!(outcome, Outcome::Answer { .. }) => {
+            identity.pid.is_some() && identity.start.is_some() && identity.uid.is_some()
+                && identity.fd.is_some()
+        }
         "uid" | "boot" => matches!(outcome, Outcome::Answer { .. }),
         "process-table" => matches!(outcome, Outcome::Listed { truncated: false, .. }),
         _ => false,
@@ -697,6 +725,12 @@ pub(crate) fn sync_observation(site: &'static str, directory: (u64, u64), compon
     };
     let outcome = error.map_or_else(|| Outcome::answer("succeeded"), |error| Outcome::refused(errno_class(error)));
     record("sync", site, identity, outcome, None);
+}
+
+/// Record a sync on a path whose opened descriptor identity was not observed.
+pub(crate) fn sync_path(site: &'static str, path: &Path, error: Option<&std::io::Error>) {
+    let outcome = error.map_or_else(|| Outcome::answer("succeeded"), |error| Outcome::refused(errno_class(error)));
+    record("sync", site, Identity::file(path, None), outcome, None);
 }
 
 /// Bind the syscall result to its existing attempt row, without a second effect.
@@ -1333,6 +1367,19 @@ mod tests {
     }
 
     #[test]
+    fn oversized_non_read_payload_yields_bounded_explicit_refusal() {
+        let oversized = "x".repeat(CAP_DOCUMENT_BYTES + 1);
+        let transcript = window(|| write_effect("create", Path::new(&oversized)));
+        assert!(transcript.len() <= CAP_DOCUMENT_BYTES);
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        assert_eq!(document["outcome"]["refusal_kind"], "document_cap");
+        assert_eq!(document["original_engine_status"], "completed");
+        assert_eq!(document["effects_omitted"], 1);
+        assert_eq!(document["caps"]["document_truncated"], true);
+        assert_eq!(document["observation_complete"], false);
+    }
+
+    #[test]
     fn an_identity_without_its_parent_still_binds_the_path() {
         let transcript = window(|| {
             read_absent("registry::read", Path::new("/fixture/barge.registry/1"));
@@ -1514,7 +1561,7 @@ mod tests {
         });
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         assert_eq!(document["reads"][0]["identity"]["start"], 123);
-        assert_eq!(document["reads"][0]["observation_proven"], false);
+        assert_eq!(document["reads"][0]["observation_proven"], true);
         assert!(document["reads"][1]["identity"].get("start").is_none());
         assert_eq!(document["reads"][1]["observation_proven"], false);
         assert!(document["reads"][2]["identity"].get("start").is_none());
@@ -1551,7 +1598,7 @@ mod tests {
         assert_eq!(row["identity"]["fd"], 7);
         assert_eq!(row["identity"]["start"], 123);
         assert_eq!(row["outcome"]["answer"]["answer"], "1");
-        assert_eq!(row["observation_proven"], false);
+        assert_eq!(row["observation_proven"], true);
     }
 
     #[test]
@@ -1656,6 +1703,19 @@ mod tests {
         assert_eq!(effects[1]["destination"], "target");
         assert_eq!(effects[1]["outcome"], "succeeded");
         assert_eq!(document["reads"][0]["outcome"]["refused"]["class"], "EIO");
+    }
+
+    #[test]
+    fn path_sync_records_success_and_failure_without_inventing_identity() {
+        let transcript = window(|| {
+            sync_path("state::sync_directory", Path::new("parent"), None);
+            let error = std::io::Error::from_raw_os_error(libc::EIO);
+            sync_path("state::sync_directory", Path::new("parent"), Some(&error));
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        assert_eq!(document["reads"][0]["outcome"]["answer"]["answer"], "succeeded");
+        assert_eq!(document["reads"][1]["outcome"]["refused"]["class"], "EIO");
+        assert_eq!(document["reads"][0]["observation_proven"], false);
     }
 
     #[test]

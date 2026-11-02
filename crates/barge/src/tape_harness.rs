@@ -44,8 +44,8 @@
 //! The orchestrator stages this exact commit's tree, builds the harness
 //! offline from the committed `Cargo.lock` with default features only — no
 //! feature is enabled, and the proof feature must stay off — through a
-//! locked Effigy staging selector under the pinned toolchain 1.97.1. That
-//! staging selector is still missing. The orchestrator invokes the executable with the argv
+//! locked Effigy build-only selector under the pinned toolchain 1.97.1. A
+//! verified export and binding are still missing. The orchestrator invokes the executable with the argv
 //! contract `--fixture-root --manifest --transcript-out --case`. The binary
 //! digests, toolchain version and lockfile digest are the orchestrator's to
 //! verify before any window; nothing here reads the live pool, root,
@@ -317,12 +317,11 @@ pub(crate) fn run(
     Ok(summary)
 }
 
-/// The source binding a staged run carries: this crate's own version, so the
-/// orchestrator's digest verification ties the executable to the exact staged
-/// source it was built from.
+/// A provisional label only; it is not a source or executable attestation.
+/// The window remains observation-incomplete until independently bound.
 fn staged_binding() -> String {
     format!(
-        "barge {} at {}",
+        "unverified: barge {} at {}",
         env!("CARGO_PKG_VERSION"),
         env!("CARGO_MANIFEST_DIR")
     )
@@ -335,7 +334,13 @@ fn write_transcript(path: &Path, transcript: &str) -> Result<(), String> {
             .map_err(|error| format!("the transcript directory cannot be created: {error}"))?;
     }
     std::fs::write(path, transcript)
-        .map_err(|error| format!("the transcript cannot be written: {error}"))
+        .map_err(|error| format!("the transcript cannot be written: {error}"))?;
+    let document: serde_json::Value = serde_json::from_str(transcript)
+        .map_err(|error| format!("the transcript cannot be inspected: {error}"))?;
+    if document["outcome"]["refusal_kind"] == "document_cap" {
+        return Err("the transcript exceeded its document cap".to_owned());
+    }
+    Ok(())
 }
 
 /// The declaration the D8 BASE fixture uses: Oxide's outputs area, released by

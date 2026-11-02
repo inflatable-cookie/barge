@@ -829,6 +829,19 @@ where
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    {
+        let result = File::open(path).and_then(|directory| directory.sync_all());
+        crate::tape::sync_path("state::sync_directory", path, result.as_ref().err());
+        result.map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("cannot sync {}: {error}", path.display()),
+            )
+            .with_detail("path", path.display().to_string().into())
+        })
+    }
+    #[cfg(not(test))]
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| {

@@ -92,6 +92,8 @@ lists the commands. Each covers what it names:
   the required end-to-end exercise or establish capture qualification.
 - `effigy rust:test:tape-eval` — the harness executable's own run with no arguments,
   which is its embedded exercise; with the argv contract it runs one manifest window.
+- `effigy rust:test:tape-stage` — build the default-feature harness without running it;
+  a separately verified export must bind source, lockfile, toolchain and executable.
 - `effigy release:native:test` and `effigy release:native:plan` — F6-R1's native
   proof apparatus, effect-free: the pinned supervisor, the argv guard, the case
   table checked against its named regressions, the proof feature's declarations
