@@ -40,9 +40,10 @@
 //! Exit codes: the engine's own — `0` or `3` for a completed plan
 //! (`PruneReport::needs_human`), `2` or `3` for a refusal
 //! (`ErrorKind::exit_code`). An apparatus error — missing arguments, an
-//! unreadable manifest, a transcript that cannot be written — exits `2` with
-//! the reason on stderr and writes no transcript, because there is no engine
-//! outcome to record.
+//! unreadable manifest or setup failure — exits `2` with the reason on stderr
+//! and attempts an apparatus refusal document once the output path is known.
+//! An unwritable output cannot carry a document, and missing output arguments
+//! do not name a destination. Neither case has an engine outcome.
 //!
 //! ## Embedded end-to-end exercise
 //!
@@ -188,13 +189,32 @@ fn main() -> std::process::ExitCode {
     let manifest_bytes = match std::fs::read(&invocation.manifest) {
         Ok(bytes) => bytes,
         Err(error) => {
-            eprintln!("barge.tape.harness/1: the manifest cannot be read: {error}",);
+            let reason = format!("the manifest cannot be read: {error}");
+            if let Err(write_error) = tape_harness::write_apparatus_refusal(
+                &invocation.transcript_out,
+                None,
+                &reason,
+            ) {
+                eprintln!("barge.tape.harness/1: {write_error}");
+            }
+            eprintln!("barge.tape.harness/1: {reason}");
             return std::process::ExitCode::from(2);
         }
     };
     match tape_harness::parse_manifest(&manifest_bytes) {
         Ok(request) if request.case == invocation.case => {}
         Ok(request) => {
+            let reason = format!(
+                "--case {} does not match the manifest's case {}",
+                invocation.case, request.case
+            );
+            if let Err(write_error) = tape_harness::write_apparatus_refusal(
+                &invocation.transcript_out,
+                Some(&manifest_bytes),
+                &reason,
+            ) {
+                eprintln!("barge.tape.harness/1: {write_error}");
+            }
             eprintln!(
                 "barge.tape.harness/1: --case {} does not match the manifest's case {}",
                 invocation.case, request.case
@@ -202,6 +222,13 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
         Err(reason) => {
+            if let Err(write_error) = tape_harness::write_apparatus_refusal(
+                &invocation.transcript_out,
+                Some(&manifest_bytes),
+                &reason,
+            ) {
+                eprintln!("barge.tape.harness/1: {write_error}");
+            }
             eprintln!("barge.tape.harness/1: {reason}");
             return std::process::ExitCode::from(2);
         }

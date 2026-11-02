@@ -32,8 +32,8 @@
 //! - `barge.named_roots`: optional array of explicitly named roots.
 //!
 //! A member that is missing or of the wrong shape is an apparatus error: the
-//! process exits `2` with the reason on stderr and writes no transcript,
-//! because there is no engine outcome to record. The engine's own refusals —
+//! process exits `2` and writes a provisional apparatus refusal document with
+//! no invented engine outcome. The engine's own refusals —
 //! an undeclared area, an unregistered volume, an unreadable registry — are
 //! engine outcomes: the transcript is written with `outcome.status` of
 //! `refused`, the engine's own refusal vocabulary, and the exit code
@@ -201,7 +201,13 @@ pub(crate) fn run(
     fixture_root: &Path,
     transcript_out: &Path,
 ) -> Result<RunSummary, String> {
-    let request = parse_manifest(manifest_bytes)?;
+    let request = match parse_manifest(manifest_bytes) {
+        Ok(request) => request,
+        Err(reason) => {
+            write_apparatus_refusal(transcript_out, Some(manifest_bytes), &reason)?;
+            return Err(reason);
+        }
+    };
     let manifest_sha256 = crate::digest::sha256_hex(manifest_bytes);
     let account = FixtureAccount {
         home: fixture_root.to_path_buf(),
@@ -209,15 +215,24 @@ pub(crate) fn run(
         tool_state: fixture_root.join("Library/Application Support/oxide/state"),
         tool_cache: fixture_root.join("Library/Caches/oxide"),
     };
-    let state_paths = StatePaths::resolve(&account, Some(&account.state))
-        .map_err(|error| format!("the fixture state directory does not resolve: {error}"))?;
-    begin_window(WindowConfig {
+    let state_paths = match StatePaths::resolve(&account, Some(&account.state)) {
+        Ok(paths) => paths,
+        Err(error) => {
+            let reason = format!("the fixture state directory does not resolve: {error}");
+            write_apparatus_refusal(transcript_out, Some(manifest_bytes), &reason)?;
+            return Err(reason);
+        }
+    };
+    if let Err(error) = begin_window(WindowConfig {
         case: request.case.clone(),
         manifest_sha256,
         entrypoint_symbol: "barge::release::plan",
         source_binding: staged_binding(),
-    })
-    .map_err(|error| format!("the tape window cannot open: {error}"))?;
+    }) {
+        let reason = format!("the tape window cannot open: {error}");
+        write_apparatus_refusal(transcript_out, Some(manifest_bytes), &reason)?;
+        return Err(reason);
+    }
 
     // The caller clock is a real reading; the tape records it as the window's
     // first clock row through state::now_ms's own leaf statement.
@@ -325,6 +340,31 @@ fn staged_binding() -> String {
         env!("CARGO_PKG_VERSION"),
         env!("CARGO_MANIFEST_DIR")
     )
+}
+
+/// Write a bounded provisional protocol document when no engine ran. Hashing
+/// the diagnostic prevents untrusted manifest text from overflowing the cap.
+pub(crate) fn write_apparatus_refusal(
+    path: &Path,
+    manifest: Option<&[u8]>,
+    reason: &str,
+) -> Result<(), String> {
+    let document = serde_json::json!({
+        "schema": crate::tape::TRANSCRIPT_SCHEMA,
+        "engine": "barge",
+        "manifest_sha256": manifest.map(crate::digest::sha256_hex),
+        "outcome": { "status": "apparatus_refused", "exit_code": 2,
+            "reason_sha256": crate::digest::sha256_hex(reason.as_bytes()) },
+        "engine_ran": false,
+        "observation_complete": false,
+        "reads": [], "effects": [], "clocks": [],
+        "caps": { "read_rows": 0, "document_bytes": 0,
+            "occurrences_per_key": CAP_OCCURRENCES, "process_rows": 0,
+            "dropped_rows": 0 }
+    });
+    let bytes = serde_json::to_string(&document)
+        .map_err(|error| format!("the apparatus refusal cannot be serialized: {error}"))?;
+    write_transcript(path, &bytes)
 }
 
 /// Write the transcript document to the caller's path.
@@ -706,18 +746,35 @@ mod tests {
         assert!(document.get("result").is_none());
     }
 
-    /// A manifest missing its members is an apparatus error: no transcript is
-    /// written, because there is no engine outcome to record.
+    /// A manifest missing its members records an apparatus refusal, not an
+    /// invented engine outcome.
     #[test]
-    fn an_apparatus_error_writes_no_transcript() {
+    fn an_apparatus_error_writes_a_refusal() {
         let fixture = crate::testkit::TempDir::new("tape-eval-apparatus");
         let transcript_out = fixture.path().join("transcripts").join("none.json");
         let summary = run(b"{}", fixture.path(), &transcript_out);
         assert!(summary.is_err(), "an empty manifest is refused");
-        assert!(
-            !transcript_out.exists(),
-            "no transcript for an apparatus error"
+        let bytes = std::fs::read(&transcript_out).expect("refusal document");
+        let document: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(document["outcome"]["status"], "apparatus_refused");
+        assert_eq!(document["engine_ran"], false);
+        assert_eq!(document["observation_complete"], false);
+    }
+
+    #[test]
+    fn apparatus_refusal_bounds_untrusted_diagnostic_text() {
+        let fixture = crate::testkit::TempDir::new("tape-eval-large-refusal");
+        let output = fixture.path().join("refusal.json");
+        let reason = "x".repeat(CAP_DOCUMENT_BYTES + 1);
+        write_apparatus_refusal(&output, Some(b"{}"), &reason).expect("refusal is written");
+        let bytes = std::fs::read(output).expect("refusal exists");
+        assert!(bytes.len() < CAP_DOCUMENT_BYTES);
+        let document: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(
+            document["outcome"]["reason_sha256"],
+            crate::digest::sha256_hex(reason.as_bytes())
         );
+        assert_eq!(document["engine_ran"], false);
     }
 
     /// The fixture volume facts come from the real platform, and the census

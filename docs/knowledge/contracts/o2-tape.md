@@ -123,8 +123,9 @@ canonical layout. It reads exactly these manifest members
 orchestrator's other members. The reads are cfg(test)-only apparatus, so
 reconciling them to the reviewed schema is a harness change and nothing
 production depends on them. A missing or
-mistyped member is an apparatus error: exit 2, the reason on stderr, no
-transcript — there is no engine outcome to record. The engine's own refusals
+mistyped member is an apparatus error: exit 2, the reason on stderr and a
+provisional apparatus-refusal document — there is no engine outcome to record.
+The engine's own refusals
 are engine outcomes: the transcript is written and the process exits with the
 engine's own code (`ErrorKind::exit_code`, or `PruneReport::needs_human`'s
 0/3).
@@ -220,14 +221,18 @@ characters in names do not merge distinct observations. These source changes
 and their regression controls have not yet been compiled or executed.
 
 There are additional known apparatus gaps. The manifest parser does not match
-mandatory obligations against observations. The provisional harness exits
-without a transcript for parse, case-mismatch and some setup failures. If
+mandatory obligations against observations. The provisional harness emits a
+bounded apparatus-refusal document for manifest parse, case-mismatch,
+unreadable manifest, state-path resolution and window-open failures once an
+output path is known. It records that the engine did not run; an unwritable
+output or missing output argument cannot carry a document. Its wire fields are
+provisional pending shared-schema review. If
 effects, clocks and the result exceed the document cap after all read rows are
 dropped, `finish` emits a bounded refusal with omitted counts and original
 engine status; those provisional fields still require shared-schema review.
-The apparatus-error cases do not satisfy the required
-refusal-document contract; the pending shared schema must not be treated as
-already settled. No successful comparison follows from any of these gaps.
+Other apparatus-error cases still require review against the eventual shared
+schema; that schema must not be treated as already settled. No successful
+comparison follows from any of these gaps.
 The current `staged_binding` is only a package version and build directory,
 not a source or executable hash. The later staging workflow must bind the
 actual source tree, lockfile, toolchain and executable before that field can
