@@ -13,7 +13,10 @@ does not prove.
 - `crates/barge/src/tape.rs` — the recorder and the transcript writer. It is
   declared in `lib.rs` as a `pub(crate)` `#[cfg(test)]` module, so a production
   build compiles none of it and nothing becomes public. Every call from a
-  production function body is a separate `#[cfg(test)]`-attributed statement.
+  production function body normally uses a separate `#[cfg(test)]`-attributed
+  statement. Where a consumed expression cannot otherwise be observed, a narrow
+  test/non-test split retains the original production expression and records
+  the single test computation.
   The tape is one-sided: it records what the real syscalls and parsers
   returned, and feeds nothing back.
 - `crates/barge/src/tape_harness.rs` — the window runner (`run`) both the
@@ -32,9 +35,8 @@ does not prove.
 - `crates/barge/src/tape.rs`'s own tests: recorder roundtrip and deterministic
   bytes, the refusal document, the caps (read rows, per-key occurrences,
   process rows, the 8 MiB document), the no-public-surface declaration shape,
-  and the statement discipline (every instrumented file carries
-  `#[cfg(test)]`; the mechanical proof of the compile-away is
-  `effigy rust:compile:release`).
+  and a limited source guard check. That check does not establish per-site
+  coverage; the mechanical compile-away check is `effigy rust:compile:release`.
 - `crates/barge/src/tape_harness.rs`'s tests: the embedded end-to-end exercise
   (one exclusively owned directory fixture on a real selected volume, the
   actual `release::plan`, one completed window over a settled root with a

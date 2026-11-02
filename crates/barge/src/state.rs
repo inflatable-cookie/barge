@@ -798,23 +798,23 @@ fn temporary_name(name: &str) -> String {
 /// Milliseconds since the Unix epoch, as every record's timestamp uses.
 pub fn now_ms() -> u64 {
     #[cfg(test)]
-    crate::tape::now_ms(clock_now_ms());
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-        })
-}
-
-/// [`now_ms`] read once, for the cfg(test) tape statement above, so the clock
-/// leaf is observed without touching the production statement below it.
-#[cfg(test)]
-fn clock_now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-        })
+    {
+        let value = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            });
+        crate::tape::now_ms(value);
+        value
+    }
+    #[cfg(not(test))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            })
+    }
 }
 
 /// The one order file locks may be taken in (design, "Account-wide state

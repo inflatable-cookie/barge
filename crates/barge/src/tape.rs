@@ -571,6 +571,11 @@ fn record(
             tape.dropped_rows = tape.dropped_rows.saturating_add(1);
             return;
         }
+        if kind == "process-row" && tape.process_rows >= CAP_PROCESS_ROWS {
+            tape.process_rows_exhausted = true;
+            tape.dropped_rows = tape.dropped_rows.saturating_add(1);
+            return;
+        }
         let key = format!("{kind}|{site}{}", identity.key());
         let slot = tape.occurrences.entry(key).or_insert(0);
         if *slot >= CAP_OCCURRENCES {
@@ -584,10 +589,6 @@ fn record(
         tape.next_epoch = tape.next_epoch.saturating_add(1);
         if kind == "process-row" {
             tape.process_rows = tape.process_rows.saturating_add(1);
-            if tape.process_rows > CAP_PROCESS_ROWS {
-                tape.process_rows_exhausted = true;
-                return;
-            }
         }
         tape.reads.push(ReadRow {
             kind,
@@ -1249,9 +1250,33 @@ mod tests {
         assert_eq!(CAP_PROCESS_ROWS, 512);
     }
 
+    #[test]
+    fn clock_row_is_the_value_returned_to_the_caller() {
+        let mut returned = 0;
+        let transcript = window(|| returned = crate::state::now_ms());
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        assert_eq!(document["clocks"].as_array().map(Vec::len), Some(1));
+        assert_eq!(document["clocks"][0]["value_ms"], returned);
+    }
+
+    #[test]
+    fn process_cap_counts_every_dropped_row_without_consuming_epochs() {
+        let transcript = window(|| {
+            for pid in 1..=(CAP_PROCESS_ROWS as u32 + 2) {
+                process_row("test", pid, Some(501), u64::from(pid));
+            }
+            now_ms(7);
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
+        assert_eq!(document["caps"]["process_rows"], CAP_PROCESS_ROWS);
+        assert_eq!(document["caps"]["dropped_rows"], 2);
+        assert_eq!(document["caps"]["process_rows_exhausted"], true);
+        assert_eq!(document["clocks"][0]["epoch"], CAP_PROCESS_ROWS);
+    }
+
     /// The statement discipline, as far as text can check it: every
-    /// instrumented production file carries `#[cfg(test)]` attributes at least
-    /// as often as it carries tape calls. The mechanical proof is the
+    /// instrumented production file has a cfg(test) guard. This count does not
+    /// establish per-call reachability or a complete source-site inventory. The mechanical proof is the
     /// release-profile compile (`effigy rust:compile:release`): the tape module
     /// does not exist outside `cfg(test)`, so a call site that leaked would
     /// fail to compile in every production build.
@@ -1261,6 +1286,7 @@ mod tests {
         let mut checked = 0usize;
         for name in [
             "os/macos.rs",
+            "os/absence.rs",
             "state.rs",
             "registry.rs",
             "reference.rs",

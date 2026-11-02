@@ -854,19 +854,22 @@ impl ProcessObserver for MacOs {
     fn effective_uid(&self) -> Result<u32> {
         #[cfg(test)]
         {
-            // SAFETY: `geteuid` takes no arguments, cannot fail and has no
-            // preconditions. The tape reads it independently of the production
-            // read below, as its own recorded occurrence.
+            // SAFETY: geteuid takes no arguments and cannot fail.
+            let uid = unsafe { libc::geteuid() };
             crate::tape::scalar(
                 "MacOs::effective_uid",
                 "uid",
                 crate::tape::Identity::none(),
-                &unsafe { libc::geteuid() }.to_string(),
+                &uid.to_string(),
             );
+            Ok(uid)
         }
-        // SAFETY: `geteuid` takes no arguments, cannot fail and has no
-        // preconditions.
-        Ok(unsafe { libc::geteuid() })
+        #[cfg(not(test))]
+        {
+            // SAFETY: `geteuid` takes no arguments, cannot fail and has no
+            // preconditions.
+            Ok(unsafe { libc::geteuid() })
+        }
     }
 
     fn boot_identity(&self) -> Result<String> {
@@ -4454,9 +4457,9 @@ fn read_identity(descriptor: &File, path: &Path) -> Result<VolumeIdentity> {
     let identity = VolumeIdentity {
         filesystem,
         device: read_device(descriptor_fd, path)?,
-        volume_uuid: volume_uuid.clone(),
+        volume_uuid,
         boot_volume: is_boot_volume(&mount_point),
-        mount_point: mount_point.clone(),
+        mount_point,
     };
     #[cfg(test)]
     crate::tape::volume(
