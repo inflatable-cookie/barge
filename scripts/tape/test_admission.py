@@ -34,6 +34,27 @@ class AdmissionControls(unittest.TestCase):
             with self.assertRaises(ValueError):
                 admission.validate_block(invalid, **self.bindings)
 
+    def test_approved_scratch_cap_is_exact_and_pool_is_bounded(self):
+        cap = 3 * 1024 * 1024 * 1024
+        self.assertEqual(admission.CAP_BYTES, cap)
+        self.assertEqual(admission.validate_block({**self.block, 'pool_cap_bytes': cap}, **self.bindings), 600)
+        for changes in ({'scratch_cap_bytes': 2 * 1024 * 1024 * 1024},
+                        {'scratch_cap_bytes': cap + 1}, {'scratch_cap_bytes': None},
+                        {'pool_cap_bytes': cap + 1}, {'pool_cap_bytes': None}, {'pool_cap_bytes': 0}):
+            with self.assertRaises(ValueError):
+                admission.validate_block({**self.block, **changes}, **self.bindings)
+
+    def test_retained_root_allocation_refuses_above_approved_cap(self):
+        root = admission.Path('/scratch/retained')
+        file_stat = mock.Mock(st_dev=1, st_ino=2, st_mode=0o100600,
+                              st_blocks=admission.CAP_BYTES // 512)
+        with mock.patch.object(admission.Path, 'resolve', lambda self, strict=True: self), \
+                mock.patch.object(admission.os, 'lstat', return_value=file_stat):
+            self.assertEqual(admission.allocated_bytes([root]), admission.CAP_BYTES)
+            file_stat.st_blocks += 1
+            with self.assertRaises(ValueError):
+                admission.allocated_bytes([root])
+
     def test_dry_requires_state_and_cache_sentinels(self):
         args = dict(home='/p/home', config='/p/config', pool='/p/scratch/pool',
                     registry_probe='/p/reg', cache_probe='/p/cache')

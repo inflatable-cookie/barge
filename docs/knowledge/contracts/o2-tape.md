@@ -215,7 +215,7 @@ symlinks. The accounting includes retained evidence as well as the new root;
 it cannot determine an earlier peak or establish that an unlisted root does not
 exist. Discovery completeness is an independent review obligation. Shared live
 pool and output roots are not counted as private scratch and their sizes remain
-unknown. The private root is supervised against the 2 GiB ceiling less other
+unknown. The private root is supervised against the prospective 3 GiB ceiling less other
 retained private allocations. Because the supervisor monitors the new root,
 the independently reviewed `retained_roots` audit must also establish that all
 other counted roots remain quiescent for the block; before/after counts alone
@@ -224,7 +224,7 @@ cannot prove an intervening aggregate peak. No cleanup or refund follows.
 An externally authenticated `barge.validation-block/1` document binds the
 task, exact Barge head and tree, wrapper, debug Oxide, source audit and root
 ledger hashes, operator authorization reference, unique block ID, finite
-seconds, 2 GiB scratch cap, private pool cap and ordered selectors. Its digest,
+seconds, 3 GiB scratch cap, private pool cap and ordered selectors. Its digest,
 the audit and ledger digests, and paths are supplied independently via
 `BARGE_VALIDATION_BLOCK[_SHA256]`, `BARGE_VALIDATION_SOURCE_AUDIT[_SHA256]`,
 and `BARGE_VALIDATION_ROOT_LEDGER[_SHA256]`. Set the pinned supervisor, Git,
@@ -247,13 +247,23 @@ answered by the operator on 2026-11-02, approves one additional prospective
 1,200-second block for the reviewed private route. The block includes setup,
 at most one 300-second debug-Oxide bootstrap, one inventory-bracketed status
 gate and named safe selectors; it does not renew the historical charges or
-increase the 2 GiB private scratch cap. A changed live inventory ends the
+increase the then-authorized 2 GiB private scratch cap. A changed live inventory ends the
 block without repair, retry or attribution. The planner must still bind and
 issue the one-use block and the independently reviewed inputs. The decision
 does not authorize a full live-reading suite, native/image proof, installation,
 production redirect, parity or merge. The host-admission correction after the
 decision requires exact-head source review and planner binding; no execution
 is inferred from this record.
+
+Operator decision `af038a7e-7ff7-428e-8899-534a90e97bc2`, version 2,
+answered by Tom on 2026-11-02, approves a prospective aggregate Barge
+scratch ceiling of 3 GiB and Oxide ceiling of 8 GiB, with one further shared
+diagnostic and at most one 300-second debug bootstrap within the same
+remaining allowance. Earlier 2 GiB sessions and their evidence retain their
+original bounds. This changes no watchdog, admission, identity, one-use or
+isolation gate; it is not a new clock, a cleanup permission or runtime proof.
+The current Barge block must explicitly bind exactly 3 GiB, with its pool cap
+no greater than that limit, and retained private roots count against it.
 
 Within the prospective block, the launcher brackets source verification and
 each actual Effigy child with bounded live before/after inventories. A changed

@@ -15,7 +15,7 @@ TASK = '9f435fb3-4374-4f23-ba6d-7c5e6869f4ae'
 OXIDE_COMMIT = '3de241325dd286ae44a5759fa6825b05a81c7b4e'
 OXIDE_TREE = '452a9c2dc6b1432c643c5053655e029955977754'
 SUPERVISOR_SHA256 = 'fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b'
-CAP_BYTES = 2 * 1024 * 1024 * 1024
+CAP_BYTES = 3 * 1024 * 1024 * 1024
 HEX64 = re.compile(r'^[0-9a-f]{64}$')
 REQUIRED_AUDIT = frozenset(('oxide_config', 'oxide_registry', 'oxide_scratch',
                             'oxide_child', 'effigy_admission', 'rustup_cargo',
@@ -65,7 +65,7 @@ def validate_block(block, *, head, wrapper_hash, oxide_hash, audit_hash, ledger_
     if type(block['max_seconds']) is not int or block['max_seconds'] < 60:
         raise ValueError('explicit bounded seconds required')
     if block['scratch_cap_bytes'] != CAP_BYTES:
-        raise ValueError('private scratch cap must remain 2 GiB')
+        raise ValueError('private scratch cap must be the approved 3 GiB')
     if type(block['pool_cap_bytes']) is not int or not 0 < block['pool_cap_bytes'] <= CAP_BYTES:
         raise ValueError('private pool budget is missing or exceeds scratch cap')
     selectors = block['selectors']
@@ -182,7 +182,7 @@ def allocated_bytes(paths):
             seen.add(key)
             total += st.st_blocks * 512
         if total > CAP_BYTES:
-            raise ValueError('private scratch exceeds 2 GiB')
+            raise ValueError('private scratch exceeds 3 GiB')
         if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
             raise ValueError('unsupported private-root entry')
     def walk(fd):
