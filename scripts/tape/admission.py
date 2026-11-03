@@ -436,11 +436,110 @@ def verify_git_tree(repo, root, commit, expected_tree, git, run):
     return expected
 
 
-def source_snapshot(root):
-    """Detect a changed archive during a supervised child without following links."""
+def _owned_destination(path, private):
+    """Resolve using no-follow directory descriptors rooted at private."""
+    private = Path(private)
+    pending = Path(os.path.normpath(path))
+    hops = 0
+    while True:
+        if not pending.is_absolute() or not pending.is_relative_to(private):
+            raise ValueError('generated output escapes private root')
+        current = private
+        parts = pending.relative_to(private).parts
+        fd = os.open(private, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            for index, part in enumerate(parts):
+                info = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                if info.st_uid != os.geteuid():
+                    raise ValueError('generated output is not owned')
+                current = current / part
+                if stat.S_ISLNK(info.st_mode):
+                    hops += 1
+                    if hops > 40:
+                        raise ValueError('generated output link loop')
+                    link = Path(os.readlink(part, dir_fd=fd))
+                    target = link if link.is_absolute() else current.parent / link
+                    pending = Path(os.path.normpath(target.joinpath(*parts[index + 1:])))
+                    break
+                if stat.S_ISDIR(info.st_mode):
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                    opened = os.fstat(child)
+                    if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                        os.close(child)
+                        raise ValueError('generated output directory changed')
+                    os.close(fd)
+                    fd = child
+                elif index != len(parts) - 1:
+                    raise ValueError('generated output ancestor is not a directory')
+            else:
+                if stat.S_ISDIR(info.st_mode):
+                    result_fd, fd = fd, -1
+                    return current, info, result_fd
+                return current, info, None
+        finally:
+            if fd != -1:
+                os.close(fd)
+
+
+def validate_generated_output(path, private):
+    """Inspect generated target custody without reading output file bytes."""
+    private = Path(private)
+    root_info = os.lstat(private)
+    if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.geteuid()
+            or private.resolve(strict=True) != private):
+        raise ValueError('private root is not a canonical owned directory')
+    seen = set()
+    pending = [Path(path)]
+    first = True
+    while pending:
+        resolved, info, fd = _owned_destination(pending.pop(), private)
+        if first and not stat.S_ISDIR(info.st_mode):
+            if fd is not None:
+                os.close(fd)
+            raise ValueError('generated target is not a directory')
+        first = False
+        identity = (info.st_dev, info.st_ino)
+        if identity in seen:
+            if fd is not None:
+                os.close(fd)
+            continue
+        seen.add(identity)
+        if len(seen) > 500000:
+            if fd is not None:
+                os.close(fd)
+            raise ValueError('generated output entry limit')
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                with os.scandir(fd) as children:
+                    pending.extend(resolved / child.name for child in children)
+            finally:
+                os.close(fd)
+        elif not stat.S_ISREG(info.st_mode):
+            raise ValueError('unsupported generated output entry')
+
+
+def source_snapshot(root, *, private=None, baseline=None):
+    """Snapshot all source; optionally admit only a new, owned target tree."""
     result = {}
-    for path in root.rglob('*'):
+    if baseline is not None:
+        if (private is None or not root.is_absolute() or root.resolve(strict=True) != root
+                or not root.is_relative_to(private)
+                or any(name == 'target' or name.startswith('target/') for name in baseline)):
+            raise ValueError('generated output exception is not bound to a clean private source')
+    def source_entries():
+        for child in root.iterdir():
+            yield child
+            if child.name == 'target' and baseline is not None:
+                continue
+            if not child.is_symlink() and child.is_dir():
+                yield from child.rglob('*')
+    for path in source_entries():
         name = path.relative_to(root).as_posix()
+        if baseline is not None and (name == 'target' or name.startswith('target/')):
+            if name == 'target':
+                validate_generated_output(path, private)
+            continue
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode):
             result[name] = ('link', os.readlink(path))

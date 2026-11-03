@@ -22,6 +22,74 @@ class AdmissionControls(unittest.TestCase):
         self.bindings = dict(head='b' * 40, wrapper_hash=self.hash, oxide_hash=self.hash,
                              audit_hash=self.hash, ledger_hash=self.hash)
 
+    def test_source_snapshot_allows_only_new_guarded_target(self):
+        root = admission.Path('/private/work')
+        private = admission.Path('/private')
+        members = [root / 'Cargo.lock', root / 'source.rs', root / 'link']
+        modes = {'Cargo.lock': 0o100644, 'source.rs': 0o100644, 'link': 0o120777,
+                 'target': 0o040700, 'unrelated': 0o100644}
+        contents = {'Cargo.lock': b'lock', 'source.rs': b'source', 'unrelated': b'new'}
+        link = ['original']
+        def metadata(path):
+            return mock.Mock(st_mode=modes[path.name])
+        with mock.patch.object(admission.Path, 'iterdir', lambda _: iter(members)), \
+                mock.patch.object(admission.Path, 'rglob', lambda self, pattern: iter(())), \
+                mock.patch.object(admission.Path, 'lstat', metadata), \
+                mock.patch.object(admission.Path, 'resolve', lambda self, strict=True: self), \
+                mock.patch.object(admission.Path, 'is_symlink', lambda self: self.name == 'link'), \
+                mock.patch.object(admission.Path, 'is_dir', lambda self: self.name == 'target'), \
+                mock.patch.object(admission.Path, 'read_bytes', lambda self: contents[self.name]), \
+                mock.patch.object(admission.os, 'readlink', lambda _: link[0]), \
+                mock.patch.object(admission, 'validate_generated_output') as validate:
+            baseline = admission.source_snapshot(root)
+            members.append(root / 'target')
+            self.assertEqual(admission.source_snapshot(root, private=private, baseline=baseline), baseline)
+            validate.assert_called_once_with(root / 'target', private)
+            self.assertNotEqual(admission.source_snapshot(root), baseline)  # Oxide stays strict.
+            contents['Cargo.lock'] = b'changed'
+            self.assertNotEqual(admission.source_snapshot(root, private=private, baseline=baseline), baseline)
+            contents['Cargo.lock'] = b'lock'
+            modes['source.rs'] = 0o100755
+            self.assertNotEqual(admission.source_snapshot(root, private=private, baseline=baseline), baseline)
+            modes['source.rs'] = 0o100644
+            link[0] = 'changed'
+            self.assertNotEqual(admission.source_snapshot(root, private=private, baseline=baseline), baseline)
+            link[0] = 'original'
+            members.append(root / 'unrelated')
+            self.assertNotEqual(admission.source_snapshot(root, private=private, baseline=baseline), baseline)
+
+    def test_generated_link_escape_is_rejected_before_external_stat(self):
+        private = admission.Path('/private')
+        info = mock.Mock(st_uid=501, st_mode=0o120777)
+        with mock.patch.object(admission.os, 'open', return_value=10), \
+                mock.patch.object(admission.os, 'close'), \
+                mock.patch.object(admission.os, 'geteuid', return_value=501), \
+                mock.patch.object(admission.os, 'fstat', return_value=mock.Mock(st_mode=0o040700)), \
+                mock.patch.object(admission.os, 'stat', return_value=info) as inspect, \
+                mock.patch.object(admission.os, 'readlink', return_value='/outside/payload'):
+            with self.assertRaisesRegex(ValueError, 'escapes'):
+                admission._owned_destination(private / 'target', private)
+            inspect.assert_called_once_with('target', dir_fd=10, follow_symlinks=False)
+
+    def test_generated_target_checks_owned_output_entries_without_reading_them(self):
+        private = admission.Path('/private')
+        target = private / 'work/target'
+        directory = mock.Mock(st_uid=501, st_mode=0o040700, st_dev=1, st_ino=2)
+        output = mock.Mock(st_uid=501, st_mode=0o100600, st_dev=1, st_ino=3)
+        child = mock.Mock()
+        child.name = 'artifact'
+        scan = mock.MagicMock()
+        scan.__enter__.return_value = iter([child])
+        with mock.patch.object(admission.os, 'lstat', return_value=directory), \
+                mock.patch.object(admission.os, 'geteuid', return_value=501), \
+                mock.patch.object(admission.Path, 'resolve', lambda self, strict=True: self), \
+                mock.patch.object(admission, '_owned_destination',
+                                  side_effect=[(target, directory, 10), (target / 'artifact', output, None)]), \
+                mock.patch.object(admission.os, 'scandir', return_value=scan), \
+                mock.patch.object(admission.os, 'close'), \
+                mock.patch.object(admission.Path, 'read_bytes', side_effect=AssertionError('output was read')):
+            admission.validate_generated_output(target, private)
+
     def test_actual_candidate_component_composition(self):
         path = admission.Path(os.environ['BARGE_TEST_CANDIDATE_COMPONENT'])
         spec = importlib.util.spec_from_file_location('actual_candidate_test', path)

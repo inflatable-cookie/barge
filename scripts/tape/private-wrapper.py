@@ -434,7 +434,8 @@ def main():
             save_inventory(label + '-after.json', after)
             admission.allocated_bytes(roots)
             admission.verify_inventory(before, after)
-            if admission.source_snapshot(work) != source_snapshot or admission.source_snapshot(source) != oxide_snapshot:
+            if (admission.source_snapshot(work, private=private, baseline=source_snapshot) != source_snapshot
+                    or admission.source_snapshot(source) != oxide_snapshot):
                 raise RuntimeError('source archive changed during a supervised child')
         if result is None or result.returncode:
             raise RuntimeError(f'{selector} did not close successfully')

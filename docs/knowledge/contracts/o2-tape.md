@@ -278,6 +278,15 @@ the unbounded process-scan exercise are not admitted by this source. They need
 their own disposition. The independently reviewed source route and a future
 positive gate are prerequisites, not current validation evidence.
 
+The Barge source archive is checked exactly before any command. Afterwards,
+the snapshot admits only the newly generated top-level `target` tree: Oxide's
+`apply_storage` names `<checkout>/target` for Cargo, and its output views can
+contain links. Every output destination must resolve, without following an
+escaped link, to owned entries inside the private root. Output bytes are not
+treated as source. All original source bytes, executable modes and symlink
+targets remain checked, and unrelated additions refuse. The unbuilt Oxide
+archive keeps the strict snapshot with no generated-output exception.
+
 The separate candidate route consumes the provider's
 `oxide.private-build-validation.candidate/1` receipt as an **unqualified**
 candidate, not as an in-root debug bootstrap. Its origin and copied executable
