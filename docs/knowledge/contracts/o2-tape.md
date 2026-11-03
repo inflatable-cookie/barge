@@ -215,7 +215,7 @@ symlinks. The accounting includes retained evidence as well as the new root;
 it cannot determine an earlier peak or establish that an unlisted root does not
 exist. Discovery completeness is an independent review obligation. Shared live
 pool and output roots are not counted as private scratch and their sizes remain
-unknown. The private root is supervised against the prospective 3 GiB ceiling less other
+unknown. The private root is supervised against the prospective 4 GiB ceiling less other
 retained private allocations. Because the supervisor monitors the new root,
 the independently reviewed `retained_roots` audit must also establish that all
 other counted roots remain quiescent for the block; before/after counts alone
@@ -224,7 +224,7 @@ cannot prove an intervening aggregate peak. No cleanup or refund follows.
 An externally authenticated `barge.validation-block/1` document binds the
 task, exact Barge head and tree, wrapper, debug Oxide, source audit and root
 ledger hashes, operator authorization reference, unique block ID, finite
-seconds, 3 GiB scratch cap, private pool cap and ordered selectors. Its digest,
+seconds, 4 GiB scratch cap, private pool cap and ordered selectors. Its digest,
 the audit and ledger digests, and paths are supplied independently via
 `BARGE_VALIDATION_BLOCK[_SHA256]`, `BARGE_VALIDATION_SOURCE_AUDIT[_SHA256]`,
 and `BARGE_VALIDATION_ROOT_LEDGER[_SHA256]`. Set the pinned supervisor, Git,
@@ -262,8 +262,12 @@ diagnostic and at most one 300-second debug bootstrap within the same
 remaining allowance. Earlier 2 GiB sessions and their evidence retain their
 original bounds. This changes no watchdog, admission, identity, one-use or
 isolation gate; it is not a new clock, a cleanup permission or runtime proof.
-The current Barge block must explicitly bind exactly 3 GiB, with its pool cap
-no greater than that limit, and retained private roots count against it.
+That 3 GiB allowance and its sessions remain historical. The planner's 2026-11-03
+prospective correction sets the Barge aggregate ceiling to 4 GiB; Oxide remains
+at 8 GiB. A new Barge block must bind exactly 4 GiB, and its issued pool remains
+256 MiB. Each run's private-root supervisor limit is the aggregate ceiling less
+the measured retained allocations; the native guard remains at most 512 MiB.
+Earlier 2 GiB and 3 GiB sessions retain their original bounds.
 
 Within the prospective block, the launcher brackets source verification and
 each actual Effigy child with bounded live before/after inventories. A changed
@@ -299,7 +303,7 @@ product_head, product_tree)` at `2f64d5aa`. Barge binds the component and its
 provider import by their reviewed hashes before loading. That fact check is not
 admission: Barge also requires actual raw guard and case receipts, nonempty
 equal live inventories, the status sentinel, origin/copy bindings and a
-separately issued one-use token. Its own block, 3 GiB ledger, host admission
+separately issued one-use token. Its own block, 4 GiB ledger, host admission
 and selector gates remain in force. An issuance's absolute use expiry may be
 later than the active guard deadline, but must still be in the future. Actual
 execution remains bounded by the earlier deadline and by the block, producer

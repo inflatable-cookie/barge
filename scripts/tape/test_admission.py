@@ -173,6 +173,9 @@ class AdmissionControls(unittest.TestCase):
             for section, key, value in (('qualification', 'state', 'unqualified'),
                                         ('live_before', None, []), ('guard', None, {}),
                                         ('issuance', 'pool_cap_bytes', 101),
+                                        ('issuance', 'scratch_cap_bytes', 3 * 1024 * 1024 * 1024),
+                                        ('issuance', 'scratch_cap_bytes', None),
+                                        ('issuance', 'scratch_cap_bytes', admission.CAP_BYTES + 1),
                                         ('issuance', 'expires_ns', 1), ('issuance', 'expires_ns', None),
                                         ('issuance', 'expires_ns', True),
                                         ('issuance', 'expires_ns', '2000'), ('issuance', 'max_seconds', 701)):
@@ -221,14 +224,19 @@ class AdmissionControls(unittest.TestCase):
                 admission.validate_block(invalid, **self.bindings)
 
     def test_approved_scratch_cap_is_exact_and_pool_is_bounded(self):
-        cap = 3 * 1024 * 1024 * 1024
+        cap = 4 * 1024 * 1024 * 1024
         self.assertEqual(admission.CAP_BYTES, cap)
-        self.assertEqual(admission.validate_block({**self.block, 'pool_cap_bytes': cap}, **self.bindings), 600)
+        self.assertEqual(admission.validate_block({**self.block, 'pool_cap_bytes': 256 * 1024 * 1024}, **self.bindings), 600)
         for changes in ({'scratch_cap_bytes': 2 * 1024 * 1024 * 1024},
+                        {'scratch_cap_bytes': 3 * 1024 * 1024 * 1024},
                         {'scratch_cap_bytes': cap + 1}, {'scratch_cap_bytes': None},
+                        {'scratch_cap_bytes': float(cap)}, {'scratch_cap_bytes': True},
                         {'pool_cap_bytes': cap + 1}, {'pool_cap_bytes': None}, {'pool_cap_bytes': 0}):
             with self.assertRaises(ValueError):
                 admission.validate_block({**self.block, **changes}, **self.bindings)
+        with self.assertRaises(ValueError):
+            admission.validate_block({key: value for key, value in self.block.items()
+                                      if key != 'scratch_cap_bytes'}, **self.bindings)
 
     def test_retained_root_allocation_refuses_above_approved_cap(self):
         root = admission.Path('/scratch/retained')
