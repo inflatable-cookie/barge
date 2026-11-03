@@ -300,9 +300,9 @@ def main():
         if build_env != expected_build_env:
             raise RuntimeError('debug build environment binding is missing or mismatched')
     else:
-        limit = min(limit, candidate_result)
-        _, _, candidate_deadline_ns, _ = candidate_module.provider.supervisor_context()
-        candidate_deadline_ns = min(candidate_deadline_ns, documents['issuance']['expires_ns'])
+        _, _, guard_deadline_ns, _ = candidate_module.provider.supervisor_context()
+        candidate_deadline_ns, limit = admission.candidate_runtime_bounds(
+            guard_deadline_ns, documents['issuance']['expires_ns'], limit, candidate_result)
     if Path(shutil.which('effigy', path=env['PATH']) or '/nonexistent').resolve() != effigy:
         raise RuntimeError('child Effigy differs from the audited binary')
     if Path(shutil.which('oxide', path=env['PATH']) or '/nonexistent').resolve() != oxide:

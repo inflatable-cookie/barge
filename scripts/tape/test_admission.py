@@ -145,7 +145,7 @@ class AdmissionControls(unittest.TestCase):
                     'scratch_cap_bytes': admission.CAP_BYTES, 'pool_cap_bytes': 100,
                     'selectors': ['rust:test:tape-private-status', 'rust:compile'],
                     'max_seconds': 600, 'planner_reference': 'issued', 'one_use_id': 'b' * 64,
-                    'expires_ns': 900, **shared}
+                    'expires_ns': 2000, **shared}
         status = ('config: /old/config.toml (selected by OXIDE_CONFIG)\n'
                   '  home: HOME /old/home (proof control OXIDE_TEST_HOME_FROM_ENV)\n'
                   'pool: /old/scratch/pool (from OXIDE_POOL)\n'
@@ -166,10 +166,16 @@ class AdmissionControls(unittest.TestCase):
                 mock.patch.object(provider, 'claim_issued_token') as claim:
             remaining, actual = admission.candidate_runtime(candidate, **kwargs)
             self.assertEqual((remaining, actual), (600, component))
+            self.assertEqual(admission.candidate_runtime_bounds(1000, issuance['expires_ns'], 700, remaining),
+                             (1000, 600))
+            self.assertEqual(admission.candidate_runtime_bounds(1000, 900, 500, remaining), (900, 500))
             claim.assert_called_once()
             for section, key, value in (('qualification', 'state', 'unqualified'),
                                         ('live_before', None, []), ('guard', None, {}),
-                                        ('issuance', 'pool_cap_bytes', 101)):
+                                        ('issuance', 'pool_cap_bytes', 101),
+                                        ('issuance', 'expires_ns', 1), ('issuance', 'expires_ns', None),
+                                        ('issuance', 'expires_ns', True),
+                                        ('issuance', 'expires_ns', '2000'), ('issuance', 'max_seconds', 701)):
                 changed = copy.deepcopy(docs)
                 if key is None:
                     changed[section] = value
@@ -177,6 +183,9 @@ class AdmissionControls(unittest.TestCase):
                     changed[section][key] = value
                 with self.subTest(section=section), self.assertRaises((ValueError, KeyError, provider.GateRefusal)):
                     admission.candidate_runtime(candidate, **{**kwargs, 'docs': changed})
+            with mock.patch.object(provider, 'now_ns', return_value=1000), self.assertRaises(ValueError):
+                admission.candidate_runtime(candidate, **kwargs)
+            claim.assert_called_once()
             with self.assertRaises((ValueError, provider.GateRefusal)):
                 admission.candidate_runtime(candidate, **{**kwargs, 'context': {**context, 'barge_head': '3' * 40}})
             with self.assertRaises(ValueError):

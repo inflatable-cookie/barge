@@ -142,11 +142,17 @@ def candidate_runtime(candidate, *, component_path, component_hash, component_co
     if checked != origin or not any(copied == root or copied.is_relative_to(root) for root in retained):
         raise ValueError('candidate origin or retained copy is unbound')
     evidence, run_id, deadline_ns, _ = provider.supervisor_context()
-    if (type(issuance.get('expires_ns')) is not int or provider.now_ns() >= issuance['expires_ns']
-            or issuance['expires_ns'] > deadline_ns):
-        raise ValueError('candidate issuance expired or exceeds supervisor')
+    now_ns = provider.now_ns()
+    if (type(issuance.get('expires_ns')) is not int or now_ns >= issuance['expires_ns']
+            or now_ns >= deadline_ns):
+        raise ValueError('candidate issuance or supervisor expired')
     provider.claim_issued_token(Path(issuance_path), digests['issuance'], run_id)
     return min(remaining, issuance['max_seconds']), module
+
+
+def candidate_runtime_bounds(guard_deadline_ns, expires_ns, block_limit, verified_limit):
+    """Keep issuance use expiry independent while bounding actual execution."""
+    return min(guard_deadline_ns, expires_ns), min(block_limit, verified_limit)
 
 
 def offline_seeder(path):

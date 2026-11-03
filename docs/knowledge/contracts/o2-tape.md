@@ -300,8 +300,11 @@ provider import by their reviewed hashes before loading. That fact check is not
 admission: Barge also requires actual raw guard and case receipts, nonempty
 equal live inventories, the status sentinel, origin/copy bindings and a
 separately issued one-use token. Its own block, 3 GiB ledger, host admission
-and selector gates remain in force. Guarded covering uses the source-bound
-shared offline seeder; missing or changed evidence refuses. This source path
+and selector gates remain in force. An issuance's absolute use expiry may be
+later than the active guard deadline, but must still be in the future. Actual
+execution remains bounded by the earlier deadline and by the block, producer
+and issuance allowances; use expiry grants no extra runtime. Guarded covering
+uses the source-bound shared offline seeder; missing or changed evidence refuses. This source path
 does not grant a runtime block or prove parity.
 
 ## Selectors
