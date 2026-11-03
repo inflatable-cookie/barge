@@ -20,6 +20,53 @@ class AdmissionControls(unittest.TestCase):
         self.bindings = dict(head='b' * 40, wrapper_hash=self.hash, oxide_hash=self.hash,
                              audit_hash=self.hash, ledger_hash=self.hash)
 
+    def test_candidate_delegates_and_refuses_unqualified_evidence(self):
+        candidate = {'schema': admission.CANDIDATE_SCHEMA, 'mode': 'candidate',
+                     'qualification': 'unqualified', 'build': {'state': 'not-built'}}
+        context = {'barge_head': 'b' * 40, 'barge_tree': 'c' * 40,
+                   'wrapper_sha256': self.hash, 'component_sha256': self.hash,
+                   'block_sha256': self.hash, 'private_root': '/private'}
+        result = {'schema': 'oxide.capture.candidate-verification/1', **context,
+                  'candidate_sha256': self.hash}
+        flags = ('qualified', 'case_and_guard_passed', 'claim_consumed', 'offline_dependencies_bound',
+                 'origin_copy_source_bound', 'toolchain_tools_bound', 'fresh_live_inventory_equal',
+                 'remaining_budget_bound', 'component_source_bound')
+        result.update({key: True for key in flags})
+        verifier = mock.Mock(return_value=result)
+        module = mock.Mock(verify_candidate=verifier)
+        kwargs = dict(candidate_hash=self.hash, component_path='/private/verified.py', component_hash=self.hash,
+                      qualification={'case': 'passed'}, guard={'closure': 'closed'},
+                      issuance={'one_use': 'fresh'}, context=context, loader=lambda _: module)
+        with mock.patch.object(admission.Path, 'resolve', lambda self, strict=True: self), \
+                mock.patch.object(admission.Path, 'is_symlink', return_value=False), \
+                mock.patch.object(admission.Path, 'is_file', return_value=True), \
+                mock.patch.object(admission.Path, 'read_bytes', return_value=b'component'), \
+                mock.patch.object(admission, 'digest', return_value=self.hash):
+            self.assertEqual(admission.candidate_runtime(candidate, **kwargs), result)
+            verifier.assert_called_once_with(candidate=candidate, qualification=kwargs['qualification'],
+                                            guard=kwargs['guard'], issuance=kwargs['issuance'], context=context)
+            for key in flags:
+                verifier.return_value = {**result, key: False}
+                with self.assertRaises(ValueError):
+                    admission.candidate_runtime(candidate, **kwargs)
+            for change in ({'barge_head': 'd' * 40}, {'candidate_sha256': 'b' * 64}):
+                verifier.return_value = {**result, **change}
+                with self.assertRaises(ValueError):
+                    admission.candidate_runtime(candidate, **kwargs)
+            verifier.return_value = result
+            with self.assertRaises(ValueError):
+                admission.candidate_runtime({**candidate, 'qualification': 'qualified'}, **kwargs)
+            with self.assertRaises(ValueError):
+                admission.candidate_runtime(candidate, **{**kwargs, 'component_hash': 'b' * 64})
+            with self.assertRaises(ValueError):
+                admission.candidate_runtime(candidate, **{**kwargs, 'guard': {}})
+            with self.assertRaises(ValueError):
+                admission.candidate_runtime(candidate, **{**kwargs, 'qualification': {}})
+            with self.assertRaises(ValueError):
+                admission.candidate_runtime(candidate, **{**kwargs, 'issuance': {}})
+            with self.assertRaises(ValueError):
+                admission.candidate_runtime(candidate, **{**kwargs, 'loader': lambda _: object()})
+
     def test_block_requires_explicit_exact_scope_and_binding(self):
         self.assertEqual(admission.validate_block(self.block, **self.bindings), 600)
         for change in ({'head': 'c' * 40}, {'authorization_reference': ''},
@@ -43,6 +90,20 @@ class AdmissionControls(unittest.TestCase):
                         {'pool_cap_bytes': cap + 1}, {'pool_cap_bytes': None}, {'pool_cap_bytes': 0}):
             with self.assertRaises(ValueError):
                 admission.validate_block({**self.block, **changes}, **self.bindings)
+
+    def test_candidate_budget_and_component_must_match_issuance(self):
+        result = {'scratch_cap_bytes': admission.CAP_BYTES, 'pool_cap_bytes': 512,
+                  'remaining_seconds': 100}
+        block = {'scratch_cap_bytes': admission.CAP_BYTES, 'pool_cap_bytes': 512}
+        audit = {'candidate_component_sha256': self.hash, 'candidate_component_commit': 'c' * 40}
+        self.assertEqual(admission.candidate_limits(result, block, 120, audit, self.hash, 'c' * 40), 100)
+        for changes in ({'remaining_seconds': 0}, {'remaining_seconds': 121},
+                        {'remaining_seconds': None}, {'scratch_cap_bytes': admission.CAP_BYTES + 1},
+                        {'pool_cap_bytes': 513}):
+            with self.assertRaises(ValueError):
+                admission.candidate_limits({**result, **changes}, block, 120, audit, self.hash, 'c' * 40)
+        with self.assertRaises(ValueError):
+            admission.candidate_limits(result, block, 120, audit, 'b' * 64, 'c' * 40)
 
     def test_retained_root_allocation_refuses_above_approved_cap(self):
         root = admission.Path('/scratch/retained')

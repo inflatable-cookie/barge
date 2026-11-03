@@ -278,6 +278,25 @@ the unbounded process-scan exercise are not admitted by this source. They need
 their own disposition. The independently reviewed source route and a future
 positive gate are prerequisites, not current validation evidence.
 
+The separate candidate route consumes the provider's
+`oxide.private-build-validation.candidate/1` receipt as an **unqualified**
+candidate, not as an in-root debug bootstrap. Its origin and copied executable
+are independently bound; no Cargo build or bootstrap receipt is fabricated.
+The launcher requires an externally digested Oxide #240 candidate verifier,
+its reviewed source commit and hash, and separately digested positive
+qualification, case/guard and one-use issuance documents. The verifier must
+expose `verify_candidate(candidate=..., qualification=..., guard=...,
+issuance=..., context=...)` and return `oxide.capture.candidate-verification/1`
+with the exact head/tree/wrapper/component/block/private-root bindings and
+positive origin/copy/source, toolchain/tools, offline dependency, fresh live
+inventory, cumulative allowance, case/guard and consumed-claim findings.
+The Barge audit separately binds the verifier's exact commit and digest; the
+existing block and root/accounting checks still apply. This component
+interface is provisional until Oxide #240 publishes and reviews it. The
+currently published handoff is refusal-only, so it cannot qualify a candidate;
+missing, incompatible or changed components refuse. This source path does not
+grant a runtime block or prove parity.
+
 ## Selectors
 
 `effigy rust:test:tape` runs the pure tape self-tests and the embedded

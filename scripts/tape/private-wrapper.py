@@ -133,82 +133,121 @@ def main():
     if sha(data) != expected:
         raise RuntimeError('debug Oxide receipt digest mismatch')
     binding = json.loads(data)
-    oxide = (private / 'bin/oxide').resolve(strict=True)
-    if not oxide.is_relative_to(private) or binding.get('executable_sha256') != sha(oxide.read_bytes()):
-        raise RuntimeError('debug Oxide executable binding mismatch')
-    if binding.get('profile') != 'debug' or binding.get('test_home_from_env') is not True:
-        raise RuntimeError('debug account-control binding missing')
-    for key in ('source_commit', 'source_tree', 'lock_sha256', 'toolchain_sha256', 'rustc_sha256'):
-        if not isinstance(binding.get(key), str) or len(binding[key]) not in (40, 64):
-            raise RuntimeError('incomplete debug Oxide provenance')
-    rustc = Path(os.environ['BARGE_PINNED_RUSTC']).resolve(strict=True)
-    if sha(rustc.read_bytes()) != binding['rustc_sha256']:
-        raise RuntimeError('rustc binding mismatch')
-    if os.environ.get('RUSTUP_TOOLCHAIN') != '1.97.1':
-        raise RuntimeError('pinned toolchain is required')
-    if binding['source_commit'] != admission.OXIDE_COMMIT or binding['source_tree'] != admission.OXIDE_TREE:
-        raise RuntimeError('debug Oxide source is not the pinned snapshot')
-    source = (private / 'oxide-source').resolve(strict=True)
-    if not source.is_relative_to(private):
-        raise RuntimeError('debug Oxide source escapes the private root')
-    files = binding.get('source_files')
-    if not isinstance(files, dict) or not files:
-        raise RuntimeError('debug Oxide source file inventory missing')
-    for rel, expected_hash in files.items():
-        if not isinstance(rel, str):
-            raise RuntimeError('debug Oxide source path is not a string')
-        path = source / rel
-        if (Path(rel).is_absolute() or '..' in Path(rel).parts
-                or path.is_symlink() or path.resolve(strict=True) != path or not path.is_file() or not isinstance(expected_hash, str)
-                or sha(path.read_bytes()) != expected_hash):
-            raise RuntimeError('debug Oxide source file binding mismatch')
-    if (files.get('Cargo.lock') != binding['lock_sha256'] or
-            files.get('rust-toolchain.toml') != binding['toolchain_sha256']):
-        raise RuntimeError('debug Oxide lock or toolchain binding mismatch')
-    build = binding.get('build')
-    if not isinstance(build, dict) or build.get('command') != ['cargo', 'build', '--offline', '--locked', '--bin', 'oxide', '--message-format=json'] \
-            or build.get('exit_code') != 0 \
-            or build.get('artifact_sha256') != sha(oxide.read_bytes()) \
-            or build.get('source_tree') != binding['source_tree'] \
-            or build.get('rustc_sha256') != binding['rustc_sha256'] \
-            or build.get('cwd') != str(source) \
-            or build.get('lock_sha256') != binding['lock_sha256'] \
-            or build.get('toolchain_sha256') != binding['toolchain_sha256']:
-        raise RuntimeError('source-bound debug build and closure evidence required')
-    for name in ('log_sha256', 'supervisor_receipt_sha256'):
-        if not isinstance(build.get(name), str) or not admission.HEX64.fullmatch(build[name]):
-            raise RuntimeError('debug build evidence digest missing')
-    for name, digest_name in (('log_path', 'log_sha256'), ('supervisor_receipt_path', 'supervisor_receipt_sha256')):
-        evidence = Path(build.get(name, '')).resolve(strict=True)
-        if not evidence.is_relative_to(private) or sha(evidence.read_bytes()) != build[digest_name]:
-            raise RuntimeError('debug build evidence is absent or changed')
-    build_supervisor = json.loads(Path(build['supervisor_receipt_path']).read_text(encoding='utf-8'))
-    admission.verify_supervisor(build_supervisor, build['command'], private)
-    artifacts = []
-    for line in Path(build['log_path']).read_bytes().splitlines():
-        try:
-            item = json.loads(line)
-        except (ValueError, UnicodeDecodeError):
-            continue
-        target = item.get('target', {})
-        if (item.get('reason') == 'compiler-artifact' and target.get('name') == 'oxide'
-                and 'bin' in target.get('kind', [])
-                and target.get('src_path') == str(source / 'src/bin/oxide/main.rs')
-                and item.get('executable')):
-            artifacts.append(Path(item['executable']).resolve(strict=True))
-    if (len(artifacts) != 1 or not artifacts[0].is_relative_to(private)
-            or sha(artifacts[0].read_bytes()) != sha(oxide.read_bytes())):
-        raise RuntimeError('debug build log does not bind the staged executable')
-    # A successful compiler is not isolation evidence. Bind and compare the
-    # actual pre/post inventories; the retained failed run cannot satisfy this.
-    before_evidence = Path(build.get('live_before_path', '')).resolve(strict=True)
-    after_evidence = Path(build.get('live_after_path', '')).resolve(strict=True)
-    if not before_evidence.is_relative_to(private) or not after_evidence.is_relative_to(private):
-        raise RuntimeError('debug build inventory evidence escapes private root')
-    before_bytes, after_bytes = before_evidence.read_bytes(), after_evidence.read_bytes()
-    if (sha(before_bytes) != build.get('live_before_sha256')
-            or sha(after_bytes) != build.get('live_after_sha256') or before_bytes != after_bytes):
-        raise RuntimeError('debug build isolation inventory did not close')
+    candidate_result = None
+    candidate_selected = binding.get('schema') == admission.CANDIDATE_SCHEMA
+    if candidate_selected:
+        component = Path(os.environ['BARGE_CANDIDATE_COMPONENT'])
+        if not component.is_relative_to(private):
+            raise RuntimeError('candidate verifier must be staged inside the private root')
+        component_hash = os.environ['BARGE_CANDIDATE_COMPONENT_SHA256']
+        component_commit = os.environ['BARGE_CANDIDATE_COMPONENT_COMMIT']
+        if len(component_commit) != 40 or any(c not in '0123456789abcdef' for c in component_commit):
+            raise RuntimeError('reviewed candidate component commit required')
+        documents = {}
+        for name in ('QUALIFICATION', 'GUARD', 'ISSUANCE'):
+            path = Path(os.environ['BARGE_CANDIDATE_' + name])
+            if (not path.is_absolute() or path.is_symlink() or path.resolve(strict=True) != path
+                    or not path.is_relative_to(private)):
+                raise RuntimeError('candidate evidence must be retained in the private root')
+            documents[name] = admission.read_json_bound(path, os.environ['BARGE_CANDIDATE_' + name + '_SHA256'])
+        context = {'barge_head': commit, 'barge_tree': block['barge_tree'],
+                   'wrapper_sha256': sha(Path(__file__).read_bytes()),
+                   'component_sha256': component_hash, 'block_sha256': block_digest,
+                   'component_commit': component_commit,
+                   'private_root': str(private)}
+        facts = binding.get('binding', {})
+        oxide = Path(binding.get('copy', {}).get('path', '')).resolve(strict=True)
+        source = (private / 'oxide-source').resolve(strict=True)
+        rustc = Path(os.environ['BARGE_PINNED_RUSTC']).resolve(strict=True)
+        files = facts.get('files')
+        if (not oxide.is_relative_to(private) or not source.is_relative_to(private)
+                or facts.get('commit') != admission.OXIDE_COMMIT or facts.get('tree') != admission.OXIDE_TREE
+                or not isinstance(files, dict) or not files
+                or facts.get('lock_sha256') != files.get('Cargo.lock')
+                or facts.get('toolchain_sha256') != files.get('rust-toolchain.toml')
+                or facts.get('oxide_sha256') != sha(oxide.read_bytes())
+                or binding.get('copy', {}).get('sha256') != facts.get('oxide_sha256')
+                or facts.get('rustc_sha256') != sha(rustc.read_bytes())
+                or os.environ.get('RUSTUP_TOOLCHAIN') != '1.97.1'):
+            raise RuntimeError('candidate source, executable or toolchain binding mismatch')
+        build = None
+    else:
+        oxide = (private / 'bin/oxide').resolve(strict=True)
+        if not oxide.is_relative_to(private) or binding.get('executable_sha256') != sha(oxide.read_bytes()):
+            raise RuntimeError('debug Oxide executable binding mismatch')
+        if binding.get('profile') != 'debug' or binding.get('test_home_from_env') is not True:
+            raise RuntimeError('debug account-control binding missing')
+        for key in ('source_commit', 'source_tree', 'lock_sha256', 'toolchain_sha256', 'rustc_sha256'):
+            if not isinstance(binding.get(key), str) or len(binding[key]) not in (40, 64):
+                raise RuntimeError('incomplete debug Oxide provenance')
+        rustc = Path(os.environ['BARGE_PINNED_RUSTC']).resolve(strict=True)
+        if sha(rustc.read_bytes()) != binding['rustc_sha256']:
+            raise RuntimeError('rustc binding mismatch')
+        if os.environ.get('RUSTUP_TOOLCHAIN') != '1.97.1':
+            raise RuntimeError('pinned toolchain is required')
+        if binding['source_commit'] != admission.OXIDE_COMMIT or binding['source_tree'] != admission.OXIDE_TREE:
+            raise RuntimeError('debug Oxide source is not the pinned snapshot')
+        source = (private / 'oxide-source').resolve(strict=True)
+        if not source.is_relative_to(private):
+            raise RuntimeError('debug Oxide source escapes the private root')
+        files = binding.get('source_files')
+        if not isinstance(files, dict) or not files:
+            raise RuntimeError('debug Oxide source file inventory missing')
+        for rel, expected_hash in files.items():
+            if not isinstance(rel, str):
+                raise RuntimeError('debug Oxide source path is not a string')
+            path = source / rel
+            if (Path(rel).is_absolute() or '..' in Path(rel).parts
+                    or path.is_symlink() or path.resolve(strict=True) != path or not path.is_file() or not isinstance(expected_hash, str)
+                    or sha(path.read_bytes()) != expected_hash):
+                raise RuntimeError('debug Oxide source file binding mismatch')
+        if (files.get('Cargo.lock') != binding['lock_sha256'] or
+                files.get('rust-toolchain.toml') != binding['toolchain_sha256']):
+            raise RuntimeError('debug Oxide lock or toolchain binding mismatch')
+        build = binding.get('build')
+        if not isinstance(build, dict) or build.get('command') != ['cargo', 'build', '--offline', '--locked', '--bin', 'oxide', '--message-format=json'] \
+                or build.get('exit_code') != 0 \
+                or build.get('artifact_sha256') != sha(oxide.read_bytes()) \
+                or build.get('source_tree') != binding['source_tree'] \
+                or build.get('rustc_sha256') != binding['rustc_sha256'] \
+                or build.get('cwd') != str(source) \
+                or build.get('lock_sha256') != binding['lock_sha256'] \
+                or build.get('toolchain_sha256') != binding['toolchain_sha256']:
+            raise RuntimeError('source-bound debug build and closure evidence required')
+        for name in ('log_sha256', 'supervisor_receipt_sha256'):
+            if not isinstance(build.get(name), str) or not admission.HEX64.fullmatch(build[name]):
+                raise RuntimeError('debug build evidence digest missing')
+        for name, digest_name in (('log_path', 'log_sha256'), ('supervisor_receipt_path', 'supervisor_receipt_sha256')):
+            evidence = Path(build.get(name, '')).resolve(strict=True)
+            if not evidence.is_relative_to(private) or sha(evidence.read_bytes()) != build[digest_name]:
+                raise RuntimeError('debug build evidence is absent or changed')
+        build_supervisor = json.loads(Path(build['supervisor_receipt_path']).read_text(encoding='utf-8'))
+        admission.verify_supervisor(build_supervisor, build['command'], private)
+        artifacts = []
+        for line in Path(build['log_path']).read_bytes().splitlines():
+            try:
+                item = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            target = item.get('target', {})
+            if (item.get('reason') == 'compiler-artifact' and target.get('name') == 'oxide'
+                    and 'bin' in target.get('kind', [])
+                    and target.get('src_path') == str(source / 'src/bin/oxide/main.rs')
+                    and item.get('executable')):
+                artifacts.append(Path(item['executable']).resolve(strict=True))
+        if (len(artifacts) != 1 or not artifacts[0].is_relative_to(private)
+                or sha(artifacts[0].read_bytes()) != sha(oxide.read_bytes())):
+            raise RuntimeError('debug build log does not bind the staged executable')
+        # A successful compiler is not isolation evidence. Bind and compare the
+        # actual pre/post inventories; the retained failed run cannot satisfy this.
+        before_evidence = Path(build.get('live_before_path', '')).resolve(strict=True)
+        after_evidence = Path(build.get('live_after_path', '')).resolve(strict=True)
+        if not before_evidence.is_relative_to(private) or not after_evidence.is_relative_to(private):
+            raise RuntimeError('debug build inventory evidence escapes private root')
+        before_bytes, after_bytes = before_evidence.read_bytes(), after_evidence.read_bytes()
+        if (sha(before_bytes) != build.get('live_before_sha256')
+                or sha(after_bytes) != build.get('live_after_sha256') or before_bytes != after_bytes):
+            raise RuntimeError('debug build isolation inventory did not close')
     supervisor = Path(os.environ['BARGE_VALIDATION_SUPERVISOR']).resolve(strict=True)
     if not supervisor.is_relative_to(private) or sha(supervisor.read_bytes()) != admission.SUPERVISOR_SHA256:
         raise RuntimeError('qualified supervisor binding missing')
@@ -239,24 +278,38 @@ def main():
             or (mode == 'validate' and (len(block['selectors']) < 2 or 'rust:test:tape-export' in block['selectors']))
             or (mode == 'export' and block['selectors'][-1] != 'rust:test:tape-export')):
         raise RuntimeError('mode and authorized selector sequence disagree')
+    if candidate_selected:
+        if (audit.get('candidate_component_sha256') != component_hash
+                or audit.get('candidate_component_commit') != component_commit):
+            raise RuntimeError('candidate component is not bound by the reviewed audit')
+        candidate_result = admission.candidate_runtime(
+            binding, candidate_hash=sha(data), component_path=component,
+            component_hash=component_hash, qualification=documents['QUALIFICATION'],
+            guard=documents['GUARD'], issuance=documents['ISSUANCE'], context=context)
+        if candidate_result.get('oxide_sha256') != facts.get('oxide_sha256'):
+            raise RuntimeError('candidate verifier and copied executable disagree')
     admission_env = admission.host_admission(os.environ, audit)
     env = admission.child_environment(os.environ, private=private, oxide=oxide, rustc=rustc,
                                       wrapper_hash=sha(Path(__file__).read_bytes()),
                                       pool_cap=block['pool_cap_bytes'], admission_env=admission_env)
-    build_env = build.get('environment')
-    expected_build_env = {key: env[key] for key in ('HOME', 'CARGO_HOME', 'TMPDIR', 'RUSTUP_HOME',
-                          'RUSTUP_TOOLCHAIN', 'RUSTC', 'OXIDE_CONFIG', 'OXIDE_POOL',
-                          'OXIDE_SCRATCH_ROOT', 'OXIDE_TASK_SCRATCH_ROOT',
-                          'OXIDE_TEST_HOME_FROM_ENV', 'CARGO_NET_OFFLINE')}
-    if build_env != expected_build_env:
-        raise RuntimeError('debug build environment binding is missing or mismatched')
+    if candidate_result is None:
+        build_env = build.get('environment')
+        expected_build_env = {key: env[key] for key in ('HOME', 'CARGO_HOME', 'TMPDIR', 'RUSTUP_HOME',
+                              'RUSTUP_TOOLCHAIN', 'RUSTC', 'OXIDE_CONFIG', 'OXIDE_POOL',
+                              'OXIDE_SCRATCH_ROOT', 'OXIDE_TASK_SCRATCH_ROOT',
+                              'OXIDE_TEST_HOME_FROM_ENV', 'CARGO_NET_OFFLINE')}
+        if build_env != expected_build_env:
+            raise RuntimeError('debug build environment binding is missing or mismatched')
+    else:
+        limit = admission.candidate_limits(candidate_result, block, limit, audit,
+                                           component_hash, component_commit)
     if Path(shutil.which('effigy', path=env['PATH']) or '/nonexistent').resolve() != effigy:
         raise RuntimeError('child Effigy differs from the audited binary')
     if Path(shutil.which('oxide', path=env['PATH']) or '/nonexistent').resolve() != oxide:
         raise RuntimeError('child Oxide differs from the audited binary')
     cargo = Path(shutil.which('cargo', path=env['PATH']) or '/nonexistent').resolve(strict=True)
     if (audit.get('child_path') != env['PATH'] or audit.get('cargo_sha256') != sha(cargo.read_bytes())
-            or build.get('cargo_sha256') != sha(cargo.read_bytes())
+            or (build.get('cargo_sha256') if build is not None else facts.get('cargo_sha256')) != sha(cargo.read_bytes())
             or audit.get('python_sha256') != sha(Path(sys.executable).resolve(strict=True).read_bytes())):
         raise RuntimeError('child PATH, Cargo or Python differs from source audit')
     rustup_home = Path(env['RUSTUP_HOME']).resolve(strict=True)
@@ -325,6 +378,12 @@ def main():
     dry_path = private / 'tape-dry-inventory.json'
     identity = {'oxide': sha(oxide.read_bytes()), 'config': sha(config.read_bytes()),
                 'receipt': sha(data), 'rustc': sha(rustc.read_bytes()), 'private': str(private)}
+    if candidate_result is not None:
+        identity.update({'candidate_receipt_sha256': sha(data),
+                         'candidate_component_sha256': component_hash,
+                         'candidate_qualification_sha256': os.environ['BARGE_CANDIDATE_QUALIFICATION_SHA256'],
+                         'candidate_verification_sha256': sha(json.dumps(candidate_result, sort_keys=True,
+                                                                          separators=(',', ':')).encode())})
     # Fixture sentinels are unique private files. Their appearance in recorded
     # status demonstrates that the actual resolver read private state and cache.
     home = private / 'home'

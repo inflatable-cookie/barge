@@ -4,6 +4,7 @@ A digest received from Queue/operator is the trust anchor for the block and
 its source audit. This module never creates a block and grants no authority.
 """
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ OXIDE_TREE = '452a9c2dc6b1432c643c5053655e029955977754'
 SUPERVISOR_SHA256 = 'fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b'
 CAP_BYTES = 3 * 1024 * 1024 * 1024
 HEX64 = re.compile(r'^[0-9a-f]{64}$')
+CANDIDATE_SCHEMA = 'oxide.private-build-validation.candidate/1'
 REQUIRED_AUDIT = frozenset(('oxide_config', 'oxide_registry', 'oxide_scratch',
                             'oxide_child', 'effigy_admission', 'rustup_cargo',
                             'compiler_linker', 'build_scripts', 'git_source', 'retained_roots'))
@@ -41,6 +43,62 @@ def read_json_bound(path, expected):
     if not isinstance(value, dict):
         raise ValueError('document is not an object')
     return value
+
+
+def candidate_runtime(candidate, *, candidate_hash, component_path, component_hash,
+                      qualification, guard, issuance, context, loader=None):
+    """Delegate candidate qualification to the independently bound Oxide component."""
+    if (candidate.get('schema') != CANDIDATE_SCHEMA or candidate.get('mode') != 'candidate'
+            or candidate.get('qualification') != 'unqualified'
+            or candidate.get('build', {}).get('state') != 'not-built'):
+        raise ValueError('not the actual unqualified provider candidate')
+    if any(not isinstance(document, dict) or not document
+           for document in (qualification, guard, issuance)):
+        raise ValueError('candidate qualification, guard and issuance are required')
+    if not isinstance(component_hash, str) or not HEX64.fullmatch(component_hash):
+        raise ValueError('independent component digest required')
+    path = Path(component_path)
+    if (not path.is_absolute() or path.is_symlink() or path.resolve(strict=True) != path
+            or not path.is_file() or digest(path.read_bytes()) != component_hash):
+        raise ValueError('canonical candidate component missing or changed')
+    if loader is None:
+        spec = importlib.util.spec_from_file_location('oxide_tape_candidate_verifier', path)
+        if spec is None or spec.loader is None:
+            raise ValueError('canonical candidate component cannot be loaded')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    else:
+        module = loader(path)
+    verify = getattr(module, 'verify_candidate', None)
+    if not callable(verify):
+        raise ValueError('canonical candidate verifier unavailable')
+    result = verify(candidate=candidate, qualification=qualification, guard=guard,
+                    issuance=issuance, context=context)
+    if not isinstance(result, dict) or result.get('schema') != 'oxide.capture.candidate-verification/1':
+        raise ValueError('canonical candidate verifier returned an incompatible result')
+    for key in ('qualified', 'case_and_guard_passed', 'claim_consumed', 'offline_dependencies_bound',
+                'origin_copy_source_bound', 'toolchain_tools_bound', 'fresh_live_inventory_equal',
+                'remaining_budget_bound', 'component_source_bound'):
+        if result.get(key) is not True:
+            raise ValueError(f'candidate {key} not established')
+    for key, value in context.items():
+        if result.get(key) != value:
+            raise ValueError(f'candidate {key} binding differs')
+    if result.get('candidate_sha256') != candidate_hash:
+        raise ValueError('candidate digest differs')
+    return result
+
+
+def candidate_limits(result, block, limit, audit, component_hash, component_commit):
+    """Retain the planner-issued cumulative budget and component binding."""
+    remaining = result.get('remaining_seconds')
+    if (audit.get('candidate_component_sha256') != component_hash
+            or audit.get('candidate_component_commit') != component_commit
+            or result.get('scratch_cap_bytes') != block['scratch_cap_bytes']
+            or result.get('pool_cap_bytes') != block['pool_cap_bytes']
+            or type(remaining) is not int or not 0 < remaining <= limit):
+        raise ValueError('candidate component or cumulative allowance mismatch')
+    return remaining
 
 
 def validate_block(block, *, head, wrapper_hash, oxide_hash, audit_hash, ledger_hash):
