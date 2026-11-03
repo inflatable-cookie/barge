@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Effect-free refusal controls. No process, inventory, build or fixture."""
 import copy
+import importlib.util
+import os
 import unittest
 from unittest import mock
 import admission
@@ -20,52 +22,112 @@ class AdmissionControls(unittest.TestCase):
         self.bindings = dict(head='b' * 40, wrapper_hash=self.hash, oxide_hash=self.hash,
                              audit_hash=self.hash, ledger_hash=self.hash)
 
-    def test_candidate_delegates_and_refuses_unqualified_evidence(self):
-        candidate = {'schema': admission.CANDIDATE_SCHEMA, 'mode': 'candidate',
-                     'qualification': 'unqualified', 'build': {'state': 'not-built'}}
-        context = {'barge_head': 'b' * 40, 'barge_tree': 'c' * 40,
-                   'wrapper_sha256': self.hash, 'component_sha256': self.hash,
-                   'block_sha256': self.hash, 'private_root': '/private'}
-        result = {'schema': 'oxide.capture.candidate-verification/1', **context,
-                  'candidate_sha256': self.hash}
-        flags = ('qualified', 'case_and_guard_passed', 'claim_consumed', 'offline_dependencies_bound',
-                 'origin_copy_source_bound', 'toolchain_tools_bound', 'fresh_live_inventory_equal',
-                 'remaining_budget_bound', 'component_source_bound')
-        result.update({key: True for key in flags})
-        verifier = mock.Mock(return_value=result)
-        module = mock.Mock(verify_candidate=verifier)
-        kwargs = dict(candidate_hash=self.hash, component_path='/private/verified.py', component_hash=self.hash,
-                      qualification={'case': 'passed'}, guard={'closure': 'closed'},
-                      issuance={'one_use': 'fresh'}, context=context, loader=lambda _: module)
-        with mock.patch.object(admission.Path, 'resolve', lambda self, strict=True: self), \
-                mock.patch.object(admission.Path, 'is_symlink', return_value=False), \
-                mock.patch.object(admission.Path, 'is_file', return_value=True), \
-                mock.patch.object(admission.Path, 'read_bytes', return_value=b'component'), \
-                mock.patch.object(admission, 'digest', return_value=self.hash):
-            self.assertEqual(admission.candidate_runtime(candidate, **kwargs), result)
-            verifier.assert_called_once_with(candidate=candidate, qualification=kwargs['qualification'],
-                                            guard=kwargs['guard'], issuance=kwargs['issuance'], context=context)
-            for key in flags:
-                verifier.return_value = {**result, key: False}
-                with self.assertRaises(ValueError):
-                    admission.candidate_runtime(candidate, **kwargs)
-            for change in ({'barge_head': 'd' * 40}, {'candidate_sha256': 'b' * 64}):
-                verifier.return_value = {**result, **change}
-                with self.assertRaises(ValueError):
-                    admission.candidate_runtime(candidate, **kwargs)
-            verifier.return_value = result
+    def test_actual_candidate_component_composition(self):
+        path = admission.Path(os.environ['BARGE_TEST_CANDIDATE_COMPONENT'])
+        spec = importlib.util.spec_from_file_location('actual_candidate_test', path)
+        component = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(component)
+        provider = component.provider
+        hashes = {name: str(index) * 64 for index, name in enumerate(
+            ('gate', 'candidate', 'qualification', 'issuance', 'guard', 'case_guard', 'live_before'), 1)}
+        hashes['live_after'] = hashes['live_before']
+        hashes['case_log'] = '9' * 64
+        artifact = 'a' * 64
+        origin = {'root': '/old', 'artifact': {'sha256': artifact, 'bytes': 10},
+                  'lock_sha256': 'lock', 'toolchain_sha256': 'toolchain',
+                  'guard': {'closure': 'closed', 'status': 0, 'census_certain': True,
+                            'census_members': 0, 'census_uncertain': 0,
+                            'receipt_sha256': 'origin-guard', 'log_sha256': 'origin-log',
+                            'receipt_path': '/origin-receipt', 'log_path': '/origin-log'}}
+        candidate = {'schema': provider.SCHEMA_CANDIDATE_RECEIPT, 'mode': 'candidate',
+                     'qualification': 'unqualified', 'ruling': provider.CANDIDATE_RULING,
+                     'status_phase': provider.STATUS_SELECTOR, 'build': {'state': 'not-built'},
+                     'origin': origin, 'copy': {'path': '/old/candidate/oxide', 'sha256': artifact},
+                     'binding': {'commit': provider.OXIDE_PIN_COMMIT, 'lock_sha256': 'lock',
+                                 'toolchain_sha256': 'toolchain', 'oxide_sha256': artifact},
+                     'live_inventory': {'before_sha256': hashes['live_before'], 'after_sha256': hashes['live_after']}}
+        guard_command = ['python', 'test-private-build-validation.py', '--candidate']
+        case_command = ['effigy', provider.STATUS_SELECTOR]
+        allowance = {'remaining_seconds': 1000}
+        gate = {'schema': provider.SCHEMA_GATE_RECEIPT, 'qualification': {'state': 'unqualified'},
+                'failures': [], 'blocks': {'oxide_block_sha256': 'prior-block'}, 'allowance': allowance,
+                'commands': [{'phase': provider.STATUS_SELECTOR, 'exit': 0, 'argv': ['guard', '--', *case_command]}],
+                'exports': {'candidate_receipt_sha256': hashes['candidate'],
+                            'candidate_copy_path': '/old/candidate/oxide', 'candidate_copy_sha256': artifact,
+                            'candidate_origin_root': '/old', 'origin_guard_receipt_sha256': 'origin-guard',
+                            'origin_build_log_sha256': 'origin-log', 'live_before_sha256': hashes['live_before'],
+                            'live_after_sha256': hashes['live_after'], 'remaining_allowance': allowance}}
+        def guard(command):
+            return {'command': command, 'scratch': '/old',
+                    'outcome': {'closure': 'closed', 'status': 0, 'fault': None, 'deadline': False, 'launched': True},
+                    'census': {'certain': True, 'members': 0, 'uncertain': 0}}
+        shared = {'retained_roots': ['/old'], 'barge_retained_roots': ['/old'], 'oxide_retained_roots': [],
+                  'offline_cache_source': '/old/cache', 'admission_env': {'hook': 'audited'},
+                  'admission_audit': {'source': 'audited'}}
+        qual = {'schema': component.QUALIFICATION_SCHEMA, 'state': 'qualified', 'review_reference': 'review',
+                'gate_sha256': hashes['gate'], 'candidate_sha256': hashes['candidate'],
+                'guard_sha256': hashes['guard'], 'case_guard_sha256': hashes['case_guard'],
+                'case_log_sha256': hashes['case_log'], 'guard_command': guard_command, 'guard_scratch': '/old',
+                'case_command': case_command, 'case_scratch': '/old', 'status_probe_id': 'probe',
+                'product_head': '1' * 40, 'product_tree': '2' * 40, 'producer_oxide_block_sha256': 'prior-block',
+                'live_before_sha256': hashes['live_before'], 'live_after_sha256': hashes['live_after'], **shared}
+        issuance = {'schema': component.ISSUANCE_SCHEMA, 'qualification_sha256': hashes['qualification'],
+                    'product_head': '1' * 40, 'product_tree': '2' * 40, 'candidate_sha256': artifact,
+                    'consumer_sha256': admission.COMPONENT_SHA256, 'provider_sha256': admission.PROVIDER_SHA256,
+                    'scratch_cap_bytes': admission.CAP_BYTES, 'pool_cap_bytes': 100,
+                    'selectors': ['rust:test:tape-private-status', 'rust:compile'],
+                    'max_seconds': 600, 'planner_reference': 'issued', 'one_use_id': 'b' * 64,
+                    'expires_ns': 900, **shared}
+        status = ('config: /old/config.toml (selected by OXIDE_CONFIG)\n'
+                  '  home: HOME /old/home (proof control OXIDE_TEST_HOME_FROM_ENV)\n'
+                  'pool: /old/scratch/pool (from OXIDE_POOL)\n'
+                  'other pool path: /old/registry-probe-probe (unrecognised; left alone)\n'
+                  'other pool path: /old/home/Library/Caches/oxide/build-pool (unrecognised; left alone)')
+        docs = {'gate': gate, 'qualification': qual, 'issuance': issuance, 'guard': guard(guard_command),
+                'case_guard': guard(case_command), 'case_log': status,
+                'live_before': [['state/pools.json']], 'live_after': [['state/pools.json']]}
+        block = {'scratch_cap_bytes': admission.CAP_BYTES, 'pool_cap_bytes': 100, 'max_seconds': 700,
+                 'selectors': ['rust:test:tape-private-status', 'rust:compile']}
+        context = {'barge_head': '1' * 40, 'barge_tree': '2' * 40}
+        kwargs = dict(component_path=path, component_hash=admission.COMPONENT_SHA256,
+                      component_commit=admission.COMPONENT_COMMIT, docs=docs, digests=hashes,
+                      context=context, issuance_path='/issued', block=block, loader=lambda _: component)
+        with mock.patch.object(provider, 'validate_candidate_origin', return_value=origin), \
+                mock.patch.object(provider, 'supervisor_context', return_value=(admission.Path('/ev'), 'run', 1000, admission.Path('/root'))), \
+                mock.patch.object(provider, 'now_ns', return_value=1), \
+                mock.patch.object(provider, 'claim_issued_token') as claim:
+            remaining, actual = admission.candidate_runtime(candidate, **kwargs)
+            self.assertEqual((remaining, actual), (600, component))
+            claim.assert_called_once()
+            for section, key, value in (('qualification', 'state', 'unqualified'),
+                                        ('live_before', None, []), ('guard', None, {}),
+                                        ('issuance', 'pool_cap_bytes', 101)):
+                changed = copy.deepcopy(docs)
+                if key is None:
+                    changed[section] = value
+                else:
+                    changed[section][key] = value
+                with self.subTest(section=section), self.assertRaises((ValueError, KeyError, provider.GateRefusal)):
+                    admission.candidate_runtime(candidate, **{**kwargs, 'docs': changed})
+            with self.assertRaises((ValueError, provider.GateRefusal)):
+                admission.candidate_runtime(candidate, **{**kwargs, 'context': {**context, 'barge_head': '3' * 40}})
             with self.assertRaises(ValueError):
-                admission.candidate_runtime({**candidate, 'qualification': 'qualified'}, **kwargs)
+                admission.candidate_runtime(candidate, **{**kwargs, 'block': {**block, 'scratch_cap_bytes': admission.CAP_BYTES + 1}})
+            claim.side_effect = provider.GateRefusal('replayed')
+            with self.assertRaises(provider.GateRefusal):
+                admission.candidate_runtime(candidate, **kwargs)
+            claim.side_effect = None
             with self.assertRaises(ValueError):
                 admission.candidate_runtime(candidate, **{**kwargs, 'component_hash': 'b' * 64})
-            with self.assertRaises(ValueError):
-                admission.candidate_runtime(candidate, **{**kwargs, 'guard': {}})
-            with self.assertRaises(ValueError):
-                admission.candidate_runtime(candidate, **{**kwargs, 'qualification': {}})
-            with self.assertRaises(ValueError):
-                admission.candidate_runtime(candidate, **{**kwargs, 'issuance': {}})
-            with self.assertRaises(ValueError):
-                admission.candidate_runtime(candidate, **{**kwargs, 'loader': lambda _: object()})
+            with mock.patch.object(admission.Path, 'read_bytes', side_effect=lambda: b'changed'):
+                with self.assertRaises(ValueError):
+                    admission.candidate_runtime(candidate, **kwargs)
+            original_read = admission.Path.read_bytes
+            def changed_provider(file):
+                return b'changed' if file.name == 'test-private-build-validation.py' else original_read(file)
+            with mock.patch.object(admission.Path, 'read_bytes', autospec=True, side_effect=changed_provider):
+                with self.assertRaises(ValueError):
+                    admission.candidate_runtime(candidate, **kwargs)
 
     def test_block_requires_explicit_exact_scope_and_binding(self):
         self.assertEqual(admission.validate_block(self.block, **self.bindings), 600)
@@ -90,20 +152,6 @@ class AdmissionControls(unittest.TestCase):
                         {'pool_cap_bytes': cap + 1}, {'pool_cap_bytes': None}, {'pool_cap_bytes': 0}):
             with self.assertRaises(ValueError):
                 admission.validate_block({**self.block, **changes}, **self.bindings)
-
-    def test_candidate_budget_and_component_must_match_issuance(self):
-        result = {'scratch_cap_bytes': admission.CAP_BYTES, 'pool_cap_bytes': 512,
-                  'remaining_seconds': 100}
-        block = {'scratch_cap_bytes': admission.CAP_BYTES, 'pool_cap_bytes': 512}
-        audit = {'candidate_component_sha256': self.hash, 'candidate_component_commit': 'c' * 40}
-        self.assertEqual(admission.candidate_limits(result, block, 120, audit, self.hash, 'c' * 40), 100)
-        for changes in ({'remaining_seconds': 0}, {'remaining_seconds': 121},
-                        {'remaining_seconds': None}, {'scratch_cap_bytes': admission.CAP_BYTES + 1},
-                        {'pool_cap_bytes': 513}):
-            with self.assertRaises(ValueError):
-                admission.candidate_limits({**result, **changes}, block, 120, audit, self.hash, 'c' * 40)
-        with self.assertRaises(ValueError):
-            admission.candidate_limits(result, block, 120, audit, 'b' * 64, 'c' * 40)
 
     def test_retained_root_allocation_refuses_above_approved_cap(self):
         root = admission.Path('/scratch/retained')

@@ -99,8 +99,8 @@ lists the commands. Each covers what it names:
 - `effigy rust:test:tape-export:pure` — pure Git blob identity controls; no
   build, fixture or export.
 - `effigy rust:test:tape-admission:pure` — mocked admission refusal controls;
-  includes the candidate verifier handoff; no inventory, child process,
-  fixture or build.
+  includes composition with the hash-bound Oxide candidate component named by
+  `BARGE_TEST_CANDIDATE_COMPONENT`; no live inventory, fixture or build.
 - `effigy rust:test:tape-private-export` — source-defined private wrapper; it
   requires independently reviewed admission and resource evidence and a new
   authorized block. Neither is established for the retained failed route.

@@ -144,17 +144,18 @@ def main():
         if len(component_commit) != 40 or any(c not in '0123456789abcdef' for c in component_commit):
             raise RuntimeError('reviewed candidate component commit required')
         documents = {}
-        for name in ('QUALIFICATION', 'GUARD', 'ISSUANCE'):
+        candidate_digests = {'candidate': sha(data)}
+        for name in ('GATE', 'QUALIFICATION', 'GUARD', 'CASE_GUARD', 'ISSUANCE',
+                     'LIVE_BEFORE', 'LIVE_AFTER', 'CASE_LOG'):
             path = Path(os.environ['BARGE_CANDIDATE_' + name])
             if (not path.is_absolute() or path.is_symlink() or path.resolve(strict=True) != path
                     or not path.is_relative_to(private)):
                 raise RuntimeError('candidate evidence must be retained in the private root')
-            documents[name] = admission.read_json_bound(path, os.environ['BARGE_CANDIDATE_' + name + '_SHA256'])
-        context = {'barge_head': commit, 'barge_tree': block['barge_tree'],
-                   'wrapper_sha256': sha(Path(__file__).read_bytes()),
-                   'component_sha256': component_hash, 'block_sha256': block_digest,
-                   'component_commit': component_commit,
-                   'private_root': str(private)}
+            expected_digest = os.environ['BARGE_CANDIDATE_' + name + '_SHA256']
+            documents[name.lower()] = admission.read_candidate_document(path, expected_digest, text=name == 'CASE_LOG')
+            candidate_digests[name.lower()] = expected_digest
+        issuance_path = Path(os.environ['BARGE_CANDIDATE_ISSUANCE'])
+        context = {'barge_head': commit, 'barge_tree': block['barge_tree']}
         facts = binding.get('binding', {})
         oxide = Path(binding.get('copy', {}).get('path', '')).resolve(strict=True)
         source = (private / 'oxide-source').resolve(strict=True)
@@ -282,12 +283,10 @@ def main():
         if (audit.get('candidate_component_sha256') != component_hash
                 or audit.get('candidate_component_commit') != component_commit):
             raise RuntimeError('candidate component is not bound by the reviewed audit')
-        candidate_result = admission.candidate_runtime(
-            binding, candidate_hash=sha(data), component_path=component,
-            component_hash=component_hash, qualification=documents['QUALIFICATION'],
-            guard=documents['GUARD'], issuance=documents['ISSUANCE'], context=context)
-        if candidate_result.get('oxide_sha256') != facts.get('oxide_sha256'):
-            raise RuntimeError('candidate verifier and copied executable disagree')
+        candidate_result, candidate_module = admission.candidate_runtime(
+            binding, component_path=component, component_hash=component_hash,
+            component_commit=component_commit, docs=documents, digests=candidate_digests,
+            context=context, issuance_path=issuance_path, block=block)
     admission_env = admission.host_admission(os.environ, audit)
     env = admission.child_environment(os.environ, private=private, oxide=oxide, rustc=rustc,
                                       wrapper_hash=sha(Path(__file__).read_bytes()),
@@ -301,8 +300,9 @@ def main():
         if build_env != expected_build_env:
             raise RuntimeError('debug build environment binding is missing or mismatched')
     else:
-        limit = admission.candidate_limits(candidate_result, block, limit, audit,
-                                           component_hash, component_commit)
+        limit = min(limit, candidate_result)
+        _, _, candidate_deadline_ns, _ = candidate_module.provider.supervisor_context()
+        candidate_deadline_ns = min(candidate_deadline_ns, documents['issuance']['expires_ns'])
     if Path(shutil.which('effigy', path=env['PATH']) or '/nonexistent').resolve() != effigy:
         raise RuntimeError('child Effigy differs from the audited binary')
     if Path(shutil.which('oxide', path=env['PATH']) or '/nonexistent').resolve() != oxide:
@@ -312,6 +312,17 @@ def main():
             or (build.get('cargo_sha256') if build is not None else facts.get('cargo_sha256')) != sha(cargo.read_bytes())
             or audit.get('python_sha256') != sha(Path(sys.executable).resolve(strict=True).read_bytes())):
         raise RuntimeError('child PATH, Cargo or Python differs from source audit')
+    if candidate_result is not None:
+        tools = documents['issuance']['tools']
+        for name, path in (('effigy', effigy), ('rustc', rustc), ('cargo', cargo),
+                           ('supervisor', supervisor), ('git', git),
+                           ('python', Path(sys.executable).resolve(strict=True))):
+            if tools.get(name) != {'path': str(path), 'sha256': sha(path.read_bytes())}:
+                raise RuntimeError('candidate issuance tool differs from the audited child')
+        for value in documents['issuance']['barge_retained_roots']:
+            path = Path(value)
+            if not any(path == root or path.is_relative_to(root) for root in roots):
+                raise RuntimeError('qualified Barge retained root is not accounted')
     rustup_home = Path(env['RUSTUP_HOME']).resolve(strict=True)
     if not rustc.is_relative_to(rustup_home):
         raise RuntimeError('pinned rustc is outside the selected RUSTUP_HOME')
@@ -382,8 +393,7 @@ def main():
         identity.update({'candidate_receipt_sha256': sha(data),
                          'candidate_component_sha256': component_hash,
                          'candidate_qualification_sha256': os.environ['BARGE_CANDIDATE_QUALIFICATION_SHA256'],
-                         'candidate_verification_sha256': sha(json.dumps(candidate_result, sort_keys=True,
-                                                                          separators=(',', ':')).encode())})
+                         'candidate_remaining_seconds': candidate_result})
     # Fixture sentinels are unique private files. Their appearance in recorded
     # status demonstrates that the actual resolver read private state and cache.
     home = private / 'home'
@@ -401,6 +411,8 @@ def main():
 
     def run_checked(selector, arguments, label):
         remaining = int(limit - (time.monotonic() - started))
+        if candidate_result is not None:
+            remaining = min(remaining, (candidate_deadline_ns - candidate_module.provider.now_ns()) // 1_000_000_000)
         if remaining < 60:
             raise RuntimeError('authorized covering block has insufficient remaining time')
         before = inventory()
@@ -449,6 +461,29 @@ def main():
     env['BARGE_TAPE_DRY_SHA256'] = sha(dry_path.read_bytes())
     if mode == 'dry':
         return
+    if candidate_result is not None:
+        seeder = component.with_name('offline_seed.py')
+        if audit.get('candidate_seeder_sha256') != admission.SEEDER_SHA256:
+            raise RuntimeError('shared offline seeder is not bound by the audit')
+        seed = admission.offline_seeder(seeder)
+        cache_source = Path(documents['issuance']['offline_cache_source'])
+        if (not cache_source.is_absolute() or cache_source.resolve(strict=True) != cache_source
+                or not cache_source.is_dir() or cache_source.stat().st_uid != os.geteuid()):
+            raise RuntimeError('qualified offline cache source unavailable')
+        lock = (work / 'Cargo.lock').read_bytes()
+        if sha(lock) != documents['issuance'].get('product_lock_sha256'):
+            raise RuntimeError('offline seed lock is not bound by issuance')
+        before = inventory()
+        save_inventory('tape-seed-before.json', before)
+        try:
+            seed_receipt = seed(cache_source, private / 'cache', lock, deadline_ns=candidate_deadline_ns)
+            with (private / 'tape-seed.json').open('x', encoding='utf-8') as out:
+                json.dump(seed_receipt, out, sort_keys=True)
+        finally:
+            after = inventory()
+            save_inventory('tape-seed-after.json', after)
+            admission.allocated_bytes(roots)
+            admission.verify_inventory(before, after)
     for index, selector in enumerate(block['selectors'][1:]):
         arguments = ['--', repo, commit, export] if selector == 'rust:test:tape-export' else []
         run_checked(selector, arguments, f'tape-command-{index}')

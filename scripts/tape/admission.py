@@ -45,22 +45,33 @@ def read_json_bound(path, expected):
     return value
 
 
-def candidate_runtime(candidate, *, candidate_hash, component_path, component_hash,
-                      qualification, guard, issuance, context, loader=None):
-    """Delegate candidate qualification to the independently bound Oxide component."""
-    if (candidate.get('schema') != CANDIDATE_SCHEMA or candidate.get('mode') != 'candidate'
-            or candidate.get('qualification') != 'unqualified'
-            or candidate.get('build', {}).get('state') != 'not-built'):
-        raise ValueError('not the actual unqualified provider candidate')
-    if any(not isinstance(document, dict) or not document
-           for document in (qualification, guard, issuance)):
-        raise ValueError('candidate qualification, guard and issuance are required')
-    if not isinstance(component_hash, str) or not HEX64.fullmatch(component_hash):
-        raise ValueError('independent component digest required')
+def read_candidate_document(path, expected, *, text=False):
+    if not isinstance(expected, str) or not HEX64.fullmatch(expected):
+        raise ValueError('independent evidence digest required')
+    with open(path, 'rb') as source:
+        data = source.read(8 * 1024 * 1024 + 1)
+    if len(data) > 8 * 1024 * 1024 or digest(data) != expected:
+        raise ValueError('candidate evidence missing, changed or over bound')
+    return data.decode('utf-8') if text else json.loads(data)
+
+
+COMPONENT_SHA256 = '0bd4f39b88d3042089545fd8b6a166496ffdfe2fa7d8c2acf71f26d66761a79b'
+PROVIDER_SHA256 = '26e0f82e4278d3322c8ddc8343cbe6bd18b106a92aa9b7ca2c3c04953f8abd3c'
+SEEDER_SHA256 = '5cbf42e127eb07c0eecbe96e82f47b72c64b144e3f0a922e45ec1bdcd66e374d'
+COMPONENT_COMMIT = '2f64d5aae0b9de93cba283d6b7be53a511e88ad6'
+
+
+def candidate_runtime(candidate, *, component_path, component_hash, component_commit,
+                      docs, digests, context, issuance_path, block, loader=None):
+    """Compose the canonical Oxide facts with Barge's own admission bounds."""
     path = Path(component_path)
-    if (not path.is_absolute() or path.is_symlink() or path.resolve(strict=True) != path
-            or not path.is_file() or digest(path.read_bytes()) != component_hash):
-        raise ValueError('canonical candidate component missing or changed')
+    provider_path = path.with_name('test-private-build-validation.py')
+    if component_commit != COMPONENT_COMMIT or component_hash != COMPONENT_SHA256:
+        raise ValueError('unreviewed candidate component identity')
+    for source, expected in ((path, COMPONENT_SHA256), (provider_path, PROVIDER_SHA256)):
+        if (not source.is_absolute() or source.is_symlink() or source.resolve(strict=True) != source
+                or not source.is_file() or digest(source.read_bytes()) != expected):
+            raise ValueError('candidate component or import closure changed')
     if loader is None:
         spec = importlib.util.spec_from_file_location('oxide_tape_candidate_verifier', path)
         if spec is None or spec.loader is None:
@@ -69,36 +80,87 @@ def candidate_runtime(candidate, *, candidate_hash, component_path, component_ha
         spec.loader.exec_module(module)
     else:
         module = loader(path)
-    verify = getattr(module, 'verify_candidate', None)
-    if not callable(verify):
-        raise ValueError('canonical candidate verifier unavailable')
-    result = verify(candidate=candidate, qualification=qualification, guard=guard,
-                    issuance=issuance, context=context)
-    if not isinstance(result, dict) or result.get('schema') != 'oxide.capture.candidate-verification/1':
-        raise ValueError('canonical candidate verifier returned an incompatible result')
-    for key in ('qualified', 'case_and_guard_passed', 'claim_consumed', 'offline_dependencies_bound',
-                'origin_copy_source_bound', 'toolchain_tools_bound', 'fresh_live_inventory_equal',
-                'remaining_budget_bound', 'component_source_bound'):
-        if result.get(key) is not True:
-            raise ValueError(f'candidate {key} not established')
-    for key, value in context.items():
-        if result.get(key) != value:
-            raise ValueError(f'candidate {key} binding differs')
-    if result.get('candidate_sha256') != candidate_hash:
-        raise ValueError('candidate digest differs')
-    return result
+    provider = module.provider
+    before, after = docs['live_before'], docs['live_after']
+    if not isinstance(before, list) or not before or before != after:
+        raise ValueError('candidate live inventory is missing, empty or changed')
+    qualification = docs['qualification']
+    guard_command = qualification['guard_command']
+    case_command = qualification['case_command']
+    if ('--candidate' not in guard_command
+            or not any(Path(part).name == 'test-private-build-validation.py' for part in guard_command)
+            or not case_command or case_command[-1] != provider.STATUS_SELECTOR):
+        raise ValueError('candidate guard or case command is not bound')
+    provider.validate_supervisor_receipt(docs['guard'], guard_command, Path(qualification['guard_scratch']))
+    provider.validate_supervisor_receipt(docs['case_guard'], case_command, Path(qualification['case_scratch']))
+    copied = Path(candidate['copy']['path'])
+    root = copied.parent.parent
+    probe = qualification['status_probe_id']
+    if not isinstance(probe, str) or not provider.BLOCK_ID.fullmatch(probe):
+        raise ValueError('candidate status sentinel identity invalid')
+    provider.verify_probe(docs['case_log'], home=root / 'home', config=root / 'config.toml',
+                          pool=root / 'scratch/pool', registry_probe=root / ('registry-probe-' + probe),
+                          cache_probe=root / 'home/Library/Caches/oxide/build-pool')
+    remaining = module.verify_candidate_facts(docs['gate'], candidate, qualification, digests,
+                                               context['barge_head'], context['barge_tree'])
+    issuance = docs['issuance']
+    if (issuance.get('schema') != module.ISSUANCE_SCHEMA
+            or issuance.get('qualification_sha256') != digests['qualification']
+            or issuance.get('product_head') != context['barge_head']
+            or issuance.get('product_tree') != context['barge_tree']
+            or issuance.get('candidate_sha256') != candidate['copy']['sha256']
+            or issuance.get('consumer_sha256') != COMPONENT_SHA256
+            or issuance.get('provider_sha256') != PROVIDER_SHA256
+            or block.get('scratch_cap_bytes') != CAP_BYTES
+            or issuance.get('pool_cap_bytes') != block['pool_cap_bytes']
+            or issuance.get('selectors') != block['selectors']
+            or type(issuance.get('max_seconds')) is not int
+            or not 0 < issuance['max_seconds'] <= remaining
+            or issuance['max_seconds'] > block['max_seconds']
+            or not isinstance(issuance.get('planner_reference'), str)
+            or not issuance['planner_reference'].strip()
+            or not isinstance(issuance.get('one_use_id'), str)
+            or not HEX64.fullmatch(issuance['one_use_id'])):
+        raise ValueError('candidate issuance does not bind the Barge block')
+    for key in ('retained_roots', 'barge_retained_roots', 'oxide_retained_roots',
+                'offline_cache_source', 'admission_env', 'admission_audit'):
+        if key not in qualification or issuance.get(key) != qualification[key]:
+            raise ValueError('candidate issuance differs from qualification')
+    retained = [Path(value) for value in issuance['retained_roots']]
+    origin = candidate['origin']
+    options = {'candidate_lock_sha256': origin['lock_sha256'],
+               'candidate_toolchain_sha256': origin['toolchain_sha256'],
+               'candidate_receipt': origin['guard']['receipt_path'],
+               'expect_candidate_receipt': origin['guard']['receipt_sha256'],
+               'candidate_log': origin['guard']['log_path'],
+               'expect_candidate_log': origin['guard']['log_sha256'],
+               'expect_candidate': issuance['candidate_sha256'],
+               'candidate_bytes': origin['artifact']['bytes']}
+    checked = provider.validate_candidate_origin(origin_root=Path(origin['root']), options=options,
+        ledger_roots=retained, pinned_lock_sha256=candidate['binding']['lock_sha256'],
+        pinned_toolchain_sha256=candidate['binding']['toolchain_sha256'])
+    if checked != origin or not any(copied == root or copied.is_relative_to(root) for root in retained):
+        raise ValueError('candidate origin or retained copy is unbound')
+    evidence, run_id, deadline_ns, _ = provider.supervisor_context()
+    if (type(issuance.get('expires_ns')) is not int or provider.now_ns() >= issuance['expires_ns']
+            or issuance['expires_ns'] > deadline_ns):
+        raise ValueError('candidate issuance expired or exceeds supervisor')
+    provider.claim_issued_token(Path(issuance_path), digests['issuance'], run_id)
+    return min(remaining, issuance['max_seconds']), module
 
 
-def candidate_limits(result, block, limit, audit, component_hash, component_commit):
-    """Retain the planner-issued cumulative budget and component binding."""
-    remaining = result.get('remaining_seconds')
-    if (audit.get('candidate_component_sha256') != component_hash
-            or audit.get('candidate_component_commit') != component_commit
-            or result.get('scratch_cap_bytes') != block['scratch_cap_bytes']
-            or result.get('pool_cap_bytes') != block['pool_cap_bytes']
-            or type(remaining) is not int or not 0 < remaining <= limit):
-        raise ValueError('candidate component or cumulative allowance mismatch')
-    return remaining
+def offline_seeder(path):
+    """Load the same reviewed offline seeder, never a network fallback."""
+    path = Path(path)
+    if (not path.is_absolute() or path.is_symlink() or path.resolve(strict=True) != path
+            or not path.is_file() or digest(path.read_bytes()) != SEEDER_SHA256):
+        raise ValueError('shared offline seeder missing or changed')
+    spec = importlib.util.spec_from_file_location('oxide_offline_seed', path)
+    if spec is None or spec.loader is None:
+        raise ValueError('shared offline seeder unavailable')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.seed_cargo_home
 
 
 def validate_block(block, *, head, wrapper_hash, oxide_hash, audit_hash, ledger_hash):

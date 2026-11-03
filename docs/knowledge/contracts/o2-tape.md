@@ -284,18 +284,16 @@ candidate, not as an in-root debug bootstrap. Its origin and copied executable
 are independently bound; no Cargo build or bootstrap receipt is fabricated.
 The launcher requires an externally digested Oxide #240 candidate verifier,
 its reviewed source commit and hash, and separately digested positive
-qualification, case/guard and one-use issuance documents. The verifier must
-expose `verify_candidate(candidate=..., qualification=..., guard=...,
-issuance=..., context=...)` and return `oxide.capture.candidate-verification/1`
-with the exact head/tree/wrapper/component/block/private-root bindings and
-positive origin/copy/source, toolchain/tools, offline dependency, fresh live
-inventory, cumulative allowance, case/guard and consumed-claim findings.
-The Barge audit separately binds the verifier's exact commit and digest; the
-existing block and root/accounting checks still apply. This component
-interface is provisional until Oxide #240 publishes and reviews it. The
-currently published handoff is refusal-only, so it cannot qualify a candidate;
-missing, incompatible or changed components refuse. This source path does not
-grant a runtime block or prove parity.
+qualification, case/guard and one-use issuance documents. The verifier is
+Oxide #240's `verify_candidate_facts(gate, candidate, qualification, digests,
+product_head, product_tree)` at `2f64d5aa`. Barge binds the component and its
+provider import by their reviewed hashes before loading. That fact check is not
+admission: Barge also requires actual raw guard and case receipts, nonempty
+equal live inventories, the status sentinel, origin/copy bindings and a
+separately issued one-use token. Its own block, 3 GiB ledger, host admission
+and selector gates remain in force. Guarded covering uses the source-bound
+shared offline seeder; missing or changed evidence refuses. This source path
+does not grant a runtime block or prove parity.
 
 ## Selectors
 
