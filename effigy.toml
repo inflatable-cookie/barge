@@ -17,8 +17,22 @@ alias = "barge"
 # (docs/knowledge/contracts/stage4-design.md, F6-R1), which no ordinary test or
 # build enables; compile and lint must still see its code.
 "rust:compile" = "oxide check --workspace --all-targets --all-features --locked"
+# The default-feature release-profile compile: proves the cfg(test)-only tape
+# (crates/barge/src/tape.rs, tape_harness.rs, tests/tape_eval.rs) compiles away
+# — a production build names none of it, so any non-cfg'd call site would fail
+# here (docs/knowledge/contracts/o2-tape.md).
+"rust:compile:release" = "oxide check --release --workspace --bins --locked"
 "rust:format" = "oxide fmt --all -- --check"
 "rust:lint" = "oxide clippy --workspace --all-targets --all-features --locked -- -D warnings"
+# Capture-only covering exception; planner activates these with the pinned Cargo,
+# offline dependencies and the qualified supervisor. Ordinary selectors stay on Oxide.
+"rust:compile:cargo" = "cargo check --workspace --all-targets --all-features --locked"
+"rust:compile:release:cargo" = "cargo check --release --workspace --bins --locked"
+"rust:format:cargo" = "cargo fmt --all -- --check"
+"rust:lint:cargo" = "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"
+"rust:test:tape:cargo" = "cargo test --locked -p barge --lib tape"
+"rust:test:tape-eval:cargo" = "cargo test --locked -p barge --test tape_eval"
+"rust:test:tape-stage:cargo" = "cargo test --locked -p barge --test tape_eval --no-run --message-format json"
 # Read-only OS-layer diagnostic (crates/barge/examples/volume_probe.rs):
 # BARGE_OS_PROBE_PATH names one directory to read, and nothing is written.
 "os:volumes:probe" = "oxide run -p barge --locked --example volume_probe"
@@ -28,6 +42,22 @@ alias = "barge"
 # Individually bounded target runs support exact-head covering evidence.
 "rust:test:prewarm" = "oxide test --admission-budget 300s --execution-budget 600s --workspace --all-targets --locked --no-run"
 "rust:test:lib" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib"
+# The B-S1 capture tape's pure self-tests (recorder roundtrip, caps, refusal
+# document, statement discipline) plus the embedded end-to-end fixture
+# exercise of the actual harness (docs/knowledge/contracts/o2-tape.md).
+"rust:test:tape" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib tape"
+# Recorder-only tests: excludes the harness exercise and its real process scan.
+"rust:test:tape:pure" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib tape::tests"
+"rust:test:tape-eval" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --test tape_eval"
+# Build only; the exporter consumes the compiler's artifact record.
+"rust:test:tape-stage" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --test tape_eval --no-run --message-format json"
+"rust:test:tape-export" = "python3 scripts/tape/export.py"
+"rust:test:tape-export:pure" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/tape/test_export.py"
+"rust:test:tape-admission:pure" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/tape/test_admission.py"
+"rust:test:tape-private-export" = "python3 scripts/tape/private-wrapper.py"
+# Recorded status is the read-only effective configuration probe; the private
+# wrapper brackets it with the live inventory and checks the sentinel output.
+"rust:test:tape-private-status" = "oxide status"
 "rust:test:native-harness" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --test native_proof_harness"
 "rust:test:volume-probe" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --example volume_probe"
 "rust:test:cli" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge-cli --bin barge"

@@ -722,15 +722,39 @@ impl VolumeRoot {
                 })?;
                 let verified =
                     os::verify_volume(facts, mounts, mount_hint, &record.expected_volume())?;
+                #[cfg(test)]
+                crate::tape::volume(
+                    "area::VolumeRoot::open_with",
+                    crate::tape::Identity::volume(
+                        Some(record.volume_uuid.as_str()),
+                        Some(verified.path()),
+                    ),
+                    crate::tape::Outcome::facts("verified"),
+                );
                 (verified.path().to_path_buf(), verified.identity().clone())
             }
             MountLookup::ByUuid(locator) => {
                 let located = os::locate_volume(locator, facts, mounts, &record.volume_uuid)?;
+                #[cfg(test)]
+                crate::tape::volume(
+                    "area::VolumeRoot::open_with",
+                    crate::tape::Identity::volume(
+                        Some(record.volume_uuid.as_str()),
+                        Some(located.path()),
+                    ),
+                    crate::tape::Outcome::facts("located"),
+                );
                 (located.path().to_path_buf(), located.identity().clone())
             }
         };
         let handle = dirs.open_path(&mount)?;
         if handle.identity().device != identity.device {
+            #[cfg(test)]
+            crate::tape::volume(
+                "area::VolumeRoot::open_with",
+                crate::tape::Identity::volume(Some(record.volume_uuid.as_str()), Some(&mount)),
+                crate::tape::Outcome::refused("device_mismatch"),
+            );
             return Err(Error::new(
                 ErrorKind::VolumeMismatch,
                 format!(
@@ -744,6 +768,12 @@ impl VolumeRoot {
             .with_detail("opened_device", handle.identity().device.to_string().into())
             .with_detail("volume_device", identity.device.to_string().into()));
         }
+        #[cfg(test)]
+        crate::tape::volume(
+            "area::VolumeRoot::open_with",
+            crate::tape::Identity::volume(Some(record.volume_uuid.as_str()), Some(&mount)),
+            crate::tape::Outcome::facts("opened"),
+        );
         Ok(Self {
             handle,
             identity,
@@ -1544,6 +1574,16 @@ pub(crate) fn resolve_by(
             device,
         }
     };
+    #[cfg(test)]
+    crate::tape::verdict(
+        "area::resolve_by",
+        crate::tape::Identity::volume(Some(record.volume_uuid.as_str()), Some(&base)),
+        if matches!(dirs_state, Direction::Existing { .. }) {
+            "resolved;folder-exists"
+        } else {
+            "resolved;folder-missing"
+        },
+    );
     Ok(ResolvedArea {
         volume_uuid: record.volume_uuid.clone(),
         mount_point: base,
@@ -2917,16 +2957,37 @@ pub fn read_declarations(state: &StatePaths) -> Result<DeclarationSet> {
 pub(crate) fn read_directory(path: &Path) -> Result<Option<Vec<String>>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
+        #[cfg(not(test))]
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(test)]
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::tape::read_absent("area::read_directory", path);
+            return Ok(None);
+        }
         Err(error) => {
+            #[cfg(test)]
+            crate::tape::stat_refused(
+                "area::read_directory",
+                path,
+                &crate::tape::errno_class(&error),
+            );
+            #[cfg(test)]
             return Err(Error::new(
                 ErrorKind::Io,
                 format!("cannot read {}: {error}", path.display()),
             )
-            .with_detail("path", path.display().to_string().into()))
+            .with_detail("path", path.display().to_string().into()));
+            #[cfg(not(test))]
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!("cannot read {}: {error}", path.display()),
+            )
+            .with_detail("path", path.display().to_string().into()));
         }
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        #[cfg(test)]
+        crate::tape::read_refused("area::read_directory", path, "not_a_real_directory");
         return Err(Error::new(
             ErrorKind::UnknownState,
             format!("{} is not a real directory", path.display()),
@@ -2935,6 +2996,12 @@ pub(crate) fn read_directory(path: &Path) -> Result<Option<Vec<String>>> {
     }
     let mut names = Vec::new();
     let entries = std::fs::read_dir(path).map_err(|error| {
+        #[cfg(test)]
+        crate::tape::listing_refused(
+            "area::read_directory",
+            path,
+            &crate::tape::errno_class(&error),
+        );
         Error::new(
             ErrorKind::Io,
             format!("cannot list {}: {error}", path.display()),
@@ -2943,15 +3010,31 @@ pub(crate) fn read_directory(path: &Path) -> Result<Option<Vec<String>>> {
     })?;
     for entry in entries {
         let entry = entry.map_err(|error| {
+            #[cfg(test)]
+            crate::tape::listing_refused(
+                "area::read_directory",
+                path,
+                &crate::tape::errno_class(&error),
+            );
             Error::new(
                 ErrorKind::Io,
                 format!("cannot list {}: {error}", path.display()),
             )
             .with_detail("path", path.display().to_string().into())
         })?;
+        #[cfg(test)]
+        crate::tape::dir_entry("area::read_directory", None, &entry.file_name());
         names.push(entry.file_name().to_string_lossy().into_owned());
     }
     names.sort();
+    #[cfg(test)]
+    crate::tape::listing(
+        "area::read_directory",
+        path,
+        names.len(),
+        names.len(),
+        false,
+    );
     Ok(Some(names))
 }
 
@@ -3766,9 +3849,18 @@ fn read_hold_directory(
 ) -> Result<HoldReading> {
     let directory = state.holds_dir().join(root_id);
     let Some(names) = read_directory(&directory)? else {
+        #[cfg(test)]
+        crate::tape::read_absent("area::read_holds", &directory);
         return Ok(HoldReading::empty());
     };
     let effective_uid = observer.effective_uid()?;
+    #[cfg(test)]
+    crate::tape::scalar(
+        "area::read_holds",
+        "uid",
+        crate::tape::Identity::none(),
+        &effective_uid.to_string(),
+    );
     let mut holds = Vec::new();
     let total = names.len();
     for name in names.into_iter().take(HOLD_ROWS) {
@@ -3795,12 +3887,20 @@ fn read_hold_directory(
         }
         let path = directory.join(&name);
         let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            #[cfg(test)]
+            crate::tape::stat_refused("area::read_holds", &path, &crate::tape::errno_class(&error));
             Error::new(
                 ErrorKind::Io,
                 format!("cannot read {}: {error}", path.display()),
             )
             .with_detail("path", path.display().to_string().into())
         })?;
+        #[cfg(test)]
+        crate::tape::stat(
+            "area::read_holds",
+            &path,
+            Some((metadata.dev(), metadata.ino(), "hold-file")),
+        );
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             holds.push(unknown_hold(
                 holder,
@@ -5285,11 +5385,20 @@ pub fn list_names(
     let handle = match &resolved.dirs {
         Direction::Existing { handle } => dirs.duplicate_dir(handle)?,
         Direction::Missing { .. } => {
+            #[cfg(test)]
+            crate::tape::listing("area::list_names", resolved.path.as_path(), 0, 0, false);
+            #[cfg(test)]
             return Ok(NameListing {
                 names: Vec::new(),
                 examined: 0,
                 truncated: false,
-            })
+            });
+            #[cfg(not(test))]
+            return Ok(NameListing {
+                names: Vec::new(),
+                examined: 0,
+                truncated: false,
+            });
         }
     };
     let name_cap = max_roots.clamp(1, LISTING_NAME_ROWS);
@@ -5306,6 +5415,14 @@ pub fn list_names(
             name,
         });
     }
+    #[cfg(test)]
+    crate::tape::listing(
+        "area::list_names",
+        resolved.path.as_path(),
+        listing.total,
+        names.len(),
+        truncated,
+    );
     Ok(NameListing {
         names,
         examined: listing.total,
@@ -5591,6 +5708,12 @@ pub fn scan_activity_within(
         activity.complete = false;
         activity.last_activity_ms = None;
         activity.reason = Some(reason);
+        #[cfg(test)]
+        crate::tape::verdict(
+            "area::scan_activity_within",
+            crate::tape::Identity::none(),
+            "activity_incomplete",
+        );
         return activity;
     }
     if activity.last_activity_ms.is_none() {
@@ -5608,6 +5731,15 @@ pub fn scan_activity_within(
             ));
         }
     }
+    #[cfg(test)]
+    crate::tape::verdict(
+        "area::scan_activity_within",
+        crate::tape::Identity::none(),
+        &match activity.last_activity_ms {
+            Some(last) => format!("activity_complete;last_ms={last}"),
+            None => "activity_unavailable".to_owned(),
+        },
+    );
     activity
 }
 

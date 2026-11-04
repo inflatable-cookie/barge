@@ -209,6 +209,17 @@ pub fn read(
     let bytes = dirs
         .read_child_file(&directory, "identity.json", IDENTITY_CAP)?
         .ok_or_else(|| Error::new(ErrorKind::UnknownState, "identity record disappeared"))?;
+    #[cfg(test)]
+    crate::tape::read_present_component(
+        "identity::read",
+        (
+            directory.identity().device.get(),
+            directory.identity().inode,
+        ),
+        "identity.json",
+        &bytes,
+        Some(IDENTITY_CAP as u64),
+    );
     let after = dirs
         .child_facts(&directory, "identity.json")?
         .ok_or_else(|| Error::new(ErrorKind::UnknownState, "identity record disappeared"))?;
@@ -598,8 +609,28 @@ pub fn verify(
     let unknown = |reason| IdentityVerdict::Unknown { reason };
     let record = match read(state, dirs, root_id, uid) {
         Ok(Some(record)) => record,
+        #[cfg(not(test))]
         Ok(None) => return unknown(IdentityReason::IdentityRecordMissing),
+        #[cfg(test)]
+        Ok(None) => {
+            crate::tape::verdict(
+                "identity::verify",
+                crate::tape::Identity::file(std::path::Path::new(root_id), None),
+                "identity_record_missing",
+            );
+            return unknown(IdentityReason::IdentityRecordMissing);
+        }
+        #[cfg(not(test))]
         Err(_) => return unknown(IdentityReason::IdentityRecordInvalid),
+        #[cfg(test)]
+        Err(_) => {
+            crate::tape::verdict(
+                "identity::verify",
+                crate::tape::Identity::file(std::path::Path::new(root_id), None),
+                "identity_record_invalid",
+            );
+            return unknown(IdentityReason::IdentityRecordInvalid);
+        }
     };
     let Ok(uuid) = VolumeUuid::parse(&record.volume_uuid) else {
         return unknown(IdentityReason::IdentityRecordInvalid);
@@ -609,9 +640,21 @@ pub fn verify(
         Err(_) => return unknown(IdentityReason::VolumeUnverified),
     };
     if candidates.len() > 1 {
+        #[cfg(test)]
+        crate::tape::verdict(
+            "identity::verify",
+            crate::tape::Identity::file(std::path::Path::new(root_id), None),
+            "duplicate_volume_uuid",
+        );
         return unknown(IdentityReason::DuplicateVolumeUuid);
     }
     let Some(mount) = candidates.first() else {
+        #[cfg(test)]
+        crate::tape::verdict(
+            "identity::verify",
+            crate::tape::Identity::file(std::path::Path::new(root_id), None),
+            "volume_unverified",
+        );
         return unknown(IdentityReason::VolumeUnverified);
     };
     let expected = crate::os::ExpectedVolume {
@@ -754,6 +797,12 @@ pub fn verify(
     {
         return unknown(IdentityReason::PathChanged);
     }
+    #[cfg(test)]
+    crate::tape::verdict(
+        "identity::verify",
+        crate::tape::Identity::file(std::path::Path::new(root_id), None),
+        "verified",
+    );
     compare(
         &record,
         &RootObservation {

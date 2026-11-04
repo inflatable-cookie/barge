@@ -31,13 +31,28 @@ synthetic account home ([stage 4 design](docs/knowledge/contracts/stage4-design.
 
 ## Validate
 
-Rust selectors run through `oxide`, never `cargo`; the `oxide:begin` block below
-lists the commands. Each covers what it names:
+Ordinary Rust selectors run through `oxide`; the `oxide:begin` block below lists
+the commands. The named capture-only Cargo selectors below are a separately
+guarded exception. Each selector covers what it names:
+
+- `effigy rust:compile:cargo`, `rust:compile:release:cargo`, `rust:format:cargo`
+  and `rust:lint:cargo` — the corresponding locked capture covering checks with
+  the owner's pinned Cargo and qualified supervisor. Release compilation plus
+  cfg(test) source discipline supports compile-away; it is not a binary behavior test.
+- `effigy rust:test:tape:cargo` — recorder controls and the embedded harness
+  fixture; `rust:test:tape-eval:cargo` runs the harness target's embedded exercise;
+  `rust:test:tape-stage:cargo` builds that target without running it and emits
+  artifact metadata. These checks do not qualify the private launcher, its
+  isolation, or the private export producer and do not authorize consumer adoption.
 
 - `effigy barge:install:test` — synthetic installer refusal and receipt fixtures; no real build or install.
 - `effigy barge:install` / `effigy barge:reinstall` — planner only, after a reviewed merge; Tom's go-ahead is required for the first host install. Set `BARGE_INSTALL_PIN` and `BARGE_INSTALL_SCRATCH` as documented in the [consumer contract](docs/knowledge/contracts/consumption.md).
 - `effigy rust:compile` — `oxide check --workspace --all-targets --all-features --locked`,
   so the proof-only `proof-synthetic-account` feature is compiled too.
+- `effigy rust:compile:release` — `oxide check --release --workspace --bins --locked`,
+  the default-feature release profile: the mechanical proof that the cfg(test)-only
+  capture tape ([o2-tape](docs/knowledge/contracts/o2-tape.md)) compiles away, since a
+  production build names none of it.
 - `effigy rust:format` — `oxide fmt --all -- --check`; run it when formatted
   Rust changed.
 - `effigy rust:lint` — clippy at the RustQuality strict profile. Every finding
@@ -79,6 +94,27 @@ lists the commands. Each covers what it names:
   declarations activate nothing, and each run is separately activated.
 - `effigy rust:test:proof-account` — the proof-only account's checks, with the
   `proof-synthetic-account` feature on. The ordinary `rust:test` never enables it.
+- `effigy rust:test:tape` — the capture tape's pure self-tests and the embedded
+  end-to-end fixture exercise of the actual release-plan harness
+  ([o2-tape](docs/knowledge/contracts/o2-tape.md)). Read-only: fixtures live in the
+  run root and the plan changes nothing.
+- `effigy rust:test:tape:pure` — the recorder's in-memory self-tests only;
+  excludes the harness exercise and its real process scan. It does not replace
+  the required end-to-end exercise or establish capture qualification.
+- `effigy rust:test:tape-eval` — the harness executable's own run with no arguments,
+  which is its embedded exercise; with the argv contract it runs one manifest window.
+- `effigy rust:test:tape-stage` — build the default-feature harness without running it;
+  a separately verified export must bind source, lockfile, toolchain and executable.
+- `effigy rust:test:tape-export` — source-defined archive/build/export producer;
+  held until its private wrapper's admission and resource gates are established.
+- `effigy rust:test:tape-export:pure` — pure Git blob identity controls; no
+  build, fixture or export.
+- `effigy rust:test:tape-admission:pure` — mocked admission refusal controls;
+  includes composition with the hash-bound Oxide candidate component named by
+  `BARGE_TEST_CANDIDATE_COMPONENT`; no live inventory, fixture or build.
+- `effigy rust:test:tape-private-export` — source-defined private wrapper; it
+  requires independently reviewed admission and resource evidence and a new
+  authorized block. Neither is established for the retained failed route.
 - `effigy release:native:test` and `effigy release:native:plan` — F6-R1's native
   proof apparatus, effect-free: the pinned supervisor, the argv guard, the case
   table checked against its named regressions, the proof feature's declarations

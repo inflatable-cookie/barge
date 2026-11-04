@@ -92,19 +92,38 @@ pub fn prove_absence(
     path: &Path,
     expected: AncestorExpected<'_>,
 ) -> Result<AbsenceProof> {
+    #[cfg(not(test))]
     let proof = prove_absence_inner(dirs, volumes, path, expected)?;
+    #[cfg(test)]
+    let proof = match prove_absence_inner(dirs, volumes, path, expected) {
+        Ok(proof) => proof,
+        Err(error) => {
+            crate::tape::read_refused("os::prove_absence", path, error.kind().as_str());
+            return Err(error);
+        }
+    };
     let encoded = serde_json::to_vec(&proof).map_err(|_| {
+        #[cfg(test)]
+        crate::tape::read_refused("os::prove_absence", path, "encode_error");
         Error::new(
             ErrorKind::UnknownState,
             "absence evidence cannot be encoded",
         )
     })?;
     if encoded.len() > 4096 {
+        #[cfg(test)]
+        crate::tape::read_refused("os::prove_absence", path, "document_cap");
         return Err(Error::new(
             ErrorKind::UnknownState,
             "absence evidence exceeds 4 KiB",
         ));
     }
+    #[cfg(test)]
+    crate::tape::verdict(
+        "os::prove_absence",
+        crate::tape::Identity::file(path, None),
+        proof.verdict,
+    );
     Ok(proof)
 }
 
@@ -143,6 +162,8 @@ fn prove_absence_inner(
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
         reason: None,
     };
+    #[cfg(test)]
+    crate::tape::now_ms_site(proof.proved_ms, "os::prove_absence_inner");
     let registered = match expected {
         AncestorExpected::BootData => None,
         AncestorExpected::Registered {
@@ -359,6 +380,46 @@ mod tests {
             Ok(self.identity())
         }
     }
+    #[test]
+    fn invalid_path_refusal_is_recorded_without_a_platform_read() {
+        use crate::tape::{begin_window, finish, EngineOutcome, WindowConfig};
+        let facts = Facts {
+            device: DeviceId::new(1),
+            removable: false,
+            located: RefCell::new(Vec::new()),
+        };
+        begin_window(WindowConfig {
+            case: "invalid".to_owned(),
+            manifest_sha256: "test".to_owned(),
+            entrypoint_symbol: "os::prove_absence",
+            source_binding: "test".to_owned(),
+        })
+        .unwrap();
+        let error = prove_absence(
+            &MacOs::new(),
+            &facts,
+            Path::new("relative"),
+            AncestorExpected::BootData,
+        )
+        .unwrap_err();
+        let transcript = finish(
+            EngineOutcome {
+                status: "refused",
+                exit_code: error.kind().exit_code(),
+                refusal_kind: Some(error.kind().as_str().to_owned()),
+                refusal_message: Some(error.message().to_owned()),
+                refusal_detail: Vec::new(),
+                engine_truncated: false,
+            },
+            None,
+        )
+        .unwrap();
+        let document: serde_json::Value = serde_json::from_str(&transcript).unwrap();
+        assert_eq!(document["reads"][0]["site"], "os::prove_absence");
+        assert_eq!(document["reads"][0]["observation_proven"], false);
+        assert!(document["reads"][0]["outcome"].get("refused").is_some());
+    }
+
     #[test]
     fn missing_leaf_requires_verified_ancestor_and_missing_parent_is_unknown() {
         let fixture = TempDir::new("absence");
