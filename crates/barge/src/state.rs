@@ -720,8 +720,7 @@ where
                 .create_new(true)
                 .mode(FILE_MODE)
                 .open(&temporary)
-        })
-        {
+        }) {
             Ok(file) => file,
             Err(error) if error.kind() == IoErrorKind::AlreadyExists => continue,
             Err(error) => {
@@ -744,7 +743,8 @@ where
             #[cfg(not(test))]
             let _ = std::fs::remove_file(&temporary);
             #[cfg(test)]
-            let _ = crate::tape::io_effect("unlink", &temporary, || std::fs::remove_file(&temporary));
+            let _ =
+                crate::tape::io_effect("unlink", &temporary, || std::fs::remove_file(&temporary));
         }
         written?;
         return sync_directory(parent);
@@ -813,18 +813,20 @@ where
     }
     #[cfg(test)]
     {
-        crate::tape::io_rename(temporary, target, || std::fs::rename(temporary, target)).map_err(|error| {
-            Error::new(
-                ErrorKind::Io,
-                format!(
-                    "cannot publish {} over {}: {error}",
-                    temporary.display(),
-                    target.display()
-                ),
-            )
-            .with_detail("path", target.display().to_string().into())
-            .with_detail("os_error", error.to_string().into())
-        })
+        crate::tape::io_rename(temporary, target, || std::fs::rename(temporary, target)).map_err(
+            |error| {
+                Error::new(
+                    ErrorKind::Io,
+                    format!(
+                        "cannot publish {} over {}: {error}",
+                        temporary.display(),
+                        target.display()
+                    ),
+                )
+                .with_detail("path", target.display().to_string().into())
+                .with_detail("os_error", error.to_string().into())
+            },
+        )
     }
     #[cfg(not(test))]
     std::fs::rename(temporary, target).map_err(|error| {
@@ -964,10 +966,14 @@ impl StateLock {
                 .mode(FILE_MODE)
                 .open(path)
         })
-            .map_err(|error| lock_open_error(path, &error))?;
+        .map_err(|error| lock_open_error(path, &error))?;
         wait_for_lock(&file, path, LockMode::Exclusive, deadline)?;
         #[cfg(test)]
-        crate::tape::lock("state::StateLock::exclusive", path, crate::tape::LockOutcome::Held(None));
+        crate::tape::lock(
+            "state::StateLock::exclusive",
+            path,
+            crate::tape::LockOutcome::Held(None),
+        );
         Ok(Self {
             path: path.to_path_buf(),
             rank,
@@ -2433,7 +2439,7 @@ pub(crate) fn read_intents_with_deadline(
                 ErrorKind::UnknownState,
                 format!("cannot read the intent journal: {error}"),
             )
-            .with_detail("path", directory.display().to_string().into()))
+            .with_detail("path", directory.display().to_string().into()));
         }
     };
     if deadline.expired() {
@@ -2464,11 +2470,7 @@ pub(crate) fn read_intents_with_deadline(
         }
         let name = entry.file_name();
         #[cfg(test)]
-        crate::tape::dir_entry(
-            "state::read_intents_with_deadline",
-            None,
-            &name,
-        );
+        crate::tape::dir_entry("state::read_intents_with_deadline", None, &name);
         let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
             return Err(Error::new(
                 ErrorKind::UnknownState,

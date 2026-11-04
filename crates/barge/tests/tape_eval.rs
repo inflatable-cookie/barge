@@ -145,11 +145,19 @@ fn parse_args(arguments: &[String]) -> Result<Invocation, String> {
     let mut case = None;
     let mut args = arguments.iter();
     while let Some(name) = args.next() {
-        let mut value = |name: &str| args.next().cloned().ok_or_else(|| format!("--{name} needs a value"));
+        let mut value = |name: &str| {
+            args.next()
+                .cloned()
+                .ok_or_else(|| format!("--{name} needs a value"))
+        };
         match name.as_str() {
-            "--fixture-root" if fixture_root.is_none() => fixture_root = Some(value("fixture-root")?),
+            "--fixture-root" if fixture_root.is_none() => {
+                fixture_root = Some(value("fixture-root")?)
+            }
             "--manifest" if manifest.is_none() => manifest = Some(value("manifest")?),
-            "--transcript-out" if transcript_out.is_none() => transcript_out = Some(value("transcript-out")?),
+            "--transcript-out" if transcript_out.is_none() => {
+                transcript_out = Some(value("transcript-out")?)
+            }
             "--case" if case.is_none() => case = Some(value("case")?),
             "--fixture-root" | "--manifest" | "--transcript-out" | "--case" => {
                 return Err(format!("duplicate argument `{name}`"));
@@ -174,7 +182,12 @@ fn parse_args(arguments: &[String]) -> Result<Invocation, String> {
 /// A malformed invocation may still name exactly one unambiguous destination.
 /// Never guess among duplicates or interpret another option as a path.
 fn refusal_destination(arguments: &[std::ffi::OsString]) -> Option<std::path::PathBuf> {
-    if arguments.iter().filter(|arg| *arg == "--transcript-out").count() != 1 {
+    if arguments
+        .iter()
+        .filter(|arg| *arg == "--transcript-out")
+        .count()
+        != 1
+    {
         return None;
     }
     let mut destinations = arguments.windows(2).filter_map(|pair| {
@@ -199,8 +212,14 @@ fn main() -> std::process::ExitCode {
             }
         };
     }
-    let decoded = arguments.iter().map(|arg| arg.to_str().map(str::to_owned)
-        .ok_or_else(|| "arguments must be UTF-8".to_owned())).collect::<Result<Vec<_>, _>>();
+    let decoded = arguments
+        .iter()
+        .map(|arg| {
+            arg.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "arguments must be UTF-8".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>();
     let invocation = match decoded.and_then(|args| parse_args(&args)) {
         Ok(invocation) => invocation,
         Err(reason) => {
@@ -220,11 +239,9 @@ fn main() -> std::process::ExitCode {
         Ok(bytes) => bytes,
         Err(error) => {
             let reason = format!("the manifest cannot be read: {error}");
-            if let Err(write_error) = tape_harness::write_apparatus_refusal(
-                &invocation.transcript_out,
-                None,
-                &reason,
-            ) {
+            if let Err(write_error) =
+                tape_harness::write_apparatus_refusal(&invocation.transcript_out, None, &reason)
+            {
                 eprintln!("barge.tape.harness/1: {write_error}");
             }
             eprintln!("barge.tape.harness/1: {reason}");

@@ -2982,7 +2982,7 @@ pub(crate) fn read_directory(path: &Path) -> Result<Option<Vec<String>>> {
                 ErrorKind::Io,
                 format!("cannot read {}: {error}", path.display()),
             )
-            .with_detail("path", path.display().to_string().into()))
+            .with_detail("path", path.display().to_string().into()));
         }
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -5398,7 +5398,7 @@ pub fn list_names(
                 names: Vec::new(),
                 examined: 0,
                 truncated: false,
-            })
+            });
         }
     };
     let name_cap = max_roots.clamp(1, LISTING_NAME_ROWS);

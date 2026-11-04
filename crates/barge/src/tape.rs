@@ -163,7 +163,11 @@ impl Identity {
 
     /// A pid whose process identity was not observed; never a positive identity.
     pub(crate) fn unidentified_process(pid: u32, fd: Option<i32>) -> Self {
-        Self { pid: Some(pid), fd, ..Self::none() }
+        Self {
+            pid: Some(pid),
+            fd,
+            ..Self::none()
+        }
     }
 
     /// A process identity: never a pid alone.
@@ -202,7 +206,6 @@ impl Identity {
             ..Self::none()
         }
     }
-
 }
 
 /// What one observation returned.
@@ -308,16 +311,21 @@ pub(crate) struct Obligation {
 /// satisfy a key. This alone does not reconcile extra reads, dynamic facts,
 /// effects, cap exhaustion, or the not-yet-approved manifest wire schema.
 pub(crate) fn missing_obligations(obligations: &[Obligation], rows: &[ReadRow]) -> Vec<usize> {
-    obligations.iter().enumerate().filter_map(|(index, obligation)| {
-        let duplicate = obligations[..index].contains(obligation);
-        let matched = !duplicate && rows.iter().any(|row| {
-            row.site == obligation.site
-                && row.identity == obligation.identity
-                && row.observation_proven
-                && !matches!(&row.outcome, Outcome::Refused { .. })
-        });
-        (!matched).then_some(index)
-    }).collect()
+    obligations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, obligation)| {
+            let duplicate = obligations[..index].contains(obligation);
+            let matched = !duplicate
+                && rows.iter().any(|row| {
+                    row.site == obligation.site
+                        && row.identity == obligation.identity
+                        && row.observation_proven
+                        && !matches!(&row.outcome, Outcome::Refused { .. })
+                });
+            (!matched).then_some(index)
+        })
+        .collect()
 }
 
 /// One observed or attempted effect. The plan's own window records none; a
@@ -515,7 +523,10 @@ impl Tape {
 /// sets are not assigned to Barge while the shared proposal lacks an engine.
 pub(crate) fn attach_effect_expectations(manifest: &[u8]) {
     let input = match serde_json::from_slice::<serde_json::Value>(manifest) {
-        Ok(document) => match document.get("expected_effects").and_then(serde_json::Value::as_array) {
+        Ok(document) => match document
+            .get("expected_effects")
+            .and_then(serde_json::Value::as_array)
+        {
             Some(effects) if effects.is_empty() => "empty",
             Some(effects) if effects.len() <= 8192 => "nonempty_unassigned",
             Some(_) => "cap_exceeded",
@@ -525,7 +536,9 @@ pub(crate) fn attach_effect_expectations(manifest: &[u8]) {
     };
     TAPE.with(|tape| {
         let mut tape = tape.borrow_mut();
-        if tape.config.is_some() { tape.expected_effects_input = input; }
+        if tape.config.is_some() {
+            tape.expected_effects_input = input;
+        }
     });
 }
 
@@ -535,49 +548,100 @@ pub(crate) fn attach_obligations(manifest: &[u8]) {
     fn unavailable(reason: &'static str) {
         TAPE.with(|tape| {
             let mut tape = tape.borrow_mut();
-            if tape.config.is_some() { tape.obligation_input_error = Some(reason); }
+            if tape.config.is_some() {
+                tape.obligation_input_error = Some(reason);
+            }
         });
     }
     let document: serde_json::Value = match serde_json::from_slice(manifest) {
         Ok(document) => document,
-        Err(_) => { unavailable("invalid_manifest"); return; },
+        Err(_) => {
+            unavailable("invalid_manifest");
+            return;
+        }
     };
-    let Some(rows) = document.get("mandatory_observations").and_then(serde_json::Value::as_array) else {
+    let Some(rows) = document
+        .get("mandatory_observations")
+        .and_then(serde_json::Value::as_array)
+    else {
         unavailable("mandatory_observations_missing_or_invalid");
         return;
     };
-    if rows.len() > 256 { unavailable("mandatory_observations_cap"); return; }
+    if rows.len() > 256 {
+        unavailable("mandatory_observations_cap");
+        return;
+    }
     let mut obligations = Vec::new();
     let mut indices = Vec::new();
     let mut unmapped = 0_usize;
     let mut unmapped_indices = Vec::new();
     for (index, row) in rows.iter().enumerate() {
-        let Some(object) = row.as_object() else { unmapped += 1; unmapped_indices.push(index); continue; };
-        if object.keys().any(|key| !matches!(key.as_str(), "engine" | "site" | "identity")) {
+        let Some(object) = row.as_object() else {
+            unmapped += 1;
+            unmapped_indices.push(index);
+            continue;
+        };
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "engine" | "site" | "identity"))
+        {
             unmapped += 1;
             unmapped_indices.push(index);
             continue;
         }
         match object.get("engine").and_then(serde_json::Value::as_str) {
             Some("oxide") => continue,
-            Some("barge") => {},
-            _ => { unmapped += 1; unmapped_indices.push(index); continue; }
+            Some("barge") => {}
+            _ => {
+                unmapped += 1;
+                unmapped_indices.push(index);
+                continue;
+            }
         }
-        let Some(site) = object.get("site").and_then(serde_json::Value::as_str).filter(|site| !site.is_empty()) else {
+        let Some(site) = object
+            .get("site")
+            .and_then(serde_json::Value::as_str)
+            .filter(|site| !site.is_empty())
+        else {
             unmapped += 1;
             unmapped_indices.push(index);
             continue;
         };
-        let identity = object.get("identity").cloned().and_then(|identity| serde_json::from_value::<Identity>(identity).ok());
+        let identity = object
+            .get("identity")
+            .cloned()
+            .and_then(|identity| serde_json::from_value::<Identity>(identity).ok());
         match identity {
-            Some(identity) if (identity.fd.is_none_or(|fd| fd >= 0)) && ((identity.path.as_deref().is_some_and(|path| !path.is_empty()) && identity.parent_device.is_some()
-                && identity.parent_inode.is_some() && identity.device.is_some() && identity.inode.is_some())
-                || (identity.component.as_deref().is_some_and(|component| !component.is_empty()) && identity.parent_device.is_some() && identity.parent_inode.is_some())
-                || (identity.pid.is_some_and(|pid| pid != 0) && identity.start.is_some_and(|start| start != 0) && identity.uid.is_some())) => {
-                    obligations.push(Obligation { site: site.to_owned(), identity });
-                    indices.push(index);
-                }
-            _ => { unmapped += 1; unmapped_indices.push(index); },
+            Some(identity)
+                if (identity.fd.is_none_or(|fd| fd >= 0))
+                    && ((identity
+                        .path
+                        .as_deref()
+                        .is_some_and(|path| !path.is_empty())
+                        && identity.parent_device.is_some()
+                        && identity.parent_inode.is_some()
+                        && identity.device.is_some()
+                        && identity.inode.is_some())
+                        || (identity
+                            .component
+                            .as_deref()
+                            .is_some_and(|component| !component.is_empty())
+                            && identity.parent_device.is_some()
+                            && identity.parent_inode.is_some())
+                        || (identity.pid.is_some_and(|pid| pid != 0)
+                            && identity.start.is_some_and(|start| start != 0)
+                            && identity.uid.is_some())) =>
+            {
+                obligations.push(Obligation {
+                    site: site.to_owned(),
+                    identity,
+                });
+                indices.push(index);
+            }
+            _ => {
+                unmapped += 1;
+                unmapped_indices.push(index);
+            }
         }
     }
     TAPE.with(|tape| {
@@ -815,7 +879,9 @@ fn record(
             tape.dropped_rows = tape.dropped_rows.saturating_add(1);
             return;
         }
-        if matches!(kind, "process-row" | "process-observation") && tape.process_rows >= CAP_PROCESS_ROWS {
+        if matches!(kind, "process-row" | "process-observation")
+            && tape.process_rows >= CAP_PROCESS_ROWS
+        {
             tape.process_rows_exhausted = true;
             tape.dropped_rows = tape.dropped_rows.saturating_add(1);
             return;
@@ -856,28 +922,51 @@ fn observation_proven(kind: &str, identity: &Identity, outcome: &Outcome) -> boo
     }
     match kind {
         "child-stat" if matches!(outcome, Outcome::Absent) => {
-            identity.parent_device.is_some() && identity.parent_inode.is_some() && identity.component.is_some()
+            identity.parent_device.is_some()
+                && identity.parent_inode.is_some()
+                && identity.component.is_some()
         }
         "child-stat" if matches!(outcome, Outcome::Facts { .. }) => {
-            identity.parent_device.is_some() && identity.parent_inode.is_some()
-                && identity.component.is_some() && identity.device.is_some() && identity.inode.is_some()
+            identity.parent_device.is_some()
+                && identity.parent_inode.is_some()
+                && identity.component.is_some()
+                && identity.device.is_some()
+                && identity.inode.is_some()
         }
         "file" if matches!(outcome, Outcome::Digest { .. }) => {
-            identity.parent_device.is_some() && identity.parent_inode.is_some()
-                && identity.device.is_some() && identity.inode.is_some()
+            identity.parent_device.is_some()
+                && identity.parent_inode.is_some()
+                && identity.device.is_some()
+                && identity.inode.is_some()
         }
         "process-row" | "process-observation" | "platform-status" => {
             identity.pid.is_some() && identity.start.is_some() && identity.uid.is_some()
         }
-        "fd-list" if matches!(outcome, Outcome::Listed { truncated: false, .. }) => {
+        "fd-list"
+            if matches!(
+                outcome,
+                Outcome::Listed {
+                    truncated: false,
+                    ..
+                }
+            ) =>
+        {
             identity.pid.is_some() && identity.start.is_some() && identity.uid.is_some()
         }
         "fd-entry" if matches!(outcome, Outcome::Answer { .. }) => {
-            identity.pid.is_some() && identity.start.is_some() && identity.uid.is_some()
+            identity.pid.is_some()
+                && identity.start.is_some()
+                && identity.uid.is_some()
                 && identity.fd.is_some()
         }
         "uid" | "boot" => matches!(outcome, Outcome::Answer { .. }),
-        "process-table" => matches!(outcome, Outcome::Listed { truncated: false, .. }),
+        "process-table" => matches!(
+            outcome,
+            Outcome::Listed {
+                truncated: false,
+                ..
+            }
+        ),
         _ => false,
     }
 }
@@ -930,11 +1019,18 @@ fn effect(kind: &'static str, path: &Path) {
 
 /// Bind an attempt to its already-open parent and, for rename, its destination.
 #[track_caller]
-pub(crate) fn child_effect(kind: &'static str, parent: (u64, u64), name: &str, destination: Option<&str>) {
+pub(crate) fn child_effect(
+    kind: &'static str,
+    parent: (u64, u64),
+    name: &str,
+    destination: Option<&str>,
+) {
     let caller = std::panic::Location::caller();
     TAPE.with(|tape| {
         let mut tape = tape.borrow_mut();
-        if tape.config.is_none() { return; }
+        if tape.config.is_none() {
+            return;
+        }
         let epoch = tape.next_epoch;
         tape.next_epoch = tape.next_epoch.saturating_add(1);
         tape.effects.push(EffectRow {
@@ -955,18 +1051,33 @@ pub(crate) fn child_effect(kind: &'static str, parent: (u64, u64), name: &str, d
 }
 
 /// Record a sync result separately from the effect set; sync is not a write effect.
-pub(crate) fn sync_observation(site: &'static str, directory: (u64, u64), component: Option<&str>, error: Option<&std::io::Error>) {
+pub(crate) fn sync_observation(
+    site: &'static str,
+    directory: (u64, u64),
+    component: Option<&str>,
+    error: Option<&std::io::Error>,
+) {
     let identity = match component {
         Some(name) => Identity::component(Some(directory), name),
-        None => Identity { device: Some(directory.0), inode: Some(directory.1), ..Identity::none() },
+        None => Identity {
+            device: Some(directory.0),
+            inode: Some(directory.1),
+            ..Identity::none()
+        },
     };
-    let outcome = error.map_or_else(|| Outcome::answer("succeeded"), |error| Outcome::refused(errno_class(error)));
+    let outcome = error.map_or_else(
+        || Outcome::answer("succeeded"),
+        |error| Outcome::refused(errno_class(error)),
+    );
     record("sync", site, identity, outcome, None);
 }
 
 /// Record a sync on a path whose opened descriptor identity was not observed.
 pub(crate) fn sync_path(site: &'static str, path: &Path, error: Option<&std::io::Error>) {
-    let outcome = error.map_or_else(|| Outcome::answer("succeeded"), |error| Outcome::refused(errno_class(error)));
+    let outcome = error.map_or_else(
+        || Outcome::answer("succeeded"),
+        |error| Outcome::refused(errno_class(error)),
+    );
     record("sync", site, Identity::file(path, None), outcome, None);
 }
 
@@ -974,9 +1085,12 @@ pub(crate) fn sync_path(site: &'static str, path: &Path, error: Option<&std::io:
 pub(crate) fn effect_outcome(kind: &str, path: &Path, error: Option<&std::io::Error>) {
     TAPE.with(|tape| {
         let mut tape = tape.borrow_mut();
-        if let Some(row) = tape.effects.iter_mut().rev().find(|row| {
-            row.kind == kind && row.match_path == path && row.outcome.is_none()
-        }) {
+        if let Some(row) = tape
+            .effects
+            .iter_mut()
+            .rev()
+            .find(|row| row.kind == kind && row.match_path == path && row.outcome.is_none())
+        {
             row.outcome = Some(error.map_or_else(|| "succeeded".to_owned(), errno_class));
             row.partial_effect_possible = error.is_some();
         }
@@ -1125,18 +1239,36 @@ pub(crate) fn io_stat(
 /// Record one entry seen in an enumeration, bound to the observed parent.
 pub(crate) fn dir_entry(site: &'static str, parent: Option<(u64, u64)>, name: &std::ffi::OsStr) {
     match name.to_str() {
-        Some(name) => record("dir-entry", site, Identity::component(parent, name), Outcome::facts("entry"), None),
+        Some(name) => record(
+            "dir-entry",
+            site,
+            Identity::component(parent, name),
+            Outcome::facts("entry"),
+            None,
+        ),
         None => {
             let mut identity = Identity::none();
             identity.parent_device = parent.map(|(device, _)| device);
             identity.parent_inode = parent.map(|(_, inode)| inode);
-            record("dir-entry", site, identity, Outcome::refused("non_utf8_component"), None);
+            record(
+                "dir-entry",
+                site,
+                identity,
+                Outcome::refused("non_utf8_component"),
+                None,
+            );
         }
     }
 }
 
 /// Record one `fstatat` result against the already-open parent.
-pub(crate) fn child_stat(site: &'static str, parent: (u64, u64), name: &str, facts: Option<(u64, u64, &str)>, error: Option<&str>) {
+pub(crate) fn child_stat(
+    site: &'static str,
+    parent: (u64, u64),
+    name: &str,
+    facts: Option<(u64, u64, &str)>,
+    error: Option<&str>,
+) {
     let mut identity = Identity::component(Some(parent), name);
     let outcome = if let Some(error) = error {
         Outcome::refused(error)
@@ -1169,7 +1301,11 @@ pub(crate) fn handle_observation(
     inode: u64,
     outcome: Outcome,
 ) {
-    let identity = Identity { device: Some(device), inode: Some(inode), ..Identity::none() };
+    let identity = Identity {
+        device: Some(device),
+        inode: Some(inode),
+        ..Identity::none()
+    };
     record(kind, site, identity, outcome, None);
 }
 
@@ -1217,8 +1353,20 @@ pub(crate) fn process_row(site: &'static str, pid: u32, uid: Option<u32>, start:
 }
 
 /// Preserve classified and retry identities as separate ordered observations.
-pub(crate) fn observed_process(site: &'static str, pid: u32, start: u64, uid: Option<u32>, label: &str) {
-    record("process-observation", site, Identity::process(pid, start, uid, None), Outcome::answer(label), None);
+pub(crate) fn observed_process(
+    site: &'static str,
+    pid: u32,
+    start: u64,
+    uid: Option<u32>,
+    label: &str,
+) {
+    record(
+        "process-observation",
+        site,
+        Identity::process(pid, start, uid, None),
+        Outcome::answer(label),
+        None,
+    );
 }
 
 /// Record the process-table read's own outcome.
@@ -1264,7 +1412,13 @@ pub(crate) fn vnode_observed(site: &'static str, pid: u32, fd: i32, device: u64,
     let mut identity = Identity::unidentified_process(pid, Some(fd));
     identity.device = Some(device);
     identity.inode = Some(inode);
-    record("vnode-facts", site, identity, Outcome::answer("readable"), None);
+    record(
+        "vnode-facts",
+        site,
+        identity,
+        Outcome::answer("readable"),
+        None,
+    );
 }
 
 /// Record one code-signing status answer for a classified identity.
@@ -1287,7 +1441,13 @@ pub(crate) fn platform(site: &'static str, pid: u32, start: u64, uid: Option<u32
 pub(crate) fn platform_unidentified(site: &'static str, pid: u32, answer: &str) {
     let identity = process_identity(pid, None);
     PROCESS_CONTEXT.with(|slot| *slot.borrow_mut() = None);
-    record("code-signing-status", site, identity, Outcome::answer(answer), None);
+    record(
+        "code-signing-status",
+        site,
+        identity,
+        Outcome::answer(answer),
+        None,
+    );
 }
 
 /// Record a scalar fact: the effective uid, the boot identity, a start.
@@ -1320,7 +1480,11 @@ pub(crate) fn custody_record(site: &'static str, pool: &Path, record_id: &str, c
 
 /// Observe the exact I/O result without changing it or repeating the operation.
 #[track_caller]
-pub(crate) fn io_effect<T>(kind: &'static str, path: &Path, operation: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+pub(crate) fn io_effect<T>(
+    kind: &'static str,
+    path: &Path,
+    operation: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
     write_effect(kind, path);
     let result = operation();
     effect_outcome(kind, path, result.as_ref().err());
@@ -1329,7 +1493,11 @@ pub(crate) fn io_effect<T>(kind: &'static str, path: &Path, operation: impl FnOn
 
 /// Record an attempted rename, including its destination, then bind its result.
 #[track_caller]
-pub(crate) fn io_rename(source: &Path, destination: &Path, operation: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+pub(crate) fn io_rename(
+    source: &Path,
+    destination: &Path,
+    operation: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
     write_effect("rename", source);
     TAPE.with(|tape| {
         if let Some(row) = tape.borrow_mut().effects.last_mut() {
@@ -1355,7 +1523,11 @@ pub(crate) fn now_ms_site(value_ms: u64, site: &'static str) {
 
 /// Record the single value returned to its actual call site.
 pub(crate) fn now_ms_at(value_ms: u64, caller: &'static std::panic::Location<'static>) {
-    clock("now_ms", format!("{}:{}", caller.file(), caller.line()), value_ms);
+    clock(
+        "now_ms",
+        format!("{}:{}", caller.file(), caller.line()),
+        value_ms,
+    );
 }
 
 /// Record a real or attempted effect from the contract's closed set.
@@ -1379,19 +1551,37 @@ mod tests {
     #[test]
     fn empty_effect_expectation_flags_every_attempt_without_claiming_parity() {
         begin_window(WindowConfig {
-            case: "static".to_owned(), manifest_sha256: "m".to_owned(),
-            entrypoint_symbol: "barge::release::plan", source_binding: "test".to_owned(),
-        }).expect("window");
+            case: "static".to_owned(),
+            manifest_sha256: "m".to_owned(),
+            entrypoint_symbol: "barge::release::plan",
+            source_binding: "test".to_owned(),
+        })
+        .expect("window");
         attach_effect_expectations(br#"{"expected_effects":[]}"#);
         write_effect("create", Path::new("child"));
-        effect_outcome("create", Path::new("child"), Some(&std::io::Error::from_raw_os_error(libc::EIO)));
-        let transcript = finish(EngineOutcome {
-            status: "completed", exit_code: 0, refusal_kind: None,
-            refusal_message: None, refusal_detail: Vec::new(), engine_truncated: false,
-        }, Some(&serde_json::json!({}))).expect("transcript");
+        effect_outcome(
+            "create",
+            Path::new("child"),
+            Some(&std::io::Error::from_raw_os_error(libc::EIO)),
+        );
+        let transcript = finish(
+            EngineOutcome {
+                status: "completed",
+                exit_code: 0,
+                refusal_kind: None,
+                refusal_message: None,
+                refusal_detail: Vec::new(),
+                engine_truncated: false,
+            },
+            Some(&serde_json::json!({})),
+        )
+        .expect("transcript");
         let doc: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
         assert_eq!(doc["effect_check"]["input"], "empty");
-        assert_eq!(doc["effect_check"]["unexpected_attempts"], serde_json::json!([0]));
+        assert_eq!(
+            doc["effect_check"]["unexpected_attempts"],
+            serde_json::json!([0])
+        );
         assert_eq!(doc["effect_check"]["status"], "insufficient");
         assert_eq!(doc["effects"][0]["outcome"], "EIO");
     }
@@ -1399,14 +1589,25 @@ mod tests {
     #[test]
     fn nonempty_effect_expectations_are_not_assigned_to_an_engine() {
         begin_window(WindowConfig {
-            case: "dynamic".to_owned(), manifest_sha256: "m".to_owned(),
-            entrypoint_symbol: "barge::release::plan", source_binding: "test".to_owned(),
-        }).expect("window");
+            case: "dynamic".to_owned(),
+            manifest_sha256: "m".to_owned(),
+            entrypoint_symbol: "barge::release::plan",
+            source_binding: "test".to_owned(),
+        })
+        .expect("window");
         attach_effect_expectations(br#"{"expected_effects":[{"kind":"save"}]}"#);
-        let transcript = finish(EngineOutcome {
-            status: "completed", exit_code: 0, refusal_kind: None,
-            refusal_message: None, refusal_detail: Vec::new(), engine_truncated: false,
-        }, Some(&serde_json::json!({}))).expect("transcript");
+        let transcript = finish(
+            EngineOutcome {
+                status: "completed",
+                exit_code: 0,
+                refusal_kind: None,
+                refusal_message: None,
+                refusal_detail: Vec::new(),
+                engine_truncated: false,
+            },
+            Some(&serde_json::json!({})),
+        )
+        .expect("transcript");
         let doc: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
         assert_eq!(doc["effect_check"]["input"], "nonempty_unassigned");
         assert_eq!(doc["effect_check"]["status"], "insufficient");
@@ -1415,9 +1616,12 @@ mod tests {
     #[test]
     fn provisional_obligations_report_missing_and_unmapped_without_parity() {
         begin_window(WindowConfig {
-            case: "obligations".to_owned(), manifest_sha256: "m".to_owned(),
-            entrypoint_symbol: "barge::release::plan", source_binding: "test".to_owned(),
-        }).expect("window");
+            case: "obligations".to_owned(),
+            manifest_sha256: "m".to_owned(),
+            entrypoint_symbol: "barge::release::plan",
+            source_binding: "test".to_owned(),
+        })
+        .expect("window");
         let manifest = serde_json::json!({"mandatory_observations": [
             {"engine": "barge", "site": "descriptor", "identity": {"pid": 42, "start": 123, "uid": 501, "fd": 4}},
             {"engine": "barge", "site": "volume", "identity": {"volume_uuid": "uuid", "mount": "/mount", "device": "disk", "window_identity": "epoch"}},
@@ -1426,15 +1630,26 @@ mod tests {
         attach_obligations(&serde_json::to_vec(&manifest).expect("manifest"));
         process_context(42, 123, Some(501));
         fd_entry("descriptor", 42, 4, 1);
-        let transcript = finish(EngineOutcome {
-            status: "completed", exit_code: 0, refusal_kind: None,
-            refusal_message: None, refusal_detail: Vec::new(), engine_truncated: false,
-        }, Some(&serde_json::json!({}))).expect("transcript");
+        let transcript = finish(
+            EngineOutcome {
+                status: "completed",
+                exit_code: 0,
+                refusal_kind: None,
+                refusal_message: None,
+                refusal_detail: Vec::new(),
+                engine_truncated: false,
+            },
+            Some(&serde_json::json!({})),
+        )
+        .expect("transcript");
         let doc: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
         assert_eq!(doc["obligations"]["status"], "insufficient");
         assert_eq!(doc["obligations"]["input_available"], true);
         assert_eq!(doc["obligations"]["unmapped"], 1);
-        assert_eq!(doc["obligations"]["unmapped_indices"], serde_json::json!([1]));
+        assert_eq!(
+            doc["obligations"]["unmapped_indices"],
+            serde_json::json!([1])
+        );
         assert_eq!(doc["obligations"]["missing"], serde_json::json!([]));
         assert_eq!(doc["observation_complete"], false);
     }
@@ -1442,18 +1657,29 @@ mod tests {
     #[test]
     fn provisional_obligation_missing_index_is_from_the_manifest() {
         begin_window(WindowConfig {
-            case: "missing".to_owned(), manifest_sha256: "m".to_owned(),
-            entrypoint_symbol: "barge::release::plan", source_binding: "test".to_owned(),
-        }).expect("window");
+            case: "missing".to_owned(),
+            manifest_sha256: "m".to_owned(),
+            entrypoint_symbol: "barge::release::plan",
+            source_binding: "test".to_owned(),
+        })
+        .expect("window");
         let manifest = serde_json::json!({"mandatory_observations": [
             {"engine": "oxide", "site": "other", "identity": {"pid": 1, "start": 2, "uid": 3}},
             {"engine": "barge", "site": "descriptor", "identity": {"pid": 42, "start": 123, "uid": 501, "fd": 4}}
         ]});
         attach_obligations(&serde_json::to_vec(&manifest).expect("manifest"));
-        let transcript = finish(EngineOutcome {
-            status: "completed", exit_code: 0, refusal_kind: None,
-            refusal_message: None, refusal_detail: Vec::new(), engine_truncated: false,
-        }, Some(&serde_json::json!({}))).expect("transcript");
+        let transcript = finish(
+            EngineOutcome {
+                status: "completed",
+                exit_code: 0,
+                refusal_kind: None,
+                refusal_message: None,
+                refusal_detail: Vec::new(),
+                engine_truncated: false,
+            },
+            Some(&serde_json::json!({})),
+        )
+        .expect("transcript");
         let doc: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
         assert_eq!(doc["obligations"]["missing"], serde_json::json!([1]));
         assert_eq!(doc["obligations"]["status"], "insufficient");
@@ -1462,17 +1688,32 @@ mod tests {
     #[test]
     fn provisional_obligation_cap_is_explicitly_insufficient() {
         begin_window(WindowConfig {
-            case: "cap".to_owned(), manifest_sha256: "m".to_owned(),
-            entrypoint_symbol: "barge::release::plan", source_binding: "test".to_owned(),
-        }).expect("window");
-        let manifest = serde_json::json!({"mandatory_observations": vec![serde_json::json!({}); 257]});
+            case: "cap".to_owned(),
+            manifest_sha256: "m".to_owned(),
+            entrypoint_symbol: "barge::release::plan",
+            source_binding: "test".to_owned(),
+        })
+        .expect("window");
+        let manifest =
+            serde_json::json!({"mandatory_observations": vec![serde_json::json!({}); 257]});
         attach_obligations(&serde_json::to_vec(&manifest).expect("manifest"));
-        let transcript = finish(EngineOutcome {
-            status: "completed", exit_code: 0, refusal_kind: None,
-            refusal_message: None, refusal_detail: Vec::new(), engine_truncated: false,
-        }, Some(&serde_json::json!({}))).expect("transcript");
+        let transcript = finish(
+            EngineOutcome {
+                status: "completed",
+                exit_code: 0,
+                refusal_kind: None,
+                refusal_message: None,
+                refusal_detail: Vec::new(),
+                engine_truncated: false,
+            },
+            Some(&serde_json::json!({})),
+        )
+        .expect("transcript");
         let doc: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
-        assert_eq!(doc["obligations"]["input_unavailable_reason"], "mandatory_observations_cap");
+        assert_eq!(
+            doc["obligations"]["input_unavailable_reason"],
+            "mandatory_observations_cap"
+        );
         assert_eq!(doc["obligations"]["input_available"], false);
         assert_eq!(doc["obligations"]["status"], "insufficient");
     }
@@ -1480,13 +1721,21 @@ mod tests {
     #[test]
     fn omitted_report_preserves_completed_engine_outcome() {
         begin_window(WindowConfig {
-            case: "omitted".to_owned(), manifest_sha256: "m".to_owned(),
-            entrypoint_symbol: "barge::release::plan", source_binding: "test".to_owned(),
-        }).expect("window");
+            case: "omitted".to_owned(),
+            manifest_sha256: "m".to_owned(),
+            entrypoint_symbol: "barge::release::plan",
+            source_binding: "test".to_owned(),
+        })
+        .expect("window");
         let bytes = finish_omitted(EngineOutcome {
-            status: "completed", exit_code: 3, refusal_kind: None,
-            refusal_message: None, refusal_detail: Vec::new(), engine_truncated: false,
-        }).expect("transcript");
+            status: "completed",
+            exit_code: 3,
+            refusal_kind: None,
+            refusal_message: None,
+            refusal_detail: Vec::new(),
+            engine_truncated: false,
+        })
+        .expect("transcript");
         let document: serde_json::Value = serde_json::from_str(&bytes).expect("JSON");
         assert_eq!(document["outcome"]["status"], "completed");
         assert_eq!(document["outcome"]["exit_code"], 3);
@@ -1503,17 +1752,31 @@ mod tests {
             identity: identity.clone(),
         };
         let mut row = ReadRow {
-            kind: "fd-entry", site: "descriptor", identity,
-            outcome: Outcome::answer("vnode"), observation_proven: true,
-            cap: None, epoch: 0, occurrence: 1,
+            kind: "fd-entry",
+            site: "descriptor",
+            identity,
+            outcome: Outcome::answer("vnode"),
+            observation_proven: true,
+            cap: None,
+            epoch: 0,
+            occurrence: 1,
         };
         assert!(missing_obligations(std::slice::from_ref(&obligation), &[row.clone()]).is_empty());
-        assert_eq!(missing_obligations(&[obligation.clone(), obligation.clone()], &[row.clone()]), vec![1]);
+        assert_eq!(
+            missing_obligations(&[obligation.clone(), obligation.clone()], &[row.clone()]),
+            vec![1]
+        );
         row.observation_proven = false;
-        assert_eq!(missing_obligations(std::slice::from_ref(&obligation), &[row.clone()]), vec![0]);
+        assert_eq!(
+            missing_obligations(std::slice::from_ref(&obligation), &[row.clone()]),
+            vec![0]
+        );
         row.observation_proven = true;
         row.identity.start = Some(124);
-        assert_eq!(missing_obligations(std::slice::from_ref(&obligation), &[row.clone()]), vec![0]);
+        assert_eq!(
+            missing_obligations(std::slice::from_ref(&obligation), &[row.clone()]),
+            vec![0]
+        );
         row.identity.start = Some(123);
         row.outcome = Outcome::refused("gone");
         assert_eq!(missing_obligations(&[obligation], &[row]), vec![0]);
@@ -1886,8 +2149,20 @@ mod tests {
     #[test]
     fn missing_and_replaced_parent_are_not_inferred_from_a_path() {
         let transcript = window(|| {
-            read_present("first", Path::new("/fixture/root/item"), Some((1, 2)), b"a", None);
-            read_present("second", Path::new("/fixture/root/item"), Some((1, 3)), b"b", None);
+            read_present(
+                "first",
+                Path::new("/fixture/root/item"),
+                Some((1, 2)),
+                b"a",
+                None,
+            );
+            read_present(
+                "second",
+                Path::new("/fixture/root/item"),
+                Some((1, 3)),
+                b"b",
+                None,
+            );
             dir_entry("component", None, std::ffi::OsStr::new("item"));
         });
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
@@ -1895,7 +2170,10 @@ mod tests {
             assert_eq!(row["observation_proven"], false);
             assert!(row["identity"].get("parent_inode").is_none());
         }
-        assert_ne!(document["reads"][0]["identity"]["inode"], document["reads"][1]["identity"]["inode"]);
+        assert_ne!(
+            document["reads"][0]["identity"]["inode"],
+            document["reads"][1]["identity"]["inode"]
+        );
         assert_eq!(document["outcome"]["status"], "completed");
         assert_eq!(document["observation_complete"], false);
     }
@@ -1919,7 +2197,10 @@ mod tests {
         let source = include_str!("tape.rs");
         let marker = "\n#[cfg(test)]\n#[allow(clippy::unwrap_used";
         let implementation = source.split_once(marker).expect("test module boundary").0;
-        assert!(implementation.contains("fn effect("), "the guard must inspect the recorder implementation");
+        assert!(
+            implementation.contains("fn effect("),
+            "the guard must inspect the recorder implementation"
+        );
         assert!(!implementation.contains("symlink_metadata"));
         assert!(!implementation.contains("fn parent_identity"));
         let state = include_str!("state.rs");
@@ -1931,7 +2212,13 @@ mod tests {
 
     #[test]
     fn held_lock_without_observed_descriptor_identity_stays_unproven() {
-        let transcript = window(|| lock("state::StateLock", Path::new("lock"), LockOutcome::Held(None)));
+        let transcript = window(|| {
+            lock(
+                "state::StateLock",
+                Path::new("lock"),
+                LockOutcome::Held(None),
+            )
+        });
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         let row = &document["reads"][0];
         assert_eq!(row["observation_proven"], false);
@@ -1953,7 +2240,14 @@ mod tests {
             fd_list("list", 42, Outcome::listed(1, 1, false));
             fd_list("list", 42, Outcome::listed(0, 0, false));
             process_context(42, 124, Some(501));
-            vnode("vnode", 43, 5, "vnode-facts", Outcome::answer("readable"), None);
+            vnode(
+                "vnode",
+                43,
+                5,
+                "vnode-facts",
+                Outcome::answer("readable"),
+                None,
+            );
         });
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         assert_eq!(document["reads"][0]["identity"]["start"], 123);
@@ -1968,7 +2262,14 @@ mod tests {
         let transcript = window(|| {
             observed_process("settle", 42, 10, Some(501), "classified");
             observed_process("settle", 42, 11, Some(501), "retry_identity");
-            vnode("vnode", 42, 3, "vnode-facts", Outcome::answer("readable"), None);
+            vnode(
+                "vnode",
+                42,
+                3,
+                "vnode-facts",
+                Outcome::answer("readable"),
+                None,
+            );
         });
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         let rows = document["reads"].as_array().expect("reads");
@@ -2030,7 +2331,13 @@ mod tests {
     #[test]
     fn non_utf8_component_is_refused_without_a_lossy_identity() {
         use std::os::unix::ffi::OsStrExt;
-        let transcript = window(|| dir_entry("listing", Some((1, 2)), std::ffi::OsStr::from_bytes(b"x\xff")));
+        let transcript = window(|| {
+            dir_entry(
+                "listing",
+                Some((1, 2)),
+                std::ffi::OsStr::from_bytes(b"x\xff"),
+            )
+        });
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         let row = &document["reads"][0];
         assert!(row["identity"].get("component").is_none());
@@ -2111,18 +2418,26 @@ mod tests {
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         let effects = document["effects"].as_array().expect("effects");
         let reads = document["reads"].as_array().expect("reads");
-        let file_sync = reads.iter().find(|row| row["site"] == "state::write_and_publish")
+        let file_sync = reads
+            .iter()
+            .find(|row| row["site"] == "state::write_and_publish")
             .expect("file sync was recorded");
-        let directory_sync = reads.iter().find(|row| row["site"] == "state::sync_directory")
+        let directory_sync = reads
+            .iter()
+            .find(|row| row["site"] == "state::sync_directory")
             .expect("directory sync was recorded");
-        let rename = effects.iter().find(|row| row["kind"] == "rename")
+        let rename = effects
+            .iter()
+            .find(|row| row["kind"] == "rename")
             .expect("rename was recorded");
         assert_eq!(file_sync["outcome"]["answer"]["answer"], "succeeded");
         assert_eq!(directory_sync["outcome"]["answer"]["answer"], "succeeded");
         assert_eq!(rename["outcome"], "succeeded");
         let file_epoch = file_sync["epoch"].as_u64().expect("file sync epoch");
         let rename_epoch = rename["epoch"].as_u64().expect("rename epoch");
-        let directory_epoch = directory_sync["epoch"].as_u64().expect("directory sync epoch");
+        let directory_epoch = directory_sync["epoch"]
+            .as_u64()
+            .expect("directory sync epoch");
         assert!(file_epoch < rename_epoch);
         assert!(rename_epoch < directory_epoch);
         assert_eq!(file_sync["observation_proven"], false);
@@ -2140,7 +2455,9 @@ mod tests {
         assert_eq!(row["kind"], "save");
         assert_eq!(row["outcome"], "EIO");
         assert_eq!(row["partial_effect_possible"], true);
-        assert!(row["site"].as_str().is_some_and(|site| site.contains("tape.rs:")));
+        assert!(row["site"]
+            .as_str()
+            .is_some_and(|site| site.contains("tape.rs:")));
         let other = window(|| {
             let _ = io_effect("create", Path::new("file"), || -> std::io::Result<()> {
                 Err(std::io::Error::from_raw_os_error(libc::EIO))
@@ -2157,10 +2474,17 @@ mod tests {
             let error = std::io::Error::from_raw_os_error(libc::EIO);
             change_errno_to_enoent();
             sync_path("state::sync_directory", Path::new("parent"), Some(&error));
-            sync_path("state::write_and_publish", Path::new("temporary"), Some(&error));
+            sync_path(
+                "state::write_and_publish",
+                Path::new("temporary"),
+                Some(&error),
+            );
         });
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
-        assert_eq!(document["reads"][0]["outcome"]["answer"]["answer"], "succeeded");
+        assert_eq!(
+            document["reads"][0]["outcome"]["answer"]["answer"],
+            "succeeded"
+        );
         assert_eq!(document["reads"][1]["outcome"]["refused"]["class"], "EIO");
         assert_eq!(document["reads"][2]["site"], "state::write_and_publish");
         assert_eq!(document["reads"][2]["outcome"]["refused"]["class"], "EIO");
@@ -2175,7 +2499,10 @@ mod tests {
             (libc::ENOTDIR, "ENOTDIR"),
             (libc::EACCES, "EACCES"),
         ] {
-            assert_eq!(errno_class(&std::io::Error::from_raw_os_error(code)), expected);
+            assert_eq!(
+                errno_class(&std::io::Error::from_raw_os_error(code)),
+                expected
+            );
         }
     }
 
@@ -2221,7 +2548,10 @@ mod tests {
         assert_eq!(document["clocks"].as_array().map(Vec::len), Some(1));
         assert_eq!(document["clocks"][0]["value_ms"], returned);
         let site = document["clocks"][0]["site"].as_str().expect("caller site");
-        assert!(site.ends_with(&format!("tape.rs:{expected_line}")), "{site}");
+        assert!(
+            site.ends_with(&format!("tape.rs:{expected_line}")),
+            "{site}"
+        );
     }
 
     #[test]
