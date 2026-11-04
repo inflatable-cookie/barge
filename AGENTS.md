@@ -31,8 +31,19 @@ synthetic account home ([stage 4 design](docs/knowledge/contracts/stage4-design.
 
 ## Validate
 
-Rust selectors run through `oxide`, never `cargo`; the `oxide:begin` block below
-lists the commands. Each covers what it names:
+Ordinary Rust selectors run through `oxide`; the `oxide:begin` block below lists
+the commands. The named capture-only Cargo selectors below are a separately
+guarded exception. Each selector covers what it names:
+
+- `effigy rust:compile:cargo`, `rust:compile:release:cargo`, `rust:format:cargo`
+  and `rust:lint:cargo` — the corresponding locked capture covering checks with
+  the owner's pinned Cargo and qualified supervisor. Release compilation plus
+  cfg(test) source discipline supports compile-away; it is not a binary behavior test.
+- `effigy rust:test:tape:cargo` — recorder controls and the embedded harness
+  fixture; `rust:test:tape-eval:cargo` runs the harness target's embedded exercise;
+  `rust:test:tape-stage:cargo` builds that target without running it and emits
+  artifact metadata. These checks do not qualify the private launcher, its
+  isolation, or the private export producer and do not authorize consumer adoption.
 
 - `effigy barge:install:test` — synthetic installer refusal and receipt fixtures; no real build or install.
 - `effigy barge:install` / `effigy barge:reinstall` — planner only, after a reviewed merge; Tom's go-ahead is required for the first host install. Set `BARGE_INSTALL_PIN` and `BARGE_INSTALL_SCRATCH` as documented in the [consumer contract](docs/knowledge/contracts/consumption.md).

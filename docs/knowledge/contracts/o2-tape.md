@@ -325,6 +325,19 @@ does not grant a runtime block or prove parity.
 
 ## Selectors
 
+Tom's 2026-11-04 decision `c6e3e9c8-0d43-458e-8fa8-6d8fd3aa2190` v2
+separates capture delivery from private launcher qualification. The capture-only
+Effigy selectors `rust:compile:cargo`, `rust:compile:release:cargo`,
+`rust:format:cargo`, `rust:lint:cargo`, `rust:test:tape:cargo`,
+`rust:test:tape-eval:cargo` and `rust:test:tape-stage:cargo` use the owner's
+pinned Cargo under the qualified supervisor with locked offline dependencies.
+They cover compilation, formatting, lint, recorder and embedded harness
+behavior, and artifact metadata. Source discipline plus release compilation
+supports cfg(test) compile-away, not a binary behavior proof. Ordinary Rust
+selectors remain Oxide-backed. Direct capture checks do not qualify private
+launcher isolation, the current export producer or consumer adoption; the
+stage artifact is not a `barge.tape.export/1` receipt.
+
 `effigy rust:test:tape` runs the pure tape self-tests and the embedded
 end-to-end exercise; `effigy rust:test:tape-eval` runs the harness executable
 (no arguments: its embedded exercise). `effigy rust:compile:release` proves

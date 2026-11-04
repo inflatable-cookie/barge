@@ -24,6 +24,15 @@ alias = "barge"
 "rust:compile:release" = "oxide check --release --workspace --bins --locked"
 "rust:format" = "oxide fmt --all -- --check"
 "rust:lint" = "oxide clippy --workspace --all-targets --all-features --locked -- -D warnings"
+# Capture-only covering exception; planner activates these with the pinned Cargo,
+# offline dependencies and the qualified supervisor. Ordinary selectors stay on Oxide.
+"rust:compile:cargo" = "cargo check --workspace --all-targets --all-features --locked"
+"rust:compile:release:cargo" = "cargo check --release --workspace --bins --locked"
+"rust:format:cargo" = "cargo fmt --all -- --check"
+"rust:lint:cargo" = "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"
+"rust:test:tape:cargo" = "cargo test --locked -p barge --lib tape"
+"rust:test:tape-eval:cargo" = "cargo test --locked -p barge --test tape_eval"
+"rust:test:tape-stage:cargo" = "cargo test --locked -p barge --test tape_eval --no-run --message-format json"
 # Read-only OS-layer diagnostic (crates/barge/examples/volume_probe.rs):
 # BARGE_OS_PROBE_PATH names one directory to read, and nothing is written.
 "os:volumes:probe" = "oxide run -p barge --locked --example volume_probe"
