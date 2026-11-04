@@ -12,7 +12,7 @@ Tom's scope and authority ruling lives in [vision](docs/knowledge/vision.md). Co
 
 - No moving live data, changing host or tool settings, or deleting existing data without explicit operator approval for that action.
   Oxide's own idle-slot eviction and output placement during ordinary Oxide-routed builds are not Barge data deletion.
-- Never write scratch to a home folder or a drive root. Use `/Volumes/Builds/scratch/barge/` when the Builds drive is present.
+- Never write scratch to a home folder or a drive root. Use `/Volumes/Stash/scratch/barge/` when the Stash drive is present.
 - Do not change Oxide from this repository. Oxide changes go through Oxide's own Queue project.
 - When a change alters current truth, update its owning knowledge file in the same change. Record operator rulings before yielding.
 
@@ -59,7 +59,8 @@ guarded exception. Each selector covers what it names:
   is repaired or recorded as a concrete deviation in
   `docs/knowledge/contracts/rust-quality-deviations.json`.
 - `effigy rust:test` — the unit and integration suites, through `oxide test`
-  with a bounded admission and execution window.
+  with 300 s admission and 600 s execution, including compilation and Cargo-lock
+  waits. Expiry still forces closure; historical 300 s timeouts remain failures.
 - `effigy os:volumes:probe` — the read-only OS-layer diagnostic:
   `BARGE_OS_PROBE_PATH` names one directory on a volume, whose facts are read
   and then verified against that identity; nothing is written. Evidence, not a
