@@ -301,14 +301,18 @@ class AdmissionControls(unittest.TestCase):
                 admission.validate_block(invalid, **self.bindings)
 
     def test_approved_scratch_cap_is_exact_and_pool_is_bounded(self):
-        cap = 4 * 1024 * 1024 * 1024
+        cap = 5 * 1024 * 1024 * 1024
+        pool_cap = 4 * 1024 * 1024 * 1024
         self.assertEqual(admission.CAP_BYTES, cap)
+        self.assertEqual(admission.POOL_MAX_BYTES, pool_cap)
         self.assertEqual(admission.validate_block({**self.block, 'pool_cap_bytes': 256 * 1024 * 1024}, **self.bindings), 600)
+        self.assertEqual(admission.validate_block({**self.block, 'pool_cap_bytes': pool_cap}, **self.bindings), 600)
         for changes in ({'scratch_cap_bytes': 2 * 1024 * 1024 * 1024},
                         {'scratch_cap_bytes': 3 * 1024 * 1024 * 1024},
+                        {'scratch_cap_bytes': 4 * 1024 * 1024 * 1024},
                         {'scratch_cap_bytes': cap + 1}, {'scratch_cap_bytes': None},
                         {'scratch_cap_bytes': float(cap)}, {'scratch_cap_bytes': True},
-                        {'pool_cap_bytes': cap + 1}, {'pool_cap_bytes': None}, {'pool_cap_bytes': 0}):
+                        {'pool_cap_bytes': pool_cap + 1}, {'pool_cap_bytes': None}, {'pool_cap_bytes': 0}):
             with self.assertRaises(ValueError):
                 admission.validate_block({**self.block, **changes}, **self.bindings)
         with self.assertRaises(ValueError):
