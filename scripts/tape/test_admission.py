@@ -22,6 +22,55 @@ class AdmissionControls(unittest.TestCase):
         self.bindings = dict(head='b' * 40, wrapper_hash=self.hash, oxide_hash=self.hash,
                              audit_hash=self.hash, ledger_hash=self.hash)
 
+    def test_foreground_gate_no_follow_custody_and_limits(self):
+        from types import SimpleNamespace
+        private = admission.Path('/private')
+        root = private / 'work'
+        scope, resource = 'a' * 32, 'b' * 32
+        gate = root / '.effigy/state/gates' / scope / (resource + '.gate')
+        dirs = [private, root, root / '.effigy', root / '.effigy/state',
+                root / '.effigy/state/gates', gate.parent]
+        def entry(mode, ino, size=0, uid=501, links=1):
+            return SimpleNamespace(st_mode=mode, st_ino=ino, st_dev=1, st_uid=uid,
+                                   st_nlink=links, st_size=size, st_mtime_ns=1)
+        entries = {path: entry(0o040700, index) for index, path in enumerate(dirs, 1)}
+        entries[gate] = entry(0o100600, 100, 30)
+        descriptors = {}
+        def open_path(name, flags, dir_fd=None):
+            path = admission.Path(name) if dir_fd is None else descriptors[dir_fd] / name
+            if path not in entries: raise FileNotFoundError(path)
+            fd = len(descriptors) + 10
+            while fd in descriptors: fd += 1
+            descriptors[fd] = path
+            return fd
+        def stat_path(name, dir_fd=None, follow_symlinks=False):
+            return entries[descriptors[dir_fd] / name]
+        with mock.patch.object(admission.Path, 'resolve', lambda self, strict=True: self), \
+                mock.patch.object(admission.os, 'geteuid', return_value=501), \
+                mock.patch.object(admission.os, 'lstat', side_effect=lambda p: entries[p]), \
+                mock.patch.object(admission.os, 'open', side_effect=open_path), \
+                mock.patch.object(admission.os, 'close'), \
+                mock.patch.object(admission.os, 'stat', side_effect=stat_path), \
+                mock.patch.object(admission.os, 'fstat', side_effect=lambda fd: entries[descriptors[fd]]):
+            self.assertTrue(admission.validate_foreground_gate(gate, root, private, {}))
+            entries[gate].st_size = 50  # diagnostic rewrite in the same inode
+            self.assertTrue(admission.validate_foreground_gate(gate, root, private, {}))
+            for attr, value in [('st_mode', 0o120777), ('st_mode', 0o100644),
+                                ('st_uid', 502), ('st_nlink', 2), ('st_size', 4097)]:
+                old = getattr(entries[gate], attr)
+                setattr(entries[gate], attr, value)
+                with self.subTest(attr=attr, value=value), self.assertRaises(ValueError):
+                    admission.validate_foreground_gate(gate, root, private, {})
+                setattr(entries[gate], attr, old)
+            entries[gate.parent].st_mode = 0o040755
+            with self.assertRaises(ValueError):
+                admission.validate_foreground_gate(gate, root, private, {})
+            self.assertFalse(admission.validate_foreground_gate(root / '.effigy/state/kernel.db', root, private, {}))
+            for name in ('runs', 'sock', 'objects', 'staging'):
+                self.assertFalse(admission.validate_foreground_gate(root / '.effigy/state' / name, root, private, {}))
+            self.assertFalse(admission.validate_foreground_gate(gate.parent / 'BAD.gate', root, private, {}))
+            self.assertFalse(admission.validate_foreground_gate(gate.parent / resource / 'deep.gate', root, private, {}))
+
     def test_source_snapshot_allows_only_new_guarded_target(self):
         root = admission.Path('/private/work')
         private = admission.Path('/private')
@@ -57,6 +106,34 @@ class AdmissionControls(unittest.TestCase):
             link[0] = 'original'
             members.append(root / 'unrelated')
             self.assertNotEqual(admission.source_snapshot(root, private=private, baseline=baseline), baseline)
+
+    def test_foreground_snapshot_keeps_baseline_and_rejects_unrelated(self):
+        root, private = admission.Path('/private/work'), admission.Path('/private')
+        effigy = root / '.effigy'
+        members = [effigy]
+        children = [effigy / 'tracked']
+        content = {'tracked': b'original', 'kernel.db': b'unrelated'}
+        def metadata(path):
+            return mock.Mock(st_mode=0o040700 if path.name in ('.effigy', 'state', 'gates') else 0o100600)
+        with mock.patch.object(admission.Path, 'iterdir', lambda _: iter(members)), \
+                mock.patch.object(admission.Path, 'rglob', lambda self, pattern: iter(children)), \
+                mock.patch.object(admission.Path, 'lstat', metadata), \
+                mock.patch.object(admission.Path, 'resolve', lambda self, strict=True: self), \
+                mock.patch.object(admission.Path, 'is_symlink', return_value=False), \
+                mock.patch.object(admission.Path, 'is_dir', lambda self: self.name == '.effigy'), \
+                mock.patch.object(admission.Path, 'read_bytes', lambda self: content[self.name]), \
+                mock.patch.object(admission, 'validate_foreground_gate', side_effect=lambda p, *_: p.name in ('state', 'gates')):
+            baseline = admission.source_snapshot(root)
+            children.extend([effigy / 'state', effigy / 'state/gates'])
+            self.assertEqual(admission.source_snapshot(root, private=private, baseline=baseline), baseline)
+            content['tracked'] = b'changed'
+            self.assertNotEqual(admission.source_snapshot(root, private=private, baseline=baseline), baseline)
+            content['tracked'] = b'original'
+            children.append(effigy / 'state/kernel.db')
+            self.assertNotEqual(admission.source_snapshot(root, private=private, baseline=baseline), baseline)
+            children[:] = [effigy / 'state'] * 4097
+            with self.assertRaisesRegex(ValueError, 'entry limit'):
+                admission.source_snapshot(root, private=private, baseline=baseline)
 
     def test_generated_link_escape_is_rejected_before_external_stat(self):
         private = admission.Path('/private')

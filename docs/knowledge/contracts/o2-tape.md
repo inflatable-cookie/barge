@@ -291,6 +291,17 @@ treated as source. All original source bytes, executable modes and symlink
 targets remain checked, and unrelated additions refuse. The unbuilt Oxide
 archive keeps the strict snapshot with no generated-output exception.
 
+For the pinned Effigy `737a6d0` foreground route, a baseline-bound Barge
+archive may also acquire only the checkout gate directories and base32-named
+scope and resource gate files under `.effigy/state/gates`. The separate
+no-follow gate check requires owned private containment, private directory and
+file modes, one link, bounded names, entries and file sizes; diagnostic contents
+may be rewritten in place and are not authority. Existing archive entries remain
+in the source snapshot, and other Effigy state remains forbidden. This applies
+to the reviewed foreground selectors and nested tape-stage, not to durable or
+other execution classes. The exporter uses the same snapshot oracle around its
+nested stage while retaining its exact Git inventory and receipt bindings.
+
 The separate candidate route consumes the provider's
 `oxide.private-build-validation.candidate/1` receipt as an **unqualified**
 candidate, not as an in-root debug bootstrap. Its origin and copied executable

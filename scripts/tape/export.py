@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import admission
 
 SCRATCH = Path('/Volumes/Builds/scratch/barge').resolve()
 HEX40 = re.compile(r'^[0-9a-f]{40}$')
@@ -55,6 +56,13 @@ def inventory(root, members):
         if kind == 'file':
             result[name]['executable'] = bool(path.stat().st_mode & 0o111)
     return result
+
+
+def verify_source_after_stage(source, members, before, private_root, baseline):
+    if inventory(source, members) != before:
+        raise RuntimeError('source changed during build')
+    if admission.source_snapshot(source, private=private_root, baseline=baseline) != baseline:
+        raise RuntimeError('source membership changed during build')
 
 
 def main():
@@ -168,22 +176,16 @@ def main():
     for required in ('Cargo.lock', 'rust-toolchain.toml'):
         if required not in before:
             raise RuntimeError(f'missing {required}')
+    baseline = admission.source_snapshot(source)
+    expected_dirs = {parent.as_posix() for name in members
+                     for parent in Path(name).parents if parent != Path('.')}
+    if set(baseline) != set(members) | expected_dirs:
+        raise RuntimeError('archive membership differs from the Git tree')
     version = command([str(rustc), '--version'], source, env).decode().strip()
     if not version.startswith('rustc 1.97.1 '):
         raise RuntimeError('wrong rustc version')
     output = command(['effigy', 'rust:test:tape-stage'], source, env)
-    if inventory(source, members) != before:
-        raise RuntimeError('source changed during build')
-    observed = {p.relative_to(source).as_posix() for p in source.rglob('*')
-                if p.is_file() or p.is_symlink()}
-    if observed != set(members):
-        raise RuntimeError('source gained or lost files during build')
-    expected_dirs = {parent.as_posix() for name in members
-                     for parent in Path(name).parents if parent != Path('.')}
-    actual_dirs = {p.relative_to(source).as_posix() for p in source.rglob('*')
-                   if p.is_dir() and not p.is_symlink()}
-    if actual_dirs != expected_dirs:
-        raise RuntimeError('source gained or lost directories during build')
+    verify_source_after_stage(source, members, before, private_root, baseline)
     artifacts = []
     for line in output.splitlines():
         try:

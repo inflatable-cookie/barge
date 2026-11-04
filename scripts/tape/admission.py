@@ -527,8 +527,80 @@ def validate_generated_output(path, private):
             raise ValueError('unsupported generated output entry')
 
 
+def validate_foreground_gate(path, root, private, baseline):
+    """Validate one newly generated foreground gate entry without following links."""
+    root, private, path = Path(root), Path(private), Path(path)
+    relative = path.relative_to(root)
+    parts = relative.parts
+    gate_name = r'[a-z2-7]{32}'
+    kinds = {('.effigy',): 'dir', ('.effigy', 'state'): 'dir',
+             ('.effigy', 'state', 'gates'): 'dir'}
+    if len(parts) == 4 and parts[:3] == ('.effigy', 'state', 'gates'):
+        if re.fullmatch(gate_name, parts[3]):
+            kinds[parts] = 'dir'
+        elif re.fullmatch(gate_name + r'\.scope', parts[3]):
+            kinds[parts] = 'file'
+    if (len(parts) == 5 and parts[:3] == ('.effigy', 'state', 'gates')
+            and re.fullmatch(gate_name, parts[3]) and re.fullmatch(gate_name + r'\.gate', parts[4])):
+        kinds[parts] = 'file'
+    expected = kinds.get(parts)
+    if expected is None:
+        return False
+    if (not private.is_absolute() or private.resolve(strict=True) != private
+            or not root.is_relative_to(private)):
+        raise ValueError('gate root is not canonical private source')
+    root_info = os.lstat(private)
+    if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.geteuid():
+        raise ValueError('gate private root is not owned')
+    fd = os.open(private, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        opened_root = os.fstat(fd)
+        if (root_info.st_dev, root_info.st_ino) != (opened_root.st_dev, opened_root.st_ino):
+            raise ValueError('gate private root changed')
+        chain = path.relative_to(private).parts
+        for index, part in enumerate(chain):
+            info = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            is_last = index == len(chain) - 1
+            if info.st_uid != os.geteuid():
+                raise ValueError('gate entry is not owned')
+            rel = path.parents[len(chain) - index - 2] if not is_last else path
+            try:
+                archive_name = rel.relative_to(root).as_posix()
+            except ValueError:
+                archive_name = None
+            generated = (archive_name is not None and archive_name.startswith('.effigy')
+                         and archive_name not in baseline)
+            if is_last and expected == 'file':
+                if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+                        or info.st_nlink != 1 or info.st_size > 4096):
+                    raise ValueError('invalid foreground gate file')
+                flags = os.O_RDONLY | os.O_NOFOLLOW
+            else:
+                if not stat.S_ISDIR(info.st_mode) or (generated and stat.S_IMODE(info.st_mode) != 0o700):
+                    raise ValueError('invalid foreground gate directory')
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            child = os.open(part, flags, dir_fd=fd)
+            opened = os.fstat(child)
+            if (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink, info.st_size,
+                    info.st_mtime_ns) != (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid,
+                                          opened.st_nlink, opened.st_size, opened.st_mtime_ns):
+                os.close(child)
+                raise ValueError('foreground gate changed while inspected')
+            after = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            if (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink, info.st_size,
+                    info.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+                                          after.st_nlink, after.st_size, after.st_mtime_ns):
+                os.close(child)
+                raise ValueError('foreground gate identity changed')
+            os.close(fd)
+            fd = child
+    finally:
+        os.close(fd)
+    return True
+
+
 def source_snapshot(root, *, private=None, baseline=None):
-    """Snapshot all source; optionally admit only a new, owned target tree."""
+    """Snapshot source, admitting only validated new target and foreground gates."""
     result = {}
     if baseline is not None:
         if (private is None or not root.is_absolute() or root.resolve(strict=True) != root
@@ -542,12 +614,19 @@ def source_snapshot(root, *, private=None, baseline=None):
                 continue
             if not child.is_symlink() and child.is_dir():
                 yield from child.rglob('*')
+    gate_entries = 0
     for path in source_entries():
         name = path.relative_to(root).as_posix()
         if baseline is not None and (name == 'target' or name.startswith('target/')):
             if name == 'target':
                 validate_generated_output(path, private)
             continue
+        if baseline is not None and name not in baseline and name.startswith('.effigy'):
+            gate_entries += 1
+            if gate_entries > 4096:
+                raise ValueError('foreground gate entry limit')
+            if validate_foreground_gate(path, root, private, baseline):
+                continue
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode):
             result[name] = ('link', os.readlink(path))
