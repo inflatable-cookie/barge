@@ -1369,6 +1369,13 @@ pub(crate) fn write_effect(kind: &'static str, path: &Path) {
 mod tests {
     use super::*;
 
+    fn change_errno_to_enoent() {
+        let error = std::fs::metadata("").expect_err("an empty path is missing");
+        let current = std::io::Error::last_os_error();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+        assert_eq!(current.raw_os_error(), Some(libc::ENOENT));
+    }
+
     #[test]
     fn empty_effect_expectation_flags_every_attempt_without_claiming_parity() {
         begin_window(WindowConfig {
@@ -2148,9 +2155,7 @@ mod tests {
         let transcript = window(|| {
             sync_path("state::sync_directory", Path::new("parent"), None);
             let error = std::io::Error::from_raw_os_error(libc::EIO);
-            #[cfg(target_os = "macos")]
-            // SAFETY: __error points to this thread's writable errno cell.
-            unsafe { *libc::__error() = libc::ENOENT; }
+            change_errno_to_enoent();
             sync_path("state::sync_directory", Path::new("parent"), Some(&error));
             sync_path("state::write_and_publish", Path::new("temporary"), Some(&error));
         });
@@ -2179,9 +2184,7 @@ mod tests {
         let transcript = window(|| {
             write_effect("create", Path::new("child"));
             let captured = std::io::Error::from_raw_os_error(libc::EACCES);
-            #[cfg(target_os = "macos")]
-            // SAFETY: __error points to this thread's writable errno cell.
-            unsafe { *libc::__error() = libc::ENOENT; }
+            change_errno_to_enoent();
             effect_outcome("create", Path::new("child"), Some(&captured));
         });
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
