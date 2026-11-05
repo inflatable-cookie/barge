@@ -49,8 +49,10 @@
 //!
 //! With no arguments, the harness runs its embedded exercise: it builds one
 //! exclusively owned directory fixture under this invocation's run root
-//! (AGENTS.md scratch), writes its manifest, runs the same [`run`] path, and
-//! asserts the transcript's shape. `oxide test --test tape_eval` selects it.
+//! (AGENTS.md scratch), runs the unchanged real-host path and retains its
+//! transcript beside the fixture. A recorded capture-cap refusal is a valid
+//! self-check outcome, never capture qualification or an eligible-root proof.
+//! Other apparatus errors still fail. `oxide test --test tape_eval` selects it.
 //!
 //! ## Staging for the later X-S2 orchestration
 //!
@@ -205,7 +207,7 @@ fn main() -> std::process::ExitCode {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     if arguments.is_empty() {
         return match tape_harness::embedded_exercise() {
-            Ok(summary) => std::process::ExitCode::from(summary.exit_code),
+            Ok(()) => std::process::ExitCode::SUCCESS,
             Err(reason) => {
                 eprintln!("barge.tape.harness/1: the embedded exercise failed: {reason}");
                 std::process::ExitCode::from(2)

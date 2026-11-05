@@ -338,14 +338,24 @@ selectors remain Oxide-backed. Direct capture checks do not qualify private
 launcher isolation, the current export producer or consumer adoption; the
 stage artifact is not a `barge.tape.export/1` receipt.
 
-`effigy rust:test:tape` runs the pure tape self-tests and the embedded
-end-to-end exercise; `effigy rust:test:tape-eval` runs the harness executable
-(no arguments: its embedded exercise). `effigy rust:compile:release` proves
+`effigy rust:test:tape` runs the tape controls, a deterministic positive
+end-to-end fixture over actual `release::plan` with explicit synthetic process
+facts, held/unknown/bounded-writer counterfactuals, and a separate real-host
+exercise. File and volume facts remain real in the positive fixture; it must
+produce the complete plan with its settled root eligible and fit the fixed caps.
+`effigy rust:test:tape-eval` runs the harness executable (no arguments: its
+real-host self-check). That self-check accepts the actual engine outcome or an
+honestly recorded fixed-cap capture refusal; neither establishes qualification.
+Ordinary argv callers still use the real MacOs observer and refuse exhausted
+captures. No process is omitted from that route and no cap changes. `effigy rust:compile:release` proves
 the production compile-away. All are covered by `effigy rust:test` and
 `effigy rust:compile` besides.
 
 Capture refusal errors include the transcript path, recorded `refusal_kind` and
-`caps`, so a test failure preserves the diagnostic even when its fixture is removed.
+`caps`. The embedded exercises copy useful transcripts beside their unique
+fixture directories within the caller's run root before fixture teardown, so
+both complete synthetic controls and insufficient real-host captures are retained.
+The tests do not qualify capture, comparison, native behavior or parity.
 
 Two errno-capture controls use a safe metadata lookup on an empty path to set
 and verify `ENOENT` before checking that the earlier captured error is recorded.

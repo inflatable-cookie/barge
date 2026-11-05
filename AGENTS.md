@@ -97,8 +97,8 @@ guarded exception. Each selector covers what it names:
   declarations activate nothing, and each run is separately activated.
 - `effigy rust:test:proof-account` — the proof-only account's checks, with the
   `proof-synthetic-account` feature on. The ordinary `rust:test` never enables it.
-- `effigy rust:test:tape` — the capture tape's pure self-tests and the embedded
-  end-to-end fixture exercise of the actual release-plan harness
+- `effigy rust:test:tape` — tape controls, a deterministic positive fixture and
+  a real-host bounded-outcome exercise of the actual release-plan harness
   ([o2-tape](docs/knowledge/contracts/o2-tape.md)). Read-only: fixtures live in the
   run root and the plan changes nothing.
 - `effigy rust:test:tape:pure` — the recorder's in-memory self-tests only;
