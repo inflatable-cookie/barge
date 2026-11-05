@@ -689,7 +689,12 @@ fn write_transcript(path: &Path, transcript: &str) -> Result<(), String> {
         || caps["process_rows_exhausted"] == true
         || caps["dropped_rows"].as_u64().unwrap_or(0) != 0
     {
-        return Err("the transcript was truncated or a capture cap was exhausted".to_owned());
+        return Err(format!(
+            "the transcript was truncated or a capture cap was exhausted; path={}; refusal_kind={}; caps={}",
+            path.display(),
+            document["outcome"]["refusal_kind"],
+            caps,
+        ));
     }
     Ok(())
 }
@@ -1082,7 +1087,10 @@ mod tests {
             "caps": { "occurrences_exhausted": true, "dropped_rows": 1 }
         });
         let bytes = serde_json::to_string(&document).expect("JSON");
-        assert!(write_transcript(&path, &bytes).is_err());
+        let error = write_transcript(&path, &bytes).expect_err("exhausted capture refuses");
+        assert!(error.contains(&format!("path={}", path.display())));
+        assert!(error.contains("refusal_kind=null"));
+        assert!(error.contains(&format!("caps={}", document["caps"])));
         let actual: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).expect("written transcript"))
                 .expect("JSON");

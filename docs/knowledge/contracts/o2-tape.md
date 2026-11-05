@@ -344,6 +344,9 @@ end-to-end exercise; `effigy rust:test:tape-eval` runs the harness executable
 the production compile-away. All are covered by `effigy rust:test` and
 `effigy rust:compile` besides.
 
+Capture refusal errors include the transcript path, recorded `refusal_kind` and
+`caps`, so a test failure preserves the diagnostic even when its fixture is removed.
+
 Two errno-capture controls use a safe metadata lookup on an empty path to set
 and verify `ENOENT` before checking that the earlier captured error is recorded.
 The lookup creates no fixture or file; the captured-error assertions remain.

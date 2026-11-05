@@ -61,6 +61,8 @@ guarded exception. Each selector covers what it names:
 - `effigy rust:test` — the unit and integration suites, through `oxide test`
   with 300 s admission and 600 s execution, including compilation and Cargo-lock
   waits. Expiry still forces closure; historical 300 s timeouts remain failures.
+  For fixture-bound runs, set `BARGE_TEST_SCRATCH_ROOT` and `TMPDIR`/`TMP`/`TEMP`
+  to the same fresh Stash scratch directory; compiler output stays in Oxide's pool.
 - `effigy os:volumes:probe` — the read-only OS-layer diagnostic:
   `BARGE_OS_PROBE_PATH` names one directory on a volume, whose facts are read
   and then verified against that identity; nothing is written. Evidence, not a
