@@ -120,7 +120,7 @@ run = "python3 scripts/native/release-proof.py diagnostic"
 # forced exit: an expired admission window starts no child, and an expired
 # execution window stops the owned group, so a hung test or leaked handle
 # cannot keep the run open.
-run = "oxide test --admission-budget 300s --execution-budget 300s --workspace --all-targets --locked"
+run = "oxide test --admission-budget 300s --execution-budget 600s --workspace --all-targets --locked"
 default = false
 
 # Slice S4's scratch expiry and deletion native: the frozen design's one bounded

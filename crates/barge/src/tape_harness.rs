@@ -494,6 +494,24 @@ pub(crate) fn run_bound(
     transcript_out: &Path,
     source_binding: &str,
 ) -> Result<RunSummary, String> {
+    run_with_observer(
+        manifest_bytes,
+        fixture_root,
+        transcript_out,
+        source_binding,
+        &crate::os::platform(),
+    )
+}
+
+// Test-only injection of explicit process facts; ordinary harness callers above
+// always supply the real MacOs observer. All other platform facts stay real.
+fn run_with_observer(
+    manifest_bytes: &[u8],
+    fixture_root: &Path,
+    transcript_out: &Path,
+    source_binding: &str,
+    observer: &dyn ProcessObserver,
+) -> Result<RunSummary, String> {
     let request = match parse_manifest(manifest_bytes) {
         Ok(request) => request,
         Err(reason) => {
@@ -545,7 +563,6 @@ pub(crate) fn run_bound(
     let dirs: &dyn DirOps = &platform;
     let facts: &dyn AbsenceVolume = &platform;
     let mounts: &dyn MountRoot = &platform;
-    let observer: &dyn ProcessObserver = &platform;
     let outcome = crate::release::plan(
         &state_paths,
         dirs,
@@ -682,16 +699,41 @@ fn write_transcript(path: &Path, transcript: &str) -> Result<(), String> {
     let document: serde_json::Value = serde_json::from_str(transcript)
         .map_err(|error| format!("the transcript cannot be inspected: {error}"))?;
     let caps = &document["caps"];
-    if document["outcome"]["refusal_kind"] == "document_cap"
+    if capture_exhausted(&document) {
+        return Err(format!(
+            "the transcript was truncated or a capture cap was exhausted; path={}; refusal_kind={}; caps={}",
+            path.display(),
+            document["outcome"]["refusal_kind"],
+            caps,
+        ));
+    }
+    Ok(())
+}
+
+// These are the same refusal conditions used by the external harness and its
+// embedded self-check. A bounded host result never qualifies capture.
+fn capture_exhausted(document: &serde_json::Value) -> bool {
+    let caps = &document["caps"];
+    document["outcome"]["refusal_kind"] == "document_cap"
         || caps["document_truncated"] == true
         || caps["read_rows_exhausted"] == true
         || caps["occurrences_exhausted"] == true
         || caps["process_rows_exhausted"] == true
         || caps["dropped_rows"].as_u64().unwrap_or(0) != 0
-    {
-        return Err("the transcript was truncated or a capture cap was exhausted".to_owned());
-    }
-    Ok(())
+}
+
+// Copy outside TempDir before it drops, but within its caller-owned run root.
+fn retain_transcript(fixture: &EmbeddedFixture, source: &Path) -> Result<PathBuf, String> {
+    let directory = fixture.dir.path();
+    let parent = directory.parent().ok_or("the fixture has no run root")?;
+    let name = directory.file_name().ok_or("the fixture has no name")?;
+    let mut retained_name = name.to_os_string();
+    retained_name.push(".transcript.json");
+    let retained = parent.join(retained_name);
+    std::fs::copy(source, &retained)
+        .map_err(|error| format!("the transcript cannot be retained: {error}"))?;
+    eprintln!("barge.tape.exercise/1: retained {}", retained.display());
+    Ok(retained)
 }
 
 /// The declaration the D8 BASE fixture uses: Oxide's outputs area, released by
@@ -821,6 +863,8 @@ pub(crate) struct EmbeddedFixture {
     pub(crate) dir: crate::testkit::TempDir,
     /// The manifest bytes the window is run under.
     pub(crate) manifest: Vec<u8>,
+    /// The fixture-owned root used by writer counterfactuals.
+    pub(crate) root: PathBuf,
 }
 
 /// Build the whole BASE-shaped fixture: real volume record, declaration, one
@@ -877,17 +921,47 @@ pub(crate) fn build_fixture(label: &str) -> Result<EmbeddedFixture, String> {
     });
     let manifest = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| format!("the manifest cannot encode: {error}"))?;
-    Ok(EmbeddedFixture { dir, manifest })
+    Ok(EmbeddedFixture {
+        dir,
+        manifest,
+        root: root.path,
+    })
 }
 
-/// The embedded end-to-end exercise the exported executable runs with no
-/// arguments: build the exclusively owned fixture, run one window through
-/// [`run`] into the fixture's own transcripts directory, and return the
-/// summary for the caller's exit code.
-pub(crate) fn embedded_exercise() -> Result<RunSummary, String> {
-    let fixture = build_fixture("tape-eval")?;
+/// Exercise the unchanged real-host route, accepting only its actual engine
+/// outcome or a recorded bounded capture refusal. Success means the self-check
+/// classified that result, never that a truncated capture qualified.
+pub(crate) fn embedded_exercise() -> Result<(), String> {
+    let fixture = build_fixture("tape-eval-real-host")?;
     let transcript_out = fixture.dir.path().join("transcripts").join("barge.json");
-    run(&fixture.manifest, fixture.dir.path(), &transcript_out)
+    let outcome = run(&fixture.manifest, fixture.dir.path(), &transcript_out);
+    let retained = retain_transcript(&fixture, &transcript_out)?;
+    let bytes = std::fs::read(&retained).map_err(|error| error.to_string())?;
+    let document: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if bytes.len() > CAP_DOCUMENT_BYTES || document["schema"] != crate::tape::TRANSCRIPT_SCHEMA {
+        return Err("the real-host transcript violates its document contract".to_owned());
+    }
+    if capture_exhausted(&document) {
+        let reason = match outcome {
+            Err(reason) => reason,
+            Ok(_) => return Err("an exhausted capture was not refused".to_owned()),
+        };
+        if document["observation_complete"] != false {
+            return Err("a bounded capture must remain insufficient".to_owned());
+        }
+        eprintln!("barge.tape.exercise/1: bounded refusal (not qualification): {reason}");
+    } else {
+        let summary = outcome?;
+        if document["outcome"]["exit_code"] != summary.exit_code {
+            return Err("the real-host engine outcome does not match its transcript".to_owned());
+        }
+        eprintln!(
+            "barge.tape.exercise/1: engine status={} exit={}; capture remains unqualified",
+            summary.status, summary.exit_code
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -902,16 +976,23 @@ mod tests {
     };
     use std::path::Path;
 
-    /// The embedded end-to-end exercise: the actual harness `run` over an
-    /// exclusively owned directory fixture on a real selected volume. The
-    /// transcript binds the manifest, records the leaf reads, and the plan
-    /// completes with the settled, absent-checkout root eligible.
+    /// Actual release::plan over real fixture files and explicit synthetic
+    /// process facts, independent of how many processes the host currently has.
+    /// This positive control must complete with its settled root eligible.
     #[test]
     fn the_harness_runs_its_embedded_fixture_end_to_end() {
         let fixture = build_fixture("tape-eval-e2e").expect("the fixture builds");
         let transcript_out = fixture.dir.path().join("transcripts").join("barge.json");
-        let summary =
-            run(&fixture.manifest, fixture.dir.path(), &transcript_out).expect("the window runs");
+        let observer = crate::testkit::FakeObserver::new();
+        let outcome = run_with_observer(
+            &fixture.manifest,
+            fixture.dir.path(),
+            &transcript_out,
+            "synthetic-process-fixture-unqualified",
+            &observer,
+        );
+        retain_transcript(&fixture, &transcript_out).expect("retain the positive control");
+        let summary = outcome.expect("the deterministic window runs");
         assert_eq!(summary.status, "completed", "the plan completes");
         assert_eq!(summary.exit_code, 0, "a complete reference set exits 0");
         assert_eq!(summary.eligible, Some(1), "the settled root is releasable");
@@ -951,16 +1032,14 @@ mod tests {
         let caps = &document["caps"];
         let exhausted = caps["read_rows_exhausted"].as_bool().unwrap_or(false)
             || caps["process_rows_exhausted"].as_bool().unwrap_or(false);
-        // The leaves the plan reads before the custody scan's whole-host
-        // descriptor walk. They always fit: the fixture's own reads are small.
+        // Real file/volume leaves remain taped; process facts are explicitly
+        // supplied by FakeObserver rather than inferred from the host.
         let before_scan = [
             "state::read_bounded_inner",
             "registry::read",
             "area::read_directory",
             "area::read_holds",
             "state::StateLock::shared_if_present",
-            "MacOs::process_table",
-            "macos::read_identity",
             "reference::read_registry",
             "reference::control_directory_with",
             "reference::pools_holding",
@@ -973,13 +1052,7 @@ mod tests {
             "MacOs::mounts_for_uuid",
             "identity::read",
         ];
-        // The leaves behind the custody scan: the custody verdict, the marker
-        // reread under the root's lock and the absence proof. On a busy host
-        // the scan's own per-fd leaf rows exhaust the fixed read-row cap —
-        // one row per listed descriptor pair is what the leaf tape owes — and
-        // the tail rows are honestly absent: the caps block records the
-        // truncation, which is the contract's own behaviour, never a quiet
-        // completion.
+        // With bounded synthetic process facts the complete tail is mandatory.
         let after_scan = [
             "custody::take_custody_by",
             "reference::read_oxide_marker",
@@ -992,18 +1065,16 @@ mod tests {
                 "the transcript must record {expected}; saw {sites:?}"
             );
         }
-        if exhausted {
+        assert!(
+            !exhausted,
+            "the synthetic process fixture fits the fixed caps"
+        );
+        assert!(!capture_exhausted(&document));
+        for expected in after_scan {
             assert!(
-                caps["dropped_rows"].as_u64().unwrap_or(0) > 0,
-                "an exhausted cap must record its dropped rows"
+                sites.iter().any(|site| site.contains(expected)),
+                "the transcript must record {expected}; saw {sites:?}"
             );
-        } else {
-            for expected in after_scan {
-                assert!(
-                    sites.iter().any(|site| site.contains(expected)),
-                    "the transcript must record {expected}; saw {sites:?}"
-                );
-            }
         }
         assert_eq!(caps["read_rows"], rows.len());
         assert!(
@@ -1022,6 +1093,50 @@ mod tests {
             transcript.len() <= CAP_DOCUMENT_BYTES,
             "the transcript respects its document cap"
         );
+    }
+
+    #[test]
+    fn the_real_host_exercise_retains_its_bounded_outcome() {
+        embedded_exercise().expect("the real-host outcome is honestly classified");
+    }
+
+    #[test]
+    fn held_unknown_and_bounded_fixture_writers_never_become_eligible() {
+        use crate::testkit::ScanMode;
+        for scan in [
+            ScanMode::Open(vec![crate::os::OpenDescriptor {
+                pid: 123,
+                descriptor: 4,
+                path: PathBuf::from("/synthetic-held-root"),
+            }]),
+            ScanMode::Unreadable,
+            ScanMode::Bounded,
+        ] {
+            let fixture = build_fixture("tape-writer-counterfactual").expect("fixture");
+            let transcript_out = fixture.dir.path().join("transcript.json");
+            let mut observer = crate::testkit::FakeObserver::new();
+            observer.scan = match scan {
+                ScanMode::Open(mut descriptors) => {
+                    descriptors[0].path = fixture.root.clone();
+                    ScanMode::Open(descriptors)
+                }
+                other => other,
+            };
+            let outcome = run_with_observer(
+                &fixture.manifest,
+                fixture.dir.path(),
+                &transcript_out,
+                "synthetic-writer-counterfactual-unqualified",
+                &observer,
+            );
+            retain_transcript(&fixture, &transcript_out).expect("retain counterfactual");
+            let summary = outcome.expect("counterfactual window completes");
+            assert_eq!(
+                summary.eligible,
+                Some(0),
+                "no unknown or held root is eligible"
+            );
+        }
     }
 
     /// A refusal is an engine outcome: the transcript is still written, with
@@ -1082,7 +1197,10 @@ mod tests {
             "caps": { "occurrences_exhausted": true, "dropped_rows": 1 }
         });
         let bytes = serde_json::to_string(&document).expect("JSON");
-        assert!(write_transcript(&path, &bytes).is_err());
+        let error = write_transcript(&path, &bytes).expect_err("exhausted capture refuses");
+        assert!(error.contains(&format!("path={}", path.display())));
+        assert!(error.contains("refusal_kind=null"));
+        assert!(error.contains(&format!("caps={}", document["caps"])));
         let actual: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).expect("written transcript"))
                 .expect("JSON");
