@@ -489,13 +489,14 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
         Err(error) if error.kind() == IoErrorKind::NotFound => return Ok(ReadOutcome::Absent),
         #[cfg(test)]
         Err(error) if error.kind() == IoErrorKind::NotFound => {
+            crate::tape::stat("state::read_bounded_inner::precheck", path, None);
             crate::tape::read_absent("state::read_bounded_inner", path);
             return Ok(ReadOutcome::Absent);
         }
         Err(error) => {
             #[cfg(test)]
             crate::tape::stat_refused(
-                "state::read_bounded_inner",
+                "state::read_bounded_inner::precheck",
                 path,
                 &crate::tape::errno_class(&error),
             );
@@ -507,6 +508,24 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
             .with_detail("os_error", error.to_string().into()));
         }
     };
+    #[cfg(test)]
+    crate::tape::stat(
+        "state::read_bounded_inner::precheck",
+        path,
+        Some((
+            metadata.dev(),
+            metadata.ino(),
+            if metadata.file_type().is_symlink() {
+                "symlink"
+            } else if metadata.is_file() {
+                "file"
+            } else if metadata.is_dir() {
+                "directory"
+            } else {
+                "other"
+            },
+        )),
+    );
     if metadata.file_type().is_symlink() {
         #[cfg(test)]
         crate::tape::read_refused("state::read_bounded_inner", path, "symlink");
