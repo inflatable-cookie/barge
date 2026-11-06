@@ -489,13 +489,14 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
         Err(error) if error.kind() == IoErrorKind::NotFound => return Ok(ReadOutcome::Absent),
         #[cfg(test)]
         Err(error) if error.kind() == IoErrorKind::NotFound => {
+            crate::tape::stat("state::read_bounded_inner::precheck", path, None);
             crate::tape::read_absent("state::read_bounded_inner", path);
             return Ok(ReadOutcome::Absent);
         }
         Err(error) => {
             #[cfg(test)]
             crate::tape::stat_refused(
-                "state::read_bounded_inner",
+                "state::read_bounded_inner::precheck",
                 path,
                 &crate::tape::errno_class(&error),
             );
@@ -507,6 +508,24 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
             .with_detail("os_error", error.to_string().into()));
         }
     };
+    #[cfg(test)]
+    crate::tape::stat(
+        "state::read_bounded_inner::precheck",
+        path,
+        Some((
+            metadata.dev(),
+            metadata.ino(),
+            if metadata.file_type().is_symlink() {
+                "symlink"
+            } else if metadata.is_file() {
+                "file"
+            } else if metadata.is_dir() {
+                "directory"
+            } else {
+                "other"
+            },
+        )),
+    );
     if metadata.file_type().is_symlink() {
         #[cfg(test)]
         crate::tape::read_refused("state::read_bounded_inner", path, "symlink");
@@ -544,6 +563,12 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
     }
 
     let mut file = File::open(path).map_err(|error| {
+        #[cfg(test)]
+        crate::tape::read_refused(
+            "state::read_bounded_inner",
+            path,
+            &crate::tape::errno_class(&error),
+        );
         Error::new(
             ErrorKind::Io,
             format!("cannot open {}: {error}", path.display()),
@@ -554,6 +579,12 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
     // The opened file is what is read, so the size checked above and the bytes
     // read below are the same file even if the path was replaced in between.
     let opened = file.metadata().map_err(|error| {
+        #[cfg(test)]
+        crate::tape::stat_refused(
+            "state::read_bounded_inner::opened",
+            path,
+            &crate::tape::errno_class(&error),
+        );
         Error::new(
             ErrorKind::Io,
             format!("cannot read the size of {}: {error}", path.display()),
@@ -605,6 +636,12 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
             ));
         }
         let read = file.read(&mut chunk).map_err(|error| {
+            #[cfg(test)]
+            crate::tape::read_refused(
+                "state::read_bounded_inner",
+                path,
+                &crate::tape::errno_class(&error),
+            );
             Error::new(
                 ErrorKind::Io,
                 format!("cannot read {}: {error}", path.display()),
@@ -967,12 +1004,24 @@ impl StateLock {
                 .open(path)
         })
         .map_err(|error| lock_open_error(path, &error))?;
+        #[cfg(not(test))]
         wait_for_lock(&file, path, LockMode::Exclusive, deadline)?;
+        #[cfg(test)]
+        wait_for_lock(&file, path, LockMode::Exclusive, deadline).inspect_err(|error| {
+            crate::tape::lock(
+                "state::StateLock::exclusive",
+                path,
+                crate::tape::LockOutcome::Refused(error.kind().as_str().to_owned()),
+            );
+        })?;
         #[cfg(test)]
         crate::tape::lock(
             "state::StateLock::exclusive",
             path,
-            crate::tape::LockOutcome::Held(None),
+            crate::tape::LockOutcome::Held(
+                lock_observed_identity(&file, path),
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+            ),
         );
         Ok(Self {
             path: path.to_path_buf(),
@@ -1018,12 +1067,24 @@ impl StateLock {
                 return Err(lock_open_error(path, &error));
             }
         };
+        #[cfg(not(test))]
         wait_for_lock(&file, path, LockMode::Shared, deadline)?;
+        #[cfg(test)]
+        wait_for_lock(&file, path, LockMode::Shared, deadline).inspect_err(|error| {
+            crate::tape::lock(
+                "state::StateLock::shared_if_present",
+                path,
+                crate::tape::LockOutcome::Refused(error.kind().as_str().to_owned()),
+            );
+        })?;
         #[cfg(test)]
         crate::tape::lock(
             "state::StateLock::shared_if_present",
             path,
-            crate::tape::LockOutcome::Held(None),
+            crate::tape::LockOutcome::Held(
+                lock_observed_identity(&file, path),
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+            ),
         );
         Ok(Some(Self {
             path: path.to_path_buf(),
@@ -1047,6 +1108,48 @@ impl StateLock {
     pub fn mode(&self) -> LockMode {
         self.mode
     }
+}
+
+/// L1: observe the already held lock descriptor without changing the lock result.
+#[cfg(test)]
+fn lock_observed_identity(file: &File, path: &Path) -> Option<(u64, u64)> {
+    let observed = LOCK_METADATA_FAIL.with(|fail| {
+        if fail.replace(false) {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            file.metadata()
+        }
+    });
+    match observed {
+        Ok(metadata) => {
+            let facts = (metadata.dev(), metadata.ino());
+            crate::tape::stat(
+                "state::StateLock::metadata",
+                path,
+                Some((facts.0, facts.1, "file")),
+            );
+            Some(facts)
+        }
+        Err(error) => {
+            crate::tape::stat_refused(
+                "state::StateLock::metadata",
+                path,
+                &crate::tape::errno_class(&error),
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOCK_METADATA_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Inject one L1 error for the recorder's failure control.
+#[cfg(test)]
+pub(crate) fn fail_next_lock_metadata() {
+    LOCK_METADATA_FAIL.with(|fail| fail.set(true));
 }
 
 impl Drop for StateLock {

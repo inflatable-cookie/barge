@@ -3733,6 +3733,20 @@ impl DirOps for MacOs {
             )
         };
         if descriptor < 0 {
+            #[cfg(test)]
+            let error = io::Error::last_os_error();
+            #[cfg(test)]
+            crate::tape::child_stat_on(
+                "MacOs::open_child_dir",
+                directory,
+                (parent.identity().device.get(), parent.identity().inode),
+                name,
+                None,
+                Some(&crate::tape::errno_class(&error)),
+            );
+            #[cfg(test)]
+            return Err(child_error(name, "cannot open the child directory", error));
+            #[cfg(not(test))]
             return Err(child_error(
                 name,
                 "cannot open the child directory",
@@ -3745,15 +3759,24 @@ impl DirOps for MacOs {
         let identity = read_dir_identity(&file, Path::new(name))?;
         #[cfg(test)]
         {
-            crate::tape::dir_entry(
+            crate::tape::handle_dir_entry(
                 "MacOs::open_child_dir",
-                Some((parent.identity().device.get(), parent.identity().inode)),
+                directory,
+                (parent.identity().device.get(), parent.identity().inode),
                 std::ffi::OsStr::new(name),
             );
             crate::tape::stat(
                 "MacOs::open_child_dir",
                 Path::new(name),
                 Some((identity.device.get(), identity.inode, "directory")),
+            );
+            crate::tape::child_stat_on(
+                "MacOs::open_child_dir",
+                directory,
+                (parent.identity().device.get(), parent.identity().inode),
+                name,
+                Some((identity.device.get(), identity.inode, "directory")),
+                None,
             );
         }
         Ok(DirHandle::from_descriptor(file, identity))
@@ -3763,8 +3786,35 @@ impl DirOps for MacOs {
         let directory = parent_descriptor(handle, "duplicate")?;
         // SAFETY: `directory` is open for this call; `dup` returns either -1 or
         // a fresh descriptor this function then owns.
+        #[cfg(not(test))]
         let duplicate = unsafe { libc::dup(directory) };
+        #[cfg(test)]
+        let duplicate = if crate::tape::take_dup_failure() {
+            // SAFETY: dup accepts any integer and returns EBADF for -1.
+            unsafe { libc::dup(-1) }
+        } else {
+            // SAFETY: `directory` remains open for the call.
+            unsafe { libc::dup(directory) }
+        };
         if duplicate < 0 {
+            #[cfg(test)]
+            let error = io::Error::last_os_error();
+            #[cfg(test)]
+            crate::tape::handle_observation(
+                "MacOs::duplicate_dir",
+                "dir-duplicate",
+                directory,
+                handle.identity().device.get(),
+                handle.identity().inode,
+                crate::tape::Outcome::refused(crate::tape::errno_class(&error)),
+            );
+            #[cfg(test)]
+            return Err(child_error(
+                "duplicate",
+                "cannot duplicate the directory",
+                error,
+            ));
+            #[cfg(not(test))]
             return Err(child_error(
                 "duplicate",
                 "cannot duplicate the directory",
@@ -3774,6 +3824,15 @@ impl DirOps for MacOs {
         // SAFETY: `duplicate` is a fresh non-negative descriptor from `dup` and
         // no other owner exists, so `File` may take ownership of it.
         let file = unsafe { File::from_raw_fd(duplicate) };
+        #[cfg(test)]
+        crate::tape::handle_observation(
+            "MacOs::duplicate_dir",
+            "dir-duplicate",
+            directory,
+            handle.identity().device.get(),
+            handle.identity().inode,
+            crate::tape::Outcome::facts("duplicated"),
+        );
         Ok(DirHandle::from_descriptor(file, handle.identity()))
     }
 
@@ -3804,8 +3863,9 @@ impl DirOps for MacOs {
                 let class = crate::tape::errno_class(&error);
                 let refusal =
                     (error.kind() != std::io::ErrorKind::NotFound).then_some(class.as_str());
-                crate::tape::child_stat(
+                crate::tape::child_stat_on(
                     "MacOs::child_facts",
+                    directory,
                     (parent.identity().device.get(), parent.identity().inode),
                     name,
                     None,
@@ -3819,15 +3879,17 @@ impl DirOps for MacOs {
         {
             let parent_id = (parent.identity().device.get(), parent.identity().inode);
             match u64::try_from(status.st_dev) {
-                Ok(device) => crate::tape::child_stat(
+                Ok(device) => crate::tape::child_stat_on(
                     "MacOs::child_facts",
+                    directory,
                     parent_id,
                     name,
                     Some((device, status.st_ino, entry_facts(&status).kind.as_str())),
                     None,
                 ),
-                Err(_) => crate::tape::child_stat(
+                Err(_) => crate::tape::child_stat_on(
                     "MacOs::child_facts",
+                    directory,
                     parent_id,
                     name,
                     None,
@@ -4069,6 +4131,18 @@ impl DirOps for MacOs {
             )
         };
         if descriptor < 0 {
+            #[cfg(test)]
+            let error = io::Error::last_os_error();
+            #[cfg(test)]
+            crate::tape::read_child_refused(
+                "MacOs::read_child_file",
+                (parent.identity().device.get(), parent.identity().inode),
+                name,
+                &crate::tape::errno_class(&error),
+            );
+            #[cfg(test)]
+            return child_read_result(name, error);
+            #[cfg(not(test))]
             return child_read_result(name, io::Error::last_os_error());
         }
         // SAFETY: `descriptor` is a fresh non-negative descriptor from `openat`
@@ -4076,12 +4150,26 @@ impl DirOps for MacOs {
         let mut file = unsafe { File::from_raw_fd(descriptor) };
         let facts = entry_facts(&fstat(&file, Path::new(name))?);
         if facts != before {
+            #[cfg(test)]
+            crate::tape::read_child_refused(
+                "MacOs::read_child_file",
+                (parent.identity().device.get(), parent.identity().inode),
+                name,
+                "changed_while_opened",
+            );
             return Err(Error::new(
                 ErrorKind::UnknownState,
                 format!("`{name}` changed while it was opened"),
             ));
         }
         if facts.kind != EntryKind::File {
+            #[cfg(test)]
+            crate::tape::read_child_refused(
+                "MacOs::read_child_file",
+                (parent.identity().device.get(), parent.identity().inode),
+                name,
+                "not_regular_file",
+            );
             return Err(Error::new(
                 ErrorKind::UnknownState,
                 format!("`{name}` is a {}, not a regular file", facts.kind.as_str()),
@@ -4089,21 +4177,36 @@ impl DirOps for MacOs {
             .with_detail("name", name.into()));
         }
         if facts.size > cap as u64 {
+            #[cfg(test)]
+            crate::tape::read_child_refused(
+                "MacOs::read_child_file",
+                (parent.identity().device.get(), parent.identity().inode),
+                name,
+                "over_size_cap",
+            );
             return Err(child_bound_error(name, facts.size, cap));
         }
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 8192];
         loop {
-            let read = file
-                .read(&mut chunk)
-                .map_err(|error| child_error(name, "cannot read the file", error))?;
+            let read = file.read(&mut chunk).map_err(|error| {
+                #[cfg(test)]
+                crate::tape::read_child_refused(
+                    "MacOs::read_child_file",
+                    (parent.identity().device.get(), parent.identity().inode),
+                    name,
+                    &crate::tape::errno_class(&error),
+                );
+                child_error(name, "cannot read the file", error)
+            })?;
             if read == 0 {
                 let after = entry_facts(&fstat(&file, Path::new(name))?);
                 if after != facts || self.child_facts(parent, name)?.as_ref() != Some(&facts) {
                     #[cfg(test)]
-                    crate::tape::read_refused(
+                    crate::tape::read_child_refused(
                         "MacOs::read_child_file",
-                        Path::new(name),
+                        (parent.identity().device.get(), parent.identity().inode),
+                        name,
                         "changed_while_read",
                     );
                     return Err(Error::new(
@@ -4117,6 +4220,7 @@ impl DirOps for MacOs {
                     (parent.identity().device.get(), parent.identity().inode),
                     name,
                     (facts.device.get(), facts.inode),
+                    file.as_raw_fd(),
                     &buffer,
                     Some(cap as u64),
                 );
@@ -4124,9 +4228,10 @@ impl DirOps for MacOs {
             }
             if buffer.len() + read > cap {
                 #[cfg(test)]
-                crate::tape::read_refused(
+                crate::tape::read_child_refused(
                     "MacOs::read_child_file",
-                    Path::new(name),
+                    (parent.identity().device.get(), parent.identity().inode),
+                    name,
                     "over_size_cap",
                 );
                 return Err(child_bound_error(name, (buffer.len() + read) as u64, cap));
@@ -4214,15 +4319,17 @@ impl DirOps for MacOs {
         #[cfg(test)]
         {
             for entry in &entries {
-                crate::tape::dir_entry(
+                crate::tape::handle_dir_entry(
                     "MacOs::list_children",
-                    Some((parent.identity().device.get(), parent.identity().inode)),
+                    directory,
+                    (parent.identity().device.get(), parent.identity().inode),
                     std::ffi::OsStr::new(&entry.name),
                 );
             }
             crate::tape::handle_observation(
                 "MacOs::list_children",
                 "dir-list",
+                directory,
                 parent.identity().device.get(),
                 parent.identity().inode,
                 crate::tape::Outcome::listed(total, entries.len(), truncated),
@@ -4311,15 +4418,17 @@ impl DirOps for MacOs {
         #[cfg(test)]
         {
             for name in &names {
-                crate::tape::dir_entry(
+                crate::tape::handle_dir_entry(
                     "MacOs::list_names",
-                    Some((parent.identity().device.get(), parent.identity().inode)),
+                    directory,
+                    (parent.identity().device.get(), parent.identity().inode),
                     std::ffi::OsStr::new(name),
                 );
             }
             crate::tape::handle_observation(
                 "MacOs::list_names",
                 "dir-list",
+                directory,
                 parent.identity().device.get(),
                 parent.identity().inode,
                 crate::tape::Outcome::listed(total, names.len(), truncated),
@@ -4452,6 +4561,7 @@ impl DirOps for MacOs {
             crate::tape::handle_observation(
                 "MacOs::dir_facts",
                 "stat",
+                descriptor.as_raw_fd(),
                 facts.device.get(),
                 facts.inode,
                 crate::tape::Outcome::facts(facts.kind.as_str()),
@@ -4496,6 +4606,7 @@ impl DirOps for MacOs {
             crate::tape::handle_observation(
                 "MacOs::recheck_dir",
                 "stat",
+                descriptor.as_raw_fd(),
                 identity.device.get(),
                 identity.inode,
                 crate::tape::Outcome::facts("directory"),

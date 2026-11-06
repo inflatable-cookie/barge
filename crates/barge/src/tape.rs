@@ -74,6 +74,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::digest::sha256_hex;
 
+#[path = "capture_wire.rs"]
+mod capture_wire;
+
 /// The transcript schema this module writes.
 pub(crate) const TRANSCRIPT_SCHEMA: &str = "oxide.capture.transcript/1";
 /// The engine name this crate's window writes.
@@ -89,6 +92,16 @@ pub(crate) const CAP_PROCESS_ROWS: usize = 512;
 
 /// Facts actually supplied for an observation. Missing fields remain absent;
 /// a lexical path alone is not a complete object identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Provenance {
+    Handle,
+    Extracted,
+    Context,
+    #[default]
+    None,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Identity {
@@ -100,10 +113,14 @@ pub(crate) struct Identity {
     parent_device: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_inode: Option<u64>,
+    #[serde(default)]
+    parent_source: Provenance,
     #[serde(skip_serializing_if = "Option::is_none")]
     device: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     inode: Option<u64>,
+    #[serde(default)]
+    own_source: Provenance,
     #[serde(skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,8 +144,10 @@ impl Identity {
             component: None,
             parent_device: None,
             parent_inode: None,
+            parent_source: Provenance::None,
             device: None,
             inode: None,
+            own_source: Provenance::None,
             pid: None,
             start: None,
             uid: None,
@@ -146,6 +165,11 @@ impl Identity {
             component: None,
             device: facts.map(|(device, _)| device),
             inode: facts.map(|(_, inode)| inode),
+            own_source: if facts.is_some() {
+                Provenance::Extracted
+            } else {
+                Provenance::None
+            },
             ..Self::none()
         }
     }
@@ -157,6 +181,11 @@ impl Identity {
             component: Some(name.to_owned()),
             parent_device: parent.map(|(device, _)| device),
             parent_inode: parent.map(|(_, inode)| inode),
+            parent_source: if parent.is_some() {
+                Provenance::Context
+            } else {
+                Provenance::None
+            },
             ..Self::none()
         }
     }
@@ -305,6 +334,7 @@ pub(crate) struct ReadRow {
 pub(crate) struct Obligation {
     pub(crate) site: String,
     pub(crate) identity: Identity,
+    pub(crate) parent_required: bool,
 }
 
 /// Return missing obligations by index. An unproven or refused row cannot
@@ -316,7 +346,10 @@ pub(crate) fn missing_obligations(obligations: &[Obligation], rows: &[ReadRow]) 
         .enumerate()
         .filter_map(|(index, obligation)| {
             let duplicate = obligations[..index].contains(obligation);
+            // K1's lifetime premise is not yet qualified. Even a live-handle
+            // row cannot discharge a mandatory parent until that proof exists.
             let matched = !duplicate
+                && !obligation.parent_required
                 && rows.iter().any(|row| {
                     row.site == obligation.site
                         && row.identity == obligation.identity
@@ -581,10 +614,12 @@ pub(crate) fn attach_obligations(manifest: &[u8]) {
             unmapped_indices.push(index);
             continue;
         };
-        if object
-            .keys()
-            .any(|key| !matches!(key.as_str(), "engine" | "site" | "identity"))
-        {
+        if object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "engine" | "site" | "identity" | "parent_required"
+            )
+        }) {
             unmapped += 1;
             unmapped_indices.push(index);
             continue;
@@ -602,6 +637,14 @@ pub(crate) fn attach_obligations(manifest: &[u8]) {
             .get("site")
             .and_then(serde_json::Value::as_str)
             .filter(|site| !site.is_empty())
+        else {
+            unmapped += 1;
+            unmapped_indices.push(index);
+            continue;
+        };
+        let Some(parent_required) = object
+            .get("parent_required")
+            .and_then(serde_json::Value::as_bool)
         else {
             unmapped += 1;
             unmapped_indices.push(index);
@@ -635,6 +678,7 @@ pub(crate) fn attach_obligations(manifest: &[u8]) {
                 obligations.push(Obligation {
                     site: site.to_owned(),
                     identity,
+                    parent_required,
                 });
                 indices.push(index);
             }
@@ -658,6 +702,15 @@ pub(crate) fn attach_obligations(manifest: &[u8]) {
 thread_local! {
     static TAPE: RefCell<Tape> = RefCell::new(Tape::empty());
     static PROCESS_CONTEXT: RefCell<Option<(u32, u64, Option<u32>)>> = const { RefCell::new(None) };
+    static FAIL_DUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn fail_next_dup() {
+    FAIL_DUP.with(|fail| fail.set(true));
+}
+
+pub(crate) fn take_dup_failure() -> bool {
+    FAIL_DUP.with(|fail| fail.replace(false))
 }
 
 /// Bind subsequent descriptor observations to the evaluator's existing identity.
@@ -699,6 +752,83 @@ pub(crate) fn finish(
 /// Preserve its real status, exit code and observed rows; do not invent a report.
 pub(crate) fn finish_omitted(outcome: EngineOutcome) -> Result<String, String> {
     finish_inner(outcome, None, true)
+}
+
+/// Translate this run's recorder output into the reviewed Oxide wire shape.
+/// Historical packets are never passed through this adapter.
+pub(crate) fn shared_transcript(transcript: &str) -> Result<String, String> {
+    let old: serde_json::Value = serde_json::from_str(transcript).map_err(|e| e.to_string())?;
+    let rows = old["reads"].as_array().ok_or("missing read rows")?;
+    let mut reads = Vec::with_capacity(rows.len());
+    for row in rows {
+        let outcome = &row["outcome"];
+        let wire_outcome = if let Some(digest) = outcome.pointer("/digest/bytes_sha256") {
+            serde_json::json!({"type": "digest", "digest": digest})
+        } else if outcome == "absent" {
+            serde_json::json!({"type": "absent"})
+        } else if let Some(reason) = outcome.pointer("/refused/class") {
+            serde_json::json!({"type": "refusal", "reason": reason})
+        } else {
+            serde_json::json!({"type": "facts", "facts": outcome.to_string()})
+        };
+        reads.push(serde_json::json!({
+            "kind": row["kind"], "site": row["site"], "identity": row["identity"],
+            "outcome": wire_outcome, "cap": row["cap"].as_u64().unwrap_or(0),
+            "epoch": row["epoch"], "occurrence": row["occurrence"],
+        }));
+    }
+    let effects = old["effects"].as_array().ok_or("missing effects")?;
+    let mut wire_effects = Vec::with_capacity(effects.len());
+    for effect in effects {
+        let kind = effect["kind"].as_str().ok_or("missing effect kind")?;
+        let path = effect["path"].as_str().ok_or("non-UTF8 effect path")?;
+        if !matches!(
+            kind,
+            "create" | "save" | "fence" | "reconcile" | "lock-create" | "rename" | "unlink"
+        ) {
+            return Err(format!("effect kind {kind} has no reviewed wire mapping"));
+        }
+        wire_effects.push(serde_json::json!({
+            "kind": kind, "site": effect["site"], "attempted": true,
+            "path": path, "epoch": effect["epoch"],
+        }));
+    }
+    let caps = &old["caps"];
+    let wire = serde_json::json!({
+        "schema": TRANSCRIPT_SCHEMA, "version": TRANSCRIPT_SCHEMA,
+        "engine": ENGINE, "case": old["case"], "manifest_sha256": old["manifest_sha256"],
+        "entrypoint": old["entrypoint"]["symbol"],
+        "window_monotonic_start_ns": null, "window_monotonic_end_ns": null,
+        "window_elapsed_ns": null,
+        "outcome": {"state": old["outcome"]["status"], "engine": old["outcome"],
+                    "result": old["result"], "result_omitted": old["result_omitted"]},
+        "truncation": {
+            "read_rows_truncated": caps["read_rows_exhausted"].as_bool().unwrap_or(false),
+            "occurrences_truncated": caps["occurrences_exhausted"].as_bool().unwrap_or(false),
+            "document_truncated": caps["document_truncated"].as_bool().unwrap_or(false),
+            "process_rows_truncated": caps["process_rows_exhausted"].as_bool().unwrap_or(false),
+            "classifications_truncated": false,
+        },
+        "effects": wire_effects, "reads": reads, "clocks": old["clocks"],
+        "classifications": [], "recorded_holders": [], "fixture_capture": null,
+        "notes": [format!("source binding: {}", old["entrypoint"]["source_binding"]),
+                  "observation coverage and K1 lifetime are unproven"],
+    });
+    let bytes = serde_json::to_string(&wire).map_err(|e| e.to_string())?;
+    capture_wire::parse_transcript(bytes.as_bytes()).map_err(|e| e.message)?;
+    Ok(bytes)
+}
+
+pub(crate) fn validate_shared_transcript(bytes: &[u8]) -> Result<(), String> {
+    capture_wire::parse_transcript(bytes)
+        .map(|_| ())
+        .map_err(|error| error.message)
+}
+
+pub(crate) fn validate_shared_manifest(bytes: &[u8]) -> Result<(), String> {
+    capture_wire::parse_manifest(bytes)
+        .map(|_| ())
+        .map_err(|error| error.message)
 }
 
 fn finish_inner(
@@ -1145,13 +1275,9 @@ pub(crate) fn read_present_component(
     bytes: &[u8],
     cap: Option<u64>,
 ) {
-    record(
-        "file",
-        site,
-        Identity::component(Some(parent), name),
-        Outcome::digest(bytes, cap),
-        cap,
-    );
+    let mut identity = Identity::component(Some(parent), name);
+    identity.parent_source = Provenance::Handle;
+    record("file", site, identity, Outcome::digest(bytes, cap), cap);
 }
 
 /// Record bytes read from a descriptor whose parent and own facts were checked.
@@ -1160,13 +1286,23 @@ pub(crate) fn read_present_component_bound(
     parent: (u64, u64),
     name: &str,
     own: (u64, u64),
+    descriptor: i32,
     bytes: &[u8],
     cap: Option<u64>,
 ) {
     let mut identity = Identity::component(Some(parent), name);
+    identity.parent_source = Provenance::Handle;
     identity.device = Some(own.0);
     identity.inode = Some(own.1);
+    identity.fd = Some(descriptor);
+    identity.own_source = Provenance::Handle;
     record("file", site, identity, Outcome::digest(bytes, cap), cap);
+}
+
+pub(crate) fn read_child_refused(site: &'static str, parent: (u64, u64), name: &str, class: &str) {
+    let mut identity = Identity::component(Some(parent), name);
+    identity.parent_source = Provenance::Handle;
+    record("file", site, identity, Outcome::refused(class), None);
 }
 
 /// Record a positive absence at a path.
@@ -1238,18 +1374,65 @@ pub(crate) fn io_stat(
 
 /// Record one entry seen in an enumeration, bound to the observed parent.
 pub(crate) fn dir_entry(site: &'static str, parent: Option<(u64, u64)>, name: &std::ffi::OsStr) {
-    match name.to_str() {
-        Some(name) => record(
+    dir_entry_with_source(site, parent, name, Provenance::Context);
+}
+
+/// Record a name obtained through a held directory descriptor.
+pub(crate) fn handle_dir_entry(
+    site: &'static str,
+    descriptor: i32,
+    parent: (u64, u64),
+    name: &std::ffi::OsStr,
+) {
+    let mut identity = Identity::none();
+    identity.fd = Some(descriptor);
+    identity.parent_device = Some(parent.0);
+    identity.parent_inode = Some(parent.1);
+    identity.parent_source = Provenance::Handle;
+    if let Some(name) = name.to_str() {
+        identity.component = Some(name.to_owned());
+        record("dir-entry", site, identity, Outcome::facts("entry"), None);
+    } else {
+        record(
             "dir-entry",
             site,
-            Identity::component(parent, name),
-            Outcome::facts("entry"),
+            identity,
+            Outcome::refused("non_utf8_component"),
             None,
-        ),
+        );
+    }
+}
+
+/// Record an enumeration name with an earlier path precheck as context only.
+pub(crate) fn extracted_dir_entry(
+    site: &'static str,
+    parent: Option<(u64, u64)>,
+    name: &std::ffi::OsStr,
+) {
+    dir_entry_with_source(site, parent, name, Provenance::Extracted);
+}
+
+fn dir_entry_with_source(
+    site: &'static str,
+    parent: Option<(u64, u64)>,
+    name: &std::ffi::OsStr,
+    source: Provenance,
+) {
+    match name.to_str() {
+        Some(name) => {
+            let mut identity = Identity::component(parent, name);
+            if parent.is_some() {
+                identity.parent_source = source;
+            }
+            record("dir-entry", site, identity, Outcome::facts("entry"), None);
+        }
         None => {
             let mut identity = Identity::none();
             identity.parent_device = parent.map(|(device, _)| device);
             identity.parent_inode = parent.map(|(_, inode)| inode);
+            if parent.is_some() {
+                identity.parent_source = source;
+            }
             record(
                 "dir-entry",
                 site,
@@ -1269,12 +1452,37 @@ pub(crate) fn child_stat(
     facts: Option<(u64, u64, &str)>,
     error: Option<&str>,
 ) {
+    child_stat_inner(site, None, parent, name, facts, error);
+}
+
+pub(crate) fn child_stat_on(
+    site: &'static str,
+    descriptor: i32,
+    parent: (u64, u64),
+    name: &str,
+    facts: Option<(u64, u64, &str)>,
+    error: Option<&str>,
+) {
+    child_stat_inner(site, Some(descriptor), parent, name, facts, error);
+}
+
+fn child_stat_inner(
+    site: &'static str,
+    descriptor: Option<i32>,
+    parent: (u64, u64),
+    name: &str,
+    facts: Option<(u64, u64, &str)>,
+    error: Option<&str>,
+) {
     let mut identity = Identity::component(Some(parent), name);
+    identity.parent_source = Provenance::Handle;
+    identity.fd = descriptor;
     let outcome = if let Some(error) = error {
         Outcome::refused(error)
     } else if let Some((device, inode, kind)) = facts {
         identity.device = Some(device);
         identity.inode = Some(inode);
+        identity.own_source = Provenance::Extracted;
         Outcome::facts(kind)
     } else {
         Outcome::absent()
@@ -1297,6 +1505,7 @@ pub(crate) fn listing(site: &'static str, path: &Path, total: usize, kept: usize
 pub(crate) fn handle_observation(
     site: &'static str,
     kind: &'static str,
+    descriptor: i32,
     device: u64,
     inode: u64,
     outcome: Outcome,
@@ -1304,6 +1513,8 @@ pub(crate) fn handle_observation(
     let identity = Identity {
         device: Some(device),
         inode: Some(inode),
+        fd: Some(descriptor),
+        own_source: Provenance::Handle,
         ..Identity::none()
     };
     record(kind, site, identity, outcome, None);
@@ -1323,7 +1534,7 @@ pub(crate) fn listing_refused(site: &'static str, path: &Path, class: &str) {
 /// Whether a lock was held, was absent, or refused.
 pub(crate) enum LockOutcome {
     /// Held, with the lock file's identity when it could be read.
-    Held(Option<(u64, u64)>),
+    Held(Option<(u64, u64)>, i32),
     /// The lock file does not exist.
     Absent,
     /// The lock could not be taken or inspected.
@@ -1334,7 +1545,14 @@ pub(crate) enum LockOutcome {
 /// could be read, positively absent, or refused.
 pub(crate) fn lock(site: &'static str, path: &Path, outcome: LockOutcome) {
     let (identity, outcome) = match outcome {
-        LockOutcome::Held(facts) => (Identity::file(path, facts), Outcome::facts("held")),
+        LockOutcome::Held(facts, descriptor) => {
+            let mut identity = Identity::file(path, facts);
+            identity.fd = Some(descriptor);
+            if facts.is_some() {
+                identity.own_source = Provenance::Handle;
+            }
+            (identity, Outcome::facts("held"))
+        }
         LockOutcome::Absent => (Identity::file(path, None), Outcome::absent()),
         LockOutcome::Refused(class) => (Identity::file(path, None), Outcome::refused(class)),
     };
@@ -1376,7 +1594,8 @@ pub(crate) fn process_table(site: &'static str, outcome: Outcome) {
 
 /// Record one per-pid descriptor listing.
 pub(crate) fn fd_list(site: &'static str, pid: u32, outcome: Outcome) {
-    let identity = process_identity(pid, None);
+    // A prior classification does not identify the process at this syscall.
+    let identity = Identity::unidentified_process(pid, None);
     PROCESS_CONTEXT.with(|slot| *slot.borrow_mut() = None);
     record("fd-list", site, identity, outcome, None);
 }
@@ -1386,7 +1605,7 @@ pub(crate) fn fd_entry(site: &'static str, pid: u32, fd: i32, fd_type: u32) {
     record(
         "fd-entry",
         site,
-        process_identity(pid, Some(fd)),
+        Identity::unidentified_process(pid, Some(fd)),
         Outcome::answer(fd_type.to_string()),
         None,
     );
@@ -1623,8 +1842,8 @@ mod tests {
         })
         .expect("window");
         let manifest = serde_json::json!({"mandatory_observations": [
-            {"engine": "barge", "site": "descriptor", "identity": {"pid": 42, "start": 123, "uid": 501, "fd": 4}},
-            {"engine": "barge", "site": "volume", "identity": {"volume_uuid": "uuid", "mount": "/mount", "device": "disk", "window_identity": "epoch"}},
+            {"engine": "barge", "site": "descriptor", "parent_required": false, "identity": {"pid": 42, "start": 123, "uid": 501, "fd": 4}},
+            {"engine": "barge", "site": "volume", "parent_required": false, "identity": {"volume_uuid": "uuid", "mount": "/mount", "device": "disk", "window_identity": "epoch"}},
             {"engine": "oxide", "site": "other", "identity": {"pid": 1, "start": 2, "uid": 3}}
         ]});
         attach_obligations(&serde_json::to_vec(&manifest).expect("manifest"));
@@ -1650,7 +1869,7 @@ mod tests {
             doc["obligations"]["unmapped_indices"],
             serde_json::json!([1])
         );
-        assert_eq!(doc["obligations"]["missing"], serde_json::json!([]));
+        assert_eq!(doc["obligations"]["missing"], serde_json::json!([0]));
         assert_eq!(doc["observation_complete"], false);
     }
 
@@ -1665,7 +1884,7 @@ mod tests {
         .expect("window");
         let manifest = serde_json::json!({"mandatory_observations": [
             {"engine": "oxide", "site": "other", "identity": {"pid": 1, "start": 2, "uid": 3}},
-            {"engine": "barge", "site": "descriptor", "identity": {"pid": 42, "start": 123, "uid": 501, "fd": 4}}
+            {"engine": "barge", "site": "descriptor", "parent_required": false, "identity": {"pid": 42, "start": 123, "uid": 501, "fd": 4}}
         ]});
         attach_obligations(&serde_json::to_vec(&manifest).expect("manifest"));
         let transcript = finish(
@@ -1750,6 +1969,7 @@ mod tests {
         let obligation = Obligation {
             site: "descriptor".to_owned(),
             identity: identity.clone(),
+            parent_required: false,
         };
         let mut row = ReadRow {
             kind: "fd-entry",
@@ -1782,6 +2002,28 @@ mod tests {
         assert_eq!(missing_obligations(&[obligation], &[row]), vec![0]);
     }
 
+    #[test]
+    fn mandatory_parent_stays_unproven_without_the_lifetime_premise() {
+        let mut identity = Identity::component(Some((1, 2)), "child");
+        identity.parent_source = Provenance::Handle;
+        let obligation = Obligation {
+            site: "child".to_owned(),
+            identity: identity.clone(),
+            parent_required: true,
+        };
+        let row = ReadRow {
+            kind: "child-stat",
+            site: "child",
+            identity,
+            outcome: Outcome::absent(),
+            observation_proven: true,
+            cap: None,
+            epoch: 0,
+            occurrence: 1,
+        };
+        assert_eq!(missing_obligations(&[obligation], &[row]), vec![0]);
+    }
+
     /// Open a window, run `body`, and return the finished transcript string.
     fn window(body: impl FnOnce()) -> String {
         begin_window(WindowConfig {
@@ -1804,6 +2046,57 @@ mod tests {
             Some(&serde_json::json!({"preview": true})),
         )
         .expect("the transcript is written")
+    }
+
+    #[test]
+    fn published_capture_vectors_pass_their_controls() {
+        super::capture_wire::run_self_checks().expect("published capture vectors");
+    }
+
+    #[test]
+    fn shared_wire_preserves_actual_row_and_engine_result() {
+        let transcript = window(|| {
+            child_stat("stat", (1, 2), "missing", None, None);
+        });
+        let bytes = shared_transcript(&transcript).expect("wire conversion");
+        let document = capture_wire::parse_transcript(bytes.as_bytes()).expect("wire parse");
+        assert_eq!(document["reads"][0]["identity"]["parent_source"], "handle");
+        assert_eq!(document["reads"][0]["outcome"]["type"], "absent");
+        assert_eq!(document["outcome"]["state"], "completed");
+        assert_eq!(document["outcome"]["result"]["preview"], true);
+    }
+
+    #[test]
+    fn held_parent_rows_survive_rename_and_refuse_a_symlink_open() {
+        use crate::os::DirOps;
+
+        let fixture = crate::testkit::TempDir::under_scratch("tape-held-parent");
+        let before = fixture.path().join("before");
+        let after = fixture.path().join("after");
+        std::fs::create_dir(&before).expect("parent directory");
+        std::fs::create_dir(before.join("child")).expect("child directory");
+        std::os::unix::fs::symlink("child", before.join("link")).expect("fixture link");
+        let dirs = crate::os::platform();
+        let parent = dirs.open_path(&before).expect("open parent");
+        let transcript = window(|| {
+            std::fs::rename(&before, &after).expect("rename held parent");
+            dirs.open_child_dir(&parent, "child").expect("held child");
+            assert!(dirs
+                .child_facts(&parent, "missing")
+                .expect("absence")
+                .is_none());
+            assert!(dirs.open_child_dir(&parent, "link").is_err());
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
+        let rows = document["reads"].as_array().expect("rows");
+        for name in ["child", "missing", "link"] {
+            assert!(rows.iter().any(|row| {
+                row["identity"]["component"] == name && row["identity"]["parent_source"] == "handle"
+            }));
+        }
+        assert!(rows.iter().any(|row| {
+            row["identity"]["component"] == "link" && row["outcome"].get("refused").is_some()
+        }));
     }
 
     #[test]
@@ -2216,13 +2509,65 @@ mod tests {
             lock(
                 "state::StateLock",
                 Path::new("lock"),
-                LockOutcome::Held(None),
+                LockOutcome::Held(None, 7),
             )
         });
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         let row = &document["reads"][0];
         assert_eq!(row["observation_proven"], false);
         assert!(row["identity"].get("inode").is_none());
+    }
+
+    #[test]
+    fn injected_l1_failure_keeps_the_real_shared_lock_held() {
+        let fixture = crate::testkit::TempDir::under_scratch("tape-lock-metadata");
+        let path = fixture.path().join("lock");
+        std::fs::write(&path, b"").expect("lock fixture");
+        let transcript = window(|| {
+            crate::state::fail_next_lock_metadata();
+            let lock = crate::state::StateLock::shared_if_present(
+                &path,
+                crate::state::LockRank::Registry,
+                crate::state::Deadline::after(std::time::Duration::from_secs(2)),
+            )
+            .expect("the shared acquisition succeeds")
+            .expect("the lock is held");
+            assert_eq!(lock.mode(), crate::state::LockMode::Shared);
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
+        let rows = document["reads"].as_array().expect("rows");
+        assert!(rows.iter().any(|row| {
+            row["site"] == "state::StateLock::metadata"
+                && row["outcome"]["refused"]["class"] == "EIO"
+        }));
+        assert!(rows.iter().any(|row| {
+            row["site"] == "state::StateLock::shared_if_present"
+                && row["outcome"]["facts"]["kind"] == "held"
+                && row["identity"].get("inode").is_none()
+                && row["observation_proven"] == false
+        }));
+    }
+
+    #[test]
+    fn injected_dup_failure_keeps_parent_open_and_allows_a_later_dup() {
+        use crate::os::DirOps;
+
+        let fixture = crate::testkit::TempDir::under_scratch("tape-dup-failure");
+        let dirs = crate::os::platform();
+        let parent = dirs.open_path(fixture.path()).expect("open parent");
+        let transcript = window(|| {
+            fail_next_dup();
+            assert!(dirs.duplicate_dir(&parent).is_err());
+            drop(dirs.duplicate_dir(&parent).expect("parent still open"));
+        });
+        let document: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
+        let rows = document["reads"].as_array().expect("rows");
+        assert!(rows.iter().any(|row| {
+            row["site"] == "MacOs::duplicate_dir" && row["outcome"]["refused"]["class"] == "EBADF"
+        }));
+        assert!(rows.iter().any(|row| {
+            row["site"] == "MacOs::duplicate_dir" && row["outcome"]["facts"]["kind"] == "duplicated"
+        }));
     }
 
     #[test]
@@ -2234,7 +2579,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_context_is_bound_to_the_observed_pid_and_consumed() {
+    fn descriptor_listing_does_not_borrow_a_classification_identity() {
         let transcript = window(|| {
             process_context(42, 123, Some(501));
             fd_list("list", 42, Outcome::listed(1, 1, false));
@@ -2250,8 +2595,8 @@ mod tests {
             );
         });
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
-        assert_eq!(document["reads"][0]["identity"]["start"], 123);
-        assert_eq!(document["reads"][0]["observation_proven"], true);
+        assert!(document["reads"][0]["identity"].get("start").is_none());
+        assert_eq!(document["reads"][0]["observation_proven"], false);
         assert!(document["reads"][1]["identity"].get("start").is_none());
         assert_eq!(document["reads"][1]["observation_proven"], false);
         assert!(document["reads"][2]["identity"].get("start").is_none());
@@ -2284,7 +2629,7 @@ mod tests {
     }
 
     #[test]
-    fn fd_entries_retain_returned_number_type_and_classified_identity() {
+    fn fd_entries_retain_returned_number_and_type_without_old_identity() {
         let transcript = window(|| {
             process_context(42, 123, Some(501));
             fd_entry("list", 42, 7, 1);
@@ -2293,9 +2638,9 @@ mod tests {
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         let row = &document["reads"][0];
         assert_eq!(row["identity"]["fd"], 7);
-        assert_eq!(row["identity"]["start"], 123);
+        assert!(row["identity"].get("start").is_none());
         assert_eq!(row["outcome"]["answer"]["answer"], "1");
-        assert_eq!(row["observation_proven"], true);
+        assert_eq!(row["observation_proven"], false);
     }
 
     #[test]
@@ -2318,11 +2663,12 @@ mod tests {
     #[test]
     fn descriptor_bound_read_records_parent_and_own_facts() {
         let transcript = window(|| {
-            read_present_component_bound("read", (1, 2), "entry", (1, 3), b"data", Some(16));
+            read_present_component_bound("read", (1, 2), "entry", (1, 3), 7, b"data", Some(16));
             read_present_component("read", (1, 2), "entry", b"data", Some(16));
         });
         let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
         assert_eq!(document["reads"][0]["identity"]["parent_inode"], 2);
+        assert_eq!(document["reads"][0]["identity"]["fd"], 7);
         assert_eq!(document["reads"][0]["identity"]["inode"], 3);
         assert_eq!(document["reads"][0]["observation_proven"], true);
         assert_eq!(document["reads"][1]["observation_proven"], false);
