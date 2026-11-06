@@ -1726,6 +1726,14 @@ premise. `qualified` is `true` only for a counted pass with every case passed, a
 positive whole-backing clearance and an unchanged real state. The diagnostic is
 always `qualified: false`.
 
+A case whose plan row does not meet its expectation records that row's deciding fields
+first — `eligible`, the first blocker and its reason, and each gate's own verdict
+(`identity`, `custody`, `last_activity_ms`, `references_complete`,
+`references_current`, `absence_verdict`) — before the bounded raw row. A plan row is a
+sorted-key document whose `absence` member alone can exceed a short cap, so a truncated
+row would not name the gate; the deciding fields are what make a failed case judgeable
+from the receipt after the run root is gone. This changes no eligibility decision.
+
 The receipt also carries `qualification_inputs`: the case rows and the image
 clearance are its own, and the qualified supervisor's receipt is named as a required
 separate input, because the supervisor writes it after the child exits. Correlating

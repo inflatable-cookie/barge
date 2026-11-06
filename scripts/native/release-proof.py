@@ -122,6 +122,11 @@ OXIDE_REGISTRY_VERSION = "oxide.outputs.registry/2"
 VOLUME_UUID_KEY = "VolumeUUID"
 HOLDER = "release-native-holder"
 PROOF_RECEIPT = "release-proof-receipt.json"
+# How much of a plan row a failing case records after its deciding fields. The fields
+# that decide eligibility are recorded first and in full, because the CLI nests a
+# sorted-key document whose `absence` member alone is larger than a short cap; the raw
+# row follows, bounded, so one huge row cannot bloat the receipt.
+ROW_EVIDENCE_CHARS = 2000
 # Any holder or name that is not this proof's own is refused.
 NAMESPACE = "example"
 # The one Cargo feature the staged binary is built with. It is named here, in the
@@ -939,6 +944,38 @@ def verify_rollback(path, identity, identity_bytes, marker_bytes, payload, pendi
         raise Fault("R11", "rollback identity or content changed")
 
 
+def row_deciding_summary(row):
+    """The fields that decide one plan row's eligibility, in a fixed order. Pure.
+
+    A plan row is a sorted-key document, so `absence` sorts first and can consume a
+    whole truncation by itself. The frozen oracle decides on `eligible` alone; this
+    summary only makes a failing row judgeable from the receipt after the run root is
+    gone, by recording each gate's own verdict, its reason and the first blocker.
+    """
+    identity = row.get("identity") or {}
+    idle = row.get("idle") or {}
+    absence = row.get("absence") or {}
+    references = [reference for reference in (row.get("references") or [])
+                  if isinstance(reference, dict)]
+    return {
+        "eligible": row.get("eligible"),
+        "blocked_by": row.get("blocked_by"),
+        "reason": row.get("reason"),
+        "identity_verdict": identity.get("verdict"),
+        "identity_reason": identity.get("reason"),
+        "custody": row.get("custody"),
+        "custody_reason": row.get("custody_reason"),
+        "last_activity_ms": idle.get("last_activity_ms"),
+        "idle_reason": idle.get("reason"),
+        "age_waived": row.get("age_waived"),
+        "references_complete": row.get("references_complete"),
+        "references_current": sorted(str(reference.get("source")) for reference in references
+                                     if reference.get("current")),
+        "absence_verdict": absence.get("verdict"),
+        "absence_reason": absence.get("reason"),
+    }
+
+
 class Proof:
     """One counted or diagnostic run: one image, one private HOME and state, many areas."""
 
@@ -1339,7 +1376,12 @@ class Proof:
         _code, preview = self.preview(area, plan_file, named=named, expect=0)
         row = self.row_for(preview, aged_root)
         if row["eligible"] != expect_eligible:
-            raise Fault(case, f"expected eligible={expect_eligible}, got {json.dumps(row)[:400]}")
+            raise Fault(
+                case,
+                f"expected eligible={expect_eligible}; "
+                f"deciding {json.dumps(row_deciding_summary(row), sort_keys=True)}; "
+                f"row {json.dumps(row)[:ROW_EVIDENCE_CHARS]}",
+            )
         return preview, row, plan_file
 
     # -- the cases --------------------------------------------------------
@@ -2269,6 +2311,81 @@ def closure_controls():
     return problems
 
 
+def plan_controls():
+    """A failing plan row stays judgeable from the receipt, and the oracle still decides.
+
+    The row the CLI prints is a sorted-key document: `absence` sorts first and its own
+    member set is larger than the driver's old 400-character cap, so a truncated detail
+    could not name the gate. These controls pin the deciding fields ahead of the row and
+    prove the eligibility requirement itself is unchanged.
+    """
+    problems = []
+    absence = {"anchor": {"kind": "registered", "path": "/Volumes/x"},
+               "ancestor": {"device": 16777248, "inode": 34,
+                            "path": "/Volumes/x/checkouts",
+                            "volume": {"kind": "registered", "volume_uuid": "u"}},
+               "components_walked": 1, "leaf": {"name": "reappears", "result": "enoent"},
+               "path": "/Volumes/x/checkouts/reappears" + "/" + "p" * 3000,
+               "proved_ms": 1, "verdict": "absent"}
+    references = [{"source": "barge-holds", "current": False},
+                  {"source": "oxide-registry", "current": True},
+                  {"source": "oxide-receipt", "current": False}]
+    row = {"absence": absence, "blocked_by": "references", "custody": "safe",
+           "eligible": False, "identity": {"verdict": "verified"},
+           "idle": {"last_activity_ms": 1700000000000, "reason": None},
+           "reason": "a reference still names this root: oxide-registry",
+           "references": references, "references_complete": True, "root_id": "r"}
+    summary = row_deciding_summary(row)
+    expected = {"eligible": False, "blocked_by": "references",
+                "reason": "a reference still names this root: oxide-registry",
+                "identity_verdict": "verified", "identity_reason": None,
+                "custody": "safe", "custody_reason": None,
+                "last_activity_ms": 1700000000000, "idle_reason": None,
+                "age_waived": None, "references_complete": True,
+                "references_current": ["oxide-registry"],
+                "absence_verdict": "absent", "absence_reason": None}
+    if summary != expected:
+        problems.append(f"the deciding summary changed: {json.dumps(summary, sort_keys=True)[:400]}")
+    if row_deciding_summary({"eligible": True}) != dict(
+            {key: None for key in expected} | {"eligible": True, "references_complete": None,
+                                               "references_current": []}):
+        problems.append("the deciding summary invents fields for a bare eligible row")
+    # Ambiguity guard: the absence document alone is longer than a short cap, so the
+    # deciding fields must lead the message rather than follow the row.
+    proof = Proof.__new__(Proof)
+    proof.root = "/guard/root"
+    proof.current_area = None
+    proof.preview = lambda *args, **kwargs: (0, {})
+    proof.row_for = lambda document, root: row
+    try:
+        proof.plan_and_run("R10", "c10", {"root_id": "r"}, expect_eligible=True)
+        problems.append("an ineligible row satisfies the eligible expectation")
+    except Fault as error:
+        detail = error.detail
+        if not detail.startswith("expected eligible=True; deciding "):
+            problems.append(f"the failure does not lead with the deciding fields: {detail[:120]}")
+        if '"blocked_by": "references"' not in detail[:400]:
+            problems.append("the first blocker is not inside the first 400 characters")
+        # The row portion is capped at ROW_EVIDENCE_CHARS; the deciding summary that
+        # precedes it is a fixed, small field set, so the whole record stays bounded.
+        if len(detail) > ROW_EVIDENCE_CHARS + 1000:
+            problems.append(f"the failure record is not bounded: {len(detail)} characters")
+    # The same row must satisfy the inverse expectation, and an eligible row must pass
+    # the eligible expectation: the decision rule itself is untouched.
+    if proof.plan_and_run("R10", "c10", {"root_id": "r"}, expect_eligible=False)[1] is not row:
+        problems.append("the inverse expectation does not return the same row")
+    eligible = dict(row, eligible=True, blocked_by=None, reason=None)
+    proof.row_for = lambda document, root: eligible
+    if proof.plan_and_run("R10", "c10", {"root_id": "r"}, expect_eligible=True)[1] is not eligible:
+        problems.append("an eligible row does not satisfy the eligible expectation")
+    try:
+        proof.plan_and_run("R10", "c10", {"root_id": "r"}, expect_eligible=False)
+        problems.append("an eligible row satisfies the ineligible expectation")
+    except Fault:
+        pass
+    return problems
+
+
 def containment_facts(**overrides):
     """The pinned guard's real monitored layout as canned facts, plus overrides. Pure.
 
@@ -2474,6 +2591,7 @@ def pure_self_check():
     problems += custody_controls()
     problems += closure_controls()
     problems += containment_controls()
+    problems += plan_controls()
     problems += guarded_controls()
     # Exercise the same path and rollback helpers used by R11, without a filesystem.
     identity = {"volume_uuid": "uuid", "mount_relative_path": "area/root", "inode": 7,
