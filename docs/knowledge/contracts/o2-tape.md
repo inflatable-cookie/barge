@@ -83,11 +83,11 @@ flush path.
 
 ## Caps and the honest finding about real hosts
 
-The accepted contract's transcript caps are fixed; the provisional recorder tracks:
-8192 read rows, 8 MiB of document, 64 occurrences per identity key, 512
-process rows. An exhausted cap is recorded in the transcript's `caps` block
-(`read_rows_exhausted`, `occurrences_exhausted`, `process_rows_exhausted`,
-`document_truncated`, `dropped_rows`) and makes any comparison insufficient —
+The recorder tracks fixed caps of 8192 read rows, 8 MiB per document, 64
+occurrences per identity key and 512 process rows. Its internal document has a
+`caps` block with exhaustion flags and dropped-row counts. The shared-wire
+transcript instead carries `truncation` flags for read rows, occurrences,
+process rows and document truncation. Exhaustion makes comparison insufficient,
 never quietly complete.
 
 The embedded exercise measured the row budget on a real development host: one
@@ -103,31 +103,26 @@ honestly (and then be insufficient). Nothing here relaxes a cap.
 
 ## The transcript
 
-One `oxide.capture.transcript/1` document per window, always written, including
-on refusal: `schema`, `engine: "barge"`, `case`, `manifest_sha256`, the
-`entrypoint` (symbol and staged source binding), `outcome` (`completed` or
-`refused`, the engine's own exit code and refusal vocabulary), the engine's
-actual `PruneReport` under `result` when completed, `effects` (empty for the
-read-only plan), `reads`, `clocks`, and `caps`. Serialization is deterministic
-for the same window.
+The harness converts the recorder's internal document to the reviewed
+`oxide.capture.transcript/1` shape for a normal window. It emits `schema`,
+`version`, `engine`, `case`, `manifest_sha256`, the entrypoint symbol,
+`outcome.state`, the engine outcome and result under `outcome`, `truncation`,
+`effects`, `reads`, `clocks`, classifications, recorded holders, fixture
+capture and notes. The source binding is recorded in notes. The internal
+`caps`, obligation diagnostics and `observation_proven` fields are not shared
+wire fields. A failed conversion retains the internal recorder document and
+returns an apparatus error; it does not invent an engine result. The bounded
+apparatus-refusal document for a failure before the engine runs is also an
+internal diagnostic, not a conforming shared transcript.
 
-No machine-readable manifest schema is accepted yet: Oxide #240 proposes
-`oxide-capture-manifest.schema.json` under the same semantic contract, and
-that reviewed shape is the wire contract for B-S1 and the later X-S2
-orchestration. What this harness has today is a consumption surface, not a
-canonical layout. It reads exactly these manifest members
-(`oxide.capture.manifest/1`, owned by the orchestrator): `case`,
-`barge.volume_uuid`, `barge.namespace`, `barge.area`, and the optional
-`barge.named_roots`; it binds the whole document's SHA-256 and ignores the
-orchestrator's other members. The reads are cfg(test)-only apparatus, so
-reconciling them to the reviewed schema is a harness change and nothing
-production depends on them. A missing or
-mistyped member is an apparatus error: exit 2, the reason on stderr and a
-provisional apparatus-refusal document — there is no engine outcome to record.
-The engine's own refusals
-are engine outcomes: the transcript is written and the process exits with the
-engine's own code (`ErrorKind::exit_code`, or `PruneReport::needs_human`'s
-0/3).
+The copied Oxide 283 parser validates the reviewed manifest wire structure,
+including `parent_required` on each mandatory observation. The harness then
+extracts `case`, `barge.volume_uuid`, `barge.namespace`, `barge.area`, and
+optional `barge.named_roots` to invoke the engine. It also binds the complete
+manifest digest and attaches obligation and effect diagnostics; it does not
+claim that the parser fully validates every substructure or establishes
+completeness. Missing or mistyped required members cause an apparatus error.
+Engine refusals retain the engine's own error and exit code in the outcome.
 
 ## Staging and export (for the later X-S2 orchestration)
 
@@ -351,8 +346,8 @@ captures. No process is omitted from that route and no cap changes. `effigy rust
 the production compile-away. All are covered by `effigy rust:test` and
 `effigy rust:compile` besides.
 
-Capture refusal errors include the transcript path, recorded `refusal_kind` and
-`caps`. The embedded exercises copy useful transcripts beside their unique
+Capture refusal errors include the transcript path and diagnostics from the
+internal document; those fields may be null for shared-wire truncation. The embedded exercises copy useful transcripts beside their unique
 fixture directories within the caller's run root before fixture teardown, so
 both complete synthetic controls and insufficient real-host captures are retained.
 The tests do not qualify capture, comparison, native behavior or parity.
@@ -372,9 +367,9 @@ a deletion, a custody conclusion or a live Builds comparison.
 
 ## Observation identity limits
 
-The provisional transcript marks individual observations according to their
-available identity; the window remains incomplete independently of the engine
-result. Fully identified process rows and classified/retry process observations,
+The internal recorder marks individual observations according to their
+available identity; the shared-wire adapter does not emit that internal flag.
+The window remains incomplete independently of the engine result. Fully identified process rows and classified/retry process observations,
 and scalar uid, boot and complete process-table observations can be marked proven; refused rows and families without audited
 identity rules remain unproven. It cannot satisfy mandatory
 coverage or establish parity. Path observations do not infer a parent with a
@@ -420,14 +415,13 @@ private matching value: an unrepresentable effect path remains absent from the
 provisional document and cannot establish a complete effect identity. The
 non-UTF-8 outcome regression is source only until the covering checks run.
 
-The lock recorder no longer calls `File::metadata` solely to fill identity,
-and the area and intent directory entry recorders no longer stat a pathname
-after the listing. The unchanged evaluator does not bind those parent and lock
-identities at those sites, so their rows remain unproven. The absence proof's
-already-stored `proved_ms` is recorded after construction without another
-clock read. Occurrence counting uses structured identity fields, so delimiter
-characters in names do not merge distinct observations. These source changes
-and their regression controls have not yet been compiled or executed.
+The declared L1 observation calls `File::metadata` once on an already-held
+lock descriptor. Failure records the error and leaves the lock held with its
+identity unproven. Area and intent entry recorders do not stat a pathname
+after listing; receipts entries can carry the earlier precheck as `extracted`
+context, not as an observed parent. The absence proof's stored `proved_ms` is
+recorded without another clock read. Occurrence keys use structured identity
+fields so delimiter characters do not merge distinct observations.
 
 There are additional known apparatus gaps. `missing_obligations` can compare
 an internal source-site and identity tuple to proven rows, and refuses
@@ -436,40 +430,36 @@ to satisfy one with an unproven or refused row. A provisional projection of
 capture, while its status remains `insufficient` regardless of matches. Unknown
 identity fields, unsupported volume binding, missing input and the 256-key cap
 are explicit; no field is dropped to produce a positive match. This projection
-does not reconcile extra reads, dynamic facts or effects and has not been
-approved as the shared schema. It does not establish obligation coverage. The
-provisional harness emits a
+does not reconcile extra reads, dynamic facts or effects and is not a complete
+shared-schema reconciliation. It does not establish obligation coverage. The
+harness emits a
 bounded apparatus-refusal document for manifest parse, case-mismatch,
 unreadable manifest, state-path resolution and window-open failures once an
 output path is known. Malformed argv also writes one when it identifies exactly
 one unambiguous transcript destination. It records that the engine did not run; an unwritable
-output or missing output argument cannot carry a document. Its wire fields are
-provisional pending shared-schema review. If
+output or missing output argument cannot carry a document. Its internal
+diagnostic fields are not the reviewed shared-wire shape. If
 effects, clocks and the result exceed the document cap after all read rows are
 dropped, `finish` emits a bounded refusal with omitted counts and original
 engine status. It carries the original outcome when that fits within a
 64-KiB summary bound; otherwise it records its digest and explicitly marks it
-omitted. Those provisional fields still require shared-schema review.
+omitted. That fallback is an internal diagnostic, not shared-wire conformance.
 Any exhausted capture cap or dropped read causes an apparatus error after the
 transcript is written, retaining the actual engine outcome. If a completed
 report cannot be serialized, the document records its omission and the real
 engine status and exit code; it does not invent a report.
-The document byte count is the serialized document's actual length, including
-the length field itself. When a document is too large, deterministic tail
+The internal recorder's document byte count is its serialized length, including
+the length field itself. When that document is too large, deterministic tail
 batches are omitted and counted rather than reserializing once per row; the
 result is explicitly truncated and is not coverage.
 
-Oxide PR #230 at `6e8ca1f07a3e26be9e96ff55fd774b0f8185165a` remained open
-without a retained approval when inspected. Its proposal represents an
-obligation as engine, site and identity, with no `kind` field; the internal
-matcher consequently uses site and identity after the caller has selected the
-Barge engine. The proposed volume identity also carries a string device and
-window identity, while this recorder has neither field in that shape. A
-future adapter must refuse those unbound keys rather than discard fields or
-claim a match. The harness checks the fixed schema name and 64 named-root bound,
-but does not validate that proposal or its other aggregate obligations.
+The Oxide 283 parser validates the reviewed shared manifest's structure,
+including `engine`, `site`, `identity` and `parent_required` on obligations.
+The internal projection keeps unsupported identity fields unmapped; it does
+not turn a volume or context mismatch into a match. The parser's successful
+structure check is not completeness or runtime coverage.
 
-The proposal's `expected_effects` entries have kind, site, path and attempted
+The shared manifest's `expected_effects` entries have kind, site, path and attempted
 but no engine. A provisional diagnostic treats only an explicitly empty
 array as unambiguous: every observed Barge write attempt, including a failed
 one, is listed as unexpected. Missing input, a set beyond 8192 entries, and a
@@ -477,19 +467,17 @@ nonempty set are reported separately; a nonempty set is not silently assigned
 to Barge. All these diagnostics remain insufficient and are not dynamic effect
 reconciliation or proof that no unrecorded write occurred.
 
-Other apparatus-error cases still require review against the eventual shared
-schema; that schema must not be treated as already settled. No successful
-comparison follows from any of these gaps.
+The shared parser does not fully validate all apparatus-error and auxiliary
+substructures. No successful comparison follows from these gaps.
 The export receipt and binding checks are source only: until the private route
 is qualified and the exact-head export is built and independently checked,
 they are not evidence of an actual staged executable or source binding.
 
-Descriptor listing and entry rows can be proven when the actual process
-identity has pid, nonzero start and uid, and the listing is complete or the
-entry names its descriptor. Retry vnode rows remain unproven. The existing
-`state::sync_directory` open-and-sync result is recorded without another stat;
-its identity remains unbound, and an earlier publish stays an effect if sync
-fails. These source controls have not been executed.
+Descriptor listing, entry and vnode rows without operation-time process
+identity remain unproven. The tape does not reuse a classified or retry
+identity for a later listing or vnode read. The existing `state::sync_directory`
+open-and-sync result is recorded without another stat; its identity remains
+unbound, and an earlier publish stays an effect if sync fails.
 
 ## Production statement audit
 
@@ -633,8 +621,7 @@ its failure does not replace the original publication error. `StateLock::exclusi
 uses only shared observation locks. The corresponding descriptor-relative
 publish path records temporary create, save, file sync, rename, directory sync
 and any cleanup unlink in `MacOs::publish_child_file` (os/macos.rs:3831–3963).
-These are source findings; the new file-sync control and the required
-current-head selectors have not been executed.
+These remain source findings and do not establish native qualification.
 
 Effect rows carry the call-site file and line separately from the closed
 effect kind. A failed operation records its actual error and

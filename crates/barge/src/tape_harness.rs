@@ -18,9 +18,9 @@
 //!
 //! The manifest is `oxide.capture.manifest/1`, owned by the orchestrator.
 //! The copied Oxide 283 parser validates its reviewed wire shape, separately
-//! from completeness. The harness reads
-//! exactly these members and binds the whole document's SHA-256; every other
-//! member is the orchestrator's and is ignored here:
+//! from completeness. After validation, the harness extracts these members
+//! for the engine, binds the whole document's SHA-256, and attaches obligation
+//! and effect diagnostics:
 //!
 //! - `case`: the case name carried into the transcript;
 //! - `barge.volume_uuid`: the fixture volume's UUID, as registered;
@@ -31,8 +31,8 @@
 //! process exits `2` and writes a provisional apparatus refusal document with
 //! no invented engine outcome. The engine's own refusals —
 //! an undeclared area, an unregistered volume, an unreadable registry — are
-//! engine outcomes: the transcript is written with `outcome.status` of
-//! `refused`, the engine's own refusal vocabulary, and the exit code
+//! engine outcomes: the shared transcript carries `outcome.state` as
+//! `refused` and the engine's own refusal vocabulary under `outcome.engine`; the exit code
 //! `ErrorKind::exit_code` gives, and the process exits with that code.
 //!
 //! ## Staged provenance for the later X-S2 orchestration
@@ -76,8 +76,8 @@ pub(crate) struct ManifestRequest {
     pub(crate) named_roots: Vec<String>,
 }
 
-/// Parse the manifest members this harness consumes. Anything else in the
-/// document is the orchestrator's; a missing or mistyped member is refused.
+/// Validate the shared manifest and extract the members the engine consumes.
+/// Missing or mistyped required members are refused.
 pub(crate) fn parse_manifest(bytes: &[u8]) -> Result<ManifestRequest, String> {
     crate::tape::validate_shared_manifest(bytes)?;
     let document: serde_json::Value = serde_json::from_slice(bytes)
