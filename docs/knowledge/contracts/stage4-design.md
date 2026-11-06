@@ -1731,9 +1731,12 @@ operation already returned — never a conjunction collapsed into one message. T
 predicates keep their original order and short-circuit, so a failure record never runs
 an observation the assertion would not have made: a filesystem fact the branch did not
 reach is reported as `unobserved`, and the release-run record carries
-`released_count`, `kept_count`, `stopped`, `replay_pending`, the expected and returned
-root ids and one entry per row (`root_id`, `outcome`, `reason`) until the reporting
-allowance is reached, with the number omitted stated. A plan row that does not meet its
+`released_count`, `kept_count`, `stopped`, `replay_pending`, the expected root id, a
+bounded prefix of the returned root ids (at most 32, inside a 400-character budget, with
+the number omitted stated) and one entry per row (`root_id`, `outcome`, `reason`) until
+the reporting allowance is reached, with the number omitted stated. The two "root kept"
+and "root released" conjunctions are separate helpers with fixed polarities, so a release
+check cannot inherit keep semantics through a flag. A plan row that does not meet its
 expectation likewise records its deciding fields first — `eligible`, the first blocker
 and its reason, and each gate's own verdict (`identity`, `custody`, `last_activity_ms`,
 `references_complete`, `references_current`, `absence_verdict`) — before the bounded raw

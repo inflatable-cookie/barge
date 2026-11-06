@@ -995,6 +995,28 @@ def failure_detail(predicate, summary):
     return f"{predicate} failed: {json.dumps(summary, sort_keys=True)}"
 
 
+ROW_ID_LIMIT = 32
+ROW_ID_CHARS = 400
+
+
+def bounded_ids(values, count_limit=ROW_ID_LIMIT, char_limit=ROW_ID_CHARS):
+    """At most `count_limit` identifiers inside a `char_limit` budget, omission stated. Pure.
+
+    A returned root-id list is one member of a bounded failure record, so it needs its own
+    bound: an unbounded list would blow the record's allowance on its own, however well the
+    per-row entries are capped.
+    """
+    kept, used = [], 0
+    for value in values:
+        rendered = bounded_text(value, 120) if isinstance(value, str) else value
+        size = len(json.dumps(rendered)) + 1
+        if len(kept) >= count_limit or used + size > char_limit:
+            break
+        kept.append(rendered)
+        used += size
+    return kept, max(0, len(values) - len(kept))
+
+
 def run_report_summary(document, expected_root_id, observations=None):
     """The decisive fields one `barge.prune.run/1` body already returned. Pure.
 
@@ -1003,13 +1025,15 @@ def run_report_summary(document, expected_root_id, observations=None):
     """
     observations = observations or {}
     rows = [row for row in (document.get("rows") or []) if isinstance(row, dict)]
+    returned_ids, ids_omitted = bounded_ids([row.get("root_id") for row in rows])
     fields = {
         "released_count": document.get("released_count"),
         "kept_count": document.get("kept_count"),
         "stopped": document.get("stopped"),
         "replay_pending": document.get("replay_pending"),
         "expected_root_id": expected_root_id,
-        "row_root_ids": [row.get("root_id") for row in rows],
+        "row_root_ids": returned_ids,
+        "row_root_ids_omitted": ids_omitted,
         "path_present": observations.get("path_present", "unobserved"),
     }
     return failure_summary(fields, [{"root_id": row.get("root_id"),
@@ -1038,17 +1062,38 @@ def released_after_replay_failure(document, expected_root_id, path_present):
     return failed, observations
 
 
-def root_kept_failure(document, expected_root_id, path_present, expected_released=0):
-    """Which "this root must still be here" predicate fails, in order. Pure.
+def root_kept_failure(document, expected_root_id, path_present):
+    """Which "this root must still be here" predicate fails, in order. Keep polarity. Pure.
 
     The original assertions were `released_count != 0 or not lexists(path)`: the count is
-    decided first and the filesystem is read once, only when it held.
+    decided first and the filesystem is read once, only when it held. The path predicate
+    fails when the path is gone.
     """
     observations = {}
 
     def observe_path():
         observations["path_present"] = bool(path_present())
         return not observations["path_present"]
+
+    failed = first_failed_predicate([
+        ("released_count", lambda: document["released_count"] != 0),
+        ("path_present", observe_path),
+    ])
+    return failed, observations
+
+
+def root_released_failure(document, expected_root_id, path_present, expected_released=1):
+    """Which "this root must be gone" predicate fails, in order. Release polarity. Pure.
+
+    The mirror of `root_kept_failure` as its own function, so a release assertion can never
+    pick up keep polarity by passing a flag: the count is decided first and the filesystem
+    is read once, only when it held, and this predicate fails when the path is still there.
+    """
+    observations = {}
+
+    def observe_path():
+        observations["path_present"] = bool(path_present())
+        return observations["path_present"]
 
     failed = first_failed_predicate([
         ("released_count", lambda: document["released_count"] != expected_released),
@@ -1617,9 +1662,8 @@ class Proof:
                 "named_roots": preview["data"]["plan"]["named_roots"],
                 "expected_named_roots": [root["root_id"]]})))
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
-        failed, observations = root_kept_failure(
-            run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]),
-            expected_released=1)
+        failed, observations = root_released_failure(
+            run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
         if failed is not None:
             raise Fault("R4", failure_detail(
                 failed, run_report_summary(run_doc["data"], root["root_id"], observations)))
@@ -2658,15 +2702,29 @@ def failure_report_controls():
     if failed != "path_present" or len(observed) != 1 or observations != {"path_present": False}:
         problems.append(f"the kept-root conjunction does not name a missing path: {failed!r}, "
                         f"{observations!r}")
+    # The release polarity is its own helper: a correct release (count 1, path gone) must
+    # pass, and a root that stays on disk must name the path. Keep polarity is the mirror.
     observed = []
-    failed, observations = root_kept_failure(
-        {"released_count": 1}, "root-a", lambda: (observed.append(1), False)[1],
-        expected_released=1)
-    if failed != "path_present" or len(observed) != 1:
-        problems.append(f"the released-root conjunction does not name a missing path: {failed!r}")
-    if root_kept_failure({"released_count": 1}, "root-a", lambda: True,
-                         expected_released=1)[0] is not None:
-        problems.append("the released-root conjunction rejects a released root")
+    failed, observations = root_released_failure(
+        {"released_count": 1}, "root-a", lambda: (observed.append(1), False)[1])
+    if failed is not None or len(observed) != 1 or observations != {"path_present": False}:
+        problems.append(f"a correct release is refused: {failed!r}, {observations!r}")
+    observed = []
+    failed, observations = root_released_failure(
+        {"released_count": 1}, "root-a", lambda: (observed.append(1), True)[1])
+    if failed != "path_present" or len(observed) != 1 or observations != {"path_present": True}:
+        problems.append(f"a root still on disk is not named: {failed!r}, {observations!r}")
+    observed = []
+    failed, observations = root_released_failure(
+        {"released_count": 0}, "root-a", lambda: (observed.append(1), False)[1])
+    if failed != "released_count" or observed or observations != {}:
+        problems.append(f"a counted release is not named: {failed!r}, {observations!r}")
+    # The two polarities stay opposites on the same document.
+    document_for_polarity = {"released_count": 1}
+    if root_kept_failure(document_for_polarity, "root-a", lambda: False)[0] != "released_count":
+        problems.append("keep polarity accepts a release")
+    if root_released_failure(document_for_polarity, "root-a", lambda: True)[0] != "path_present":
+        problems.append("release polarity accepts a root that stays on disk")
 
     # The replay conjunction: the intent list is only read when the document held.
     calls = []
@@ -2694,15 +2752,35 @@ def failure_report_controls():
     summary = run_report_summary(document_with_rows, "root-a")
     if len(json.dumps(summary, sort_keys=True)) > ROW_EVIDENCE_CHARS:
         problems.append("the run failure record exceeds the reporting allowance")
-    for key, value in (("released_count", 0), ("kept_count", 40), ("row_root_ids",
-                                                                  [row["root_id"] for row in rows]),
+    for key, value in (("released_count", 0), ("kept_count", 40),
                        ("expected_root_id", "root-a"), ("path_present", "unobserved")):
         if summary.get(key) != value:
             problems.append(f"the run failure record drops {key}")
+    returned = [row["root_id"] for row in rows]
+    if (summary["row_root_ids"] != returned[:len(summary["row_root_ids"])]
+            or len(summary["row_root_ids"]) + summary["row_root_ids_omitted"] != len(returned)):
+        problems.append(f"the returned root ids are not a bounded prefix: "
+                        f"{len(summary['row_root_ids'])}, {summary['row_root_ids_omitted']}")
     if (summary["rows_total"] != 40 or summary["rows_omitted"] == 0
             or len(summary["rows"]) + summary["rows_omitted"] != 40):
         problems.append(f"the run failure record does not bound its rows: {summary['rows_total']}, "
                         f"{summary['rows_omitted']}, {len(summary['rows'])}")
+    # The returned root-id list needs its own bound: 200 rows with long ids must not blow
+    # the allowance, and the omitted count must account for every id.
+    hostile_rows = [{"root_id": "root-" + "x" * 200 + f"-{index}", "outcome": "kept",
+                     "reason": "r" * 900} for index in range(200)]
+    hostile = run_report_summary({"released_count": 0, "kept_count": 200, "stopped": False,
+                                  "replay_pending": 0, "rows": hostile_rows}, "root-a")
+    hostile_detail = failure_detail("released_count", hostile)
+    if len(hostile_detail) > ROW_EVIDENCE_CHARS:
+        problems.append(f"a 200-row failure record exceeds the allowance: {len(hostile_detail)}")
+    if (len(hostile["row_root_ids"]) > ROW_ID_LIMIT
+            or len(hostile["row_root_ids"]) + hostile["row_root_ids_omitted"] != 200):
+        problems.append(f"the returned root ids are not bounded or accounted: "
+                        f"{len(hostile['row_root_ids'])}, {hostile['row_root_ids_omitted']}")
+    if (len(hostile["rows"]) + hostile["rows_omitted"] != 200
+            or len(json.dumps(hostile, sort_keys=True)) > ROW_EVIDENCE_CHARS):
+        problems.append("the 200-row record does not account for every row inside the allowance")
     small = run_report_summary({"released_count": 1, "kept_count": 0, "stopped": False,
                                 "replay_pending": 0,
                                 "rows": [{"root_id": "root-b", "outcome": "kept",
