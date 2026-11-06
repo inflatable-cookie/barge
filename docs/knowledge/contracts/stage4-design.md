@@ -1634,10 +1634,19 @@ never reads what `release:native:stage` staged. The ordinary production build
 (without the feature) is never the one run.
 
 The inner half re-checks that it is the pinned supervisor's guarded child: the
-evidence and owned scratch directories exist, `TMPDIR` and the evidence directory
-resolve inside the owned scratch, the supervisor bytes still match the pin, and the
-carried scratch route is the pinned one. A refusal there returns `125` with no
-staging and no fixture.
+supervisor bytes still match the pin, the carried scratch route is the pinned one,
+`TMPDIR` resolves inside the scratch directory, and the guard's monitored layout is
+this occurrence's own. That layout is the pinned supervisor's, not an assumption:
+it creates one `oxide-proof.*` root directly under `--root-parent`, then `scratch/`
+and, by default, `evidence/` inside that root, so `OXIDE_TASK_SCRATCH_ROOT` and
+`OXIDE_PROOF_EVIDENCE` are siblings inside one monitored owned root and evidence is
+**not** inside the scratch directory. The check therefore requires both directories
+to be absolute, canonical, symlink-free, this account's and private (no group or
+other write; the owned root itself owner-only), the owned root to be a direct child
+of the verified Stash scratch parent, and the evidence directory to sit inside that
+same owned root without aliasing the scratch directory or the owned root. An aliased
+or symlinked path, an escape, a foreign or off-parent root and a mismatched occurrence
+all refuse. A refusal there returns `125` with no staging and no fixture.
 
 **Custody of the image.** Before the 64 MiB sparse APFS backing exists, the run
 publishes the guard's opt-in `image-custody.json` indication (its exact shape:
@@ -1733,7 +1742,11 @@ reference) is carried by `an_incomplete_or_divergent_reference_source_keeps_the_
 which uses a synthetic `FakeAccount`.
 
 What is not yet established: nothing in this repository has run the body against the
-proof build. Its self-check (`release:native:test`), its feature declarations and
+proof build. One activated diagnostic at `1e7267c` refused before staging and before
+any fixture effect, on a driver premise that wrongly required the guard's evidence
+directory to be inside its scratch directory; the guard itself closed that occurrence
+cleanly with no image or resource retained beyond its own evidence. The contract above
+and its pure controls now encode the guard's real sibling layout. Its self-check (`release:native:test`), its feature declarations and
 its pure counterfactuals (`release:native:test`, `rust:test:proof-account`) are
 checked. The self-check also drives the readiness correction's own decisions on
 canned observations and seams: a wrong scratch route or volume UUID, a carried route

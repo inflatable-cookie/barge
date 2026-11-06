@@ -179,8 +179,8 @@ ENVIRONMENT = {
     "BARGE_PROOF_SUPERVISOR": "the optional path to the hash-pinned Oxide supervisor",
     "BARGE_PROOF_ROUTE": "the scratch route the outer half verified, re-checked by the guarded half",
     "BARGE_PROOF_WALL_DEADLINE_NS": "the guard's absolute monotonic wall deadline, so staging spends it and never resets a clock",
-    "OXIDE_PROOF_EVIDENCE": "the supervisor's evidence directory for the receipt and the image-custody indication",
-    "OXIDE_TASK_SCRATCH_ROOT": "the supervisor's owned scratch root that TMPDIR, the evidence directory and the staged build must be inside",
+    "OXIDE_PROOF_EVIDENCE": "the supervisor's evidence directory for the receipt and the image-custody indication; a sibling of the scratch directory inside the same monitored owned root",
+    "OXIDE_TASK_SCRATCH_ROOT": "the supervisor's own scratch directory (one child of its monitored owned root); TMPDIR and the staged build live inside it",
     "DYLD_INSERT_LIBRARIES": "discarded from both halves: this proof injects no interposer",
     "HOME": "a private fixture home, so no real account state is read or written",
     "CARGO_HOME": "a private fixture Cargo home; the fixture build is the guarded proof-feature stage",
@@ -1730,13 +1730,117 @@ def inside_owned(path, owned):
     return real_path == real_owned or real_path.startswith(real_owned + os.sep)
 
 
+def guard_owned_root(scratch):
+    """The guard's monitored owned root: the parent of the scratch directory it sets.
+
+    The pinned supervisor creates one `oxide-proof.*` root directly under its
+    `--root-parent` and then `scratch/` (and, by default, `evidence/`) inside it
+    (`create_owned_root`, `owned_root` and `setup` in the pinned bytes), so the scratch
+    directory's parent is that one monitored owned root.
+    """
+    if not isinstance(scratch, str) or not os.path.isabs(scratch):
+        return None
+    parent = os.path.dirname(os.path.normpath(scratch))
+    return parent if parent not in ("", os.sep) else None
+
+
+def guard_containment_facts(scratch_env=None, evidence_env=None):
+    """What the host says about the guard's monitored layout. Read-only.
+
+    One `lstat` and one real resolution per path; nothing is created. `scratch_env`
+    and `evidence_env` default to the guard's own variables.
+    """
+    scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "") if scratch_env is None else scratch_env
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "") if evidence_env is None else evidence_env
+    facts = {"scratch": scratch, "evidence": evidence,
+             "root_parent": os.path.realpath(DESIGNATED_SCRATCH),
+             "uid": os.getuid(), "scratch_facts": None, "evidence_facts": None,
+             "root_facts": None}
+    for key, path in (("scratch_facts", scratch), ("evidence_facts", evidence),
+                      ("root_facts", guard_owned_root(scratch))):
+        if not path:
+            continue
+        facts[key] = {"path": path, "realpath": None, "isdir": False, "islink": False,
+                      "uid": None, "mode": None, "present": False}
+        try:
+            info = os.lstat(path)
+        except OSError:
+            continue
+        facts[key].update(realpath=os.path.realpath(path), islink=os.path.islink(path),
+                          isdir=os.path.isdir(path) and not os.path.islink(path),
+                          uid=info.st_uid, mode=info.st_mode & 0o777, present=True)
+    return facts
+
+
+def _private_directory_problems(name, facts, uid, owner_only):
+    """Why one guard-set directory is not this occurrence's private canonical directory."""
+    problems = []
+    if isinstance(facts, dict) and facts.get("islink") is True:
+        return [f"the {name} {facts.get('path')!r} is a symlink"]
+    if not isinstance(facts, dict) or facts.get("present") is not True or facts.get("isdir") is not True:
+        return [f"the {name} {facts.get('path') if isinstance(facts, dict) else None!r} is not a directory"]
+    path = facts.get("path")
+    if not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path:
+        problems.append(f"the {name} {path!r} is not an absolute canonical path")
+    if facts.get("realpath") != path:
+        problems.append(f"the {name} {path!r} resolves to {facts.get('realpath')!r}, so its path is an alias or a symlink")
+    if facts.get("uid") != uid:
+        problems.append(f"the {name} {path!r} is not owned by this account")
+    mode = facts.get("mode")
+    writable = 0o077 if owner_only else 0o022
+    if not isinstance(mode, int) or mode & writable:
+        problems.append(f"the {name} {path!r} mode {mode!r} is not private")
+    return problems
+
+
+def guard_containment_problems(facts):
+    """Why the guard's scratch and evidence are not this occurrence's monitored layout.
+
+    Pure. The pinned supervisor keeps them as siblings inside one owned root under the
+    verified scratch parent: it creates `oxide-proof.*` directly under `--root-parent`
+    (here the verified Stash scratch), then `scratch/` and, by default, `evidence/`
+    inside that root. Evidence therefore need not be inside the scratch directory; it
+    must be inside the same monitored owned root. This refuses an aliased or symlinked
+    path, a path outside that owned root, a foreign or nested-off-parent root, a
+    directory of another account, an unprivate directory, and evidence that aliases
+    the scratch directory or the owned root itself.
+    """
+    problems = []
+    uid = facts.get("uid")
+    root_parent = facts.get("root_parent")
+    scratch = facts.get("scratch_facts")
+    problems += _private_directory_problems("scratch directory", scratch, uid, owner_only=False)
+    problems += _private_directory_problems("evidence directory", facts.get("evidence_facts"), uid, owner_only=False)
+    problems += _private_directory_problems("owned root", facts.get("root_facts"), uid, owner_only=True)
+    scratch_path = scratch.get("path") if isinstance(scratch, dict) else None
+    owned_root = guard_owned_root(scratch_path)
+    if not owned_root:
+        problems.append("the scratch directory does not name a guarded owned root")
+    else:
+        if os.path.dirname(owned_root) != root_parent:
+            problems.append(f"the owned root {owned_root} is not directly under the verified scratch parent {root_parent}")
+        evidence = facts.get("evidence_facts")
+        evidence_path = evidence.get("path") if isinstance(evidence, dict) else None
+        if not evidence_path:
+            problems.append("the evidence directory is absent")
+        else:
+            if evidence_path == owned_root:
+                problems.append("the evidence directory names the owned root itself")
+            if os.path.normpath(evidence_path) == os.path.normpath(scratch_path):
+                problems.append("the evidence directory aliases the scratch directory")
+            if not inside_owned(evidence_path, owned_root) or os.path.realpath(evidence_path) == os.path.realpath(owned_root):
+                problems.append(f"the evidence directory {evidence_path} is outside the monitored owned root {owned_root}")
+    return problems
+
+
 def guard_refusals(facts):
     """Why this process is not the pinned supervisor's guarded child. Pure.
 
     `facts` carries what the process observed: whether the evidence directory and the
     owned scratch root are directories, whether TMPDIR resolves inside the scratch, the
-    installed supervisor's pin problems, and the carried scratch route. Nothing here
-    reaches a build or a fixture.
+    observed containment problems of the guard's monitored layout, the installed
+    supervisor's pin problems, and the carried scratch route. Nothing here reaches a
+    build or a fixture.
     """
     refusals = []
     if facts.get("evidence_isdir") is not True:
@@ -1749,8 +1853,7 @@ def guard_refusals(facts):
     refusals += route_refusals(facts.get("route"))
     if facts.get("deadline_ns") is None:
         refusals.append(f"{WALL_DEADLINE_ENV} does not name the guard's wall deadline")
-    if facts.get("evidence_inside_scratch") is not True:
-        refusals.append("the evidence directory is not inside the guarded root")
+    refusals += [f"guard containment: {problem}" for problem in facts.get("containment_problems") or []]
     return refusals
 
 
@@ -1897,11 +2000,12 @@ def inner_half(mode, receipt_path):
     evidence = os.environ.get("OXIDE_PROOF_EVIDENCE")
     scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
     tmpdir = os.environ.get("TMPDIR", "")
+    containment = guard_containment_facts(scratch, evidence or "")
     facts = {
         "evidence_isdir": bool(evidence) and os.path.isdir(evidence),
         "scratch_isdir": bool(scratch) and os.path.isdir(scratch),
         "tmpdir_inside_scratch": inside_owned(tmpdir, scratch),
-        "evidence_inside_scratch": inside_owned(evidence, scratch),
+        "containment_problems": guard_containment_problems(containment),
         "supervisor_problems": installed_supervisor_problems(),
         "route": carried_route(),
         "deadline_ns": wall_deadline(),
@@ -1912,8 +2016,9 @@ def inner_half(mode, receipt_path):
         return 125
     if receipt_path is None:
         receipt_path = os.path.join(evidence, PROOF_RECEIPT)
+    owned_root = guard_owned_root(scratch)
     return guarded_run(mode, receipt_path, facts["route"], facts["deadline_ns"], scratch,
-                       {"owned root": scratch, "evidence directory": evidence})
+                       {"owned root": owned_root, "evidence directory": evidence})
 
 
 def carried_route():
@@ -2164,6 +2269,108 @@ def closure_controls():
     return problems
 
 
+def containment_facts(**overrides):
+    """The pinned guard's real monitored layout as canned facts, plus overrides. Pure.
+
+    The supervisor creates `oxide-proof.*` directly under `--root-parent`, then
+    `scratch/` and, by default, `evidence/` inside it, so scratch and evidence are
+    siblings inside one owned root: that is the positive shape these canned facts carry.
+    """
+    root = "/Volumes/Stash/scratch/barge/oxide-proof.abc123"
+    facts = {
+        "scratch": root + "/scratch",
+        "evidence": root + "/evidence",
+        "root_parent": os.path.realpath(DESIGNATED_SCRATCH),
+        "uid": 501,
+        "scratch_facts": {"path": root + "/scratch", "realpath": root + "/scratch",
+                          "isdir": True, "uid": 501, "mode": 0o755, "present": True},
+        "evidence_facts": {"path": root + "/evidence", "realpath": root + "/evidence",
+                           "isdir": True, "uid": 501, "mode": 0o755, "present": True},
+        "root_facts": {"path": root, "realpath": root, "isdir": True, "uid": 501,
+                       "mode": 0o700, "present": True},
+    }
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(facts.get(key), dict):
+            facts[key] = dict(facts[key], **value)
+        else:
+            facts[key] = value
+    return facts
+
+
+def containment_controls():
+    """The guard's real scratch/evidence layout and its refusals. Pure."""
+    problems = []
+    root = "/Volumes/Stash/scratch/barge/oxide-proof.abc123"
+    if guard_containment_problems(containment_facts()):
+        problems.append("the pinned guard's sibling scratch and evidence layout is refused")
+    for evidence in (root + "/scratch/supervisor-evidence.xyz",
+                     root + "/scratch/evidence/nested"):
+        facts = containment_facts(evidence=evidence,
+                                  evidence_facts={"path": evidence, "realpath": evidence})
+        if guard_containment_problems(facts):
+            problems.append(f"a guard evidence directory inside the same owned root is refused: {evidence}")
+    for name, facts in (
+            ("evidence outside the owned root",
+             containment_facts(evidence="/private/tmp/evidence",
+                               evidence_facts={"path": "/private/tmp/evidence",
+                                               "realpath": "/private/tmp/evidence"})),
+            ("evidence naming the owned root", containment_facts(
+                evidence=root, evidence_facts={"path": root, "realpath": root})),
+            ("evidence aliasing the scratch directory", containment_facts(
+                evidence=root + "/scratch",
+                evidence_facts={"path": root + "/scratch", "realpath": root + "/scratch"})),
+            ("an aliased evidence path",
+             containment_facts(evidence=root + "/evidence-link",
+                               evidence_facts={"path": root + "/evidence-link",
+                                               "realpath": root + "/evidence"})),
+            ("a symlinked evidence directory",
+             containment_facts(evidence=root + "/evidence-link",
+                               evidence_facts={"path": root + "/evidence-link", "islink": True})),
+            ("a symlinked scratch directory",
+             containment_facts(scratch_facts={"islink": True})),
+            ("an aliased scratch path",
+             containment_facts(scratch_facts={"realpath": "/private/tmp/elsewhere"})),
+            ("a foreign owned root",
+             containment_facts(scratch="/private/tmp/oxide-proof.abc123/scratch",
+                               scratch_facts={"path": "/private/tmp/oxide-proof.abc123/scratch",
+                                              "realpath": "/private/tmp/oxide-proof.abc123/scratch"},
+                               evidence="/private/tmp/oxide-proof.abc123/evidence",
+                               evidence_facts={"path": "/private/tmp/oxide-proof.abc123/evidence",
+                                               "realpath": "/private/tmp/oxide-proof.abc123/evidence"},
+                               root_facts={"path": "/private/tmp/oxide-proof.abc123",
+                                           "realpath": "/private/tmp/oxide-proof.abc123"})),
+            ("a root nested off the verified parent",
+             containment_facts(
+                 scratch=DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123/scratch",
+                 scratch_facts={"path": DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123/scratch",
+                                "realpath": DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123/scratch"},
+                 evidence=DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123/evidence",
+                 evidence_facts={"path": DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123/evidence",
+                                 "realpath": DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123/evidence"},
+                 root_facts={"path": DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123",
+                             "realpath": DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123"})),
+            ("an unprivate owned root", containment_facts(root_facts={"mode": 0o755})),
+            ("an owned root of another account", containment_facts(root_facts={"uid": 0})),
+            ("a group-writable scratch", containment_facts(scratch_facts={"mode": 0o775})),
+            ("a world-writable evidence directory", containment_facts(evidence_facts={"mode": 0o777})),
+            ("an evidence directory of another account", containment_facts(evidence_facts={"uid": 0})),
+            ("a scratch path that is not a directory", containment_facts(scratch_facts={"isdir": False})),
+            ("an absent evidence directory", containment_facts(evidence_facts={"present": False})),
+            ("a scratch path with no parent", containment_facts(scratch="scratch", scratch_facts=None)),
+            ("a relative evidence path", containment_facts(evidence="evidence",
+                                                           evidence_facts={"path": "evidence"}))):
+        if not guard_containment_problems(facts):
+            problems.append(f"the guard containment accepts {name}")
+    # The real observation helper reports the pinned layout it is pointed at, and
+    # nothing at all for an absent path.
+    absent = guard_containment_facts("/nonexistent/scratch", "/nonexistent/evidence")
+    if absent["scratch_facts"] is None or absent["evidence_facts"] is None:
+        problems.append("the containment observation does not record the paths it was given")
+    if not guard_containment_problems(absent):
+        problems.append("an absent guard layout is accepted")
+    return problems
+
+
 def guarded_controls():
     """The guarded half's refusals and its stage-verify-prove order, on seams. Pure."""
     problems = []
@@ -2171,10 +2378,12 @@ def guarded_controls():
                             "volume_mount": SCRATCH_VOLUME_MOUNT, "volume_uuid": SCRATCH_VOLUME_UUID,
                             "owner_uid": 501, "mode": 0o700, "uid": 501, "present": True})
     good = {"evidence_isdir": True, "scratch_isdir": True, "tmpdir_inside_scratch": True,
-            "evidence_inside_scratch": True, "supervisor_problems": [], "route": route,
+            "containment_problems": [], "supervisor_problems": [], "route": route,
             "deadline_ns": 1}
     if guard_refusals(good):
         problems.append("the guarded premises are refused")
+    if not guard_refusals(dict(good, containment_problems=["the evidence directory is outside"])):
+        problems.append("a containment problem does not refuse the guarded run")
     if not inside_owned("/guard/root", "/guard/root"):
         problems.append("the owned root itself is not inside the owned root")
     if not inside_owned("/guard/root/evidence", "/guard/root"):
@@ -2185,7 +2394,7 @@ def guarded_controls():
         if inside_owned(path, owned):
             problems.append(f"{path!r} is accepted as inside {owned!r}")
     for flipped in ({"evidence_isdir": False}, {"scratch_isdir": False},
-                    {"tmpdir_inside_scratch": False}, {"evidence_inside_scratch": False},
+                    {"tmpdir_inside_scratch": False},
                     {"supervisor_problems": ["the supervisor is sha256 x, not the pinned y"]},
                     {"route": None}, {"route": dict(route, volume_uuid="0")},
                     {"deadline_ns": None}):
@@ -2264,6 +2473,7 @@ def pure_self_check():
     problems += stage_controls()
     problems += custody_controls()
     problems += closure_controls()
+    problems += containment_controls()
     problems += guarded_controls()
     # Exercise the same path and rollback helpers used by R11, without a filesystem.
     identity = {"volume_uuid": "uuid", "mount_relative_path": "area/root", "inode": 7,
@@ -2358,7 +2568,8 @@ def plan_document():
         "isolation": {
             "fixture_bindings": sorted(fixture_environment("<home>", "<state>", "<run>")),
             "oxide_directories": {"state": OXIDE_STATE_RELATIVE, "cache": OXIDE_CACHE_RELATIVE},
-            "rule": "every bound path resolves inside the supervisor's owned scratch; the reference control each case chose must too",
+            "rule": "every bound fixture path resolves inside the supervisor's owned scratch; the reference control each case chose must too",
+            "guard_containment": "the pinned supervisor keeps its scratch directory and its evidence directory as siblings inside one monitored owned root it creates directly under the verified Stash scratch parent; the driver requires both to be canonical, symlink-free, this account's and private, binds the owned root to the verified parent, and refuses an alias, an escape, a foreign or off-parent root and a mismatched occurrence (evidence is not required to be inside the scratch directory)",
         },
         "custody": {
             "indication": CUSTODY_NAME,
@@ -2428,7 +2639,8 @@ def main(argv):
         if problems:
             return 1
         print(f"release-proof self-check: {len(CASES)} cases carried by named regressions; "
-              "the pinned supervisor, the scratch route, the stage route and the closure gate hold")
+              "the pinned supervisor, the scratch route, the guard's sibling containment, "
+              "the stage route and the closure gate hold")
         return 0
     if args.plan:
         json.dump(plan_document(), sys.stdout, indent=2)
