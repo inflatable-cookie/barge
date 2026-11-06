@@ -127,6 +127,8 @@ PROOF_RECEIPT = "release-proof-receipt.json"
 # sorted-key document whose `absence` member alone is larger than a short cap; the raw
 # row follows, bounded, so one huge row cannot bloat the receipt.
 ROW_EVIDENCE_CHARS = 2000
+# How much of one free-text value a failure record keeps; the marker states the remainder.
+FAILURE_TEXT_CHARS = 400
 # Any holder or name that is not this proof's own is refused.
 NAMESPACE = "example"
 # The one Cargo feature the staged binary is built with. It is named here, in the
@@ -940,8 +942,137 @@ def verify_rollback(path, identity, identity_bytes, marker_bytes, payload, pendi
         same_inode = os.stat(path, follow_symlinks=False).st_ino == identity["inode"]
     except OSError as error:
         raise Fault("R11", f"rollback root cannot be observed: {error}") from error
-    if not (same_record and same_marker and same_content and same_inode):
-        raise Fault("R11", "rollback identity or content changed")
+    failed = rollback_failure(same_record, same_marker, same_content, same_inode)
+    if failed is not None:
+        raise Fault("R11", failure_detail(failed, failure_summary({
+            "identity_record": same_record, "marker": same_marker,
+            "content": same_content, "inode": same_inode})))
+
+
+def bounded_text(value, limit=FAILURE_TEXT_CHARS):
+    """One free-text value, capped with an explicit marker. Pure."""
+    if not isinstance(value, str) or len(value) <= limit:
+        return value
+    return value[:limit] + f"...[+{len(value) - limit} chars]"
+
+
+def failure_summary(fields, rows=(), limit=ROW_EVIDENCE_CHARS):
+    """A bounded failure record: the deciding fields first, then as many rows as fit. Pure.
+
+    Scalars are never dropped, because a deciding field is useless if truncation can hide
+    it. Free text is capped per value, rows are appended only while the whole record stays
+    inside the existing reporting allowance, and the number omitted is stated.
+    """
+    summary = {key: bounded_text(value) for key, value in fields.items()}
+    summary["rows_total"] = len(rows)
+    summary["rows"] = []
+    summary["rows_omitted"] = 0
+    for index, row in enumerate(rows):
+        rendered = {key: bounded_text(value) for key, value in row.items()}
+        candidate = dict(summary, rows=summary["rows"] + [rendered])
+        if len(json.dumps(candidate, sort_keys=True)) > limit - 100:
+            summary["rows_omitted"] = len(rows) - index
+            break
+        summary["rows"].append(rendered)
+    return summary
+
+
+def first_failed_predicate(checks):
+    """The first failing check's name, in order, short-circuiting exactly like `or`. Pure.
+
+    `checks` is an ordered sequence of `(name, predicate)` pairs. Each predicate runs only
+    when every earlier one held, so a failure record never causes an observation the
+    original assertion would not have made.
+    """
+    for name, predicate in checks:
+        if predicate():
+            return name
+    return None
+
+
+def failure_detail(predicate, summary):
+    """The one-line failure record an oracle raises: predicate first, bounded fields after."""
+    return f"{predicate} failed: {json.dumps(summary, sort_keys=True)}"
+
+
+def run_report_summary(document, expected_root_id, observations=None):
+    """The decisive fields one `barge.prune.run/1` body already returned. Pure.
+
+    `observations` carries predicates the original assertion actually reached; a
+    filesystem fact the branch never reached is reported as `unobserved`, never guessed.
+    """
+    observations = observations or {}
+    rows = [row for row in (document.get("rows") or []) if isinstance(row, dict)]
+    fields = {
+        "released_count": document.get("released_count"),
+        "kept_count": document.get("kept_count"),
+        "stopped": document.get("stopped"),
+        "replay_pending": document.get("replay_pending"),
+        "expected_root_id": expected_root_id,
+        "row_root_ids": [row.get("root_id") for row in rows],
+        "path_present": observations.get("path_present", "unobserved"),
+    }
+    return failure_summary(fields, [{"root_id": row.get("root_id"),
+                                     "outcome": row.get("outcome"),
+                                     "reason": row.get("reason")} for row in rows])
+
+
+def released_after_replay_failure(document, expected_root_id, path_present):
+    """Which post-replay predicate fails, in the original order, plus what it observed. Pure.
+
+    `path_present` is a thunk: the filesystem is read exactly once and only when the
+    earlier predicates held, exactly as the original `or` chain did.
+    """
+    observations = {}
+
+    def observe_path():
+        observations["path_present"] = bool(path_present())
+        return observations["path_present"]
+
+    failed = first_failed_predicate([
+        ("released_count", lambda: document["released_count"] != 1),
+        ("path_present", observe_path),
+        ("row_count", lambda: len(document["rows"]) != 1),
+        ("root_id", lambda: document["rows"][0]["root_id"] != expected_root_id),
+    ])
+    return failed, observations
+
+
+def root_kept_failure(document, expected_root_id, path_present, expected_released=0):
+    """Which "this root must still be here" predicate fails, in order. Pure.
+
+    The original assertions were `released_count != 0 or not lexists(path)`: the count is
+    decided first and the filesystem is read once, only when it held.
+    """
+    observations = {}
+
+    def observe_path():
+        observations["path_present"] = bool(path_present())
+        return not observations["path_present"]
+
+    failed = first_failed_predicate([
+        ("released_count", lambda: document["released_count"] != expected_released),
+        ("path_present", observe_path),
+    ])
+    return failed, observations
+
+
+def replay_settlement_failure(document, pending_intents):
+    """Which replay predicate fails, in order; intents are read only when reached. Pure."""
+    return first_failed_predicate([
+        ("replay_pending", lambda: document["replay_pending"] != 0),
+        ("pending_intents", lambda: bool(pending_intents())),
+    ])
+
+
+def rollback_failure(same_record, same_marker, same_content, same_inode):
+    """Which rollback observation differs, in the original order. Pure."""
+    return first_failed_predicate([
+        ("identity_record", lambda: not same_record),
+        ("marker", lambda: not same_marker),
+        ("content", lambda: not same_content),
+        ("inode", lambda: not same_inode),
+    ])
 
 
 def row_deciding_summary(row):
@@ -1398,14 +1529,28 @@ class Proof:
         digest = preview["data"]["plan_digest"]
         _code, run_doc = self.real(plan_file, digest, expect=0)
         if run_doc["data"]["released_count"] != 1:
-            raise Fault("R1", f"released {run_doc['data']['released_count']}, expected 1")
-        if os.path.lexists(root["path"]):
-            raise Fault("R1", "the released root is still present")
+            raise Fault("R1", failure_detail(
+                "released_count", run_report_summary(run_doc["data"], root["root_id"])))
+        present = os.path.lexists(root["path"])
+        if present:
+            raise Fault("R1", failure_detail("path_present", run_report_summary(
+                run_doc["data"], root["root_id"], {"path_present": present})))
         if self.pending_intents():
-            raise Fault("R1", "an intent is left pending after a clean release")
+            raise Fault("R1", failure_detail("pending_intents", run_report_summary(
+                run_doc["data"], root["root_id"])))
         settled = self.settled_intents()
-        if len(settled) != 1 or settled[0].get("identity") is None:
-            raise Fault("R1", "the settled intent does not keep the identity evidence")
+        observations = {"settled_intents": len(settled), "expected_settled_intents": 1}
+
+        def settled_identity_missing():
+            observations["settled_intent_identity_present"] = settled[0].get("identity") is not None
+            return not observations["settled_intent_identity_present"]
+
+        failed = first_failed_predicate([
+            ("settled_intent_count", lambda: observations["settled_intents"] != 1),
+            ("settled_intent_identity", settled_identity_missing),
+        ])
+        if failed is not None:
+            raise Fault("R1", failure_detail(failed, failure_summary(observations)))
         _code, again = self.real(plan_file, digest, expect=0)
         if again["data"]["released_count"] != 0:
             raise Fault("R1", "replaying the same bytes released a root")
@@ -1420,8 +1565,11 @@ class Proof:
         if row["blocked_by"] != "identity":
             raise Fault("R2", f"blocked by {row['blocked_by']}, expected identity")
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
-        if run_doc["data"]["released_count"] != 0 or not os.path.lexists(root["path"]):
-            raise Fault("R2", "a root without its identity record was released")
+        failed, observations = root_kept_failure(
+            run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
+        if failed is not None:
+            raise Fault("R2", failure_detail(
+                failed, run_report_summary(run_doc["data"], root["root_id"], observations)))
         return {"root": root["root_id"], "blocked_by": row["blocked_by"],
                 "counterfactual_of": "R1", "flipped_condition": "identity"}
 
@@ -1433,8 +1581,11 @@ class Proof:
         if row["blocked_by"] != "custody":
             raise Fault("R3", f"blocked by {row['blocked_by']}, expected custody")
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
-        if run_doc["data"]["released_count"] != 0 or not os.path.lexists(root["path"]):
-            raise Fault("R3", "a held root was released")
+        failed, observations = root_kept_failure(
+            run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
+        if failed is not None:
+            raise Fault("R3", failure_detail(
+                failed, run_report_summary(run_doc["data"], root["root_id"], observations)))
         return {"root": root["root_id"], "blocked_by": row["blocked_by"],
                 "counterfactual_of": "R1", "flipped_condition": "custody"}
 
@@ -1443,16 +1594,35 @@ class Proof:
         root = self.new_root(area, aged=False)
         _p, young, _f = self.plan_and_run("R4-young", area, root, expect_eligible=False)
         # The plan omits `age_waived` when it is false, so an absent key is an unwaived row.
-        if young["blocked_by"] != "policy" or young.get("age_waived"):
-            raise Fault("R4", "an unnamed young root was not kept by the age gate")
+        failed = first_failed_predicate([
+            ("blocked_by", lambda: young["blocked_by"] != "policy"),
+            ("age_waived", lambda: bool(young.get("age_waived"))),
+        ])
+        if failed is not None:
+            raise Fault("R4", failure_detail(failed, failure_summary({
+                "blocked_by": young["blocked_by"], "age_waived": young.get("age_waived"),
+                "reason": young.get("reason"),
+                "identity_verdict": (young.get("identity") or {}).get("verdict")})))
         preview, row, plan_file = self.plan_and_run(
             "R4-named", area, root, named=[root["root_id"]], expect_eligible=True
         )
-        if not row["age_waived"] or preview["data"]["plan"]["named_roots"] != [root["root_id"]]:
-            raise Fault("R4", "the named waiver is not stated in the plan")
+        failed = first_failed_predicate([
+            ("age_waived", lambda: not row["age_waived"]),
+            ("named_roots",
+             lambda: preview["data"]["plan"]["named_roots"] != [root["root_id"]]),
+        ])
+        if failed is not None:
+            raise Fault("R4", failure_detail(failed, failure_summary({
+                "age_waived": row.get("age_waived"),
+                "named_roots": preview["data"]["plan"]["named_roots"],
+                "expected_named_roots": [root["root_id"]]})))
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
-        if run_doc["data"]["released_count"] != 1 or os.path.lexists(root["path"]):
-            raise Fault("R4", "the named root was not released under its own waiver")
+        failed, observations = root_kept_failure(
+            run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]),
+            expected_released=1)
+        if failed is not None:
+            raise Fault("R4", failure_detail(
+                failed, run_report_summary(run_doc["data"], root["root_id"], observations)))
         return {"root": root["root_id"], "young_blocked_by": "policy", "named_released": 1,
                 "counterfactual_of": "R1", "flipped_condition": "age"}
 
@@ -1465,8 +1635,11 @@ class Proof:
         if row["blocked_by"] != "references":
             raise Fault("R5", f"blocked by {row['blocked_by']}, expected references")
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
-        if run_doc["data"]["released_count"] != 0 or not os.path.lexists(root["path"]):
-            raise Fault("R5", "a root Oxide still marks pending was released")
+        failed, observations = root_kept_failure(
+            run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
+        if failed is not None:
+            raise Fault("R5", failure_detail(
+                failed, run_report_summary(run_doc["data"], root["root_id"], observations)))
         return {"root": root["root_id"], "blocked_by": row["blocked_by"],
                 "counterfactual_of": "R1", "flipped_condition": "references"}
 
@@ -1480,13 +1653,25 @@ class Proof:
         os.makedirs(checkout)
         self.oxide_registry([self.oxide_row(root, checkout, on_volume=True)], complete=True)
         preview, row, plan_file = self.plan_and_run("R6-present", area, root, expect_eligible=False)
-        if row["blocked_by"] != "absence" or (row.get("absence") or {}).get("verdict") != "present":
-            raise Fault("R6", "a present consumer path did not keep the root")
+        absence = row.get("absence") or {}
+        failed = first_failed_predicate([
+            ("blocked_by", lambda: row["blocked_by"] != "absence"),
+            ("absence_verdict", lambda: absence.get("verdict") != "present"),
+        ])
+        if failed is not None:
+            raise Fault("R6", failure_detail(failed, failure_summary({
+                "blocked_by": row["blocked_by"], "absence_verdict": absence.get("verdict"),
+                "absence_reason": absence.get("reason")})))
         os.rmdir(checkout)
         preview, row, plan_file = self.plan_and_run("R6-absent", area, root, expect_eligible=True)
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
-        if run_doc["data"]["released_count"] != 1 or os.path.lexists(root["path"]):
-            raise Fault("R6", "an absent consumer path did not release by reference")
+        if run_doc["data"]["released_count"] != 1:
+            raise Fault("R6", failure_detail(
+                "released_count", run_report_summary(run_doc["data"], root["root_id"])))
+        present = os.path.lexists(root["path"])
+        if present:
+            raise Fault("R6", failure_detail("path_present", run_report_summary(
+                run_doc["data"], root["root_id"], {"path_present": present})))
         return {"root": root["root_id"], "present_blocked_by": "absence", "released": 1,
                 "policy": "release_on_reference"}
 
@@ -1517,8 +1702,11 @@ class Proof:
         self.edit_marker_kind(root["path"], "foreign-kind")
         preview, row, plan_file = self.plan_and_run("R8", area, root, expect_eligible=False)
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
-        if run_doc["data"]["released_count"] != 0 or not os.path.lexists(root["path"]):
-            raise Fault("R8", "a foreign marker qualified its root")
+        failed, observations = root_kept_failure(
+            run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
+        if failed is not None:
+            raise Fault("R8", failure_detail(
+                failed, run_report_summary(run_doc["data"], root["root_id"], observations)))
         return {"root": root["root_id"], "blocked_by": row["blocked_by"],
                 "counterfactual_of": "R1", "flipped_condition": "marker kind"}
 
@@ -1527,8 +1715,18 @@ class Proof:
         root = self.new_root(area, aged=True)
         preview, row, plan_file = self.plan_and_run("R9", area, root, expect_eligible=True)
         refusal = self.refused(plan_file, "0" * 64, area)
-        if refusal["kind"] != "usage" or not os.path.lexists(root["path"]):
-            raise Fault("R9", f"a changed digest did not refuse cleanly: {refusal}")
+        observations = {"refusal": refusal}
+
+        def path_missing():
+            observations["path_present"] = os.path.lexists(root["path"])
+            return not observations["path_present"]
+
+        failed = first_failed_predicate([
+            ("refusal_kind", lambda: refusal["kind"] != "usage"),
+            ("path_present", path_missing),
+        ])
+        if failed is not None:
+            raise Fault("R9", failure_detail(failed, failure_summary(observations)))
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
         if run_doc["data"]["released_count"] != 1:
             raise Fault("R9", "the presented bytes did not release after the refusal")
@@ -1542,8 +1740,11 @@ class Proof:
         preview, row, plan_file = self.plan_and_run("R10", area, root, expect_eligible=True)
         os.makedirs(checkout)
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
-        if run_doc["data"]["released_count"] != 0 or not os.path.lexists(root["path"]):
-            raise Fault("R10", "a consumer path that reappeared did not keep its root")
+        failed, observations = root_kept_failure(
+            run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
+        if failed is not None:
+            raise Fault("R10", failure_detail(
+                failed, run_report_summary(run_doc["data"], root["root_id"], observations)))
         return {"root": root["root_id"], "released": 0, "kept_by": "absence"}
 
     def case_intent_before_rename_then_remount_replay(self):
@@ -1570,10 +1771,21 @@ class Proof:
         code, run_doc = self.real(plan_file, digest, expect=3)
         os.chmod(folder, 0o700)
         if run_doc["data"]["rows"][0]["outcome"] != "pending":
-            raise Fault("R11", f"the rename refusal did not leave a pending row: {run_doc['data']['rows']}")
+            raise Fault("R11", failure_detail(
+                "pending_row_outcome", run_report_summary(run_doc["data"], root["root_id"])))
         pending = self.pending_intents()
-        if len(pending) != 1 or pending[0].get("identity") is None:
-            raise Fault("R11", "the pending intent does not carry the identity evidence")
+        observations = {"pending_intents": len(pending), "expected_pending_intents": 1}
+
+        def pending_identity_missing():
+            observations["pending_intent_identity_present"] = pending[0].get("identity") is not None
+            return not observations["pending_intent_identity_present"]
+
+        failed = first_failed_predicate([
+            ("pending_intent_count", lambda: observations["pending_intents"] != 1),
+            ("pending_intent_identity", pending_identity_missing),
+        ])
+        if failed is not None:
+            raise Fault("R11", failure_detail(failed, failure_summary(observations)))
         if not os.path.lexists(root["path"]):
             raise Fault("R11", "the unit moved before its rename succeeded")
         old_device = self.device
@@ -1589,18 +1801,29 @@ class Proof:
                         "device_changed": remounted, "mount_relative_path": identity["mount_relative_path"],
                         "attachment": mounted, "closed_before_attach": detached["closed"]}
         _code, replay = self.real(plan_file, digest, expect=0)
-        if replay["data"]["replay_pending"] != 0 or self.pending_intents():
-            raise Fault("R11", f"the remount replay left an intent pending: {replay['data']}")
+        failed = replay_settlement_failure(replay["data"], self.pending_intents)
+        if failed is not None:
+            raise Fault("R11", failure_detail(
+                failed, run_report_summary(replay["data"], root["root_id"])))
         root = dict(root, path=rebound_path(old_mount, self.mount, root["path"], identity, self.uuid))
         verify_rollback(root["path"], identity, identity_bytes, marker_bytes, payload, self.pending_intents())
         preview2, row2, plan2 = self.plan_and_run("R11-after", area, root, expect_eligible=True)
-        if row2["mount_relative_path"] != identity["mount_relative_path"] or row2["identity"]["verdict"] != "verified":
-            raise Fault("R11", "fresh plan did not verify the original relative identity")
+        failed = first_failed_predicate([
+            ("mount_relative_path",
+             lambda: row2["mount_relative_path"] != identity["mount_relative_path"]),
+            ("identity_verdict", lambda: row2["identity"]["verdict"] != "verified"),
+        ])
+        if failed is not None:
+            raise Fault("R11", failure_detail(failed, failure_summary({
+                "mount_relative_path": row2["mount_relative_path"],
+                "expected_mount_relative_path": identity["mount_relative_path"],
+                "identity_verdict": row2["identity"]["verdict"]})))
         _code, released = self.real(plan2, preview2["data"]["plan_digest"], expect=0)
-        if (released["data"]["released_count"] != 1 or os.path.lexists(root["path"])
-                or len(released["data"]["rows"]) != 1
-                or released["data"]["rows"][0]["root_id"] != root["root_id"]):
-            raise Fault("R11", "the root was not released after the replay settled")
+        failed, observations = released_after_replay_failure(
+            released["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
+        if failed is not None:
+            raise Fault("R11", failure_detail(
+                failed, run_report_summary(released["data"], root["root_id"], observations)))
         return {"root": root["root_id"], "pending_before_detach": 1, "detach": detached,
                 "device_before": old_device, "device_after": self.device_after_remount,
                 "device_changed": remounted, "mount_before": old_mount, "mount_after": self.mount,
@@ -1613,10 +1836,22 @@ class Proof:
         if not self.results or self.results[-1]["case"] != "R11" or self.results[-1]["status"] != "passed":
             raise Fault("registration", "R11 has not completed successfully")
         remount = self.remount or {}
-        if (remount.get("closed_before_attach") is not True or remount.get("attachment", {}).get("state") != "attached"
-                or remount.get("backing") != self.image or remount.get("volume_uuid") != self.uuid
-                or not self.attached or self.mount != remount.get("mount_after")):
-            raise Fault("registration", "R11 did not leave one positively bound remount of the same backing and volume")
+        attachment = remount.get("attachment") or {}
+        failed = first_failed_predicate([
+            ("remount_closed", lambda: remount.get("closed_before_attach") is not True),
+            ("remount_attached", lambda: attachment.get("state") != "attached"),
+            ("remount_backing", lambda: remount.get("backing") != self.image),
+            ("remount_volume_uuid", lambda: remount.get("volume_uuid") != self.uuid),
+            ("current_attachment", lambda: not self.attached),
+            ("remount_mount", lambda: self.mount != remount.get("mount_after")),
+        ])
+        if failed is not None:
+            raise Fault("registration", failure_detail(failed, failure_summary({
+                "closed_before_attach": remount.get("closed_before_attach"),
+                "attachment_state": attachment.get("state"),
+                "backing": remount.get("backing"), "volume_uuid": remount.get("volume_uuid"),
+                "mount_after": remount.get("mount_after"), "attached": self.attached,
+                "mount": self.mount})))
         self.state = tempfile.mkdtemp(prefix="state-r12-", dir=self.root)
         self.env["BARGE_STATE_DIR"] = self.state
         _code, preview = self.barge(
@@ -1625,8 +1860,17 @@ class Proof:
             "--floor", "1KiB", "--declared-by", "release-proof", "--plan", expect=0)
         plan = preview["data"]["plan"]
         document = json.loads(plan)
-        if document["record"]["volume_uuid"] != self.uuid or document["record"]["mount_hint"] != self.mount:
-            raise Fault("registration", "registration plan did not bind the verified image")
+        failed = first_failed_predicate([
+            ("registration_volume_uuid",
+             lambda: document["record"]["volume_uuid"] != self.uuid),
+            ("registration_mount_hint",
+             lambda: document["record"]["mount_hint"] != self.mount),
+        ])
+        if failed is not None:
+            raise Fault("registration", failure_detail(failed, failure_summary({
+                "volume_uuid": document["record"]["volume_uuid"], "expected_volume_uuid": self.uuid,
+                "mount_hint": document["record"]["mount_hint"],
+                "expected_mount_hint": self.mount})))
         plan_file = os.path.join(self.root, "r12-register.json")
         with open(plan_file, "w", encoding="utf-8") as handle:
             handle.write(plan)
@@ -1642,7 +1886,8 @@ class Proof:
         late = self.new_root(area, aged=True)
         _code, run_doc = self.real(plan_file, digest, expect=0)
         if run_doc["data"]["released_count"] != 1:
-            raise Fault("R12", f"released {run_doc['data']['released_count']}, expected 1")
+            raise Fault("R12", failure_detail(
+                "released_count", run_report_summary(run_doc["data"], given["root_id"])))
         if not os.path.lexists(late["path"]):
             raise Fault("R12", "a root the presented plan did not carry was released")
         return {"given": given["root_id"], "not_given_kept": late["root_id"], "released": 1}
@@ -2311,6 +2556,172 @@ def closure_controls():
     return problems
 
 
+def failure_report_controls():
+    """Each failed oracle names its own predicate and keeps bounded decisive fields. Pure.
+
+    Every case below uses canned documents and counting thunks only; none of it claims a
+    live observation. The point is that a failure record can no longer absorb the deciding
+    fields, and that the original predicate order and short-circuit are preserved.
+    """
+    problems = []
+    if bounded_text("x" * 10, 4) != "xxxx...[+6 chars]":
+        problems.append("bounded_text does not mark a capped value")
+    if bounded_text(7) != 7 or bounded_text(None) is not None:
+        problems.append("bounded_text does not pass non-strings through")
+
+    # Order and short-circuit, with call counts: only checks up to the first failure run.
+    calls = []
+
+    def recorded(name, answer):
+        def check():
+            calls.append(name)
+            return answer
+        return check
+
+    failed = first_failed_predicate([("a", recorded("a", False)), ("b", recorded("b", True)),
+                                     ("c", recorded("c", True))])
+    if failed != "b" or calls != ["a", "b"]:
+        problems.append(f"first_failed_predicate order or short-circuit changed: {failed}, {calls}")
+    if first_failed_predicate([("a", recorded("a", False)), ("b", recorded("b", False))]) is not None:
+        problems.append("a conjunction that holds reports a failed predicate")
+
+    # The R11 post-replay conjunction: each predicate discriminated on its own, plus the
+    # actual passing conjunction, with the path observation counted.
+    def document(count, rows, *, missing_rows=False):
+        value = {"released_count": count, "kept_count": 0, "stopped": False, "replay_pending": 0}
+        if not missing_rows:
+            value["rows"] = rows
+        return value
+
+    def case(name, doc, expected, expected_calls, expected_observations):
+        observed = []
+        try:
+            actual, observations = released_after_replay_failure(
+                doc, "root-a", lambda: (observed.append(1), False)[1])
+        except Exception as error:  # an eager conjunction reaches a member it must not
+            problems.append(f"R11 post-replay predicate {name} raised {type(error).__name__}: {error}")
+            return
+        if actual != expected or len(observed) != expected_calls or observations != expected_observations:
+            problems.append(
+                f"R11 post-replay predicate {name}: got {actual!r}, {len(observed)} path reads, "
+                f"{observations!r}")
+
+    case("zero released", document(0, []), "released_count", 0, {})
+    case("zero rows", document(1, []), "row_count", 1, {"path_present": False})
+    case("multi-row", document(1, [{"root_id": "root-a"}, {"root_id": "root-b"}]),
+         "row_count", 1, {"path_present": False})
+    case("wrong root", document(1, [{"root_id": "root-b"}]),
+         "root_id", 1, {"path_present": False})
+    case("passing conjunction", document(1, [{"root_id": "root-a"}]),
+         None, 1, {"path_present": False})
+    # A path that is still present fails on its own name, and the filesystem is read once.
+    observed = []
+    try:
+        actual, observations = released_after_replay_failure(
+            document(1, [{"root_id": "root-a"}]), "root-a",
+            lambda: (observed.append(1), True)[1])
+        if actual != "path_present" or len(observed) != 1 or observations != {"path_present": True}:
+            problems.append(f"R11 path predicate: got {actual!r}, {len(observed)} reads, {observations!r}")
+    except Exception as error:
+        problems.append(f"R11 path predicate raised {type(error).__name__}: {error}")
+    # Short-circuit preserved: an unreached member is never demanded.
+    try:
+        actual, observations = released_after_replay_failure(
+            document(0, [], missing_rows=True), "root-a", lambda: False)
+        if actual != "released_count" or observations != {}:
+            problems.append(f"an unreached rows member was demanded: {actual!r}, {observations!r}")
+    except KeyError:
+        problems.append("an unreached rows member was read")
+    try:
+        released_after_replay_failure(document(1, [], missing_rows=True), "root-a", lambda: False)
+        problems.append("a reached rows member is not propagated when absent")
+    except KeyError:
+        pass
+
+    # The "root must still be here" conjunction used by R2/R3/R5/R8/R10 (and R4's release):
+    # the count decides first, the filesystem is read once, and the name discriminates.
+    kept_document = {"released_count": 0, "kept_count": 1, "stopped": False,
+                     "replay_pending": 0, "rows": [{"root_id": "root-a", "outcome": "kept"}]}
+    observed = []
+    failed, observations = root_kept_failure(
+        kept_document, "root-a", lambda: (observed.append(1), True)[1])
+    if failed is not None or len(observed) != 1 or observations != {"path_present": True}:
+        problems.append(f"the kept-root conjunction rejects a kept root: {failed!r}, {observations!r}")
+    observed = []
+    failed, observations = root_kept_failure(
+        {"released_count": 1}, "root-a", lambda: (observed.append(1), True)[1])
+    if failed != "released_count" or observed or observations != {}:
+        problems.append(f"the kept-root conjunction does not name a release: {failed!r}, {observations!r}")
+    observed = []
+    failed, observations = root_kept_failure(
+        kept_document, "root-a", lambda: (observed.append(1), False)[1])
+    if failed != "path_present" or len(observed) != 1 or observations != {"path_present": False}:
+        problems.append(f"the kept-root conjunction does not name a missing path: {failed!r}, "
+                        f"{observations!r}")
+    observed = []
+    failed, observations = root_kept_failure(
+        {"released_count": 1}, "root-a", lambda: (observed.append(1), False)[1],
+        expected_released=1)
+    if failed != "path_present" or len(observed) != 1:
+        problems.append(f"the released-root conjunction does not name a missing path: {failed!r}")
+    if root_kept_failure({"released_count": 1}, "root-a", lambda: True,
+                         expected_released=1)[0] is not None:
+        problems.append("the released-root conjunction rejects a released root")
+
+    # The replay conjunction: the intent list is only read when the document held.
+    calls = []
+    if replay_settlement_failure({"replay_pending": 1}, lambda: calls.append(1) or [{"id": 1}]) != "replay_pending" or calls:
+        problems.append("the replay conjunction read intents before the document's own count")
+    calls = []
+    if replay_settlement_failure({"replay_pending": 0}, lambda: calls.append(1) or [{"id": 1}]) != "pending_intents" or len(calls) != 1:
+        problems.append("the replay conjunction does not name a pending intent")
+    if replay_settlement_failure({"replay_pending": 0}, lambda: []) is not None:
+        problems.append("a settled replay reports a failure")
+    for index, name in enumerate(("identity_record", "marker", "content", "inode")):
+        flags = [True, True, True, True]
+        flags[index] = False
+        if rollback_failure(*flags) != name:
+            problems.append(f"rollback does not discriminate {name}")
+    if rollback_failure(True, True, True, True) is not None:
+        problems.append("an intact rollback reports a changed observation")
+
+    # The bounded record: forty rows with long reasons stay inside the allowance, the
+    # decisive fields survive, and an unobserved path is never guessed.
+    rows = [{"root_id": f"root-{index}", "outcome": "kept", "reason": "r" * 600}
+            for index in range(40)]
+    document_with_rows = {"released_count": 0, "kept_count": 40, "stopped": False,
+                          "replay_pending": 0, "rows": rows, "area": "example/c11"}
+    summary = run_report_summary(document_with_rows, "root-a")
+    if len(json.dumps(summary, sort_keys=True)) > ROW_EVIDENCE_CHARS:
+        problems.append("the run failure record exceeds the reporting allowance")
+    for key, value in (("released_count", 0), ("kept_count", 40), ("row_root_ids",
+                                                                  [row["root_id"] for row in rows]),
+                       ("expected_root_id", "root-a"), ("path_present", "unobserved")):
+        if summary.get(key) != value:
+            problems.append(f"the run failure record drops {key}")
+    if (summary["rows_total"] != 40 or summary["rows_omitted"] == 0
+            or len(summary["rows"]) + summary["rows_omitted"] != 40):
+        problems.append(f"the run failure record does not bound its rows: {summary['rows_total']}, "
+                        f"{summary['rows_omitted']}, {len(summary['rows'])}")
+    small = run_report_summary({"released_count": 1, "kept_count": 0, "stopped": False,
+                                "replay_pending": 0,
+                                "rows": [{"root_id": "root-b", "outcome": "kept",
+                                          "reason": "a reason"}]}, "root-a",
+                               {"path_present": False})
+    if small["rows"] != [{"root_id": "root-b", "outcome": "kept", "reason": "a reason"}]:
+        problems.append(f"the per-row record changed: {small['rows']!r}")
+    if small["path_present"] is not False:
+        problems.append("a reached path observation is not reported")
+    detail = failure_detail("root_id", small)
+    if not detail.startswith("root_id failed: ") or '"expected_root_id": "root-a"' not in detail[:400]:
+        problems.append(f"the failure detail does not lead with its predicate and fields: {detail[:120]}")
+    # A field set alone is still inside the allowance.
+    if len(json.dumps(failure_summary({f"field{index}": index for index in range(200)}),
+                      sort_keys=True)) <= ROW_EVIDENCE_CHARS:
+        problems.append("the failure-summary bound check did not run")
+    return problems
+
+
 def plan_controls():
     """A failing plan row stays judgeable from the receipt, and the oracle still decides.
 
@@ -2592,6 +3003,7 @@ def pure_self_check():
     problems += closure_controls()
     problems += containment_controls()
     problems += plan_controls()
+    problems += failure_report_controls()
     problems += guarded_controls()
     # Exercise the same path and rollback helpers used by R11, without a filesystem.
     identity = {"volume_uuid": "uuid", "mount_relative_path": "area/root", "inode": 7,

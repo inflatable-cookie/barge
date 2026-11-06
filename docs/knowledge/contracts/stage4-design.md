@@ -1726,10 +1726,18 @@ premise. `qualified` is `true` only for a counted pass with every case passed, a
 positive whole-backing clearance and an unchanged real state. The diagnostic is
 always `qualified: false`.
 
-A case whose plan row does not meet its expectation records that row's deciding fields
-first — `eligible`, the first blocker and its reason, and each gate's own verdict
-(`identity`, `custody`, `last_activity_ms`, `references_complete`,
-`references_current`, `absence_verdict`) — before the bounded raw row. A plan row is a
+A failed oracle names the one predicate that failed and the decisive values the
+operation already returned — never a conjunction collapsed into one message. The
+predicates keep their original order and short-circuit, so a failure record never runs
+an observation the assertion would not have made: a filesystem fact the branch did not
+reach is reported as `unobserved`, and the release-run record carries
+`released_count`, `kept_count`, `stopped`, `replay_pending`, the expected and returned
+root ids and one entry per row (`root_id`, `outcome`, `reason`) until the reporting
+allowance is reached, with the number omitted stated. A plan row that does not meet its
+expectation likewise records its deciding fields first — `eligible`, the first blocker
+and its reason, and each gate's own verdict (`identity`, `custody`, `last_activity_ms`,
+`references_complete`, `references_current`, `absence_verdict`) — before the bounded raw
+row. A plan row is a
 sorted-key document whose `absence` member alone can exceed a short cap, so a truncated
 row would not name the gate; the deciding fields are what make a failed case judgeable
 from the receipt after the run root is gone. This changes no eligibility decision.
