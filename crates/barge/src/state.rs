@@ -563,6 +563,12 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
     }
 
     let mut file = File::open(path).map_err(|error| {
+        #[cfg(test)]
+        crate::tape::read_refused(
+            "state::read_bounded_inner",
+            path,
+            &crate::tape::errno_class(&error),
+        );
         Error::new(
             ErrorKind::Io,
             format!("cannot open {}: {error}", path.display()),
@@ -573,6 +579,12 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
     // The opened file is what is read, so the size checked above and the bytes
     // read below are the same file even if the path was replaced in between.
     let opened = file.metadata().map_err(|error| {
+        #[cfg(test)]
+        crate::tape::stat_refused(
+            "state::read_bounded_inner::opened",
+            path,
+            &crate::tape::errno_class(&error),
+        );
         Error::new(
             ErrorKind::Io,
             format!("cannot read the size of {}: {error}", path.display()),
@@ -624,6 +636,12 @@ fn read_bounded_inner(path: &Path, bounds: &Bounds) -> Result<ReadOutcome> {
             ));
         }
         let read = file.read(&mut chunk).map_err(|error| {
+            #[cfg(test)]
+            crate::tape::read_refused(
+                "state::read_bounded_inner",
+                path,
+                &crate::tape::errno_class(&error),
+            );
             Error::new(
                 ErrorKind::Io,
                 format!("cannot read {}: {error}", path.display()),
