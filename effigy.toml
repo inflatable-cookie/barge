@@ -93,17 +93,22 @@ alias = "barge"
 
 # F6-R1's release effect (scripts/native/release-proof.py). The self-check and the
 # plan are effect-free: they check the pinned supervisor, the argv guard, the case
-# table, the proof feature's declarations and the source text, and start no image
-# and no child process.
+# table, the proof feature's declarations, the Stash scratch route, the stage route
+# and the custody/closure gates, and start no image and no child process.
 "release:native:test" = "python3 scripts/native/release-proof.py --self-check"
 "release:native:plan" = "python3 scripts/native/release-proof.py --plan"
-# Builds the proof-feature binary of HEAD through Oxide, copies and hashes it into the
-# designated scratch, and writes its manifest. It runs no proof and touches no image.
+# Builds the proof-feature binary of HEAD through Oxide, copies and hashes it into an
+# exclusive directory under the designated Stash scratch, and writes its manifest. It
+# runs no proof and touches no image. It is an explicit staging record only: a native
+# run never reads this copy, because it stages its own inside the guard.
 "release:native:stage" = "python3 scripts/native/release-proof.py stage"
 
 # The elevated native run: one owned 64 MiB APFS image under the guard's scratch, the
-# qualified shared supervisor, 300 s wall and 512 MiB scratch. Each run stages the
-# proof-feature build of HEAD first and runs only that staged file. HELD for owner
+# qualified shared supervisor, 300 s wall and 512 MiB scratch. Each run verifies the
+# supervisor's bytes and the Stash scratch route, then stages the proof-feature build
+# of HEAD inside the guarded run and runs only that staged file; the guard's image
+# custody indication is published before the backing exists, and closure needs the
+# ordinary detach's success and reap plus whole-backing absence. HELD for owner
 # activation: these declarations activate nothing, and each run is separately
 # activated at an exact head (the diagnostic first, then the counted author pass,
 # then a distinct reviewer pass). A missing receipt is a missing proof.
