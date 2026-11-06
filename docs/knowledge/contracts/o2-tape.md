@@ -656,3 +656,35 @@ sysctl. The tape's 512-row cap and the scan's deadline do not bound that prior
 allocation. Consequently the process-census capture does not establish the
 accepted allocation bound. A bounded production allocation requires separate
 design and review; the tape does not inject a limit or alter evaluator flow.
+
+### Shared-wire source and limits
+
+The test-only wire parser and canonical vector files are adapted from Oxide
+commit `a35aef84bc3b8cb0ac943dfa005456a45167399b`;
+`src/bin/oxide/capture_wire.rs` there hashes to
+`6c0d4b47779af389f33072a7e397f5799a27002282bc8b23436ea617c1b77c8f`,
+and its vector `SHA256SUMS` hashes to
+`bb50822c3393bb0cb9e8bc53142c821dd1cdfa1a4d4828186c7b90d375099091`.
+The local copy uses Barge's digest implementation and local vector paths. It
+is compiled only in the test tape. The parser checks structure; its vector
+controls do not establish runtime coverage or parity. Clocks, classifications,
+truncation, notes and fixture-capture substructures remain outside its full
+validation. Historical packets with provisional field names are not migrated.
+
+Current recorder identities use `parent_source` and `own_source`: a parent
+held for a descriptor-relative operation is `handle`; the separate receipts
+precheck is `extracted`; other contextual facts are `context`; missing facts
+are `none`. Those labels describe observation provenance, not proof of K1.
+The K1 lifetime premise and mandatory parent obligations remain unqualified.
+Process descriptor rows lacking an identity at the operation remain unproven;
+an earlier classification is not reused as a later listing identity. L1
+adds one metadata call on a held lock; failure leaves the lock held and its
+identity unproven. Schema conformance alone does not establish full capture.
+
+| Remaining obligation | Current limit |
+| --- | --- |
+| K1 lifetime | Held parent identity is recorded, but lifetime and non-reassignment across the required interval are not qualified. |
+| Direct-reader parents | Path prechecks and opens resolve separately; their parent remains unproven pending reviewed Route B compatibility. |
+| Process and descriptor binding | A listing or vnode read without identity observed at that operation remains unproven, even when a classified pid was read earlier. |
+| Complete shared reconciliation | The copied parser and vectors check their declared surfaces; clocks, classifications, truncation, notes and fixture capture are not fully validated. |
+| Real capture qualification | The retained host exercise is bounded evidence, not native, parity, producer, or adoption qualification. |

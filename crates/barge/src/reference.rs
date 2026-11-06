@@ -1619,6 +1619,9 @@ fn read_receipts_with(
     deadline: Deadline,
     read_one: ReceiptRead<'_>,
 ) -> OxideReceipts {
+    #[cfg(test)]
+    let parent_facts;
+    #[cfg(not(test))]
     let outputs_state = match std::fs::metadata(outputs) {
         Ok(metadata) if metadata.is_dir() => true,
         Ok(_) => {
@@ -1637,6 +1640,57 @@ fn read_receipts_with(
                     outputs.display()
                 ),
             }
+        }
+    };
+    #[cfg(test)]
+    let outputs_state = match std::fs::metadata(outputs) {
+        Ok(metadata) if metadata.is_dir() => {
+            #[cfg(test)]
+            {
+                parent_facts = Some((metadata.dev(), metadata.ino()));
+                crate::tape::stat(
+                    "reference::read_receipts_with::precheck",
+                    outputs,
+                    Some((metadata.dev(), metadata.ino(), "directory")),
+                );
+            }
+            true
+        }
+        Ok(metadata) => {
+            #[cfg(test)]
+            crate::tape::stat(
+                "reference::read_receipts_with::precheck",
+                outputs,
+                Some((metadata.dev(), metadata.ino(), "other")),
+            );
+            return OxideReceipts::Unknown {
+                reason: format!(
+                    "{} exists and is not a directory, so Oxide's receipts cannot be read",
+                    outputs.display()
+                ),
+            };
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(test)]
+            {
+                parent_facts = None;
+                crate::tape::stat("reference::read_receipts_with::precheck", outputs, None);
+            }
+            false
+        }
+        Err(error) => {
+            #[cfg(test)]
+            crate::tape::stat_refused(
+                "reference::read_receipts_with::precheck",
+                outputs,
+                &crate::tape::errno_class(&error),
+            );
+            return OxideReceipts::Unknown {
+                reason: format!(
+                    "{} cannot be inspected, so whether Oxide's receipts live there is unknown: {error}",
+                    outputs.display()
+                ),
+            };
         }
     };
     if !outputs_state {
@@ -1688,9 +1742,9 @@ fn read_receipts_with(
         };
         let path = entry.path();
         #[cfg(test)]
-        crate::tape::dir_entry(
+        crate::tape::extracted_dir_entry(
             "reference::read_receipts_with",
-            None,
+            parent_facts,
             &path
                 .file_name()
                 .map_or_else(std::ffi::OsString::new, std::ffi::OsStr::to_os_string),
@@ -2322,27 +2376,42 @@ pub fn read_oxide_marker(
             Err(error) => return Err(format!("the marker cannot be read: {error}")),
         };
     #[cfg(test)]
-    let bytes =
-        match dirs.read_child_file(root, OXIDE_MARKER_FILE, MARKER_CAP_BYTES) {
-            Ok(Some(bytes)) => {
-                #[cfg(test)]
-                crate::tape::read_present_component(
-                    "reference::read_oxide_marker",
-                    (root.identity().device.get(), root.identity().inode),
-                    OXIDE_MARKER_FILE,
-                    &bytes,
-                    Some(MARKER_CAP_BYTES as u64),
-                );
-                bytes
-            }
-            // The marker was observed a moment ago; a read that finds nothing is a
-            // change under the observation, never "this root has no Oxide marker".
-            Ok(None) => return Err(
+    let bytes = match dirs.read_child_file(root, OXIDE_MARKER_FILE, MARKER_CAP_BYTES) {
+        Ok(Some(bytes)) => {
+            #[cfg(test)]
+            crate::tape::read_present_component(
+                "reference::read_oxide_marker",
+                (root.identity().device.get(), root.identity().inode),
+                OXIDE_MARKER_FILE,
+                &bytes,
+                Some(MARKER_CAP_BYTES as u64),
+            );
+            bytes
+        }
+        // The marker was observed a moment ago; a read that finds nothing is a
+        // change under the observation, never "this root has no Oxide marker".
+        Ok(None) => {
+            crate::tape::read_child_refused(
+                "reference::read_oxide_marker",
+                (root.identity().device.get(), root.identity().inode),
+                OXIDE_MARKER_FILE,
+                "disappeared",
+            );
+            return Err(
                 "the Oxide marker was observed and is no longer there, so the observation changed"
                     .to_owned(),
-            ),
-            Err(error) => return Err(format!("the marker cannot be read: {error}")),
-        };
+            );
+        }
+        Err(error) => {
+            crate::tape::read_child_refused(
+                "reference::read_oxide_marker",
+                (root.identity().device.get(), root.identity().inode),
+                OXIDE_MARKER_FILE,
+                error.kind().as_str(),
+            );
+            return Err(format!("the marker cannot be read: {error}"));
+        }
+    };
     // The bytes are evidence only if the same entry is still the one that was
     // observed before the read.
     match dirs.child_facts(root, OXIDE_MARKER_FILE) {

@@ -633,3 +633,53 @@ state-reader seam for proven parents on boot-volume state files — is recorded
 where it is rejected (section "Test-only context carrying versus private
 handle/type instrumentation") as an operator scope question for a future
 brief, not as an open issue here.
+
+### Candidate private read seam for review
+
+This candidate is not an implementation or an equivalence claim. The existing
+`state::read_bounded_inner(path, bounds)` resolves a path separately for its
+`symlink_metadata` precheck and `File::open`, then checks the opened file's
+metadata and reads it under the original byte and deadline bounds. A candidate
+private operation would accept `(parent: &File, name: &OsStr, bounds: &Bounds)`
+and use `fstatat` without following the final link for the precheck, followed
+by `openat` with the existing leaf-following behavior, then the existing
+opened-file metadata and read loop. The `File` owns the directory descriptor;
+opened files are owned by `File` and dropped on all returns. Opened descriptors
+must be close-on-exec. The parent remains alive through the relative operation;
+a separately recorded fstat of that same live descriptor must report its actual
+result, including error. No observation feeds a reader decision.
+
+For `StateLock::shared_if_present`, a separate candidate would take the same
+parent and component, open read-only without creation, then run the existing
+shared-lock wait. A successful lock still owns the file until `StateLock` drops;
+its additional test-only L1 metadata observation cannot turn a held lock into
+a refusal. Exclusive creation is outside this candidate. For enumeration, a
+candidate would own a directory stream made from a duplicated descriptor and
+close it on every return, retaining existing per-entry, deadline and count
+handling. It must not silently omit an unreadable or non-UTF8 entry.
+
+These signatures leave the parent-opening problem unresolved. A root path,
+relative path, empty or trailing component, intermediate symlink, missing
+ancestor, replaced parent, and parent rename can produce different outcomes
+from the current path resolution. The current metadata precheck and later open
+resolve separately; pinning one parent could instead read an object from a
+renamed or replaced directory. Extra open, dup and fstat calls add bounded
+resource cost and can fail with `EMFILE`, `EACCES`, or other real errors. A
+missing child must remain distinct from a missing ancestor. Leaf symlinks must
+retain the current operation's follow/no-follow behavior. Post-read path
+replacement cannot establish the parent used earlier. The proposal requires
+per-site tests of those cases and exact error, budget and read-limit equivalence
+before activation; if equivalence fails, retain the existing operation and its
+unproven parent. The held parent alone does not qualify K1's identity lifetime
+premise and cannot change writer-custody or deletion decisions. This is a
+production I/O change, requiring a separate verification-tier judgment and
+independent review before planner activation; custody or deletion eligibility
+changes require Elevated scoped evidence.
+
+Before activating the candidate, inject failures at parent open, child open,
+stream duplication and descriptor metadata, then verify each acquired handle is
+closed on every return and the caller receives the existing refusal or an
+explicitly reviewed difference. In particular, test `EMFILE` before any
+handle is acquired and after the parent is acquired. These are requirements
+for the unimplemented seam, not evidence supplied by the test-only recorder's
+separate injected `dup` and L1 controls.

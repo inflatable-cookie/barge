@@ -16,13 +16,9 @@
 //!
 //! ## Manifest fields this harness reads
 //!
-//! The manifest is `oxide.capture.manifest/1`, owned by the orchestrator. No
-//! machine-readable schema is accepted yet: Oxide #240 proposes
-//! `oxide-capture-manifest.schema.json` under the same semantic contract, and
-//! that reviewed shape is the wire contract. The members below are this
-//! harness's consumption requirements, not a canonical layout; the reads are
-//! cfg(test)-only apparatus, so reconciling them to the reviewed schema is a
-//! harness change and nothing production depends on them. The harness reads
+//! The manifest is `oxide.capture.manifest/1`, owned by the orchestrator.
+//! The copied Oxide 283 parser validates its reviewed wire shape, separately
+//! from completeness. The harness reads
 //! exactly these members and binds the whole document's SHA-256; every other
 //! member is the orchestrator's and is ignored here:
 //!
@@ -83,6 +79,7 @@ pub(crate) struct ManifestRequest {
 /// Parse the manifest members this harness consumes. Anything else in the
 /// document is the orchestrator's; a missing or mistyped member is refused.
 pub(crate) fn parse_manifest(bytes: &[u8]) -> Result<ManifestRequest, String> {
+    crate::tape::validate_shared_manifest(bytes)?;
     let document: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("the manifest is not one JSON document: {error}"))?;
     fn member<'a>(
@@ -589,11 +586,11 @@ fn run_with_observer(
                         refusal_detail: Vec::new(),
                         engine_truncated,
                     })?;
-                    write_transcript(transcript_out, &document)?;
+                    write_shared_transcript(transcript_out, &document)?;
                     return Err(reason);
                 }
             };
-            write_transcript(
+            write_shared_transcript(
                 transcript_out,
                 &finish(
                     crate::tape::EngineOutcome {
@@ -627,7 +624,7 @@ fn run_with_observer(
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
-            write_transcript(
+            write_shared_transcript(
                 transcript_out,
                 &finish(
                     crate::tape::EngineOutcome {
@@ -656,6 +653,17 @@ fn run_with_observer(
         }
     };
     Ok(summary)
+}
+
+fn write_shared_transcript(path: &Path, recorded: &str) -> Result<(), String> {
+    match crate::tape::shared_transcript(recorded) {
+        Ok(wire) => write_transcript(path, &wire),
+        Err(error) => {
+            // Preserve the actual engine result and observations on adapter failure.
+            write_transcript(path, recorded)?;
+            Err(format!("shared capture adapter refused: {error}"))
+        }
+    }
 }
 
 /// Write a bounded provisional protocol document when no engine ran. Hashing
@@ -714,7 +722,12 @@ fn write_transcript(path: &Path, transcript: &str) -> Result<(), String> {
 // embedded self-check. A bounded host result never qualifies capture.
 fn capture_exhausted(document: &serde_json::Value) -> bool {
     let caps = &document["caps"];
+    let truncation = &document["truncation"];
     document["outcome"]["refusal_kind"] == "document_cap"
+        || truncation["document_truncated"] == true
+        || truncation["read_rows_truncated"] == true
+        || truncation["occurrences_truncated"] == true
+        || truncation["process_rows_truncated"] == true
         || caps["document_truncated"] == true
         || caps["read_rows_exhausted"] == true
         || caps["occurrences_exhausted"] == true
@@ -910,6 +923,8 @@ pub(crate) fn build_fixture(label: &str) -> Result<EmbeddedFixture, String> {
         "schema": "oxide.capture.manifest/1",
         "case": "CTL-0",
         "window": {"identity": "embedded-exercise"},
+        "source": {}, "dynamic": [], "mandatory_observations": [],
+        "expected_effects": [], "expected": {},
         "fixture": {"volume": {"uuid": record.volume_uuid.as_str(), "mount": mount.display().to_string()}},
         "barge": {
             "volume_uuid": record.volume_uuid.as_str(),
@@ -947,13 +962,10 @@ pub(crate) fn embedded_exercise() -> Result<(), String> {
             Err(reason) => reason,
             Ok(_) => return Err("an exhausted capture was not refused".to_owned()),
         };
-        if document["observation_complete"] != false {
-            return Err("a bounded capture must remain insufficient".to_owned());
-        }
         eprintln!("barge.tape.exercise/1: bounded refusal (not qualification): {reason}");
     } else {
         let summary = outcome?;
-        if document["outcome"]["exit_code"] != summary.exit_code {
+        if document["outcome"]["engine"]["exit_code"] != summary.exit_code {
             return Err("the real-host engine outcome does not match its transcript".to_owned());
         }
         eprintln!(
@@ -1007,6 +1019,8 @@ mod tests {
         );
         let transcript =
             std::fs::read_to_string(&transcript_out).expect("the transcript is written");
+        crate::tape::validate_shared_transcript(transcript.as_bytes())
+            .expect("the actual emitted transcript follows the shared wire");
         let document: serde_json::Value =
             serde_json::from_str(&transcript).expect("the transcript parses");
         assert_eq!(document["schema"], TRANSCRIPT_SCHEMA);
@@ -1016,10 +1030,10 @@ mod tests {
             document["manifest_sha256"],
             crate::digest::sha256_hex(&fixture.manifest)
         );
-        assert_eq!(document["outcome"]["status"], "completed");
-        assert_eq!(document["result"]["preview"], true);
+        assert_eq!(document["outcome"]["state"], "completed");
+        assert_eq!(document["outcome"]["result"]["preview"], true);
         assert_eq!(
-            document["result"]["oxide"]["complete"], true,
+            document["outcome"]["result"]["oxide"]["complete"], true,
             "the fixture's reference set reads completely"
         );
         let rows = document["reads"].as_array().expect("read rows");
@@ -1029,9 +1043,9 @@ mod tests {
              volume, custody and absence leaves; saw {}",
             rows.len()
         );
-        let caps = &document["caps"];
-        let exhausted = caps["read_rows_exhausted"].as_bool().unwrap_or(false)
-            || caps["process_rows_exhausted"].as_bool().unwrap_or(false);
+        let caps = &document["truncation"];
+        let exhausted = caps["read_rows_truncated"].as_bool().unwrap_or(false)
+            || caps["process_rows_truncated"].as_bool().unwrap_or(false);
         // Real file/volume leaves remain taped; process facts are explicitly
         // supplied by FakeObserver rather than inferred from the host.
         let before_scan = [
@@ -1076,7 +1090,6 @@ mod tests {
                 "the transcript must record {expected}; saw {sites:?}"
             );
         }
-        assert_eq!(caps["read_rows"], rows.len());
         assert!(
             !document["clocks"]
                 .as_array()
@@ -1157,19 +1170,19 @@ mod tests {
             std::fs::read_to_string(&transcript_out).expect("the refusal transcript is written");
         let document: serde_json::Value =
             serde_json::from_str(&transcript).expect("the transcript parses");
-        assert_eq!(document["outcome"]["status"], "refused");
+        assert_eq!(document["outcome"]["state"], "refused");
         assert_eq!(
-            document["outcome"]["exit_code"], 2,
+            document["outcome"]["engine"]["exit_code"], 2,
             "an undeclared area exits 2"
         );
         assert!(
-            document["outcome"]["refusal_message"]
+            document["outcome"]["engine"]["refusal_message"]
                 .as_str()
                 .expect("a refusal message")
                 .contains("never-declared"),
             "the engine's own refusal names the undeclared area"
         );
-        assert!(document.get("result").is_none());
+        assert!(document["outcome"]["result"].is_null());
     }
 
     /// A manifest missing its members records an apparatus refusal, not an
@@ -1404,6 +1417,8 @@ mod tests {
         let manifest = serde_json::json!({
             "schema": "oxide.capture.manifest/1",
             "case": "LEG-LISTED",
+            "window": {}, "source": {}, "fixture": {}, "dynamic": {},
+            "mandatory_observations": [], "expected_effects": [], "expected": {},
             "barge": {
                 "volume_uuid": "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
                 "volume_mount": "/Volumes/Builds",
