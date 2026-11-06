@@ -412,8 +412,8 @@ compile-away proof.
 The recorder keeps the original path privately to bind a syscall result to its
 attempt, including when the path is not UTF-8. It does not serialize that
 private matching value: an unrepresentable effect path remains absent from the
-provisional document and cannot establish a complete effect identity. The
-non-UTF-8 outcome regression is source only until the covering checks run.
+internal document and cannot establish a complete effect identity. The
+non-UTF-8 outcome control does not qualify that identity.
 
 The declared L1 observation calls `File::metadata` once on an already-held
 lock descriptor. Failure records the error and leaves the lock held with its
@@ -445,7 +445,8 @@ engine status. It carries the original outcome when that fits within a
 64-KiB summary bound; otherwise it records its digest and explicitly marks it
 omitted. That fallback is an internal diagnostic, not shared-wire conformance.
 Any exhausted capture cap or dropped read causes an apparatus error after the
-transcript is written, retaining the actual engine outcome. If a completed
+transcript is written; the bounded fallback preserves the engine outcome or
+its digest and omission marker as described above. If a completed
 report cannot be serialized, the document records its omission and the real
 engine status and exit code; it does not invent a report.
 The internal recorder's document byte count is its serialized length, including
