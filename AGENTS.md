@@ -120,15 +120,23 @@ guarded exception. Each selector covers what it names:
   authorized block. Neither is established for the retained failed route.
 - `effigy release:native:test` and `effigy release:native:plan` — F6-R1's native
   proof apparatus, effect-free: the pinned supervisor, the argv guard, the case
-  table checked against its named regressions, the proof feature's declarations
+  table checked against its named regressions, the proof feature's declarations,
+  the Stash scratch route, the stage route and the attach/custody/closure gates,
   and the held bounds. No image, no scratch and no child process.
 - `effigy release:native:stage` — builds the proof-feature binary of HEAD through
-  Oxide and stages a hashed copy under the designated scratch. It runs no proof.
+  Oxide and stages a hashed copy in an exclusive directory under the designated
+  Stash scratch (`/Volumes/Stash/scratch/barge`). It runs no proof; a native run
+  never reads that copy.
 - `effigy release:native` and `effigy release:native:diagnostic` — F6-R1's one
   bounded native for the release effect, on one owned 64 MiB APFS image under the
-  qualified supervisor (300 s, 512 MiB). Each run stages the proof-feature build
-  of HEAD and runs only that staged file; the ordinary production build is never
-  the one tested. The proof feature tests release logic over synthetic
+  qualified supervisor (300 s, 512 MiB). Each run verifies the supervisor's bytes
+  and the verified Stash scratch UUID before any effect, then stages the
+  proof-feature build of HEAD inside the guarded run and runs only that staged
+  file; the ordinary production build is never the one tested. The guard's opt-in
+  image-custody indication is published before the backing exists, and closure
+  requires the ordinary detach's success and reap plus whole-backing attachment
+  absence, so an uncertain attach or detach retains the image and faults the run.
+  The proof feature tests release logic over synthetic
   AccountFacts and does not establish the production account lookup's
   equivalence. HELD for owner activation: the declarations activate nothing; the
   diagnostic runs first, then the counted author pass and a distinct reviewer pass,

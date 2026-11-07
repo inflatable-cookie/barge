@@ -9,16 +9,19 @@
 
 It is owner-activated. No ordinary Effigy selector runs a counted or diagnostic pass,
 and the declarations activate nothing. The binary under test is never named by the
-caller: each counted or diagnostic run first stages a proof-feature build of HEAD
-through Oxide, hashes it, and runs only that staged file.
+caller: the guard's own child stages a proof-feature build of HEAD inside the run
+root the guard created, hashes it, verifies the source-bound manifest, and runs only
+that staged file. No artifact from another run, and no shared stage directory, is
+accepted.
 
-What it does, in one sentence: under Oxide's qualified shared supervisor (pinned
-below, executed with the same interpreter), it creates one private run root inside
-the guard's owned scratch, attaches one owned APFS sparse image of 64 MiB with
-ownership enabled, registers that image as the only volume, and runs twelve release
-cases through the staged `barge` CLI against a private HOME, a private state
-directory and a synthetic account home (BARGE_ACCOUNT_HOME, equal to HOME). Each case
-declares its own area, so one case's roots never reach another case's plan.
+What it does, in one sentence: after the unchanged qualified supervisor's bytes and
+this host's Stash scratch route are verified, and under that supervisor (pinned below,
+executed with the same interpreter), it creates one private run root inside the
+guard's owned scratch, attaches one owned APFS sparse image of 64 MiB with ownership
+enabled, registers that image as the only volume, and runs twelve release cases
+through the staged `barge` CLI against a private HOME, a private state directory and a
+synthetic account home (BARGE_ACCOUNT_HOME, equal to HOME). Each case declares its own
+area, so one case's roots never reach another case's plan.
 
 The staged binary is the `proof-synthetic-account` feature build. Under that feature
 alone, Oxide's reference directories come from the synthetic account home. The
@@ -27,13 +30,21 @@ receipt records that difference as a limitation (LIMITATION below).
 
 What it never does:
 
+  - it never stages or builds before the supervisor's own bytes and the scratch
+    route are verified, and staging spends the supervisor's 300 s wall, so no
+    unguarded prewarm or clock reset exists;
   - it never touches the real account home or the real Barge state directory, and it
     never registers a real drive (Builds included);
   - it never reads or writes Oxide's real account control: the staged build resolves
     Oxide's directories from the synthetic home only, and every case records the
     reference control it chose, which must lie inside the owned scratch;
   - it never deletes anything but synthetic roots inside its own image;
-  - it never force-detaches; detach is the ordinary `hdiutil detach`;
+  - it never force-detaches; detach is the ordinary `hdiutil detach`, authorized by a
+    fresh rebind census each time, and closure needs the child's success and reap plus
+    whole-backing attachment absence, not merely a missing mount path;
+  - it publishes the guard's opt-in `image-custody.json` indication BEFORE the backing
+    exists, so the guard's own cleanup keeps the root while the backing is mounted or
+    attached-but-unmounted;
   - it never writes outside the guard's owned scratch and its evidence directory;
   - it never runs without the supervisor's contract environment.
 
@@ -77,7 +88,14 @@ DEFAULT_SUPERVISOR = os.path.expanduser("~/Dev/projects/oxide/scripts/bounded-te
 # name. Barge writes no second supervisor; the pin moves only with a brief that names
 # the head it verified.
 SUPERVISOR_SHA256 = "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b"
-DESIGNATED_SCRATCH = "/Volumes/Builds/scratch/barge"
+# The one volume and scratch parent this proof uses. The volume's UUID is verified
+# before any staging or fixture effect, and the scratch parent must be the canonical,
+# owner-only barge scratch directly under that mount: no drive root, no home folder,
+# no symlinked component and no other volume. Historical Builds evidence stays
+# unavailable history and is never reconstructed here.
+DESIGNATED_SCRATCH = "/Volumes/Stash/scratch/barge"
+SCRATCH_VOLUME_MOUNT = "/Volumes/Stash"
+SCRATCH_VOLUME_UUID = "8A660440-C919-45C6-A3F1-3365B9BD2006"
 LIMIT_SECONDS = 300
 SCRATCH_BUDGET_MIB = 512
 # One small owned image. Sparse, so the allocated size is far below the logical size.
@@ -104,18 +122,50 @@ OXIDE_REGISTRY_VERSION = "oxide.outputs.registry/2"
 VOLUME_UUID_KEY = "VolumeUUID"
 HOLDER = "release-native-holder"
 PROOF_RECEIPT = "release-proof-receipt.json"
+# How much of a plan row a failing case records after its deciding fields. The fields
+# that decide eligibility are recorded first and in full, because the CLI nests a
+# sorted-key document whose `absence` member alone is larger than a short cap; the raw
+# row follows, bounded, so one huge row cannot bloat the receipt.
+ROW_EVIDENCE_CHARS = 2000
+# How much of one free-text value a failure record keeps; the marker states the remainder.
+FAILURE_TEXT_CHARS = 400
 # Any holder or name that is not this proof's own is refused.
 NAMESPACE = "example"
 # The one Cargo feature the staged binary is built with. It is named here, in the
 # build command, the staged manifest and the self-check's manifest reading.
 PROOF_FEATURE = "proof-synthetic-account"
+# `--offline` and `--locked` refuse a network fetch and a lockfile change, so the
+# staged bytes come from the committed lock on the pinned toolchain.
 BUILD_COMMAND = [
-    "oxide", "build", "-p", "barge-cli", "--locked",
+    "oxide", "build", "-p", "barge-cli", "--locked", "--offline",
     "--features", PROOF_FEATURE, "--message-format", "json",
 ]
-STAGE_ROOT = os.path.join(DESIGNATED_SCRATCH, "release-proof-stage")
+TOOLCHAIN_CHANNEL = "1.97.1"
+# The staged copy lives inside this occurrence's guarded root, never a shared stage
+# directory and never outside the guard, and its directory name is exclusive.
+STAGE_PREFIX = "proof-binary-"
+# The explicit, separately selected `release:native:stage` build is the only one that
+# may take longer than the guard's wall; it is still bounded.
+STAGE_LIMIT_SECONDS = 1800
 STAGE_MANIFEST = "proof-binary.json"
 STAGE_SCHEMA = "barge.release.proof-binary/1"
+# The guard hands the child its own 300 s wall. The outer half publishes the same
+# absolute monotonic deadline it launched with, so staging and its waits spend the
+# guard's bound and never a fresh clock of their own.
+WALL_DEADLINE_ENV = "BARGE_PROOF_WALL_DEADLINE_NS"
+# The verified scratch route, as a document the guarded half re-checks.
+ROUTE_ENV = "BARGE_PROOF_ROUTE"
+ROUTE_SCHEMA = "barge.release.proof-route/1"
+# The guard's opt-in image-custody indication (oxide#191): one bounded atomic
+# document naming every attachable backing this run can create. It is published
+# BEFORE the backing exists and stays for the run, so the guard's own cleanup sees
+# the backing and keeps the root while it is mounted or attached-but-unmounted.
+CUSTODY_NAME = "image-custody.json"
+CUSTODY_VERSION = 1
+INFO_TIMEOUT_SECONDS = 10
+DETACH_TIMEOUT_SECONDS = 30
+HDIUTIL = "/usr/bin/hdiutil"
+DISKUTIL = "/usr/sbin/diskutil"
 # Oxide's account directories under the synthetic home, as the proof build resolves
 # them: the same relative layout the ordinary build uses under the password home.
 OXIDE_STATE_RELATIVE = os.path.join("Library", "Application Support", "oxide", "state")
@@ -134,11 +184,13 @@ ENVIRONMENT = {
     "BARGE_STATE_DIR": "the private fixture state directory this proof creates",
     "BARGE_ACCOUNT_HOME": "the synthetic account home, equal to HOME; Oxide's directories hang from it in the proof build",
     "BARGE_PROOF_SUPERVISOR": "the optional path to the hash-pinned Oxide supervisor",
-    "OXIDE_PROOF_EVIDENCE": "the supervisor's evidence directory for the receipt",
-    "OXIDE_TASK_SCRATCH_ROOT": "the supervisor's owned scratch root that TMPDIR must be inside",
+    "BARGE_PROOF_ROUTE": "the scratch route the outer half verified, re-checked by the guarded half",
+    "BARGE_PROOF_WALL_DEADLINE_NS": "the guard's absolute monotonic wall deadline, so staging spends it and never resets a clock",
+    "OXIDE_PROOF_EVIDENCE": "the supervisor's evidence directory for the receipt and the image-custody indication; a sibling of the scratch directory inside the same monitored owned root",
+    "OXIDE_TASK_SCRATCH_ROOT": "the supervisor's own scratch directory (one child of its monitored owned root); TMPDIR and the staged build live inside it",
     "DYLD_INSERT_LIBRARIES": "discarded from both halves: this proof injects no interposer",
     "HOME": "a private fixture home, so no real account state is read or written",
-    "CARGO_HOME": "a private fixture Cargo home; this proof builds nothing",
+    "CARGO_HOME": "a private fixture Cargo home; the fixture build is the guarded proof-feature stage",
 }
 
 # Each case is one release claim, carried by one named regression in the source tree
@@ -298,46 +350,356 @@ def installed_supervisor_problems():
     return []
 
 
-def inner_command(mode, binary):
-    """The argv the supervisor runs: this script, its mode, and the binary."""
-    return [sys.executable, SCRIPT_PATH, "--inner", mode, "--binary", binary]
+def volume_uuid(mount):
+    """The mounted volume's own UUID from `diskutil`, or None when it is unreadable."""
+    observed = subprocess.run([DISKUTIL, "info", "-plist", mount],
+                              capture_output=True, timeout=INFO_TIMEOUT_SECONDS)
+    if observed.returncode != 0:
+        return None
+    try:
+        document = plistlib.loads(observed.stdout)
+    except (ValueError, plistlib.InvalidFileException):
+        return None
+    uuid = document.get("VolumeUUID")
+    return uuid if isinstance(uuid, str) and uuid else None
 
 
-def supervisor_command(supervisor, mode, binary):
+def scratch_route_facts(path=DESIGNATED_SCRATCH, mount=SCRATCH_VOLUME_MOUNT):
+    """What the host says about the designated scratch: its path, owner, mode and volume.
+
+    Read-only: one `lstat`, one real resolution and one bounded `diskutil` read of the
+    mount's UUID. Nothing is created.
+    """
+    facts = {"path": path, "realpath": None, "volume_mount": mount,
+             "volume_uuid": None, "owner_uid": None, "mode": None,
+             "uid": os.getuid(), "present": False}
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return facts
+    facts["present"] = True
+    facts["realpath"] = os.path.realpath(path)
+    facts["owner_uid"] = info.st_uid
+    facts["mode"] = info.st_mode & 0o777
+    facts["volume_uuid"] = volume_uuid(mount)
+    return facts
+
+
+def scratch_route_problems(facts):
+    """Why the designated scratch is not this proof's own volume path. Pure.
+
+    `facts` is what `scratch_route_facts` observed (or a canned equivalent). A drive
+    root, a home folder, a symlinked path, another account's directory, a
+    group- or world-accessible scratch and another volume each refuse, and every
+    refusal names the observed value, so a wrong host is never mistaken for a pass.
+    """
+    problems = []
+    path = facts.get("path")
+    if path != DESIGNATED_SCRATCH:
+        problems.append(f"the designated scratch is {path!r}, not {DESIGNATED_SCRATCH!r}")
+    if facts.get("present") is not True or facts.get("owner_uid") is None:
+        problems.append(f"the designated scratch {path!r} is absent")
+    if facts.get("realpath") != path:
+        problems.append(f"the designated scratch resolves to {facts.get('realpath')!r}, so its path is not canonical")
+    expected_parent = os.path.join(SCRATCH_VOLUME_MOUNT, "scratch")
+    if not isinstance(path, str) or os.path.dirname(path) != expected_parent:
+        problems.append(f"the designated scratch is not the barge scratch directly under {SCRATCH_VOLUME_MOUNT}")
+    if facts.get("volume_mount") != SCRATCH_VOLUME_MOUNT:
+        problems.append(f"the scratch mount is {facts.get('volume_mount')!r}, not {SCRATCH_VOLUME_MOUNT!r}")
+    uuid = facts.get("volume_uuid")
+    if not isinstance(uuid, str) or uuid.upper() != SCRATCH_VOLUME_UUID:
+        problems.append(f"the scratch volume UUID is {uuid!r}, not the pinned {SCRATCH_VOLUME_UUID}")
+    if facts.get("owner_uid") != facts.get("uid"):
+        problems.append("the designated scratch is not owned by this account")
+    mode = facts.get("mode")
+    if not isinstance(mode, int) or mode & 0o077:
+        problems.append(f"the designated scratch mode {mode!r} is not owner-only")
+    return problems
+
+
+def route_document(facts):
+    """The verified scratch route as the document the guarded half re-checks. Pure."""
+    return {"schema": ROUTE_SCHEMA, "designated_scratch": DESIGNATED_SCRATCH,
+            "volume_mount": SCRATCH_VOLUME_MOUNT, "volume_uuid": SCRATCH_VOLUME_UUID,
+            "observed": facts}
+
+
+def route_refusals(document):
+    """Why a carried route document does not name this proof's pinned scratch. Pure."""
+    if not isinstance(document, dict):
+        return ["the scratch route document is absent"]
+    problems = []
+    if document.get("schema") != ROUTE_SCHEMA:
+        problems.append("the scratch route document is not this proof's schema")
+    if document.get("designated_scratch") != DESIGNATED_SCRATCH:
+        problems.append("the scratch route names another designated scratch")
+    if document.get("volume_mount") != SCRATCH_VOLUME_MOUNT:
+        problems.append("the scratch route names another mount")
+    if document.get("volume_uuid") != SCRATCH_VOLUME_UUID:
+        problems.append("the scratch route names another volume UUID")
+    if scratch_route_problems(document.get("observed") or {"path": None}):
+        problems.append("the scratch route's own observation is not this host's verified scratch")
+    return problems
+
+
+def stage_parent_problems(parent, owned):
+    """Where a staged proof binary may live. Pure: names only, nothing is created.
+
+    The staged copy belongs to this occurrence. Under the guard that is the run's own
+    root and evidence directory, so the guard's monitored bytes and its custody cover
+    it; the unguarded `stage` mode may only use the designated scratch. A home folder,
+    a drive root, a relative path or a path reached through `..` refuses.
+    """
+    if not isinstance(parent, str) or not os.path.isabs(parent) or os.path.normpath(parent) != parent:
+        return [f"the stage parent {parent!r} is not an absolute canonical path"]
+    problems = []
+    for path in owned.values():
+        if isinstance(path, str) and os.path.isabs(path) and (
+                parent == os.path.normpath(path)
+                or parent.startswith(os.path.normpath(path) + os.sep)):
+            break
+    else:
+        problems.append(f"the stage parent {parent} is outside every owned root it may use")
+    if parent in (os.sep, SCRATCH_VOLUME_MOUNT, os.path.expanduser("~")):
+        problems.append(f"the stage parent {parent} is a home folder or a drive root")
+    if parent == DESIGNATED_SCRATCH:
+        problems.append("the stage parent is the shared designated scratch, not this occurrence's own directory")
+    return problems
+
+
+def stage_directory(document):
+    """The refusal-free summary of a staged build, or why it is not one. Pure."""
+    problems = []
+    if document.get("schema") != STAGE_SCHEMA:
+        problems.append("the staged build is not this proof's schema")
+    if document.get("features") != [PROOF_FEATURE]:
+        problems.append(f"the staged build's features are {document.get('features')}, not [{PROOF_FEATURE!r}]")
+    if not isinstance(document.get("sha256"), str) or len(document["sha256"]) != 64:
+        problems.append("the staged build records no digest")
+    return problems
+
+
+def stage_environment_problems(environment):
+    """The build's own environment: pinned, offline-capable and free of inherited flags. Pure."""
+    problems = []
+    for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "DYLD_INSERT_LIBRARIES"):
+        if environment.get(name) is not None:
+            problems.append(f"the stage environment still carries {name}")
+    if environment.get("RUSTUP_AUTO_INSTALL") != "0":
+        problems.append("the stage environment does not disable the toolchain auto-install")
+    if environment.get("RUSTUP_TOOLCHAIN") != TOOLCHAIN_CHANNEL:
+        problems.append(f"the stage environment does not pin the toolchain to {TOOLCHAIN_CHANNEL}")
+    if environment.get("CARGO_NET_OFFLINE") != "true":
+        problems.append("the stage environment does not ask Cargo to stay offline")
+    for name in ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_EVIDENCE", "OXIDE_TEST_HOME_FROM_ENV"):
+        if environment.get(name) is not None:
+            problems.append(f"the stage environment still carries the guard's {name} hook")
+    if not isinstance(environment.get("TMPDIR"), str) or not environment["TMPDIR"]:
+        problems.append("the stage environment has no temporary directory")
+    for flag in ("--locked", "--offline", "--features", PROOF_FEATURE):
+        if flag not in BUILD_COMMAND:
+            problems.append(f"the build command does not name {flag}")
+    return problems
+
+
+def stage_environment(base, tmpdir):
+    """The exact environment the guarded stage build runs with. Pure.
+
+    It is an ordinary managed Oxide compilation: the guard's own scratch and evidence
+    hooks are dropped so the build never nests a session inside this occurrence's
+    fixture root, and only TMPDIR points at the guard so the compiler's temporary files
+    stay monitored.
+    """
+    environment = {key: value for key, value in base.items()
+                   if key not in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "DYLD_INSERT_LIBRARIES",
+                                  "RUSTUP_TOOLCHAIN", "RUSTUP_AUTO_INSTALL", "CARGO_NET_OFFLINE",
+                                  "OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_EVIDENCE",
+                                  "OXIDE_TEST_HOME_FROM_ENV")}
+    environment.update({"RUSTUP_TOOLCHAIN": TOOLCHAIN_CHANNEL, "RUSTUP_AUTO_INSTALL": "0",
+                        "CARGO_NET_OFFLINE": "true", "TMPDIR": tmpdir})
+    return environment
+
+
+def custody_document(backing, root, evidence):
+    """The guard's opt-in image-custody indication for this run's one backing. Pure.
+
+    It is published before the backing exists, so an attach this run never finishes
+    still leaves the guard able to see the backing it must not clean up under. The
+    shape is the guard's own: exactly `version` and `backings`, one canonical path
+    inside the guard's owned root or evidence directory.
+    """
+    if not isinstance(backing, str) or not os.path.isabs(backing) or os.path.normpath(backing) != backing:
+        raise ValueError("the image backing is not an absolute canonical path")
+    owned = [os.path.normpath(path) for path in (root, evidence)
+             if isinstance(path, str) and os.path.isabs(path)]
+    if not any(backing.startswith(path + os.sep) for path in owned):
+        raise ValueError("the image backing is outside this run's owned root and evidence")
+    return {"version": CUSTODY_VERSION, "backings": [backing]}
+
+
+def image_attachments(backing, environment):
+    """The live attachment census for one backing, or None when it is unreadable.
+
+    Each row is `(device, mount_point)`, with `mount_point` None for an attached but
+    unmounted entity. A backing named by no image is `[]`, which is the only positive
+    whole-backing absence. An unreadable or divergent census is None: never absence.
+    """
+    try:
+        observed = subprocess.run([HDIUTIL, "info", "-plist"], env=environment,
+                                  capture_output=True, timeout=INFO_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if observed.returncode != 0:
+        return None
+    try:
+        images = plistlib.loads(observed.stdout)["images"]
+    except (ValueError, KeyError, TypeError, plistlib.InvalidFileException):
+        return None
+    wanted = os.path.realpath(backing)
+    rows = []
+    for image in images:
+        path = image.get("image-path")
+        if not isinstance(path, str) or not path:
+            return None
+        if os.path.realpath(path) != wanted:
+            continue
+        for entity in image.get("system-entities") or []:
+            device = entity.get("dev-entry")
+            mount = entity.get("mount-point")
+            if not isinstance(device, str) or not device:
+                return None
+            if mount is not None and (not isinstance(mount, str) or not mount):
+                return None
+            rows.append((device, mount))
+    return rows
+
+
+def attach_document(exit_code, reaped, rows, mount, device):
+    """Why one attach is not positively this run's image at its own mount. Pure.
+
+    An APFS image attaches as a container entity plus its mounted volume entity, exactly
+    as the guard's own census and the reviewed space pattern read it, so the count of
+    entities is not the identity: the decision is the one entity whose mount point is
+    this run's unique mount, whose device is the one the attach child reported, and a
+    refusal of any *other* entity that carries a mount point. A failed or unreaped
+    child, an unreadable census, no mounted entity, a duplicate mount, a mismatched
+    device or a second mounted entity all mean unknown custody: the backing is retained
+    and never cleaned up.
+    """
+    if reaped is not True or exit_code != 0:
+        return {"state": "unknown", "reason": f"the attach child did not succeed and reap (exit {exit_code})"}
+    if rows is None:
+        return {"state": "unknown", "reason": "the attachment census is unreadable"}
+    mounted = [row for row in rows if row[1] == mount]
+    if len(mounted) != 1:
+        return {"state": "unknown",
+                "reason": f"{len(mounted)} attachment entities name the mount {mount}"}
+    if not isinstance(device, str) or not device:
+        return {"state": "unknown", "reason": "the attach child reported no device for the mounted entity"}
+    if mounted[0][0] != device:
+        return {"state": "unknown", "reason": "the mounted device is not the one the attach reported"}
+    elsewhere = [row for row in rows if row[1] is not None and row[1] != mount]
+    if elsewhere:
+        return {"state": "unknown",
+                "reason": f"a second attachment entity is mounted at {elsewhere[0][1]}"}
+    return {"state": "attached", "device": device, "mount": mount, "entities": len(rows)}
+
+
+def detach_binding_problems(rows, mount, device, expected_uuid, observed_uuid):
+    """Why the image may not be detached: its own bindings must agree first. Pure.
+
+    The backing is one image with the container and volume entities the guard's census
+    reads, so the binding is the one entity at this run's mount with this run's device,
+    and no other mounted entity of the same backing. An extra mount of the owned image,
+    a missing or duplicated binding, or another volume UUID refuses the detach.
+    """
+    problems = []
+    if rows is None:
+        problems.append("the pre-detach attachment census is unreadable")
+        return problems
+    bound = [row for row in rows if row == (device, mount)]
+    if len(bound) != 1:
+        problems.append(f"the pre-detach census names {len(bound)} entities for the owned {device} at {mount}")
+    elsewhere = [row for row in rows if row[1] is not None and row != (device, mount)]
+    if elsewhere:
+        problems.append(f"the pre-detach census mounts a second entity of the backing at {elsewhere[0][1]}")
+    if not isinstance(observed_uuid, str) or observed_uuid.upper() != str(expected_uuid).upper():
+        problems.append(f"the mounted volume UUID {observed_uuid!r} is not the registered {expected_uuid!r}")
+    return problems
+
+
+def closure_document(purpose, exit_code, reaped, rows, mount_absent):
+    """Whether one ordinary detach positively closed the owned backing. Pure.
+
+    Closure needs all four: the ordinary child succeeded and was reaped, the census is
+    readable and names no attachment for this backing at all (whole-backing absence,
+    not merely an absent mount path), and the mount path is gone. A missing mount with
+    the backing still attached, a non-zero or unreaped child and an unreadable census
+    are each a retained, unqualified outcome with no retry.
+    """
+    document = {"purpose": purpose, "exit": exit_code, "reaped": bool(reaped),
+                "mount_absent": mount_absent is True, "backing_attached": None,
+                "closed": False, "reason": None, "custody": "retained"}
+    if rows is None:
+        document["reason"] = "the post-detach attachment census is unreadable"
+        return document
+    document["backing_attached"] = bool(rows)
+    if reaped is not True or exit_code != 0:
+        document["reason"] = f"the ordinary detach did not succeed and reap (exit {exit_code})"
+        return document
+    if rows:
+        document["reason"] = (f"the backing is still attached ({len(rows)} entities, "
+                              f"mounted at {rows[0][1]!r})")
+        return document
+    if mount_absent is not True:
+        document["reason"] = "the whole backing is absent from the census but the mount path is still present"
+        return document
+    document["closed"] = True
+    document["custody"] = "closed"
+    return document
+
+
+def inner_command(mode):
+    """The argv the supervisor runs: this script and its mode. No artifact is named."""
+    return [sys.executable, SCRIPT_PATH, "--inner", mode]
+
+
+def supervisor_command(supervisor, mode):
     return [
         sys.executable, supervisor,
         "--limit", str(LIMIT_SECONDS),
         "--scratch-budget-mib", str(SCRATCH_BUDGET_MIB),
         "--root-parent", DESIGNATED_SCRATCH,
-        "--", *inner_command(mode, binary),
+        "--", *inner_command(mode),
     ]
 
 
 def argv_guard_problems():
-    """Prove the outer command and the inner parser agree for both modes. Pure."""
+    """Prove the outer command and the inner parser agree, and refuse an artifact. Pure."""
     problems = []
-    binary = "/nonexistent/barge-proof-binary"
     for mode in ("counted", "diagnostic"):
-        command = supervisor_command("/nonexistent/bounded-test.py", mode, binary)
-        if command[command.index("--") + 1:] != inner_command(mode, binary):
+        command = supervisor_command("/nonexistent/bounded-test.py", mode)
+        if command[command.index("--") + 1:] != inner_command(mode):
             problems.append(f"the {mode} command does not end in this script's inner argv")
-        inner = inner_command(mode, binary)
+        inner = inner_command(mode)
         with contextlib.redirect_stderr(io.StringIO()):
             try:
                 parsed = argument_parser().parse_args(inner[2:])
             except SystemExit:
                 problems.append(f"the {mode} inner argv does not parse with this script's parser")
                 continue
-        if parsed.inner != mode or parsed.binary != binary or parsed.mode is not None:
+        if parsed.inner != mode or parsed.mode is not None or hasattr(parsed, "binary"):
             problems.append(f"the {mode} inner argv parses to the wrong fields")
-        broken = [sys.executable, SCRIPT_PATH, "--inner", mode, binary]
-        with contextlib.redirect_stderr(io.StringIO()):
-            try:
-                argument_parser().parse_args(broken[2:])
-            except SystemExit:
-                pass
-            else:
-                problems.append(f"an executable in the positional mode slot is accepted for {mode}")
+        for artifact in (["/nonexistent/barge-proof-binary"], ["--binary", "/nonexistent/barge"]):
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    argument_parser().parse_args(inner[2:] + artifact)
+                except SystemExit:
+                    continue
+            problems.append(f"the {mode} inner argv accepts an artifact {artifact!r}")
+        if any("--binary" in part or part.startswith("/nonexistent/")
+               for part in command[command.index("--") + 1:]):
+            problems.append(f"the {mode} guarded command names an artifact")
     return problems
 
 
@@ -457,21 +819,27 @@ def executable_from_build(text):
     return None
 
 
-def staged_build_problems(binary, head):
-    """Why a binary is not the staged proof build of this head. Reads the manifest and the bytes."""
+def staged_build_problems(binary, head, root):
+    """Why a binary is not this occurrence's staged proof build of this head.
+
+    Reads the manifest and the bytes. The staged path must lie inside the guard's own
+    root, so a caller-supplied artifact from anywhere else is refused.
+    """
+    problems = []
+    if not isinstance(binary, str) or not isinstance(root, str) or not os.path.isabs(binary):
+        return ["the staged binary is not an absolute path inside an owned root"]
+    owned = os.path.normpath(root)
+    if not binary.startswith(owned + os.sep):
+        problems.append(f"the binary {binary} is outside this occurrence's owned root {owned}")
     manifest_path = os.path.join(os.path.dirname(os.path.abspath(binary)), STAGE_MANIFEST)
     try:
         with open(manifest_path, encoding="utf-8") as handle:
             manifest = json.load(handle)
     except (OSError, ValueError) as error:
-        return [f"the staged manifest {manifest_path} is unreadable: {error}"]
-    problems = []
-    if manifest.get("schema") != STAGE_SCHEMA:
-        problems.append("the staged manifest is not this proof's schema")
+        return problems + [f"the staged manifest {manifest_path} is unreadable: {error}"]
+    problems += stage_directory(manifest)
     if manifest.get("path") != os.path.abspath(binary):
         problems.append("the binary is not the path the staged manifest names")
-    if manifest.get("features") != [PROOF_FEATURE]:
-        problems.append(f"the staged build's features are {manifest.get('features')}, not [{PROOF_FEATURE!r}]")
     if manifest.get("head") != head:
         problems.append(f"the staged build is for head {manifest.get('head')}, not {head}")
     try:
@@ -483,22 +851,41 @@ def staged_build_problems(binary, head):
     return problems
 
 
-def stage_proof_binary():
+def stage_proof_binary(parent, owned, deadline_ns=None, runner=None):
     """Build the proof-feature binary of HEAD through Oxide and stage a hashed copy.
 
-    The copy sits in its own stage directory under the designated scratch. The
-    ordinary production build (target/debug/barge without the feature) is never
-    the one staged. Raises Infrastructure when the build or the copy cannot be made.
+    The copy goes in one exclusive directory under `parent`, which must be one of the
+    `owned` roots this occurrence may stage inside, and the whole build spends only the
+    wall the caller still holds: under the guard that is the supervisor's own 300 s
+    bound, so staging and its waits are inside it rather than a clock of their own. The
+    ordinary production build (target/debug/barge without the feature) is never the one
+    staged, and no artifact from any other run is accepted. Raises Infrastructure when
+    the build or the copy cannot be made.
     """
+    problems = stage_parent_problems(parent, owned)
+    if problems:
+        raise Infrastructure("stage", "; ".join(problems))
     head = git_head()
     if not head:
         raise Infrastructure("stage", "HEAD is unreadable, so the staged build cannot be named")
-    stage_env = dict(os.environ)
-    stage_env.pop("RUSTFLAGS", None)
-    stage_env.pop("CARGO_ENCODED_RUSTFLAGS", None)
-    stage_env["RUSTUP_AUTO_INSTALL"] = "0"
-    build = subprocess.run(BUILD_COMMAND, cwd=REPO_ROOT, env=stage_env,
-                           capture_output=True, text=True, timeout=1800)
+    remaining = None
+    if deadline_ns is not None:
+        remaining = (deadline_ns - time.monotonic_ns()) / 1e9
+        if remaining <= 0:
+            raise Infrastructure("stage", "no guard wall is left to stage the proof build")
+    environment = stage_environment(dict(os.environ), parent)
+    environment_problems_found = stage_environment_problems(environment)
+    if environment_problems_found:
+        raise Infrastructure("stage", "; ".join(environment_problems_found))
+    started = time.time()
+    execute = runner or subprocess.run
+    try:
+        build = execute(BUILD_COMMAND, cwd=REPO_ROOT, env=environment,
+                        capture_output=True, text=True, timeout=remaining)
+    except subprocess.TimeoutExpired:
+        raise Infrastructure("stage", "the guard's wall expired while staging the proof build") from None
+    except OSError as error:
+        raise Infrastructure("stage", f"the build could not start: {error}") from None
     if build.returncode != 0:
         raise Infrastructure("stage", f"oxide build exited {build.returncode}: {build.stderr[-400:]}")
     found = executable_from_build(build.stdout)
@@ -506,9 +893,7 @@ def stage_proof_binary():
         raise Infrastructure("stage", "the build reported no barge binary artifact")
     if found["features"] != [PROOF_FEATURE]:
         raise Infrastructure("stage", f"the barge artifact was built with features {found['features']}, not [{PROOF_FEATURE!r}]")
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    directory = os.path.join(STAGE_ROOT, f"{head}-{stamp}-{os.getpid()}")
-    os.makedirs(directory)
+    directory = tempfile.mkdtemp(prefix=STAGE_PREFIX, dir=parent)
     staged = os.path.join(directory, "barge")
     shutil.copyfile(found["executable"], staged)
     os.chmod(staged, 0o755)
@@ -517,6 +902,8 @@ def stage_proof_binary():
         "head": head,
         "features": found["features"],
         "build_command": BUILD_COMMAND,
+        "toolchain": TOOLCHAIN_CHANNEL,
+        "offline": True,
         "source": found["executable"],
         "path": staged,
         "sha256": sha256_file(staged),
@@ -524,7 +911,10 @@ def stage_proof_binary():
     with open(os.path.join(directory, STAGE_MANIFEST), "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=1)
         handle.write("\n")
-    return manifest
+    return manifest, {"seconds": round(time.time() - started, 3),
+                      "bound_seconds": None if remaining is None else round(remaining, 3),
+                      "environment": {key: environment[key] for key in
+                                      ("RUSTUP_TOOLCHAIN", "RUSTUP_AUTO_INSTALL", "CARGO_NET_OFFLINE")}}
 
 
 def rebound_path(old_mount, new_mount, old_path, identity, uuid):
@@ -552,18 +942,226 @@ def verify_rollback(path, identity, identity_bytes, marker_bytes, payload, pendi
         same_inode = os.stat(path, follow_symlinks=False).st_ino == identity["inode"]
     except OSError as error:
         raise Fault("R11", f"rollback root cannot be observed: {error}") from error
-    if not (same_record and same_marker and same_content and same_inode):
-        raise Fault("R11", "rollback identity or content changed")
+    failed = rollback_failure(same_record, same_marker, same_content, same_inode)
+    if failed is not None:
+        raise Fault("R11", failure_detail(failed, failure_summary({
+            "identity_record": same_record, "marker": same_marker,
+            "content": same_content, "inode": same_inode})))
+
+
+def bounded_text(value, limit=FAILURE_TEXT_CHARS):
+    """One free-text value, capped with an explicit marker. Pure."""
+    if not isinstance(value, str) or len(value) <= limit:
+        return value
+    return value[:limit] + f"...[+{len(value) - limit} chars]"
+
+
+def failure_summary(fields, rows=(), limit=ROW_EVIDENCE_CHARS):
+    """A bounded failure record: the deciding fields first, then as many rows as fit. Pure.
+
+    Scalars are never dropped, because a deciding field is useless if truncation can hide
+    it. Free text is capped per value, rows are appended only while the whole record stays
+    inside the existing reporting allowance, and the number omitted is stated.
+    """
+    summary = {key: bounded_text(value) for key, value in fields.items()}
+    summary["rows_total"] = len(rows)
+    summary["rows"] = []
+    summary["rows_omitted"] = 0
+    for index, row in enumerate(rows):
+        rendered = {key: bounded_text(value) for key, value in row.items()}
+        candidate = dict(summary, rows=summary["rows"] + [rendered])
+        if len(json.dumps(candidate, sort_keys=True)) > limit - 100:
+            summary["rows_omitted"] = len(rows) - index
+            break
+        summary["rows"].append(rendered)
+    return summary
+
+
+def first_failed_predicate(checks):
+    """The first failing check's name, in order, short-circuiting exactly like `or`. Pure.
+
+    `checks` is an ordered sequence of `(name, predicate)` pairs. Each predicate runs only
+    when every earlier one held, so a failure record never causes an observation the
+    original assertion would not have made.
+    """
+    for name, predicate in checks:
+        if predicate():
+            return name
+    return None
+
+
+def failure_detail(predicate, summary):
+    """The one-line failure record an oracle raises: predicate first, bounded fields after."""
+    return f"{predicate} failed: {json.dumps(summary, sort_keys=True)}"
+
+
+ROW_ID_LIMIT = 32
+ROW_ID_CHARS = 400
+
+
+def bounded_ids(values, count_limit=ROW_ID_LIMIT, char_limit=ROW_ID_CHARS):
+    """At most `count_limit` identifiers inside a `char_limit` budget, omission stated. Pure.
+
+    A returned root-id list is one member of a bounded failure record, so it needs its own
+    bound: an unbounded list would blow the record's allowance on its own, however well the
+    per-row entries are capped.
+    """
+    kept, used = [], 0
+    for value in values:
+        rendered = bounded_text(value, 120) if isinstance(value, str) else value
+        size = len(json.dumps(rendered)) + 1
+        if len(kept) >= count_limit or used + size > char_limit:
+            break
+        kept.append(rendered)
+        used += size
+    return kept, max(0, len(values) - len(kept))
+
+
+def run_report_summary(document, expected_root_id, observations=None):
+    """The decisive fields one `barge.prune.run/1` body already returned. Pure.
+
+    `observations` carries predicates the original assertion actually reached; a
+    filesystem fact the branch never reached is reported as `unobserved`, never guessed.
+    """
+    observations = observations or {}
+    rows = [row for row in (document.get("rows") or []) if isinstance(row, dict)]
+    returned_ids, ids_omitted = bounded_ids([row.get("root_id") for row in rows])
+    fields = {
+        "released_count": document.get("released_count"),
+        "kept_count": document.get("kept_count"),
+        "stopped": document.get("stopped"),
+        "replay_pending": document.get("replay_pending"),
+        "expected_root_id": expected_root_id,
+        "row_root_ids": returned_ids,
+        "row_root_ids_omitted": ids_omitted,
+        "path_present": observations.get("path_present", "unobserved"),
+    }
+    return failure_summary(fields, [{"root_id": row.get("root_id"),
+                                     "outcome": row.get("outcome"),
+                                     "reason": row.get("reason")} for row in rows])
+
+
+def released_after_replay_failure(document, expected_root_id, path_present):
+    """Which post-replay predicate fails, in the original order, plus what it observed. Pure.
+
+    `path_present` is a thunk: the filesystem is read exactly once and only when the
+    earlier predicates held, exactly as the original `or` chain did.
+    """
+    observations = {}
+
+    def observe_path():
+        observations["path_present"] = bool(path_present())
+        return observations["path_present"]
+
+    failed = first_failed_predicate([
+        ("released_count", lambda: document["released_count"] != 1),
+        ("path_present", observe_path),
+        ("row_count", lambda: len(document["rows"]) != 1),
+        ("root_id", lambda: document["rows"][0]["root_id"] != expected_root_id),
+    ])
+    return failed, observations
+
+
+def root_kept_failure(document, expected_root_id, path_present):
+    """Which "this root must still be here" predicate fails, in order. Keep polarity. Pure.
+
+    The original assertions were `released_count != 0 or not lexists(path)`: the count is
+    decided first and the filesystem is read once, only when it held. The path predicate
+    fails when the path is gone.
+    """
+    observations = {}
+
+    def observe_path():
+        observations["path_present"] = bool(path_present())
+        return not observations["path_present"]
+
+    failed = first_failed_predicate([
+        ("released_count", lambda: document["released_count"] != 0),
+        ("path_present", observe_path),
+    ])
+    return failed, observations
+
+
+def root_released_failure(document, expected_root_id, path_present, expected_released=1):
+    """Which "this root must be gone" predicate fails, in order. Release polarity. Pure.
+
+    The mirror of `root_kept_failure` as its own function, so a release assertion can never
+    pick up keep polarity by passing a flag: the count is decided first and the filesystem
+    is read once, only when it held, and this predicate fails when the path is still there.
+    """
+    observations = {}
+
+    def observe_path():
+        observations["path_present"] = bool(path_present())
+        return observations["path_present"]
+
+    failed = first_failed_predicate([
+        ("released_count", lambda: document["released_count"] != expected_released),
+        ("path_present", observe_path),
+    ])
+    return failed, observations
+
+
+def replay_settlement_failure(document, pending_intents):
+    """Which replay predicate fails, in order; intents are read only when reached. Pure."""
+    return first_failed_predicate([
+        ("replay_pending", lambda: document["replay_pending"] != 0),
+        ("pending_intents", lambda: bool(pending_intents())),
+    ])
+
+
+def rollback_failure(same_record, same_marker, same_content, same_inode):
+    """Which rollback observation differs, in the original order. Pure."""
+    return first_failed_predicate([
+        ("identity_record", lambda: not same_record),
+        ("marker", lambda: not same_marker),
+        ("content", lambda: not same_content),
+        ("inode", lambda: not same_inode),
+    ])
+
+
+def row_deciding_summary(row):
+    """The fields that decide one plan row's eligibility, in a fixed order. Pure.
+
+    A plan row is a sorted-key document, so `absence` sorts first and can consume a
+    whole truncation by itself. The frozen oracle decides on `eligible` alone; this
+    summary only makes a failing row judgeable from the receipt after the run root is
+    gone, by recording each gate's own verdict, its reason and the first blocker.
+    """
+    identity = row.get("identity") or {}
+    idle = row.get("idle") or {}
+    absence = row.get("absence") or {}
+    references = [reference for reference in (row.get("references") or [])
+                  if isinstance(reference, dict)]
+    return {
+        "eligible": row.get("eligible"),
+        "blocked_by": row.get("blocked_by"),
+        "reason": row.get("reason"),
+        "identity_verdict": identity.get("verdict"),
+        "identity_reason": identity.get("reason"),
+        "custody": row.get("custody"),
+        "custody_reason": row.get("custody_reason"),
+        "last_activity_ms": idle.get("last_activity_ms"),
+        "idle_reason": idle.get("reason"),
+        "age_waived": row.get("age_waived"),
+        "references_complete": row.get("references_complete"),
+        "references_current": sorted(str(reference.get("source")) for reference in references
+                                     if reference.get("current")),
+        "absence_verdict": absence.get("verdict"),
+        "absence_reason": absence.get("reason"),
+    }
 
 
 class Proof:
     """One counted or diagnostic run: one image, one private HOME and state, many areas."""
 
-    def __init__(self, binary, receipt_path, diagnostic, build):
+    def __init__(self, binary, receipt_path, diagnostic, build, evidence=None, route=None):
         self.binary = binary
         self.receipt_path = receipt_path
+        self.evidence = evidence or os.path.dirname(os.path.abspath(receipt_path))
         self.diagnostic = diagnostic
         self.build = build
+        self.route = route or {}
         self.isolation = None
         self.references = []
         self.root = None
@@ -575,6 +1173,8 @@ class Proof:
         self.uuid = None
         self.device = None
         self.device_after_remount = None
+        self.remount = None
+        self.custody = None
         self.env = None
         self.attached = False
         self.results = []
@@ -620,30 +1220,81 @@ class Proof:
         }
         if problems:
             raise Fault("premise", "; ".join(problems))
-        for name in ("hdiutil", "diskutil"):
-            if shutil.which(name) is None:
+        for name in (HDIUTIL, DISKUTIL):
+            if not os.path.isfile(name):
                 raise Infrastructure("host", f"{name} is not available")
         self.image = os.path.join(self.root, "release-volume.sparseimage")
-        run(["hdiutil", "create", *CREATE_IMAGE_OPTIONS, self.image], self.env)
+        # The guard's opt-in custody indication is published before the backing exists,
+        # so an attach interrupted anywhere below still leaves the backing visible to
+        # the guard's own cleanup, which then keeps the root instead of removing it.
+        self.publish_custody()
+        run([HDIUTIL, "create", *CREATE_IMAGE_OPTIONS, self.image], self.env)
         self.attach(first=True)
         self.write_registry([self.volume_record()])
         code, _ = self.barge("describe", expect=0)
         if code != 0:
             raise Fault("premise", "the binary under test does not run `describe`")
 
+    def publish_custody(self):
+        """Publish the guard's image-custody indication: one bounded atomic document."""
+        document = custody_document(self.image, self.root, self.evidence)
+        path = os.path.join(self.evidence, CUSTODY_NAME)
+        temporary = path + ".tmp"
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(document, handle, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except OSError as error:
+            raise Infrastructure("custody", f"the image-custody indication cannot be published: {error}") from error
+        self.custody = {"path": path, "published_before_backing": not os.path.lexists(self.image),
+                        "version": document["version"], "backings": document["backings"]}
+        if not self.custody["published_before_backing"]:
+            raise Infrastructure("custody", "the custody indication was published after the backing existed")
+
     def attach(self, first):
+        """Attach the owned image once and require a positive identity for it.
+
+        A failed, partial or unreadable attach is unknown custody: the mount, backing
+        and evidence are retained, the guard's custody indication keeps the root, and
+        nothing is detached, repaired or retried.
+        """
         name = f"barge-release-proof-{os.getpid()}-{int(time.time()) % 100000}-{'a' if first else 'b'}"
         mount = f"/Volumes/{name}"
+        if os.path.realpath(self.image) != self.image or os.path.lexists(mount):
+            raise Infrastructure("attach", "the backing is not canonical or the mount already exists")
         self.mount = mount
-        self.attached = True  # An interrupted attach has unknown custody, not absence.
-        run(["hdiutil", "attach", self.image, "-mountpoint", mount, *ATTACH_OPTIONS], self.env)
         self.mount_history.append(mount)
-        info = plistlib.loads(run(["diskutil", "info", "-plist", mount], self.env).stdout.encode())
-        uuid = info.get(VOLUME_UUID_KEY)
-        device = info.get("DeviceIdentifier")
-        if not uuid or not device:
-            raise Fault("premise", "the owned image did not report its UUID and device")
-        text = run(["diskutil", "info", mount], self.env).stdout
+        self.attached = True  # An interrupted attach has unknown custody, not absence.
+        try:
+            spawn = subprocess.run([HDIUTIL, "attach", self.image, "-mountpoint", mount,
+                                    *ATTACH_OPTIONS, "-plist"], env=self.env,
+                                   capture_output=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise Infrastructure("attach", f"the attach child did not complete: {error}") from error
+        device = None
+        try:
+            entities = plistlib.loads(spawn.stdout)["system-entities"]
+            mounted = [row for row in entities if row.get("mount-point") == mount]
+            if len(mounted) == 1 and spawn.returncode == 0:
+                device = mounted[0].get("dev-entry")
+        except (ValueError, KeyError, TypeError, plistlib.InvalidFileException):
+            device = None
+        document = attach_document(spawn.returncode, True, image_attachments(self.image, self.env),
+                                   mount, device)
+        if document["state"] != "attached":
+            raise Infrastructure("attach", document["reason"])
+        info = run([DISKUTIL, "info", "-plist", mount], self.env)
+        parsed = plistlib.loads(info.stdout.encode())
+        uuid = parsed.get(VOLUME_UUID_KEY)
+        observed_device = parsed.get("DeviceIdentifier")
+        if not uuid or not observed_device:
+            raise Infrastructure("attach", "the owned image did not report its UUID and device")
+        if not device.endswith(observed_device):
+            raise Infrastructure("attach", "the attached entity and the mounted volume report different devices")
+        text = run([DISKUTIL, "info", mount], self.env).stdout
         state = ownership_state(text)
         if first:
             self.uuid = uuid
@@ -651,18 +1302,44 @@ class Proof:
             self.ownership = {"attach_argv": list(ATTACH_OPTIONS), "text_state": state}
         else:
             if uuid != self.uuid:
-                raise Fault("premise", "the reattached image reports a different volume UUID")
+                raise Infrastructure("attach", "the reattached image reports a different volume UUID")
             self.device_after_remount = device
         if state != "enabled":
-            raise Fault("premise", f"the image does not state `Owners: Enabled` (reads {state!r})")
+            raise Infrastructure("attach", f"the image does not state `Owners: Enabled` (reads {state!r})")
+        return {"state": "attached", "mount": mount, "device": device, "volume_uuid": uuid,
+                "backing": self.image, "ownership": state, "first": first}
 
-    def detach(self):
-        """Ordinary detach only. Returns whether the mount is gone afterwards."""
-        result = run(["hdiutil", "detach", self.mount], self.env, check=False, timeout=120)
-        gone = not os.path.lexists(self.mount)
-        if result.returncode == 0 or gone:
+    def detach(self, purpose):
+        """One ordinary detach, authorized by a fresh rebind census and closed positively.
+
+        Each call re-reads the image's own bindings (backing, mount, device and volume
+        UUID) before it detaches, so the intermediate R11 detach and the final one
+        never borrow each other's authority. Never forced, never retried, and never
+        accepted on a missing mount alone: the whole backing must be absent from the
+        attachment census.
+        """
+        if not self.attached or self.mount is None or self.uuid is None or self.device is None:
+            return {"purpose": purpose, "exit": None, "reaped": False, "mount_absent": False,
+                    "backing_attached": None, "closed": False, "custody": "retained",
+                    "reason": "no positively recorded attachment to detach"}
+        problems = detach_binding_problems(image_attachments(self.image, self.env), self.mount,
+                                           self.device, self.uuid, volume_uuid(self.mount))
+        if problems:
+            return {"purpose": purpose, "exit": None, "reaped": False, "mount_absent": False,
+                    "backing_attached": None, "closed": False, "custody": "unknown",
+                    "reason": "; ".join(problems)}
+        try:
+            result = subprocess.run([HDIUTIL, "detach", self.mount], env=self.env,
+                                    capture_output=True, timeout=DETACH_TIMEOUT_SECONDS)
+            exit_code, reaped = result.returncode, True
+        except (OSError, subprocess.SubprocessError):
+            exit_code, reaped = None, False
+        document = closure_document(purpose, exit_code, reaped,
+                                    image_attachments(self.image, self.env),
+                                    not os.path.lexists(self.mount))
+        if document["closed"]:
             self.attached = False
-        return {"exit": result.returncode, "mount_absent": gone, "mount": self.mount}
+        return document
 
     def volume_record(self):
         return {
@@ -875,7 +1552,12 @@ class Proof:
         _code, preview = self.preview(area, plan_file, named=named, expect=0)
         row = self.row_for(preview, aged_root)
         if row["eligible"] != expect_eligible:
-            raise Fault(case, f"expected eligible={expect_eligible}, got {json.dumps(row)[:400]}")
+            raise Fault(
+                case,
+                f"expected eligible={expect_eligible}; "
+                f"deciding {json.dumps(row_deciding_summary(row), sort_keys=True)}; "
+                f"row {json.dumps(row)[:ROW_EVIDENCE_CHARS]}",
+            )
         return preview, row, plan_file
 
     # -- the cases --------------------------------------------------------
@@ -892,14 +1574,28 @@ class Proof:
         digest = preview["data"]["plan_digest"]
         _code, run_doc = self.real(plan_file, digest, expect=0)
         if run_doc["data"]["released_count"] != 1:
-            raise Fault("R1", f"released {run_doc['data']['released_count']}, expected 1")
-        if os.path.lexists(root["path"]):
-            raise Fault("R1", "the released root is still present")
+            raise Fault("R1", failure_detail(
+                "released_count", run_report_summary(run_doc["data"], root["root_id"])))
+        present = os.path.lexists(root["path"])
+        if present:
+            raise Fault("R1", failure_detail("path_present", run_report_summary(
+                run_doc["data"], root["root_id"], {"path_present": present})))
         if self.pending_intents():
-            raise Fault("R1", "an intent is left pending after a clean release")
+            raise Fault("R1", failure_detail("pending_intents", run_report_summary(
+                run_doc["data"], root["root_id"])))
         settled = self.settled_intents()
-        if len(settled) != 1 or settled[0].get("identity") is None:
-            raise Fault("R1", "the settled intent does not keep the identity evidence")
+        observations = {"settled_intents": len(settled), "expected_settled_intents": 1}
+
+        def settled_identity_missing():
+            observations["settled_intent_identity_present"] = settled[0].get("identity") is not None
+            return not observations["settled_intent_identity_present"]
+
+        failed = first_failed_predicate([
+            ("settled_intent_count", lambda: observations["settled_intents"] != 1),
+            ("settled_intent_identity", settled_identity_missing),
+        ])
+        if failed is not None:
+            raise Fault("R1", failure_detail(failed, failure_summary(observations)))
         _code, again = self.real(plan_file, digest, expect=0)
         if again["data"]["released_count"] != 0:
             raise Fault("R1", "replaying the same bytes released a root")
@@ -914,8 +1610,11 @@ class Proof:
         if row["blocked_by"] != "identity":
             raise Fault("R2", f"blocked by {row['blocked_by']}, expected identity")
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
-        if run_doc["data"]["released_count"] != 0 or not os.path.lexists(root["path"]):
-            raise Fault("R2", "a root without its identity record was released")
+        failed, observations = root_kept_failure(
+            run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
+        if failed is not None:
+            raise Fault("R2", failure_detail(
+                failed, run_report_summary(run_doc["data"], root["root_id"], observations)))
         return {"root": root["root_id"], "blocked_by": row["blocked_by"],
                 "counterfactual_of": "R1", "flipped_condition": "identity"}
 
@@ -927,8 +1626,11 @@ class Proof:
         if row["blocked_by"] != "custody":
             raise Fault("R3", f"blocked by {row['blocked_by']}, expected custody")
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
-        if run_doc["data"]["released_count"] != 0 or not os.path.lexists(root["path"]):
-            raise Fault("R3", "a held root was released")
+        failed, observations = root_kept_failure(
+            run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
+        if failed is not None:
+            raise Fault("R3", failure_detail(
+                failed, run_report_summary(run_doc["data"], root["root_id"], observations)))
         return {"root": root["root_id"], "blocked_by": row["blocked_by"],
                 "counterfactual_of": "R1", "flipped_condition": "custody"}
 
@@ -937,16 +1639,34 @@ class Proof:
         root = self.new_root(area, aged=False)
         _p, young, _f = self.plan_and_run("R4-young", area, root, expect_eligible=False)
         # The plan omits `age_waived` when it is false, so an absent key is an unwaived row.
-        if young["blocked_by"] != "policy" or young.get("age_waived"):
-            raise Fault("R4", "an unnamed young root was not kept by the age gate")
+        failed = first_failed_predicate([
+            ("blocked_by", lambda: young["blocked_by"] != "policy"),
+            ("age_waived", lambda: bool(young.get("age_waived"))),
+        ])
+        if failed is not None:
+            raise Fault("R4", failure_detail(failed, failure_summary({
+                "blocked_by": young["blocked_by"], "age_waived": young.get("age_waived"),
+                "reason": young.get("reason"),
+                "identity_verdict": (young.get("identity") or {}).get("verdict")})))
         preview, row, plan_file = self.plan_and_run(
             "R4-named", area, root, named=[root["root_id"]], expect_eligible=True
         )
-        if not row["age_waived"] or preview["data"]["plan"]["named_roots"] != [root["root_id"]]:
-            raise Fault("R4", "the named waiver is not stated in the plan")
+        failed = first_failed_predicate([
+            ("age_waived", lambda: not row["age_waived"]),
+            ("named_roots",
+             lambda: preview["data"]["plan"]["named_roots"] != [root["root_id"]]),
+        ])
+        if failed is not None:
+            raise Fault("R4", failure_detail(failed, failure_summary({
+                "age_waived": row.get("age_waived"),
+                "named_roots": preview["data"]["plan"]["named_roots"],
+                "expected_named_roots": [root["root_id"]]})))
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
-        if run_doc["data"]["released_count"] != 1 or os.path.lexists(root["path"]):
-            raise Fault("R4", "the named root was not released under its own waiver")
+        failed, observations = root_released_failure(
+            run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
+        if failed is not None:
+            raise Fault("R4", failure_detail(
+                failed, run_report_summary(run_doc["data"], root["root_id"], observations)))
         return {"root": root["root_id"], "young_blocked_by": "policy", "named_released": 1,
                 "counterfactual_of": "R1", "flipped_condition": "age"}
 
@@ -959,8 +1679,11 @@ class Proof:
         if row["blocked_by"] != "references":
             raise Fault("R5", f"blocked by {row['blocked_by']}, expected references")
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
-        if run_doc["data"]["released_count"] != 0 or not os.path.lexists(root["path"]):
-            raise Fault("R5", "a root Oxide still marks pending was released")
+        failed, observations = root_kept_failure(
+            run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
+        if failed is not None:
+            raise Fault("R5", failure_detail(
+                failed, run_report_summary(run_doc["data"], root["root_id"], observations)))
         return {"root": root["root_id"], "blocked_by": row["blocked_by"],
                 "counterfactual_of": "R1", "flipped_condition": "references"}
 
@@ -974,13 +1697,25 @@ class Proof:
         os.makedirs(checkout)
         self.oxide_registry([self.oxide_row(root, checkout, on_volume=True)], complete=True)
         preview, row, plan_file = self.plan_and_run("R6-present", area, root, expect_eligible=False)
-        if row["blocked_by"] != "absence" or (row.get("absence") or {}).get("verdict") != "present":
-            raise Fault("R6", "a present consumer path did not keep the root")
+        absence = row.get("absence") or {}
+        failed = first_failed_predicate([
+            ("blocked_by", lambda: row["blocked_by"] != "absence"),
+            ("absence_verdict", lambda: absence.get("verdict") != "present"),
+        ])
+        if failed is not None:
+            raise Fault("R6", failure_detail(failed, failure_summary({
+                "blocked_by": row["blocked_by"], "absence_verdict": absence.get("verdict"),
+                "absence_reason": absence.get("reason")})))
         os.rmdir(checkout)
         preview, row, plan_file = self.plan_and_run("R6-absent", area, root, expect_eligible=True)
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
-        if run_doc["data"]["released_count"] != 1 or os.path.lexists(root["path"]):
-            raise Fault("R6", "an absent consumer path did not release by reference")
+        if run_doc["data"]["released_count"] != 1:
+            raise Fault("R6", failure_detail(
+                "released_count", run_report_summary(run_doc["data"], root["root_id"])))
+        present = os.path.lexists(root["path"])
+        if present:
+            raise Fault("R6", failure_detail("path_present", run_report_summary(
+                run_doc["data"], root["root_id"], {"path_present": present})))
         return {"root": root["root_id"], "present_blocked_by": "absence", "released": 1,
                 "policy": "release_on_reference"}
 
@@ -1011,8 +1746,11 @@ class Proof:
         self.edit_marker_kind(root["path"], "foreign-kind")
         preview, row, plan_file = self.plan_and_run("R8", area, root, expect_eligible=False)
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
-        if run_doc["data"]["released_count"] != 0 or not os.path.lexists(root["path"]):
-            raise Fault("R8", "a foreign marker qualified its root")
+        failed, observations = root_kept_failure(
+            run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
+        if failed is not None:
+            raise Fault("R8", failure_detail(
+                failed, run_report_summary(run_doc["data"], root["root_id"], observations)))
         return {"root": root["root_id"], "blocked_by": row["blocked_by"],
                 "counterfactual_of": "R1", "flipped_condition": "marker kind"}
 
@@ -1021,8 +1759,18 @@ class Proof:
         root = self.new_root(area, aged=True)
         preview, row, plan_file = self.plan_and_run("R9", area, root, expect_eligible=True)
         refusal = self.refused(plan_file, "0" * 64, area)
-        if refusal["kind"] != "usage" or not os.path.lexists(root["path"]):
-            raise Fault("R9", f"a changed digest did not refuse cleanly: {refusal}")
+        observations = {"refusal": refusal}
+
+        def path_missing():
+            observations["path_present"] = os.path.lexists(root["path"])
+            return not observations["path_present"]
+
+        failed = first_failed_predicate([
+            ("refusal_kind", lambda: refusal["kind"] != "usage"),
+            ("path_present", path_missing),
+        ])
+        if failed is not None:
+            raise Fault("R9", failure_detail(failed, failure_summary(observations)))
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
         if run_doc["data"]["released_count"] != 1:
             raise Fault("R9", "the presented bytes did not release after the refusal")
@@ -1036,8 +1784,11 @@ class Proof:
         preview, row, plan_file = self.plan_and_run("R10", area, root, expect_eligible=True)
         os.makedirs(checkout)
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
-        if run_doc["data"]["released_count"] != 0 or not os.path.lexists(root["path"]):
-            raise Fault("R10", "a consumer path that reappeared did not keep its root")
+        failed, observations = root_kept_failure(
+            run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
+        if failed is not None:
+            raise Fault("R10", failure_detail(
+                failed, run_report_summary(run_doc["data"], root["root_id"], observations)))
         return {"root": root["root_id"], "released": 0, "kept_by": "absence"}
 
     def case_intent_before_rename_then_remount_replay(self):
@@ -1064,40 +1815,87 @@ class Proof:
         code, run_doc = self.real(plan_file, digest, expect=3)
         os.chmod(folder, 0o700)
         if run_doc["data"]["rows"][0]["outcome"] != "pending":
-            raise Fault("R11", f"the rename refusal did not leave a pending row: {run_doc['data']['rows']}")
+            raise Fault("R11", failure_detail(
+                "pending_row_outcome", run_report_summary(run_doc["data"], root["root_id"])))
         pending = self.pending_intents()
-        if len(pending) != 1 or pending[0].get("identity") is None:
-            raise Fault("R11", "the pending intent does not carry the identity evidence")
+        observations = {"pending_intents": len(pending), "expected_pending_intents": 1}
+
+        def pending_identity_missing():
+            observations["pending_intent_identity_present"] = pending[0].get("identity") is not None
+            return not observations["pending_intent_identity_present"]
+
+        failed = first_failed_predicate([
+            ("pending_intent_count", lambda: observations["pending_intents"] != 1),
+            ("pending_intent_identity", pending_identity_missing),
+        ])
+        if failed is not None:
+            raise Fault("R11", failure_detail(failed, failure_summary(observations)))
         if not os.path.lexists(root["path"]):
             raise Fault("R11", "the unit moved before its rename succeeded")
         old_device = self.device
-        detached = self.detach()
-        if detached["exit"] != 0 or not detached["mount_absent"]:
+        detached = self.detach("intermediate")
+        if not detached["closed"]:
             self.unknown_custody = True
-            raise Infrastructure("detach", "ordinary detach did not establish a clean closure")
-        self.attach(first=False)
+            raise Infrastructure("detach", f"ordinary detach did not positively close the owned backing: {detached['reason']}")
+        mounted = self.attach(first=False)
         remounted = self.device_after_remount != old_device
+        self.remount = {"mount_before": old_mount, "mount_after": self.mount,
+                        "backing": self.image, "volume_uuid": self.uuid,
+                        "device_before": old_device, "device_after": self.device_after_remount,
+                        "device_changed": remounted, "mount_relative_path": identity["mount_relative_path"],
+                        "attachment": mounted, "closed_before_attach": detached["closed"]}
         _code, replay = self.real(plan_file, digest, expect=0)
-        if replay["data"]["replay_pending"] != 0 or self.pending_intents():
-            raise Fault("R11", f"the remount replay left an intent pending: {replay['data']}")
+        failed = replay_settlement_failure(replay["data"], self.pending_intents)
+        if failed is not None:
+            raise Fault("R11", failure_detail(
+                failed, run_report_summary(replay["data"], root["root_id"])))
         root = dict(root, path=rebound_path(old_mount, self.mount, root["path"], identity, self.uuid))
         verify_rollback(root["path"], identity, identity_bytes, marker_bytes, payload, self.pending_intents())
         preview2, row2, plan2 = self.plan_and_run("R11-after", area, root, expect_eligible=True)
-        if row2["mount_relative_path"] != identity["mount_relative_path"] or row2["identity"]["verdict"] != "verified":
-            raise Fault("R11", "fresh plan did not verify the original relative identity")
+        failed = first_failed_predicate([
+            ("mount_relative_path",
+             lambda: row2["mount_relative_path"] != identity["mount_relative_path"]),
+            ("identity_verdict", lambda: row2["identity"]["verdict"] != "verified"),
+        ])
+        if failed is not None:
+            raise Fault("R11", failure_detail(failed, failure_summary({
+                "mount_relative_path": row2["mount_relative_path"],
+                "expected_mount_relative_path": identity["mount_relative_path"],
+                "identity_verdict": row2["identity"]["verdict"]})))
         _code, released = self.real(plan2, preview2["data"]["plan_digest"], expect=0)
-        if (released["data"]["released_count"] != 1 or os.path.lexists(root["path"])
-                or len(released["data"]["rows"]) != 1
-                or released["data"]["rows"][0]["root_id"] != root["root_id"]):
-            raise Fault("R11", "the root was not released after the replay settled")
+        failed, observations = released_after_replay_failure(
+            released["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
+        if failed is not None:
+            raise Fault("R11", failure_detail(
+                failed, run_report_summary(released["data"], root["root_id"], observations)))
         return {"root": root["root_id"], "pending_before_detach": 1, "detach": detached,
                 "device_before": old_device, "device_after": self.device_after_remount,
-                "device_changed": remounted, "replay_pending": 0, "released_after": 1}
+                "device_changed": remounted, "mount_before": old_mount, "mount_after": self.mount,
+                "backing": self.image, "volume_uuid": self.uuid,
+                "mount_relative_path": identity["mount_relative_path"], "remount": self.remount,
+                "replay_pending": 0, "released_after": 1}
 
     def reset_registration(self):
         """Use a new private state and a supported registration, only after R11 passes."""
         if not self.results or self.results[-1]["case"] != "R11" or self.results[-1]["status"] != "passed":
             raise Fault("registration", "R11 has not completed successfully")
+        remount = self.remount or {}
+        attachment = remount.get("attachment") or {}
+        failed = first_failed_predicate([
+            ("remount_closed", lambda: remount.get("closed_before_attach") is not True),
+            ("remount_attached", lambda: attachment.get("state") != "attached"),
+            ("remount_backing", lambda: remount.get("backing") != self.image),
+            ("remount_volume_uuid", lambda: remount.get("volume_uuid") != self.uuid),
+            ("current_attachment", lambda: not self.attached),
+            ("remount_mount", lambda: self.mount != remount.get("mount_after")),
+        ])
+        if failed is not None:
+            raise Fault("registration", failure_detail(failed, failure_summary({
+                "closed_before_attach": remount.get("closed_before_attach"),
+                "attachment_state": attachment.get("state"),
+                "backing": remount.get("backing"), "volume_uuid": remount.get("volume_uuid"),
+                "mount_after": remount.get("mount_after"), "attached": self.attached,
+                "mount": self.mount})))
         self.state = tempfile.mkdtemp(prefix="state-r12-", dir=self.root)
         self.env["BARGE_STATE_DIR"] = self.state
         _code, preview = self.barge(
@@ -1106,8 +1904,17 @@ class Proof:
             "--floor", "1KiB", "--declared-by", "release-proof", "--plan", expect=0)
         plan = preview["data"]["plan"]
         document = json.loads(plan)
-        if document["record"]["volume_uuid"] != self.uuid or document["record"]["mount_hint"] != self.mount:
-            raise Fault("registration", "registration plan did not bind the verified image")
+        failed = first_failed_predicate([
+            ("registration_volume_uuid",
+             lambda: document["record"]["volume_uuid"] != self.uuid),
+            ("registration_mount_hint",
+             lambda: document["record"]["mount_hint"] != self.mount),
+        ])
+        if failed is not None:
+            raise Fault("registration", failure_detail(failed, failure_summary({
+                "volume_uuid": document["record"]["volume_uuid"], "expected_volume_uuid": self.uuid,
+                "mount_hint": document["record"]["mount_hint"],
+                "expected_mount_hint": self.mount})))
         plan_file = os.path.join(self.root, "r12-register.json")
         with open(plan_file, "w", encoding="utf-8") as handle:
             handle.write(plan)
@@ -1123,7 +1930,8 @@ class Proof:
         late = self.new_root(area, aged=True)
         _code, run_doc = self.real(plan_file, digest, expect=0)
         if run_doc["data"]["released_count"] != 1:
-            raise Fault("R12", f"released {run_doc['data']['released_count']}, expected 1")
+            raise Fault("R12", failure_detail(
+                "released_count", run_report_summary(run_doc["data"], given["root_id"])))
         if not os.path.lexists(late["path"]):
             raise Fault("R12", "a root the presented plan did not carry was released")
         return {"given": given["root_id"], "not_given_kept": late["root_id"], "released": 1}
@@ -1198,12 +2006,25 @@ class Proof:
             "isolation": self.isolation,
             "limitation": LIMITATION,
             "supervisor": {"path": supervisor_path(), "sha256": SUPERVISOR_SHA256},
-            "image": {"size_mib": IMAGE_MIB, "volume_uuid": self.uuid, "device": self.device,
-                      "device_after_remount": self.device_after_remount,
-                      "mounts": self.mount_history, "ownership": self.ownership},
+            "route": self.route,
+            "image": {"size_mib": IMAGE_MIB, "backing": self.image, "volume_uuid": self.uuid,
+                      "device": self.device, "device_after_remount": self.device_after_remount,
+                      "mounts": self.mount_history, "ownership": self.ownership,
+                      "custody": self.custody, "remount": self.remount},
             "resources": {"limit_seconds": LIMIT_SECONDS, "scratch_budget_mib": SCRATCH_BUDGET_MIB,
                           "wall_seconds": round(time.time() - self.started, 3)},
             "closure": self.closure,
+            "qualification_inputs": {
+                "case_rows": "every R1-R12 row passed in this mode",
+                "image_whole_backing_clearance": (self.closure or {}).get("closed"),
+                "guard_receipt": {
+                    "required": True,
+                    "path": os.path.join(self.evidence or "<evidence>", "receipt.json"),
+                    "state": "written by the qualified supervisor after this process exits; "
+                             "the activator correlates its clean conclusion and its own detach/cleanup "
+                             "record with this receipt before counting the pass",
+                },
+            },
             "preflight": self.preflight,
             "cases": self.results,
             "first_fault": self.first_fault,
@@ -1225,33 +2046,181 @@ def git_head():
     return result.stdout.strip() or None
 
 
-def inner_half(mode, binary, receipt_path):
-    """The guarded run: the premises, the cases, the closure, then the receipt."""
-    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE")
-    scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
-    if not evidence or not os.path.isdir(evidence):
-        print(json.dumps({"schema": SCHEMA, "ok": False,
-                          "refused": "OXIDE_PROOF_EVIDENCE is not a directory; this is not the guard's run"}))
+def inside_owned(path, owned):
+    """Whether a path is the owned root itself or strictly inside it, by resolution. Pure.
+
+    The guard sets TMPDIR to the owned scratch root itself, so that equality must be
+    accepted; a path that only shares a name prefix, or that resolves outside by `..`,
+    must not be.
+    """
+    if not path or not owned:
+        return False
+    real_path, real_owned = os.path.realpath(path), os.path.realpath(owned)
+    if real_owned == os.sep:
+        return real_path.startswith(real_owned)
+    return real_path == real_owned or real_path.startswith(real_owned + os.sep)
+
+
+def guard_owned_root(scratch):
+    """The guard's monitored owned root: the parent of the scratch directory it sets.
+
+    The pinned supervisor creates one `oxide-proof.*` root directly under its
+    `--root-parent` and then `scratch/` (and, by default, `evidence/`) inside it
+    (`create_owned_root`, `owned_root` and `setup` in the pinned bytes), so the scratch
+    directory's parent is that one monitored owned root.
+    """
+    if not isinstance(scratch, str) or not os.path.isabs(scratch):
+        return None
+    parent = os.path.dirname(os.path.normpath(scratch))
+    return parent if parent not in ("", os.sep) else None
+
+
+def guard_containment_facts(scratch_env=None, evidence_env=None):
+    """What the host says about the guard's monitored layout. Read-only.
+
+    One `lstat` and one real resolution per path; nothing is created. `scratch_env`
+    and `evidence_env` default to the guard's own variables.
+    """
+    scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "") if scratch_env is None else scratch_env
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "") if evidence_env is None else evidence_env
+    facts = {"scratch": scratch, "evidence": evidence,
+             "root_parent": os.path.realpath(DESIGNATED_SCRATCH),
+             "uid": os.getuid(), "scratch_facts": None, "evidence_facts": None,
+             "root_facts": None}
+    for key, path in (("scratch_facts", scratch), ("evidence_facts", evidence),
+                      ("root_facts", guard_owned_root(scratch))):
+        if not path:
+            continue
+        facts[key] = {"path": path, "realpath": None, "isdir": False, "islink": False,
+                      "uid": None, "mode": None, "present": False}
+        try:
+            info = os.lstat(path)
+        except OSError:
+            continue
+        facts[key].update(realpath=os.path.realpath(path), islink=os.path.islink(path),
+                          isdir=os.path.isdir(path) and not os.path.islink(path),
+                          uid=info.st_uid, mode=info.st_mode & 0o777, present=True)
+    return facts
+
+
+def _private_directory_problems(name, facts, uid, owner_only):
+    """Why one guard-set directory is not this occurrence's private canonical directory."""
+    problems = []
+    if isinstance(facts, dict) and facts.get("islink") is True:
+        return [f"the {name} {facts.get('path')!r} is a symlink"]
+    if not isinstance(facts, dict) or facts.get("present") is not True or facts.get("isdir") is not True:
+        return [f"the {name} {facts.get('path') if isinstance(facts, dict) else None!r} is not a directory"]
+    path = facts.get("path")
+    if not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path:
+        problems.append(f"the {name} {path!r} is not an absolute canonical path")
+    if facts.get("realpath") != path:
+        problems.append(f"the {name} {path!r} resolves to {facts.get('realpath')!r}, so its path is an alias or a symlink")
+    if facts.get("uid") != uid:
+        problems.append(f"the {name} {path!r} is not owned by this account")
+    mode = facts.get("mode")
+    writable = 0o077 if owner_only else 0o022
+    if not isinstance(mode, int) or mode & writable:
+        problems.append(f"the {name} {path!r} mode {mode!r} is not private")
+    return problems
+
+
+def guard_containment_problems(facts):
+    """Why the guard's scratch and evidence are not this occurrence's monitored layout.
+
+    Pure. The pinned supervisor keeps them as siblings inside one owned root under the
+    verified scratch parent: it creates `oxide-proof.*` directly under `--root-parent`
+    (here the verified Stash scratch), then `scratch/` and, by default, `evidence/`
+    inside that root. Evidence therefore need not be inside the scratch directory; it
+    must be inside the same monitored owned root. This refuses an aliased or symlinked
+    path, a path outside that owned root, a foreign or nested-off-parent root, a
+    directory of another account, an unprivate directory, and evidence that aliases
+    the scratch directory or the owned root itself.
+    """
+    problems = []
+    uid = facts.get("uid")
+    root_parent = facts.get("root_parent")
+    scratch = facts.get("scratch_facts")
+    problems += _private_directory_problems("scratch directory", scratch, uid, owner_only=False)
+    problems += _private_directory_problems("evidence directory", facts.get("evidence_facts"), uid, owner_only=False)
+    problems += _private_directory_problems("owned root", facts.get("root_facts"), uid, owner_only=True)
+    scratch_path = scratch.get("path") if isinstance(scratch, dict) else None
+    owned_root = guard_owned_root(scratch_path)
+    if not owned_root:
+        problems.append("the scratch directory does not name a guarded owned root")
+    else:
+        if os.path.dirname(owned_root) != root_parent:
+            problems.append(f"the owned root {owned_root} is not directly under the verified scratch parent {root_parent}")
+        evidence = facts.get("evidence_facts")
+        evidence_path = evidence.get("path") if isinstance(evidence, dict) else None
+        if not evidence_path:
+            problems.append("the evidence directory is absent")
+        else:
+            if evidence_path == owned_root:
+                problems.append("the evidence directory names the owned root itself")
+            if os.path.normpath(evidence_path) == os.path.normpath(scratch_path):
+                problems.append("the evidence directory aliases the scratch directory")
+            if not inside_owned(evidence_path, owned_root) or os.path.realpath(evidence_path) == os.path.realpath(owned_root):
+                problems.append(f"the evidence directory {evidence_path} is outside the monitored owned root {owned_root}")
+    return problems
+
+
+def guard_refusals(facts):
+    """Why this process is not the pinned supervisor's guarded child. Pure.
+
+    `facts` carries what the process observed: whether the evidence directory and the
+    owned scratch root are directories, whether TMPDIR resolves inside the scratch, the
+    observed containment problems of the guard's monitored layout, the installed
+    supervisor's pin problems, and the carried scratch route. Nothing here reaches a
+    build or a fixture.
+    """
+    refusals = []
+    if facts.get("evidence_isdir") is not True:
+        refusals.append("OXIDE_PROOF_EVIDENCE is not a directory; this is not the guard's run")
+    if facts.get("scratch_isdir") is not True:
+        refusals.append("OXIDE_TASK_SCRATCH_ROOT is unset or absent; this is not the guard's run")
+    if facts.get("tmpdir_inside_scratch") is not True:
+        refusals.append("TMPDIR is not inside the guard's owned scratch")
+    refusals += list(facts.get("supervisor_problems") or [])
+    refusals += route_refusals(facts.get("route"))
+    if facts.get("deadline_ns") is None:
+        refusals.append(f"{WALL_DEADLINE_ENV} does not name the guard's wall deadline")
+    refusals += [f"guard containment: {problem}" for problem in facts.get("containment_problems") or []]
+    return refusals
+
+
+def guarded_run(mode, receipt_path, route, deadline_ns, parent, owned, stage=None,
+                 verify=None, head=None, prove=None):
+    """The guarded body: stage the source-bound build, verify it, then prove.
+
+    Every step is a seam, so the self-check can drive the real order without a build or
+    a fixture. A staging refusal returns 125 with no fixture effect at all: staging is
+    the first thing that happens inside the guard.
+    """
+    stage = stage or stage_proof_binary
+    verify = verify or staged_build_problems
+    prove = prove or run_proof
+    head = head if head is not None else git_head()
+    try:
+        manifest, stage_record = stage(parent, owned, deadline_ns=deadline_ns)
+    except Infrastructure as error:
+        print(json.dumps({"schema": SCHEMA, "ok": False, "stage": None,
+                          "refused": f"staging the proof build failed: {error.detail}"}))
         return 125
-    if not scratch or not os.path.isdir(scratch):
+    problems = verify(manifest["path"], head, parent)
+    if problems:
         print(json.dumps({"schema": SCHEMA, "ok": False,
-                          "refused": "OXIDE_TASK_SCRATCH_ROOT is unset or absent; this is not the guard's run"}))
+                          "refused": "; ".join(problems)}))
         return 125
-    if not os.path.realpath(os.environ.get("TMPDIR", "")).startswith(os.path.realpath(scratch)):
-        print(json.dumps({"schema": SCHEMA, "ok": False,
-                          "refused": "TMPDIR is not inside the guard's owned scratch"}))
-        return 125
-    if receipt_path is None:
-        receipt_path = os.path.join(evidence, PROOF_RECEIPT)
-    head = git_head()
-    build_problems = staged_build_problems(binary, head)
-    if build_problems:
-        print(json.dumps({"schema": SCHEMA, "ok": False,
-                          "refused": "; ".join(build_problems)}))
-        return 125
-    with open(os.path.join(os.path.dirname(os.path.abspath(binary)), STAGE_MANIFEST), encoding="utf-8") as handle:
-        build = json.load(handle)
-    proof = Proof(binary, receipt_path, mode == "diagnostic", build)
+    return prove(mode, manifest, stage_record, receipt_path, route)
+
+
+def run_proof(mode, build, stage_record, receipt_path, route):
+    """The premises, the cases, the closure, then the receipt."""
+    binary = build["path"]
+    evidence = os.path.dirname(os.path.abspath(receipt_path))
+    proof = Proof(binary, receipt_path, mode == "diagnostic", build,
+                  evidence=evidence, route=route)
+    proof.build = dict(build, stage=stage_record)
     cancelled = None
     try:
         proof.setup()
@@ -1276,15 +2245,24 @@ def inner_half(mode, binary, receipt_path):
     finally:
         try:
             if proof.unknown_custody:
-                proof.closure = {"exit": None, "mount_absent": False, "mount": proof.mount,
-                                 "detail": "unknown custody; retained without repair"}
+                proof.closure = {"purpose": "final", "exit": None, "reaped": False,
+                                 "mount_absent": False, "backing_attached": None,
+                                 "closed": False, "custody": "retained", "mount": proof.mount,
+                                 "detail": "unknown custody; retained without repair, retry or force detach"}
             elif proof.attached:
-                proof.closure = proof.detach()
+                proof.closure = proof.detach("final")
             else:
-                proof.closure = {"exit": None, "mount_absent": True, "mount": proof.mount}
+                proof.closure = {"purpose": "final", "exit": None, "reaped": False,
+                                 "mount_absent": not os.path.lexists(proof.mount or ""),
+                                 "backing_attached": None, "closed": False, "custody": "retained",
+                                 "mount": proof.mount,
+                                 "detail": "no attachment was established in this run"}
         except Exception as error:
             cancelled = f"the detach raised: {type(error).__name__}: {error}"
-            proof.closure = {"exit": None, "mount_absent": False, "mount": proof.mount}
+            proof.closure = {"purpose": "final", "exit": None, "reaped": False,
+                             "mount_absent": False, "backing_attached": None, "closed": False,
+                             "custody": "retained", "mount": proof.mount,
+                             "detail": cancelled}
 
     recorded = {result["case"] for result in proof.results}
     for case in CASES:
@@ -1314,8 +2292,9 @@ def inner_half(mode, binary, receipt_path):
         mode == "counted"
         and proof.infrastructure is None
         and receipt["all_cases_passed"]
-        and proof.closure is not None
-        and proof.closure["mount_absent"]
+        and isinstance(proof.closure, dict)
+        and proof.closure.get("closed") is True
+        and proof.closure.get("backing_attached") is False
         and premise_failure is None
         and proof.isolation is not None
         and not proof.isolation["problems"]
@@ -1347,34 +2326,79 @@ def inner_half(mode, binary, receipt_path):
     return 3 if mode == "diagnostic" else 1
 
 
-def outer_half(mode):
-    """Stage the proof build, verify the pinned supervisor, and hand this script to it."""
-    supervisor = supervisor_path()
-    if not os.path.isfile(supervisor) or not os.access(supervisor, os.R_OK):
-        print(json.dumps({"schema": SCHEMA, "ok": False,
-                          "refused": f"the qualified supervisor is not a readable regular file at {supervisor}"}))
+def inner_half(mode, receipt_path):
+    """Refuse anything but the pinned supervisor's guarded child, then stage and prove."""
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE")
+    scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
+    tmpdir = os.environ.get("TMPDIR", "")
+    containment = guard_containment_facts(scratch, evidence or "")
+    facts = {
+        "evidence_isdir": bool(evidence) and os.path.isdir(evidence),
+        "scratch_isdir": bool(scratch) and os.path.isdir(scratch),
+        "tmpdir_inside_scratch": inside_owned(tmpdir, scratch),
+        "containment_problems": guard_containment_problems(containment),
+        "supervisor_problems": installed_supervisor_problems(),
+        "route": carried_route(),
+        "deadline_ns": wall_deadline(),
+    }
+    refusals = guard_refusals(facts)
+    if refusals:
+        print(json.dumps({"schema": SCHEMA, "ok": False, "refused": "; ".join(refusals)}))
         return 125
-    digest = sha256_file(supervisor)
-    if digest != SUPERVISOR_SHA256:
-        print(json.dumps({"schema": SCHEMA, "ok": False,
-                          "refused": f"{supervisor} is sha256 {digest}, not the qualified {SUPERVISOR_SHA256}"}))
-        return 125
-    if not os.path.isdir(DESIGNATED_SCRATCH):
-        print(json.dumps({"schema": SCHEMA, "ok": False,
-                          "refused": f"the designated scratch parent is not present: {DESIGNATED_SCRATCH}"}))
-        return 125
+    if receipt_path is None:
+        receipt_path = os.path.join(evidence, PROOF_RECEIPT)
+    owned_root = guard_owned_root(scratch)
+    return guarded_run(mode, receipt_path, facts["route"], facts["deadline_ns"], scratch,
+                       {"owned root": owned_root, "evidence directory": evidence})
+
+
+def carried_route():
+    """The scratch route the outer half verified, or None when it carried none."""
+    raw = os.environ.get(ROUTE_ENV)
+    if not raw:
+        return None
     try:
-        manifest = stage_proof_binary()
-    except Infrastructure as error:
-        print(json.dumps({"schema": SCHEMA, "ok": False,
-                          "refused": f"staging the proof build failed: {error.detail}"}))
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
+def wall_deadline():
+    """The absolute monotonic deadline the outer half launched the guard with, if any."""
+    raw = os.environ.get(WALL_DEADLINE_ENV)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def outer_half(mode):
+    """Verify the pinned supervisor and this host's scratch route, then hand over to it.
+
+    Nothing is staged and no fixture exists yet: entering the unchanged supervisor's
+    bytes comes first, the scratch volume's UUID and shape second, and the guarded
+    child stages its own source-bound build inside the run the guard created.
+    """
+    supervisor = supervisor_path()
+    problems = installed_supervisor_problems()
+    if problems:
+        print(json.dumps({"schema": SCHEMA, "ok": False, "refused": "; ".join(problems)}))
         return 125
-    binary = manifest["path"]
+    facts = scratch_route_facts()
+    route_problems = scratch_route_problems(facts)
+    if route_problems:
+        print(json.dumps({"schema": SCHEMA, "ok": False,
+                          "refused": "; ".join(route_problems), "route": route_document(facts)}))
+        return 125
     env = dict(os.environ)
     env.pop("OXIDE_TASK_SCRATCH_ROOT", None)
     env.pop("DYLD_INSERT_LIBRARIES", None)
+    env.pop("BARGE_PROOF_ROUTE", None)
+    env[ROUTE_ENV] = json.dumps(route_document(facts), separators=(",", ":"))
+    env[WALL_DEADLINE_ENV] = str(time.monotonic_ns() + (LIMIT_SECONDS - 2) * 1_000_000_000)
     env["BARGE_PROOF_SUPERVISOR"] = supervisor
-    result = subprocess.run(supervisor_command(supervisor, mode, binary), env=env)
+    result = subprocess.run(supervisor_command(supervisor, mode), env=env)
     return result.returncode
 
 
@@ -1403,6 +2427,618 @@ def feature_problems():
         problems.append("macos.rs lacks the ordinary tool-home branch that ignores the environment")
     if not os.path.isfile(os.path.join(REPO_ROOT, "crates", "barge", "src", "os", "proof_account.rs")):
         problems.append("the proof-only account module is missing")
+    return problems
+
+
+def route_controls():
+    """The scratch-route decisions, pinned on canned observations. Pure."""
+    problems = []
+    route = {"path": DESIGNATED_SCRATCH, "realpath": DESIGNATED_SCRATCH,
+             "volume_mount": SCRATCH_VOLUME_MOUNT, "volume_uuid": SCRATCH_VOLUME_UUID,
+             "owner_uid": 501, "mode": 0o700, "uid": 501, "present": True}
+    if scratch_route_problems(route):
+        problems.append("the pinned Stash scratch route is refused")
+    for flipped in ({"volume_uuid": "00000000-0000-0000-0000-000000000000"},
+                    {"volume_uuid": None},
+                    {"path": SCRATCH_VOLUME_MOUNT},
+                    {"path": os.path.expanduser("~/scratch/barge")},
+                    {"realpath": "/private" + DESIGNATED_SCRATCH},
+                    {"mode": 0o755},
+                    {"owner_uid": 0},
+                    {"present": False}):
+        if not scratch_route_problems(dict(route, **flipped)):
+            problems.append(f"a wrong scratch route {flipped} is accepted")
+    document = route_document(route)
+    if route_refusals(document):
+        problems.append("the carried route document of the pinned scratch is refused")
+    for flipped in ({"designated_scratch": SCRATCH_VOLUME_MOUNT},
+                    {"volume_uuid": "0" * 8},
+                    {"schema": "other/1"},
+                    {"observed": dict(route, mode=0o777)}):
+        if not route_refusals(dict(document, **flipped)):
+            problems.append(f"a carried route document {flipped} is accepted")
+    for absent in (None, {}, "not a document"):
+        if not route_refusals(absent):
+            problems.append("an absent scratch route document is accepted")
+    return problems
+
+
+def stage_controls():
+    """Staging's location, environment and ordering decisions. Pure: reads source text."""
+    problems = []
+    guarded = {"owned root": "/guard/root", "evidence directory": "/guard/root/evidence"}
+    if stage_parent_problems("/guard/root", guarded):
+        problems.append("a stage directory inside the guarded root is refused")
+    for parent in ("/elsewhere/stage", DESIGNATED_SCRATCH, os.sep, SCRATCH_VOLUME_MOUNT,
+                   os.path.expanduser("~"), "relative/stage",
+                   "/guard/root/../elsewhere"):
+        if not stage_parent_problems(parent, guarded):
+            problems.append(f"the stage parent {parent} is accepted")
+    unguarded = {"designated scratch": DESIGNATED_SCRATCH}
+    if not stage_parent_problems("/elsewhere/stage", unguarded):
+        problems.append("the unguarded stage mode accepts a directory outside the designated scratch")
+    if stage_parent_problems(os.path.join(DESIGNATED_SCRATCH, "proof-occurrence-x"), unguarded):
+        problems.append("the stage mode refuses its own occurrence directory")
+    if stage_directory({"schema": STAGE_SCHEMA, "features": [PROOF_FEATURE], "sha256": "0" * 64}):
+        problems.append("a well-formed staged build is refused")
+    for broken in ({"schema": "other/1"}, {"features": []}, {"sha256": None}):
+        document = {"schema": STAGE_SCHEMA, "features": [PROOF_FEATURE], "sha256": "0" * 64}
+        if not stage_directory(dict(document, **broken)):
+            problems.append(f"a staged build {broken} is accepted")
+    environment = stage_environment({"RUSTFLAGS": "-C target-cpu=native",
+                                     "CARGO_ENCODED_RUSTFLAGS": "-C debug-assertions=on",
+                                     "DYLD_INSERT_LIBRARIES": "/tmp/shim.dylib",
+                                     "RUSTUP_TOOLCHAIN": "stable", "PATH": "/usr/bin"},
+                                    "/guard/root")
+    if stage_environment_problems(environment):
+        problems.append("the guarded stage environment is refused after its own scrub")
+    if environment.get("TMPDIR") != "/guard/root":
+        problems.append("the stage environment does not place its temporary directory in the guard")
+    for broken in ({"RUSTFLAGS": "-C debug-assertions=on"}, {"RUSTUP_TOOLCHAIN": "stable"},
+                   {"RUSTUP_AUTO_INSTALL": "1"}, {"CARGO_NET_OFFLINE": "false"},
+                   {"OXIDE_TASK_SCRATCH_ROOT": "/guard/root"}, {"TMPDIR": ""}):
+        if not stage_environment_problems(dict(environment, **broken)):
+            problems.append(f"a stage environment {broken} is accepted")
+    with open(SCRIPT_PATH, encoding="utf-8") as handle:
+        text = handle.read()
+    outer = text.split("def outer_half(", 1)
+    if len(outer) != 2 or "stage_proof_binary" in outer[1].split("\ndef ", 1)[0]:
+        problems.append("the outer half stages the proof build before the supervisor is entered")
+    inner = text.split("def inner_half(", 1)
+    if len(inner) != 2:
+        problems.append("the guarded half is missing")
+    else:
+        body = inner[1].split("\ndef ", 1)[0]
+        if "guard_refusals(" not in body or "guarded_run(" not in body:
+            problems.append("the guarded half does not refuse its premises before it stages")
+        elif body.find("guard_refusals(") > body.find("guarded_run("):
+            problems.append("the guarded half stages before it refuses a non-guard caller")
+    return problems
+
+
+def custody_controls():
+    """The guard's image-custody indication and the attach decisions. Pure."""
+    problems = []
+    backing = "/guard/root/run/release-volume.sparseimage"
+    if custody_document(backing, "/guard/root/run", "/guard/root/evidence") != {
+            "version": CUSTODY_VERSION, "backings": [backing]}:
+        problems.append("the image-custody indication changed the guard's own shape")
+    if custody_document("/guard/root/evidence/proof.sparseimage", "/guard/root/run",
+                        "/guard/root/evidence")["backings"] != ["/guard/root/evidence/proof.sparseimage"]:
+        problems.append("a backing inside the evidence directory is refused")
+    for path in ("/Users/tom/run/image.sparseimage", "/guard/root/../image.sparseimage",
+                 "relative.sparseimage", "/guard/rootish/image.sparseimage"):
+        try:
+            custody_document(path, "/guard/root/run", "/guard/root/evidence")
+        except ValueError:
+            continue
+        problems.append(f"a custody backing {path} outside the owned root is published")
+    mount = "/Volumes/barge-release-proof-1-2-a"
+    device = "/dev/disk9s1"
+    # An APFS image attaches as a container entity plus its mounted volume entity. That
+    # is the shape the guard's own census and the reviewed space pattern read, so this
+    # positive control is the real one and not a single-row simplification.
+    container = ("/dev/disk9", None)
+    for rows in ([(device, mount)], [container, (device, mount)],
+                 [container, (device, mount), ("/dev/disk9s2", None)]):
+        document = attach_document(0, True, rows, mount, device)
+        if document["state"] != "attached" or document.get("entities") != len(rows):
+            problems.append(f"a positive attach is refused for the census {rows!r}: {document}")
+    for exit_code, reaped, rows, reported in (
+            (1, True, [(device, mount)], device),
+            (0, False, [(device, mount)], device),
+            (0, True, None, device),
+            (0, True, [], device),
+            (0, True, [container], device),
+            (0, True, [container, (device, None)], device),
+            (0, True, [container, (device, mount), ("/dev/disk9s2", "/Volumes/other")], device),
+            (0, True, [container, (device, mount), (device, mount)], device),
+            (0, True, [container, ("x", mount)], device),
+            (0, True, [(device, mount)], None),
+            (0, True, [(device, mount)], "")):
+        if attach_document(exit_code, reaped, rows, mount, reported)["state"] == "attached":
+            problems.append(f"an unknown attach {exit_code, reaped, rows, reported} is accepted")
+    return problems
+
+
+def closure_controls():
+    """The detach authorization and the closure gate. Pure."""
+    problems = []
+    mount = "/Volumes/barge-release-proof-1-2-a"
+    device = "/dev/disk9s1"
+    uuid = "8A660440-C919-45C6-A3F1-3365B9BD2006"
+    # The container-plus-volume shape is the reviewed positive binding, and single-entity
+    # censuses stay acceptable so the same gate covers both real shapes.
+    container = ("/dev/disk9", None)
+    for rows in ([(device, mount)], [container, (device, mount)],
+                 [(device, mount), ("/dev/disk9s2", None)]):
+        problems_found = detach_binding_problems(rows, mount, device, uuid, uuid.lower())
+        if problems_found:
+            problems.append(f"a bound image is refused a detach for {rows!r}: {problems_found}")
+    for rows, observed in (([], uuid), (None, uuid), ([container], uuid),
+                           ([(device, mount), (device, mount)], uuid),
+                           ([container, (device, mount), ("/dev/disk9s2", "/Volumes/other")], uuid),
+                           ([container, ("/dev/disk9s2", mount)], uuid),
+                           ([(device, mount)], "other"), ([(device, mount)], None)):
+        if not detach_binding_problems(rows, mount, device, uuid, observed):
+            problems.append(f"a detach is authorized by {rows, observed}")
+    if not closure_document("final", 0, True, [], True)["closed"]:
+        problems.append("a correct ordinary detach with whole-backing absence is not closed")
+    for exit_code, reaped, rows, mount_absent in (
+            (0, True, [(device, None)], True),
+            (0, True, [container], True),
+            (0, True, [container, (device, mount)], True),
+            (1, True, [], True),
+            (None, False, [], True),
+            (0, True, None, True),
+            (0, True, [], False)):
+        document = closure_document("final", exit_code, reaped, rows, mount_absent)
+        if document["closed"] or document["custody"] != "retained":
+            problems.append(f"an unclosed detach {exit_code, reaped, rows, mount_absent} is accepted")
+    if closure_document("intermediate", 0, True, [], True)["purpose"] != "intermediate":
+        problems.append("the closure record does not keep the detach's purpose")
+    return problems
+
+
+def failure_report_controls():
+    """Each failed oracle names its own predicate and keeps bounded decisive fields. Pure.
+
+    Every case below uses canned documents and counting thunks only; none of it claims a
+    live observation. The point is that a failure record can no longer absorb the deciding
+    fields, and that the original predicate order and short-circuit are preserved.
+    """
+    problems = []
+    if bounded_text("x" * 10, 4) != "xxxx...[+6 chars]":
+        problems.append("bounded_text does not mark a capped value")
+    if bounded_text(7) != 7 or bounded_text(None) is not None:
+        problems.append("bounded_text does not pass non-strings through")
+
+    # Order and short-circuit, with call counts: only checks up to the first failure run.
+    calls = []
+
+    def recorded(name, answer):
+        def check():
+            calls.append(name)
+            return answer
+        return check
+
+    failed = first_failed_predicate([("a", recorded("a", False)), ("b", recorded("b", True)),
+                                     ("c", recorded("c", True))])
+    if failed != "b" or calls != ["a", "b"]:
+        problems.append(f"first_failed_predicate order or short-circuit changed: {failed}, {calls}")
+    if first_failed_predicate([("a", recorded("a", False)), ("b", recorded("b", False))]) is not None:
+        problems.append("a conjunction that holds reports a failed predicate")
+
+    # The R11 post-replay conjunction: each predicate discriminated on its own, plus the
+    # actual passing conjunction, with the path observation counted.
+    def document(count, rows, *, missing_rows=False):
+        value = {"released_count": count, "kept_count": 0, "stopped": False, "replay_pending": 0}
+        if not missing_rows:
+            value["rows"] = rows
+        return value
+
+    def case(name, doc, expected, expected_calls, expected_observations):
+        observed = []
+        try:
+            actual, observations = released_after_replay_failure(
+                doc, "root-a", lambda: (observed.append(1), False)[1])
+        except Exception as error:  # an eager conjunction reaches a member it must not
+            problems.append(f"R11 post-replay predicate {name} raised {type(error).__name__}: {error}")
+            return
+        if actual != expected or len(observed) != expected_calls or observations != expected_observations:
+            problems.append(
+                f"R11 post-replay predicate {name}: got {actual!r}, {len(observed)} path reads, "
+                f"{observations!r}")
+
+    case("zero released", document(0, []), "released_count", 0, {})
+    case("zero rows", document(1, []), "row_count", 1, {"path_present": False})
+    case("multi-row", document(1, [{"root_id": "root-a"}, {"root_id": "root-b"}]),
+         "row_count", 1, {"path_present": False})
+    case("wrong root", document(1, [{"root_id": "root-b"}]),
+         "root_id", 1, {"path_present": False})
+    case("passing conjunction", document(1, [{"root_id": "root-a"}]),
+         None, 1, {"path_present": False})
+    # A path that is still present fails on its own name, and the filesystem is read once.
+    observed = []
+    try:
+        actual, observations = released_after_replay_failure(
+            document(1, [{"root_id": "root-a"}]), "root-a",
+            lambda: (observed.append(1), True)[1])
+        if actual != "path_present" or len(observed) != 1 or observations != {"path_present": True}:
+            problems.append(f"R11 path predicate: got {actual!r}, {len(observed)} reads, {observations!r}")
+    except Exception as error:
+        problems.append(f"R11 path predicate raised {type(error).__name__}: {error}")
+    # Short-circuit preserved: an unreached member is never demanded.
+    try:
+        actual, observations = released_after_replay_failure(
+            document(0, [], missing_rows=True), "root-a", lambda: False)
+        if actual != "released_count" or observations != {}:
+            problems.append(f"an unreached rows member was demanded: {actual!r}, {observations!r}")
+    except KeyError:
+        problems.append("an unreached rows member was read")
+    try:
+        released_after_replay_failure(document(1, [], missing_rows=True), "root-a", lambda: False)
+        problems.append("a reached rows member is not propagated when absent")
+    except KeyError:
+        pass
+
+    # The "root must still be here" conjunction used by R2/R3/R5/R8/R10 (and R4's release):
+    # the count decides first, the filesystem is read once, and the name discriminates.
+    kept_document = {"released_count": 0, "kept_count": 1, "stopped": False,
+                     "replay_pending": 0, "rows": [{"root_id": "root-a", "outcome": "kept"}]}
+    observed = []
+    failed, observations = root_kept_failure(
+        kept_document, "root-a", lambda: (observed.append(1), True)[1])
+    if failed is not None or len(observed) != 1 or observations != {"path_present": True}:
+        problems.append(f"the kept-root conjunction rejects a kept root: {failed!r}, {observations!r}")
+    observed = []
+    failed, observations = root_kept_failure(
+        {"released_count": 1}, "root-a", lambda: (observed.append(1), True)[1])
+    if failed != "released_count" or observed or observations != {}:
+        problems.append(f"the kept-root conjunction does not name a release: {failed!r}, {observations!r}")
+    observed = []
+    failed, observations = root_kept_failure(
+        kept_document, "root-a", lambda: (observed.append(1), False)[1])
+    if failed != "path_present" or len(observed) != 1 or observations != {"path_present": False}:
+        problems.append(f"the kept-root conjunction does not name a missing path: {failed!r}, "
+                        f"{observations!r}")
+    # The release polarity is its own helper: a correct release (count 1, path gone) must
+    # pass, and a root that stays on disk must name the path. Keep polarity is the mirror.
+    observed = []
+    failed, observations = root_released_failure(
+        {"released_count": 1}, "root-a", lambda: (observed.append(1), False)[1])
+    if failed is not None or len(observed) != 1 or observations != {"path_present": False}:
+        problems.append(f"a correct release is refused: {failed!r}, {observations!r}")
+    observed = []
+    failed, observations = root_released_failure(
+        {"released_count": 1}, "root-a", lambda: (observed.append(1), True)[1])
+    if failed != "path_present" or len(observed) != 1 or observations != {"path_present": True}:
+        problems.append(f"a root still on disk is not named: {failed!r}, {observations!r}")
+    observed = []
+    failed, observations = root_released_failure(
+        {"released_count": 0}, "root-a", lambda: (observed.append(1), False)[1])
+    if failed != "released_count" or observed or observations != {}:
+        problems.append(f"a counted release is not named: {failed!r}, {observations!r}")
+    # The two polarities stay opposites on the same document.
+    document_for_polarity = {"released_count": 1}
+    if root_kept_failure(document_for_polarity, "root-a", lambda: False)[0] != "released_count":
+        problems.append("keep polarity accepts a release")
+    if root_released_failure(document_for_polarity, "root-a", lambda: True)[0] != "path_present":
+        problems.append("release polarity accepts a root that stays on disk")
+
+    # The replay conjunction: the intent list is only read when the document held.
+    calls = []
+    if replay_settlement_failure({"replay_pending": 1}, lambda: calls.append(1) or [{"id": 1}]) != "replay_pending" or calls:
+        problems.append("the replay conjunction read intents before the document's own count")
+    calls = []
+    if replay_settlement_failure({"replay_pending": 0}, lambda: calls.append(1) or [{"id": 1}]) != "pending_intents" or len(calls) != 1:
+        problems.append("the replay conjunction does not name a pending intent")
+    if replay_settlement_failure({"replay_pending": 0}, lambda: []) is not None:
+        problems.append("a settled replay reports a failure")
+    for index, name in enumerate(("identity_record", "marker", "content", "inode")):
+        flags = [True, True, True, True]
+        flags[index] = False
+        if rollback_failure(*flags) != name:
+            problems.append(f"rollback does not discriminate {name}")
+    if rollback_failure(True, True, True, True) is not None:
+        problems.append("an intact rollback reports a changed observation")
+
+    # The bounded record: forty rows with long reasons stay inside the allowance, the
+    # decisive fields survive, and an unobserved path is never guessed.
+    rows = [{"root_id": f"root-{index}", "outcome": "kept", "reason": "r" * 600}
+            for index in range(40)]
+    document_with_rows = {"released_count": 0, "kept_count": 40, "stopped": False,
+                          "replay_pending": 0, "rows": rows, "area": "example/c11"}
+    summary = run_report_summary(document_with_rows, "root-a")
+    if len(json.dumps(summary, sort_keys=True)) > ROW_EVIDENCE_CHARS:
+        problems.append("the run failure record exceeds the reporting allowance")
+    for key, value in (("released_count", 0), ("kept_count", 40),
+                       ("expected_root_id", "root-a"), ("path_present", "unobserved")):
+        if summary.get(key) != value:
+            problems.append(f"the run failure record drops {key}")
+    returned = [row["root_id"] for row in rows]
+    if (summary["row_root_ids"] != returned[:len(summary["row_root_ids"])]
+            or len(summary["row_root_ids"]) + summary["row_root_ids_omitted"] != len(returned)):
+        problems.append(f"the returned root ids are not a bounded prefix: "
+                        f"{len(summary['row_root_ids'])}, {summary['row_root_ids_omitted']}")
+    if (summary["rows_total"] != 40 or summary["rows_omitted"] == 0
+            or len(summary["rows"]) + summary["rows_omitted"] != 40):
+        problems.append(f"the run failure record does not bound its rows: {summary['rows_total']}, "
+                        f"{summary['rows_omitted']}, {len(summary['rows'])}")
+    # The returned root-id list needs its own bound: 200 rows with long ids must not blow
+    # the allowance, and the omitted count must account for every id.
+    hostile_rows = [{"root_id": "root-" + "x" * 200 + f"-{index}", "outcome": "kept",
+                     "reason": "r" * 900} for index in range(200)]
+    hostile = run_report_summary({"released_count": 0, "kept_count": 200, "stopped": False,
+                                  "replay_pending": 0, "rows": hostile_rows}, "root-a")
+    hostile_detail = failure_detail("released_count", hostile)
+    if len(hostile_detail) > ROW_EVIDENCE_CHARS:
+        problems.append(f"a 200-row failure record exceeds the allowance: {len(hostile_detail)}")
+    if (len(hostile["row_root_ids"]) > ROW_ID_LIMIT
+            or len(hostile["row_root_ids"]) + hostile["row_root_ids_omitted"] != 200):
+        problems.append(f"the returned root ids are not bounded or accounted: "
+                        f"{len(hostile['row_root_ids'])}, {hostile['row_root_ids_omitted']}")
+    if (len(hostile["rows"]) + hostile["rows_omitted"] != 200
+            or len(json.dumps(hostile, sort_keys=True)) > ROW_EVIDENCE_CHARS):
+        problems.append("the 200-row record does not account for every row inside the allowance")
+    small = run_report_summary({"released_count": 1, "kept_count": 0, "stopped": False,
+                                "replay_pending": 0,
+                                "rows": [{"root_id": "root-b", "outcome": "kept",
+                                          "reason": "a reason"}]}, "root-a",
+                               {"path_present": False})
+    if small["rows"] != [{"root_id": "root-b", "outcome": "kept", "reason": "a reason"}]:
+        problems.append(f"the per-row record changed: {small['rows']!r}")
+    if small["path_present"] is not False:
+        problems.append("a reached path observation is not reported")
+    detail = failure_detail("root_id", small)
+    if not detail.startswith("root_id failed: ") or '"expected_root_id": "root-a"' not in detail[:400]:
+        problems.append(f"the failure detail does not lead with its predicate and fields: {detail[:120]}")
+    # A field set alone is still inside the allowance.
+    if len(json.dumps(failure_summary({f"field{index}": index for index in range(200)}),
+                      sort_keys=True)) <= ROW_EVIDENCE_CHARS:
+        problems.append("the failure-summary bound check did not run")
+    return problems
+
+
+def plan_controls():
+    """A failing plan row stays judgeable from the receipt, and the oracle still decides.
+
+    The row the CLI prints is a sorted-key document: `absence` sorts first and its own
+    member set is larger than the driver's old 400-character cap, so a truncated detail
+    could not name the gate. These controls pin the deciding fields ahead of the row and
+    prove the eligibility requirement itself is unchanged.
+    """
+    problems = []
+    absence = {"anchor": {"kind": "registered", "path": "/Volumes/x"},
+               "ancestor": {"device": 16777248, "inode": 34,
+                            "path": "/Volumes/x/checkouts",
+                            "volume": {"kind": "registered", "volume_uuid": "u"}},
+               "components_walked": 1, "leaf": {"name": "reappears", "result": "enoent"},
+               "path": "/Volumes/x/checkouts/reappears" + "/" + "p" * 3000,
+               "proved_ms": 1, "verdict": "absent"}
+    references = [{"source": "barge-holds", "current": False},
+                  {"source": "oxide-registry", "current": True},
+                  {"source": "oxide-receipt", "current": False}]
+    row = {"absence": absence, "blocked_by": "references", "custody": "safe",
+           "eligible": False, "identity": {"verdict": "verified"},
+           "idle": {"last_activity_ms": 1700000000000, "reason": None},
+           "reason": "a reference still names this root: oxide-registry",
+           "references": references, "references_complete": True, "root_id": "r"}
+    summary = row_deciding_summary(row)
+    expected = {"eligible": False, "blocked_by": "references",
+                "reason": "a reference still names this root: oxide-registry",
+                "identity_verdict": "verified", "identity_reason": None,
+                "custody": "safe", "custody_reason": None,
+                "last_activity_ms": 1700000000000, "idle_reason": None,
+                "age_waived": None, "references_complete": True,
+                "references_current": ["oxide-registry"],
+                "absence_verdict": "absent", "absence_reason": None}
+    if summary != expected:
+        problems.append(f"the deciding summary changed: {json.dumps(summary, sort_keys=True)[:400]}")
+    if row_deciding_summary({"eligible": True}) != dict(
+            {key: None for key in expected} | {"eligible": True, "references_complete": None,
+                                               "references_current": []}):
+        problems.append("the deciding summary invents fields for a bare eligible row")
+    # Ambiguity guard: the absence document alone is longer than a short cap, so the
+    # deciding fields must lead the message rather than follow the row.
+    proof = Proof.__new__(Proof)
+    proof.root = "/guard/root"
+    proof.current_area = None
+    proof.preview = lambda *args, **kwargs: (0, {})
+    proof.row_for = lambda document, root: row
+    try:
+        proof.plan_and_run("R10", "c10", {"root_id": "r"}, expect_eligible=True)
+        problems.append("an ineligible row satisfies the eligible expectation")
+    except Fault as error:
+        detail = error.detail
+        if not detail.startswith("expected eligible=True; deciding "):
+            problems.append(f"the failure does not lead with the deciding fields: {detail[:120]}")
+        if '"blocked_by": "references"' not in detail[:400]:
+            problems.append("the first blocker is not inside the first 400 characters")
+        # The row portion is capped at ROW_EVIDENCE_CHARS; the deciding summary that
+        # precedes it is a fixed, small field set, so the whole record stays bounded.
+        if len(detail) > ROW_EVIDENCE_CHARS + 1000:
+            problems.append(f"the failure record is not bounded: {len(detail)} characters")
+    # The same row must satisfy the inverse expectation, and an eligible row must pass
+    # the eligible expectation: the decision rule itself is untouched.
+    if proof.plan_and_run("R10", "c10", {"root_id": "r"}, expect_eligible=False)[1] is not row:
+        problems.append("the inverse expectation does not return the same row")
+    eligible = dict(row, eligible=True, blocked_by=None, reason=None)
+    proof.row_for = lambda document, root: eligible
+    if proof.plan_and_run("R10", "c10", {"root_id": "r"}, expect_eligible=True)[1] is not eligible:
+        problems.append("an eligible row does not satisfy the eligible expectation")
+    try:
+        proof.plan_and_run("R10", "c10", {"root_id": "r"}, expect_eligible=False)
+        problems.append("an eligible row satisfies the ineligible expectation")
+    except Fault:
+        pass
+    return problems
+
+
+def containment_facts(**overrides):
+    """The pinned guard's real monitored layout as canned facts, plus overrides. Pure.
+
+    The supervisor creates `oxide-proof.*` directly under `--root-parent`, then
+    `scratch/` and, by default, `evidence/` inside it, so scratch and evidence are
+    siblings inside one owned root: that is the positive shape these canned facts carry.
+    """
+    root = "/Volumes/Stash/scratch/barge/oxide-proof.abc123"
+    facts = {
+        "scratch": root + "/scratch",
+        "evidence": root + "/evidence",
+        "root_parent": os.path.realpath(DESIGNATED_SCRATCH),
+        "uid": 501,
+        "scratch_facts": {"path": root + "/scratch", "realpath": root + "/scratch",
+                          "isdir": True, "uid": 501, "mode": 0o755, "present": True},
+        "evidence_facts": {"path": root + "/evidence", "realpath": root + "/evidence",
+                           "isdir": True, "uid": 501, "mode": 0o755, "present": True},
+        "root_facts": {"path": root, "realpath": root, "isdir": True, "uid": 501,
+                       "mode": 0o700, "present": True},
+    }
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(facts.get(key), dict):
+            facts[key] = dict(facts[key], **value)
+        else:
+            facts[key] = value
+    return facts
+
+
+def containment_controls():
+    """The guard's real scratch/evidence layout and its refusals. Pure."""
+    problems = []
+    root = "/Volumes/Stash/scratch/barge/oxide-proof.abc123"
+    if guard_containment_problems(containment_facts()):
+        problems.append("the pinned guard's sibling scratch and evidence layout is refused")
+    for evidence in (root + "/scratch/supervisor-evidence.xyz",
+                     root + "/scratch/evidence/nested"):
+        facts = containment_facts(evidence=evidence,
+                                  evidence_facts={"path": evidence, "realpath": evidence})
+        if guard_containment_problems(facts):
+            problems.append(f"a guard evidence directory inside the same owned root is refused: {evidence}")
+    for name, facts in (
+            ("evidence outside the owned root",
+             containment_facts(evidence="/private/tmp/evidence",
+                               evidence_facts={"path": "/private/tmp/evidence",
+                                               "realpath": "/private/tmp/evidence"})),
+            ("evidence naming the owned root", containment_facts(
+                evidence=root, evidence_facts={"path": root, "realpath": root})),
+            ("evidence aliasing the scratch directory", containment_facts(
+                evidence=root + "/scratch",
+                evidence_facts={"path": root + "/scratch", "realpath": root + "/scratch"})),
+            ("an aliased evidence path",
+             containment_facts(evidence=root + "/evidence-link",
+                               evidence_facts={"path": root + "/evidence-link",
+                                               "realpath": root + "/evidence"})),
+            ("a symlinked evidence directory",
+             containment_facts(evidence=root + "/evidence-link",
+                               evidence_facts={"path": root + "/evidence-link", "islink": True})),
+            ("a symlinked scratch directory",
+             containment_facts(scratch_facts={"islink": True})),
+            ("an aliased scratch path",
+             containment_facts(scratch_facts={"realpath": "/private/tmp/elsewhere"})),
+            ("a foreign owned root",
+             containment_facts(scratch="/private/tmp/oxide-proof.abc123/scratch",
+                               scratch_facts={"path": "/private/tmp/oxide-proof.abc123/scratch",
+                                              "realpath": "/private/tmp/oxide-proof.abc123/scratch"},
+                               evidence="/private/tmp/oxide-proof.abc123/evidence",
+                               evidence_facts={"path": "/private/tmp/oxide-proof.abc123/evidence",
+                                               "realpath": "/private/tmp/oxide-proof.abc123/evidence"},
+                               root_facts={"path": "/private/tmp/oxide-proof.abc123",
+                                           "realpath": "/private/tmp/oxide-proof.abc123"})),
+            ("a root nested off the verified parent",
+             containment_facts(
+                 scratch=DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123/scratch",
+                 scratch_facts={"path": DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123/scratch",
+                                "realpath": DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123/scratch"},
+                 evidence=DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123/evidence",
+                 evidence_facts={"path": DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123/evidence",
+                                 "realpath": DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123/evidence"},
+                 root_facts={"path": DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123",
+                             "realpath": DESIGNATED_SCRATCH + "/nested/oxide-proof.abc123"})),
+            ("an unprivate owned root", containment_facts(root_facts={"mode": 0o755})),
+            ("an owned root of another account", containment_facts(root_facts={"uid": 0})),
+            ("a group-writable scratch", containment_facts(scratch_facts={"mode": 0o775})),
+            ("a world-writable evidence directory", containment_facts(evidence_facts={"mode": 0o777})),
+            ("an evidence directory of another account", containment_facts(evidence_facts={"uid": 0})),
+            ("a scratch path that is not a directory", containment_facts(scratch_facts={"isdir": False})),
+            ("an absent evidence directory", containment_facts(evidence_facts={"present": False})),
+            ("a scratch path with no parent", containment_facts(scratch="scratch", scratch_facts=None)),
+            ("a relative evidence path", containment_facts(evidence="evidence",
+                                                           evidence_facts={"path": "evidence"}))):
+        if not guard_containment_problems(facts):
+            problems.append(f"the guard containment accepts {name}")
+    # The real observation helper reports the pinned layout it is pointed at, and
+    # nothing at all for an absent path.
+    absent = guard_containment_facts("/nonexistent/scratch", "/nonexistent/evidence")
+    if absent["scratch_facts"] is None or absent["evidence_facts"] is None:
+        problems.append("the containment observation does not record the paths it was given")
+    if not guard_containment_problems(absent):
+        problems.append("an absent guard layout is accepted")
+    return problems
+
+
+def guarded_controls():
+    """The guarded half's refusals and its stage-verify-prove order, on seams. Pure."""
+    problems = []
+    route = route_document({"path": DESIGNATED_SCRATCH, "realpath": DESIGNATED_SCRATCH,
+                            "volume_mount": SCRATCH_VOLUME_MOUNT, "volume_uuid": SCRATCH_VOLUME_UUID,
+                            "owner_uid": 501, "mode": 0o700, "uid": 501, "present": True})
+    good = {"evidence_isdir": True, "scratch_isdir": True, "tmpdir_inside_scratch": True,
+            "containment_problems": [], "supervisor_problems": [], "route": route,
+            "deadline_ns": 1}
+    if guard_refusals(good):
+        problems.append("the guarded premises are refused")
+    if not guard_refusals(dict(good, containment_problems=["the evidence directory is outside"])):
+        problems.append("a containment problem does not refuse the guarded run")
+    if not inside_owned("/guard/root", "/guard/root"):
+        problems.append("the owned root itself is not inside the owned root")
+    if not inside_owned("/guard/root/evidence", "/guard/root"):
+        problems.append("a directory inside the owned root is not inside it")
+    for path, owned in (("/guard/rootish", "/guard/root"), ("/elsewhere", "/guard/root"),
+                        ("/guard/root/../elsewhere", "/guard/root"), ("", "/guard/root"),
+                        ("/guard/root", "")):
+        if inside_owned(path, owned):
+            problems.append(f"{path!r} is accepted as inside {owned!r}")
+    for flipped in ({"evidence_isdir": False}, {"scratch_isdir": False},
+                    {"tmpdir_inside_scratch": False},
+                    {"supervisor_problems": ["the supervisor is sha256 x, not the pinned y"]},
+                    {"route": None}, {"route": dict(route, volume_uuid="0")},
+                    {"deadline_ns": None}):
+        if not guard_refusals(dict(good, **flipped)):
+            problems.append(f"a guarded run accepts {flipped}")
+    order = []
+    staged = {"schema": STAGE_SCHEMA, "features": [PROOF_FEATURE], "sha256": "0" * 64,
+              "head": "0" * 40, "path": "/guard/root/proof-binary-x/barge"}
+    def fake_stage(parent, owned, deadline_ns=None):
+        order.append("stage")
+        return staged, {"seconds": 0.0}
+    def fake_verify(binary, head, root):
+        order.append("verify")
+        return []
+    def fake_prove(mode, build, record, receipt_path, guarded_route):
+        order.append("prove")
+        return 0
+    def guarded(**overrides):
+        arguments = {"stage": fake_stage, "verify": fake_verify, "head": "0" * 40,
+                     "prove": fake_prove}
+        arguments.update(overrides)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return guarded_run("counted", "/guard/root/evidence/receipt.json", route, 1,
+                               "/guard/root", {"owned root": "/guard/root"}, **arguments)
+    if guarded() != 0 or order != ["stage", "verify", "prove"]:
+        problems.append(f"the guarded order is not stage-verify-prove: {order}")
+    order.clear()
+    def failing_stage(parent, owned, deadline_ns=None):
+        order.append("stage")
+        raise Infrastructure("stage", "synthetic stage refusal")
+    if guarded(stage=failing_stage) != 125 or order != ["stage"]:
+        problems.append(f"a staging refusal reached a later effect: {order}")
+    order.clear()
+    def stale_verify(binary, head, root):
+        order.append("verify")
+        return ["the staged build is for another head"]
+    if guarded(verify=stale_verify) != 125 or order != ["stage", "verify"]:
+        problems.append(f"a stale staged build reached the proof: {order}")
     return problems
 
 
@@ -1435,8 +3071,18 @@ def pure_self_check():
         problems.append("the staged binary's artifact is not read from the build's JSON")
     if executable_from_build('{"reason":"build-finished"}') is not None:
         problems.append("a build with no barge binary artifact reports one")
-    if not staged_build_problems(os.path.join(scratch, "absent", "barge"), "0" * 40):
+    if not staged_build_problems(os.path.join(scratch, "absent", "barge"), "0" * 40, scratch):
         problems.append("a binary with no staged manifest is not refused")
+    if not staged_build_problems("/elsewhere/barge", "0" * 40, scratch):
+        problems.append("a binary outside the owned root is not refused")
+    problems += route_controls()
+    problems += stage_controls()
+    problems += custody_controls()
+    problems += closure_controls()
+    problems += containment_controls()
+    problems += plan_controls()
+    problems += failure_report_controls()
+    problems += guarded_controls()
     # Exercise the same path and rollback helpers used by R11, without a filesystem.
     identity = {"volume_uuid": "uuid", "mount_relative_path": "area/root", "inode": 7,
                 "record_path": "/state/id"}
@@ -1507,29 +3153,52 @@ def plan_document():
         "schema": SELF_CHECK_SCHEMA,
         "status": "held: no owner activation; no receipt exists",
         "supervisor": {"name": SUPERVISOR_NAME, "sha256": SUPERVISOR_SHA256},
+        "route": {
+            "designated_scratch": DESIGNATED_SCRATCH,
+            "volume_mount": SCRATCH_VOLUME_MOUNT,
+            "volume_uuid": SCRATCH_VOLUME_UUID,
+            "rule": "the mount's UUID, the canonical path, the account ownership and an "
+                    "owner-only mode are verified before any staging or fixture effect; "
+                    "a drive root, a home folder, a symlink or another volume refuses",
+        },
         "build": {
             "feature": PROOF_FEATURE,
             "command": BUILD_COMMAND,
-            "staged_under": STAGE_ROOT,
-            "stage_selector": "release:native:stage",
+            "staged_under": "this occurrence's guarded root (a private exclusive directory "
+                            "inside OXIDE_TASK_SCRATCH_ROOT), never a shared stage directory",
+            "stage_budget": f"inside the guard's {LIMIT_SECONDS} s wall: staging and its waits "
+                            "spend the supervisor's own bound and never a clock of their own",
+            "stage_selector": "release:native:stage (an explicit, separately selected staging "
+                              "build; a native run never reads it)",
             "production_build": "not run by this proof",
+            "toolchain": TOOLCHAIN_CHANNEL,
         },
         "isolation": {
             "fixture_bindings": sorted(fixture_environment("<home>", "<state>", "<run>")),
             "oxide_directories": {"state": OXIDE_STATE_RELATIVE, "cache": OXIDE_CACHE_RELATIVE},
-            "rule": "every bound path resolves inside the supervisor's owned scratch; the reference control each case chose must too",
+            "rule": "every bound fixture path resolves inside the supervisor's owned scratch; the reference control each case chose must too",
+            "guard_containment": "the pinned supervisor keeps its scratch directory and its evidence directory as siblings inside one monitored owned root it creates directly under the verified Stash scratch parent; the driver requires both to be canonical, symlink-free, this account's and private, binds the owned root to the verified parent, and refuses an alias, an escape, a foreign or off-parent root and a mismatched occurrence (evidence is not required to be inside the scratch directory)",
+        },
+        "custody": {
+            "indication": CUSTODY_NAME,
+            "version": CUSTODY_VERSION,
+            "published": "before the backing exists and before any attach, retained for the run",
+            "intermediate_detach": "R11's ordinary detach, authorized by its own fresh rebind census",
+            "final_detach": "the script's final ordinary detach, authorized by its own fresh rebind census; "
+                            "the guard's cleanup is authorized separately by its own custody scan",
+            "closure": "ordinary child success and reap plus whole-backing attachment absence plus an absent mount path",
         },
         "limitation": LIMITATION,
         "premise_dispositions": {
-            "private_home_rustup": "setup uses private HOME/CARGO_HOME; no fixture builds; stage_proof_binary uses the pinned repository toolchain and committed lock with auto-install disabled",
+            "private_home_rustup": "every fixture child gets a private HOME/CARGO_HOME and the fixture state; the staged proof-feature compile is the ordinary managed Oxide build and therefore keeps the real account's HOME, CARGO_HOME and rustup home, writes nothing into the fixture, and is pinned to RUSTUP_TOOLCHAIN 1.97.1 with auto-install disabled and the committed lock; no fixture builds",
             "account_home": "fixture_environment binds HOME and BARGE_ACCOUNT_HOME; setup sets OXIDE_TEST_HOME_FROM_ENV for children",
-            "environment": "setup scrubs inherited OXIDE, XDG and BARGE variables, then restores guard and fixture bindings",
+            "environment": "setup scrubs inherited OXIDE, XDG and BARGE variables, then restores guard and fixture bindings; the stage environment drops both Rust flag variables",
             "adoption": "no checkout build in the fixture; roots are created explicitly by new_root",
             "cargo_argv": "no fake Cargo external subcommand is invoked",
-            "owned_image": "attach uses owners on; UUID and ownership checked; ordinary detach only; uncertain custody retained",
-            "compiler_flags": "stage_proof_binary and fixture setup remove both inherited flag variables",
-            "temporary_storage": "setup creates run root inside the guard scratch, image backing inside run root",
-            "mktemp": "setup and reset_registration use tempfile.mkdtemp with an explicit owned parent",
+            "owned_image": "one 64 MiB sparse image, attach uses owners on, UUID, device and whole-backing attachment verified, the guard's image-custody indication published before the backing exists, ordinary detach only, uncertain custody retained without repair, retry or force detach",
+            "compiler_flags": "stage_environment removes RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS and DYLD_INSERT_LIBRARIES, drops the guard hooks so the build is an ordinary managed Oxide compilation, pins RUSTUP_TOOLCHAIN, RUSTUP_AUTO_INSTALL=0 and CARGO_NET_OFFLINE=true, and points TMPDIR at the guard",
+            "temporary_storage": "the staged copy lives in one exclusive directory directly inside the guard's owned scratch root, before any fixture exists; setup then creates the private run root inside that same owned scratch, with the image backing inside the run root",
+            "mktemp": "setup and reset_registration use tempfile.mkdtemp with an explicit owned parent; the stage directory is exclusive too",
         },
         "bounds": {
             "admission": "heavy",
@@ -1540,16 +3209,20 @@ def plan_document():
             "may_delete": "synthetic fixture roots inside the owned image only",
         },
         "commands": {
-            "counted": supervisor_command("<supervisor>", "counted", "<staged proof binary>"),
-            "diagnostic": supervisor_command("<supervisor>", "diagnostic", "<staged proof binary>"),
+            "counted": supervisor_command("<supervisor>", "counted"),
+            "diagnostic": supervisor_command("<supervisor>", "diagnostic"),
         },
         "cases": [{"id": case["id"], "claim": case["claim"], "carried_by": case["carried_by"]}
                   for case in CASES],
         "activation_order": [
-            "0. release:native:stage builds and hashes the proof-feature binary of the exact head",
+            "0. release:native:stage builds and hashes the proof-feature binary of the exact head; "
+            "a native run never reads that copy, because it stages its own inside the guard",
             "1. the owner activates one uncounted diagnostic at the exact head; it proves nothing alone",
             "2. the owner activates one counted author pass at the same head",
             "3. a distinct reviewer activates its own counted pass at the same head",
+            "4. the activator correlates the script receipt's case rows and whole-backing clearance "
+            "with the supervisor's own receipt (its clean conclusion and its detach/cleanup record); "
+            "a missing or unclear half is a missing proof",
         ],
     }
 
@@ -1560,7 +3233,6 @@ def argument_parser():
     parser.add_argument("--self-check", action="store_true")
     parser.add_argument("--plan", action="store_true")
     parser.add_argument("--inner", choices=["counted", "diagnostic"])
-    parser.add_argument("--binary")
     parser.add_argument("--receipt")
     return parser
 
@@ -1575,25 +3247,35 @@ def main(argv):
         if problems:
             return 1
         print(f"release-proof self-check: {len(CASES)} cases carried by named regressions; "
-              "the pinned supervisor and the argv guard hold")
+              "the pinned supervisor, the scratch route, the guard's sibling containment, "
+              "the stage route and the closure gate hold")
         return 0
     if args.plan:
         json.dump(plan_document(), sys.stdout, indent=2)
         sys.stdout.write("\n")
         return 0
     if args.inner:
-        if not args.binary:
-            parser.error("--inner needs --binary")
-        return inner_half(args.inner, args.binary, args.receipt)
+        return inner_half(args.inner, args.receipt)
     if args.mode is None:
         parser.error("name a mode: stage, counted or diagnostic (or --self-check / --plan)")
     if args.mode == "stage":
-        try:
-            manifest = stage_proof_binary()
-        except Infrastructure as error:
-            print(json.dumps({"schema": SCHEMA, "ok": False, "refused": f"staging failed: {error.detail}"}))
+        facts = scratch_route_facts()
+        problems = scratch_route_problems(facts)
+        if problems:
+            print(json.dumps({"schema": SCHEMA, "ok": False, "refused": "; ".join(problems),
+                              "route": route_document(facts)}))
             return 125
-        print(json.dumps({"schema": STAGE_SCHEMA, "ok": True, **manifest}, indent=1))
+        try:
+            occurrence = tempfile.mkdtemp(prefix="proof-occurrence-", dir=DESIGNATED_SCRATCH)
+            manifest, record = stage_proof_binary(
+                occurrence, {"designated scratch": DESIGNATED_SCRATCH},
+                deadline_ns=time.monotonic_ns() + STAGE_LIMIT_SECONDS * 1_000_000_000)
+        except Infrastructure as error:
+            print(json.dumps({"schema": SCHEMA, "ok": False,
+                              "refused": f"staging failed: {error.detail}"}))
+            return 125
+        print(json.dumps({"schema": STAGE_SCHEMA, "ok": True, "route": route_document(facts),
+                          "stage": record, **manifest}, indent=1))
         return 0
     return outer_half(args.mode)
 

@@ -1598,18 +1598,97 @@ and the incomplete-reference rule are the ordinary code. The ordinary build igno
 **Native proof: built, held for owner activation, not run.**
 `scripts/native/release-proof.py` carries the bounded native body. It runs under
 Oxide's qualified shared supervisor, pinned to the same bytes the S6, S7 and space
-proofs name, with a 300 s wall and 512 MiB of scratch. It first stages the
-proof-feature build of HEAD through `oxide build --features proof-synthetic-account`,
-copies it under the designated scratch with a manifest of head, features and digest,
-and runs only that staged file. The inner half re-checks the manifest and the digest
-before any effect. It creates one owned
-64 MiB sparse APFS image under the guard's scratch, attaches it with `-owners on`,
-and registers it as the only volume. Its environment binds `HOME`,
-`BARGE_ACCOUNT_HOME` and `BARGE_STATE_DIR` inside the owned scratch, and it checks
-that each path resolves there. Each case's receipt records the reference control
-its previews chose, and a control outside the owned scratch faults the case. Each of
-its twelve cases declares its own area, so one case's roots never reach another
-case's plan:
+proofs name, with a 300 s wall and 512 MiB of scratch. Its fixed command is that
+script and its mode: the binary under test is never a caller argument.
+
+**Route and staging.** New proof work runs on `/Volumes/Stash/scratch/barge` under the
+verified volume UUID `8A660440-C919-45C6-A3F1-3365B9BD2006`. The outer half first
+reads the installed supervisor's bytes against the pin (an unreadable or different
+supervisor refuses) and then the scratch route: the mount's UUID, the canonical
+path, this account's ownership and an owner-only mode. A drive root, a home folder, a
+symlinked path or another volume refuses before anything is staged, and nothing is
+probed for a verdict. Historical Builds receipts and the `/Volumes/Builds` scratch
+that earlier plans named are unavailable history: no receipt is reconstructed from
+them and none is moved.
+
+The guard's own child then stages the proof-feature build. It runs
+`oxide build -p barge-cli --locked --offline --features proof-synthetic-account`
+with `RUSTUP_TOOLCHAIN=1.97.1`, `RUSTUP_AUTO_INSTALL=0` and
+`CARGO_NET_OFFLINE=true`, drops both Rust flag variables and
+`DYLD_INSERT_LIBRARIES`, drops the guard's own scratch and evidence hooks so the
+build is an ordinary managed Oxide compilation rather than a nested proof
+session, points `TMPDIR` at the guard, and copies the built `barge` artifact into
+one exclusive directory inside the guard's owned scratch root
+(`OXIDE_TASK_SCRATCH_ROOT`). The private fixture run root is created later, inside
+that same owned scratch, so the staged copy and the fixture share the guarded root
+without the staged copy living in the fixture tree. The compile itself keeps the
+real account's `HOME`, `CARGO_HOME` and rustup home, because it is the ordinary
+managed Oxide build the brief allows; only the fixture children are bound to the
+private home and state, and the compile writes nothing into the fixture. It hashes that
+copy, writes its manifest (head, features, toolchain, build command, digest) and
+re-checks the manifest and the digest before any effect. Staging and its waits spend the same
+300 s command bound and the guard's own clock: the outer half publishes its absolute
+monotonic deadline and the child never resets one. There is no unguarded prewarm, no
+shared stage directory and no accepted artifact from another run; `release:native`
+never reads what `release:native:stage` staged. The ordinary production build
+(without the feature) is never the one run.
+
+The inner half re-checks that it is the pinned supervisor's guarded child: the
+supervisor bytes still match the pin, the carried scratch route is the pinned one,
+`TMPDIR` resolves inside the scratch directory, and the guard's monitored layout is
+this occurrence's own. That layout is the pinned supervisor's, not an assumption:
+it creates one `oxide-proof.*` root directly under `--root-parent`, then `scratch/`
+and, by default, `evidence/` inside that root, so `OXIDE_TASK_SCRATCH_ROOT` and
+`OXIDE_PROOF_EVIDENCE` are siblings inside one monitored owned root and evidence is
+**not** inside the scratch directory. The check therefore requires both directories
+to be absolute, canonical, symlink-free, this account's and private (no group or
+other write; the owned root itself owner-only), the owned root to be a direct child
+of the verified Stash scratch parent, and the evidence directory to sit inside that
+same owned root without aliasing the scratch directory or the owned root. An aliased
+or symlinked path, an escape, a foreign or off-parent root and a mismatched occurrence
+all refuse. A refusal there returns `125` with no staging and no fixture.
+
+**Custody of the image.** Before the 64 MiB sparse APFS backing exists, the run
+publishes the guard's opt-in `image-custody.json` indication (its exact shape:
+`version` and one canonical backing inside the owned root or evidence directory).
+That is what keeps the root safe when an attach is interrupted: the guard's own
+cleanup reads the indication, and a backing that is mounted or attached-but-unmounted
+keeps the root, its backing and the evidence instead of being removed.
+
+The attach itself must be positively the owned image: exactly one entity of that backing
+mounted at this run's unique `/Volumes/<owned-name>` mount, with the device the attach
+child reported, the mounted volume UUID, and `Owners: Enabled`. The census is read as
+every system entity of the backing, the container entity plus its mounted volume, the
+same shape the guard's own census and the reviewed space pattern read; entity count is
+not identity. A second entity of the backing that carries a mount point, a duplicate
+mount, a mismatched device, and a failed, partial or unreadable attach are each unknown
+custody; nothing is detached, repaired or retried. The same rule decides the pre-detach binding
+and R11's remount, and clearance after a detach is zero entity rows for the backing.
+
+**Closure.** Each detach is one ordinary `hdiutil detach` of the run's own mount,
+authorized by a fresh rebind census taken immediately before it (the same backing,
+mount, device and volume UUID), and accepted only when all of these hold: the child
+succeeded and was reaped, the attachment census is readable and names no attachment
+for the backing at all — whole-backing absence, not merely an absent mount path —
+and the mount path is gone. A non-zero or unreaped child, an unreadable census, or a
+missing mount with the backing still attached is a retained, unqualified outcome
+with no retry and no force detach.
+
+R11's intermediate detach and the final one are distinct: each re-derives its own
+authority, and neither borrows the other's census. R11's remount must verify the same
+backing, the same volume UUID and the same recorded relative path before its replay
+binds them, and R12 begins only after that remount and its digest-bound registration
+succeed. The final closure is the script's own; the guard's cleanup is authorized
+separately by the guard's own custody scan, so a counted pass correlates all twelve
+case rows, this whole-backing clearance and the supervisor's own receipt, and a
+missing or unclear half is a missing proof.
+
+It creates one owned 64 MiB sparse APFS image inside that run root and registers it
+as the only volume. Its environment binds `HOME`, `BARGE_ACCOUNT_HOME` and
+`BARGE_STATE_DIR` inside the owned scratch, and it checks that each path resolves
+there. Each case's receipt records the reference control its previews chose, and a
+control outside the owned scratch faults the case. Each of its twelve cases declares
+its own area, so one case's roots never reach another case's plan:
 
 | Case | Claim | Counterfactual of |
 | --- | --- | --- |
@@ -1638,12 +1717,39 @@ identify skipped and unexecuted cases. The effect-free self-check exercises the
 rebind, rollback and dispatch gates; it supplies no native credit.
 
 The receipt, `release-proof-receipt.json` under `OXIDE_PROOF_EVIDENCE`, records the
-head, the binary's and the supervisor's digests, the volume UUID and its device
-before and after the remount, the closure (ordinary detach, mount absent), the
+head, the binary's and the supervisor's digests, the verified scratch route, the
+staged build's manifest and digest, the volume UUID and its device before and after
+the remount, the image-custody indication, the closure (the ordinary detach's exit and
+reap, the whole-backing census, the mount path and the purpose of that detach), the
 wall time, each case's status and evidence, the first fault, and the real-state
 premise. `qualified` is `true` only for a counted pass with every case passed, a
-closed image and an unchanged real state. The diagnostic is always `qualified:
-false`.
+positive whole-backing clearance and an unchanged real state. The diagnostic is
+always `qualified: false`.
+
+A failed oracle names the one predicate that failed and the decisive values the
+operation already returned — never a conjunction collapsed into one message. The
+predicates keep their original order and short-circuit, so a failure record never runs
+an observation the assertion would not have made: a filesystem fact the branch did not
+reach is reported as `unobserved`, and the release-run record carries
+`released_count`, `kept_count`, `stopped`, `replay_pending`, the expected root id, a
+bounded prefix of the returned root ids (at most 32, inside a 400-character budget, with
+the number omitted stated) and one entry per row (`root_id`, `outcome`, `reason`) until
+the reporting allowance is reached, with the number omitted stated. The two "root kept"
+and "root released" conjunctions are separate helpers with fixed polarities, so a release
+check cannot inherit keep semantics through a flag. A plan row that does not meet its
+expectation likewise records its deciding fields first — `eligible`, the first blocker
+and its reason, and each gate's own verdict (`identity`, `custody`, `last_activity_ms`,
+`references_complete`, `references_current`, `absence_verdict`) — before the bounded raw
+row. A plan row is a
+sorted-key document whose `absence` member alone can exceed a short cap, so a truncated
+row would not name the gate; the deciding fields are what make a failed case judgeable
+from the receipt after the run root is gone. This changes no eligibility decision.
+
+The receipt also carries `qualification_inputs`: the case rows and the image
+clearance are its own, and the qualified supervisor's receipt is named as a required
+separate input, because the supervisor writes it after the child exits. Correlating
+both, with the guard's own custody and detach record, is what turns a counted run into
+a final qualification; half of it is not evidence.
 
 The receipt's `limitation` field states what the proof does not establish. It runs a
 proof-only build whose Oxide directories come from one synthetic home. It tests the
@@ -1655,11 +1761,23 @@ reference) is carried by `an_incomplete_or_divergent_reference_source_keeps_the_
 which uses a synthetic `FakeAccount`.
 
 What is not yet established: nothing in this repository has run the body against the
-proof build. Its self-check (`release:native:test`), its feature declarations and
+proof build. One activated diagnostic at `1e7267c` refused before staging and before
+any fixture effect, on a driver premise that wrongly required the guard's evidence
+directory to be inside its scratch directory; the guard itself closed that occurrence
+cleanly with no image or resource retained beyond its own evidence. The contract above
+and its pure controls now encode the guard's real sibling layout. Its self-check (`release:native:test`), its feature declarations and
 its pure counterfactuals (`release:native:test`, `rust:test:proof-account`) are
-checked. The diagnostic pass, the counted author pass and a distinct reviewer pass
-each need owner activation at an exact head. Until those receipts exist, a missing
-receipt is a missing proof.
+checked. The self-check also drives the readiness correction's own decisions on
+canned observations and seams: a wrong scratch route or volume UUID, a carried route
+document that names another scratch, a stage parent outside this occurrence (or the
+shared scratch, a home folder or a drive root), an inherited Rust flag or unpinned
+toolchain, a custody backing outside the owned root, a failed or partial attach, a
+missing mount whose backing is still attached, a correct ordinary detach with
+whole-backing absence, and an unreadable census all decide the way this contract
+says. It also drives the guarded order — refuse, stage, verify, prove — and proves a
+staging or stale-build refusal reaches no later effect. The diagnostic pass, the
+counted author pass and a distinct reviewer pass each need owner activation at an
+exact head. Until those receipts exist, a missing receipt is a missing proof.
 
 ## Proposed validation
 
@@ -1740,10 +1858,15 @@ a remount and the absence primitive together:
 
 ### The nine-premise HIGH checklist
 
-Recorded in the proof's own plan and receipt:
+The checklist for the one bounded native. The proof's own plan carries the matching
+`premise_dispositions` (its nine named dispositions), and its receipt records the
+isolation, route, build, custody and closure facts it actually observed.
 
 1. A private `HOME`, `CARGO_HOME` and state directory, so no real account state
-   is read or written.
+   is read or written. The staged proof-feature compile is the exception the brief
+   names: it is the ordinary managed Oxide compilation and keeps the real
+   account's `HOME`, `CARGO_HOME` and rustup home. It writes nothing into the
+   fixture, and no fixture child inherits those paths.
 2. The account home used for state resolution is the fixture's, and the real
    account state is untouched — asserted by a before/after digest of the real
    state directory, and by `barge describe` naming the fixture state root.
@@ -1752,8 +1875,9 @@ Recorded in the proof's own plan and receipt:
    path, and no inherited `BARGE_*` hook the proof did not set.
 4. Explicit adoption only: every fixture root is created or adopted by an
    explicit command with a recorded plan, never by a default.
-5. Owned image with ownership enabled (`-owners on`), ordinary detach, and a
-   forced detach only of the owned image's own whole-disk device.
+5. Owned image with ownership enabled (`-owners on`), and ordinary detach only —
+   the proof never forces a detach, and an uncertain attachment or detach keeps
+   the mount, the backing and the evidence.
 6. Every flag and environment hook used is listed with its purpose; the only
    debug-only hooks are the existing crash and fault injections, each bounded to
    the guard's scratch and each writing a fired-marker into the evidence
