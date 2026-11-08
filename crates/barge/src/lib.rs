@@ -71,3 +71,10 @@ pub(crate) mod tape;
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) mod tape_harness;
+// The effect-free per-case fixture specifications and owned setup for the
+// limited first batch (docs/knowledge/contracts/o2-tape.md, "First-batch fixture
+// cases"). Compiled only under cfg(test) like the harness it prepares state
+// for; it opens no window, runs no engine and is never proof input.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) mod tape_cases;

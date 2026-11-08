@@ -125,6 +125,13 @@ mod tape;
 #[allow(dead_code)]
 #[path = "../src/tape_harness.rs"]
 mod tape_harness;
+// The effect-free per-case fixture specifications and owned setup. Compiled here
+// so the harness target compiles the case builder a future execution materializes
+// with; the target's argv contract and the window path are unchanged.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../src/tape_cases.rs"]
+mod tape_cases;
 #[cfg(test)]
 #[allow(dead_code)]
 #[path = "../src/testkit.rs"]

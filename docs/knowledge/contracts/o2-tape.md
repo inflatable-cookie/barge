@@ -29,8 +29,15 @@ does not prove.
   `crates/barge/tests/fixtures/capture-vectors/v2/`. It is a `#[path]` child
   module of `tape.rs`, compiled only in the test tape.
 - `crates/barge/src/tape_harness.rs` — the window runner (`run`) both the
-  executable and the embedded exercise call, plus the fixture builders. Also
-  `cfg(test)`-only and `pub(crate)`.
+  executable and the embedded exercise call, plus the fixture builders: the
+  shared owned setup (`build_fixture_setup`/`build_fixture_setup_in`), the
+  manifest skeleton (`manifest_document`), and the unchanged BASE-shaped
+  `build_fixture`. Also `cfg(test)`-only and `pub(crate)`.
+- `crates/barge/src/tape_cases.rs` — the first batch's effect-free case
+  specifications and owned fixture preparation ([first-batch fixture
+  cases](#first-batch-fixture-cases-source-preparation)). `cfg(test)`-only,
+  `pub(crate)`, compiled by the library's test build and by the `tape_eval`
+  target through a `#[path]` include; it opens no window and runs no engine.
 - `crates/barge/tests/tape_eval.rs` — the `[[test]]` target with
   `harness = false`, so the compiled artifact is a standalone executable whose
   argv contract is `--fixture-root --manifest --transcript-out --case`. The
@@ -49,6 +56,13 @@ does not prove.
   change, the PCF-4/PCF-5 controls, and a limited source guard check. That
   check does not establish per-site coverage; the mechanical compile-away check
   is `effigy rust:compile:release`.
+- `crates/barge/src/tape_cases.rs`'s tests: the case inventory and its counts,
+  the refusal of an unlisted case, the no-BASE-masquerade check, the complete CF
+  and obligation tables, the effect-free plan, and the per-case owned **setup
+  controls** (each supported case's declared files, real bytes digests, parent
+  identities, absences, registry/receipt/marker/control documents, the pending
+  Barge intent, the declaration policy and the operator list) plus the refusal
+  control. They are setup controls, not decision, volume or native proof.
 - `crates/barge/src/tape_harness.rs`'s tests: the embedded end-to-end exercise
   (one exclusively owned directory fixture on a real selected volume, the
   actual `release::plan`, one completed window over a settled root with a
@@ -205,6 +219,95 @@ both-or-neither, so that number stays in the recorder document and the wire
 states no own identity; effect parent identity and rename destinations, the
 clock site and the digest's byte size have no `/2` field; and the surface never
 carries an internal provenance flag.
+
+## First-batch fixture cases (source preparation)
+
+**Status: prepared; nothing here ran.** The limited first batch's fixture breadth
+is specified and materialized source, and no case is executable. No window was
+opened over a case, no engine evaluated one, no comparison or parity follows, and
+the O2/O3 holds, every cap and `K1_PREMISE_QUALIFIED` are unchanged. The cases
+come from Oxide's reviewed finite D8/CF inventory at PR250 (reviewed
+`2804c5ab310d8d3f1ba568b4265b9b4bbd120de7`, merged
+`2ad8a56bef6c1efea878b0135b299305f6a0eb1f`), `barge-adoption.md`, "The finite D8
+case matrix", "Case-family disposition (D8 and CF inventory, no new matrix)" and
+"Limited verdict policy and first-batch plan (oxide#286 implemented)". Barge's
+planning base is `f9f81f72a20e0f4d694b8046acfbe3a0558f8c9b`.
+
+**The seam.** `crate::tape_cases` is the case interface: `CASES` is the fixed
+table, `spec(id)` looks one case up (an unlisted id is refused; there is no BASE
+fallback), `prepare`/`prepare_in` materialize one case's declared state inside a
+fresh owned fixture, and `plan_document` is the effect-free print. Preparation
+builds the shared owned setup once through
+`tape_harness::build_fixture_setup` (the fixture directory, the real volume
+record, initialized Barge state, the declaration and one area root created
+through the real platform), writes only the case's declared paths, observes each
+one, and encodes that case's `oxide.capture.manifest/2` document, which the
+copied strict `/2` parser must accept before it is returned. `build_fixture`
+keeps its BASE shape and emits the same manifest skeleton as before.
+
+**Specification versus setup.** A specification is data: case id, family, the
+declared paths and their content *shapes*, the in-window actions preparation does
+not perform, the premises an execution still needs, the decision sites the case
+obliges, the declared fates, and every CF with a reason. It holds no byte, device
+number or inode. Those are observed during preparation: each declared file's
+`lstat` identity, mode, size and bytes digest, each parent's own device and inode,
+and each declared absence. `fixture.entries` is exactly those observations and is
+never a directory walk's extras; `fixture.roots` names the owned roots the case
+declares; `fixture.device`/`inode`/`mode` are the fixture directory's own.
+
+**What the manifest deliberately does not claim.** `mandatory_observations` stays
+empty: an obligation's `/2` identity is a complete alternative whose facts only
+an execution can observe, and preparation may not serialize an invented identity
+as an actual fact. The obligation set is declared in the specification instead
+(site `<source symbol>#<family>`, identity slot kind and `parent_required`) and
+the plan prints it, so the Oxide owner can bind each one when a window runs.
+`dynamic.writers` is empty and no writer absence is claimed: writer closure is a
+future execution premise (CF-2 remains declared), not a fixture fact. The export
+receipt/closure binding, the real volume attachment and the manifest's source
+block remain future inputs; the skeleton's `source` block is the same explicit
+unverified placeholder `build_fixture` uses, and a run is refused without the
+independently supplied export binding.
+
+**The inventory (50 rows, no runnable case).** 37 cases are prepared, 6 are
+unsupported here, and 7 deferred. Each prepared case still needs the export
+closure, a bound manifest and the recorder's in-window leaf bind; the
+marker-, identity- and absence-reading cases additionally name K1.
+
+| Family | Cases | Prepared fixture state |
+| --- | --- | --- |
+| Control and sticky batch | CTL-0, CTL-1 | outputs + one settled registry row; the incomplete registry with its `incomplete` record |
+| Registry shape and caps | REG-MISSING, REG-MALFORMED, REG-OVERSIZE, REG-CONTRADICTORY, REG-OVERFLOW | the outputs/registry absence, invalid bytes, a document over `REGISTRY_CAP_BYTES`, two live rows naming one root from two checkouts, and the cancelled-overflow record |
+| References and intents | REF-PENDING, REF-RESERVATION, REF-CANCELLING, REF-PRUNING, REF-SELECTED-NOT-CURRENT, REF-ORPHAN-MARKED | the row flag under test; PRUNING also writes an unfinished registry-journal entry and one real pending `barge.intent/2` record with observed facts; the orphan writes a marked extra plan root and no row |
+| Receipts and markers | RCP-MISSING, RCP-MALFORMED, RCP-NONCOMMITTED, RCP-CONTRADICTORY, RCP-V1, MRK-MISSING, MRK-MALFORMED, MRK-REPLACED, ID-NONCE, ID-GENERATION | the receipt absence, invalid bytes, a non-committed state, a mismatched checkout id, a committed `/1`, and the marker's absence, invalid bytes, recorded-digest mismatch, other nonce and stale generation |
+| Identity and volume | ID-INODE, ID-DEVICE-STALE, VOL-DUP-REGISTRY, ABS-UUID-CONFLICT | a registry row recording a root inode/device one above the observed root's; the declared document records for the volume cases |
+| Checkout absence | ABS-ANCESTOR-MISSING, ABS-ANCESTOR-REPLACED | a present checkout parent with a missing leaf, and with a present leaf (the CF-7 replacement is an in-window action) |
+| Fence, declaration and policy | FENCE-MISSING, FENCE-UNKNOWN, DECL-MISSING, DECL-POLICY-NONE | the absent control state, a version-9 state with an unknown owned-outputs fence, no declaration, and a `prune: none` declaration |
+| Legacy and operator list | LEG-UNLISTED, LEG-LISTED, LEG-LISTED-MARKED, LEG-RECEIPTLESS | the operator list absent or naming the root, with and without a receipt |
+
+The six unsupported cases name the evidence this preparation may not produce and
+are refused, never approximated as BASE: **CAP-1** (more than 8192 rows exceeds
+the unchanged shared caps), **ID-DEVICE-LIVE** (a mid-window remount),
+**VOL-ABSENT** and **VOL-REMOVED-DURING** (a real detach), **VOL-DUP-LIVE** (a
+real duplicate-UUID mount census) and **ABS-BOOT-DATA** (an internal boot-Data
+placement). The seven deferred cases are the deliberately held second batch:
+**WRT-LIVE-THIS**, **WRT-LIVE-OTHER**, **WRT-UNKNOWN**, **WRT-ACQUIRING**,
+**WRT-RETIRED-CLEAN**, **EFFECT-1** and **EFFECT-2**.
+
+**The plan.** `effigy rust:test:fixture-plan` prints one
+`barge.capture.fixture-plan/1` document: every row's status, prepared state or
+named unsupported/deferred reason, the D8 relationship verbatim, its CF notes,
+its premises, its enumerations, its declared relative path shapes and its
+obligations. It creates no fixture, opens no window and evaluates nothing; it is a
+diagnostic print, never a capture, a transcript or proof input. `runnable` is
+`0`.
+
+**Recorded insufficiencies, not absorbed.** No case is runnable: the recorder's
+in-window bind check still reports every path-only file row unbound, no
+export-closure digest or receipt is qualified, K1 is unqualified for every
+handle-parent row, the custody and admission families are deferred, and the
+dynamic cases need a second mount epoch. Every case's *end-to-end* fixture and
+engine behavior is unrun; the setup controls above are not decision, volume,
+native or comparison evidence, and no historical proof is reclassified.
 
 ## Staging and export (for the later X-S2 orchestration)
 
@@ -420,6 +523,13 @@ end-to-end fixture over actual `release::plan` with explicit synthetic process
 facts, held/unknown/bounded-writer counterfactuals, and a separate real-host
 exercise. File and volume facts remain real in the positive fixture; it must
 produce the complete plan with its settled root eligible and fit the fixed caps.
+`effigy rust:test:fixture-spec` runs only the first batch's effect-free case
+specification and owned setup controls (`plan`, inventory, refusals and each
+prepared case's observed state); it does not run `release::plan` or the embedded
+harness exercise. `effigy rust:test:fixture-plan` prints the effect-free plan
+document. Both are pure apparatus controls: they create only their own fixture
+under the caller's run root, and they are not decision, volume or native proof.
+
 `effigy rust:test:tape-eval` runs the harness executable (no arguments: its
 real-host self-check). That self-check accepts the actual engine outcome or an
 honestly recorded fixed-cap capture refusal; neither establishes qualification.
