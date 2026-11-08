@@ -672,7 +672,7 @@ identity unproven. Schema conformance alone does not establish full capture.
 | Remaining obligation | Current limit |
 | --- | --- |
 | K1 lifetime | Held parent identity is recorded, but lifetime and non-reassignment across the required interval are not qualified. |
-| Direct-reader parents | Path prechecks and opens resolve separately; their parent remains unproven. The per-caller compatibility disposition (18 read sites, 2 lock sites) is in `oxide-capture-parent-identity.md`, "Route B compatibility disposition"; it is a source-backed recommendation to defer, pending planner ruling R-K2. |
+| Direct-reader parents | Path prechecks and opens resolve separately; their parent remains unproven. The per-caller compatibility disposition (19 read call sites in 18 functions, 2 lock sites) is in `oxide-capture-parent-identity.md`, "Route B compatibility disposition"; it is a source-backed recommendation to defer, pending planner ruling R-K2. |
 | Process and descriptor binding | A listing or vnode read without identity observed at that operation remains unproven, even when a classified pid was read earlier. |
 | Complete shared reconciliation | The copied parser and vectors check their declared surfaces; clocks, classifications, truncation, notes and fixture capture are not fully validated. |
 | Real capture qualification | The retained host exercise is bounded evidence, not native, parity, producer, or adoption qualification. |
