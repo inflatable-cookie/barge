@@ -69,9 +69,9 @@ does not prove.
   and the refusal control. Beyond those readers, the declaration controls read
   the declaration through the real `area::show`, and the volume control reads
   `VOL-DUP-REGISTRY`'s document through the real `registry::read` and asserts
-  its refusal. The legacy operator list and the absence chains have no reader
-  call in these controls, so they are covered by setup controls only; no case's
-  documents are read by `release::plan`. They are setup and reader controls, not
+  its refusal. The fence control state, the legacy operator list and the
+  absence chains have no reader call in these controls, so they are covered by
+  setup controls only; no case's documents are read by `release::plan`. They are setup and reader controls, not
   decision, volume, engine or native proof.
 - `crates/barge/src/tape_harness.rs`'s tests: the embedded end-to-end exercise
   (one exclusively owned directory fixture on a real selected volume, the
