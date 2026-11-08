@@ -918,6 +918,7 @@ pub(crate) fn fixture_oxide_records(
 
 /// One built fixture: the directory this process owns, the manifest bytes and
 /// the volume UUID the record and the manifest both name.
+#[derive(Debug)]
 pub(crate) struct EmbeddedFixture {
     /// The exclusively owned fixture directory.
     pub(crate) dir: crate::testkit::TempDir,
@@ -927,11 +928,58 @@ pub(crate) struct EmbeddedFixture {
     pub(crate) root: PathBuf,
 }
 
-/// Build the whole BASE-shaped fixture: real volume record, declaration, one
-/// owned root, settled Oxide row, absent checkout, and the manifest naming
-/// them. Setup writes only inside the fixture, before any window opens.
-pub(crate) fn build_fixture(label: &str) -> Result<EmbeddedFixture, String> {
-    let dir = crate::testkit::TempDir::new(label);
+/// The owned setup every fixture shares: the exclusively owned directory, the
+/// real volume record, the initialized Barge state, an optional declaration and
+/// the owned root created through the real platform. Building it writes only
+/// inside the fixture and opens no window.
+pub(crate) struct FixtureSetup {
+    /// The exclusively owned fixture directory.
+    pub(crate) dir: crate::testkit::TempDir,
+    /// The fixture tree the volume record names.
+    pub(crate) volume_root: PathBuf,
+    /// The real mount point of the fixture volume.
+    pub(crate) mount: PathBuf,
+    /// The real volume record, as registered.
+    pub(crate) record: crate::registry::VolumeRecord,
+    /// The fixture's explicit account facts.
+    pub(crate) account: FixtureAccount,
+    /// The fixture's Barge state paths.
+    pub(crate) state_paths: StatePaths,
+    /// The declaration that was written, when one was.
+    pub(crate) declaration: Option<AreaDeclaration>,
+    /// The owned root, when the fixture created one.
+    pub(crate) root: Option<crate::area::OwnedRoot>,
+}
+
+impl FixtureSetup {
+    /// The owned root, which every prepared case but the undeclared one has.
+    pub(crate) fn owned_root(&self) -> Result<&crate::area::OwnedRoot, String> {
+        self.root
+            .as_ref()
+            .ok_or_else(|| "the fixture has no owned root".to_owned())
+    }
+
+    /// The fixture directory.
+    pub(crate) fn dir(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+/// Build the shared owned setup inside this invocation's run root.
+pub(crate) fn build_fixture_setup(
+    label: &str,
+    declaration: Option<&AreaDeclaration>,
+) -> Result<FixtureSetup, String> {
+    build_fixture_setup_in(&crate::testkit::scratch_root(), label, declaration)
+}
+
+/// Build the shared owned setup inside `root`, which its caller owns.
+pub(crate) fn build_fixture_setup_in(
+    root: &crate::testkit::RunRoot,
+    label: &str,
+    declaration: Option<&AreaDeclaration>,
+) -> Result<FixtureSetup, String> {
+    let dir = crate::testkit::TempDir::within_run_root(root, label);
     let volume_root = dir.path().join("volume-root");
     std::fs::create_dir_all(&volume_root)
         .map_err(|error| format!("the fixture volume root cannot be created: {error}"))?;
@@ -961,18 +1009,37 @@ pub(crate) fn build_fixture(label: &str) -> Result<EmbeddedFixture, String> {
         )
         .map_err(|error| format!("the fixture registry cannot be written: {error}"))?;
     drop(lock);
-    let declaration = base_declaration();
-    crate::area::declare(&state_paths, &declaration, 1_000)
-        .map_err(|error| format!("the fixture area cannot be declared: {error}"))?;
-    let root = fixture_owned_root(&state_paths, &record, &declaration)?;
-    fixture_oxide_records(&account, &root, record.volume_uuid.as_str())?;
-    // The shared manifest is strictly typed. This embedded fixture's source
-    // block is an explicitly unverified placeholder: a real window replaces it
-    // with the exported receipt's binding, which `verify_manifest_binding`
-    // checks against the staged commit, lockfile and executable before any run.
-    let manifest = serde_json::json!({
+    let (declaration, root) = match declaration {
+        Some(declaration) => {
+            crate::area::declare(&state_paths, declaration, 1_000)
+                .map_err(|error| format!("the fixture area cannot be declared: {error}"))?;
+            let root = fixture_owned_root(&state_paths, &record, declaration)?;
+            (Some(declaration.clone()), Some(root))
+        }
+        None => (None, None),
+    };
+    Ok(FixtureSetup {
+        dir,
+        volume_root,
+        mount,
+        record,
+        account,
+        state_paths,
+        declaration,
+        root,
+    })
+}
+
+/// The manifest document's fixed, deliberately unverified skeleton: the source
+/// block is a placeholder a real window replaces with the exported receipt's
+/// binding, which `verify_manifest_binding` checks against the staged commit,
+/// lockfile and executable before any run. `case` and the per-case fixture
+/// state are the caller's to fill.
+pub(crate) fn manifest_document(setup: &FixtureSetup, case: &str) -> serde_json::Value {
+    let record = &setup.record;
+    serde_json::json!({
         "schema": crate::tape::MANIFEST_SCHEMA,
-        "case": "CTL-0",
+        "case": case,
         "window": {"identity": "embedded-exercise", "start_monotonic_ns": 0, "end_monotonic_ns": 0},
         "source": {
             "oxide_commit": "embedded-unverified",
@@ -994,28 +1061,38 @@ pub(crate) fn build_fixture(label: &str) -> Result<EmbeddedFixture, String> {
         "expected_effects": [],
         "expected": {"classification": "MATCH", "roots": []},
         "fixture": {
-            "root": dir.path().display().to_string(),
+            "root": setup.dir.path().display().to_string(),
             "device": 0,
             "inode": 0,
             "mode": 0o700,
             "entries": [],
             "roots": [],
-            "volume": {"uuid": record.volume_uuid.as_str(), "mount": mount.display().to_string()},
+            "volume": {"uuid": record.volume_uuid.as_str(), "mount": setup.mount.display().to_string()},
         },
         "barge": {
             "volume_uuid": record.volume_uuid.as_str(),
-            "volume_mount": mount.display().to_string(),
+            "volume_mount": setup.mount.display().to_string(),
             "namespace": "oxide",
             "area": "outputs",
             "named_roots": [],
         },
-    });
-    let manifest = serde_json::to_vec_pretty(&manifest)
+    })
+}
+
+/// Build the whole BASE-shaped fixture: real volume record, declaration, one
+/// owned root, settled Oxide row, absent checkout, and the manifest naming
+/// them. Setup writes only inside the fixture, before any window opens.
+pub(crate) fn build_fixture(label: &str) -> Result<EmbeddedFixture, String> {
+    let setup = build_fixture_setup(label, Some(&base_declaration()))?;
+    let root = setup.owned_root()?.clone();
+    fixture_oxide_records(&setup.account, &root, setup.record.volume_uuid.as_str())?;
+    let manifest = serde_json::to_vec_pretty(&manifest_document(&setup, "CTL-0"))
         .map_err(|error| format!("the manifest cannot encode: {error}"))?;
+    let root = root.path;
     Ok(EmbeddedFixture {
-        dir,
+        dir: setup.dir,
         manifest,
-        root: root.path,
+        root,
     })
 }
 

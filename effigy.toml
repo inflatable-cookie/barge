@@ -46,6 +46,14 @@ alias = "barge"
 # document, statement discipline) plus the embedded end-to-end fixture
 # exercise of the actual harness (docs/knowledge/contracts/o2-tape.md).
 "rust:test:tape" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib tape"
+# The effect-free first-batch fixture preparation: the case table, the plan, the
+# per-case owned setup controls and the refusal controls. It creates no fixture
+# outside its own scratch, opens no window and runs no engine
+# (docs/knowledge/contracts/o2-tape.md, "First-batch fixture cases").
+"rust:test:fixture-spec" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib tape_cases::tests"
+# The same specs printed as one effect-free plan document: specs, obligations,
+# unsupported and deferred reasons. Nothing is created or evaluated.
+"rust:test:fixture-plan" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib tape_cases::tests::the_plan_prints_every_spec_and_obligation -- --exact --nocapture"
 # Recorder-only tests: excludes the harness exercise and its real process scan.
 "rust:test:tape:pure" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib tape::tests"
 "rust:test:tape-eval" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --test tape_eval"
