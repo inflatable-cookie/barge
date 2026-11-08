@@ -39,6 +39,20 @@
 //! `refused` with the engine's own refusal reason, and the exit code
 //! `ErrorKind::exit_code` gives, and the process exits with that code.
 //!
+//! ## Retained fixture custody (explicit opt-in, test-only)
+//!
+//! The ordinary embedded exercise removes its own fixture when it drops. A
+//! caller that must census the leader's tree after the child exits opts in by
+//! setting `BARGE_TAPE_CUSTODY=barge.tape.kept-fixture/1` together with this
+//! invocation's own run root in `BARGE_TEST_SCRATCH_ROOT`; the mode is resolved
+//! and every premise is checked before a fixture exists. Under it the fixture
+//! leaves automatic cleanup inside the creation call, before any fallible step,
+//! its path is announced once as `barge.tape.exercise/1: kept fixture <path>`,
+//! and the manifest bytes the fixture already holds are published as
+//! `manifest.json` inside it before the window runs. Nothing here removes it
+//! afterwards; an ordinary route is unchanged
+//! (`docs/knowledge/contracts/o2-tape.md`, "Retained fixture custody").
+//!
 //! ## Staged provenance for the later X-S2 orchestration
 //!
 //! The orchestrator stages this exact commit's tree, builds the harness
@@ -50,6 +64,8 @@
 //! receipt digest must be supplied independently; nothing here reads the live pool, root,
 //! registry or account.
 
+use std::ffi::OsStr;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -782,7 +798,8 @@ fn capture_exhausted(document: &serde_json::Value) -> bool {
         || truncation["classifications_truncated"] == true
 }
 
-// Copy outside TempDir before it drops, but within its caller-owned run root.
+// Copy outside the fixture before it is removed, but within its caller-owned
+// run root.
 fn retain_transcript(fixture: &EmbeddedFixture, source: &Path) -> Result<PathBuf, String> {
     let directory = fixture.dir.path();
     let parent = directory.parent().ok_or("the fixture has no run root")?;
@@ -916,12 +933,311 @@ pub(crate) fn fixture_oxide_records(
     .map_err(|error| format!("the registry cannot be written: {error}"))
 }
 
+// ---- retained fixture custody --------------------------------------------
+//
+// The no-argument embedded exercise removes its own fixture when it drops, so a
+// success, an early return or a panic before a caller's census loses the whole
+// directory. Retained custody is an explicit, source-owned opt-in that keeps
+// the fixture from its creation: the caller's guard owns removal after its own
+// census and this process never removes it (`docs/knowledge/contracts/o2-tape.md`,
+// "Retained fixture custody").
+
+/// The variable that opts the no-argument route into retained custody.
+///
+/// It is not a signal or a deletion grant: it is checked once, before any
+/// fixture exists, and only together with the run root below.
+pub(crate) const RETAINED_CUSTODY_ENV: &str = "BARGE_TAPE_CUSTODY";
+
+/// The only value [`RETAINED_CUSTODY_ENV`] accepts.
+pub(crate) const RETAINED_CUSTODY_VALUE: &str = "barge.tape.kept-fixture/1";
+
+/// The marker the observation driver matches, unchanged from the retained
+/// transcript line beside it.
+pub(crate) const KEPT_FIXTURE_MARKER: &str = "barge.tape.exercise/1: kept fixture ";
+
+/// The longest kept-fixture path one custody line may carry. The line is bounded
+/// before a fixture is created, so an over-long path can never be announced.
+pub(crate) const KEPT_FIXTURE_PATH_MAX_BYTES: usize = 512;
+
+/// The longest directory name `testkit::TempDir` gives a fixture here: the
+/// label, the process id, the sequence and the nanoseconds.
+const FIXTURE_NAME_MAX_BYTES: usize = 96;
+
+/// The manifest file name inside a kept fixture.
+pub(crate) const KEPT_MANIFEST_FILE: &str = "manifest.json";
+
+/// The label the no-argument route's fixture uses.
+const REAL_HOST_LABEL: &str = "tape-eval-real-host";
+
+/// Who removes one fixture directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Custody {
+    /// The ordinary route: the fixture removes itself when it drops.
+    Ordinary,
+    /// Retained custody: the fixture is kept from creation, and the caller's
+    /// guard — not this process — removes it after its own census.
+    Retained,
+}
+
+/// One fixture directory and the authority that removes it.
+#[derive(Debug)]
+pub(crate) enum FixtureDir {
+    /// Ordinary custody: self-removing while it is alive.
+    TempDir(crate::testkit::TempDir),
+    /// Retained custody: kept at creation; no process-side removal exists.
+    Kept(PathBuf),
+}
+
+impl FixtureDir {
+    /// The directory's path.
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Self::TempDir(dir) => dir.path(),
+            Self::Kept(path) => path,
+        }
+    }
+}
+
+/// Create one fresh fixture directory under `root` with the requested custody.
+///
+/// With [`Custody::Retained`] the directory leaves automatic cleanup inside this
+/// call, before the caller runs any fallible step: nothing after it can re-arm
+/// removal.
+pub(crate) fn create_fixture_dir(
+    root: &crate::testkit::RunRoot,
+    label: &str,
+    custody: Custody,
+) -> FixtureDir {
+    let temp = crate::testkit::TempDir::within_run_root(root, label);
+    match custody {
+        Custody::Ordinary => FixtureDir::TempDir(temp),
+        Custody::Retained => FixtureDir::Kept(temp.keep()),
+    }
+}
+
+/// Create one retained fixture directory and name it on `out` before any
+/// fallible setup runs. A path the custody line cannot carry is refused, and the
+/// refusal names the directory that is already kept but unannounced.
+pub(crate) fn create_announced_fixture(
+    root: &crate::testkit::RunRoot,
+    label: &str,
+    out: &mut dyn Write,
+) -> Result<FixtureDir, String> {
+    let dir = create_fixture_dir(root, label, Custody::Retained);
+    announce_kept_fixture(dir.path(), &root.path, out).map_err(|reason| {
+        format!(
+            "{reason}; the fixture directory {} is kept and was not announced",
+            dir.path().display()
+        )
+    })?;
+    Ok(dir)
+}
+
+/// The one bounded line that names a kept fixture, or the reason this path
+/// cannot be named.
+///
+/// A path that is not UTF-8, holds a control character or surrounding
+/// whitespace, is longer than the bound, is the run root itself or is not a
+/// plain path inside it never becomes an apparent custody record. Nothing is
+/// written here.
+pub(crate) fn kept_fixture_line(fixture: &Path, root: &Path) -> Result<String, String> {
+    let reported = fixture
+        .to_str()
+        .ok_or_else(|| "the kept fixture path is not UTF-8 and cannot be named".to_owned())?;
+    if reported.is_empty() || reported.chars().any(char::is_control) || reported.trim() != reported
+    {
+        return Err(
+            "the kept fixture path holds a character the custody line cannot carry".to_owned(),
+        );
+    }
+    if reported.len() > KEPT_FIXTURE_PATH_MAX_BYTES {
+        return Err(format!(
+            "the kept fixture path is longer than the {KEPT_FIXTURE_PATH_MAX_BYTES}-byte custody line bound"
+        ));
+    }
+    let inside = fixture
+        .strip_prefix(root)
+        .map_err(|_| "the kept fixture is not inside the caller's run root".to_owned())?;
+    if inside.as_os_str().is_empty() {
+        return Err("the kept fixture is the run root itself, not a fixture inside it".to_owned());
+    }
+    if !inside
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("the kept fixture path is not a plain path inside the run root".to_owned());
+    }
+    Ok(format!("{KEPT_FIXTURE_MARKER}{reported}"))
+}
+
+/// Write exactly one kept-fixture line, and nothing when the path cannot be
+/// named.
+pub(crate) fn announce_kept_fixture(
+    fixture: &Path,
+    root: &Path,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let line = kept_fixture_line(fixture, root)?;
+    writeln!(out, "{line}")
+        .and_then(|()| out.flush())
+        .map_err(|error| format!("the kept fixture line cannot be written: {error}"))
+}
+
+/// Resolve this invocation's fixture custody from the two values that can state
+/// it. Nothing is created, read or written here.
+///
+/// * No opt-in is the ordinary route, whatever run root is named: a directory
+///   name is never guard authority on its own.
+/// * The exact opt-in value with no run root, an empty, relative, un-namable,
+///   over-long or root-level path is a refusal, so no fixture is created.
+/// * The exact opt-in value with a caller-supplied run root is retained
+///   custody, in a root this process does not own.
+pub(crate) fn retained_custody_from(
+    opt_in: Option<&OsStr>,
+    supplied_root: Option<&OsStr>,
+) -> Result<Option<crate::testkit::RunRoot>, String> {
+    let Some(opt_in) = opt_in else {
+        return Ok(None);
+    };
+    if opt_in != OsStr::new(RETAINED_CUSTODY_VALUE) {
+        return Err(format!(
+            "{RETAINED_CUSTODY_ENV} does not carry the only value this route accepts \
+             ({RETAINED_CUSTODY_VALUE}); no fixture was created"
+        ));
+    }
+    let root = supplied_root
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "the retained custody mode requires this invocation's own run root in {}; \
+                 no fixture was created",
+                crate::testkit::SCRATCH_ROOT_ENV
+            )
+        })?;
+    let path = Path::new(root);
+    if !Path::new(root).is_absolute() {
+        return Err(format!(
+            "the retained custody run root {} is not an absolute path; no fixture was created",
+            path.display()
+        ));
+    }
+    if path.parent().is_none() {
+        return Err(format!(
+            "the retained custody run root {} is the filesystem root, not a caller-owned \
+             directory; no fixture was created",
+            path.display()
+        ));
+    }
+    let reported = root.to_str().ok_or_else(|| {
+        format!(
+            "the retained custody run root {} is not UTF-8 and cannot name a fixture; no \
+             fixture was created",
+            path.display()
+        )
+    })?;
+    if reported.chars().any(char::is_control) {
+        return Err(
+            "the retained custody run root holds a control character; no fixture was created"
+                .to_owned(),
+        );
+    }
+    if reported.len() + 1 + FIXTURE_NAME_MAX_BYTES > KEPT_FIXTURE_PATH_MAX_BYTES {
+        return Err(format!(
+            "the retained custody run root is longer than the budget that keeps its fixture \
+             name inside the {KEPT_FIXTURE_PATH_MAX_BYTES}-byte custody line; no fixture was created"
+        ));
+    }
+    Ok(Some(crate::testkit::RunRoot {
+        path: path.to_path_buf(),
+        owned: false,
+    }))
+}
+
+/// Refuse a retained run root that is absent, a link or not a directory. The
+/// caller names the directory it owns; this proves the name resolves to one.
+pub(crate) fn verify_retained_root(path: &Path) -> Result<(), String> {
+    let facts = std::fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "the retained custody run root {} cannot be read: {error}",
+            path.display()
+        )
+    })?;
+    if facts.file_type().is_symlink() {
+        return Err(format!(
+            "the retained custody run root {} is a link; name the directory this invocation owns",
+            path.display()
+        ));
+    }
+    if !facts.is_dir() {
+        return Err(format!(
+            "the retained custody run root {} is not a directory",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// This process's fixture custody, from the environment.
+fn retained_custody() -> Result<Option<crate::testkit::RunRoot>, String> {
+    let custody = retained_custody_from(
+        std::env::var_os(RETAINED_CUSTODY_ENV).as_deref(),
+        std::env::var_os(crate::testkit::SCRATCH_ROOT_ENV).as_deref(),
+    )?;
+    if let Some(root) = &custody {
+        verify_retained_root(&root.path)?;
+    }
+    Ok(custody)
+}
+
+/// Publish the manifest bytes the fixture already holds inside it, before any
+/// engine call. The kept document is the one the window runs, not a
+/// reconstruction of it.
+fn write_manifest(fixture: &Path, manifest: &[u8]) -> Result<(), String> {
+    let path = fixture.join(KEPT_MANIFEST_FILE);
+    std::fs::write(&path, manifest).map_err(|error| {
+        format!(
+            "the kept fixture's manifest cannot be written at {}: {error}",
+            path.display()
+        )
+    })
+}
+
+/// Publish the manifest inside the kept fixture, then run the window.
+///
+/// Both steps are injected so the setup controls can prove the order — the
+/// manifest exists before any engine call — without running `release::plan`. A
+/// publication that fails never reaches the run.
+pub(crate) fn published_then_run<P, R>(
+    fixture: &Path,
+    manifest: &[u8],
+    transcript_out: &Path,
+    publish: P,
+    run: R,
+) -> Result<RunSummary, String>
+where
+    P: FnOnce(&Path, &[u8]) -> Result<(), String>,
+    R: FnOnce(&Path, &Path) -> Result<RunSummary, String>,
+{
+    publish(fixture, manifest)?;
+    run(fixture, transcript_out)
+}
+
+/// The honest reason for a retained run that stopped before a manifest existed.
+/// The partial fixture is kept and named; nothing fabricates its manifest.
+fn missing_manifest_reason(fixture: &Path, reason: &str) -> String {
+    format!(
+        "{reason}; the fixture at {} is kept without a manifest: no manifest bytes were published",
+        fixture.display()
+    )
+}
+
 /// One built fixture: the directory this process owns, the manifest bytes and
 /// the volume UUID the record and the manifest both name.
 #[derive(Debug)]
 pub(crate) struct EmbeddedFixture {
-    /// The exclusively owned fixture directory.
-    pub(crate) dir: crate::testkit::TempDir,
+    /// The exclusively owned fixture directory, with the custody it was built
+    /// under.
+    pub(crate) dir: FixtureDir,
     /// The manifest bytes the window is run under.
     pub(crate) manifest: Vec<u8>,
     /// The fixture-owned root used by writer counterfactuals.
@@ -933,8 +1249,9 @@ pub(crate) struct EmbeddedFixture {
 /// the owned root created through the real platform. Building it writes only
 /// inside the fixture and opens no window.
 pub(crate) struct FixtureSetup {
-    /// The exclusively owned fixture directory.
-    pub(crate) dir: crate::testkit::TempDir,
+    /// The exclusively owned fixture directory, with the custody it was built
+    /// under.
+    pub(crate) dir: FixtureDir,
     /// The fixture tree the volume record names.
     pub(crate) volume_root: PathBuf,
     /// The real mount point of the fixture volume.
@@ -979,7 +1296,18 @@ pub(crate) fn build_fixture_setup_in(
     label: &str,
     declaration: Option<&AreaDeclaration>,
 ) -> Result<FixtureSetup, String> {
-    let dir = crate::testkit::TempDir::within_run_root(root, label);
+    finish_fixture_setup(
+        create_fixture_dir(root, label, Custody::Ordinary),
+        declaration,
+    )
+}
+
+/// Every fallible setup step, over a directory that already exists and already
+/// has its custody. Nothing here creates, arms or disarms the directory.
+fn finish_fixture_setup(
+    dir: FixtureDir,
+    declaration: Option<&AreaDeclaration>,
+) -> Result<FixtureSetup, String> {
     let volume_root = dir.path().join("volume-root");
     std::fs::create_dir_all(&volume_root)
         .map_err(|error| format!("the fixture volume root cannot be created: {error}"))?;
@@ -1083,7 +1411,39 @@ pub(crate) fn manifest_document(setup: &FixtureSetup, case: &str) -> serde_json:
 /// owned root, settled Oxide row, absent checkout, and the manifest naming
 /// them. Setup writes only inside the fixture, before any window opens.
 pub(crate) fn build_fixture(label: &str) -> Result<EmbeddedFixture, String> {
-    let setup = build_fixture_setup(label, Some(&base_declaration()))?;
+    build_fixture_with(
+        &crate::testkit::scratch_root(),
+        label,
+        Custody::Ordinary,
+        &mut std::io::sink(),
+    )
+}
+
+/// Build the whole BASE-shaped fixture inside `root` with the requested custody.
+///
+/// Retained custody is armed and announced before the first fallible setup step,
+/// so a setup error leaves the partial directory kept and already named.
+fn build_fixture_with(
+    root: &crate::testkit::RunRoot,
+    label: &str,
+    custody: Custody,
+    out: &mut dyn Write,
+) -> Result<EmbeddedFixture, String> {
+    let dir = match custody {
+        Custody::Ordinary => create_fixture_dir(root, label, Custody::Ordinary),
+        Custody::Retained => create_announced_fixture(root, label, out)?,
+    };
+    let fixture_path = dir.path().to_path_buf();
+    finish_base_fixture(dir).map_err(|reason| match custody {
+        Custody::Ordinary => reason,
+        Custody::Retained => missing_manifest_reason(&fixture_path, &reason),
+    })
+}
+
+/// The fallible remainder of a BASE fixture build, over a directory whose
+/// custody is already decided.
+fn finish_base_fixture(dir: FixtureDir) -> Result<EmbeddedFixture, String> {
+    let setup = finish_fixture_setup(dir, Some(&base_declaration()))?;
     let root = setup.owned_root()?.clone();
     fixture_oxide_records(&setup.account, &root, setup.record.volume_uuid.as_str())?;
     let manifest = serde_json::to_vec_pretty(&manifest_document(&setup, "CTL-0"))
@@ -1099,11 +1459,43 @@ pub(crate) fn build_fixture(label: &str) -> Result<EmbeddedFixture, String> {
 /// Exercise the unchanged real-host route, accepting only its actual engine
 /// outcome or a recorded bounded capture refusal. Success means the self-check
 /// classified that result, never that a truncated capture qualified.
+///
+/// The ordinary route is unchanged. Under the explicit retained-custody opt-in
+/// the fixture is kept from creation, its path is announced before any fallible
+/// setup, and the manifest bytes are published inside it before the window
+/// runs; this process never removes it afterwards.
 pub(crate) fn embedded_exercise() -> Result<(), String> {
-    let fixture = build_fixture("tape-eval-real-host")?;
+    match retained_custody()? {
+        None => {
+            let fixture = build_fixture(REAL_HOST_LABEL)?;
+            let transcript_out = fixture.dir.path().join("transcripts").join("barge.json");
+            let outcome = run(&fixture.manifest, fixture.dir.path(), &transcript_out);
+            classify_exercise(&fixture, outcome)
+        }
+        Some(root) => {
+            let mut err = std::io::stderr();
+            let fixture = build_fixture_with(&root, REAL_HOST_LABEL, Custody::Retained, &mut err)?;
+            let transcript_out = fixture.dir.path().join("transcripts").join("barge.json");
+            let outcome = published_then_run(
+                fixture.dir.path(),
+                &fixture.manifest,
+                &transcript_out,
+                write_manifest,
+                |fixture_root, transcript_out| run(&fixture.manifest, fixture_root, transcript_out),
+            );
+            classify_exercise(&fixture, outcome)
+        }
+    }
+}
+
+/// Classify one embedded outcome from its transcript. A capture-cap refusal is
+/// an honest bounded result; any other disagreement is an apparatus failure.
+fn classify_exercise(
+    fixture: &EmbeddedFixture,
+    outcome: Result<RunSummary, String>,
+) -> Result<(), String> {
     let transcript_out = fixture.dir.path().join("transcripts").join("barge.json");
-    let outcome = run(&fixture.manifest, fixture.dir.path(), &transcript_out);
-    let retained = retain_transcript(&fixture, &transcript_out)?;
+    let retained = retain_transcript(fixture, &transcript_out)?;
     let bytes = std::fs::read(&retained).map_err(|error| error.to_string())?;
     let document: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
@@ -1796,5 +2188,381 @@ mod tests {
         let state_paths =
             StatePaths::resolve(&account, Some(&account.state)).expect("the state resolves");
         assert!(state_paths.root().starts_with(root));
+    }
+
+    /// One fresh directory this test owns, as a caller-owned run root: fixtures
+    /// live inside it and it is removed with the test's own fixture, not by the
+    /// code under control.
+    fn caller_root(base: &crate::testkit::TempDir) -> crate::testkit::RunRoot {
+        let path = base.join("run");
+        std::fs::create_dir(&path).unwrap();
+        crate::testkit::RunRoot { path, owned: false }
+    }
+
+    /// The fixture paths an announcement stream named, and nothing else.
+    fn announced_paths(out: &[u8]) -> Vec<PathBuf> {
+        std::str::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| PathBuf::from(line.strip_prefix(KEPT_FIXTURE_MARKER).unwrap()))
+            .collect()
+    }
+
+    /// The steps one injected run recorded, in order.
+    fn events<'a>(order: &std::cell::RefCell<Vec<&'a str>>) -> Vec<&'a str> {
+        order.borrow().clone()
+    }
+
+    /// The two lifetime outcomes side by side: the ordinary fixture removes
+    /// itself on a successful drop, and the retained one keeps every byte.
+    /// Neither route runs an engine.
+    #[test]
+    fn custody_ordinary_fixture_removes_itself_and_retained_fixture_stays() {
+        let base = crate::testkit::TempDir::new("custody-drop");
+        let root = caller_root(&base);
+        let ordinary = create_fixture_dir(&root, "custody-ordinary", Custody::Ordinary);
+        let ordinary_path = ordinary.path().to_path_buf();
+        assert!(ordinary_path.is_dir());
+        drop(ordinary);
+        assert!(
+            !ordinary_path.exists(),
+            "an ordinary fixture removes itself"
+        );
+
+        let retained = create_fixture_dir(&root, "custody-retained", Custody::Retained);
+        assert!(matches!(retained, FixtureDir::Kept(_)));
+        let kept_path = retained.path().to_path_buf();
+        std::fs::write(kept_path.join("partial.txt"), b"left behind").unwrap();
+        drop(retained);
+        assert!(
+            kept_path.is_dir(),
+            "the retained fixture survives its own drop"
+        );
+        assert!(
+            kept_path.join("partial.txt").is_file(),
+            "its bytes are untouched"
+        );
+    }
+
+    /// Retention is armed at creation, so the first fallible setup step — the
+    /// real one, made to fail by a file holding its directory name — leaves the
+    /// partial fixture kept and already named. The same failure under ordinary
+    /// custody still cleans up, so default behaviour is unchanged.
+    #[test]
+    fn custody_retention_is_armed_before_the_first_fallible_setup_step() {
+        let base = crate::testkit::TempDir::new("custody-setup");
+        let root = caller_root(&base);
+
+        let mut announced = Vec::new();
+        let retained =
+            create_announced_fixture(&root, "custody-setup-retained", &mut announced).unwrap();
+        let kept = retained.path().to_path_buf();
+        assert_eq!(announced_paths(&announced), vec![kept.clone()]);
+        std::fs::write(kept.join("volume-root"), b"not a directory").unwrap();
+        assert!(
+            finish_fixture_setup(retained, None).is_err(),
+            "the injected first fallible step fails"
+        );
+        assert!(
+            kept.is_dir(),
+            "the retained fixture survives the first fallible setup step"
+        );
+        assert!(
+            kept.join("volume-root").is_file(),
+            "the partial bytes are kept, not repaired"
+        );
+
+        let ordinary = create_fixture_dir(&root, "custody-setup-ordinary", Custody::Ordinary);
+        let gone = ordinary.path().to_path_buf();
+        std::fs::write(gone.join("volume-root"), b"not a directory").unwrap();
+        assert!(finish_fixture_setup(ordinary, None).is_err());
+        assert!(
+            !gone.exists(),
+            "an ordinary fixture still removes itself on the same failure"
+        );
+    }
+
+    /// Unwinding is the same drop the lifetime decision already covers: the
+    /// retained fixture stays and the ordinary one still goes.
+    #[test]
+    fn custody_panic_unwinding_keeps_the_retained_fixture() {
+        let base = crate::testkit::TempDir::new("custody-panic");
+        let root = caller_root(&base);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let mut retained_path = PathBuf::new();
+        let retained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let dir = create_fixture_dir(&root, "custody-panic-retained", Custody::Retained);
+            retained_path = dir.path().to_path_buf();
+            panic!("injected unwinding after creation");
+        }));
+        let mut ordinary_path = PathBuf::new();
+        let ordinary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let dir = create_fixture_dir(&root, "custody-panic-ordinary", Custody::Ordinary);
+            ordinary_path = dir.path().to_path_buf();
+            panic!("injected unwinding after creation");
+        }));
+        std::panic::set_hook(previous);
+        assert!(retained.is_err() && ordinary.is_err(), "both unwound");
+        assert!(
+            retained_path.is_dir(),
+            "unwinding leaves the retained fixture in place"
+        );
+        assert!(
+            !ordinary_path.exists(),
+            "unwinding still cleans up an ordinary fixture"
+        );
+    }
+
+    /// The kept path is named before any setup runs, in exactly one bounded
+    /// line; a root whose path cannot be carried refuses and keeps the fixture
+    /// unannounced rather than claiming custody it cannot report.
+    #[test]
+    fn custody_announcement_names_the_fixture_before_setup() {
+        let base = crate::testkit::TempDir::new("custody-announce");
+        let root = caller_root(&base);
+        let mut out = Vec::new();
+        let dir = create_announced_fixture(&root, "custody-announce-ok", &mut out).unwrap();
+        let kept = dir.path().to_path_buf();
+        assert!(kept.is_dir(), "the announced fixture exists");
+        assert_eq!(announced_paths(&out), vec![kept]);
+        assert_eq!(
+            out.iter().filter(|byte| **byte == b'\n').count(),
+            1,
+            "exactly one line, and nothing else"
+        );
+
+        let bad_root = crate::testkit::RunRoot {
+            path: base.path().join("bad\nroot"),
+            owned: false,
+        };
+        std::fs::create_dir(&bad_root.path).unwrap();
+        let mut refused = Vec::new();
+        let failure =
+            create_announced_fixture(&bad_root, "custody-announce-bad", &mut refused).unwrap_err();
+        assert!(refused.is_empty(), "nothing was announced");
+        assert!(
+            failure.contains("kept"),
+            "the refusal names the kept fixture"
+        );
+        assert_eq!(
+            std::fs::read_dir(&bad_root.path).unwrap().count(),
+            1,
+            "the fixture is kept, not removed"
+        );
+    }
+
+    /// The manifest is inside the kept fixture before any run call, and a
+    /// publication that fails never reaches the run. The steps are injected, so
+    /// no engine runs.
+    #[test]
+    fn custody_manifest_is_published_before_the_window_runs() {
+        let base = crate::testkit::TempDir::new("custody-manifest");
+        let root = caller_root(&base);
+        let dir = create_fixture_dir(&root, "custody-manifest-run", Custody::Retained);
+        let fixture = dir.path().to_path_buf();
+        let transcript_out = fixture.join("transcripts").join("barge.json");
+        let manifest = b"{\"schema\":\"oxide.capture.manifest/2\"}".to_vec();
+        let order = std::cell::RefCell::new(Vec::<&str>::new());
+        let stopped = published_then_run(
+            &fixture,
+            &manifest,
+            &transcript_out,
+            |fixture, bytes| {
+                order.borrow_mut().push("publish");
+                write_manifest(fixture, bytes)
+            },
+            |fixture, _transcript| {
+                assert!(
+                    events(&order) == vec!["publish"],
+                    "the manifest is published first"
+                );
+                assert!(
+                    fixture.join(KEPT_MANIFEST_FILE).is_file(),
+                    "the manifest exists before any run call"
+                );
+                assert_eq!(
+                    std::fs::read(fixture.join(KEPT_MANIFEST_FILE)).unwrap(),
+                    manifest,
+                    "the published bytes are the window's own"
+                );
+                order.borrow_mut().push("run");
+                Err("injected engine stop".to_owned())
+            },
+        );
+        assert_eq!(stopped.unwrap_err(), "injected engine stop");
+        assert_eq!(events(&order), vec!["publish", "run"]);
+
+        order.borrow_mut().clear();
+        let refused = published_then_run(
+            &fixture,
+            &manifest,
+            &transcript_out,
+            |_, _| {
+                order.borrow_mut().push("publish");
+                Err("injected publication refusal".to_owned())
+            },
+            |_, _| {
+                order.borrow_mut().push("run");
+                Err("never reached".to_owned())
+            },
+        );
+        assert_eq!(refused.unwrap_err(), "injected publication refusal");
+        assert_eq!(
+            events(&order),
+            vec!["publish"],
+            "a refused publication runs nothing"
+        );
+    }
+
+    /// The opt-in and the run root are premises checked before any fixture
+    /// exists: no opt-in is ordinary custody, and every absent, malformed,
+    /// foreign, root-level or un-namable form refuses and creates nothing.
+    #[test]
+    fn custody_premises_refuse_before_any_fixture_exists() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let exact = Some(OsStr::new(RETAINED_CUSTODY_VALUE));
+        assert_eq!(
+            retained_custody_from(None, None).unwrap(),
+            None,
+            "no opt-in is the ordinary route"
+        );
+        assert_eq!(
+            retained_custody_from(None, Some(OsStr::new("/caller/run"))).unwrap(),
+            None,
+            "a run root alone is never guard authority"
+        );
+
+        let base = crate::testkit::TempDir::new("custody-premises");
+        let root = caller_root(&base);
+        let retained = retained_custody_from(exact, Some(root.path.as_os_str()))
+            .unwrap()
+            .expect("the opt-in with a caller root is retained custody");
+        assert_eq!(retained.path, root.path);
+        assert!(!retained.owned, "the caller's root is never ours to remove");
+
+        let long = format!("/{}", "a".repeat(KEPT_FIXTURE_PATH_MAX_BYTES));
+        let refusals: [(Option<&OsStr>, Option<&OsStr>); 9] = [
+            (Some(OsStr::new("")), Some(root.path.as_os_str())),
+            (
+                Some(OsStr::new("barge.tape.kept-fixture/2")),
+                Some(root.path.as_os_str()),
+            ),
+            (Some(OsStr::new("1")), Some(root.path.as_os_str())),
+            (Some(OsStr::new("false")), Some(root.path.as_os_str())),
+            (exact, None),
+            (exact, Some(OsStr::new(""))),
+            (exact, Some(OsStr::new("relative/run"))),
+            (exact, Some(OsStr::new("/"))),
+            (exact, Some(OsStr::new("/caller/run\nroot"))),
+        ];
+        for (opt_in, supplied) in refusals {
+            assert!(
+                retained_custody_from(opt_in, supplied).is_err(),
+                "{opt_in:?} with {supplied:?} must refuse"
+            );
+        }
+        assert!(
+            retained_custody_from(exact, Some(OsStr::new(long.as_str()))).is_err(),
+            "an over-long root cannot keep a namable fixture"
+        );
+        assert!(
+            retained_custody_from(exact, Some(OsStr::from_bytes(b"/caller/\xff"))).is_err(),
+            "a non-UTF-8 root cannot name its fixture"
+        );
+        assert_eq!(
+            std::fs::read_dir(&root.path).unwrap().count(),
+            0,
+            "no refused premise created a fixture"
+        );
+
+        assert!(
+            verify_retained_root(&root.path.join("absent")).is_err(),
+            "a root that does not exist refuses"
+        );
+        let file = root.path.join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(
+            verify_retained_root(&file).is_err(),
+            "a file is not a run root"
+        );
+        let link = root.path.join("a-link");
+        std::os::unix::fs::symlink(&root.path, &link).unwrap();
+        assert!(
+            verify_retained_root(&link).is_err(),
+            "a link is not the caller's own directory"
+        );
+        assert!(verify_retained_root(&root.path).is_ok());
+    }
+
+    /// One bounded, exact line: a control character, surrounding whitespace, an
+    /// over-long path, a non-UTF-8 path, the run root itself or a path outside it
+    /// never becomes an apparent custody record, and a refused path writes
+    /// nothing.
+    #[test]
+    fn custody_kept_fixture_line_is_bounded_and_exact() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let base = crate::testkit::TempDir::new("custody-line");
+        let root = caller_root(&base);
+        let fixture = root.path.join("barge-test-x");
+        std::fs::create_dir(&fixture).unwrap();
+        assert_eq!(
+            kept_fixture_line(&fixture, &root.path).unwrap(),
+            format!("{KEPT_FIXTURE_MARKER}{}", fixture.display())
+        );
+
+        for outside in [
+            base.path().to_path_buf(),
+            root.path.clone(),
+            PathBuf::from("/elsewhere/fixture"),
+            Path::new(OsStr::from_bytes(b"/fixture/\xff")).to_path_buf(),
+        ] {
+            assert!(
+                kept_fixture_line(&outside, &root.path).is_err(),
+                "{} is not a namable fixture inside the root",
+                outside.display()
+            );
+        }
+        let newline = root.path.join("bad\nname");
+        std::fs::create_dir(&newline).unwrap();
+        assert!(kept_fixture_line(&newline, &root.path).is_err());
+        assert!(
+            kept_fixture_line(&root.path.join("trailing "), &root.path).is_err(),
+            "surrounding whitespace cannot survive the driver's strip"
+        );
+        let long = root.path.join("a".repeat(KEPT_FIXTURE_PATH_MAX_BYTES));
+        assert!(
+            kept_fixture_line(&long, &root.path).is_err(),
+            "an over-long path is never announced"
+        );
+
+        let mut out: Vec<u8> = Vec::new();
+        assert!(announce_kept_fixture(&long, &root.path, &mut out).is_err());
+        assert!(out.is_empty(), "a path that cannot be named writes no line");
+        announce_kept_fixture(&fixture, &root.path, &mut out).unwrap();
+        assert_eq!(
+            out,
+            format!("{KEPT_FIXTURE_MARKER}{}\n", fixture.display()).as_bytes()
+        );
+    }
+
+    /// A retained run that stops before a manifest exists is kept and named
+    /// with an honest missing-manifest reason. Nothing fabricates one.
+    #[test]
+    fn custody_missing_manifest_reason_names_the_kept_fixture() {
+        let reason =
+            missing_manifest_reason(Path::new("/kept/fixture"), "the fixture volume is not APFS");
+        assert!(
+            reason.starts_with("the fixture volume is not APFS"),
+            "the original reason is preserved verbatim"
+        );
+        assert!(
+            reason.contains("/kept/fixture"),
+            "the kept fixture is named"
+        );
+        assert!(reason.contains("kept without a manifest"));
+        assert!(reason.contains("no manifest bytes were published"));
     }
 }

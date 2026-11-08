@@ -104,6 +104,12 @@ guarded exception. Each selector covers what it names:
 - `effigy rust:test:tape:pure` — the recorder's in-memory self-tests only;
   excludes the harness exercise and its real process scan. It does not replace
   the required end-to-end exercise or establish capture qualification.
+- `effigy rust:test:tape:custody` — the retained fixture custody setup controls
+  ([o2-tape](docs/knowledge/contracts/o2-tape.md), "Retained fixture custody"):
+  ordinary cleanup versus retained lifetime on drop, an injected failing setup
+  step and unwinding, the opt-in and run-root premises, the bounded kept-fixture
+  line and the manifest-before-run order. No engine window, host-volume probe,
+  image or native run; the mode itself is a test-only fixture lifetime.
 - `effigy rust:test:tape-eval` — the harness executable's own run with no arguments,
   which is its embedded exercise; with the argv contract it runs one manifest window.
 - `effigy rust:test:tape-stage` — build the default-feature harness without running it;

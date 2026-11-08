@@ -9,6 +9,11 @@
 //! fixture, so no fixture is ever created directly in the shared scratch parent.
 //! Tests that need the state directory use
 //! [`crate::state::StatePaths`] over a directory here.
+//!
+//! One caller may take a fixture out of that lifetime: [`TempDir::keep`] hands
+//! the directory and its removal to whoever called it, immediately and for good
+//! (`docs/knowledge/contracts/o2-tape.md`, "Retained fixture custody"). Every
+//! other fixture keeps removing itself on success and on failure.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -103,6 +108,9 @@ pub struct TempDir {
     /// The run root this process created for the fixture, removed once the
     /// fixture is gone and the root is empty. `None` for a root a caller owns.
     owned_root: Option<PathBuf>,
+    /// Whether [`TempDir::keep`] took this fixture out of automatic cleanup.
+    /// Set once, at the call, and never cleared: removal cannot be re-armed.
+    retained: bool,
 }
 
 impl TempDir {
@@ -118,6 +126,7 @@ impl TempDir {
         Self {
             path: Self::create_under(base, label),
             owned_root: None,
+            retained: false,
         }
     }
 
@@ -136,7 +145,25 @@ impl TempDir {
         Self {
             path: Self::create_under(&root.path, label),
             owned_root: root.owned.then(|| root.path.clone()),
+            retained: false,
         }
+    }
+
+    /// Take this fixture out of automatic cleanup for good and hand back its
+    /// path.
+    ///
+    /// From this call on the directory keeps every byte and nothing this
+    /// process does removes it: dropping the value is a no-op, and the run root
+    /// this process created for it is left in place. The caller's own guard now
+    /// owns removal, after its own census of the directory. The decision is
+    /// taken when the call is made — no later success, early return or unwind
+    /// can re-arm removal — so a caller that has not decided who removes the
+    /// directory must not call it (`docs/knowledge/contracts/o2-tape.md`,
+    /// "Retained fixture custody").
+    pub fn keep(mut self) -> PathBuf {
+        self.retained = true;
+        self.owned_root = None;
+        self.path.clone()
     }
 
     /// The path one fresh directory under `base` got, creating `base` when it is
@@ -189,6 +216,12 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
+        if self.retained {
+            // `keep` handed removal to the caller's guard. Nothing here may
+            // remove the directory or the root, on a normal drop or on an
+            // unwinding one.
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.path);
         if let Some(root) = self.owned_root.take() {
             // Removing the root succeeds only when this fixture was the last

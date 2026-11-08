@@ -56,6 +56,12 @@ alias = "barge"
 "rust:test:fixture-plan" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib tape_cases::tests::the_plan_prints_every_spec_and_obligation -- --exact --nocapture"
 # Recorder-only tests: excludes the harness exercise and its real process scan.
 "rust:test:tape:pure" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib tape::tests"
+# Retained fixture custody's own setup controls (docs/knowledge/contracts/o2-tape.md,
+# "Retained fixture custody"): ordinary cleanup versus retained lifetime on drop,
+# an injected failing setup step and unwinding, the opt-in and run-root premises,
+# the bounded kept-fixture line and the manifest-before-run order. No engine
+# window, no host-volume probe, no image and no native run.
+"rust:test:tape:custody" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib tape_harness::tests::custody"
 "rust:test:tape-eval" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --test tape_eval"
 # Build only; the exporter consumes the compiler's artifact record.
 "rust:test:tape-stage" = "oxide test --admission-budget 300s --execution-budget 300s --locked -p barge --test tape_eval --no-run --message-format json"
