@@ -3825,12 +3825,12 @@ impl DirOps for MacOs {
         // no other owner exists, so `File` may take ownership of it.
         let file = unsafe { File::from_raw_fd(duplicate) };
         #[cfg(test)]
-        crate::tape::handle_observation(
+        crate::tape::linked_handle_observation(
             "MacOs::duplicate_dir",
             "dir-duplicate",
             directory,
-            handle.identity().device.get(),
-            handle.identity().inode,
+            (handle.identity().device.get(), handle.identity().inode),
+            (handle.identity().device.get(), handle.identity().inode),
             crate::tape::Outcome::facts("duplicated"),
         );
         Ok(DirHandle::from_descriptor(file, handle.identity()))
@@ -3923,6 +3923,8 @@ impl DirOps for MacOs {
         }
         #[cfg(test)]
         {
+            // SAFETY: the same open directory, one NUL-terminated component and
+            // the same mode the non-test branch passes.
             let answer = unsafe { libc::mkdirat(directory, raw.as_ptr(), mode as libc::mode_t) };
             let error = (answer != 0).then(io::Error::last_os_error);
             crate::tape::effect_outcome("create", Path::new(name), error.as_ref());
@@ -4019,8 +4021,6 @@ impl DirOps for MacOs {
                 result
                     .map_err(|error| child_error(name, "cannot sync the temporary file", error))?;
             }
-            // SAFETY: both names are NUL-terminated components inside the same
-            // open directory, which is what makes the rename atomic.
             #[cfg(test)]
             crate::tape::child_effect(
                 "rename",
@@ -4028,6 +4028,8 @@ impl DirOps for MacOs {
                 &temporary,
                 Some(name),
             );
+            // SAFETY: both names are NUL-terminated components inside the same
+            // open directory, which is what makes the rename atomic.
             #[cfg(not(test))]
             if unsafe {
                 libc::renameat(
@@ -4046,6 +4048,8 @@ impl DirOps for MacOs {
             }
             #[cfg(test)]
             {
+                // SAFETY: both names are NUL-terminated components inside the
+                // same open directory, as in the non-test branch.
                 let answer = unsafe {
                     libc::renameat(
                         directory,
@@ -4071,6 +4075,8 @@ impl DirOps for MacOs {
             }
             #[cfg(test)]
             {
+                // SAFETY: `directory` is the open directory the rename happened
+                // in, as in the non-test branch.
                 let answer = unsafe { libc::fsync(directory) };
                 let error = (answer != 0).then(io::Error::last_os_error);
                 crate::tape::sync_observation(
@@ -4101,6 +4107,8 @@ impl DirOps for MacOs {
                     &temporary,
                     None,
                 );
+                // SAFETY: `temporary_raw` names the file this call created, as
+                // in the non-test branch.
                 let answer = unsafe { libc::unlinkat(directory, temporary_raw.as_ptr(), 0) };
                 let error = (answer != 0).then(io::Error::last_os_error);
                 crate::tape::effect_outcome("unlink", Path::new(&temporary), error.as_ref());
@@ -4558,12 +4566,12 @@ impl DirOps for MacOs {
         #[cfg(test)]
         {
             let facts = entry_facts(&fstat(descriptor, Path::new("facts"))?);
-            crate::tape::handle_observation(
+            crate::tape::linked_handle_observation(
                 "MacOs::dir_facts",
                 "stat",
                 descriptor.as_raw_fd(),
-                facts.device.get(),
-                facts.inode,
+                (facts.device.get(), facts.inode),
+                (handle.identity().device.get(), handle.identity().inode),
                 crate::tape::Outcome::facts(facts.kind.as_str()),
             );
             Ok(facts)
@@ -4603,12 +4611,12 @@ impl DirOps for MacOs {
         #[cfg(test)]
         {
             let identity = read_dir_identity(descriptor, Path::new("recheck"))?;
-            crate::tape::handle_observation(
+            crate::tape::linked_handle_observation(
                 "MacOs::recheck_dir",
                 "stat",
                 descriptor.as_raw_fd(),
-                identity.device.get(),
-                identity.inode,
+                (identity.device.get(), identity.inode),
+                (handle.identity().device.get(), handle.identity().inode),
                 crate::tape::Outcome::facts("directory"),
             );
             Ok(identity)

@@ -9,18 +9,22 @@
 //! `override_dir`, supplies a test-only [`AccountFacts`] returning fixture
 //! paths, passes the real platform object for all five trait arguments, calls
 //! the actual `barge::release::plan` with `ReleaseBounds::design()` and a real
-//! `now_ms`, and always writes one `oxide.capture.transcript/1` document —
+//! `now_ms`, and always writes one `oxide.capture.transcript/2` document —
 //! including on refusal. It records only; it feeds nothing back, copies no
 //! policy, and never touches the production account resolution or the
-//! `proof-synthetic-account` feature.
+//! `proof-synthetic-account` feature. A refusal before the engine ran, or a
+//! report that cannot be carried into a conforming transcript, writes the
+//! distinct `oxide.capture.apparatus/2` diagnostic instead; that document is
+//! never a capture.
 //!
 //! ## Manifest fields this harness reads
 //!
-//! The manifest is `oxide.capture.manifest/1`, owned by the orchestrator.
-//! The copied Oxide 283 parser validates its reviewed wire shape, separately
-//! from completeness. After validation, the harness extracts these members
-//! for the engine, binds the whole document's SHA-256, and attaches obligation
-//! and effect diagnostics:
+//! The manifest is `oxide.capture.manifest/2`, owned by the orchestrator. The
+//! copied Oxide 284 parser validates its reviewed wire shape, separately from
+//! completeness; completeness is judged afterwards by the same shared parser
+//! and reconciler rules over the emitted transcript. After validation, the
+//! harness extracts these members for the engine and binds the whole document's
+//! SHA-256:
 //!
 //! - `case`: the case name carried into the transcript;
 //! - `barge.volume_uuid`: the fixture volume's UUID, as registered;
@@ -28,11 +32,11 @@
 //! - `barge.named_roots`: optional array of explicitly named roots.
 //!
 //! A member that is missing or of the wrong shape is an apparatus error: the
-//! process exits `2` and writes a provisional apparatus refusal document with
+//! process exits `2` and writes an `oxide.capture.apparatus/2` diagnostic with
 //! no invented engine outcome. The engine's own refusals —
 //! an undeclared area, an unregistered volume, an unreadable registry — are
 //! engine outcomes: the shared transcript carries `outcome.state` as
-//! `refused` and the engine's own refusal vocabulary under `outcome.engine`; the exit code
+//! `refused` with the engine's own refusal reason, and the exit code
 //! `ErrorKind::exit_code` gives, and the process exits with that code.
 //!
 //! ## Staged provenance for the later X-S2 orchestration
@@ -57,8 +61,8 @@ use crate::os::{AccountFacts, DirOps, MountRoot, ProcessObserver, VolumeFacts, V
 use crate::release::{ReleaseBounds, ReleaseRequest};
 use crate::state::StatePaths;
 use crate::tape::{
-    begin_window, finish, read_present, WindowConfig, CAP_DOCUMENT_BYTES, CAP_OCCURRENCES,
-    CAP_PROCESS_ROWS, CAP_READ_ROWS,
+    begin_window, finish, finish_apparatus, read_present, WindowConfig, CAP_DOCUMENT_BYTES,
+    CAP_OCCURRENCES, CAP_PROCESS_ROWS, CAP_READ_ROWS,
 };
 
 /// The manifest members this harness reads, after parsing.
@@ -90,8 +94,11 @@ pub(crate) fn parse_manifest(bytes: &[u8]) -> Result<ManifestRequest, String> {
             .get(key)
             .ok_or_else(|| format!("the manifest has no `{key}` member"))
     }
-    if member(&document, "schema")?.as_str() != Some("oxide.capture.manifest/1") {
-        return Err("the manifest schema is not oxide.capture.manifest/1".to_owned());
+    if member(&document, "schema")?.as_str() != Some(crate::tape::MANIFEST_SCHEMA) {
+        return Err(format!(
+            "the manifest schema is not {}",
+            crate::tape::MANIFEST_SCHEMA
+        ));
     }
     let case = member(&document, "case")?
         .as_str()
@@ -198,6 +205,10 @@ pub(crate) struct RunSummary {
     pub(crate) read_rows: usize,
     /// The declared transcript caps, restated for the caller's own check.
     pub(crate) caps: (usize, usize, u32, usize),
+    /// The shared completeness issues this window's transcript produces. A
+    /// nonempty list is the honest statement that the window is not sufficient
+    /// proof; it is never a parity or coverage claim.
+    pub(crate) issues: Vec<String>,
 }
 
 /// Check the export receipt and its actual source and executable bytes before
@@ -541,8 +552,8 @@ fn run_with_observer(
         write_apparatus_refusal(transcript_out, Some(manifest_bytes), &reason)?;
         return Err(reason);
     }
-    crate::tape::attach_obligations(manifest_bytes);
-    crate::tape::attach_effect_expectations(manifest_bytes);
+    crate::tape::attach_manifest(manifest_bytes);
+    crate::tape::begin_fixture(fixture_root);
 
     // The caller clock is a real reading; the tape records it as the window's
     // first clock row through state::now_ms's own leaf statement.
@@ -578,43 +589,37 @@ fn run_with_observer(
                 Ok(result) => result,
                 Err(error) => {
                     let reason = format!("the engine's report cannot be serialized: {error}");
-                    let document = crate::tape::finish_omitted(crate::tape::EngineOutcome {
-                        status: "completed",
-                        exit_code,
-                        refusal_kind: None,
-                        refusal_message: None,
-                        refusal_detail: Vec::new(),
-                        engine_truncated,
-                    })?;
-                    write_shared_transcript(transcript_out, &document)?;
+                    let document = finish_apparatus(&format!(
+                        "the engine completed with exit code {exit_code} but {reason}"
+                    ))?;
+                    write_transcript(transcript_out, &document)?;
                     return Err(reason);
                 }
             };
-            write_shared_transcript(
-                transcript_out,
-                &finish(
-                    crate::tape::EngineOutcome {
-                        status: "completed",
-                        exit_code,
-                        refusal_kind: None,
-                        refusal_message: None,
-                        refusal_detail: Vec::new(),
-                        engine_truncated,
-                    },
-                    Some(&result),
-                )?,
+            let recorded = finish(
+                crate::tape::EngineOutcome {
+                    status: "completed",
+                    exit_code,
+                    refusal_kind: None,
+                    refusal_message: None,
+                    refusal_detail: Vec::new(),
+                    engine_truncated,
+                },
+                Some(&result),
             )?;
+            let (read_rows, issues) = publish_capture(transcript_out, &recorded, manifest_bytes)?;
             RunSummary {
                 status: "completed",
                 exit_code,
                 eligible: Some(eligible),
-                read_rows: 0,
+                read_rows,
                 caps: (
                     CAP_READ_ROWS,
                     CAP_DOCUMENT_BYTES,
                     CAP_OCCURRENCES,
                     CAP_PROCESS_ROWS,
                 ),
+                issues,
             }
         }
         Err(error) => {
@@ -624,76 +629,114 @@ fn run_with_observer(
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
-            write_shared_transcript(
-                transcript_out,
-                &finish(
-                    crate::tape::EngineOutcome {
-                        status: "refused",
-                        exit_code,
-                        refusal_kind: Some(error.kind().as_str().to_owned()),
-                        refusal_message: Some(error.message().to_owned()),
-                        refusal_detail,
-                        engine_truncated: false,
-                    },
-                    None,
-                )?,
+            let recorded = finish(
+                crate::tape::EngineOutcome {
+                    status: "refused",
+                    exit_code,
+                    refusal_kind: Some(error.kind().as_str().to_owned()),
+                    refusal_message: Some(error.message().to_owned()),
+                    refusal_detail,
+                    engine_truncated: false,
+                },
+                None,
             )?;
+            let (read_rows, issues) = publish_capture(transcript_out, &recorded, manifest_bytes)?;
             RunSummary {
                 status: "refused",
                 exit_code,
                 eligible: None,
-                read_rows: 0,
+                read_rows,
                 caps: (
                     CAP_READ_ROWS,
                     CAP_DOCUMENT_BYTES,
                     CAP_OCCURRENCES,
                     CAP_PROCESS_ROWS,
                 ),
+                issues,
             }
         }
     };
     Ok(summary)
 }
 
-fn write_shared_transcript(path: &Path, recorded: &str) -> Result<(), String> {
-    match crate::tape::shared_transcript(recorded) {
-        Ok(wire) => write_transcript(path, &wire),
-        Err(error) => {
-            // Preserve the actual engine result and observations on adapter failure.
-            write_transcript(path, recorded)?;
-            Err(format!("shared capture adapter refused: {error}"))
-        }
+/// Convert the recorder document, write the shared transcript, and judge it
+/// with the shared parser and reconciler rules. An apparatus fallback is
+/// written and reported, never passed off as a capture.
+fn publish_capture(
+    path: &Path,
+    recorded: &str,
+    manifest: &[u8],
+) -> Result<(usize, Vec<String>), String> {
+    if recorder_schema(recorded).as_deref() == Some(crate::tape::APPARATUS_SCHEMA) {
+        let document: serde_json::Value =
+            serde_json::from_str(recorded).map_err(|error| error.to_string())?;
+        write_transcript(path, recorded)?;
+        return Err(document["reason"]
+            .as_str()
+            .unwrap_or("the capture fell back to an apparatus diagnostic")
+            .to_owned());
     }
+    let wire = match crate::tape::shared_transcript(recorded) {
+        Ok(wire) => wire,
+        Err(error) => {
+            let document: serde_json::Value =
+                serde_json::from_str(recorded).map_err(|parse| parse.to_string())?;
+            let case = document["case"].as_str().unwrap_or("").to_owned();
+            let digest = document["manifest_sha256"].as_str().map(str::to_owned);
+            let reason = format!("the recorder document could not be converted: {error}");
+            write_transcript(
+                path,
+                &crate::tape::apparatus_document(&case, digest.as_deref(), &reason),
+            )?;
+            let recorder_path = recorder_sidecar(path);
+            std::fs::write(&recorder_path, recorded)
+                .map_err(|write| format!("the recorder document cannot be retained: {write}"))?;
+            return Err(reason);
+        }
+    };
+    write_transcript(path, &wire)?;
+    let document: serde_json::Value =
+        serde_json::from_str(&wire).map_err(|error| error.to_string())?;
+    let read_rows = document["reads"].as_array().map_or(0, Vec::len);
+    let issues = crate::tape::assess_shared(&wire, manifest)?.issues;
+    Ok((read_rows, issues))
 }
 
-/// Write a bounded provisional protocol document when no engine ran. Hashing
-/// the diagnostic prevents untrusted manifest text from overflowing the cap.
+/// The recorder document's sidecar path: the transcript file's own name with
+/// `.recorder.json` appended, so `barge.json` keeps its recorder evidence at
+/// `barge.json.recorder.json`. A replacement extension would collide with a
+/// real sibling and would not name the transcript it belongs to.
+fn recorder_sidecar(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".recorder.json");
+    path.with_file_name(name)
+}
+
+fn recorder_schema(document: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(document)
+        .ok()
+        .and_then(|value| value["schema"].as_str().map(str::to_owned))
+}
+
+/// Write an apparatus diagnostic when no engine ran. Untrusted manifest text is
+/// never copied into the document; the reason is bounded by the caller.
 pub(crate) fn write_apparatus_refusal(
     path: &Path,
     manifest: Option<&[u8]>,
     reason: &str,
 ) -> Result<(), String> {
-    let mut document = serde_json::json!({
-        "schema": crate::tape::TRANSCRIPT_SCHEMA,
-        "engine": "barge",
-        "manifest_sha256": manifest.map(crate::digest::sha256_hex),
-        "outcome": { "status": "apparatus_refused", "exit_code": 2,
-            "reason_sha256": crate::digest::sha256_hex(reason.as_bytes()) },
-        "engine_ran": false,
-        "observation_complete": false,
-        "reads": [], "effects": [], "clocks": [],
-        "caps": { "read_rows": 0, "document_bytes": 0,
-            "occurrences_per_key": CAP_OCCURRENCES, "process_rows": 0,
-            "dropped_rows": 0 }
-    });
-    loop {
-        let bytes = serde_json::to_string(&document)
-            .map_err(|error| format!("the apparatus refusal cannot be serialized: {error}"))?;
-        if document["caps"]["document_bytes"].as_u64() == Some(bytes.len() as u64) {
-            return write_transcript(path, &bytes);
-        }
-        document["caps"]["document_bytes"] = bytes.len().into();
-    }
+    let case = manifest
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .and_then(|document| document["case"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let digest = manifest.map(crate::digest::sha256_hex);
+    write_transcript(
+        path,
+        &crate::tape::apparatus_document(&case, digest.as_deref(), reason),
+    )
 }
 
 /// Write the transcript document to the caller's path.
@@ -706,13 +749,23 @@ fn write_transcript(path: &Path, transcript: &str) -> Result<(), String> {
         .map_err(|error| format!("the transcript cannot be written: {error}"))?;
     let document: serde_json::Value = serde_json::from_str(transcript)
         .map_err(|error| format!("the transcript cannot be inspected: {error}"))?;
-    let caps = &document["caps"];
+    if document["schema"] != crate::tape::TRANSCRIPT_SCHEMA {
+        // A distinct apparatus diagnostic is a real result, not a failed write.
+        if document["schema"] == crate::tape::APPARATUS_SCHEMA {
+            return Ok(());
+        }
+        return Err(format!(
+            "the written document is neither a transcript nor an apparatus diagnostic; path={}",
+            path.display()
+        ));
+    }
+    crate::tape::validate_shared_transcript(transcript.as_bytes())?;
     if capture_exhausted(&document) {
         return Err(format!(
-            "the transcript was truncated or a capture cap was exhausted; path={}; refusal_kind={}; caps={}",
+            "the transcript was truncated or a capture cap was exhausted; path={}; truncation={}; notes={}",
             path.display(),
-            document["outcome"]["refusal_kind"],
-            caps,
+            document["truncation"],
+            document["notes"],
         ));
     }
     Ok(())
@@ -721,18 +774,12 @@ fn write_transcript(path: &Path, transcript: &str) -> Result<(), String> {
 // These are the same refusal conditions used by the external harness and its
 // embedded self-check. A bounded host result never qualifies capture.
 fn capture_exhausted(document: &serde_json::Value) -> bool {
-    let caps = &document["caps"];
     let truncation = &document["truncation"];
-    document["outcome"]["refusal_kind"] == "document_cap"
-        || truncation["document_truncated"] == true
+    truncation["document_truncated"] == true
         || truncation["read_rows_truncated"] == true
         || truncation["occurrences_truncated"] == true
         || truncation["process_rows_truncated"] == true
-        || caps["document_truncated"] == true
-        || caps["read_rows_exhausted"] == true
-        || caps["occurrences_exhausted"] == true
-        || caps["process_rows_exhausted"] == true
-        || caps["dropped_rows"].as_u64().unwrap_or(0) != 0
+        || truncation["classifications_truncated"] == true
 }
 
 // Copy outside TempDir before it drops, but within its caller-owned run root.
@@ -919,13 +966,42 @@ pub(crate) fn build_fixture(label: &str) -> Result<EmbeddedFixture, String> {
         .map_err(|error| format!("the fixture area cannot be declared: {error}"))?;
     let root = fixture_owned_root(&state_paths, &record, &declaration)?;
     fixture_oxide_records(&account, &root, record.volume_uuid.as_str())?;
+    // The shared manifest is strictly typed. This embedded fixture's source
+    // block is an explicitly unverified placeholder: a real window replaces it
+    // with the exported receipt's binding, which `verify_manifest_binding`
+    // checks against the staged commit, lockfile and executable before any run.
     let manifest = serde_json::json!({
-        "schema": "oxide.capture.manifest/1",
+        "schema": crate::tape::MANIFEST_SCHEMA,
         "case": "CTL-0",
-        "window": {"identity": "embedded-exercise"},
-        "source": {}, "dynamic": [], "mandatory_observations": [],
-        "expected_effects": [], "expected": {},
-        "fixture": {"volume": {"uuid": record.volume_uuid.as_str(), "mount": mount.display().to_string()}},
+        "window": {"identity": "embedded-exercise", "start_monotonic_ns": 0, "end_monotonic_ns": 0},
+        "source": {
+            "oxide_commit": "embedded-unverified",
+            "oxide_files": {},
+            "cargo_lock_sha256": "0".repeat(64),
+            "rust_toolchain_sha256": "0".repeat(64),
+            "barge_pin": "4af9360bd09629e970c143080ca159de8eef2562",
+            "barge_slice_commit": "embedded-unverified",
+            "barge_files": {},
+            "staged_lock_sha256": "0".repeat(64),
+            "oxide_toolchain": "1.97.1",
+            "barge_toolchain": "1.97.1",
+            "oxide_executable_sha256": "0".repeat(64),
+            "barge_executable_sha256": "0".repeat(64),
+            "oxide_tree": "0".repeat(40),
+        },
+        "dynamic": {"volumes": [], "writers": [], "external_allowances": []},
+        "mandatory_observations": [],
+        "expected_effects": [],
+        "expected": {"classification": "MATCH", "roots": []},
+        "fixture": {
+            "root": dir.path().display().to_string(),
+            "device": 0,
+            "inode": 0,
+            "mode": 0o700,
+            "entries": [],
+            "roots": [],
+            "volume": {"uuid": record.volume_uuid.as_str(), "mount": mount.display().to_string()},
+        },
         "barge": {
             "volume_uuid": record.volume_uuid.as_str(),
             "volume_mount": mount.display().to_string(),
@@ -965,12 +1041,18 @@ pub(crate) fn embedded_exercise() -> Result<(), String> {
         eprintln!("barge.tape.exercise/1: bounded refusal (not qualification): {reason}");
     } else {
         let summary = outcome?;
-        if document["outcome"]["engine"]["exit_code"] != summary.exit_code {
+        let recorded = document["outcome"]["state"].as_str();
+        if recorded != Some(summary.status) {
             return Err("the real-host engine outcome does not match its transcript".to_owned());
         }
+        if summary.status == "refused" && document["outcome"]["exit_code"] != summary.exit_code {
+            return Err("the real-host refusal exit code does not match its transcript".to_owned());
+        }
         eprintln!(
-            "barge.tape.exercise/1: engine status={} exit={}; capture remains unqualified",
-            summary.status, summary.exit_code
+            "barge.tape.exercise/1: engine status={} exit={}; {} completeness issue(s); capture remains unqualified",
+            summary.status,
+            summary.exit_code,
+            summary.issues.len()
         );
     }
     Ok(())
@@ -1016,6 +1098,28 @@ mod tests {
                 CAP_OCCURRENCES,
                 CAP_PROCESS_ROWS
             )
+        );
+        assert!(
+            summary.read_rows > 0,
+            "the window records real observation rows"
+        );
+        // Completeness is the shared implementation's own: the window origin is
+        // unproven and no emitted row collides within its key.
+        assert!(
+            summary
+                .issues
+                .iter()
+                .any(|issue| issue == "window origin and end unproven"),
+            "{:?}",
+            summary.issues
+        );
+        assert!(
+            !summary
+                .issues
+                .iter()
+                .any(|issue| issue.contains("collision")),
+            "{:?}",
+            summary.issues
         );
         let transcript =
             std::fs::read_to_string(&transcript_out).expect("the transcript is written");
@@ -1103,6 +1207,18 @@ mod tests {
             "the read-only plan's STATIC effect set is empty"
         );
         assert!(
+            document["recorded_holders"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "this plan observes no structured holder record"
+        );
+        assert!(
+            document["fixture_capture"]["post"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty()),
+            "the apparatus captures the owned fixture tree"
+        );
+        assert!(
             transcript.len() <= CAP_DOCUMENT_BYTES,
             "the transcript respects its document cap"
         );
@@ -1172,21 +1288,25 @@ mod tests {
             serde_json::from_str(&transcript).expect("the transcript parses");
         assert_eq!(document["outcome"]["state"], "refused");
         assert_eq!(
-            document["outcome"]["engine"]["exit_code"], 2,
+            document["outcome"]["exit_code"], 2,
             "an undeclared area exits 2"
         );
+        assert_eq!(document["outcome"]["source"], "engine");
         assert!(
-            document["outcome"]["engine"]["refusal_message"]
+            document["outcome"]["reason"]
                 .as_str()
-                .expect("a refusal message")
+                .expect("a refusal reason")
                 .contains("never-declared"),
             "the engine's own refusal names the undeclared area"
         );
-        assert!(document["outcome"]["result"].is_null());
+        assert!(
+            document["outcome"].get("result").is_none(),
+            "a refused outcome carries no engine result"
+        );
     }
 
     /// A manifest missing its members records an apparatus refusal, not an
-    /// invented engine outcome.
+    /// invented engine outcome, and never a transcript.
     #[test]
     fn an_apparatus_error_writes_a_refusal() {
         let fixture = crate::testkit::TempDir::new("tape-eval-apparatus");
@@ -1195,30 +1315,108 @@ mod tests {
         assert!(summary.is_err(), "an empty manifest is refused");
         let bytes = std::fs::read(&transcript_out).expect("refusal document");
         let document: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
-        assert_eq!(document["outcome"]["status"], "apparatus_refused");
-        assert_eq!(document["engine_ran"], false);
-        assert_eq!(document["observation_complete"], false);
+        assert_eq!(document["schema"], crate::tape::APPARATUS_SCHEMA);
+        assert_eq!(document["version"], crate::tape::APPARATUS_SCHEMA);
+        assert_eq!(
+            document["manifest_sha256"],
+            crate::digest::sha256_hex(b"{}")
+        );
+        assert!(
+            document["reason"]
+                .as_str()
+                .expect("a reason")
+                .contains("manifest"),
+            "the refusal names the manifest"
+        );
+        assert!(
+            crate::tape::validate_shared_transcript(&bytes).is_err(),
+            "an apparatus diagnostic is never a conforming transcript"
+        );
+    }
+
+    #[test]
+    fn a_failed_conversion_keeps_the_recorder_document_at_its_sidecar_name() {
+        let fixture = crate::testkit::TempDir::new("tape-recorder-sidecar");
+        let transcript_out = fixture.path().join("transcripts").join("barge.json");
+        // A completed recorder document with no result object is not a capture:
+        // the shared wire requires one, so the adapter must refuse it.
+        let recorded = serde_json::json!({
+            "schema": crate::tape::RECORDER_SCHEMA,
+            "engine": "barge",
+            "case": "SIDECAR",
+            "manifest_sha256": "0".repeat(64),
+            "entrypoint": {"symbol": "barge::release::plan", "source_binding": "control"},
+            "window_elapsed_ns": 1,
+            "outcome": {"status": "completed", "exit_code": 0},
+            "observation_complete": false,
+            "effects": [], "reads": [], "clocks": [], "recorded_holders": [],
+            "fixture_capture": null, "notes": [],
+            "caps": {"read_rows": 0, "document_bytes": 0, "occurrences_per_key": 64,
+                "process_rows": 0, "dropped_rows": 0}
+        })
+        .to_string();
+        let error = publish_capture(&transcript_out, &recorded, b"{}")
+            .expect_err("a completed document without a result cannot convert");
+        assert!(error.contains("could not be converted"), "{error}");
+        let transcript: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&transcript_out).expect("apparatus document"))
+                .expect("JSON");
+        assert_eq!(transcript["schema"], crate::tape::APPARATUS_SCHEMA);
+        assert_eq!(transcript["case"], "SIDECAR");
+        let sidecar = fixture
+            .path()
+            .join("transcripts")
+            .join("barge.json.recorder.json");
+        let retained: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).expect("the sidecar is written"))
+                .expect("JSON");
+        assert_eq!(retained["schema"], crate::tape::RECORDER_SCHEMA);
+        assert_eq!(retained["case"], "SIDECAR");
+        assert!(
+            !fixture
+                .path()
+                .join("transcripts")
+                .join("barge.recorder.json")
+                .exists(),
+            "the sidecar never replaces the transcript's extension"
+        );
     }
 
     #[test]
     fn exhausted_capture_is_written_then_refused() {
         let fixture = crate::testkit::TempDir::new("tape-cap-refusal");
         let path = fixture.path().join("cap.json");
-        let document = serde_json::json!({
-            "schema": crate::tape::TRANSCRIPT_SCHEMA,
-            "outcome": { "status": "completed", "exit_code": 0 },
-            "caps": { "occurrences_exhausted": true, "dropped_rows": 1 }
-        });
-        let bytes = serde_json::to_string(&document).expect("JSON");
-        let error = write_transcript(&path, &bytes).expect_err("exhausted capture refuses");
+        crate::tape::begin_window(crate::tape::WindowConfig {
+            case: "CAP".to_owned(),
+            manifest_sha256: "0".repeat(64),
+            entrypoint_symbol: "barge::release::plan",
+            source_binding: "control".to_owned(),
+        })
+        .expect("the window opens");
+        for _ in 0..=CAP_OCCURRENCES {
+            crate::tape::read_absent("state::read_bounded_inner", Path::new("/fixture/one"));
+        }
+        let recorded = crate::tape::finish(
+            crate::tape::EngineOutcome {
+                status: "completed",
+                exit_code: 0,
+                refusal_kind: None,
+                refusal_message: None,
+                refusal_detail: Vec::new(),
+                engine_truncated: false,
+            },
+            Some(&serde_json::json!({})),
+        )
+        .expect("the recorder document is written");
+        let wire = crate::tape::shared_transcript(&recorded).expect("the wire converts");
+        let error = write_transcript(&path, &wire).expect_err("exhausted capture refuses");
         assert!(error.contains(&format!("path={}", path.display())));
-        assert!(error.contains("refusal_kind=null"));
-        assert!(error.contains(&format!("caps={}", document["caps"])));
-        let actual: serde_json::Value =
+        assert!(error.contains("occurrences_truncated"));
+        let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).expect("written transcript"))
                 .expect("JSON");
-        assert_eq!(actual["outcome"]["status"], "completed");
-        assert_eq!(actual["caps"]["dropped_rows"], 1);
+        assert_eq!(written["truncation"]["occurrences_truncated"], true);
+        assert_eq!(written["outcome"]["state"], "completed");
     }
 
     #[test]
@@ -1383,11 +1581,18 @@ mod tests {
         let bytes = std::fs::read(output).expect("refusal exists");
         assert!(bytes.len() < CAP_DOCUMENT_BYTES);
         let document: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(document["schema"], crate::tape::APPARATUS_SCHEMA);
         assert_eq!(
-            document["outcome"]["reason_sha256"],
+            document["reason_sha256"],
             crate::digest::sha256_hex(reason.as_bytes())
         );
-        assert_eq!(document["engine_ran"], false);
+        assert!(
+            document["reason"]
+                .as_str()
+                .expect("a bounded reason")
+                .ends_with("[truncated]"),
+            "the reason text is bounded"
+        );
     }
 
     /// The fixture volume facts come from the real platform, and the census
@@ -1410,23 +1615,15 @@ mod tests {
         assert_eq!(found, vec![mount.clone()], "one real mount, the fixture's");
     }
 
-    /// The parse accepts the manifest's optional `named_roots` and refuses
-    /// mistyped members with precise reasons.
+    /// The parse accepts the strict `/2` manifest, its optional `named_roots`,
+    /// and refuses mistyped members with precise reasons.
     #[test]
     fn the_manifest_parse_binds_its_members() {
-        let manifest = serde_json::json!({
-            "schema": "oxide.capture.manifest/1",
-            "case": "LEG-LISTED",
-            "window": {}, "source": {}, "fixture": {}, "dynamic": {},
-            "mandatory_observations": [], "expected_effects": [], "expected": {},
-            "barge": {
-                "volume_uuid": "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
-                "volume_mount": "/Volumes/Builds",
-                "namespace": "oxide",
-                "area": "outputs",
-                "named_roots": ["root-a"],
-            },
-        });
+        let fixture = build_fixture("tape-manifest-parse").expect("the fixture builds");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fixture.manifest).expect("the manifest parses");
+        manifest["case"] = serde_json::json!("LEG-LISTED");
+        manifest["barge"]["named_roots"] = serde_json::json!(["root-a"]);
         let request =
             parse_manifest(&serde_json::to_vec(&manifest).unwrap()).expect("the manifest parses");
         assert_eq!(request.case, "LEG-LISTED");
