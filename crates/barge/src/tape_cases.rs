@@ -885,6 +885,12 @@ const PREPARED_PREMISES: &[Premise] = &[
 const CF1_OUTPUTS_ABSENT: &str =
     "the outputs folder is deliberately absent, so the snapshot's receipt enumeration returns ENOENT; the recorded absence is the enumeration's own result, not a bound set";
 
+/// The CF-1 reason for a case this preparation does not fixture at all: it names
+/// no state, so it enumerates nothing. It is never described as a deliberate
+/// absence, which only a prepared case can have.
+const CF1_NO_FIXTURE: &str =
+    "this case has no prepared fixture: it is named unsupported or deferred, so no state exists to enumerate and nothing is claimed about an outputs folder";
+
 /// The premises one unsupported case still needs, named per blocker.
 const PREMISE_DYNAMIC_EPOCH: &[Premise] = &[Premise::DynamicEpoch];
 const PREMISE_SHARED_CAPS: &[Premise] = &[Premise::SharedCaps];
@@ -1704,8 +1710,28 @@ pub(crate) fn spec(id: &str) -> Result<&'static CaseSpec, String> {
 /// Every counterfactual's applicability for one case. The family table fixes
 /// CF-2 to CF-7; CF-1 is derived from the case's **actual** state — whether it
 /// creates Oxide's outputs folder, which Barge's snapshot enumerates on every
-/// run — never from a family label.
+/// run — never from a family label. An unsupported or deferred row has no
+/// fixture at all, so its CF-1 names that absence of state and never claims a
+/// deliberate absence of a folder it never creates.
 pub(crate) fn cf_notes(case: &CaseSpec) -> Vec<CfNote> {
+    if !matches!(case.support, Support::Prepared) {
+        return case
+            .family
+            .cf()
+            .iter()
+            .map(|note| {
+                if note.cf == Cf::Cf1 {
+                    CfNote {
+                        cf: Cf::Cf1,
+                        applies: false,
+                        reason: CF1_NO_FIXTURE,
+                    }
+                } else {
+                    *note
+                }
+            })
+            .collect();
+    }
     let outputs = case
         .files
         .iter()
@@ -1731,6 +1757,9 @@ pub(crate) fn cf_notes(case: &CaseSpec) -> Vec<CfNote> {
 /// enumerated by the snapshot on every run, so it is recorded per case: as a
 /// set where the folder exists, and as its own `ENOENT` where it does not.
 pub(crate) fn enumerations(case: &CaseSpec) -> Vec<&'static str> {
+    if !matches!(case.support, Support::Prepared) {
+        return Vec::new();
+    }
     let mut rows: Vec<&'static str> = case.family.enumerations().to_vec();
     let outputs = case.files.iter().find(|file| file.slot == Slot::OutputsDir);
     match outputs {
@@ -1784,6 +1813,23 @@ pub(crate) fn plan_document() -> serde_json::Value {
                     })
                 })
                 .collect();
+            // A row with no prepared fixture states no declaration and no
+            // recorded paths, so the plan cannot read as a state that exists.
+            let prepared = matches!(case.support, Support::Prepared);
+            let declaration = match (prepared, case.id) {
+                (false, _) => serde_json::Value::Null,
+                (true, "DECL-MISSING") => serde_json::json!("absent"),
+                (true, _) => serde_json::json!("present"),
+            };
+            let shared_files: Vec<&'static str> = if prepared {
+                vec![
+                    Slot::Declaration.shape(),
+                    Slot::PlacementsDir.shape(),
+                    Slot::BargeRegistry.shape(),
+                ]
+            } else {
+                Vec::new()
+            };
             serde_json::json!({
                 "id": case.id,
                 "family": case.family.name(),
@@ -1791,15 +1837,10 @@ pub(crate) fn plan_document() -> serde_json::Value {
                 "fixture": fixture,
                 "classification": case.classification,
                 "relationship": case.relationship,
-                // The shared declared state every prepared case records, then
-                // this case's own paths. The undeclared case's declaration is
-                // recorded as its own absence.
-                "declaration": if case.id == "DECL-MISSING" { "absent" } else { "present" },
-                "shared_files": [
-                    Slot::Declaration.shape(),
-                    Slot::PlacementsDir.shape(),
-                    Slot::BargeRegistry.shape(),
-                ],
+                // Only a prepared case records shared declared state; its own
+                // paths follow.
+                "declaration": declaration,
+                "shared_files": shared_files,
                 "files": case.files.iter().map(|file| file.slot.shape()).collect::<Vec<_>>(),
                 "window_actions": case.window_actions,
                 "premises": case.premises.iter().map(|premise| premise.name()).collect::<Vec<_>>(),
@@ -2804,9 +2845,19 @@ mod tests {
                 file.slot == Slot::OutputsDir && matches!(file.content, Content::Directory)
             });
             let cf1 = notes.iter().find(|note| note.cf == Cf::Cf1).unwrap();
-            assert_eq!(cf1.applies, outputs, "{} CF-1", case.id);
-            if !outputs {
-                assert!(cf1.reason.contains("ENOENT"), "{} CF-1 reason", case.id);
+            if matches!(case.support, Support::Prepared) {
+                assert_eq!(cf1.applies, outputs, "{} CF-1", case.id);
+                if !outputs {
+                    assert!(cf1.reason.contains("ENOENT"), "{} CF-1 reason", case.id);
+                }
+            } else {
+                // A row with no fixture claims no outputs state at all.
+                assert!(!cf1.applies, "{} CF-1", case.id);
+                assert!(
+                    cf1.reason.contains("no prepared fixture"),
+                    "{} CF-1 reason",
+                    case.id
+                );
             }
             for note in &notes {
                 assert!(!note.reason.is_empty());
@@ -2850,6 +2901,41 @@ mod tests {
         assert_eq!(ctl["status"], "insufficient");
         assert_eq!(ctl["fixture"], "prepared");
         assert!(ctl["obligations"].as_array().unwrap().len() >= 3);
+        // Only a prepared row states a declaration or records shared paths; a row
+        // with no fixture states neither and never claims a deliberate absence.
+        for row in rows {
+            let prepared = row["fixture"] == "prepared";
+            let cf1 = row["cf"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|note| note["cf"] == "CF-1")
+                .unwrap();
+            if prepared {
+                assert!(
+                    row["declaration"] == "present" || row["declaration"] == "absent",
+                    "{} declaration state",
+                    row["id"]
+                );
+                assert_eq!(row["shared_files"].as_array().unwrap().len(), 3);
+            } else {
+                assert!(row["declaration"].is_null(), "{} declaration", row["id"]);
+                assert!(row["shared_files"].as_array().unwrap().is_empty());
+                assert!(row["files"].as_array().unwrap().is_empty());
+                assert!(row["enumerations"].as_array().unwrap().is_empty());
+                let reason = cf1["reason"].as_str().unwrap();
+                assert!(
+                    reason.contains("no prepared fixture"),
+                    "{} CF-1 reason: {reason}",
+                    row["id"]
+                );
+                assert!(
+                    !reason.contains("deliberately absent"),
+                    "{} claims a deliberate absence it has no fixture for",
+                    row["id"]
+                );
+            }
+        }
         let effect = rows.iter().find(|row| row["id"] == "EFFECT-1").unwrap();
         assert_eq!(effect["status"], "deferred");
         assert_eq!(effect["fixture"], "not prepared");

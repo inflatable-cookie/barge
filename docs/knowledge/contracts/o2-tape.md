@@ -62,10 +62,14 @@ does not prove.
   controls** (each supported case's declared files, real bytes digests, parent
   identities, absences, registry/receipt/marker/control documents, the pending
   Barge intent, the declaration and placements records, the declaration policy
-  and the operator list), a **reader control** that reads each case's registry,
-  receipt and marker documents through the real `OxideSnapshot`/marker readers
-  and asserts that case's outcome, and the refusal control. They are setup and
-  reader controls, not decision, volume, engine or native proof.
+  and the operator list), a **reader control** that reads the registry, receipt
+  and marker documents of the cases it names (the control, registry-shape,
+  references, receipts/markers and identity-nonce/replaced cases) through the
+  real `OxideSnapshot` and `read_oxide_marker` readers and asserts that reading,
+  and the refusal control. The fence, declaration, legacy, absence and volume
+  documents are covered by setup controls only, and no case's documents are read
+  by `release::plan`. They are setup and reader controls, not decision, volume,
+  engine or native proof.
 - `crates/barge/src/tape_harness.rs`'s tests: the embedded end-to-end exercise
   (one exclusively owned directory fixture on a real selected volume, the
   actual `release::plan`, one completed window over a settled root with a
@@ -289,7 +293,7 @@ marker-, identity- and absence-reading cases additionally name K1.
 | Registry shape and caps | REG-MISSING, REG-MALFORMED, REG-OVERSIZE, REG-CONTRADICTORY, REG-OVERFLOW | the outputs/registry absence, invalid bytes, a document over `REGISTRY_CAP_BYTES`, two live rows naming one root from two checkouts, and the cancelled-overflow record |
 | References and intents | REF-PENDING, REF-RESERVATION, REF-CANCELLING, REF-PRUNING, REF-SELECTED-NOT-CURRENT, REF-ORPHAN-MARKED | the row flag under test; PRUNING also writes an unfinished registry-journal entry and one real pending `barge.intent/2` record with observed facts; the orphan writes a marked extra plan root and no row |
 | Receipts and markers | RCP-MISSING, RCP-MALFORMED, RCP-NONCOMMITTED, RCP-CONTRADICTORY, RCP-V1, MRK-MISSING, MRK-MALFORMED, MRK-REPLACED, ID-NONCE, ID-GENERATION | the receipt absence, invalid bytes, a non-committed state, a mismatched checkout id, a committed `/1`, and the marker's absence, invalid bytes, recorded-digest mismatch, other nonce and stale generation |
-| Identity and volume | ID-INODE, ID-DEVICE-STALE, VOL-DUP-REGISTRY, ABS-UUID-CONFLICT | a registry row recording a root inode/device one above the observed root's; the declared document records for the volume cases |
+| Identity and volume | ID-INODE, ID-DEVICE-STALE, VOL-DUP-REGISTRY, ABS-UUID-CONFLICT | a registry row recording a root inode/device one above the observed root's; Barge's own registry document holding two volume records that name one UUID (a record the reader refuses, and the writer would too, so the fixture writes the divergent bytes); and a registry row plus marker recording a checkout volume UUID the fixture never mounts |
 | Checkout absence | ABS-ANCESTOR-MISSING, ABS-ANCESTOR-REPLACED | a present checkout parent with a missing leaf, and with a present leaf (the CF-7 replacement is an in-window action) |
 | Fence, declaration and policy | FENCE-MISSING, FENCE-UNKNOWN, DECL-MISSING, DECL-POLICY-NONE | the absent control state, a version-9 state with an unknown owned-outputs fence, no declaration, and a `prune: none` declaration |
 | Legacy and operator list | LEG-UNLISTED, LEG-LISTED, LEG-LISTED-MARKED, LEG-RECEIPTLESS | the operator list absent or naming the root, with and without a receipt |
@@ -315,9 +319,12 @@ diagnostic print, never a capture, a transcript or proof input. `runnable` is
 per case from whether that case creates Oxide's outputs folder, which the
 snapshot enumerates for receipts on every run: present rows are a bound set,
 `REG-MISSING`'s deliberate absence is the enumeration's own `ENOENT` result, and
-the plan prints the outputs, declaration and placement enumerations per case.
-CF-2 to CF-7 keep the family dispositions the D8 inventory names, each with a
-reason whether it applies or not.
+the plan prints the outputs, declaration and placement enumerations per prepared
+case. A row with no prepared fixture states no declaration, records no paths and
+enumerates nothing, and its CF-1 names the absence of a fixture rather than a
+deliberate absence of a folder it never creates. CF-2 to CF-7 keep the family
+dispositions the D8 inventory names, each with a reason whether it applies or
+not.
 
 **Sticky incompleteness and the volume conditions are the reader's.** The
 sticky-incomplete cases write the reader's own record (`reason`, `since_ms`,
