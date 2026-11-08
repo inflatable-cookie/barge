@@ -50,7 +50,7 @@ pub(crate) const CHECKOUT_ID: &str =
     "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 /// The second checkout id, for the contradictory registry case.
 pub(crate) const OTHER_CHECKOUT_ID: &str =
-    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 /// The nonce the fixture's records and markers carry.
 pub(crate) const NONCE: &str = "00112233445566778899aabbccddeeff";
 /// A second nonce, recorded by one document where the other records [`NONCE`].
@@ -59,6 +59,9 @@ pub(crate) const OTHER_NONCE: &str = "ffeeddccbbaa99887766554433221100";
 pub(crate) const INTENT_ID: &str = "11111111111111111111111111111111";
 /// The marker digest recorded where no marker has those bytes.
 pub(crate) const RECORDED_MARKER_DIGEST: &str = "0";
+/// A volume UUID the fixture never mounts, recorded where the live mount's
+/// UUID must differ from it.
+pub(crate) const OTHER_VOLUME_UUID: &str = "A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C5D";
 
 /// The case families of the finite D8/CF inventory, in the plan's order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,12 +298,20 @@ pub(crate) enum Slot {
     Intent,
     /// A folder under the area that no registry row names.
     ExtraRoot,
+    /// The Oxide marker inside the unregistered extra root.
+    ExtraRootMarker,
     /// The checkout path the registry row names, which is absent.
     Checkout,
     /// The checkout's parent directory, present in the absence family.
     CheckoutAncestor,
     /// The checkout leaf below its parent, missing or replaced in the absence family.
     CheckoutLeaf,
+    /// Barge's one area declaration document.
+    Declaration,
+    /// Barge's placements directory, which the plan enumerates.
+    PlacementsDir,
+    /// Barge's volume registry document.
+    BargeRegistry,
 }
 
 impl Slot {
@@ -318,9 +329,13 @@ impl Slot {
             Self::IntentJournal => "<fixture>/state/intents/",
             Self::Intent => "<fixture>/state/intents/<intent-id>.json",
             Self::ExtraRoot => "<mount>/oxide-outputs/<extra-root>/",
+            Self::ExtraRootMarker => "<mount>/oxide-outputs/<extra-root>/.oxide-output.json",
             Self::Checkout => "<fixture>/checkout",
             Self::CheckoutAncestor => "<fixture>/checkout/",
             Self::CheckoutLeaf => "<fixture>/checkout/target",
+            Self::Declaration => "<fixture>/state/areas/<namespace>/<area>.json",
+            Self::PlacementsDir => "<fixture>/state/placements/",
+            Self::BargeRegistry => "<fixture>/state/registry.json",
         }
     }
 }
@@ -332,6 +347,9 @@ pub(crate) enum Content {
     Directory,
     /// The path is deliberately absent.
     Absent,
+    /// A document the shared setup or a preparation step already wrote; it is
+    /// observed, never rewritten.
+    Preserved,
     /// Oxide's registry, in one reviewed shape.
     Registry(RegistryShape),
     /// One Oxide receipt, in one reviewed shape.
@@ -375,6 +393,8 @@ pub(crate) enum RegistryShape {
     Empty,
     /// The recorded nonce differs from the marker's.
     StaleNonce,
+    /// The recorded checkout volume UUID is not the live mount's.
+    ForeignVolume,
     /// The recorded generation differs from the marker's.
     StaleGeneration,
     /// The recorded root inode differs from the owned root's.
@@ -411,8 +431,8 @@ pub(crate) enum MarkerShape {
     Malformed,
     /// A `/1` marker, which Barge reports as unknown.
     V1,
-    /// A valid `/2` marker recording [`OTHER_NONCE`].
-    OtherNonce,
+    /// A valid `/2` marker recording a checkout volume the fixture never mounts.
+    ForeignVolume,
     /// A valid `/2` marker whose bytes no recorded digest names.
     Replaced,
 }
@@ -489,8 +509,6 @@ pub(crate) struct CaseSpec {
     pub(crate) relationship: &'static str,
     /// The declared fates, by root slot (`owned` or `extra`).
     pub(crate) expected_roots: &'static [(&'static str, &'static str)],
-    /// CF applicability with a reason for every CF.
-    pub(crate) cf: &'static [CfNote],
 }
 
 // --- CF tables -----------------------------------------------------------
@@ -540,8 +558,8 @@ const CF_CONTROL: &[CfNote] = &[
 const CF_REGISTRY: &[CfNote] = &[
     cf_note(
         Cf::Cf1,
-        false,
-        "the fixture creates no enumerated set; the case decides on the registry file itself",
+        true,
+        "Barge's snapshot enumerates Oxide's outputs folder for receipts on every run, so this case's outputs/ presence is the enumerated set",
     ),
     cf_note(Cf::Cf2, false, "no writer participates"),
     cf_note(Cf::Cf3, false, "no root marker exists in this family"),
@@ -602,8 +620,8 @@ const CF_RECEIPTS: &[CfNote] = &[
 const CF_IDENTITY: &[CfNote] = &[
     cf_note(
         Cf::Cf1,
-        false,
-        "the fixture enumerates no receipt, intent, declaration or placement set for these cases",
+        true,
+        "Barge's snapshot enumerates Oxide's outputs folder for receipts on every run, and the plan enumerates declarations and placements",
     ),
     cf_note(
         Cf::Cf2,
@@ -636,8 +654,8 @@ const CF_IDENTITY: &[CfNote] = &[
 const CF_ABSENCE: &[CfNote] = &[
     cf_note(
         Cf::Cf1,
-        false,
-        "no receipt, intent, declaration or placement set is enumerated",
+        true,
+        "Barge's snapshot enumerates Oxide's outputs folder for receipts on every run, and the plan enumerates declarations and placements",
     ),
     cf_note(Cf::Cf2, false, "no writer participates"),
     cf_note(Cf::Cf3, false, "no root marker is replaced"),
@@ -861,6 +879,12 @@ const PREPARED_PREMISES: &[Premise] = &[
     Premise::RecorderBind,
 ];
 
+/// The CF-1 reason where the case's outputs folder is deliberately absent: the
+/// snapshot's own receipt enumeration returns `ENOENT`, and that absence is the
+/// recorded result rather than a bound set.
+const CF1_OUTPUTS_ABSENT: &str =
+    "the outputs folder is deliberately absent, so the snapshot's receipt enumeration returns ENOENT; the recorded absence is the enumeration's own result, not a bound set";
+
 /// The premises one unsupported case still needs, named per blocker.
 const PREMISE_DYNAMIC_EPOCH: &[Premise] = &[Premise::DynamicEpoch];
 const PREMISE_SHARED_CAPS: &[Premise] = &[Premise::SharedCaps];
@@ -904,7 +928,6 @@ const fn prepared(
         classification,
         relationship,
         expected_roots,
-        cf: family.cf(),
     }
 }
 
@@ -928,7 +951,6 @@ const fn prepared_k1(
         classification,
         relationship,
         expected_roots,
-        cf: family.cf(),
     }
 }
 
@@ -950,7 +972,6 @@ const fn unsupported(
         classification: "SCOPE",
         relationship,
         expected_roots: &[],
-        cf: family.cf(),
     }
 }
 
@@ -966,7 +987,6 @@ const fn deferred(id: &'static str, family: Family, reason: &'static str) -> Cas
         classification: "SCOPE",
         relationship: "deferred: the second batch is held",
         expected_roots: &[],
-        cf: family.cf(),
     }
 }
 
@@ -1053,7 +1073,8 @@ const REF_ORPHAN_MARKED: &[PlannedPath] = &[
     planned(Slot::OutputsDir, Content::Directory),
     planned(Slot::Registry, Content::Registry(RegistryShape::Empty)),
     planned(Slot::ExtraRoot, Content::Directory),
-    planned(Slot::Marker, Content::Marker(MarkerShape::Base)),
+    // The orphan's marker belongs on the unregistered folder, not the owned root.
+    planned(Slot::ExtraRootMarker, Content::Marker(MarkerShape::Base)),
     planned(Slot::IntentJournal, Content::Directory),
 ];
 const RCP_MISSING: &[PlannedPath] = &[
@@ -1154,8 +1175,13 @@ const VOL_DUP_REGISTRY: &[PlannedPath] = &[
 const ABS_UUID_CONFLICT: &[PlannedPath] = &[
     planned(Slot::ControlDir, Content::Directory),
     planned(Slot::OutputsDir, Content::Directory),
-    planned(Slot::Registry, Content::Registry(RegistryShape::Base)),
-    planned(Slot::Marker, Content::Marker(MarkerShape::OtherNonce)),
+    // The recorded checkout volume is a UUID the fixture never mounts, which is
+    // the case's defining condition.
+    planned(
+        Slot::Registry,
+        Content::Registry(RegistryShape::ForeignVolume),
+    ),
+    planned(Slot::Marker, Content::Marker(MarkerShape::ForeignVolume)),
     planned(Slot::Checkout, Content::Absent),
 ];
 const ABS_ANCESTOR_MISSING: &[PlannedPath] = &[
@@ -1673,6 +1699,55 @@ pub(crate) fn spec(id: &str) -> Result<&'static CaseSpec, String> {
         .ok_or_else(|| format!("`{id}` is not a case of the limited first-batch inventory"))
 }
 
+// --- per-case CF and enumerations ---------------------------------------
+
+/// Every counterfactual's applicability for one case. The family table fixes
+/// CF-2 to CF-7; CF-1 is derived from the case's **actual** state — whether it
+/// creates Oxide's outputs folder, which Barge's snapshot enumerates on every
+/// run — never from a family label.
+pub(crate) fn cf_notes(case: &CaseSpec) -> Vec<CfNote> {
+    let outputs = case
+        .files
+        .iter()
+        .any(|file| file.slot == Slot::OutputsDir && matches!(file.content, Content::Directory));
+    case.family
+        .cf()
+        .iter()
+        .map(|note| {
+            if note.cf == Cf::Cf1 && !outputs {
+                CfNote {
+                    cf: Cf::Cf1,
+                    applies: false,
+                    reason: CF1_OUTPUTS_ABSENT,
+                }
+            } else {
+                *note
+            }
+        })
+        .collect()
+}
+
+/// The engine enumerations one case's own state triggers. The outputs folder is
+/// enumerated by the snapshot on every run, so it is recorded per case: as a
+/// set where the folder exists, and as its own `ENOENT` where it does not.
+pub(crate) fn enumerations(case: &CaseSpec) -> Vec<&'static str> {
+    let mut rows: Vec<&'static str> = case.family.enumerations().to_vec();
+    let outputs = case.files.iter().find(|file| file.slot == Slot::OutputsDir);
+    match outputs {
+        Some(file) if matches!(file.content, Content::Directory) => rows.push(
+            "barge: reference::read_receipts over read_dir(outputs) (every snapshot)",
+        ),
+        Some(_) => rows.push(
+            "barge: reference::read_receipts over read_dir(outputs) returns ENOENT (the folder is absent)",
+        ),
+        None => {}
+    }
+    rows.push("barge: area::read_declarations (every plan)");
+    rows.push("barge: cache::read_placements over read_dir(placements) (every plan)");
+    rows.dedup();
+    rows
+}
+
 // --- the effect-free plan ------------------------------------------------
 
 /// The effect-free plan for every case: what would be prepared, what each case
@@ -1687,8 +1762,7 @@ pub(crate) fn plan_document() -> serde_json::Value {
                 Support::Unsupported(reason) => ("insufficient", reason),
                 Support::Deferred(_) => ("deferred", "not prepared"),
             };
-            let cf: Vec<serde_json::Value> = case
-                .cf
+            let cf: Vec<serde_json::Value> = cf_notes(case)
                 .iter()
                 .map(|note| {
                     serde_json::json!({
@@ -1717,10 +1791,19 @@ pub(crate) fn plan_document() -> serde_json::Value {
                 "fixture": fixture,
                 "classification": case.classification,
                 "relationship": case.relationship,
+                // The shared declared state every prepared case records, then
+                // this case's own paths. The undeclared case's declaration is
+                // recorded as its own absence.
+                "declaration": if case.id == "DECL-MISSING" { "absent" } else { "present" },
+                "shared_files": [
+                    Slot::Declaration.shape(),
+                    Slot::PlacementsDir.shape(),
+                    Slot::BargeRegistry.shape(),
+                ],
                 "files": case.files.iter().map(|file| file.slot.shape()).collect::<Vec<_>>(),
                 "window_actions": case.window_actions,
                 "premises": case.premises.iter().map(|premise| premise.name()).collect::<Vec<_>>(),
-                "enumerations": case.family.enumerations(),
+                "enumerations": enumerations(case),
                 "obligations": obligations,
                 "cf": cf,
             })
@@ -1761,13 +1844,18 @@ struct Layout {
     root: Option<PathBuf>,
     extra_root: PathBuf,
     checkout: PathBuf,
+    declaration: PathBuf,
+    placements: PathBuf,
+    barge_registry: PathBuf,
 }
 
 impl Layout {
-    fn of(setup: &FixtureSetup) -> Self {
+    fn of(setup: &FixtureSetup) -> Result<Self, String> {
         let pool = setup.account.tool_cache.join("build-pool");
         let outputs = pool.join(OXIDE_CONTROL_DIR).join(OXIDE_OUTPUTS_DIR);
-        Self {
+        let declaration = crate::area::declaration_path(&setup.state_paths, "oxide", "outputs")
+            .map_err(|error| format!("the declaration path does not resolve: {error}"))?;
+        Ok(Self {
             dir: setup.dir.path().to_path_buf(),
             mount: setup.mount.clone(),
             uuid: setup.record.volume_uuid.clone(),
@@ -1776,7 +1864,10 @@ impl Layout {
             root: setup.root.as_ref().map(|root| root.path.clone()),
             extra_root: setup.volume_root.join(OXIDE_OUTPUTS_DIR).join("extra-root"),
             checkout: setup.account.home.join("checkout"),
-        }
+            declaration,
+            placements: setup.state_paths.placements_dir(),
+            barge_registry: setup.state_paths.registry_path(),
+        })
     }
 
     fn resolve(&self, slot: Slot) -> PathBuf {
@@ -1798,8 +1889,12 @@ impl Layout {
                 .join("intents")
                 .join(format!("{INTENT_ID}.json")),
             Slot::ExtraRoot => self.extra_root.clone(),
+            Slot::ExtraRootMarker => self.extra_root.join(OXIDE_MARKER_FILE),
             Slot::Checkout | Slot::CheckoutAncestor => self.checkout.clone(),
             Slot::CheckoutLeaf => self.checkout.join("target"),
+            Slot::Declaration => self.declaration.clone(),
+            Slot::PlacementsDir => self.placements.clone(),
+            Slot::BargeRegistry => self.barge_registry.clone(),
         }
     }
 }
@@ -1878,9 +1973,14 @@ pub(crate) fn prepare_in(
         std::fs::remove_file(&path)
             .map_err(|error| format!("the declaration cannot be removed: {error}"))?;
     }
-    let layout = Layout::of(&setup);
-    write_declared_state(&layout, case)?;
-    let entries = observe_declared_state(&layout, case)?;
+    let layout = Layout::of(&setup)?;
+    if case.id == "VOL-DUP-REGISTRY" {
+        materialize_duplicate_volume(&setup)?;
+    }
+    let mut planned = shared_declared(case);
+    planned.extend_from_slice(case.files);
+    write_declared_state(&layout, &planned)?;
+    let entries = observe_declared_state(&layout, &planned)?;
     let roots = declared_roots(&layout, case);
     let mut manifest = manifest_document(&setup, case.id);
     let expected: Vec<serde_json::Value> = case
@@ -1933,6 +2033,38 @@ pub(crate) fn prepare_in(
     })
 }
 
+/// The declared state every prepared case shares: Barge's one declaration
+/// (absent for the undeclared case), the placements directory the plan
+/// enumerates, and the volume registry the plan reads.
+fn shared_declared(case: &CaseSpec) -> Vec<PlannedPath> {
+    let declaration = if case.id == "DECL-MISSING" {
+        Content::Absent
+    } else {
+        Content::Preserved
+    };
+    vec![
+        planned(Slot::Declaration, declaration),
+        planned(Slot::PlacementsDir, Content::Directory),
+        planned(Slot::BargeRegistry, Content::Preserved),
+    ]
+}
+
+/// VOL-DUP-REGISTRY's defining condition: two volume records with one UUID in
+/// Barge's own registry document. The writer refuses that document by its own
+/// validation, so the fixture authors the divergent bytes deliberately; Barge's
+/// reader must refuse it, which is the case's expected outcome.
+fn materialize_duplicate_volume(setup: &FixtureSetup) -> Result<(), String> {
+    let mut duplicate = setup.record.clone();
+    duplicate.generation = setup.record.generation + 1;
+    duplicate.registered_ms = setup.record.registered_ms + 1;
+    let document = crate::registry::RegistryDocument::new(vec![setup.record.clone(), duplicate]);
+    let mut bytes = serde_json::to_vec_pretty(&document)
+        .map_err(|error| format!("the duplicate volume registry cannot encode: {error}"))?;
+    bytes.push(b'\n');
+    std::fs::write(setup.state_paths.registry_path(), bytes)
+        .map_err(|error| format!("the duplicate volume registry cannot be written: {error}"))
+}
+
 /// The declaration a case's fixture writes. `DECL-MISSING` writes one and then
 /// removes it, so its area root still exists as the case's state.
 fn declaration_for(case: &CaseSpec) -> crate::area::AreaDeclaration {
@@ -1944,8 +2076,8 @@ fn declaration_for(case: &CaseSpec) -> crate::area::AreaDeclaration {
 }
 
 /// Write only the case's declared paths. Nothing outside the fixture is touched.
-fn write_declared_state(layout: &Layout, case: &CaseSpec) -> Result<(), String> {
-    for file in case.files {
+fn write_declared_state(layout: &Layout, planned: &[PlannedPath]) -> Result<(), String> {
+    for file in planned {
         let path = layout.resolve(file.slot);
         match file.content {
             Content::Absent => {
@@ -1961,6 +2093,17 @@ fn write_declared_state(layout: &Layout, case: &CaseSpec) -> Result<(), String> 
             Content::Directory => {
                 std::fs::create_dir_all(&path)
                     .map_err(|error| format!("{} cannot be created: {error}", path.display()))?;
+                continue;
+            }
+            Content::Preserved => {
+                // Written by the shared setup or a preparation step; observed
+                // below, never rewritten here.
+                if std::fs::symlink_metadata(&path).is_err() {
+                    return Err(format!(
+                        "the fixture declares {} preserved but it was never written",
+                        path.display()
+                    ));
+                }
                 continue;
             }
             _ => {}
@@ -1994,8 +2137,8 @@ fn document_bytes(layout: &Layout, content: &Content) -> Result<Vec<u8>, String>
             .to_string()]))
         .map_err(|error| format!("the operator list cannot encode: {error}"))?),
         Content::BargeIntent => barge_intent_bytes(layout, root, root_facts),
-        Content::Directory | Content::Absent => {
-            Err("a directory or an absence carries no document".to_owned())
+        Content::Directory | Content::Absent | Content::Preserved => {
+            Err("a directory, an absence or a preserved document carries no bytes here".to_owned())
         }
     }
 }
@@ -2052,23 +2195,55 @@ fn registry_bytes(
         document
     };
     let encoded = match shape {
-        RegistryShape::Base | RegistryShape::StaleNonce => serde_json::to_vec_pretty(&document(
+        RegistryShape::Base => serde_json::to_vec_pretty(&document(
             vec![row(CHECKOUT_ID, &checkout, serde_json::json!({}))],
             true,
             serde_json::Value::Null,
         )),
         RegistryShape::Incomplete | RegistryShape::Overflow => {
-            let tag = if shape == RegistryShape::Incomplete {
-                "cancelled"
+            // The reader's own sticky-incomplete record: a reason, the time it
+            // began and the transaction that left it. An overflow tag lives in
+            // the registry's `cancelled_overflow`, not inside the record.
+            let (reason, transaction) = if shape == RegistryShape::Incomplete {
+                ("cancelled", "tx-cancelled")
             } else {
-                "cancelled-overflow"
+                ("overflow", "tx-overflow")
             };
-            serde_json::to_vec_pretty(&document(
+            let mut document = document(
                 vec![row(CHECKOUT_ID, &checkout, serde_json::json!({}))],
                 false,
-                serde_json::json!({"reason": tag, "cancelled": tag}),
-            ))
+                serde_json::json!({
+                    "reason": reason,
+                    "since_ms": 1,
+                    "transaction": transaction,
+                }),
+            );
+            if shape == RegistryShape::Overflow {
+                document["cancelled_overflow"] = serde_json::json!(["overflow"]);
+            }
+            serde_json::to_vec_pretty(&document)
         }
+        RegistryShape::StaleNonce => serde_json::to_vec_pretty(&document(
+            vec![row(
+                CHECKOUT_ID,
+                &checkout,
+                serde_json::json!({"nonce": OTHER_NONCE}),
+            )],
+            true,
+            serde_json::Value::Null,
+        )),
+        RegistryShape::ForeignVolume => serde_json::to_vec_pretty(&document(
+            vec![row(
+                CHECKOUT_ID,
+                &checkout,
+                serde_json::json!({
+                    "checkout_volume_uuid": OTHER_VOLUME_UUID,
+                    "volume_uuid": OTHER_VOLUME_UUID,
+                }),
+            )],
+            true,
+            serde_json::Value::Null,
+        )),
         RegistryShape::Malformed => Ok(b"{\"version\":\"oxide.outputs.registry/2\",".to_vec()),
         RegistryShape::Oversize => {
             let mut bytes = b"{\"version\":\"oxide.outputs.registry/2\",\"rows\":[".to_vec();
@@ -2260,11 +2435,7 @@ fn receipt_bytes(layout: &Layout, root: &Path, shape: ReceiptShape) -> Result<Ve
 
 fn marker_bytes(layout: &Layout, shape: MarkerShape) -> Result<Vec<u8>, String> {
     let checkout = layout.checkout.display().to_string();
-    let nonce = if shape == MarkerShape::OtherNonce {
-        OTHER_NONCE
-    } else {
-        NONCE
-    };
+    let nonce = NONCE;
     let version = if shape == MarkerShape::V1 {
         OXIDE_MARKER_V1
     } else {
@@ -2272,8 +2443,11 @@ fn marker_bytes(layout: &Layout, shape: MarkerShape) -> Result<Vec<u8>, String> 
     };
     match shape {
         MarkerShape::Malformed => Ok(b"{\"version\":\"oxide.outputs.root/2\",".to_vec()),
-        MarkerShape::Base | MarkerShape::V1 | MarkerShape::OtherNonce | MarkerShape::Replaced => {
-            serde_json::to_vec_pretty(&serde_json::json!({
+        MarkerShape::Base
+        | MarkerShape::V1
+        | MarkerShape::ForeignVolume
+        | MarkerShape::Replaced => {
+            let mut marker = serde_json::json!({
                 "version": version,
                 "checkout": checkout,
                 "checkout_id": CHECKOUT_ID,
@@ -2283,8 +2457,12 @@ fn marker_bytes(layout: &Layout, shape: MarkerShape) -> Result<Vec<u8>, String> 
                 "nonce": nonce,
                 "generation": 1,
                 "created_ms": 1,
-            }))
-            .map_err(|error| format!("the marker cannot encode: {error}"))
+            });
+            if shape == MarkerShape::ForeignVolume {
+                marker["checkout_volume_uuid"] = serde_json::json!(OTHER_VOLUME_UUID);
+            }
+            serde_json::to_vec_pretty(&marker)
+                .map_err(|error| format!("the marker cannot encode: {error}"))
         }
     }
 }
@@ -2358,9 +2536,12 @@ fn barge_intent_bytes(
 
 /// Observe every declared path, and only declared paths. The manifest's entries
 /// are these observations, never a directory walk's extras.
-fn observe_declared_state(layout: &Layout, case: &CaseSpec) -> Result<Vec<DeclaredEntry>, String> {
+fn observe_declared_state(
+    layout: &Layout,
+    planned: &[PlannedPath],
+) -> Result<Vec<DeclaredEntry>, String> {
     let mut entries = Vec::new();
-    for file in case.files {
+    for file in planned {
         let path = layout.resolve(file.slot);
         let parent = path
             .parent()
@@ -2488,7 +2669,22 @@ fn manifest_entry(entry: &DeclaredEntry) -> serde_json::Value {
 mod tests {
     use super::*;
 
-    /// The inventory is the D8/CF one: 50 cases, seven deferred, five
+    /// The one observed entry with `shape`, so no test depends on an index.
+    fn entry_for<'a>(prepared: &'a PreparedCase, shape: &str) -> &'a DeclaredEntry {
+        prepared
+            .entries
+            .iter()
+            .find(|entry| entry.shape == shape)
+            .unwrap_or_else(|| panic!("{} has no {shape} entry", prepared.spec.id))
+    }
+
+    /// One declared file's bytes, found by its shape.
+    fn document_for(prepared: &PreparedCase, shape: &str) -> Vec<u8> {
+        let entry = entry_for(prepared, shape);
+        std::fs::read(prepared.fixture.dir.path().join(&entry.rel)).unwrap()
+    }
+
+    /// The inventory is the D8/CF one: 50 cases, seven deferred, six
     /// unsupported, and no duplicate id.
     #[test]
     fn the_inventory_is_complete_and_unique() {
@@ -2601,8 +2797,18 @@ mod tests {
     #[test]
     fn the_plan_obligations_and_cf_are_complete() {
         for case in CASES {
-            assert_eq!(case.cf.len(), 7, "{} does not name all seven CFs", case.id);
-            for note in case.cf {
+            let notes = cf_notes(case);
+            assert_eq!(notes.len(), 7, "{} does not name all seven CFs", case.id);
+            // CF-1 follows the case's own outputs state, never a family label.
+            let outputs = case.files.iter().any(|file| {
+                file.slot == Slot::OutputsDir && matches!(file.content, Content::Directory)
+            });
+            let cf1 = notes.iter().find(|note| note.cf == Cf::Cf1).unwrap();
+            assert_eq!(cf1.applies, outputs, "{} CF-1", case.id);
+            if !outputs {
+                assert!(cf1.reason.contains("ENOENT"), "{} CF-1 reason", case.id);
+            }
+            for note in &notes {
                 assert!(!note.reason.is_empty());
             }
             if matches!(case.support, Support::Prepared) {
@@ -2706,6 +2912,245 @@ mod tests {
             .any(|root| root == &prepared.fixture.root.display().to_string()));
     }
 
+    /// The registry, receipt and marker documents each case names are read by the
+    /// **real** readers, and each one produces the outcome its case states. This
+    /// is a reader control over the fixture state; it is not a decision, an engine
+    /// run or a comparison.
+    #[test]
+    fn every_document_reads_as_its_case_names() {
+        use std::time::Duration;
+
+        use crate::os::DirOps;
+        use crate::reference::{OxideReceipts, OxideRegistry};
+
+        fn snapshot(prepared: &PreparedCase) -> crate::reference::OxideSnapshot {
+            let account = crate::testkit::FakeAccount {
+                home: prepared.fixture.dir.path().to_path_buf(),
+            };
+            crate::reference::OxideSnapshot::read_within(&account, Duration::from_secs(10))
+        }
+
+        // Registry shapes.
+        let base = prepare("tape-case-read-ctl0", "CTL-0").unwrap();
+        match &snapshot(&base).registry {
+            OxideRegistry::Read { rows, complete, .. } => {
+                assert!(complete);
+                assert_eq!(rows.len(), 1);
+                assert!(!rows[0].live());
+            }
+            other => panic!("CTL-0 registry read as {other:?}"),
+        }
+        let incomplete = prepare("tape-case-read-ctl1", "CTL-1").unwrap();
+        match &snapshot(&incomplete).registry {
+            OxideRegistry::Read { complete, .. } => assert!(!complete),
+            other => panic!("CTL-1 registry read as {other:?}"),
+        }
+        let overflow = prepare("tape-case-read-overflow", "REG-OVERFLOW").unwrap();
+        match &snapshot(&overflow).registry {
+            OxideRegistry::Read { complete, .. } => assert!(!complete),
+            other => panic!("REG-OVERFLOW registry read as {other:?}"),
+        }
+        // The overflow tag is the registry's own field, not inside the record.
+        let raw: serde_json::Value =
+            serde_json::from_slice(&document_for(&overflow, Slot::Registry.shape())).unwrap();
+        assert_eq!(raw["cancelled_overflow"][0], "overflow");
+        assert_eq!(raw["incomplete"]["reason"], "overflow");
+        assert!(raw["incomplete"]["since_ms"].is_u64());
+        assert!(raw["incomplete"]["transaction"].is_string());
+
+        let missing = prepare("tape-case-read-reg-missing", "REG-MISSING").unwrap();
+        assert!(matches!(snapshot(&missing).registry, OxideRegistry::Absent));
+        for id in ["REG-MALFORMED", "REG-OVERSIZE"] {
+            let prepared = prepare(&format!("tape-case-read-{}", id.to_lowercase()), id).unwrap();
+            assert!(
+                matches!(snapshot(&prepared).registry, OxideRegistry::Unknown { .. }),
+                "{id} did not read as unknown"
+            );
+        }
+        let contradictory =
+            prepare("tape-case-read-reg-contradictory", "REG-CONTRADICTORY").unwrap();
+        match &snapshot(&contradictory).registry {
+            OxideRegistry::Read { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                assert!(rows.iter().all(crate::reference::OxideRow::live));
+            }
+            other => panic!("REG-CONTRADICTORY registry read as {other:?}"),
+        }
+
+        // Reference flags and the journal projection.
+        for (id, flag) in [
+            ("REF-PENDING", "pending"),
+            ("REF-RESERVATION", "reservation"),
+            ("REF-CANCELLING", "cancelling"),
+            ("REF-PRUNING", "pruning"),
+            ("REF-SELECTED-NOT-CURRENT", "selected"),
+        ] {
+            let prepared = prepare(&format!("tape-case-read-{}", id.to_lowercase()), id).unwrap();
+            match &snapshot(&prepared).registry {
+                OxideRegistry::Read { rows, intents, .. } => {
+                    assert_eq!(rows.len(), 1, "{id}");
+                    assert!(rows[0].live(), "{id} row is not live");
+                    let set = match flag {
+                        "pending" => rows[0].pending,
+                        "reservation" => rows[0].reservation,
+                        "cancelling" => rows[0].cancelling,
+                        "pruning" => rows[0].pruning,
+                        _ => rows[0].selected,
+                    };
+                    assert!(set, "{id} does not set {flag}");
+                    if id == "REF-PRUNING" {
+                        assert_eq!(intents.len(), 1);
+                        assert_eq!(intents[0].phase, "renamed");
+                    } else {
+                        assert!(intents.is_empty(), "{id}");
+                    }
+                }
+                other => panic!("{id} registry read as {other:?}"),
+            }
+        }
+        let orphan = prepare("tape-case-read-orphan", "REF-ORPHAN-MARKED").unwrap();
+        match &snapshot(&orphan).registry {
+            OxideRegistry::Read { rows, .. } => assert!(rows.is_empty()),
+            other => panic!("REF-ORPHAN-MARKED registry read as {other:?}"),
+        }
+
+        // Receipt shapes.
+        let rcp_missing = prepare("tape-case-read-rcp-missing", "RCP-MISSING").unwrap();
+        match &snapshot(&rcp_missing).receipts {
+            OxideReceipts::Read(receipts) => assert!(receipts.is_empty()),
+            other => panic!("RCP-MISSING receipts read as {other:?}"),
+        }
+        for id in ["RCP-MALFORMED", "RCP-CONTRADICTORY"] {
+            let prepared = prepare(&format!("tape-case-read-{}", id.to_lowercase()), id).unwrap();
+            assert!(
+                matches!(snapshot(&prepared).receipts, OxideReceipts::Unknown { .. }),
+                "{id} did not read as unknown"
+            );
+        }
+        let noncommitted = prepare("tape-case-read-rcp-prepared", "RCP-NONCOMMITTED").unwrap();
+        match &snapshot(&noncommitted).receipts {
+            OxideReceipts::Read(receipts) => {
+                assert_eq!(receipts.len(), 1);
+                assert!(receipts[0].current.is_empty());
+            }
+            other => panic!("RCP-NONCOMMITTED receipts read as {other:?}"),
+        }
+        let v1 = prepare("tape-case-read-rcp-v1", "RCP-V1").unwrap();
+        match &snapshot(&v1).receipts {
+            OxideReceipts::Read(receipts) => {
+                assert_eq!(receipts.len(), 1);
+                assert_eq!(receipts[0].current, vec![v1.fixture.root.clone()]);
+            }
+            other => panic!("RCP-V1 receipts read as {other:?}"),
+        }
+
+        // Marker shapes, read through a real opened root descriptor.
+        let platform = crate::os::platform();
+        let read_marker = |root: &std::path::Path| {
+            let handle = platform.open_path(root).unwrap();
+            crate::reference::read_oxide_marker(&platform, &handle)
+        };
+        let marker_missing = prepare("tape-case-read-mrk-missing", "MRK-MISSING").unwrap();
+        assert!(read_marker(&marker_missing.fixture.root).unwrap().is_none());
+        let marker_malformed = prepare("tape-case-read-mrk-malformed", "MRK-MALFORMED").unwrap();
+        assert!(read_marker(&marker_malformed.fixture.root).is_err());
+        let marker_v1 = prepare("tape-case-read-mrk-v1", "RCP-V1").unwrap();
+        assert!(read_marker(&marker_v1.fixture.root).is_err());
+        for id in ["MRK-REPLACED", "ID-NONCE"] {
+            let prepared = prepare(&format!("tape-case-read-{}", id.to_lowercase()), id).unwrap();
+            let marker = read_marker(&prepared.fixture.root)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} marker is missing"));
+            assert_eq!(marker.checkout_id, CHECKOUT_ID);
+        }
+    }
+
+    /// The orphan's marker is on the unregistered extra root, and the owned root
+    /// carries none, so the extra root is the case's candidate.
+    #[test]
+    fn the_orphan_marker_sits_on_the_extra_root() {
+        let prepared = prepare("tape-case-orphan-marker", "REF-ORPHAN-MARKED").unwrap();
+        let extra = entry_for(&prepared, Slot::ExtraRoot.shape());
+        let marker = entry_for(&prepared, Slot::ExtraRootMarker.shape());
+        let extra_path = prepared.fixture.dir.path().join(&extra.rel);
+        let marker_path = prepared.fixture.dir.path().join(&marker.rel);
+        assert!(marker_path.starts_with(&extra_path));
+        assert_eq!(marker.parent_inode, extra.inode.unwrap());
+        assert_eq!(marker.kind, "file");
+        // No marker on the owned root.
+        let owned_marker = prepared.fixture.root.join(OXIDE_MARKER_FILE);
+        assert!(!owned_marker.exists());
+        // The reader sees the orphan's marker on the extra root only.
+        use crate::os::DirOps;
+        let platform = crate::os::platform();
+        let handle = platform.open_path(&extra_path).unwrap();
+        let read = crate::reference::read_oxide_marker(&platform, &handle)
+            .unwrap()
+            .expect("the extra root carries a marker");
+        assert_eq!(read.checkout_id, CHECKOUT_ID);
+    }
+
+    /// The volume cases materialize the condition their D8 rows name: two volume
+    /// records with one UUID, and a recorded checkout UUID the fixture never
+    /// mounts.
+    #[test]
+    fn the_volume_cases_materialize_their_condition() {
+        let duplicate = prepare("tape-case-vol-dup", "VOL-DUP-REGISTRY").unwrap();
+        let state = crate::state::StatePaths::resolve(
+            &crate::testkit::FakeAccount {
+                home: duplicate.fixture.dir.path().to_path_buf(),
+            },
+            Some(&duplicate.fixture.dir.path().join("state")),
+        )
+        .unwrap();
+        let error = crate::registry::read(&state).unwrap_err();
+        assert!(
+            error.message().contains("registered twice") || error.message().contains("duplicate"),
+            "the duplicate-volume registry did not refuse: {}",
+            error.message()
+        );
+        let raw: serde_json::Value =
+            serde_json::from_slice(&document_for(&duplicate, Slot::BargeRegistry.shape())).unwrap();
+        let volumes = raw["volumes"].as_array().unwrap();
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(volumes[0]["volume_uuid"], volumes[1]["volume_uuid"]);
+
+        let conflict = prepare("tape-case-abs-uuid", "ABS-UUID-CONFLICT").unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&document_for(&conflict, Slot::Registry.shape())).unwrap();
+        let row = &raw["rows"][0];
+        assert_eq!(row["checkout_volume_uuid"], OTHER_VOLUME_UUID);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&conflict.fixture.manifest).unwrap();
+        assert_ne!(manifest["barge"]["volume_uuid"], OTHER_VOLUME_UUID);
+        let marker: serde_json::Value =
+            serde_json::from_slice(&document_for(&conflict, Slot::Marker.shape())).unwrap();
+        assert_eq!(marker["checkout_volume_uuid"], OTHER_VOLUME_UUID);
+    }
+
+    /// Every prepared case records its declaration and placements directory, so
+    /// the undeclared case's absence is observed rather than inferred.
+    #[test]
+    fn the_declaration_and_placements_are_recorded() {
+        let declared = prepare("tape-case-decl-recorded", "CTL-0").unwrap();
+        assert_eq!(entry_for(&declared, Slot::Declaration.shape()).kind, "file");
+        assert_eq!(
+            entry_for(&declared, Slot::PlacementsDir.shape()).kind,
+            "directory"
+        );
+        let undeclared = prepare("tape-case-decl-absent", "DECL-MISSING").unwrap();
+        assert_eq!(
+            entry_for(&undeclared, Slot::Declaration.shape()).kind,
+            "absent"
+        );
+        assert!(!undeclared
+            .fixture
+            .dir
+            .path()
+            .join(&entry_for(&undeclared, Slot::Declaration.shape()).rel)
+            .exists());
+    }
+
     /// Every prepared case materializes, its manifest parses as strict `/2`, and
     /// each declared entry's observed facts are the fixture's own. This is a
     /// per-case setup control over all 37 prepared specifications.
@@ -2745,11 +3190,28 @@ mod tests {
             assert!(document["expected_effects"].as_array().unwrap().is_empty());
             assert_eq!(
                 document["fixture"]["entries"].as_array().unwrap().len(),
-                case.files.len(),
+                case.files.len() + 3,
                 "{}",
                 case.id
             );
-            for (entry, file) in prepared.entries.iter().zip(case.files) {
+            assert_eq!(prepared.entries.len(), case.files.len() + 3);
+            // The shared declared state is recorded for every case.
+            for (slot, kind) in [
+                (
+                    Slot::Declaration,
+                    if case.id == "DECL-MISSING" {
+                        "absent"
+                    } else {
+                        "file"
+                    },
+                ),
+                (Slot::PlacementsDir, "directory"),
+                (Slot::BargeRegistry, "file"),
+            ] {
+                let entry = entry_for(&prepared, slot.shape());
+                assert_eq!(entry.kind, kind, "{} {:?}", case.id, slot);
+            }
+            for (entry, file) in prepared.entries.iter().skip(3).zip(case.files) {
                 assert_eq!(entry.shape, file.slot.shape(), "{}", case.id);
                 let path = prepared.fixture.dir.path().join(&entry.rel);
                 match file.content {
@@ -2794,8 +3256,7 @@ mod tests {
         assert!(!missing.fixture.dir.path().join(&outputs.rel).exists());
 
         let malformed = prepare("tape-case-reg-malformed", "REG-MALFORMED").unwrap();
-        let bytes =
-            std::fs::read(malformed.fixture.dir.path().join(&malformed.entries[2].rel)).unwrap();
+        let bytes = document_for(&malformed, Slot::Registry.shape());
         assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_err());
 
         let oversize = prepare("tape-case-reg-oversize", "REG-OVERSIZE").unwrap();
@@ -2807,14 +3268,7 @@ mod tests {
         assert!(entry.size.unwrap() > REGISTRY_CAP_BYTES as u64);
 
         let incomplete = prepare("tape-case-reg-incomplete", "CTL-1").unwrap();
-        let bytes = std::fs::read(
-            incomplete
-                .fixture
-                .dir
-                .path()
-                .join(&incomplete.entries[2].rel),
-        )
-        .unwrap();
+        let bytes = document_for(&incomplete, Slot::Registry.shape());
         let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(document["complete"], false);
         assert!(document["incomplete"].is_object());
@@ -2822,7 +3276,7 @@ mod tests {
         // The BASE and the incomplete case are not the same bytes, so an empty or
         // BASE-shaped state cannot stand in for CTL-1.
         let base = prepare("tape-case-ctl0-compare", "CTL-0").unwrap();
-        let base_bytes = std::fs::read(base.fixture.dir.path().join(&base.entries[2].rel)).unwrap();
+        let base_bytes = document_for(&base, Slot::Registry.shape());
         assert_ne!(base_bytes, bytes);
     }
 
@@ -2848,8 +3302,7 @@ mod tests {
         assert_eq!(intents.records.len(), 1);
         assert!(intents.records[0].is_pending());
         // The registry row is pruning, with its own unfinished journal entry.
-        let registry =
-            std::fs::read(prepared.fixture.dir.path().join(&prepared.entries[2].rel)).unwrap();
+        let registry = document_for(&prepared, Slot::Registry.shape());
         let document: serde_json::Value = serde_json::from_slice(&registry).unwrap();
         assert_eq!(document["rows"][0]["pruning"], "intent-1");
         assert_eq!(document["intents"][0]["phase"], "renamed");
@@ -2861,8 +3314,7 @@ mod tests {
             ("REF-SELECTED-NOT-CURRENT", "selected"),
         ] {
             let prepared = prepare(&format!("tape-case-{}", id.to_lowercase()), id).unwrap();
-            let registry =
-                std::fs::read(prepared.fixture.dir.path().join(&prepared.entries[2].rel)).unwrap();
+            let registry = document_for(&prepared, Slot::Registry.shape());
             let document: serde_json::Value = serde_json::from_slice(&registry).unwrap();
             assert!(
                 !document["rows"][0][flag].is_null() && document["rows"][0][flag] != false,
@@ -2890,16 +3342,15 @@ mod tests {
         assert_eq!(marker.kind, "file");
 
         let v1 = prepare("tape-case-rcp-v1", "RCP-V1").unwrap();
-        let receipt = std::fs::read(v1.fixture.dir.path().join(&v1.entries[3].rel)).unwrap();
+        let receipt = document_for(&v1, Slot::Receipt.shape());
         let document: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
         assert_eq!(document["version"], OXIDE_RECEIPT_V1);
-        let marker = std::fs::read(v1.fixture.dir.path().join(&v1.entries[4].rel)).unwrap();
+        let marker = document_for(&v1, Slot::Marker.shape());
         let document: serde_json::Value = serde_json::from_slice(&marker).unwrap();
         assert_eq!(document["version"], OXIDE_MARKER_V1);
 
         let replaced = prepare("tape-case-mrk-replaced", "MRK-REPLACED").unwrap();
-        let registry =
-            std::fs::read(replaced.fixture.dir.path().join(&replaced.entries[2].rel)).unwrap();
+        let registry = document_for(&replaced, Slot::Registry.shape());
         let document: serde_json::Value = serde_json::from_slice(&registry).unwrap();
         assert_eq!(
             document["rows"][0]["marker_digest"],
@@ -2932,7 +3383,7 @@ mod tests {
         let inode = prepare("tape-case-id-inode", "ID-INODE").unwrap();
         let root = &inode.fixture.root;
         let facts = std::fs::symlink_metadata(root).unwrap();
-        let registry = std::fs::read(inode.fixture.dir.path().join(&inode.entries[2].rel)).unwrap();
+        let registry = document_for(&inode, Slot::Registry.shape());
         let document: serde_json::Value = serde_json::from_slice(&registry).unwrap();
         assert_eq!(
             document["rows"][0]["root_ino"].as_u64().unwrap(),
@@ -2940,8 +3391,7 @@ mod tests {
         );
         let device = prepare("tape-case-id-device", "ID-DEVICE-STALE").unwrap();
         let device_facts = std::fs::symlink_metadata(&device.fixture.root).unwrap();
-        let registry =
-            std::fs::read(device.fixture.dir.path().join(&device.entries[2].rel)).unwrap();
+        let registry = document_for(&device, Slot::Registry.shape());
         let document: serde_json::Value = serde_json::from_slice(&registry).unwrap();
         assert_eq!(
             document["rows"][0]["root_dev"].as_u64().unwrap(),
@@ -2962,8 +3412,7 @@ mod tests {
         assert_eq!(state.kind, "absent");
 
         let unknown = prepare("tape-case-fence-unknown", "FENCE-UNKNOWN").unwrap();
-        let bytes =
-            std::fs::read(unknown.fixture.dir.path().join(&unknown.entries[3].rel)).unwrap();
+        let bytes = document_for(&unknown, Slot::ControlState.shape());
         assert!(String::from_utf8(bytes)
             .unwrap()
             .contains("oxide.outputs/unknown"));

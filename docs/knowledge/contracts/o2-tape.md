@@ -58,11 +58,14 @@ does not prove.
   is `effigy rust:compile:release`.
 - `crates/barge/src/tape_cases.rs`'s tests: the case inventory and its counts,
   the refusal of an unlisted case, the no-BASE-masquerade check, the complete CF
-  and obligation tables, the effect-free plan, and the per-case owned **setup
+  and obligation tables, the effect-free plan, the per-case owned **setup
   controls** (each supported case's declared files, real bytes digests, parent
   identities, absences, registry/receipt/marker/control documents, the pending
-  Barge intent, the declaration policy and the operator list) plus the refusal
-  control. They are setup controls, not decision, volume or native proof.
+  Barge intent, the declaration and placements records, the declaration policy
+  and the operator list), a **reader control** that reads each case's registry,
+  receipt and marker documents through the real `OxideSnapshot`/marker readers
+  and asserts that case's outcome, and the refusal control. They are setup and
+  reader controls, not decision, volume, engine or native proof.
 - `crates/barge/src/tape_harness.rs`'s tests: the embedded end-to-end exercise
   (one exclusively owned directory fixture on a real selected volume, the
   actual `release::plan`, one completed window over a settled root with a
@@ -255,6 +258,13 @@ and each declared absence. `fixture.entries` is exactly those observations and i
 never a directory walk's extras; `fixture.roots` names the owned roots the case
 declares; `fixture.device`/`inode`/`mode` are the fixture directory's own.
 
+Every prepared case also records the **shared declared state** the plan reads: its
+one area declaration (recorded as `absent` for `DECL-MISSING`, whose prepared
+state is a real area root with no declaration), the placements directory the plan
+enumerates, and Barge's volume registry document. Those three are observed like
+every other declared path, so a declaration's presence or absence is manifest
+state rather than an inferred fact.
+
 **What the manifest deliberately does not claim.** `mandatory_observations` stays
 empty: an obligation's `/2` identity is a complete alternative whose facts only
 an execution can observe, and preparation may not serialize an invented identity
@@ -300,6 +310,26 @@ its premises, its enumerations, its declared relative path shapes and its
 obligations. It creates no fixture, opens no window and evaluates nothing; it is a
 diagnostic print, never a capture, a transcript or proof input. `runnable` is
 `0`.
+
+**CF-1 follows actual state.** The seven CF notes are data, but CF-1 is derived
+per case from whether that case creates Oxide's outputs folder, which the
+snapshot enumerates for receipts on every run: present rows are a bound set,
+`REG-MISSING`'s deliberate absence is the enumeration's own `ENOENT` result, and
+the plan prints the outputs, declaration and placement enumerations per case.
+CF-2 to CF-7 keep the family dispositions the D8 inventory names, each with a
+reason whether it applies or not.
+
+**Sticky incompleteness and the volume conditions are the reader's.** The
+sticky-incomplete cases write the reader's own record (`reason`, `since_ms`,
+`transaction`); `REG-OVERFLOW`'s tag is the registry's `cancelled_overflow`
+array, not a member of that record. `VOL-DUP-REGISTRY` authors Barge's own
+registry document with two records naming one UUID — the writer refuses such a
+document by design, so the fixture writes the divergent bytes deliberately and
+Barge's reader refuses them, which is the case's outcome. `ABS-UUID-CONFLICT`
+records, in both the registry row and the root marker, a checkout volume UUID the
+fixture never mounts, so the recorded volume differs from the live one. The
+orphan case's `/2` marker sits on the unregistered extra plan root, and the owned
+root carries none.
 
 **Recorded insufficiencies, not absorbed.** No case is runnable: the recorder's
 in-window bind check still reports every path-only file row unbound, no
