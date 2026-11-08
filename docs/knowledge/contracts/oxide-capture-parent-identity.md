@@ -628,58 +628,294 @@ proposed validation above belongs to the implementation slices.
 
 ## Open design issues
 
-Mandatory parent coverage for direct state reads remains unresolved. The named future option — a descriptor-relative
-state-reader seam for proven parents on boot-volume state files — is recorded
-where it is rejected (section "Test-only context carrying versus private
-handle/type instrumentation") as an operator scope question for a future
-brief, not as an open issue here.
+Mandatory parent coverage for direct state reads remains unresolved. The only
+candidate that could supply it, a per-call parent open (C1), is disposed of
+below. Source does not support activation. The open decision is the product
+boundary R-K2 (section 5 of the disposition). Until that ruling, direct-read
+parents stay unproven.
 
-### Candidate private read seam for review
+### Route B compatibility disposition: the parent-opening question
 
-This candidate is not an implementation or an equivalence claim. The existing
-`state::read_bounded_inner(path, bounds)` resolves a path separately for its
-`symlink_metadata` precheck and `File::open`, then checks the opened file's
-metadata and reads it under the original byte and deadline bounds. A candidate
-private operation would accept `(parent: &File, name: &OsStr, bounds: &Bounds)`
-and use `fstatat` without following the final link for the precheck, followed
-by `openat` with the existing leaf-following behavior, then the existing
-opened-file metadata and read loop. The `File` owns the directory descriptor;
-opened files are owned by `File` and dropped on all returns. Opened descriptors
-must be close-on-exec. The parent remains alive through the relative operation;
-a separately recorded fstat of that same live descriptor must report its actual
-result, including error. No observation feeds a reader decision.
+Status: source-backed design disposition. Nothing here is executed. No test,
+fixture, native run, build or process probe backs it. Source identity: Barge
+`main` at `b613506` (after the 045 merge `e39fce7` and the 044 merge
+`b613506`). Line numbers below are at that head.
 
-For `StateLock::shared_if_present`, a separate candidate would take the same
-parent and component, open read-only without creation, then run the existing
-shared-lock wait. A successful lock still owns the file until `StateLock` drops;
-its additional test-only L1 metadata observation cannot turn a held lock into
-a refusal. Exclusive creation is outside this candidate. For enumeration, a
-candidate would own a directory stream made from a duplicated descriptor and
-close it on every return, retaining existing per-entry, deadline and count
-handling. It must not silently omit an unreadable or non-UTF8 entry.
+This section replaces "Candidate private read seam for review". That section
+framed the candidate for activation ("before activating the candidate",
+"before planner activation") and left the parent-opening question open.
+Source does not support activation. This section answers the question, and
+the candidate is not activation-ready.
 
-These signatures leave the parent-opening problem unresolved. A root path,
-relative path, empty or trailing component, intermediate symlink, missing
-ancestor, replaced parent, and parent rename can produce different outcomes
-from the current path resolution. The current metadata precheck and later open
-resolve separately; pinning one parent could instead read an object from a
-renamed or replaced directory. Extra open, dup and fstat calls add bounded
-resource cost and can fail with `EMFILE`, `EACCES`, or other real errors. A
-missing child must remain distinct from a missing ancestor. Leaf symlinks must
-retain the current operation's follow/no-follow behavior. Post-read path
-replacement cannot establish the parent used earlier. The proposal requires
-per-site tests of those cases and exact error, budget and read-limit equivalence
-before activation; if equivalence fails, retain the existing operation and its
-unproven parent. The held parent alone does not qualify K1's identity lifetime
-premise and cannot change writer-custody or deletion decisions. This is a
-production I/O change, requiring a separate verification-tier judgment and
-independent review before planner activation; custody or deletion eligibility
-changes require Elevated scoped evidence.
+#### 1. Does a caller already own a usable parent descriptor?
 
-Before activating the candidate, inject failures at parent open, child open,
-stream duplication and descriptor metadata, then verify each acquired handle is
-closed on every return and the caller receives the existing refusal or an
-explicitly reviewed difference. In particular, test `EMFILE` before any
-handle is acquired and after the parent is acquired. These are requirements
-for the unimplemented seam, not evidence supplied by the test-only recorder's
-separate injected `dup` and L1 controls.
+No. Source facts:
+
+- The 19 production call sites of `state::read_bounded` sit in 18 functions.
+  `registry::read_with_deadline` (`registry.rs:559`, `:565`) has two cfg
+  variants and counts twice. Every site reaches the reader through
+  `read_bounded` (`state.rs:470`), the sole entry to `read_bounded_inner`
+  (`state.rs:477`). No site receives a `DirHandle` or `File` for the leaf's
+  parent.
+- `StatePaths` holds a `PathBuf` root (`state.rs:103–106`). `LockSet` holds
+  `StatePaths` only (`state.rs:1246–1250`). `StateLock` holds the lock file's
+  own descriptor, not its parent's (`state.rs:975–981`).
+- The one state-root descriptor in production is `identity::identity_directory`
+  (`identity.rs:168`, `dirs.open_path(state.root())`). It is local to that
+  function and feeds only the K1 child reads of `identity.json`. No
+  `read_bounded` caller is in its scope.
+
+So each read must open its parent newly. Reuse would need either a handle
+threaded from a caller that holds none (Route B, rejected above) or a
+`StatePaths`-owned root handle (C2 below).
+
+#### 2. Direct lookup versus directory open
+
+Current `read_bounded_inner` (`state.rs:477`): `symlink_metadata(path)`, then
+refuse a link, a non-file or an over-cap file, then `File::open(path)`, then
+`file.metadata()`, then the read loop. That is two path resolutions (lstat and
+open) and one descriptor, held from open to drop. A precheck `NotFound` maps to
+`Absent` at `state.rs:484–493`, whatever the cause.
+
+Candidate C1 (section 3): `open(parent, O_RDONLY|O_DIRECTORY|O_CLOEXEC)`, with
+no `O_NOFOLLOW` on the parent so that links along the path are followed as
+today. Then `fstatat(name, AT_SYMLINK_NOFOLLOW)` with the same checks, then
+`openat(name, O_RDONLY|O_CLOEXEC)` (leaf-follow kept, as `File::open` does),
+then `file.metadata()`, then the same read loop. The parent descriptor is
+dropped on every return. Rust's `OpenOptions` already sets `O_CLOEXEC` on Unix
+(local std source, `library/std/src/sys/fs/unix.rs`).
+
+Counterfactuals. Each is a source-backed prediction, not an executed result.
+
+**Links and missing components**
+
+| Condition | Current | C1 | Result |
+| --- | --- | --- | --- |
+| Link in an intermediate component (for example, state root is a symlink) | followed by lstat and open | followed by the parent open | same |
+| Leaf is a symlink | refused at precheck | refused at `fstatat(NOFOLLOW)` | same |
+| Leaf missing | `NotFound`, mapped to `Absent` | `ENOENT` at `fstatat`, mapped to `Absent` | same |
+| Parent missing | `NotFound`, mapped to `Absent` | `ENOENT` at parent open | same only if the parent `ENOENT` maps to `Absent`. Today missing child and missing ancestor are both `Absent`, so the contract's "distinct" requirement is new, not preserved |
+| Parent is a file | `ENOTDIR`, refused | `ENOTDIR` at parent open, refused | same class; error detail differs |
+| Parent has no read bit (search-only, `wx`-class) | lstat and open succeed | `open(O_RDONLY\|O_DIRECTORY)` needs read: `EACCES`, refused | **new refusal**; the read succeeded before |
+| Only one fd free | one fd needed; succeeds | two fds held together; parent open `EMFILE`, refused | **new refusal** under fd exhaustion |
+| File replaced after open | bytes from the opened descriptor | same | same for bytes; the recorded parent is the object opened, not the path's current occupant |
+
+**Root, relative, empty and trailing components**
+
+| Condition | Current | C1 | Result |
+| --- | --- | --- | --- |
+| Single relative component (`plan.json`) | `Path::parent()` is `Some("")`; lstat and open resolve against the cwd; an existing file is read | open of `""` returns `ENOENT`. Mapped to `Absent` as today, the existing file reads as `Absent` | **false `Absent`** unless the empty parent is opened as `"."` |
+| Root path (`/`), or a leaf with no normal name (`..`, `x/..`) | `lstat` finds a directory; refused as not a regular file | no file name to split off; C1 must refuse first, with the same class | same only if the explicit refusal is added |
+| Trailing slash on a regular file (`dir/file.json/`) | `lstat` returns `ENOTDIR`; refused | parent `dir`, name `file.json`; opens and reads the file | **new read** where the current read refuses |
+| Trailing slash on a symlink (`dir/link/`) | `lstat` follows the link; refused as not-regular or `ENOTDIR`, not as `symlink` | `fstatat(NOFOLLOW)` sees the link; refused as `symlink` | same refusal, different class and detail |
+| Interior `.` (`dir/./file.json`) | kernel normalizes | Rust `Path` drops the interior `.`; same parent and name | none |
+| Relative multi-component path (`dir/file.json`) | cwd-relative | parent open is cwd-relative too | none for the cwd; relative input is a caller fact (section 2, path form) |
+
+**Acquisition and cleanup failures**
+
+| Failure | Current | C1 | Result |
+| --- | --- | --- | --- |
+| Parent open fails `EACCES` or `EMFILE` | the lstat or open of the leaf may still succeed | refused at parent open; no fd leaked if the parent is never acquired | **new refusal** |
+| `fstatat` fails after the parent is acquired | refused as `stat_refused` (lstat) | refused; the parent must close on this return | same class if mapped; cleanup is a test obligation |
+| `openat` fails after a successful precheck (race) | `File::open` error, refused | refused; parent closes on return | same class |
+| `file.metadata()` or read fails | refused | refused; parent and file close on return | same class |
+| Cleanup on each return | `File` drops | the parent `File` must drop on every `?` path | source shows the design, not the behaviour; test required (section 7) |
+
+**Path form per caller (absoluteness).** The reviewer asked for this evidence.
+Every ordinary-build state and Oxide root is built from the password database
+home, which source does not validate as absolute:
+
+- Barge state root (ordinary build): `password_database_home()` joined with
+  `STATE_ROOT_RELATIVE` (`os/macos.rs:809`). `password_database_home` returns
+  `pw_dir` unchecked (`os/macos.rs:5017–5056`). A relative override
+  `BARGE_STATE_DIR` is refused (`state.rs:117–124`).
+- Proof-feature account home: a relative path is refused (`os/macos.rs:4967–4972`).
+- Oxide state and cache directories: `tool_account_home` returns
+  `password_database_home()` in ordinary builds (`os/macos.rs:831–833`).
+- Oxide pool paths: checked absolute when the pools record is parsed
+  (`inspect.rs:644`). Registration and registry paths derive from those.
+- CLI `--plan-file`: `PathBuf::from` with no check (`main.rs:518`). A relative
+  name is read against the cwd, and an absent file is a usage error
+  (`main.rs:532`). This is the one inventory caller where user input reaches
+  the reader without an absoluteness check.
+
+The premise "`pw_dir` is absolute" is conventional, not checked in source. It
+is named here as a premise, not as evidence.
+
+**Pinning does not merge observations.** Each read opens its own parent. That
+gives one occurrence per call, keyed to that call. A second read of the same
+file is a second occurrence. No parent descriptor is reused across calls, so
+one call's parent never speaks for another's.
+
+**Rejected: observe-only parent open in cfg(test).** A parent open that the
+read does not use is a second resolution. It is the defect `226da715` removed,
+and it binds nothing the read used.
+
+**Why C1 still does not discharge the parent obligation.** The handle-class
+parent C1 gains holds for one call only. Discharging the shared contract's
+mandatory parent obligation needs the K1 lifetime premise, and source does not
+establish it (K1 theorem, above: APFS `(dev, ino)` non-reuse is unverified).
+C1 buys per-call parent consistency. It costs the refusals in the tables. It
+does not satisfy the obligation by itself.
+
+#### 3. Options
+
+- **C1, smallest candidate.** Change `read_bounded_inner` and
+  `StateLock::shared_if_present`. Because `read_bounded_inner` is shared,
+  every one of the 19 call sites changes, including the CLI plan-file read.
+  No caller signature changes. The parent is a local `File`. In
+  `shared_if_present` the parent is dropped after `openat` and before
+  `wait_for_lock`, so no parent descriptor is held during the lock wait
+  (`LOCK_WAIT`, 5 s). Also required: an explicit `"."` for an empty parent, and
+  an explicit refusal for a root or a leaf with no normal name, both with the
+  same class as today.
+- **C1′, narrowed.** The same design behind a new state-scoped entry point that
+  only the inventory callers use. The CLI plan-file read stays on the path
+  reader. This is a distinct behaviour surface and is part of R-K2 option B′.
+- **C2, larger.** A `StatePaths`-owned root handle, opened once per command and
+  threaded to every reader. This changes ownership and lifetime across a
+  command. A root replaced mid-command changes selection for every later read.
+  Multi-level sites still need intermediate opens. Not recommended.
+- **C0, no change.** Direct-read parents stay `none` (unproven), as today
+  (Route A, `o2-tape.md` "Direct-reader parents").
+
+**Recommendation: C0 now.** C1 or C1′ becomes the candidate only when both
+hold: (a) the owner accepts the tables' refusals and selection differences as
+real semantic changes; and (b) the K1 lifetime premise is qualified, so a
+handle-class parent can discharge the mandatory obligation. Without (b), C1
+adds refusals and discharges nothing.
+
+#### 4. Per-caller table
+
+Production call sites: 19, in 18 functions (`registry::read_with_deadline`
+counted for both cfg variants). Plus the two production shared-lock callers
+(L1, L2).
+
+Chain column: "inv." means the site is named in the shared contract's Direct
+state reads or Locks rows (Oxide `docs/knowledge/contracts/barge-adoption.md`,
+lines 862–863) or in this contract's S/R inventory. "other" means it is not.
+
+Verdicts:
+
+- **A**: mechanical under an existing proved invariant. None.
+- **B**: needs the product boundary ruling R-K2 (section 5).
+- **B-E**: B, and the site feeds a custody, release or deletion decision. Any
+  refusal change needs the Elevated evidence the shared contract requires,
+  before the change.
+- **N**: not affected by C1. None: C1 changes the shared reader, so every site
+  is affected.
+
+| # | Site (file:symbol) | Chain | Ordered ops today | Parent handle today | Budget and mapping | Caller invariant | Verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | `barge-cli` `volume` (`main.rs:518`, `read_bounded` at `:526`), user-named plan file | other | `read_bounded(file)` | none | registration cap, 1 row; `Absent` → usage error; refused → error | CLI apply; user input with no absoluteness check; relative names resolve against the cwd (section 2, path form) | B. C1 changes it through the shared reader; C1′ leaves it unchanged |
+| 2 | `cache::read_placements` (`cache.rs:699`) | inv. S9 | `area::read_directory(placements)` (path precheck, `area.rs:2958`), then per-id `read_bounded` | none (K4 listing + K2) | placement cap, rows; `Absent` → skip; refused → error | no lock traced | B |
+| 3 | `cache::read_adopt_intent` (`cache.rs:928`) | other | `read_bounded(root/cache-adopt-<kind>.json)` | none | intent cap, 1 row; `Absent` → `None` | cache command gates | B |
+| 4 | `cache::finish_record` readback (`cache.rs:2597`) | other | publish, then `read_bounded(placement)` | none | placement cap, 1 row | caller has just published the file | B |
+| 5 | `cache/undo_capture::require_no_pending` (`undo_capture.rs:59`) | other | `read_bounded(root/cache-undo-<kind>.json)` | none | 2 rows; only `Absent` passes | pending-journal gate | B |
+| 6 | `registry::read_with_deadline` (`registry.rs:559`, `:565`) | inv. S2 | `read_bounded(registry_path)` | none | registry cap, volume rows, caller deadline; `Absent` → `Registry::Absent` | no uniform invariant. Read under a registry lock at `describe.rs:681`, `release.rs:749`, `volume.rs:94` and `:306–308`, `space.rs:241`, `prune.rs:821`. Read before or outside any registry lock at `area.rs:3101` (pre-lock read; lock taken at `:3104`), `area.rs:3514`, `area.rs:3664`, `area.rs:4953`, `delete.rs:2958`. The `registry::read` doc says the caller locks first; the call sites do not all do | B-E |
+| 7 | `area::read_declarations` (`area.rs:2895`) | inv. S4 | `read_directory(areas)` (path precheck `symlink_metadata`, `area.rs:2958`), `read_directory(ns)`, per-file `read_bounded` | none | declaration cap, `AREA_ROWS`; `Absent` → skipped | no lock traced. Pre-existing: a listed-then-vanished file is skipped, not refused | B |
+| 8 | `area::release_with` hold read (`area.rs:3672`) | effect | `registry::read` (`:3664`), `lock_root` (exclusive, `:3667`), `read_bounded(holds/<root>/<holder>.json)` | none | hold cap; `Absent` → `released: false` | exclusive root lock held at the read | B-E |
+| 9 | `area::activity_record_bytes` (`area.rs:3796`) | effect | `read_bounded(activity_path)` | none | activity cap, 1 row | root lock held in `release_with` (`area.rs:3715`); second caller `idle_baseline_with` (`area.rs:5167`) lock not traced | B-E |
+| 10 | `area::read_hold_directory` (`area.rs:3936`) | inv. R5 | `symlink_metadata(hold)` (`area.rs:3889`), uid and mode checks, `read_bounded` | none; directory listing gives `extracted` only | hold cap; refused → `unknown_hold` (non-fatal) | `read_holds` observers | B-E |
+| 11 | `area::read_activity` (`area.rs:4287`) | other | `symlink_metadata` (`area.rs:4253`), uid and mode checks, `read_bounded` | none | activity cap, 1 row; `Absent` → missing; refused → unverified | observer `effective_uid`; callers in `release_with` (`area.rs:3680`, `:3714`), `idle_baseline_with`, `list_roots_with` | B-E |
+| 12 | `census::read_registry` (`census.rs:349`) from `observe_oxide_registry` (`census.rs:312`) | other | `read_bounded(pool/outputs/registry)` for each pool in the pools record | none | Oxide registry cap; refused → `Unknown` | Oxide-owned path; pool paths checked absolute at `inspect.rs:644` | B-E |
+| 13 | `inspect::read_pools` (`inspect.rs:622`) | inv. S10 | `read_bounded(state_dir/pools)` | none | pools cap, pool rows; refused → observation error | Oxide state dir | B-E |
+| 14 | `inspect::read_registration` (`inspect.rs:447`) | inv. S10 | `read_bounded(candidate registration)` | none | 1 row; refused → observation error | per candidate | B-E |
+| 15 | `pool_custody::read_document` (`pool_custody.rs:402`) | inv. S13 | `identity(path)` pre-stat, `read_bounded`, post-stat | none; pre and post stats are path-based | document cap, `MAX_RECORDS`; refused → `Err`, keeps the pool | custody decision | B-E |
+| 16 | `reference::read_registry` (`reference.rs:1180`) from `read_within` (`reference.rs:636`) | inv. S10 | `read_bounded(outputs/<registry>)` | none | Oxide registry cap; refused → `Unknown` | Oxide-owned path | B-E |
+| 17 | `reference::read_receipt` (`reference.rs:1811`) | inv. S11 | per listed entry: precheck `metadata(outputs)` (follows links), `read_dir(outputs)`, `read_bounded(entry)` | none; precheck is `extracted` | receipt cap, 1 row; `Absent` → `Ok(None)`; refused → `Err` | S11: no parent may be claimed when the precheck refused | B-E |
+| 18 | `state::read_intent_with_deadline` (`state.rs:2413`) | inv. S14 | `read_dir(intents)` (K4, no precheck), then per-stem `read_intent_with_deadline` (`state.rs:2587`) → `read_bounded(intents/<id>.json)` | none; no precheck | intent cap, 1 row, caller deadline; `Absent` → `UnknownState` | journal enumeration in `read_intents_with_deadline`, used by guard and effect paths | B-E |
+| L1 | `LockSet::acquire_shared` → `StateLock::shared_if_present` (`state.rs:1038`, `:1362`) | inv. S1, S6, R1 (`observe_*`) | `open(path, RDONLY)` (follows leaf, no create), `wait_for_lock` (poll 20 ms, to `LOCK_WAIT`), L1 test fstat | none | `NotFound` → `None`; other → error | rank check in `LockSet`; the held lock owns its fd until drop | B. C1 must close the parent before the wait |
+| L2 | `space.rs:246` volume lock | other | `shared_if_present` | none | `READ_DEADLINE` | lock dropped per loop iteration | B |
+
+Tally: A 0; B 8 (rows 1, 2, 3, 4, 5, 7, L1, L2); B-E 12 (rows 6, 8–18); N 0.
+
+#### 5. Product boundary ruling R-K2 (for the planner, once)
+
+Question for Tom: may the state and Oxide-artifact readers change refusal
+classes and object selection in the cases in section 2 (search-only parent
+`EACCES`; parent-open `EMFILE`; rename between parent open and child
+operations; relative single-component input reading as `Absent`; trailing-slash
+reads), in exchange for a per-call parent that cannot discharge the mandatory
+parent obligation until the K1 lifetime premise is qualified?
+
+- **A. Defer (recommended).** No production change. Direct-read parents stay
+  unproven, as `o2-tape.md` records. Revisit when K1 lifetime is qualified.
+- **B. Accept C1 for all 19 sites.** Change the shared reader and lock seam
+  under section 7. The new refusals, including on the CLI plan-file read,
+  become declared behaviour.
+- **B′. Accept C1′ for inventory sites only.** The same design behind a
+  state-scoped entry point. The CLI plan-file read stays on the path reader.
+  Still changes refusal and selection for the inventory sites.
+- **C. Thread a `StatePaths` root handle (C2).** Larger ownership change. Still
+  no parent for multi-level sites. Not recommended.
+
+Recommendation: A. B and B′ add refusal and selection changes and still leave
+the mandatory obligation undischarged. The cost is real. The benefit is not yet
+attainable.
+
+#### 6. Contract conflict, and what this does not solve
+
+**Conflict.** Oxide's shared contract (`barge-adoption.md`, "Direct state
+reads", line 862) requires parent identity for its listed direct readers. No
+source-backed candidate meets that today. A handle-class parent needs a new
+per-call open (C1 or C1′), which changes refusal and selection. Its lifetime
+premise (K1) is one that source does not establish. This conflict goes to the
+planner with R-K2. Barge does not edit `barge-adoption.md` from this
+repository.
+
+**Not solved by this disposition:**
+
+- K1 lifetime, and APFS `(dev, ino)` non-reuse over a descriptor's life.
+- Operation-time process and fd identity: who holds the fd, and whether the
+  same fd number names the same object at a later observation.
+- Enumeration parents (K4): `read_dir` entries at rows 2, 7, 17 and 18 stay
+  `none` or `extracted` under C1. If enumeration is ever taken, the withdrawn
+  candidate's rules stand: one duplicated descriptor per stream, closed on every
+  return, and no silent omission of an unreadable or non-UTF-8 entry.
+- Multi-level parents beyond the immediate parent.
+- Native behaviour of `EACCES`, `EMFILE`, rename windows and trailing-slash
+  forms on APFS. Every section 2 row is a counterfactual.
+- Parents of the Oxide-owned readers (rows 12–17) beyond the same K1 premise.
+- The `pw_dir` absoluteness premise (section 2, path form).
+- Custody and deletion decisions. This disposition changes none of them. Any
+  change on a B-E site needs Elevated evidence first.
+
+#### 7. Regression and verification requirements (only if R-K2 is ruled B or B′)
+
+Nothing here is run by this disposition.
+
+- **Fault injection (cfg(test), declared).** Inject failure at parent open,
+  `fstatat`, child open, `fstat` and read. Each path must close every acquired
+  descriptor on every return. Compare the fd count before and after.
+- **Parity controls.** Intermediate symlink (followed); leaf symlink (refused);
+  missing leaf (`Absent`); missing ancestor (`Absent`); parent that is a file
+  (`ENOTDIR`, refused); single relative component with an existing file
+  (present, not `Absent`); root path and `..` leaf (refused as not a regular
+  file); file replaced after open (bytes from the opened descriptor); lock
+  absent, held, and refused by deadline. Each must match the current result.
+- **Declared-difference controls.** Search-only parent (`EACCES`); fd
+  exhaustion at parent open (`EMFILE`); injected rename between parent open and
+  child operations; trailing slash on a regular file (must be refused as today,
+  and the C1 difference recorded if it is not); trailing slash on a symlink
+  (refused as today, class change recorded). Each must show the outcome and be
+  recorded as a difference, not as parity.
+- **Lock.** The parent descriptor is closed before `wait_for_lock`. The fd
+  count during the wait is unchanged.
+- **Verification tier.** `effigy rust:compile`, `rust:compile:release`
+  (cfg(test) compile-away), `rust:format`, `rust:lint`, `rust:test` (with the
+  scratch variables from `AGENTS.md`), `rust:test:tape` and
+  `rust:test:tape-eval`, `docs:check`. Native: a separately activated run under
+  Oxide's qualified supervisor, diagnostic first, in the X-S2 pattern.
+  Independent exact-head review. B-E sites also need Elevated evidence before
+  any change.
+
+#### 8. Recommended next scoped action
+
+1. Planner takes R-K2 (section 5) and the contract conflict (section 6) to Tom
+   once, with options A, B, B′ and C and recommendation A.
+2. If A: section 4 is the complete inventory. The `o2-tape.md` rows stay
+   unproven. No implementation brief.
+3. If B or B′: a separate implementation brief carrying section 7, scoped to
+   `read_bounded_inner` and `StateLock::shared_if_present` (B), or to a new
+   state-scoped entry point (B′).
