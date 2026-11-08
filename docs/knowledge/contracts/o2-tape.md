@@ -32,7 +32,9 @@ does not prove.
   executable and the embedded exercise call, plus the fixture builders: the
   shared owned setup (`build_fixture_setup`/`build_fixture_setup_in`), the
   manifest skeleton (`manifest_document`), and the unchanged BASE-shaped
-  `build_fixture`. Also `cfg(test)`-only and `pub(crate)`.
+  `build_fixture`. It also owns the explicit retained-custody mode of that
+  exercise ([retained fixture custody](#retained-fixture-custody)). Also
+  `cfg(test)`-only and `pub(crate)`.
 - `crates/barge/src/tape_cases.rs` — the first batch's effect-free case
   specifications and owned fixture preparation ([first-batch fixture
   cases](#first-batch-fixture-cases-source-preparation)). `cfg(test)`-only,
@@ -543,6 +545,89 @@ and issuance allowances; use expiry grants no extra runtime. Guarded covering
 uses the source-bound shared offline seeder; missing or changed evidence refuses. This source path
 does not grant a runtime block or prove parity.
 
+## Retained fixture custody
+
+The no-argument embedded exercise ordinarily builds its fixture as a
+self-removing `testkit::TempDir`, so its success path, an early return and a
+panic all remove the directory before any caller's census. A caller that has to
+census the leader's process tree after the child exits and then decide needs the
+opposite lifetime: the fixture must still be there, and it must not be this
+process's to delete. Oxide 289/PR253's observation driver requires exactly that
+(`tests`-side `BARGE_CUSTODY_PROPERTY`/`BARGE_CUSTODY_FILES`); its own
+`BARGE_CUSTODY_REVIEWED` is its reviewed binding of this exact revision, and
+nothing in Barge sets, opens or claims that gate.
+
+The mode is one source-owned opt-in, resolved once before a fixture exists:
+
+- `BARGE_TAPE_CUSTODY` must carry exactly `barge.tape.kept-fixture/1`. Any other
+  value — including an empty one, `1` or `false` — refuses and names the value it
+  accepts.
+- `BARGE_TEST_SCRATCH_ROOT` must name this invocation's own run root: an
+  absolute path with no control character, not the filesystem root, short enough
+  that the fixture name it creates still fits the 512-byte path line, and
+  existing as a real directory that this process did not create and does not
+  own. A missing path, a regular file and a link each refuse.
+- A run root without the opt-in stays the ordinary route: a directory name alone
+  is never guard authority. The opt-in without a run root refuses.
+
+No refused premise creates a fixture. In the mode, `testkit::TempDir::keep`
+takes the freshly created directory out of automatic cleanup inside the creation
+call, before any fallible step, and removal cannot be re-armed: `Drop` returns
+immediately, and a run root this process created for the fixture is left in
+place too. The order after creation is fixed and each step keeps what already
+exists:
+
+1. the kept path is announced;
+2. the ordinary setup runs unchanged (`volume-root`, real volume record, state
+   initialization, registry, declaration, owned root);
+3. the Oxide-side records are written;
+4. the manifest bytes the fixture already holds are published as
+   `manifest.json` inside it;
+5. the existing window runs, then the existing transcript retention copies the
+   transcript beside the fixture inside the run root.
+
+A failure before step 4 appends
+`; the fixture at <path> is kept without a manifest: no manifest bytes were
+published` to the reason and fabricates nothing; a failure after it keeps the
+real manifest and whatever rows the transcript holds. Custody, exit code and
+outcome stay separate statements: the mode changes only who removes the
+directory.
+
+The child writes on stderr exactly one custody line:
+
+```text
+barge.tape.exercise/1: kept fixture <absolute path inside the run root>
+```
+
+The path is the fixture directory itself, at most 512 bytes, UTF-8, without a
+control character and without surrounding whitespace, and a path this line
+cannot carry is refused with nothing written — the refusal names the directory
+that is kept and unannounced rather than claiming a custody record. A path
+outside the root, the root itself or a non-plain relative path never becomes an
+apparent record. `manifest.json` inside the kept fixture is the exact byte
+sequence the window ran, written before any engine call. The retained-transcript
+line (`barge.tape.exercise/1: retained <path>`) is unchanged.
+
+The invoking driver must therefore set both variables in the child's
+environment, read the single custody line, require it to resolve inside its own
+run root as a real non-symlink directory, read `<kept fixture>/manifest.json` as
+a real file, treat a missing line, a missing manifest or an unresolvable path as
+a missing custody record rather than as a kept fixture, and decide removal
+itself after its own census. Barge removes nothing for it.
+
+This is a test-only fixture lifetime: it is not an admission hook, a signal, a
+deletion grant, a production contract or a policy change. No non-test code path
+names it, `effigy rust:compile:release` still compiles none of it, and every
+other fixture — the recorder's, `tape_cases`' prepared cases, the writer
+counterfactuals and `effigy rust:test`'s own — keeps removing itself on success
+and on failure. Its only covering control is `effigy rust:test:tape:custody`,
+which drives tiny owned temporary directories: ordinary cleanup versus retained
+lifetime on drop, an injected failing first setup step and panic unwinding, the
+opt-in and run-root premises, the bounded path line and the
+publication-before-window order. Those controls run no engine, `release::plan`,
+capture, image or host-volume probe, and they are setup evidence — not a native
+run, a comparison, a custody qualification or an Oxide adoption.
+
 ## Selectors
 
 Tom's 2026-11-04 decision `c6e3e9c8-0d43-458e-8fa8-6d8fd3aa2190` v2
@@ -563,6 +648,9 @@ end-to-end fixture over actual `release::plan` with explicit synthetic process
 facts, held/unknown/bounded-writer counterfactuals, and a separate real-host
 exercise. File and volume facts remain real in the positive fixture; it must
 produce the complete plan with its settled root eligible and fit the fixed caps.
+`effigy rust:test:tape:custody` runs only the retained fixture custody setup
+controls ([retained fixture custody](#retained-fixture-custody)): no engine
+window, no host-volume probe, image or native run.
 `effigy rust:test:fixture-spec` runs only the first batch's effect-free case
 specification and owned setup controls (`plan`, inventory, refusals and each
 prepared case's observed state); it does not run `release::plan` or the embedded

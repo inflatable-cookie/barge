@@ -57,6 +57,13 @@
 //! self-check outcome, never capture qualification or an eligible-root proof.
 //! Other apparatus errors still fail. `oxide test --test tape_eval` selects it.
 //!
+//! The explicit retained-custody opt-in (`BARGE_TAPE_CUSTODY` with this
+//! invocation's own `BARGE_TEST_SCRATCH_ROOT`) keeps the fixture from creation
+//! instead, announces its path once and publishes the manifest inside it before
+//! the window; the caller's guard then owns removal
+//! (`docs/knowledge/contracts/o2-tape.md`, "Retained fixture custody"). The
+//! default route is unchanged.
+//!
 //! ## Staging for the later X-S2 orchestration
 //!
 //! Build from the exact staged commit offline, default features only, pinned
