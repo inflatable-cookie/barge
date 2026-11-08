@@ -553,6 +553,155 @@ parity; a declared attempt is named and never matched. An observed attempt, a
 repeated completed row is an extra effect. The run summary reports those issues;
 it does not claim dynamic effect reconciliation.
 
+## Production statement audit
+
+The O1 pin `4af9360bd09629e970c143080ca159de8eef2562` and the planning
+base `39064bafbc14b2ba7bd876e286e9752f12583dd1` have no diff under `crates/`,
+workspace manifests, lockfile or toolchain. Source review at this branch restores
+non-test match arms and expressions at the instrumented read sites. A line-level
+O1 diff has no removed source lines after these splits; that check alone does
+not prove that newly added statements compile away or preserve behavior. A
+per-statement equivalence review and release compile remain required before
+acceptance.
+
+The O1-to-planning difference is not empty across the entire repository:
+`scripts/native/release-proof.py` changed in commits `56b067b`, `b966777` and
+`3a21036` for the native release-proof dependency guard, remount replay and R12
+fixture thresholds. It is a separate executable proof apparatus, not the
+library evaluator; there is no additional change to that script between the
+planning base and this branch. Those historical changes are not evidence for
+this tape or permission to execute a native proof.
+
+Those script deltas are executable: staging drops inherited Rust flags and
+disables automatic toolchain installation; fixture startup scrubs inherited
+Oxide, XDG and Barge variables and explicitly selects the synthetic account;
+attach marks custody before invoking `hdiutil`. R11 now saves content, marker
+and identity, validates remount-relative rebinding and rollback, and stops on
+unknown detach custody. R12 first creates a fresh private registration only
+after R11 passes. Dispatch marks dependent cases skipped, distinguishes
+unknown or unexecuted cases, retains unknown custody without repair, and adds
+pure controls for the rebind and dispatcher. These are prior proof-apparatus
+behavior changes, not non-test library statement equivalence.
+
+The current source map against that O1 pin, for reviewer inspection, is:
+
+| File | Source sites changed | Non-test basis and remaining review |
+| --- | --- | --- |
+| `area.rs` | `VolumeRoot::open_with`, `resolve_by`, `read_directory`, `read_hold_directory`, `list_names`, `scan_activity_within`; `ResolvedArea::held_identity` | Volume verification/open and resolution keep the O1 calls and returns, with test-only observations after results. In `read_directory`, the original NotFound arm and original error return are retained in `cfg(not(test))`; the test arms retain the same return and error, and other additions only record already obtained results. Its entry row binds the parent that this function's own precheck already observed, with no added call. `held_identity` is a `#[cfg(test)]` accessor returning the identity of the handle the resolution already holds; it performs no filesystem operation. `read_hold_directory` records the existing uid and metadata results. `list_names` preserves the original missing-directory return in its non-test arm and reconstructs the same return in its test arm; the completed-list observation precedes the unchanged result. `scan_activity_within` records immediately before its existing incomplete and final returns. |
+| `custody.rs` | `take_custody_by`, `decide` | The O1 `Ok(evidence)` and two `Err(Refusal::...)` match arms remain verbatim in `cfg(not(test))`; test arms record then return the same constructors. `decide` adds one test-only call before its original `Ok(CustodyEvidence { ... })`. |
+| `identity.rs` | `read`, `verify` | The original `read_child_file` result is recorded after its `?` and before the original `child_facts`. The O1 `Ok(None)` and `Err(_)` arms remain verbatim under `cfg(not(test))`; the test arms return the same unknown reasons. Duplicate UUID, missing mount and final compare retain their original order with test-only calls immediately before their existing statements. |
+| `os/absence.rs` | `prove_absence`, `prove_absence_inner` | The O1 `let proof = prove_absence_inner(...)?` remains verbatim in the non-test branch; the test branch calls it once and returns the same error. Serialization and cap checks remain in their original order, with test-only refusal records. The original proof clock expression remains in the struct; the test row reads the already stored `proved_ms`. The added regression is test-only. |
+| `os/macos.rs` | mount/volume, process and descriptor observations; `DirOps` | Mount census, lookup, boot and root checks keep the original syscalls and returns with test-only observations. `effective_uid` retains the original `geteuid` expression under `cfg(not(test))`; its test branch calls it once and records the returned uid. Process/descriptor additions record existing rows, errno values and retry identities. `path_facts`, `child_facts` and `open_directory` retain the original `last_os_error()` returns under `cfg(not(test))`; their test branches capture errno immediately and return through the original helper. `create_child_dir`, `publish_child_file`, `dir_facts`, `recheck_dir` and `read_identity` retain original non-test operations in cfg splits; test branches call each operation once. For publish the original `write_all`, file sync, `renameat`, directory sync and cleanup `unlinkat` are individually preserved in non-test branches, with corresponding single-operation test branches. Removal and rename retain original syscalls and record attempts/results around them. Directory listings and child reads record already obtained entries, handles and bytes. Five `cfg`-split `unsafe` blocks gained or moved SAFETY comments so the crate's denied `undocumented_unsafe_blocks` lint passes; comments only, no statement, flag or behavior change. This is a source map, not a compiled cfg-equivalence proof. |
+| `pool_custody.rs` | `classify`, `read_document` | The classification loop adds a test-only row before the original duplicate check. The three O1 `read_bounded` arms remain verbatim under `cfg(not(test))`; test arms record the consumed outcome then return the same value. The original `if identity(path)? != before` remains verbatim in the non-test branch; the test branch evaluates `identity(path)?` once, records it, then makes the same comparison and return. |
+| `reference.rs` | `BargeReferences::read`, `control_directory_with`, `pools_holding`, `read_registry`, `read_receipts_with`, `read_oxide_marker` | Original placement-read, removable-pool metadata match, registry read and parse matches, and both marker child-facts/read matches remain verbatim under `cfg(not(test))`. Their test counterparts perform each original call once and return the same values and errors, adding observations. `control_directory_with` records its stored inspect result. The receipt `Ok(Some(receipt))` push remains verbatim in the non-test arm; the test arm records then pushes the same receipt. Other receipt additions read the already obtained path's component and add no filesystem operation. |
+| `registry.rs` | `read_with_deadline` | The complete original `let bytes = match state::read_bounded(...)` and `let document = serde_json::from_slice(...).map_err(...)?` statements remain verbatim in `cfg(not(test))`. Test branches use the same read and parser once, record their consumed outcomes, and return the same named errors. Validation follows both branches unchanged. |
+| `state.rs` | `read_bounded_inner`, `publish_atomic_with`, `write_and_publish`, `sync_directory`, `now_ms`, `StateLock`, `wait_for_lock`, `read_intents_with_deadline` | The O1 NotFound arms of bounded read, shared lock and intent directory read remain verbatim in non-test branches; test arms return the same absent values after recording. Other read and lock additions observe existing values or error branches. Publication retains the original create, cleanup unlink, write, file sync, rename and directory-sync statements in non-test branches; test branches execute each original operation once through the recorder and retain its error handling. `now_ms` retains its original expression under `cfg(not(test))`; the test branch evaluates it once and returns the recorded value. Intent enumeration uses the existing entry name and preserves its sorted result. |
+| `release.rs` | `decide_root` (R2 context link) | Caller clock observations come from `state::now_ms`; release's original calls remain in place. After the original `dirs.open_path(&root.path)` result, one `#[cfg(test)]` block records the opened identity linked to the area handle the resolution already holds. It adds no call, no lookup and no return-value change. |
+| `capture_wire.rs` | new test-only shared wire module | The copied Oxide 284 parser, completeness rules, vector self-check and cap checks. Declared only as a `#[path]` child module of `tape.rs`; `lib.rs` does not name it, so no production build compiles it. Its vector/example fixtures live under `crates/barge/tests/fixtures/`, which no production target reads. |
+| `lib.rs`, `Cargo.toml`, `tests/tape_eval.rs`, `tape.rs`, `tape_harness.rs` | test-only modules, harness target and recorder | The O1 library declarations remain intact; `lib.rs` adds only `cfg(test)` crate-private tape and harness modules. The Cargo addition is a `[[test]]` target, with no dependency or feature change. `tests/tape_eval.rs` includes the existing library source as test-target modules; the two new recorder modules are test-only. Release compile-away remains unverified. |
+| `effect.rs`, `guard.rs`, `undo_capture.rs` | source-link shadows for the included test target | These are Git symlinks respectively to `space/effect.rs`, `space/guard.rs` and `cache/undo_capture.rs`. The original production child-module declarations remain in their original parents; `lib.rs` adds no top-level declarations for these shadows. They resolve the same existing bytes for the included test-target parent modules. Their actual target/build reachability remains unverified until compilation. |
+
+This map identifies the changes for review; it is not a completed proof that
+every newly added item compiles away. In particular, a textual diff cannot
+prove cfg reachability. The mechanical evidence is the covering
+`effigy rust:compile:release` run recorded in the delivery: a default-feature
+production build names none of these modules or statements, so `cfg(test)`-only
+reachability is compiled out. Apart from those SAFETY comments, no non-test byte
+changed.
+
+The named write helpers are outside the direct plan body: `release::plan` calls
+`plan_observed` (release.rs:358, 387), while effect execution starts at
+`release::execute` (release.rs:1854). `identity.rs:122,284,318` and
+`area.rs:1297,1745,2259,2261,2361` locate random and sync operations in
+identity creation and area mutation paths, rather than by themselves proving
+plan reachability. `set_dir_mode` and `create_child_symlink` are DirOps mutation
+implementations in `os/macos.rs:4362,4403`. Their absence from the concrete
+plan call path follows from the trace below, not merely from their names.
+
+The observed lock branch is narrower than the exclusive mutation branch:
+`release::read_registry` calls `LockSet::observe_registry`, and
+`plan_observed`/`decide_root` call `observe_volume`, `observe_root` or
+`observe_unit` (release.rs:747, 514, 800). Those methods lead to
+`StateLock::shared_if_present` (state.rs:970, 1182–1225), whose `OpenOptions`
+has `read(true)` and no create/write flags; an absent lock returns `None`.
+That does not reach `StateLock::exclusive`'s create/open or the publication
+helpers. `release::plan_observed` calls `area::show`, `resolve_by`,
+`list_names`, `BargeReferences::read`, `OxideSnapshot::read_within`,
+`pending_intents` and `decide_root` (release.rs:404–550). `area::show` reads
+declarations (area.rs:2867, 3167), while `resolve_by` uses
+`walk_folder_chain` (area.rs:1041, 1509); neither call selects a creation
+entry point. Their descendants and the concrete platform callbacks are traced
+below; the tape records a failed write as possibly partial rather than asserting
+that it changed nothing.
+The placement census branch goes from `BargeReferences::read` to
+`cache::read_placements` (reference.rs:277; cache.rs:676), which enumerates
+via `area::read_directory`, reads bounded placement documents, validates and
+returns the set; it does not call the cache adoption or publication methods.
+The Oxide snapshot branch (reference.rs:628) calls `control_directory`,
+`read_registry`, `read_receipts`, `pools_holding` and `PoolCustody::read`;
+the latter reads pool records through `read_pool` and `read_document`
+(pool_custody.rs:129, 192, 394). This branch is observational and does not call
+the state publication helpers. Root custody goes through
+`custody::take_custody_by` → `decide` (custody.rs:403, 644), including hold,
+marker, identity and process-observer checks. The platform leaves are traced
+below; refusals return from these read paths without a cleanup write.
+
+Within `custody::decide` (custody.rs:644), the state operations are hold and
+registry reads. It opens the area and parent, obtains child facts and a
+directory handle, reads the marker, asks for the current pid/start and scans
+descriptors; it does not call a `DirOps` create, publish, rename, unlink or
+sync operation. Its early returns do not run cleanup writes. The area folder
+walk is `walk_folder_chain` → `walk_folder`, using child facts and directory
+opens (area.rs:1041); it reports the remainder when absent, it does not create
+it. `StatePaths::resolve` also constructs paths without initialization
+(state.rs, `StatePaths::resolve`); its separate `initialize` method is not
+called from the harness or plan. At the macOS `DirOps` boundary, `open_path`
+opens a directory; `path_facts` uses `lstat`; `open_child_dir` uses `openat`
+with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW`; `child_facts` uses no-follow
+`fstatat`; `read_child_file` uses read-only no-follow `openat` and reads; and
+`list_children`/`list_names` duplicate the descriptor and use `readdir`
+(os/macos.rs:3647–4263). `dir_facts` and `recheck_dir` only query the open
+descriptor (os/macos.rs:4342, 4383). The mutation methods in that implementation
+are separate: create/publish/remove/rename (os/macos.rs:3803, 3831, 4264,
+4296), plus `set_dir_mode` and `create_child_symlink` (os/macos.rs:4362, 4403).
+The concrete harness supplies `MacOs` for every platform trait, rather than a
+caller-provided mutation callback. Its descriptor scan starts with
+`process_table` and `scan_processes` (os/macos.rs:958, 1015, 2817); the
+production call supplies an empty fault list. Its process table and individual
+identity `sysctl` calls pass a null new-value pointer and zero new-value size,
+and descriptor enumeration uses `proc_pidinfo`/`proc_pidfdinfo` and
+`csops(CS_OPS_STATUS)`. Retry paths re-observe or sleep; they do not write a
+fixture. The process-table allocation before the cap remains separately
+unbounded and is not qualified by this source review. Volume identification
+uses read-only directory opens, `getfsstat`, `fstatfs`, `fstat` and volume UUID
+attribute reads (os/macos.rs:176–415, 445–505, 4480–4680). The volume-flush
+fork and sync path (os/macos.rs:552 onward) is a separate operation, not called
+by those identification methods or `release::plan`.
+
+For this concrete `release::plan` window, the reviewed branches therefore do
+not call a data-mutating operation: its effect set is empty if that source
+trace holds at execution. The excluded publication/effect entry points still
+record their attempts and outcomes when exercised by tests; an attempted write
+is never removed to make a transcript empty. This is a static source finding,
+not a runtime receipt or proof that the fixed tape captures every read.
+
+The separate state publication path is `publish_atomic` →
+`publish_atomic_with` → `write_and_publish` (state.rs:654, 660, 763). It
+records temporary-file create, `write_all`, and rename attempts with their
+actual outcomes; a failed save retains possible partial effects. Between the
+save and rename, the test branch calls `file.sync_all()` once and records its
+returned result at `state::write_and_publish`, without a path stat or inferred
+descriptor identity. The original non-test statement remains verbatim. A
+successful rename remains an effect even if `sync_directory` subsequently
+fails (state.rs:750, 843); the directory sync result is recorded separately.
+Before rename, an error triggers a recorded best-effort temporary-file unlink;
+its failure does not replace the original publication error. `StateLock::exclusive`
+(state.rs:946) records the create/open attempt and outcome; the concrete plan
+uses only shared observation locks. The corresponding descriptor-relative
+publish path records temporary create, save, file sync, rename, directory sync
+and any cleanup unlink in `MacOs::publish_child_file` (os/macos.rs:3831–3963).
+These remain source findings and do not establish native qualification.
+
 Effect rows carry the call-site file and line separately from the closed
 effect kind. A failed operation records its actual error in the recorder
 document and `partial_effect_possible`; in particular, `write_all` does not
@@ -584,7 +733,12 @@ vector files are adapted from Oxide 284, merged at
 `e7018741921f795bc461c96b23a552ddf2d1e1752ff78e70b650104749380d76`
 (48 files: eight valid transcripts, eighteen parser refusals, twelve
 parser-positive completeness failures, three valid and seven invalid
-manifests). The two canonical manifest examples are copied too:
+manifests). The same commit's `docs/knowledge/contracts/oxide-capture-manifest.v2.schema.json`
+hashes to
+`26ecc08285bcb5ad40bc6b46b4804b22f52d859db22ae5d932c657963811f830`; it is the
+declared shape the copied parser enforces, and it is bound here by that digest
+rather than copied into this crate, because no target reads the JSON schema
+itself. The two canonical manifest examples are copied too:
 `capture-examples/v2/manifest-example.json` hashes to
 `8025455c4f84bb7640ba2b802bee48282ca09a7148ccc595a627512ed0c42f33` and
 `manifest-effects-all-kinds.json` to

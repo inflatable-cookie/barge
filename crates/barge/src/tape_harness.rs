@@ -688,7 +688,7 @@ fn publish_capture(
                 path,
                 &crate::tape::apparatus_document(&case, digest.as_deref(), &reason),
             )?;
-            let recorder_path = path.with_extension("recorder.json");
+            let recorder_path = recorder_sidecar(path);
             std::fs::write(&recorder_path, recorded)
                 .map_err(|write| format!("the recorder document cannot be retained: {write}"))?;
             return Err(reason);
@@ -700,6 +700,19 @@ fn publish_capture(
     let read_rows = document["reads"].as_array().map_or(0, Vec::len);
     let issues = crate::tape::assess_shared(&wire, manifest)?.issues;
     Ok((read_rows, issues))
+}
+
+/// The recorder document's sidecar path: the transcript file's own name with
+/// `.recorder.json` appended, so `barge.json` keeps its recorder evidence at
+/// `barge.json.recorder.json`. A replacement extension would collide with a
+/// real sibling and would not name the transcript it belongs to.
+fn recorder_sidecar(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".recorder.json");
+    path.with_file_name(name)
 }
 
 fn recorder_schema(document: &str) -> Option<String> {
@@ -1318,6 +1331,54 @@ mod tests {
         assert!(
             crate::tape::validate_shared_transcript(&bytes).is_err(),
             "an apparatus diagnostic is never a conforming transcript"
+        );
+    }
+
+    #[test]
+    fn a_failed_conversion_keeps_the_recorder_document_at_its_sidecar_name() {
+        let fixture = crate::testkit::TempDir::new("tape-recorder-sidecar");
+        let transcript_out = fixture.path().join("transcripts").join("barge.json");
+        // A completed recorder document with no result object is not a capture:
+        // the shared wire requires one, so the adapter must refuse it.
+        let recorded = serde_json::json!({
+            "schema": crate::tape::RECORDER_SCHEMA,
+            "engine": "barge",
+            "case": "SIDECAR",
+            "manifest_sha256": "0".repeat(64),
+            "entrypoint": {"symbol": "barge::release::plan", "source_binding": "control"},
+            "window_elapsed_ns": 1,
+            "outcome": {"status": "completed", "exit_code": 0},
+            "observation_complete": false,
+            "effects": [], "reads": [], "clocks": [], "recorded_holders": [],
+            "fixture_capture": null, "notes": [],
+            "caps": {"read_rows": 0, "document_bytes": 0, "occurrences_per_key": 64,
+                "process_rows": 0, "dropped_rows": 0}
+        })
+        .to_string();
+        let error = publish_capture(&transcript_out, &recorded, b"{}")
+            .expect_err("a completed document without a result cannot convert");
+        assert!(error.contains("could not be converted"), "{error}");
+        let transcript: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&transcript_out).expect("apparatus document"))
+                .expect("JSON");
+        assert_eq!(transcript["schema"], crate::tape::APPARATUS_SCHEMA);
+        assert_eq!(transcript["case"], "SIDECAR");
+        let sidecar = fixture
+            .path()
+            .join("transcripts")
+            .join("barge.json.recorder.json");
+        let retained: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).expect("the sidecar is written"))
+                .expect("JSON");
+        assert_eq!(retained["schema"], crate::tape::RECORDER_SCHEMA);
+        assert_eq!(retained["case"], "SIDECAR");
+        assert!(
+            !fixture
+                .path()
+                .join("transcripts")
+                .join("barge.recorder.json")
+                .exists(),
+            "the sidecar never replaces the transcript's extension"
         );
     }
 
