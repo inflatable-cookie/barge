@@ -66,10 +66,13 @@ does not prove.
   and marker documents of the cases it names (the control, registry-shape,
   references, receipts/markers and identity-nonce/replaced cases) through the
   real `OxideSnapshot` and `read_oxide_marker` readers and asserts that reading,
-  and the refusal control. The fence, declaration, legacy, absence and volume
-  documents are covered by setup controls only, and no case's documents are read
-  by `release::plan`. They are setup and reader controls, not decision, volume,
-  engine or native proof.
+  and the refusal control. Beyond those readers, the declaration controls read
+  the declaration through the real `area::show`, and the volume control reads
+  `VOL-DUP-REGISTRY`'s document through the real `registry::read` and asserts
+  its refusal. The legacy operator list and the absence chains have no reader
+  call in these controls, so they are covered by setup controls only; no case's
+  documents are read by `release::plan`. They are setup and reader controls, not
+  decision, volume, engine or native proof.
 - `crates/barge/src/tape_harness.rs`'s tests: the embedded end-to-end exercise
   (one exclusively owned directory fixture on a real selected volume, the
   actual `release::plan`, one completed window over a settled root with a
