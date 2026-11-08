@@ -10,15 +10,18 @@
 //!
 //! ## Transcript
 //!
-//! [`finish`] serializes the window as one versioned `oxide.capture.transcript/1`
-//! document, always written, including when the planner refused. It carries the
-//! engine, the case and the manifest digest it is bound to, the entrypoint
-//! identity, the engine's own result or refusal, the effect rows (empty for the
-//! read-only plan, which is the STATIC effect set), the read rows and the clock
-//! rows. Identity fields contain only available observations. Rows without
-//! audited identity binding remain unproven, and the window remains incomplete. An outcome is a bytes digest, an
-//! explicit absent, a listed count, or a refusal class — never a defaulted
-//! verdict.
+//! [`finish`] serializes the window as the recorder's own
+//! `barge.capture.recorder/1` diagnostic document, always written, including
+//! when the planner refused: the caps, the per-row provenance flag, the
+//! fixture capture, the notes and the engine's own result or refusal.
+//! [`shared_transcript`] then converts it to the reviewed
+//! `oxide.capture.transcript/2` capture, and [`assess_shared`] judges that
+//! transcript with the copied shared completeness rules. Identity fields
+//! contain only available observations. Rows without audited identity binding
+//! remain unproven, and the window remains incomplete. An outcome is a bytes
+//! digest, an explicit absent, a listed count, or a refusal class — never a
+//! defaulted verdict. An apparatus refusal or a fallback is the distinct
+//! `oxide.capture.apparatus/2` diagnostic, never a capture.
 //!
 //! ## Caps (fixed by the accepted capture contract)
 //!
@@ -69,6 +72,7 @@ use std::collections::HashMap;
 use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -77,10 +81,24 @@ use crate::digest::sha256_hex;
 #[path = "capture_wire.rs"]
 mod capture_wire;
 
-/// The transcript schema this module writes.
-pub(crate) const TRANSCRIPT_SCHEMA: &str = "oxide.capture.transcript/1";
+/// The reviewed shared transcript schema the adapter emits.
+pub(crate) const TRANSCRIPT_SCHEMA: &str = capture_wire::TRANSCRIPT_SCHEMA;
+/// The reviewed shared manifest schema the harness reads and binds.
+pub(crate) const MANIFEST_SCHEMA: &str = capture_wire::MANIFEST_SCHEMA;
+/// The recorder's own diagnostic document. It carries caps, provenance flags,
+/// the fixture capture and the completeness report; it is not a capture schema
+/// and is never proof input.
+pub(crate) const RECORDER_SCHEMA: &str = "barge.capture.recorder/1";
+/// A distinct apparatus diagnostic for a refusal before the engine ran or a
+/// serialization fallback. The transcript parser refuses it, so it can never be
+/// read as a conforming capture.
+pub(crate) const APPARATUS_SCHEMA: &str = "oxide.capture.apparatus/2";
 /// The engine name this crate's window writes.
 pub(crate) const ENGINE: &str = "barge";
+/// The fixture-entry cap on each side of the fixture capture.
+pub(crate) const CAP_FIXTURE_ENTRIES: usize = 4096;
+/// The bound on bytes hashed across one fixture capture.
+const CAP_FIXTURE_BYTES: u64 = 32 * 1024 * 1024;
 /// The transcript's read-row cap.
 pub(crate) const CAP_READ_ROWS: usize = 8192;
 /// The transcript's document size cap.
@@ -133,6 +151,11 @@ pub(crate) struct Identity {
     volume_uuid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mount: Option<String>,
+    // The device a volume was observed as (a device path). This recorder does
+    // not observe it today; the shared wire requires the key, so it is carried
+    // explicitly as absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume_device: Option<String>,
 }
 
 impl Identity {
@@ -154,6 +177,7 @@ impl Identity {
             fd: None,
             volume_uuid: None,
             mount: None,
+            volume_device: None,
         }
     }
 
@@ -220,7 +244,8 @@ impl Identity {
     }
 
     /// A volume identity observed at a path: the path and its device, the
-    /// UUID, and the kernel's mount point.
+    /// UUID, and the kernel's mount point. The device number was observed at
+    /// this site, so the own identity is `extracted`.
     pub(crate) fn volume_at(
         path: &Path,
         device: u64,
@@ -232,6 +257,7 @@ impl Identity {
             device: Some(device),
             volume_uuid: volume_uuid.map(str::to_owned),
             mount: mount.and_then(Path::to_str).map(str::to_owned),
+            own_source: Provenance::Extracted,
             ..Self::none()
         }
     }
@@ -328,39 +354,6 @@ pub(crate) struct ReadRow {
     occurrence: u32,
 }
 
-/// Semantic obligation independent of the still-provisional wire schema.
-/// Only Barge obligations are passed here by a future schema adapter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Obligation {
-    pub(crate) site: String,
-    pub(crate) identity: Identity,
-    pub(crate) parent_required: bool,
-}
-
-/// Return missing obligations by index. An unproven or refused row cannot
-/// satisfy a key. This alone does not reconcile extra reads, dynamic facts,
-/// effects, cap exhaustion, or the not-yet-approved manifest wire schema.
-pub(crate) fn missing_obligations(obligations: &[Obligation], rows: &[ReadRow]) -> Vec<usize> {
-    obligations
-        .iter()
-        .enumerate()
-        .filter_map(|(index, obligation)| {
-            let duplicate = obligations[..index].contains(obligation);
-            // K1's lifetime premise is not yet qualified. Even a live-handle
-            // row cannot discharge a mandatory parent until that proof exists.
-            let matched = !duplicate
-                && !obligation.parent_required
-                && rows.iter().any(|row| {
-                    row.site == obligation.site
-                        && row.identity == obligation.identity
-                        && row.observation_proven
-                        && !matches!(&row.outcome, Outcome::Refused { .. })
-                });
-            (!matched).then_some(index)
-        })
-        .collect()
-}
-
 /// One observed or attempted effect. The plan's own window records none; a
 /// non-empty set is the honest record of an attempted write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -369,7 +362,8 @@ pub(crate) struct EffectRow {
     site: String,
     path: Option<String>,
     // Retain the exact path only for matching the result to its attempt. The
-    // provisional wire representation still refuses to invent UTF-8 text.
+    // shared wire still refuses to invent UTF-8 text: an unrepresentable path
+    // becomes a descriptor effect with no path and its observed result.
     #[serde(skip)]
     match_path: PathBuf,
     parent_device: Option<u64>,
@@ -441,89 +435,114 @@ pub(crate) struct EngineOutcome {
     pub(crate) engine_truncated: bool,
 }
 
-/// The transcript document. Field order is the serialization order.
+/// One recorded pool or lock holder, with the kernel facts it actually
+/// supplied. A holder whose kernel start or uid was not observed keeps an
+/// explicit `null`; completeness then reports the lifetime as unproven.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RecordedHolder {
+    site: String,
+    record_id: u64,
+    pid: u32,
+    recorded_start_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kernel_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uid: Option<u32>,
+    epoch: u64,
+}
+
+/// One fixture-tree entry, as the apparatus observed it before or after the
+/// window. The wire names are the shared schema's `device` and `inode`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FixtureEntry {
+    rel: String,
+    kind: &'static str,
+    size: u64,
+    device: u64,
+    inode: u64,
+    parent_device: Option<u64>,
+    parent_inode: Option<u64>,
+    mode: u32,
+    bytes_sha256: Option<String>,
+}
+
+/// One window's bounded fixture capture: the tree before the engine ran, after
+/// it finished, and the net change between them. A fixture diff is an observed
+/// net change whose writer result was not observed, so every diff effect is
+/// `unknown` at epoch zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FixtureCapture {
+    root: String,
+    truncated: bool,
+    pre: Vec<FixtureEntry>,
+    post: Vec<FixtureEntry>,
+}
+
+/// The recorder's own document. Field order is the serialization order. This
+/// document is a diagnostic, not a capture schema: it carries the caps, the
+/// per-row provenance flag and the fixture capture that the shared wire has no
+/// field for, and it is never proof input.
 #[derive(Debug, Serialize)]
-pub(crate) struct Transcript<'a> {
+struct RecorderDocument<'a> {
     schema: &'static str,
     engine: &'static str,
     case: &'a str,
     manifest_sha256: &'a str,
     entrypoint: Entrypoint<'a>,
+    window_elapsed_ns: u64,
     outcome: &'a EngineOutcome,
-    /// This provisional recorder has not established complete source coverage.
+    /// This recorder has not established complete source coverage.
     observation_complete: bool,
     /// The engine's own result in its own document, when it completed.
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<&'a serde_json::Value>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    result_omitted: bool,
-    obligations: ObligationReport,
-    effect_check: EffectReport,
     effects: &'a [EffectRow],
     reads: &'a [ReadRow],
     clocks: &'a [ClockRow],
+    recorded_holders: &'a [RecordedHolder],
+    fixture_capture: Option<serde_json::Value>,
+    notes: Vec<String>,
     caps: Caps,
 }
 
-/// The entrypoint identity the transcript names.
+/// The entrypoint identity the recorder names.
 #[derive(Debug, Serialize)]
 struct Entrypoint<'a> {
     symbol: &'static str,
     source_binding: &'a str,
 }
 
-/// Provisional diagnostics only: this is never an assertion of parity or
-/// complete reconciliation, even if no missing index is listed.
-#[derive(Debug, Serialize)]
-struct ObligationReport {
-    status: &'static str,
-    input_available: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    input_unavailable_reason: Option<&'static str>,
-    unmapped: usize,
-    unmapped_indices: Vec<usize>,
-    missing: Vec<usize>,
-    extra_reads_unchecked: bool,
-    effects_unchecked: bool,
-}
-
-/// Only an explicitly empty shared expected-effect set has an unambiguous
-/// meaning for both engines. A nonempty proposal has no per-engine field.
-#[derive(Debug, Serialize)]
-struct EffectReport {
-    status: &'static str,
-    input: &'static str,
-    unexpected_attempts: Vec<usize>,
-    unexpected_attempts_omitted: usize,
-}
-
 /// The per-thread recorder state. The plan is single-threaded, so one
 /// thread-local window holds every leaf the plan reaches; a lib test that
 /// never opens a window records nothing.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Tape {
     config: Option<WindowConfig>,
+    started: Option<Instant>,
+    fixture_root: Option<PathBuf>,
+    fixture_pre: Vec<FixtureEntry>,
+    fixture_truncated: bool,
     reads: Vec<ReadRow>,
     clocks: Vec<ClockRow>,
     effects: Vec<EffectRow>,
+    holders: Vec<RecordedHolder>,
     occurrences: HashMap<(&'static str, &'static str, Identity), u32>,
     process_rows: usize,
+    holder_rows: usize,
     next_epoch: u64,
     read_rows_exhausted: bool,
     occurrences_exhausted: bool,
     process_rows_exhausted: bool,
+    holders_exhausted: bool,
     dropped_rows: u64,
-    obligations: Option<Vec<Obligation>>,
-    obligation_input_error: Option<&'static str>,
-    obligation_indices: Vec<usize>,
-    unmapped_obligations: usize,
-    unmapped_indices: Vec<usize>,
-    expected_effects_input: &'static str,
+    manifest: Option<serde_json::Value>,
+    unrepresentable_effect_noted: bool,
+    notes: Vec<String>,
 }
 
 impl Tape {
     /// Drop every row and counter but leave the (already taken) window gone, so
-    /// the next window starts from epoch zero and no rows.
+    /// the next window starts from epoch one and no rows.
     fn reset_without_window(&mut self) {
         *self = Self::empty();
     }
@@ -532,169 +551,60 @@ impl Tape {
     fn empty() -> Self {
         Self {
             config: None,
+            started: None,
+            fixture_root: None,
+            fixture_pre: Vec::new(),
+            fixture_truncated: false,
             reads: Vec::new(),
             clocks: Vec::new(),
             effects: Vec::new(),
+            holders: Vec::new(),
             occurrences: HashMap::new(),
             process_rows: 0,
-            next_epoch: 0,
+            holder_rows: 0,
+            next_epoch: 1,
             read_rows_exhausted: false,
             occurrences_exhausted: false,
             process_rows_exhausted: false,
+            holders_exhausted: false,
             dropped_rows: 0,
-            obligations: None,
-            obligation_input_error: None,
-            obligation_indices: Vec::new(),
-            unmapped_obligations: 0,
-            unmapped_indices: Vec::new(),
-            expected_effects_input: "unavailable",
+            manifest: None,
+            unrepresentable_effect_noted: false,
+            notes: Vec::new(),
+        }
+    }
+
+    fn push_note(&mut self, note: String) {
+        if self.notes.len() < CAP_READ_ROWS {
+            self.notes.push(note);
         }
     }
 }
 
-/// Prepare diagnostics without changing the evaluator request. Nonempty
-/// sets are not assigned to Barge while the shared proposal lacks an engine.
-pub(crate) fn attach_effect_expectations(manifest: &[u8]) {
-    let input = match serde_json::from_slice::<serde_json::Value>(manifest) {
-        Ok(document) => match document
-            .get("expected_effects")
-            .and_then(serde_json::Value::as_array)
-        {
-            Some(effects) if effects.is_empty() => "empty",
-            Some(effects) if effects.len() <= 8192 => "nonempty_unassigned",
-            Some(_) => "cap_exceeded",
-            None => "unavailable",
-        },
-        Err(_) => "unavailable",
-    };
+/// Attach the manifest the window is run under. Completeness is then judged by
+/// the shared parser and reconciler rules over the emitted transcript, never by
+/// a second projection here.
+pub(crate) fn attach_manifest(manifest: &[u8]) {
+    let document = serde_json::from_slice::<serde_json::Value>(manifest).ok();
     TAPE.with(|tape| {
         let mut tape = tape.borrow_mut();
         if tape.config.is_some() {
-            tape.expected_effects_input = input;
+            tape.manifest = document;
         }
     });
 }
 
-/// Attach a provisional manifest projection. Unsupported identity fields are
-/// retained as unmapped rather than being dropped to manufacture a match.
-pub(crate) fn attach_obligations(manifest: &[u8]) {
-    fn unavailable(reason: &'static str) {
-        TAPE.with(|tape| {
-            let mut tape = tape.borrow_mut();
-            if tape.config.is_some() {
-                tape.obligation_input_error = Some(reason);
-            }
-        });
-    }
-    let document: serde_json::Value = match serde_json::from_slice(manifest) {
-        Ok(document) => document,
-        Err(_) => {
-            unavailable("invalid_manifest");
-            return;
-        }
-    };
-    let Some(rows) = document
-        .get("mandatory_observations")
-        .and_then(serde_json::Value::as_array)
-    else {
-        unavailable("mandatory_observations_missing_or_invalid");
-        return;
-    };
-    if rows.len() > 256 {
-        unavailable("mandatory_observations_cap");
-        return;
-    }
-    let mut obligations = Vec::new();
-    let mut indices = Vec::new();
-    let mut unmapped = 0_usize;
-    let mut unmapped_indices = Vec::new();
-    for (index, row) in rows.iter().enumerate() {
-        let Some(object) = row.as_object() else {
-            unmapped += 1;
-            unmapped_indices.push(index);
-            continue;
-        };
-        if object.keys().any(|key| {
-            !matches!(
-                key.as_str(),
-                "engine" | "site" | "identity" | "parent_required"
-            )
-        }) {
-            unmapped += 1;
-            unmapped_indices.push(index);
-            continue;
-        }
-        match object.get("engine").and_then(serde_json::Value::as_str) {
-            Some("oxide") => continue,
-            Some("barge") => {}
-            _ => {
-                unmapped += 1;
-                unmapped_indices.push(index);
-                continue;
-            }
-        }
-        let Some(site) = object
-            .get("site")
-            .and_then(serde_json::Value::as_str)
-            .filter(|site| !site.is_empty())
-        else {
-            unmapped += 1;
-            unmapped_indices.push(index);
-            continue;
-        };
-        let Some(parent_required) = object
-            .get("parent_required")
-            .and_then(serde_json::Value::as_bool)
-        else {
-            unmapped += 1;
-            unmapped_indices.push(index);
-            continue;
-        };
-        let identity = object
-            .get("identity")
-            .cloned()
-            .and_then(|identity| serde_json::from_value::<Identity>(identity).ok());
-        match identity {
-            Some(identity)
-                if (identity.fd.is_none_or(|fd| fd >= 0))
-                    && ((identity
-                        .path
-                        .as_deref()
-                        .is_some_and(|path| !path.is_empty())
-                        && identity.parent_device.is_some()
-                        && identity.parent_inode.is_some()
-                        && identity.device.is_some()
-                        && identity.inode.is_some())
-                        || (identity
-                            .component
-                            .as_deref()
-                            .is_some_and(|component| !component.is_empty())
-                            && identity.parent_device.is_some()
-                            && identity.parent_inode.is_some())
-                        || (identity.pid.is_some_and(|pid| pid != 0)
-                            && identity.start.is_some_and(|start| start != 0)
-                            && identity.uid.is_some())) =>
-            {
-                obligations.push(Obligation {
-                    site: site.to_owned(),
-                    identity,
-                    parent_required,
-                });
-                indices.push(index);
-            }
-            _ => {
-                unmapped += 1;
-                unmapped_indices.push(index);
-            }
-        }
-    }
+/// Capture the fixture tree before the engine runs. The capture is apparatus,
+/// not an observation fed to the engine: it reads the fixture root the caller
+/// already owns, bounded to 4096 entries and 32 MiB of hashed bytes.
+pub(crate) fn begin_fixture(root: &Path) {
+    let (entries, truncated) = capture_fixture(root);
     TAPE.with(|tape| {
         let mut tape = tape.borrow_mut();
         if tape.config.is_some() {
-            tape.obligations = Some(obligations);
-            tape.obligation_indices = indices;
-            tape.unmapped_obligations = unmapped;
-            tape.unmapped_indices = unmapped_indices;
+            tape.fixture_truncated = truncated;
+            tape.fixture_pre = entries;
+            tape.fixture_root = Some(root.to_path_buf());
         }
     });
 }
@@ -734,89 +644,153 @@ pub(crate) fn begin_window(config: WindowConfig) -> Result<(), String> {
             return Err("a tape window is already open on this thread".to_owned());
         }
         PROCESS_CONTEXT.with(|slot| *slot.borrow_mut() = None);
+        let mut notes = vec![format!(
+            "source binding: {}",
+            config.source_binding
+        )];
+        notes.push(
+            "observation coverage, K1 parent lifetime and process facts at the operation remain unproven"
+                .to_owned(),
+        );
         tape.config = Some(config);
+        tape.started = Some(Instant::now());
+        tape.notes = notes;
         Ok(())
     })
 }
 
-/// Close the window and serialize the transcript. The tape resets, so a later
-/// window starts from epoch zero and no rows.
+/// Close the window and serialize the recorder document. The tape resets, so a
+/// later window starts from epoch one and no rows.
 pub(crate) fn finish(
     outcome: EngineOutcome,
     result: Option<&serde_json::Value>,
 ) -> Result<String, String> {
-    finish_inner(outcome, result, false)
+    finish_inner(outcome, result)
 }
 
-/// The evaluator returned a report but the apparatus could not serialize it.
-/// Preserve its real status, exit code and observed rows; do not invent a report.
-pub(crate) fn finish_omitted(outcome: EngineOutcome) -> Result<String, String> {
-    finish_inner(outcome, None, true)
+/// Close the window as an apparatus diagnostic: the engine's own report or
+/// refusal could not be carried into a conforming transcript, so the capture is
+/// not a capture. The reason states the real engine status and exit code.
+pub(crate) fn finish_apparatus(reason: &str) -> Result<String, String> {
+    TAPE.with(|tape| {
+        let mut tape = tape.borrow_mut();
+        let config = tape
+            .config
+            .take()
+            .ok_or_else(|| "no tape window is open on this thread".to_owned())?;
+        tape.reset_without_window();
+        Ok(apparatus_document(
+            &config.case,
+            Some(config.manifest_sha256.as_str()),
+            reason,
+        ))
+    })
 }
 
-/// Translate this run's recorder output into the reviewed Oxide wire shape.
-/// Historical packets are never passed through this adapter.
-pub(crate) fn shared_transcript(transcript: &str) -> Result<String, String> {
-    let old: serde_json::Value = serde_json::from_str(transcript).map_err(|e| e.to_string())?;
-    let rows = old["reads"].as_array().ok_or("missing read rows")?;
-    let mut reads = Vec::with_capacity(rows.len());
-    for row in rows {
-        let outcome = &row["outcome"];
-        let wire_outcome = if let Some(digest) = outcome.pointer("/digest/bytes_sha256") {
-            serde_json::json!({"type": "digest", "digest": digest})
-        } else if outcome == "absent" {
-            serde_json::json!({"type": "absent"})
-        } else if let Some(reason) = outcome.pointer("/refused/class") {
-            serde_json::json!({"type": "refusal", "reason": reason})
-        } else {
-            serde_json::json!({"type": "facts", "facts": outcome.to_string()})
-        };
-        reads.push(serde_json::json!({
-            "kind": row["kind"], "site": row["site"], "identity": row["identity"],
-            "outcome": wire_outcome, "cap": row["cap"].as_u64().unwrap_or(0),
-            "epoch": row["epoch"], "occurrence": row["occurrence"],
-        }));
-    }
-    let effects = old["effects"].as_array().ok_or("missing effects")?;
-    let mut wire_effects = Vec::with_capacity(effects.len());
-    for effect in effects {
-        let kind = effect["kind"].as_str().ok_or("missing effect kind")?;
-        let path = effect["path"].as_str().ok_or("non-UTF8 effect path")?;
-        if !matches!(
-            kind,
-            "create" | "save" | "fence" | "reconcile" | "lock-create" | "rename" | "unlink"
-        ) {
-            return Err(format!("effect kind {kind} has no reviewed wire mapping"));
+/// A distinct apparatus diagnostic. It is never a conforming capture: the
+/// transcript parser refuses its schema by name. The reason is bounded, and the
+/// full reason's digest is always recorded beside it, so untrusted diagnostic
+/// text can never overflow the document.
+pub(crate) fn apparatus_document(
+    case: &str,
+    manifest_sha256: Option<&str>,
+    reason: &str,
+) -> String {
+    const MAX_REASON: usize = 16 * 1024;
+    let bounded = if reason.len() > MAX_REASON {
+        let mut cut = MAX_REASON;
+        while cut > 0 && !reason.is_char_boundary(cut) {
+            cut -= 1;
         }
-        wire_effects.push(serde_json::json!({
-            "kind": kind, "site": effect["site"], "attempted": true,
-            "path": path, "epoch": effect["epoch"],
-        }));
+        format!("{} [truncated]", &reason[..cut])
+    } else {
+        reason.to_owned()
+    };
+    let document = serde_json::json!({
+        "schema": APPARATUS_SCHEMA,
+        "version": APPARATUS_SCHEMA,
+        "case": case,
+        "manifest_sha256": manifest_sha256,
+        "reason": bounded,
+        "reason_sha256": sha256_hex(reason.as_bytes()),
+    });
+    serde_json::to_string(&document).unwrap_or_else(|_| {
+        format!(
+            r#"{{"schema":"{APPARATUS_SCHEMA}","version":"{APPARATUS_SCHEMA}","case":"","manifest_sha256":null,"reason":"apparatus diagnostic could not be serialized","reason_sha256":null}}"#
+        )
+    })
+}
+
+/// Translate this run's recorder document into the reviewed `oxide.capture.transcript/2`
+/// shape. Every available row fact is preserved, absence is an explicit null,
+/// and the shared parser must accept the result. Historical `/1` packets are
+/// never passed through this adapter and are never upgraded.
+pub(crate) fn shared_transcript(transcript: &str) -> Result<String, String> {
+    let recorder: serde_json::Value =
+        serde_json::from_str(transcript).map_err(|error| error.to_string())?;
+    if recorder["schema"] == APPARATUS_SCHEMA {
+        return Err("an apparatus diagnostic is not a transcript".to_owned());
     }
-    let caps = &old["caps"];
+    let case = recorder["case"]
+        .as_str()
+        .ok_or("the recorder document has no case")?;
+    let outcome = wire_outcome(&recorder)?;
+    let manifest_sha256 = recorder["manifest_sha256"]
+        .as_str()
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()));
+    let entrypoint = recorder["entrypoint"]["symbol"]
+        .as_str()
+        .ok_or("the recorder document has no entrypoint symbol")?;
+    let truncation = &recorder["caps"];
+    let (reads, occurrences_truncated) = wire_reads(&recorder)?;
     let wire = serde_json::json!({
-        "schema": TRANSCRIPT_SCHEMA, "version": TRANSCRIPT_SCHEMA,
-        "engine": ENGINE, "case": old["case"], "manifest_sha256": old["manifest_sha256"],
-        "entrypoint": old["entrypoint"]["symbol"],
-        "window_monotonic_start_ns": null, "window_monotonic_end_ns": null,
-        "window_elapsed_ns": null,
-        "outcome": {"state": old["outcome"]["status"], "engine": old["outcome"],
-                    "result": old["result"], "result_omitted": old["result_omitted"]},
+        "schema": TRANSCRIPT_SCHEMA,
+        "version": TRANSCRIPT_SCHEMA,
+        "engine": ENGINE,
+        "case": case,
+        "manifest_sha256": manifest_sha256,
+        "entrypoint": entrypoint,
+        // No absolute window origin is proven, so both ends stay an explicit null.
+        "window_monotonic_start_ns": serde_json::Value::Null,
+        "window_monotonic_end_ns": serde_json::Value::Null,
+        "window_elapsed_ns": recorder["window_elapsed_ns"].as_u64().unwrap_or(0),
+        "outcome": outcome,
         "truncation": {
-            "read_rows_truncated": caps["read_rows_exhausted"].as_bool().unwrap_or(false),
-            "occurrences_truncated": caps["occurrences_exhausted"].as_bool().unwrap_or(false),
-            "document_truncated": caps["document_truncated"].as_bool().unwrap_or(false),
-            "process_rows_truncated": caps["process_rows_exhausted"].as_bool().unwrap_or(false),
+            "read_rows_truncated": truncation["read_rows_exhausted"].as_bool().unwrap_or(false),
+            "occurrences_truncated": truncation["occurrences_exhausted"].as_bool().unwrap_or(false)
+                || occurrences_truncated,
+            "document_truncated": truncation["document_truncated"].as_bool().unwrap_or(false),
+            "process_rows_truncated": truncation["process_rows_exhausted"].as_bool().unwrap_or(false),
+            // This evaluator records no separate classification family.
             "classifications_truncated": false,
         },
-        "effects": wire_effects, "reads": reads, "clocks": old["clocks"],
-        "classifications": [], "recorded_holders": [], "fixture_capture": null,
-        "notes": [format!("source binding: {}", old["entrypoint"]["source_binding"]),
-                  "observation coverage and K1 lifetime are unproven"],
+        "effects": wire_effects(&recorder)?,
+        "reads": reads,
+        "clocks": wire_clocks(&recorder)?,
+        "classifications": [],
+        "recorded_holders": wire_holders(&recorder),
+        "fixture_capture": wire_fixture_capture(&recorder),
+        "notes": recorder["notes"].clone(),
     });
-    let bytes = serde_json::to_string(&wire).map_err(|e| e.to_string())?;
-    capture_wire::parse_transcript(bytes.as_bytes()).map_err(|e| e.message)?;
+    let bytes = serde_json::to_string(&wire).map_err(|error| error.to_string())?;
+    capture_wire::parse_transcript(bytes.as_bytes()).map_err(|error| error.message)?;
     Ok(bytes)
+}
+
+/// Judge the emitted transcript with the shared parser and reconciler rules.
+/// This is the only completeness implementation in this crate: it does not
+/// keep a second projection.
+pub(crate) fn assess_shared(
+    transcript: &str,
+    manifest: &[u8],
+) -> Result<capture_wire::Completeness, String> {
+    let recorded =
+        capture_wire::parse_transcript(transcript.as_bytes()).map_err(|error| error.message)?;
+    let manifest = capture_wire::parse_manifest(manifest).map_err(|error| error.message)?;
+    Ok(capture_wire::assess_completeness(
+        &recorded,
+        Some(&manifest),
+    ))
 }
 
 pub(crate) fn validate_shared_transcript(bytes: &[u8]) -> Result<(), String> {
@@ -831,10 +805,484 @@ pub(crate) fn validate_shared_manifest(bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| error.message)
 }
 
+/// The engine outcome in the shared vocabulary. A refusal names the engine as
+/// its source; a completed window carries the engine's own result object.
+fn wire_outcome(recorder: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let engine = &recorder["outcome"];
+    match engine["status"].as_str() {
+        Some("completed") => {
+            let result = &recorder["result"];
+            if !result.is_object() {
+                return Err("a completed window has no engine result object to carry".to_owned());
+            }
+            Ok(serde_json::json!({ "state": "completed", "result": result }))
+        }
+        Some("refused") => {
+            let reason = match (
+                engine["refusal_kind"].as_str(),
+                engine["refusal_message"].as_str(),
+            ) {
+                (Some(kind), Some(message)) => format!("{kind}: {message}"),
+                (Some(kind), None) => kind.to_owned(),
+                (None, Some(message)) => message.to_owned(),
+                (None, None) => "refused".to_owned(),
+            };
+            Ok(serde_json::json!({
+                "state": "refused",
+                "reason": reason,
+                "exit_code": engine["exit_code"].as_u64().unwrap_or(2),
+                "source": "engine",
+            }))
+        }
+        other => Err(format!("unknown engine outcome status {other:?}")),
+    }
+}
+
+/// The wire read rows, and whether the wire's own occurrence cap cut a row.
+///
+/// The reviewed wire requires `kind` to equal `site`, so Barge's `site` is the
+/// source symbol with the observation family appended (`symbol#family`). One
+/// source symbol can record several leaf families, and each family is its own
+/// reconcilable key. The recorder counts occurrences per complete internal
+/// identity; the wire's identity key is narrower (it has no fd, pid, start, uid
+/// or volume UUID), so the adapter renumbers occurrences per emitted key in
+/// emitted order. Every row keeps its own outcome and epoch; a key that would
+/// exceed the 64-occurrence cap stops emitting rows for that key, records the
+/// wire truncation and leaves the rows in the recorder document.
+fn wire_reads(recorder: &serde_json::Value) -> Result<(Vec<serde_json::Value>, bool), String> {
+    let rows = recorder["reads"]
+        .as_array()
+        .ok_or("the recorder document has no read rows")?;
+    let mut reads = Vec::with_capacity(rows.len());
+    let mut counts: HashMap<(String, String, String, String, String), u64> = HashMap::new();
+    let mut truncated = false;
+    for row in rows {
+        let symbol = row["site"].as_str().ok_or("a read row has no site")?;
+        let family = row["kind"].as_str().ok_or("a read row has no kind")?;
+        let site = format!("{symbol}#{family}");
+        let identity = row["identity"]
+            .as_object()
+            .ok_or("a read row has no identity")?;
+        let wire_identity = wire_identity(identity);
+        let part = |value: &serde_json::Value| match value {
+            serde_json::Value::Null => "none".to_owned(),
+            other => other.to_string(),
+        };
+        let key = (
+            site.clone(),
+            part(&wire_identity["path"]),
+            part(&wire_identity["component"]),
+            part(&wire_identity["parent_device"]),
+            part(&wire_identity["parent_inode"]),
+        );
+        let occurrence = counts.entry(key).or_insert(0);
+        *occurrence = occurrence.saturating_add(1);
+        if *occurrence > u64::from(CAP_OCCURRENCES) {
+            truncated = true;
+            continue;
+        }
+        reads.push(serde_json::json!({
+            "kind": site,
+            "site": site,
+            "identity": wire_identity,
+            "outcome": wire_outcome_of_row(row),
+            "cap": row["cap"].as_u64(),
+            "epoch": row["epoch"].as_u64().ok_or("a read row has no epoch")?,
+            "occurrence": occurrence,
+        }));
+    }
+    Ok((reads, truncated))
+}
+
+/// Every identity key is present; a missing fact is an explicit null. The
+/// parent pair and its provenance, and the own pair and its provenance, are
+/// emitted together so the shared pair rules hold by construction.
+fn wire_identity(identity: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    let value = |key: &str| {
+        identity
+            .get(key)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let pair = |device: &str, inode: &str| {
+        identity
+            .get(device)
+            .and_then(serde_json::Value::as_u64)
+            .zip(identity.get(inode).and_then(serde_json::Value::as_u64))
+    };
+    let parent = pair("parent_device", "parent_inode");
+    let own = pair("device", "inode");
+    let parent_source = if parent.is_some() {
+        identity
+            .get("parent_source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("context")
+            .to_owned()
+    } else {
+        "none".to_owned()
+    };
+    let own_source = if own.is_some() {
+        identity
+            .get("own_source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("extracted")
+            .to_owned()
+    } else {
+        "none".to_owned()
+    };
+    serde_json::json!({
+        "path": value("path"),
+        "component": value("component"),
+        "parent_device": parent.map(|(device, _)| device),
+        "parent_inode": parent.map(|(_, inode)| inode),
+        "device": own.map(|(device, _)| device),
+        "inode": own.map(|(_, inode)| inode),
+        "pid": value("pid"),
+        "start": value("start"),
+        "uid": value("uid"),
+        "fd": value("fd"),
+        "volume_uuid": value("volume_uuid"),
+        "mount": value("mount"),
+        "volume_device": value("volume_device"),
+        "parent_source": parent_source,
+        "own_source": own_source,
+    })
+}
+
+/// One observation's outcome in the shared vocabulary. A listed count, an
+/// answer and a presence fact are carried as the `facts` string; the digest,
+/// absence and refusal shapes are explicit so nothing is inferred from text.
+fn wire_outcome_of_row(row: &serde_json::Value) -> serde_json::Value {
+    let outcome = &row["outcome"];
+    if let Some(digest) = outcome.pointer("/digest/bytes_sha256") {
+        return serde_json::json!({ "type": "digest", "digest": digest });
+    }
+    if outcome == "absent" {
+        return serde_json::json!({ "type": "absent" });
+    }
+    if let Some(reason) = outcome.pointer("/refused/class") {
+        return serde_json::json!({ "type": "refusal", "reason": reason });
+    }
+    if let Some(facts) = outcome.pointer("/facts/kind") {
+        return serde_json::json!({ "type": "facts", "facts": facts });
+    }
+    if let Some(answer) = outcome.pointer("/answer/answer") {
+        return serde_json::json!({ "type": "facts", "facts": answer });
+    }
+    // An enumeration keeps its counts and truncation flag as the facts text of
+    // its own outcome object; no field is dropped.
+    serde_json::json!({ "type": "facts", "facts": outcome.to_string() })
+}
+
+fn wire_effects(recorder: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let rows = recorder["effects"]
+        .as_array()
+        .ok_or("the recorder document has no effect rows")?;
+    let mut effects = Vec::with_capacity(rows.len());
+    for row in rows {
+        let kind = row["kind"].as_str().ok_or("an effect row has no kind")?;
+        let site = row["site"].as_str().ok_or("an effect row has no site")?;
+        let path = row["path"].as_str();
+        let partial = row["partial_effect_possible"].as_bool().unwrap_or(false);
+        let (attempted, result) = match row["outcome"].as_str() {
+            None => (true, "unknown"),
+            Some("succeeded") => (false, "succeeded"),
+            Some(_) if partial => (false, "partial"),
+            Some(_) => (false, "failed"),
+        };
+        // An unrepresentable path has no wire path field. The effect keeps its
+        // observed result as a descriptor effect, whose identity stays unproven.
+        let (kind, path) = if path.is_none() {
+            ("descriptor-effect", None)
+        } else {
+            if !matches!(
+                kind,
+                "create" | "save" | "fence" | "reconcile" | "lock-create" | "rename" | "unlink"
+            ) {
+                return Err(format!("effect kind {kind} has no shared wire mapping"));
+            }
+            (kind, path)
+        };
+        effects.push(serde_json::json!({
+            "kind": kind,
+            "site": site,
+            "attempted": attempted,
+            "path": path,
+            "epoch": row["epoch"].as_u64().ok_or("an effect row has no epoch")?,
+            "result": result,
+        }));
+    }
+    Ok(effects)
+}
+
+fn wire_clocks(recorder: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let rows = recorder["clocks"]
+        .as_array()
+        .ok_or("the recorder document has no clock rows")?;
+    rows.iter()
+        .map(|row| {
+            Ok(serde_json::json!({
+                "kind": row["kind"].as_str().ok_or("a clock row has no kind")?,
+                "value": row["value_ms"].as_u64(),
+                "epoch": row["epoch"].as_u64().ok_or("a clock row has no epoch")?,
+            }))
+        })
+        .collect()
+}
+
+fn wire_holders(recorder: &serde_json::Value) -> Vec<serde_json::Value> {
+    recorder["recorded_holders"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "site": row["site"],
+                        "record_id": row["record_id"],
+                        "pid": row["pid"],
+                        "recorded_start_ms": row["recorded_start_ms"],
+                        "kernel_start": row["kernel_start"],
+                        "uid": row["uid"],
+                        "epoch": row["epoch"],
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn wire_fixture_capture(recorder: &serde_json::Value) -> serde_json::Value {
+    let capture = &recorder["fixture_capture"];
+    if !capture.is_object() {
+        return serde_json::Value::Null;
+    }
+    serde_json::json!({
+        "root": capture["root"],
+        "truncated": capture["truncated"],
+        "pre": wire_fixture_entries(&capture["pre"]),
+        "post": wire_fixture_entries(&capture["post"]),
+        "diff_effects": capture["diff_effects"],
+    })
+}
+
+fn wire_fixture_entries(entries: &serde_json::Value) -> Vec<serde_json::Value> {
+    entries
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "rel": entry["rel"],
+                        "kind": entry["kind"],
+                        "size": entry["size"],
+                        "device": entry["device"],
+                        "inode": entry["inode"],
+                        "parent_device": entry["parent_device"],
+                        "parent_inode": entry["parent_inode"],
+                        "mode": entry["mode"],
+                        "bytes_sha256": entry["bytes_sha256"],
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ---- fixture-capture apparatus ----
+//
+// Everything below reads the fixture tree the caller already owns, before and
+// after the engine window. It is apparatus for binding fixture identity and net
+// change; it states no engine observation and feeds the engine nothing.
+
+/// One bounded walk of the fixture tree, as the apparatus observed it. The
+/// capture reads only the fixture root the caller owns, before the engine runs
+/// and again after it finishes; it feeds nothing to the engine and states no
+/// engine observation.
+fn capture_fixture(root: &Path) -> (Vec<FixtureEntry>, bool) {
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    let mut remaining = CAP_FIXTURE_BYTES;
+    walk_fixture(root, root, &mut entries, &mut truncated, &mut remaining);
+    (entries, truncated)
+}
+
+fn walk_fixture(
+    root: &Path,
+    dir: &Path,
+    entries: &mut Vec<FixtureEntry>,
+    truncated: &mut bool,
+    remaining: &mut u64,
+) {
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        *truncated = true;
+        return;
+    };
+    let parent = std::fs::metadata(dir).ok();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in read_dir {
+        match entry {
+            Ok(entry) => {
+                // A lossy name could alias a different fixture entry.
+                if entry.file_name().to_str().is_some() {
+                    paths.push(entry.path());
+                } else {
+                    *truncated = true;
+                }
+            }
+            Err(_) => *truncated = true,
+        }
+    }
+    paths.sort();
+    for path in paths {
+        if entries.len() >= CAP_FIXTURE_ENTRIES {
+            *truncated = true;
+            return;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            *truncated = true;
+            continue;
+        };
+        let Some(rel) = path
+            .strip_prefix(root)
+            .ok()
+            .and_then(|rel| rel.to_str())
+            .map(str::to_owned)
+        else {
+            *truncated = true;
+            continue;
+        };
+        let kind = if meta.file_type().is_symlink() {
+            "symlink"
+        } else if meta.is_dir() {
+            "dir"
+        } else if meta.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        let bytes_sha256 = if meta.is_file() {
+            match read_fixture_file(&path, remaining) {
+                Some(digest) => Some(digest),
+                None => {
+                    *truncated = true;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        entries.push(FixtureEntry {
+            rel: rel.clone(),
+            kind,
+            size: meta.len(),
+            device: meta.dev(),
+            inode: meta.ino(),
+            parent_device: parent.as_ref().map(std::os::unix::fs::MetadataExt::dev),
+            parent_inode: parent.as_ref().map(std::os::unix::fs::MetadataExt::ino),
+            mode: meta.mode() & 0o7777,
+            bytes_sha256,
+        });
+        if meta.is_dir() {
+            walk_fixture(root, &path, entries, truncated, remaining);
+        }
+    }
+}
+
+/// Hash one fixture file inside the remaining byte budget. A file that cannot
+/// be read, or that would exceed the budget, carries no digest and truncates
+/// the capture rather than silently ignoring the bytes.
+fn read_fixture_file(path: &Path, remaining: &mut u64) -> Option<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path).and_then(|file| {
+        file.take(remaining.saturating_add(1))
+            .read_to_end(&mut bytes)
+    });
+    match read {
+        Ok(_) if u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= *remaining => {
+            *remaining = remaining.saturating_sub(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            Some(sha256_hex(&bytes))
+        }
+        _ => None,
+    }
+}
+
+/// The fixture capture the recorder document carries: root, both sides and the
+/// net change. A diff effect is an observed net change with no observed writer
+/// result, so it is `unknown` at epoch zero and never completed parity.
+fn fixture_capture_document(
+    root: &Path,
+    pre: &[FixtureEntry],
+    truncated: bool,
+) -> serde_json::Value {
+    let (post, post_truncated) = capture_fixture(root);
+    let mut diff = Vec::new();
+    for entry in &post {
+        match pre.iter().find(|before| before.rel == entry.rel) {
+            None => diff.push(fixture_diff_effect("create", &entry.rel)),
+            Some(before) => {
+                let is_dir = entry.kind == "dir";
+                let changed = before.device != entry.device
+                    || before.inode != entry.inode
+                    || before.mode != entry.mode
+                    || (!is_dir
+                        && (before.size != entry.size
+                            || before.bytes_sha256 != entry.bytes_sha256))
+                    || (is_dir && before.bytes_sha256 != entry.bytes_sha256);
+                if changed {
+                    diff.push(fixture_diff_effect("save", &entry.rel));
+                }
+            }
+        }
+    }
+    for entry in pre {
+        if !post.iter().any(|after| after.rel == entry.rel) {
+            diff.push(fixture_diff_effect("unlink", &entry.rel));
+        }
+    }
+    diff.sort_by(|left, right| {
+        left["path"]
+            .as_str()
+            .cmp(&right["path"].as_str())
+            .then(left["kind"].as_str().cmp(&right["kind"].as_str()))
+    });
+    serde_json::json!({
+        "root": root.display().to_string(),
+        "truncated": truncated || post_truncated,
+        "pre": pre.iter().map(fixture_entry_document).collect::<Vec<_>>(),
+        "post": post.iter().map(fixture_entry_document).collect::<Vec<_>>(),
+        "diff_effects": diff,
+    })
+}
+
+fn fixture_entry_document(entry: &FixtureEntry) -> serde_json::Value {
+    serde_json::json!({
+        "rel": entry.rel,
+        "kind": entry.kind,
+        "size": entry.size,
+        "device": entry.device,
+        "inode": entry.inode,
+        "parent_device": entry.parent_device,
+        "parent_inode": entry.parent_inode,
+        "mode": entry.mode,
+        "bytes_sha256": entry.bytes_sha256,
+    })
+}
+
+fn fixture_diff_effect(kind: &str, rel: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "site": "fixture-diff",
+        "attempted": false,
+        "path": rel,
+        "epoch": 0,
+        "result": "unknown",
+    })
+}
+
 fn finish_inner(
     outcome: EngineOutcome,
     result: Option<&serde_json::Value>,
-    result_omitted: bool,
 ) -> Result<String, String> {
     TAPE.with(|tape| {
         let mut tape = tape.borrow_mut();
@@ -845,12 +1293,35 @@ fn finish_inner(
         if result.is_some() && outcome.status != "completed" {
             return Err("a refused window carries no engine result".to_owned());
         }
-        if result.is_none() && outcome.status != "refused" && !result_omitted {
+        if result.is_none() && outcome.status != "refused" {
             return Err("a completed window carries the engine result".to_owned());
         }
-        if result_omitted && (outcome.status != "completed" || result.is_some()) {
-            return Err("only an unavailable completed result can be omitted".to_owned());
+        if tape.effects.iter().any(|row| row.path.is_none()) {
+            tape.push_note(
+                "an effect with an unrepresentable path is emitted as a descriptor effect \
+                 with no path; its identity stays unproven"
+                    .to_owned(),
+            );
         }
+        if tape
+            .effects
+            .iter()
+            .any(|row| row.parent_device.is_some() || row.destination.is_some())
+        {
+            tape.push_note(
+                "child-effect parent identity and rename destination are recorded in this \
+                 diagnostic document only; the shared wire has no field for them"
+                    .to_owned(),
+            );
+        }
+        let elapsed_ns = tape
+            .started
+            .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        let fixture_capture = tape
+            .fixture_root
+            .as_ref()
+            .map(|root| fixture_capture_document(root, &tape.fixture_pre, tape.fixture_truncated));
         let mut caps = Caps {
             read_rows: tape.reads.len(),
             document_bytes: 0,
@@ -858,7 +1329,7 @@ fn finish_inner(
             process_rows: tape.process_rows,
             read_rows_exhausted: tape.read_rows_exhausted,
             occurrences_exhausted: tape.occurrences_exhausted,
-            process_rows_exhausted: tape.process_rows_exhausted,
+            process_rows_exhausted: tape.process_rows_exhausted || tape.holders_exhausted,
             document_truncated: false,
             dropped_rows: tape.dropped_rows,
         };
@@ -866,8 +1337,8 @@ fn finish_inner(
         // The document cap is a contract cap, not a suggestion: rows leave from
         // the tail until the document fits, and the truncation is recorded.
         loop {
-            let document = Transcript {
-                schema: TRANSCRIPT_SCHEMA,
+            let document = RecorderDocument {
+                schema: RECORDER_SCHEMA,
                 engine: ENGINE,
                 case: &config.case,
                 manifest_sha256: &config.manifest_sha256,
@@ -875,44 +1346,20 @@ fn finish_inner(
                     symbol: config.entrypoint_symbol,
                     source_binding: &config.source_binding,
                 },
+                window_elapsed_ns: elapsed_ns,
                 outcome: &outcome,
                 observation_complete: false,
                 result,
-                result_omitted,
-                obligations: ObligationReport {
-                    status: "insufficient",
-                    input_available: tape.obligations.is_some(),
-                    input_unavailable_reason: tape.obligation_input_error,
-                    unmapped: tape.unmapped_obligations,
-                    unmapped_indices: tape.unmapped_indices.clone(),
-                    missing: tape.obligations.as_ref().map_or_else(Vec::new, |keys| {
-                        missing_obligations(keys, &reads).into_iter()
-                            .map(|index| tape.obligation_indices[index]).collect()
-                    }),
-                    extra_reads_unchecked: true,
-                    effects_unchecked: true,
-                },
-                effect_check: EffectReport {
-                    status: "insufficient",
-                    input: tape.expected_effects_input,
-                    unexpected_attempts: if tape.expected_effects_input == "empty" {
-                        (0..tape.effects.len().min(8192)).collect()
-                    } else {
-                        Vec::new()
-                    },
-                    unexpected_attempts_omitted: if tape.expected_effects_input == "empty" {
-                        tape.effects.len().saturating_sub(8192)
-                    } else {
-                        0
-                    },
-                },
                 effects: &tape.effects,
                 reads: &reads,
                 clocks: &tape.clocks,
+                recorded_holders: &tape.holders,
+                fixture_capture: fixture_capture.clone(),
+                notes: tape.notes.clone(),
                 caps,
             };
             let bytes = serde_json::to_string(&document)
-                .map_err(|error| format!("the transcript cannot be serialized: {error}"))?;
+                .map_err(|error| format!("the recorder document cannot be serialized: {error}"))?;
             // The decimal length field itself contributes to the encoded size.
             // Iterate to a fixed point before deciding whether it fits.
             if caps.document_bytes != bytes.len() {
@@ -929,54 +1376,33 @@ fn finish_inner(
                 // complete empty effect set or pretend the engine refused.
                 let omitted_effects = tape.effects.len();
                 let omitted_clocks = tape.clocks.len();
-                caps.document_truncated = true;
-                caps.document_bytes = 0;
                 let original = serde_json::to_vec(&outcome)
                     .map_err(|error| format!("the engine outcome cannot be serialized: {error}"))?;
-                let mut refusal = serde_json::json!({
-                    "schema": TRANSCRIPT_SCHEMA,
-                    "engine": ENGINE,
-                    "case_sha256": sha256_hex(config.case.as_bytes()),
-                    "manifest_sha256_sha256": sha256_hex(config.manifest_sha256.as_bytes()),
-                    "entrypoint_binding_sha256": sha256_hex(config.source_binding.as_bytes()),
-                    "outcome": { "status": "refused", "exit_code": 2,
-                        "refusal_kind": "document_cap", "refusal_message": "transcript payload exceeds document cap" },
-                    "original_engine_status": outcome.status,
-                    "original_engine_exit_code": outcome.exit_code,
-                    "original_engine_outcome_sha256": sha256_hex(&original),
-                    "original_engine_outcome_omitted": original.len() > 65536,
-                    "result_omitted": result.is_some() || result_omitted,
-                    "effects_omitted": omitted_effects,
-                    "clocks_omitted": omitted_clocks,
-                    "obligations_omitted": true,
-                    "obligation_input_available": tape.obligations.is_some(),
-                    "obligation_input_error": tape.obligation_input_error,
-                    "obligation_count": tape.obligations.as_ref().map_or(0, Vec::len),
-                    "unmapped_obligations": tape.unmapped_obligations,
-                    "effect_check_omitted": true,
-                    "expected_effects_input": tape.expected_effects_input,
-                    "observation_complete": false,
-                    "caps": caps,
-                });
-                if original.len() <= 65536 {
-                    refusal["original_engine_outcome"] = serde_json::from_slice(&original)
-                        .map_err(|error| format!("the engine outcome cannot be inspected: {error}"))?;
-                }
+                let reason = format!(
+                    "the recorder document exceeds the {CAP_DOCUMENT_BYTES}-byte cap; \
+                     engine status={} exit={}; engine outcome sha256={}; \
+                     document truncated after {} rows; effects omitted={omitted_effects}; \
+                     clocks omitted={omitted_clocks}; result_omitted={}",
+                    outcome.status,
+                    outcome.exit_code,
+                    sha256_hex(&original),
+                    reads.len() + omitted_effects + omitted_clocks,
+                    result.is_none(),
+                );
+                let document = apparatus_document(
+                    &config.case,
+                    Some(config.manifest_sha256.as_str()),
+                    &reason,
+                );
                 tape.reset_without_window();
-                loop {
-                    let bytes = serde_json::to_string(&refusal)
-                        .map_err(|error| format!("the cap refusal cannot be serialized: {error}"))?;
-                    if refusal["caps"]["document_bytes"].as_u64() == Some(bytes.len() as u64) {
-                        return Ok(bytes);
-                    }
-                    refusal["caps"]["document_bytes"] = bytes.len().into();
-                }
+                return Ok(document);
             }
             // Remove a deterministic tail in batches: serializing the whole
             // 8 MiB document once per dropped row is quadratic at the row cap.
             let keep = reads.len() / 2;
             let dropped_count = reads.len() - keep;
-            let dropped_processes = reads[keep..].iter()
+            let dropped_processes = reads[keep..]
+                .iter()
                 .filter(|row| matches!(row.kind, "process-row" | "process-observation"))
                 .count();
             reads.truncate(keep);
@@ -1101,6 +1527,60 @@ fn observation_proven(kind: &str, identity: &Identity, outcome: &Outcome) -> boo
     }
 }
 
+/// The direct-read site inventory (K2/K3/K4): a path precheck stat, a bounded
+/// path read or a path enumeration. None of these operations holds the parent
+/// descriptor, so a row claiming a `handle` parent at one of them is
+/// provenance laundering, not an observation.
+pub(crate) const DIRECT_READ_SITES: &[&str] = &[
+    "state::read_bounded_inner",
+    "registry::read",
+    "MacOs::path_facts",
+    "area::read_directory",
+    "area::read_holds",
+    "reference::read_receipts_with",
+    "state::read_intents_with_deadline",
+];
+
+/// The sites whose observation is the held directory itself (R8).
+pub(crate) const HANDLE_SELF_SITES: &[&str] = &["MacOs::dir_facts", "MacOs::recheck_dir"];
+
+/// PCF-4 control: a direct-read site cannot have observed a parent descriptor,
+/// so such a row would launder its provenance. The control names the rows, it
+/// does not repair them.
+pub(crate) fn laundered_parent_rows(rows: &[ReadRow]) -> Vec<String> {
+    rows.iter()
+        .filter(|row| {
+            row.identity.parent_source == Provenance::Handle
+                && DIRECT_READ_SITES.contains(&row.site)
+        })
+        .map(|row| format!("{} claims a handle parent at a direct-read site", row.site))
+        .collect()
+}
+
+/// PCF-5 control: a handle self-observation whose own identity differs from the
+/// context identity of the handle it was taken from is an incoherent reread
+/// inside one window.
+pub(crate) fn incoherent_handle_rereads(rows: &[ReadRow]) -> Vec<String> {
+    rows.iter()
+        .filter(|row| HANDLE_SELF_SITES.contains(&row.site))
+        .filter(|row| {
+            row.identity
+                .device
+                .is_some_and(|device| row.identity.parent_device != Some(device))
+                || row
+                    .identity
+                    .inode
+                    .is_some_and(|inode| row.identity.parent_inode != Some(inode))
+        })
+        .map(|row| {
+            format!(
+                "{} observed a directory identity that differs from its handle context",
+                row.site
+            )
+        })
+        .collect()
+}
+
 /// Record one clock reading on this thread's window.
 fn clock(kind: &'static str, site: String, value_ms: u64) {
     TAPE.with(|tape| {
@@ -1192,6 +1672,7 @@ pub(crate) fn sync_observation(
         None => Identity {
             device: Some(directory.0),
             inode: Some(directory.1),
+            own_source: Provenance::Handle,
             ..Identity::none()
         },
     };
@@ -1520,6 +2001,36 @@ pub(crate) fn handle_observation(
     record(kind, site, identity, outcome, None);
 }
 
+/// Record an observation made through an already-open descriptor, linked to the
+/// context of the handle it was taken from.
+///
+/// S8 (`duplicate_dir`) and R8 (`dir_facts`, `recheck_dir`) observe the held
+/// directory itself. The row keeps the identity the descriptor actually
+/// supplied as its own (`handle`) and names the handle's opened identity as its
+/// `context` parent. The shared wire has no epoch-reference field, so the link
+/// is the observed identity and its provenance, not an epoch cross-reference; a
+/// mandatory parent stays unproven.
+pub(crate) fn linked_handle_observation(
+    site: &'static str,
+    kind: &'static str,
+    descriptor: i32,
+    own: (u64, u64),
+    context: (u64, u64),
+    outcome: Outcome,
+) {
+    let identity = Identity {
+        device: Some(own.0),
+        inode: Some(own.1),
+        fd: Some(descriptor),
+        own_source: Provenance::Handle,
+        parent_device: Some(context.0),
+        parent_inode: Some(context.1),
+        parent_source: Provenance::Context,
+        ..Identity::none()
+    };
+    record(kind, site, identity, outcome, None);
+}
+
 /// Record an enumeration refusal.
 pub(crate) fn listing_refused(site: &'static str, path: &Path, class: &str) {
     record(
@@ -1557,6 +2068,61 @@ pub(crate) fn lock(site: &'static str, path: &Path, outcome: LockOutcome) {
         LockOutcome::Refused(class) => (Identity::file(path, None), Outcome::refused(class)),
     };
     record("lock", site, identity, outcome, None);
+}
+
+/// Record the context link for an object opened by pathname where the caller
+/// already holds the descriptor of the directory the object is a child of. The
+/// opened object keeps its own observed identity; the parent is `context` from
+/// the held handle, so a mandatory parent stays unproven and nothing is
+/// inferred by a later lookup.
+pub(crate) fn context_link(site: &'static str, path: &Path, own: (u64, u64), context: (u64, u64)) {
+    let mut identity = Identity::file(path, Some(own));
+    identity.parent_device = Some(context.0);
+    identity.parent_inode = Some(context.1);
+    identity.parent_source = Provenance::Context;
+    record(
+        "context-link",
+        site,
+        identity,
+        Outcome::facts("opened"),
+        None,
+    );
+}
+
+/// Record one observed pool or lock holder. The record's own pid and start
+/// reading are facts; the kernel start and uid are `null` when this run did not
+/// observe them, so completeness reports the lifetime as unproven.
+pub(crate) fn recorded_holder(
+    site: &'static str,
+    record_id: u64,
+    pid: u32,
+    recorded_start_ms: u64,
+    kernel_start: Option<u64>,
+    uid: Option<u32>,
+) {
+    TAPE.with(|tape| {
+        let mut tape = tape.borrow_mut();
+        if tape.config.is_none() {
+            return;
+        }
+        if tape.holder_rows >= CAP_PROCESS_ROWS {
+            tape.holders_exhausted = true;
+            tape.dropped_rows = tape.dropped_rows.saturating_add(1);
+            return;
+        }
+        let epoch = tape.next_epoch;
+        tape.next_epoch = tape.next_epoch.saturating_add(1);
+        tape.holder_rows = tape.holder_rows.saturating_add(1);
+        tape.holders.push(RecordedHolder {
+            site: site.to_owned(),
+            record_id,
+            pid,
+            recorded_start_ms,
+            kernel_start,
+            uid,
+            epoch,
+        });
+    });
 }
 
 /// Record one kernel process-table row: never a pid alone.
@@ -1631,6 +2197,7 @@ pub(crate) fn vnode_observed(site: &'static str, pid: u32, fd: i32, device: u64,
     let mut identity = Identity::unidentified_process(pid, Some(fd));
     identity.device = Some(device);
     identity.inode = Some(inode);
+    identity.own_source = Provenance::Extracted;
     record(
         "vnode-facts",
         site,
@@ -1767,23 +2334,60 @@ mod tests {
         assert_eq!(current.raw_os_error(), Some(libc::ENOENT));
     }
 
-    #[test]
-    fn empty_effect_expectation_flags_every_attempt_without_claiming_parity() {
-        begin_window(WindowConfig {
-            case: "static".to_owned(),
-            manifest_sha256: "m".to_owned(),
-            entrypoint_symbol: "barge::release::plan",
-            source_binding: "test".to_owned(),
-        })
-        .expect("window");
-        attach_effect_expectations(br#"{"expected_effects":[]}"#);
-        write_effect("create", Path::new("child"));
-        effect_outcome(
-            "create",
-            Path::new("child"),
-            Some(&std::io::Error::from_raw_os_error(libc::EIO)),
-        );
-        let transcript = finish(
+    /// A `/2` manifest for the completeness controls: one Barge obligation, an
+    /// explicitly declared effect set, and the schema's complete source block.
+    /// Digest values are placeholders: these controls judge completeness rules,
+    /// never a source binding.
+    fn shared_manifest(
+        case: &str,
+        obligations: serde_json::Value,
+        expected_effects: serde_json::Value,
+    ) -> Vec<u8> {
+        let manifest = serde_json::json!({
+            "schema": MANIFEST_SCHEMA,
+            "case": case,
+            "window": {"identity": "control", "start_monotonic_ns": 1, "end_monotonic_ns": 2},
+            "source": {
+                "oxide_commit": "control",
+                "oxide_files": {},
+                "cargo_lock_sha256": "0".repeat(64),
+                "rust_toolchain_sha256": "0".repeat(64),
+                "barge_pin": "4af9360bd09629e970c143080ca159de8eef2562",
+                "barge_slice_commit": "control",
+                "barge_files": {},
+                "staged_lock_sha256": "0".repeat(64),
+                "oxide_toolchain": "1.97.1",
+                "barge_toolchain": "1.97.1",
+                "oxide_executable_sha256": "0".repeat(64),
+                "barge_executable_sha256": "0".repeat(64),
+                "oxide_tree": "0".repeat(40),
+            },
+            "fixture": {"root": "/fixture", "device": 1, "inode": 2, "mode": 448, "entries": [], "roots": []},
+            "dynamic": {"volumes": [], "writers": [], "external_allowances": []},
+            "mandatory_observations": obligations,
+            "expected_effects": expected_effects,
+            "expected": {"classification": "MATCH", "roots": []},
+            "barge": {"volume_uuid": "0", "namespace": "oxide", "area": "outputs"},
+        });
+        serde_json::to_vec(&manifest).expect("the control manifest encodes")
+    }
+
+    fn one_obligation(
+        site: &str,
+        parent_required: bool,
+        identity: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!([{
+            "engine": "barge",
+            "site": site,
+            "parent_required": parent_required,
+            "identity": identity,
+        }])
+    }
+
+    /// Finish the open window as a completed engine result.
+    fn finish_completed() -> String {
+        finish(
             EngineOutcome {
                 status: "completed",
                 exit_code: 0,
@@ -1792,236 +2396,154 @@ mod tests {
                 refusal_detail: Vec::new(),
                 engine_truncated: false,
             },
-            Some(&serde_json::json!({})),
+            Some(&serde_json::json!({"preview": true})),
         )
-        .expect("transcript");
-        let doc: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
-        assert_eq!(doc["effect_check"]["input"], "empty");
-        assert_eq!(
-            doc["effect_check"]["unexpected_attempts"],
-            serde_json::json!([0])
-        );
-        assert_eq!(doc["effect_check"]["status"], "insufficient");
-        assert_eq!(doc["effects"][0]["outcome"], "EIO");
+        .expect("the recorder document is written")
     }
 
     #[test]
-    fn nonempty_effect_expectations_are_not_assigned_to_an_engine() {
+    fn completeness_is_delegated_to_the_shared_rules() {
+        // One proven obligation plus an explicitly empty effect set: the only
+        // remaining issues are the unproven window origin and, for K2, nothing
+        // else. The rules are the shared parser's, not a second projection.
+        let case = "CONTROL-COMPLETE";
         begin_window(WindowConfig {
-            case: "dynamic".to_owned(),
-            manifest_sha256: "m".to_owned(),
+            case: case.to_owned(),
+            manifest_sha256: "0".repeat(64),
             entrypoint_symbol: "barge::release::plan",
-            source_binding: "test".to_owned(),
+            source_binding: "control".to_owned(),
         })
-        .expect("window");
-        attach_effect_expectations(br#"{"expected_effects":[{"kind":"save"}]}"#);
-        let transcript = finish(
-            EngineOutcome {
-                status: "completed",
-                exit_code: 0,
-                refusal_kind: None,
-                refusal_message: None,
-                refusal_detail: Vec::new(),
-                engine_truncated: false,
-            },
-            Some(&serde_json::json!({})),
+        .expect("the window opens");
+        process_row("process-row-site", 42, Some(501), 123);
+        let recorded = finish_completed();
+        let wire = shared_transcript(&recorded).expect("the wire converts");
+        let manifest = shared_manifest(
+            case,
+            one_obligation(
+                "process-row-site#process-row",
+                false,
+                serde_json::json!({"pid": 42, "start": 123, "uid": 501}),
+            ),
+            serde_json::json!([]),
+        );
+        let issues = assess_shared(&wire, &manifest)
+            .expect("completeness runs")
+            .issues;
+        assert_eq!(issues, vec!["window origin and end unproven".to_owned()]);
+
+        // A wrong identity and a missing obligation are named, never matched.
+        let wrong = shared_manifest(
+            case,
+            one_obligation(
+                "process-row-site#process-row",
+                false,
+                serde_json::json!({"pid": 42, "start": 124, "uid": 501}),
+            ),
+            serde_json::json!([]),
+        );
+        let issues = assess_shared(&wire, &wrong)
+            .expect("completeness runs")
+            .issues;
+        assert!(
+            issues.contains(&"wrong identity at process-row-site#process-row".to_owned()),
+            "{issues:?}"
+        );
+        let missing = shared_manifest(
+            case,
+            one_obligation(
+                "never-observed",
+                false,
+                serde_json::json!({"pid": 42, "start": 123, "uid": 501}),
+            ),
+            serde_json::json!([]),
+        );
+        let issues = assess_shared(&wire, &missing)
+            .expect("completeness runs")
+            .issues;
+        assert!(
+            issues.contains(&"missing obligation at never-observed".to_owned()),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn a_handle_parent_stays_unproven_and_an_attempt_is_not_parity() {
+        let case = "CONTROL-PARENT";
+        begin_window(WindowConfig {
+            case: case.to_owned(),
+            manifest_sha256: "0".repeat(64),
+            entrypoint_symbol: "barge::release::plan",
+            source_binding: "control".to_owned(),
+        })
+        .expect("the window opens");
+        child_stat("child-site", (1, 2), "child", None, None);
+        write_effect("save", Path::new("/fixture/ledger"));
+        let recorded = finish_completed();
+        let wire = shared_transcript(&recorded).expect("the wire converts");
+        let manifest = shared_manifest(
+            case,
+            one_obligation(
+                "child-site#child-stat",
+                true,
+                serde_json::json!({"component": "child", "parent_device": 1, "parent_inode": 2}),
+            ),
+            serde_json::json!([{
+                "kind": "save", "site": "ledger", "path": "/fixture/ledger", "attempted": false
+            }]),
+        );
+        let issues = assess_shared(&wire, &manifest)
+            .expect("completeness runs")
+            .issues;
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("parent_required unproven at child-site#child-stat")),
+            "{issues:?}"
+        );
+        // The attempt's site is its real caller location; the declared effect at
+        // `ledger` is neither completed nor matched.
+        assert!(
+            issues.iter().any(|issue| {
+                issue.starts_with("effect not completed at ") && issue.ends_with("(unknown)")
+            }),
+            "{issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue == "omitted or extra effects"),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn apparatus_documents_are_distinct_from_captures() {
+        // A completed window whose report cannot be carried keeps its real
+        // engine status in a distinct apparatus diagnostic.
+        begin_window(WindowConfig {
+            case: "CONTROL-APPARATUS".to_owned(),
+            manifest_sha256: "0".repeat(64),
+            entrypoint_symbol: "barge::release::plan",
+            source_binding: "control".to_owned(),
+        })
+        .expect("the window opens");
+        let document = finish_apparatus(
+            "the engine completed with exit code 3 but its report could not be serialized",
         )
-        .expect("transcript");
-        let doc: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
-        assert_eq!(doc["effect_check"]["input"], "nonempty_unassigned");
-        assert_eq!(doc["effect_check"]["status"], "insufficient");
-    }
-
-    #[test]
-    fn provisional_obligations_report_missing_and_unmapped_without_parity() {
-        begin_window(WindowConfig {
-            case: "obligations".to_owned(),
-            manifest_sha256: "m".to_owned(),
-            entrypoint_symbol: "barge::release::plan",
-            source_binding: "test".to_owned(),
-        })
-        .expect("window");
-        let manifest = serde_json::json!({"mandatory_observations": [
-            {"engine": "barge", "site": "descriptor", "parent_required": false, "identity": {"pid": 42, "start": 123, "uid": 501, "fd": 4}},
-            {"engine": "barge", "site": "volume", "parent_required": false, "identity": {"volume_uuid": "uuid", "mount": "/mount", "device": "disk", "window_identity": "epoch"}},
-            {"engine": "oxide", "site": "other", "identity": {"pid": 1, "start": 2, "uid": 3}}
-        ]});
-        attach_obligations(&serde_json::to_vec(&manifest).expect("manifest"));
-        process_context(42, 123, Some(501));
-        fd_entry("descriptor", 42, 4, 1);
-        let transcript = finish(
-            EngineOutcome {
-                status: "completed",
-                exit_code: 0,
-                refusal_kind: None,
-                refusal_message: None,
-                refusal_detail: Vec::new(),
-                engine_truncated: false,
-            },
-            Some(&serde_json::json!({})),
-        )
-        .expect("transcript");
-        let doc: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
-        assert_eq!(doc["obligations"]["status"], "insufficient");
-        assert_eq!(doc["obligations"]["input_available"], true);
-        assert_eq!(doc["obligations"]["unmapped"], 1);
-        assert_eq!(
-            doc["obligations"]["unmapped_indices"],
-            serde_json::json!([1])
-        );
-        assert_eq!(doc["obligations"]["missing"], serde_json::json!([0]));
-        assert_eq!(doc["observation_complete"], false);
-    }
-
-    #[test]
-    fn provisional_obligation_missing_index_is_from_the_manifest() {
-        begin_window(WindowConfig {
-            case: "missing".to_owned(),
-            manifest_sha256: "m".to_owned(),
-            entrypoint_symbol: "barge::release::plan",
-            source_binding: "test".to_owned(),
-        })
-        .expect("window");
-        let manifest = serde_json::json!({"mandatory_observations": [
-            {"engine": "oxide", "site": "other", "identity": {"pid": 1, "start": 2, "uid": 3}},
-            {"engine": "barge", "site": "descriptor", "parent_required": false, "identity": {"pid": 42, "start": 123, "uid": 501, "fd": 4}}
-        ]});
-        attach_obligations(&serde_json::to_vec(&manifest).expect("manifest"));
-        let transcript = finish(
-            EngineOutcome {
-                status: "completed",
-                exit_code: 0,
-                refusal_kind: None,
-                refusal_message: None,
-                refusal_detail: Vec::new(),
-                engine_truncated: false,
-            },
-            Some(&serde_json::json!({})),
-        )
-        .expect("transcript");
-        let doc: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
-        assert_eq!(doc["obligations"]["missing"], serde_json::json!([1]));
-        assert_eq!(doc["obligations"]["status"], "insufficient");
-    }
-
-    #[test]
-    fn provisional_obligation_cap_is_explicitly_insufficient() {
-        begin_window(WindowConfig {
-            case: "cap".to_owned(),
-            manifest_sha256: "m".to_owned(),
-            entrypoint_symbol: "barge::release::plan",
-            source_binding: "test".to_owned(),
-        })
-        .expect("window");
-        let manifest =
-            serde_json::json!({"mandatory_observations": vec![serde_json::json!({}); 257]});
-        attach_obligations(&serde_json::to_vec(&manifest).expect("manifest"));
-        let transcript = finish(
-            EngineOutcome {
-                status: "completed",
-                exit_code: 0,
-                refusal_kind: None,
-                refusal_message: None,
-                refusal_detail: Vec::new(),
-                engine_truncated: false,
-            },
-            Some(&serde_json::json!({})),
-        )
-        .expect("transcript");
-        let doc: serde_json::Value = serde_json::from_str(&transcript).expect("JSON");
-        assert_eq!(
-            doc["obligations"]["input_unavailable_reason"],
-            "mandatory_observations_cap"
-        );
-        assert_eq!(doc["obligations"]["input_available"], false);
-        assert_eq!(doc["obligations"]["status"], "insufficient");
-    }
-
-    #[test]
-    fn omitted_report_preserves_completed_engine_outcome() {
-        begin_window(WindowConfig {
-            case: "omitted".to_owned(),
-            manifest_sha256: "m".to_owned(),
-            entrypoint_symbol: "barge::release::plan",
-            source_binding: "test".to_owned(),
-        })
-        .expect("window");
-        let bytes = finish_omitted(EngineOutcome {
-            status: "completed",
-            exit_code: 3,
-            refusal_kind: None,
-            refusal_message: None,
-            refusal_detail: Vec::new(),
-            engine_truncated: false,
-        })
-        .expect("transcript");
-        let document: serde_json::Value = serde_json::from_str(&bytes).expect("JSON");
-        assert_eq!(document["outcome"]["status"], "completed");
-        assert_eq!(document["outcome"]["exit_code"], 3);
-        assert_eq!(document["result_omitted"], true);
-        assert!(document.get("result").is_none());
-        assert_eq!(document["observation_complete"], false);
-    }
-
-    #[test]
-    fn obligations_require_the_exact_proven_source_and_identity() {
-        let identity = Identity::process(42, 123, Some(501), Some(4));
-        let obligation = Obligation {
-            site: "descriptor".to_owned(),
-            identity: identity.clone(),
-            parent_required: false,
-        };
-        let mut row = ReadRow {
-            kind: "fd-entry",
-            site: "descriptor",
-            identity,
-            outcome: Outcome::answer("vnode"),
-            observation_proven: true,
-            cap: None,
-            epoch: 0,
-            occurrence: 1,
-        };
-        assert!(missing_obligations(std::slice::from_ref(&obligation), &[row.clone()]).is_empty());
-        assert_eq!(
-            missing_obligations(&[obligation.clone(), obligation.clone()], &[row.clone()]),
-            vec![1]
-        );
-        row.observation_proven = false;
-        assert_eq!(
-            missing_obligations(std::slice::from_ref(&obligation), &[row.clone()]),
-            vec![0]
-        );
-        row.observation_proven = true;
-        row.identity.start = Some(124);
-        assert_eq!(
-            missing_obligations(std::slice::from_ref(&obligation), &[row.clone()]),
-            vec![0]
-        );
-        row.identity.start = Some(123);
-        row.outcome = Outcome::refused("gone");
-        assert_eq!(missing_obligations(&[obligation], &[row]), vec![0]);
-    }
-
-    #[test]
-    fn mandatory_parent_stays_unproven_without_the_lifetime_premise() {
-        let mut identity = Identity::component(Some((1, 2)), "child");
-        identity.parent_source = Provenance::Handle;
-        let obligation = Obligation {
-            site: "child".to_owned(),
-            identity: identity.clone(),
-            parent_required: true,
-        };
-        let row = ReadRow {
-            kind: "child-stat",
-            site: "child",
-            identity,
-            outcome: Outcome::absent(),
-            observation_proven: true,
-            cap: None,
-            epoch: 0,
-            occurrence: 1,
-        };
-        assert_eq!(missing_obligations(&[obligation], &[row]), vec![0]);
+        .expect("the apparatus diagnostic is written");
+        let value: serde_json::Value = serde_json::from_str(&document).expect("JSON");
+        assert_eq!(value["schema"], APPARATUS_SCHEMA);
+        assert_eq!(value["version"], APPARATUS_SCHEMA);
+        assert_eq!(value["case"], "CONTROL-APPARATUS");
+        assert!(value["reason"]
+            .as_str()
+            .expect("a reason")
+            .contains("exit code 3"));
+        // The transcript parser refuses it by name, so it cannot read as a capture.
+        let refused = capture_wire::parse_transcript(document.as_bytes()).expect_err("refused");
+        assert!(refused.message.contains("unknown version"), "{refused:?}");
+        // One engine outcome per window: a second finish has nothing to close.
+        assert!(finish_apparatus("again").is_err());
     }
 
     /// Open a window, run `body`, and return the finished transcript string.
@@ -2114,7 +2636,7 @@ mod tests {
         });
         let document: serde_json::Value =
             serde_json::from_str(&transcript).expect("the transcript parses");
-        assert_eq!(document["schema"], TRANSCRIPT_SCHEMA);
+        assert_eq!(document["schema"], RECORDER_SCHEMA);
         assert_eq!(document["engine"], ENGINE);
         assert_eq!(document["case"], "CTL-0");
         assert_eq!(document["reads"].as_array().map(Vec::len), Some(2));
@@ -2130,7 +2652,7 @@ mod tests {
             sha256_hex(b"bytes")
         );
         assert_eq!(row["cap"], 64);
-        assert_eq!(row["epoch"], 0);
+        assert_eq!(row["epoch"], 1);
         assert_eq!(row["occurrence"], 1);
         assert_eq!(document["caps"]["read_rows"], 2);
         // A second identical observation is occurrence 2 of the same key.
@@ -2315,19 +2837,24 @@ mod tests {
     }
 
     #[test]
-    fn oversized_non_read_payload_yields_bounded_explicit_refusal() {
+    fn oversized_non_read_payload_yields_bounded_apparatus_refusal() {
         let oversized = "x".repeat(CAP_DOCUMENT_BYTES + 1);
-        let transcript = window(|| write_effect("create", Path::new(&oversized)));
-        assert!(transcript.len() <= CAP_DOCUMENT_BYTES);
-        let document: serde_json::Value = serde_json::from_str(&transcript).expect("transcript");
-        assert_eq!(document["outcome"]["refusal_kind"], "document_cap");
-        assert_eq!(document["caps"]["document_bytes"], transcript.len());
-        assert_eq!(document["original_engine_status"], "completed");
-        assert_eq!(document["original_engine_outcome"]["status"], "completed");
-        assert_eq!(document["original_engine_outcome_omitted"], false);
-        assert_eq!(document["effects_omitted"], 1);
-        assert_eq!(document["caps"]["document_truncated"], true);
-        assert_eq!(document["observation_complete"], false);
+        let document = window(|| write_effect("create", Path::new(&oversized)));
+        assert!(document.len() <= CAP_DOCUMENT_BYTES);
+        let value: serde_json::Value = serde_json::from_str(&document).expect("JSON");
+        // The payload cannot be a conforming capture, so the result is the
+        // distinct apparatus diagnostic, never a transcript-shaped invention.
+        assert_eq!(value["schema"], APPARATUS_SCHEMA);
+        let reason = value["reason"].as_str().expect("a reason");
+        assert!(reason.contains("exceeds the"), "{reason}");
+        assert!(
+            reason.contains("engine status=completed exit=0"),
+            "{reason}"
+        );
+        assert!(reason.contains("effects omitted=1"), "{reason}");
+        assert!(reason.contains("result_omitted=false"), "{reason}");
+        assert_eq!(value["case"], "CTL-0");
+        assert!(capture_wire::parse_transcript(document.as_bytes()).is_err());
     }
 
     #[test]
@@ -2356,7 +2883,15 @@ mod tests {
         };
         let first = window(body);
         let second = window(body);
-        assert_eq!(first, second);
+        // The window's elapsed nanoseconds are the one measured field; every
+        // row, row order and epoch is byte-identical between the two windows.
+        let normalize = |document: &str| {
+            let mut value: serde_json::Value = serde_json::from_str(document).expect("JSON");
+            value["window_elapsed_ns"] = serde_json::json!(0);
+            value["caps"]["document_bytes"] = serde_json::json!(0);
+            serde_json::to_string(&value).expect("JSON")
+        };
+        assert_eq!(normalize(&first), normalize(&second));
     }
 
     /// Two observations of one identity key are two bound occurrences, never
@@ -2494,7 +3029,15 @@ mod tests {
             implementation.contains("fn effect("),
             "the guard must inspect the recorder implementation"
         );
-        assert!(!implementation.contains("symlink_metadata"));
+        // The recorder proper takes no filesystem read of its own: the only
+        // reads are the declared fixture-capture apparatus below this marker.
+        let recorder = implementation
+            .split_once("// ---- fixture-capture apparatus ----")
+            .expect("the fixture-capture section is declared")
+            .0;
+        assert!(!recorder.contains("symlink_metadata"));
+        assert!(!recorder.contains("read_dir"));
+        assert!(!recorder.contains("File::open"));
         assert!(!implementation.contains("fn parent_identity"));
         let state = include_str!("state.rs");
         let area = include_str!("area.rs");
@@ -2927,7 +3470,7 @@ mod tests {
         assert_eq!(document["caps"]["process_rows"], CAP_PROCESS_ROWS);
         assert_eq!(document["caps"]["dropped_rows"], 2);
         assert_eq!(document["caps"]["process_rows_exhausted"], true);
-        assert_eq!(document["clocks"][0]["epoch"], CAP_PROCESS_ROWS);
+        assert_eq!(document["clocks"][0]["epoch"], CAP_PROCESS_ROWS + 1);
     }
 
     /// The statement discipline, as far as text can check it: every
@@ -2965,6 +3508,354 @@ mod tests {
             checked >= 40,
             "expected the full leaf inventory, saw {checked}"
         );
+    }
+
+    /// The emitted-shape regression: every row kind the recorder writes is
+    /// emitted through the real leaves, parsed as `/2`, and the reviewed field
+    /// rules hold. This is emitter conformance, not coverage or parity.
+    #[test]
+    fn emitted_transcript_has_the_reviewed_two_shape() {
+        let fixture = crate::testkit::TempDir::under_scratch("tape-emitted-shape");
+        std::fs::write(fixture.path().join("a.json"), b"one").expect("fixture file");
+        begin_window(WindowConfig {
+            case: "EMITTED-SHAPE".to_owned(),
+            manifest_sha256: "0".repeat(64),
+            entrypoint_symbol: "barge::release::plan",
+            source_binding: "embedded-unverified".to_owned(),
+        })
+        .expect("the window opens");
+        begin_fixture(fixture.path());
+        read_absent("absent-site", Path::new("/fixture/missing"));
+        read_present(
+            "digest-site",
+            Path::new("/fixture/a.json"),
+            Some((1, 2)),
+            b"one",
+            None,
+        );
+        read_present(
+            "capped-site",
+            Path::new("/fixture/a.json"),
+            Some((1, 2)),
+            b"one",
+            Some(0),
+        );
+        read_present(
+            "bounded-site",
+            Path::new("/fixture/a.json"),
+            Some((1, 2)),
+            b"one",
+            Some(64),
+        );
+        child_stat("child-site", (1, 2), "a.json", Some((1, 3, "file")), None);
+        handle_observation("handle-site", "stat", 7, 5, 6, Outcome::facts("directory"));
+        linked_handle_observation(
+            "MacOs::dir_facts",
+            "stat",
+            7,
+            (5, 6),
+            (5, 6),
+            Outcome::facts("directory"),
+        );
+        volume(
+            "volume-site",
+            Identity::volume_at(
+                Path::new("/mount"),
+                9,
+                Some("volume"),
+                Some(Path::new("/mount")),
+            ),
+            Outcome::facts("mounted"),
+        );
+        recorded_holder("lock-holder", 9, 42, 77, None, None);
+        now_ms(1234);
+        write_effect("save", Path::new("/fixture/attempt-ledger"));
+        write_effect("save", Path::new("/fixture/succeeded-ledger"));
+        effect_outcome("save", Path::new("/fixture/succeeded-ledger"), None);
+        let partial = std::io::Error::from_raw_os_error(libc::EIO);
+        write_effect("save", Path::new("/fixture/partial-ledger"));
+        effect_outcome("save", Path::new("/fixture/partial-ledger"), Some(&partial));
+        write_effect("create", Path::new("/fixture/failed-ledger"));
+        effect_outcome(
+            "create",
+            Path::new("/fixture/failed-ledger"),
+            Some(&std::io::Error::from_raw_os_error(libc::EACCES)),
+        );
+        write_effect("save", Path::new("/fixture/dup-ledger"));
+        effect_outcome("save", Path::new("/fixture/dup-ledger"), None);
+        write_effect("save", Path::new("/fixture/dup-ledger"));
+        effect_outcome("save", Path::new("/fixture/dup-ledger"), None);
+        std::fs::write(fixture.path().join("a.json"), b"two").expect("fixture file change");
+        std::fs::write(fixture.path().join("new.json"), b"new").expect("fixture file added");
+        let recorded = finish_completed();
+        let wire = shared_transcript(&recorded).expect("the wire converts");
+        let parsed = capture_wire::parse_transcript(wire.as_bytes()).expect("the wire parses");
+        let at = |pointer: &str| {
+            parsed
+                .pointer(pointer)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        };
+        assert_eq!(at("/schema"), serde_json::json!(TRANSCRIPT_SCHEMA));
+        assert_eq!(at("/version"), serde_json::json!(TRANSCRIPT_SCHEMA));
+        assert!(at("/manifest_sha256").is_string());
+        assert!(at("/window_monotonic_start_ns").is_null());
+        assert!(at("/window_monotonic_end_ns").is_null());
+        assert!(at("/reads/0/kind") == at("/reads/0/site"));
+        // Null is no cap; zero is a real zero cap; 64 is the real bound.
+        assert!(at("/reads/1/cap").is_null(), "{}", at("/reads/1/cap"));
+        assert_eq!(at("/reads/2/cap"), serde_json::json!(0));
+        assert_eq!(at("/reads/3/cap"), serde_json::json!(64));
+        // A handle-child row keeps its handle parent; a descriptor row keeps
+        // its own handle identity and its context link.
+        assert_eq!(at("/reads/4/identity/parent_source"), "handle");
+        assert_eq!(at("/reads/5/identity/fd"), serde_json::json!(7));
+        assert_eq!(at("/reads/5/identity/own_source"), "handle");
+        assert_eq!(at("/reads/6/identity/parent_source"), "context");
+        // A volume row keeps its UUID. The observed numeric device has no inode
+        // beside it, and the wire's device/inode pair is both-or-neither, so it
+        // stays in the recorder document and the wire states no own identity.
+        assert_eq!(at("/reads/7/identity/volume_uuid"), "volume");
+        assert!(at("/reads/7/identity/device").is_null());
+        assert_eq!(at("/reads/7/identity/own_source"), "none");
+        let recorder: serde_json::Value = serde_json::from_str(&recorded).expect("JSON");
+        assert_eq!(
+            recorder["reads"][7]["identity"]["device"],
+            serde_json::json!(9)
+        );
+        // A recorded holder keeps its unproven kernel start and uid as null.
+        assert_eq!(at("/recorded_holders/0/pid"), serde_json::json!(42));
+        assert!(at("/recorded_holders/0/kernel_start").is_null());
+        assert!(at("/recorded_holders/0/uid").is_null());
+        assert_eq!(at("/clocks/0/value"), serde_json::json!(1234));
+        // An attempt is unknown; a completed row is succeeded; an error keeps
+        // its partial result (this recorder cannot prove none was written, so
+        // it never claims `failed`); a repeated completed row stays repeated.
+        assert!(at("/effects/0/attempted") == serde_json::json!(true));
+        assert_eq!(at("/effects/0/result"), "unknown");
+        assert_eq!(at("/effects/1/result"), "succeeded");
+        assert_eq!(at("/effects/2/result"), "partial");
+        assert_eq!(at("/effects/3/result"), "partial");
+        assert_eq!(at("/effects/4/result"), "succeeded");
+        assert_eq!(at("/effects/5/result"), "succeeded");
+        // Fixture entries use the wire identity names, and the net change is an
+        // observed unknown-result diff, never a completed effect.
+        let entries = at("/fixture_capture/post");
+        let first = entries
+            .as_array()
+            .and_then(|rows| rows.first())
+            .cloned()
+            .expect("a fixture entry");
+        assert!(first["device"].is_u64());
+        assert!(first.get("dev").is_none());
+        assert_eq!(at("/fixture_capture/diff_effects/0/result"), "unknown");
+        assert_eq!(
+            at("/fixture_capture/diff_effects/0/epoch"),
+            serde_json::json!(0)
+        );
+        assert_eq!(at("/outcome/state"), "completed");
+        assert_eq!(at("/outcome/result/preview"), serde_json::json!(true));
+        // The same bytes tampered, as `/1`, or as the apparatus diagnostic are
+        // all refused by the transcript parser.
+        let mut tampered: serde_json::Value = parsed.clone();
+        tampered["reads"][1]["cap"] = serde_json::json!("none");
+        assert!(capture_wire::parse_transcript(tampered.to_string().as_bytes()).is_err());
+        let mut historical = parsed.clone();
+        historical["schema"] = serde_json::json!("oxide.capture.transcript/1");
+        historical["version"] = serde_json::json!("oxide.capture.transcript/1");
+        let refusal = capture_wire::parse_transcript(historical.to_string().as_bytes())
+            .expect_err("a /1 document is refused");
+        assert!(refusal.message.contains("historical /1"), "{refusal:?}");
+        let apparatus =
+            apparatus_document("EMITTED-SHAPE", Some(&"0".repeat(64)), "manifest refused");
+        assert!(capture_wire::parse_transcript(apparatus.as_bytes()).is_err());
+    }
+
+    /// The shared wire's identity key is narrower than the recorder's: it has
+    /// no fd, pid, start, uid or volume UUID. Many real observations therefore
+    /// share one wire key, and the shared 64-occurrence cap truncates them. The
+    /// truncation is recorded, the rows stay in the recorder document, and the
+    /// window is insufficient by rule.
+    #[test]
+    fn the_wire_occurrence_cap_truncates_a_collapsed_key() {
+        begin_window(WindowConfig {
+            case: "COLLAPSED-KEY".to_owned(),
+            manifest_sha256: "0".repeat(64),
+            entrypoint_symbol: "barge::release::plan",
+            source_binding: "control".to_owned(),
+        })
+        .expect("the window opens");
+        for pid in 1..=CAP_OCCURRENCES + 6 {
+            process_row("process-table-site", pid, Some(501), u64::from(pid));
+        }
+        let recorded = finish_completed();
+        let wire = shared_transcript(&recorded).expect("the wire converts");
+        let parsed = capture_wire::parse_transcript(wire.as_bytes()).expect("the wire parses");
+        let reads = parsed["reads"].as_array().expect("read rows");
+        assert_eq!(reads.len(), CAP_OCCURRENCES as usize);
+        assert_eq!(
+            parsed["truncation"]["occurrences_truncated"],
+            serde_json::json!(true)
+        );
+        assert!(
+            reads
+                .iter()
+                .all(|row| row["kind"] == "process-table-site#process-row"),
+            "the wire site names the source symbol and the observation family"
+        );
+        let recorder: serde_json::Value = serde_json::from_str(&recorded).expect("JSON");
+        assert_eq!(
+            recorder["reads"].as_array().map(Vec::len),
+            Some(CAP_OCCURRENCES as usize + 6),
+            "every recorded row stays in the recorder document"
+        );
+    }
+
+    #[test]
+    fn an_unrepresentable_effect_path_is_a_descriptor_effect() {
+        use std::os::unix::ffi::OsStrExt;
+        begin_window(WindowConfig {
+            case: "UNREPRESENTABLE".to_owned(),
+            manifest_sha256: "0".repeat(64),
+            entrypoint_symbol: "barge::release::plan",
+            source_binding: "control".to_owned(),
+        })
+        .expect("the window opens");
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"name\xff"));
+        write_effect("create", path);
+        effect_outcome(
+            "create",
+            path,
+            Some(&std::io::Error::from_raw_os_error(libc::EACCES)),
+        );
+        let recorded = finish_completed();
+        let wire = shared_transcript(&recorded).expect("the wire converts");
+        let parsed = capture_wire::parse_transcript(wire.as_bytes()).expect("the wire parses");
+        assert_eq!(parsed["effects"][0]["kind"], "descriptor-effect");
+        assert!(parsed["effects"][0]["path"].is_null());
+        assert_eq!(parsed["effects"][0]["result"], "partial");
+        assert_eq!(parsed["effects"][0]["attempted"], serde_json::json!(false));
+        // The recorder document keeps the real effect kind and its path state.
+        let recorder: serde_json::Value = serde_json::from_str(&recorded).expect("JSON");
+        assert_eq!(recorder["effects"][0]["kind"], "create");
+        assert!(recorder["effects"][0]["path"].is_null());
+    }
+
+    #[test]
+    fn fixture_capture_reports_the_net_change_it_observed() {
+        let fixture = crate::testkit::TempDir::under_scratch("tape-fixture-capture");
+        std::fs::write(fixture.path().join("kept.json"), b"kept").expect("fixture file");
+        std::fs::write(fixture.path().join("changed.json"), b"before").expect("fixture file");
+        begin_window(WindowConfig {
+            case: "FIXTURE-CAPTURE".to_owned(),
+            manifest_sha256: "0".repeat(64),
+            entrypoint_symbol: "barge::release::plan",
+            source_binding: "control".to_owned(),
+        })
+        .expect("the window opens");
+        begin_fixture(fixture.path());
+        std::fs::write(fixture.path().join("changed.json"), b"after").expect("change");
+        std::fs::write(fixture.path().join("added.json"), b"added").expect("add");
+        std::fs::remove_file(fixture.path().join("kept.json")).expect("remove");
+        let recorded = finish_completed();
+        let wire = shared_transcript(&recorded).expect("the wire converts");
+        let parsed = capture_wire::parse_transcript(wire.as_bytes()).expect("the wire parses");
+        let diff = parsed["fixture_capture"]["diff_effects"]
+            .as_array()
+            .expect("diff rows");
+        let kinds: Vec<(&str, &str)> = diff
+            .iter()
+            .map(|row| {
+                (
+                    row["path"].as_str().unwrap_or(""),
+                    row["kind"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert!(kinds.contains(&("added.json", "create")), "{kinds:?}");
+        assert!(kinds.contains(&("changed.json", "save")), "{kinds:?}");
+        assert!(kinds.contains(&("kept.json", "unlink")), "{kinds:?}");
+        assert!(diff.iter().all(|row| row["result"] == "unknown"));
+        assert_eq!(
+            parsed["fixture_capture"]["truncated"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn a_direct_read_site_cannot_launder_a_handle_parent() {
+        // Real rows at direct-read sites carry no handle provenance.
+        let recorded = window(|| {
+            read_absent("state::read_bounded_inner", Path::new("/fixture/registry"));
+            stat("MacOs::path_facts", Path::new("/fixture/area"), None);
+            extracted_dir_entry(
+                "area::read_directory",
+                Some((1, 2)),
+                std::ffi::OsStr::new("entry"),
+            );
+        });
+        let document: serde_json::Value = serde_json::from_str(&recorded).expect("JSON");
+        let rows = document["reads"].as_array().expect("rows");
+        assert!(rows.iter().any(|row| {
+            row["site"] == "area::read_directory" && row["identity"]["parent_source"] == "extracted"
+        }));
+        let mut identity = Identity::component(Some((1, 2)), "entry");
+        identity.parent_source = Provenance::Handle;
+        let doctored = vec![ReadRow {
+            kind: "dir-entry",
+            site: "area::read_directory",
+            identity,
+            outcome: Outcome::facts("entry"),
+            observation_proven: true,
+            cap: None,
+            epoch: 1,
+            occurrence: 1,
+        }];
+        let issues = laundered_parent_rows(&doctored);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("area::read_directory"));
+    }
+
+    #[test]
+    fn a_handle_reread_must_agree_with_its_context_identity() {
+        let recorded = window(|| {
+            linked_handle_observation(
+                "MacOs::recheck_dir",
+                "stat",
+                7,
+                (5, 6),
+                (5, 6),
+                Outcome::facts("directory"),
+            );
+        });
+        let document: serde_json::Value = serde_json::from_str(&recorded).expect("JSON");
+        let row = &document["reads"][0];
+        assert_eq!(row["identity"]["parent_source"], "context");
+        assert_eq!(row["identity"]["own_source"], "handle");
+        let coherent = vec![ReadRow {
+            kind: "stat",
+            site: "MacOs::recheck_dir",
+            identity: Identity {
+                device: Some(5),
+                inode: Some(6),
+                own_source: Provenance::Handle,
+                parent_device: Some(5),
+                parent_inode: Some(6),
+                parent_source: Provenance::Context,
+                ..Identity::none()
+            },
+            outcome: Outcome::facts("directory"),
+            observation_proven: false,
+            cap: None,
+            epoch: 1,
+            occurrence: 1,
+        }];
+        assert!(incoherent_handle_rereads(&coherent).is_empty());
+        let mut incoherent = coherent;
+        incoherent[0].identity.inode = Some(7);
+        let issues = incoherent_handle_rereads(&incoherent);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("MacOs::recheck_dir"));
     }
 
     /// The declaration shape: the tape is `pub(crate)` under `cfg(test)` in

@@ -336,6 +336,41 @@ the `cfg(test)` tape module; the production build compiles none of it.
   the `extracted` precheck identity; the `state::read_intents_with_deadline`
   entry rows switch to parent `none`.
 
+#### Implemented test-only observations (Barge047)
+
+The `/2` adoption completed the finite observation deviations that current
+source supplies the fact for. Implemented names and limits:
+
+- `crate::tape::extracted_dir_entry(site, parent, name)` records one
+  enumeration row whose parent is the identity the site's own production
+  precheck already observed (`extracted`). `area::read_directory` uses it, so an
+  entry row is parent-bound without a second lookup and without a handle.
+- `crate::tape::context_link(site, path, own, context)` records the R2 link:
+  the opened root's own observed identity with the identity of the area handle
+  the resolution already holds as its `context` parent. `release::decide_root`
+  calls it immediately after the original `dirs.open_path(&root.path)`;
+  `ResolvedArea::held_identity` is a `#[cfg(test)]` accessor over the handle the
+  resolution already holds.
+- `crate::tape::linked_handle_observation(site, kind, descriptor, own, context,
+  outcome)` records the S8/R8 rows: the descriptor's own `handle` identity and
+  the source handle's identity as their `context` parent. `MacOs::duplicate_dir`
+  passes the handle's identity for both; `MacOs::dir_facts` and
+  `MacOs::recheck_dir` pass the identity the descriptor actually returned, so a
+  divergence from the handle's open identity is visible rather than smoothed.
+- PCF-4 and PCF-5 are pure controls: `laundered_parent_rows` names a row that
+  claims a `handle` parent at a direct-read site (`DIRECT_READ_SITES`), and
+  `incoherent_handle_rereads` names a handle self-observation (`HANDLE_SELF_SITES`)
+  whose own identity differs from its context identity. Each is tested with a
+  real recorder row and a doctored row.
+
+Limits. The reviewed transcript schema has no epoch-reference field, so a
+context link is the observed identity plus `context` provenance, not an epoch
+cross-reference; the design's "links to its source handle's open epoch" is not
+expressible and is not claimed. None of these rows discharges a
+`parent_required` obligation: K1 stays unqualified, so completeness reports it
+as an issue. The rows add no syscall, no path lookup and no production
+statement.
+
 ### Declared new observations (cost and error semantics)
 
 | Observation | Where | Cost | Error semantics |
@@ -630,9 +665,22 @@ proposed validation above belongs to the implementation slices.
 
 Mandatory parent coverage for direct state reads remains unresolved. The only
 candidate that could supply it, a per-call parent open (C1), is disposed of
-below. Source does not support activation. The open decision is the product
-boundary R-K2 (section 5 of the disposition). Until that ruling, direct-read
-parents stay unproven.
+below. Source does not support activation.
+
+R-K2 is ruled. Tom's authentic board answer to decision
+`0bcedf55-c0a2-42fe-86eb-1f3c384996fa` version 2 is: **"Defer the production
+reader change (recommended)"** (Nov8). Task 046/PR46 merged
+`bcb1f58ef1d164c31ba42ec8dcce917460b2bd06`; its per-site disposition found no
+mechanical parent-handle reuse at the 19 read call sites in 18 functions and
+the 2 lock sites. Therefore:
+
+- No production C1, C1-prime or C2 conversion is activated.
+- Existing read, lock, error and object-selection behavior stays exactly as it
+  is; this contract changes no production statement.
+- Direct-read parent, K1 lifetime, process and enumeration gaps remain
+  unproven, and full capture comparison remains held.
+- The deferral is not completion of the mandatory parent prerequisite, and R-K2
+  is not re-asked. A future activation would need its own reviewed scope.
 
 ### Route B compatibility disposition: the parent-opening question
 
@@ -645,7 +693,9 @@ This section replaces "Candidate private read seam for review". That section
 framed the candidate for activation ("before activating the candidate",
 "before planner activation") and left the parent-opening question open.
 Source does not support activation. This section answers the question, and
-the candidate is not activation-ready.
+the candidate is not activation-ready. Tom's Nov8 answer to decision
+`0bcedf55` v2 (recorded under "Open design issues") defers the production
+reader change outright, so nothing in this disposition is activated.
 
 #### 1. Does a caller already own a usable parent descriptor?
 
@@ -830,17 +880,23 @@ Verdicts:
 
 Tally: A 0; B 8 (rows 1, 2, 3, 4, 5, 7, L1, L2); B-E 12 (rows 6, 8–18); N 0.
 
-#### 5. Product boundary ruling R-K2 (for the planner, once)
+#### 5. Product boundary ruling R-K2 (answered: defer)
 
-Question for Tom: may the state and Oxide-artifact readers change refusal
-classes and object selection in the cases in section 2 (search-only parent
-`EACCES`; parent-open `EMFILE`; rename between parent open and child
+Question put to Tom: whether the state and Oxide-artifact readers may change
+refusal classes and object selection in the cases in section 2 (search-only
+parent `EACCES`; parent-open `EMFILE`; rename between parent open and child
 operations; relative single-component input reading as `Absent`; trailing-slash
 reads), in exchange for a per-call parent that cannot discharge the mandatory
-parent obligation until the K1 lifetime premise is qualified?
+parent obligation until the K1 lifetime premise is qualified.
 
-- **A. Defer (recommended).** No production change. Direct-read parents stay
-  unproven, as `o2-tape.md` records. Revisit when K1 lifetime is qualified.
+**Answer.** Tom's authentic board answer to decision `0bcedf55` version 2 is
+"Defer the production reader change (recommended)" (Nov8). Choice A below is
+the ruling: no production change, direct-read parents stay unproven, and the
+question is not re-asked.
+
+- **A. Defer (recommended and chosen).** No production change. Direct-read
+  parents stay unproven, as `o2-tape.md` records. Revisit when K1 lifetime is
+  qualified.
 - **B. Accept C1 for all 19 sites.** Change the shared reader and lock seam
   under section 7. The new refusals, including on the CLI plan-file read,
   become declared behaviour.
@@ -852,7 +908,7 @@ parent obligation until the K1 lifetime premise is qualified?
 
 Recommendation: A. B and B′ add refusal and selection changes and still leave
 the mandatory obligation undischarged. The cost is real. The benefit is not yet
-attainable.
+attainable. Tom chose A.
 
 #### 6. Contract conflict, and what this does not solve
 
@@ -912,10 +968,12 @@ Nothing here is run by this disposition.
 
 #### 8. Recommended next scoped action
 
-1. Planner takes R-K2 (section 5) and the contract conflict (section 6) to Tom
-   once, with options A, B, B′ and C and recommendation A.
-2. If A: section 4 is the complete inventory. The `o2-tape.md` rows stay
-   unproven. No implementation brief.
-3. If B or B′: a separate implementation brief carrying section 7, scoped to
-   `read_bounded_inner` and `StateLock::shared_if_present` (B), or to a new
-   state-scoped entry point (B′).
+1. R-K2 (section 5) is answered: option A, defer. The contract conflict in
+   section 6 is recorded, not re-asked.
+2. Under A, section 4 is the complete inventory. The `o2-tape.md` rows stay
+   unproven and no implementation brief follows. The test-only observation work
+   that needed no production seam is implemented under "Implemented test-only
+   observations (Barge047)".
+3. A future B or B′ would need its own implementation brief carrying section 7,
+   scoped to `read_bounded_inner` and `StateLock::shared_if_present` (B), or to
+   a new state-scoped entry point (B′).

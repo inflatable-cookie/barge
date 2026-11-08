@@ -835,6 +835,22 @@ fn decide_root(
             );
         }
     };
+    #[cfg(test)]
+    {
+        // R2's context link: the resolution already holds the area folder's
+        // handle, and this root is a child of it. The link adds an observed
+        // context parent to the opened root's own identity; it performs no
+        // lookup and proves no mandatory parent.
+        let opened = handle.identity();
+        if let Some(area) = resolved.held_identity() {
+            crate::tape::context_link(
+                "release::decide_root",
+                &root.path,
+                (opened.device.get(), opened.inode),
+                (area.device.get(), area.inode),
+            );
+        }
+    }
     let expectation = area::MarkerExpectation {
         volume_uuid: &record.volume_uuid,
         resolved_path: &root.path,

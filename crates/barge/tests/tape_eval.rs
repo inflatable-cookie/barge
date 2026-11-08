@@ -32,10 +32,13 @@
 //! ```
 //!
 //! The fixture root is an exclusively owned directory tree on a real selected
-//! volume; the manifest is one `oxide.capture.manifest/1` document; the
-//! transcript is always one `oxide.capture.transcript/1` document, including
-//! on the engine's refusal. The `--case` value must equal the manifest's
-//! `case` member, so a mismatched invocation is refused before any window.
+//! volume; the manifest is one `oxide.capture.manifest/2` document; the
+//! transcript is always one `oxide.capture.transcript/2` document, including
+//! on the engine's refusal. A refusal before the engine ran, or a report that
+//! cannot be carried into a conforming transcript, writes the distinct
+//! `oxide.capture.apparatus/2` diagnostic instead. The `--case` value must
+//! equal the manifest's `case` member, so a mismatched invocation is refused
+//! before any window.
 //!
 //! Exit codes: the engine's own — `0` or `3` for a completed plan
 //! (`PruneReport::needs_human`), `2` or `3` for a refusal

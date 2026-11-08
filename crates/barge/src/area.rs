@@ -1409,6 +1409,20 @@ impl ResolvedArea {
     pub fn exists(&self) -> bool {
         matches!(self.dirs, Direction::Existing { .. })
     }
+
+    /// The identity of the directory handle this resolution actually holds.
+    ///
+    /// It exists so the capture tape can record an already observed context
+    /// link for a child opened by pathname: the configuration resolved this
+    /// handle, and the child's open is relative to the same area folder. It
+    /// adds no filesystem operation.
+    #[cfg(test)]
+    pub(crate) fn held_identity(&self) -> Option<crate::os::DirId> {
+        match &self.dirs {
+            Direction::Existing { handle } => Some(handle.identity()),
+            Direction::Missing { handle, .. } => Some(handle.identity()),
+        }
+    }
 }
 
 /// The policy fields two declarations for one area disagree on, in the fixed
@@ -3023,7 +3037,13 @@ pub(crate) fn read_directory(path: &Path) -> Result<Option<Vec<String>>> {
             .with_detail("path", path.display().to_string().into())
         })?;
         #[cfg(test)]
-        crate::tape::dir_entry("area::read_directory", None, &entry.file_name());
+        // Every listed name is a child of the directory this site's own
+        // precheck observed, so the parent is `extracted`, never inferred.
+        crate::tape::extracted_dir_entry(
+            "area::read_directory",
+            Some((metadata.dev(), metadata.ino())),
+            &entry.file_name(),
+        );
         names.push(entry.file_name().to_string_lossy().into_owned());
     }
     names.sort();

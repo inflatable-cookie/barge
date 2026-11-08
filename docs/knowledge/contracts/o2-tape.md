@@ -18,7 +18,16 @@ does not prove.
   test/non-test split retains the original production expression and records
   the single test computation.
   The tape is one-sided: it records what the real syscalls and parsers
-  returned, and feeds nothing back.
+  returned, and feeds nothing back. The module writes two documents: its own
+  `barge.capture.recorder/1` diagnostic (caps, per-row provenance flags, the
+  fixture capture and the notes) and, through the adapter below, the reviewed
+  `oxide.capture.transcript/2` capture. The recorder document is not a capture
+  schema and is never proof input.
+- `crates/barge/src/capture_wire.rs` — the copied, reviewed shared-wire parser
+  and completeness rules for `oxide.capture.transcript/2` and
+  `oxide.capture.manifest/2`, with the hashed `/2` vectors under
+  `crates/barge/tests/fixtures/capture-vectors/v2/`. It is a `#[path]` child
+  module of `tape.rs`, compiled only in the test tape.
 - `crates/barge/src/tape_harness.rs` — the window runner (`run`) both the
   executable and the embedded exercise call, plus the fixture builders. Also
   `cfg(test)`-only and `pub(crate)`.
@@ -33,10 +42,13 @@ does not prove.
   compiles none of them). The linked library rlib is never used for
   instrumented code.
 - `crates/barge/src/tape.rs`'s own tests: recorder roundtrip and deterministic
-  bytes, the refusal document, the caps (read rows, per-key occurrences,
-  process rows, the 8 MiB document), the no-public-surface declaration shape,
-  and a limited source guard check. That check does not establish per-site
-  coverage; the mechanical compile-away check is `effigy rust:compile:release`.
+  bytes (the measured `window_elapsed_ns` aside), the apparatus diagnostic, the
+  caps (read rows, per-key occurrences, process rows, the 8 MiB document), the
+  no-public-surface declaration shape, the emitted `/2`-shape conformance
+  regression, the delegated completeness controls, the fixture-capture net
+  change, the PCF-4/PCF-5 controls, and a limited source guard check. That
+  check does not establish per-site coverage; the mechanical compile-away check
+  is `effigy rust:compile:release`.
 - `crates/barge/src/tape_harness.rs`'s tests: the embedded end-to-end exercise
   (one exclusively owned directory fixture on a real selected volume, the
   actual `release::plan`, one completed window over a settled root with a
@@ -45,8 +57,8 @@ does not prove.
 
 ## What the tape records
 
-The provisional instrumentation includes the following source symbols; it is
-not a complete source-site audit. Process leaves (`MacOs::process_table`,
+The instrumentation includes the following source symbols; it is not a
+complete source-site audit. Process leaves (`MacOs::process_table`,
 per-fd `PROC_PIDLISTFDS` listings, per-descriptor
 `PROC_PIDFDVNODEPATHINFO`/`PROC_PIDFDVNODEINFO` answers including every
 bounded retry, `csops` code-signing status, effective uid, boot identity,
@@ -95,7 +107,12 @@ custody scan over this account's ~480 same-uid processes produces about 4700
 per-fd leaf rows (`descriptor_path` and `descriptor_vnode_facts` for every
 listed descriptor) plus the process rows, which alone approach or pass the
 8192-row cap, and the host's full process table exceeds the 512 process-row
-cap. This is the leaf tape recording exactly what the scan really reads, as
+cap. The wire's narrower identity key then truncates the same families again:
+the retained real-host window reports `read_rows_truncated`,
+`process_rows_truncated` and `occurrences_truncated`, emits about 1,860 of its
+8,192 recorded rows, and is therefore insufficient by rule. That is a finding
+about the shared key, recorded under "Shared-wire source and limits", not a
+relaxation of any cap. This is the leaf tape recording exactly what the scan really reads, as
 the contract requires; the consequence for the later X-S2 windows is theirs to
 measure and declare — a counted comparison on a real host must either run in a
 machine state whose custody scan fits the fixed caps or record its truncation
@@ -103,26 +120,91 @@ honestly (and then be insufficient). Nothing here relaxes a cap.
 
 ## The transcript
 
-The harness converts the recorder's internal document to the reviewed
-`oxide.capture.transcript/1` shape for a normal window. It emits `schema`,
-`version`, `engine`, `case`, `manifest_sha256`, the entrypoint symbol,
-`outcome.state`, the engine outcome and result under `outcome`, `truncation`,
-`effects`, `reads`, `clocks`, classifications, recorded holders, fixture
-capture and notes. The source binding is recorded in notes. The internal
-`caps`, obligation diagnostics and `observation_proven` fields are not shared
-wire fields. A failed conversion retains the internal recorder document and
-returns an apparatus error; it does not invent an engine result. The bounded
-apparatus-refusal document for a failure before the engine runs is also an
-internal diagnostic, not a conforming shared transcript.
+`/2` is the current proof input (Oxide 284, merged at
+`923d01f803cc7708569985cd5217edc294a1189c`). A `/1` transcript or manifest is
+refused by name and never upgraded; the `/1` fixtures and their hashes stay
+unchanged under `crates/barge/tests/fixtures/capture-vectors/` as history and
+are refused as current proof inputs.
 
-The copied Oxide 283 parser validates the reviewed manifest wire structure,
-including `parent_required` on each mandatory observation. The harness then
-extracts `case`, `barge.volume_uuid`, `barge.namespace`, `barge.area`, and
-optional `barge.named_roots` to invoke the engine. It also binds the complete
-manifest digest and attaches obligation and effect diagnostics; it does not
-claim that the parser fully validates every substructure or establishes
-completeness. Missing or mistyped required members cause an apparatus error.
-Engine refusals retain the engine's own error and exit code in the outcome.
+The harness emits one conforming `oxide.capture.transcript/2` document per
+window, including an engine refusal, from the recorder's rows:
+
+- `schema` and `version` are both `oxide.capture.transcript/2`; `engine` is
+  `barge`; `manifest_sha256` binds the whole manifest; `entrypoint` names the
+  called symbol; `window_monotonic_start_ns` and `window_monotonic_end_ns` are
+  explicit `null` because no absolute origin is proven, while
+  `window_elapsed_ns` is the recorder's real measured elapsed time.
+- `outcome` is `completed` with the engine's own report object, or `refused`
+  with the engine's refusal reason, exit code and `source: engine`.
+- `reads` rows carry `kind` equal to the observed `site`. The wire requires the
+  two to agree, and one Barge source symbol records several leaf families, so
+  Barge's wire site is `<source symbol>#<observation family>` (for example
+  `MacOs::dir_facts#stat`, `state::read_bounded_inner#file`). The recorder
+  document keeps the bare symbol and the family separately, and a manifest
+  obligation for Barge must name the same string. Every row also carries a
+  complete 15-field identity (`null` where a fact is missing), one of the
+  shared outcome shapes, `cap` as `null` when no cap applies (a real `0` stays
+  `0`), `epoch` and `occurrence`. The recorder counts occurrences per complete
+  internal identity (which includes fd, pid, start, uid and volume UUID); the
+  wire key is narrower, so the adapter renumbers occurrences per emitted key in
+  emitted order and stops emitting rows for a key at the shared 64 cap,
+  recording `occurrences_truncated`. Every row keeps its outcome and epoch, and
+  the recorder document keeps every recorded row.
+- `effects` rows are attempts (`result: unknown`) or observed results.
+  `succeeded` is only a completed observation. Any error is recorded as
+  `partial`, because this recorder cannot prove that no bytes were written, so
+  it never claims `failed`; that vocabulary remains a parser and completeness
+  shape exercised by the vectors. A row whose path cannot be represented is
+  emitted as `descriptor-effect` with no path and its observed result, so its
+  identity stays unproven rather than being invented.
+- `clocks` rows carry the `now_ms` value that was returned to its caller.
+  `classifications` is empty because this evaluator keeps no separate
+  classification family.
+- `recorded_holders` rows carry the record id, pid, recorded start, and an
+  explicit `null` `kernel_start` and `uid` unless this run observed them.
+- `fixture_capture` is the apparatus's bounded pre/post walk of the owned
+  fixture tree (4096 entries, 32 MiB of hashed bytes) with the wire identity
+  names `device` and `inode`, plus the net change as `fixture-diff` effects:
+  `attempted: false`, `epoch: 0`, `result: unknown`. A diff corroborates a
+  persistent change; it never replaces a temporal observation, and a truncated
+  capture is a completeness issue.
+- Epochs start at one, are assigned at the leaf and are unique across reads,
+  effects, clocks and holders.
+
+Completeness is not reimplemented here. After emission, the harness calls the
+copied shared `capture_wire::assess_completeness` over the emitted document and
+the manifest, and reports the resulting issues in its run summary. The
+in-window identity and effect-parity rules are the shared parser's own
+functions, so no second projection can diverge.
+
+Two distinct diagnostic documents are never captures:
+
+- `oxide.capture.apparatus/2` (`schema`, `version`, `case`, `manifest_sha256`,
+  a bounded `reason` and the reason's `reason_sha256`) records a refusal
+  before the engine ran, or a fallback where the engine's report could not be
+  carried into a conforming transcript. The transcript parser refuses its
+  schema by name.
+- `barge.capture.recorder/1` is the recorder's own diagnostic document. It is
+  where the caps, the per-row `observation_proven` flag, the effect parent and
+  rename-destination facts, the clock site, the digest size and the fixture
+  pre/post arrays that have no `/2` field are kept. It is written beside the
+  apparatus document (`<transcript>.recorder.json`) when a conversion fails;
+  it is never written under a capture schema.
+
+The copied Oxide 284 parser validates the strict `/2` manifest (typed source
+binding, fixture entries by kind, complete obligation identities, mandated
+`parent_required`, `attempted` on every declared effect, window order). The
+harness then extracts `case`, `barge.volume_uuid`, `barge.namespace`,
+`barge.area`, and optional `barge.named_roots` to invoke the engine, and binds
+the complete manifest digest. Missing or mistyped required members cause an
+apparatus error. Engine refusals keep the engine's own reason and exit code.
+
+Known shared-wire limits, stated rather than worked around: a volume row can
+observe a numeric device without an inode, and the wire's device/inode pair is
+both-or-neither, so that number stays in the recorder document and the wire
+states no own identity; effect parent identity and rename destinations, the
+clock site and the digest's byte size have no `/2` field; and the surface never
+carries an internal provenance flag.
 
 ## Staging and export (for the later X-S2 orchestration)
 
@@ -346,11 +428,13 @@ captures. No process is omitted from that route and no cap changes. `effigy rust
 the production compile-away. All are covered by `effigy rust:test` and
 `effigy rust:compile` besides.
 
-Capture refusal errors include the transcript path and diagnostics from the
-internal document; those fields may be null for shared-wire truncation. The embedded exercises copy useful transcripts beside their unique
-fixture directories within the caller's run root before fixture teardown, so
-both complete synthetic controls and insufficient real-host captures are retained.
-The tests do not qualify capture, comparison, native behavior or parity.
+Capture refusal errors include the transcript path and its truncation flags; a
+refusal before the engine ran writes the distinct apparatus diagnostic, which
+names its bounded reason and the reason's digest. The embedded exercises copy
+useful transcripts beside their unique fixture directories within the caller's
+run root before fixture teardown, so both complete synthetic controls and
+insufficient real-host captures are retained. The tests do not qualify capture,
+comparison, native behavior or parity.
 
 Two errno-capture controls use a safe metadata lookup on an empty path to set
 and verify `ENOENT` before checking that the earlier captured error is recorded.
@@ -369,7 +453,10 @@ a deletion, a custody conclusion or a live Builds comparison.
 
 The internal recorder marks individual observations according to their
 available identity; the shared-wire adapter does not emit that internal flag.
-The window remains incomplete independently of the engine result. Fully identified process rows and classified/retry process observations,
+The completeness rules the harness applies are the shared parser's own, and
+`parent_required`, a holder without a kernel start, an unvalued clock and an
+unproven window origin are all named issues. The window remains incomplete
+independently of the engine result. Fully identified process rows and classified/retry process observations,
 and scalar uid, boot and complete process-table observations can be marked proven; refused rows and families without audited
 identity rules remain unproven. It cannot satisfy mandatory
 coverage or establish parity. Path observations do not infer a parent with a
@@ -389,8 +476,9 @@ opens its target by path and an absent open supplies no parent identity.
 `reference::read_receipts_with` receives a `ReadDir` and entries but does not
 expose a parent descriptor identity for those entries. `MacOs::dir_facts` and
 `recheck_dir` observe a descriptor's own identity but `DirHandle` carries no
-path or parent identity. These sites cannot establish the required binding by a
-later stat or a lexical path. A separately reviewed change would need to carry
+path identity, so the wire row names the handle's observed identity as its
+`context` parent and never a pathname. These sites cannot establish the
+required binding by a later stat or a lexical path. A separately reviewed change would need to carry
 an already opened parent descriptor and its identity through these existing
 operations, binding each child observation to that descriptor and recording
 its actual result, without a second lookup; no such change is authorized here.
@@ -423,213 +511,53 @@ context, not as an observed parent. The absence proof's stored `proved_ms` is
 recorded without another clock read. Occurrence keys use structured identity
 fields so delimiter characters do not merge distinct observations.
 
-There are additional known apparatus gaps. `missing_obligations` can compare
-an internal source-site and identity tuple to proven rows, and refuses
-to satisfy one with an unproven or refused row. A provisional projection of
-`mandatory_observations` reports missing and unmapped manifest indices after
-capture, while its status remains `insufficient` regardless of matches. Unknown
-identity fields, unsupported volume binding, missing input and the 256-key cap
-are explicit; no field is dropped to produce a positive match. This projection
-does not reconcile extra reads, dynamic facts or effects and is not a complete
-shared-schema reconciliation. It does not establish obligation coverage. The
-harness emits a
-bounded apparatus-refusal document for manifest parse, case-mismatch,
-unreadable manifest, state-path resolution and window-open failures once an
-output path is known. Malformed argv also writes one when it identifies exactly
-one unambiguous transcript destination. It records that the engine did not run; an unwritable
-output or missing output argument cannot carry a document. Its internal
-diagnostic fields are not the reviewed shared-wire shape. If
-effects, clocks and the result exceed the document cap after all read rows are
-dropped, `finish` emits a bounded refusal with omitted counts and original
-engine status. It carries the original outcome when that fits within a
-64-KiB summary bound; otherwise it records its digest and explicitly marks it
-omitted. That fallback is an internal diagnostic, not shared-wire conformance.
-Any exhausted capture cap or dropped read causes an apparatus error after the
-transcript is written; the bounded fallback preserves the engine outcome or
-its digest and omission marker as described above. If a completed
-report cannot be serialized, the document records its omission and the real
-engine status and exit code; it does not invent a report.
-The internal recorder's document byte count is its serialized length, including
-the length field itself. When that document is too large, deterministic tail
-batches are omitted and counted rather than reserializing once per row; the
-result is explicitly truncated and is not coverage.
+There are additional known apparatus bounds. Completeness is no longer a
+Barge projection: the harness applies the copied shared
+`assess_completeness` to the emitted `/2` document and manifest, so a missing
+obligation, a wrong identity, an unresolved `parent_required`, an unproven
+holder lifetime, an unvalued clock, an unproven window origin and any effect
+parity failure are reported by the shared rules, never by a second copy. That
+report is a run-summary diagnostic; the transcript itself carries only the
+shared fields.
 
-The Oxide 283 parser validates the reviewed shared manifest's structure,
-including `engine`, `site`, `identity` and `parent_required` on obligations.
-The internal projection keeps unsupported identity fields unmapped; it does
-not turn a volume or context mismatch into a match. The parser's successful
-structure check is not completeness or runtime coverage.
+The harness writes a bounded `oxide.capture.apparatus/2` diagnostic for manifest
+parse refusal, case mismatch, an unreadable manifest, state-path resolution,
+window-open failure, an unserializable engine report, and a recorder document
+that cannot be converted or exceeds the document cap. Malformed argv also writes
+one when it identifies exactly one unambiguous transcript destination. The
+diagnostic records that the engine did not run (or its real status when it did),
+with a bounded reason and the reason's digest; an unwritable output or missing
+output argument cannot carry a document. It is never a transcript. Any exhausted
+capture cap or dropped read causes an apparatus error after the transcript is
+written.
 
-The shared manifest's `expected_effects` entries have kind, site, path and attempted
-but no engine. A provisional diagnostic treats only an explicitly empty
-array as unambiguous: every observed Barge write attempt, including a failed
-one, is listed as unexpected. Missing input, a set beyond 8192 entries, and a
-nonempty set are reported separately; a nonempty set is not silently assigned
-to Barge. All these diagnostics remain insufficient and are not dynamic effect
-reconciliation or proof that no unrecorded write occurred.
+The recorder's document byte count is its serialized length, including the
+length field itself. When that document is too large, deterministic tail
+batches are omitted and counted rather than reserializing once per row; when it
+still does not fit, the result is the bounded apparatus diagnostic, which names
+the engine status, exit code, outcome digest and the omitted counts. A truncated
+recorder document was never written under a capture schema.
 
-The shared parser does not fully validate all apparatus-error and auxiliary
-substructures. No successful comparison follows from these gaps.
-The export receipt and binding checks are source only: until the private route
-is qualified and the exact-head export is built and independently checked,
-they are not evidence of an actual staged executable or source binding.
+The copied Oxide 284 parser validates the reviewed shared manifest's complete
+structure: typed source binding, fixture entries by kind, the four obligation
+identity alternatives, mandatory `engine`, `site`, `identity` and
+`parent_required`, declared `attempted` on every expected effect, window order
+and every cap. Its successful structure check is not completeness or runtime
+coverage, and it is the same parser and reconciler implementation the vectors
+exercise.
 
-Descriptor listing, entry and vnode rows without operation-time process
-identity remain unproven. The tape does not reuse a classified or retry
-identity for a later listing or vnode read. The existing `state::sync_directory`
-open-and-sync result is recorded without another stat; its identity remains
-unbound, and an earlier publish stays an effect if sync fails.
-
-## Production statement audit
-
-The O1 pin `4af9360bd09629e970c143080ca159de8eef2562` and the planning
-base `39064bafbc14b2ba7bd876e286e9752f12583dd1` have no diff under `crates/`,
-workspace manifests, lockfile or toolchain. Source review at this branch restores
-non-test match arms and expressions at the instrumented read sites. A line-level
-O1 diff has no removed source lines after these splits; that check alone does
-not prove that newly added statements compile away or preserve behavior. A
-per-statement equivalence review and release compile remain required before
-acceptance.
-
-The O1-to-planning difference is not empty across the entire repository:
-`scripts/native/release-proof.py` changed in commits `56b067b`, `b966777` and
-`3a21036` for the native release-proof dependency guard, remount replay and R12
-fixture thresholds. It is a separate executable proof apparatus, not the
-library evaluator; there is no additional change to that script between the
-planning base and this branch. Those historical changes are not evidence for
-this tape or permission to execute a native proof.
-
-Those script deltas are executable: staging drops inherited Rust flags and
-disables automatic toolchain installation; fixture startup scrubs inherited
-Oxide, XDG and Barge variables and explicitly selects the synthetic account;
-attach marks custody before invoking `hdiutil`. R11 now saves content, marker
-and identity, validates remount-relative rebinding and rollback, and stops on
-unknown detach custody. R12 first creates a fresh private registration only
-after R11 passes. Dispatch marks dependent cases skipped, distinguishes
-unknown or unexecuted cases, retains unknown custody without repair, and adds
-pure controls for the rebind and dispatcher. These are prior proof-apparatus
-behavior changes, not non-test library statement equivalence.
-
-The current source map against that O1 pin, for reviewer inspection, is:
-
-| File | Source sites changed | Non-test basis and remaining review |
-| --- | --- | --- |
-| `area.rs` | `VolumeRoot::open_with`, `resolve_by`, `read_directory`, `read_hold_directory`, `list_names`, `scan_activity_within` | Volume verification/open and resolution keep the O1 calls and returns, with test-only observations after results. In `read_directory`, the original NotFound arm and original error return are retained in `cfg(not(test))`; the test arms retain the same return and error, and other additions only record already obtained results. `read_hold_directory` records the existing uid and metadata results. `list_names` preserves the original missing-directory return in its non-test arm and reconstructs the same return in its test arm; the completed-list observation precedes the unchanged result. `scan_activity_within` records immediately before its existing incomplete and final returns. |
-| `custody.rs` | `take_custody_by`, `decide` | The O1 `Ok(evidence)` and two `Err(Refusal::...)` match arms remain verbatim in `cfg(not(test))`; test arms record then return the same constructors. `decide` adds one test-only call before its original `Ok(CustodyEvidence { ... })`. |
-| `identity.rs` | `read`, `verify` | The original `read_child_file` result is recorded after its `?` and before the original `child_facts`. The O1 `Ok(None)` and `Err(_)` arms remain verbatim under `cfg(not(test))`; the test arms return the same unknown reasons. Duplicate UUID, missing mount and final compare retain their original order with test-only calls immediately before their existing statements. |
-| `os/absence.rs` | `prove_absence`, `prove_absence_inner` | The O1 `let proof = prove_absence_inner(...)?` remains verbatim in the non-test branch; the test branch calls it once and returns the same error. Serialization and cap checks remain in their original order, with test-only refusal records. The original proof clock expression remains in the struct; the test row reads the already stored `proved_ms`. The added regression is test-only. |
-| `os/macos.rs` | mount/volume, process and descriptor observations; `DirOps` | Mount census, lookup, boot and root checks keep the original syscalls and returns with test-only observations. `effective_uid` retains the original `geteuid` expression under `cfg(not(test))`; its test branch calls it once and records the returned uid. Process/descriptor additions record existing rows, errno values and retry identities. `path_facts`, `child_facts` and `open_directory` retain the original `last_os_error()` returns under `cfg(not(test))`; their test branches capture errno immediately and return through the original helper. `create_child_dir`, `publish_child_file`, `dir_facts`, `recheck_dir` and `read_identity` retain original non-test operations in cfg splits; test branches call each operation once. For publish the original `write_all`, file sync, `renameat`, directory sync and cleanup `unlinkat` are individually preserved in non-test branches, with corresponding single-operation test branches. Removal and rename retain original syscalls and record attempts/results around them. Directory listings and child reads record already obtained entries, handles and bytes. This is a source map, not a compiled cfg-equivalence proof. |
-| `pool_custody.rs` | `classify`, `read_document` | The classification loop adds a test-only row before the original duplicate check. The three O1 `read_bounded` arms remain verbatim under `cfg(not(test))`; test arms record the consumed outcome then return the same value. The original `if identity(path)? != before` remains verbatim in the non-test branch; the test branch evaluates `identity(path)?` once, records it, then makes the same comparison and return. |
-| `reference.rs` | `BargeReferences::read`, `control_directory_with`, `pools_holding`, `read_registry`, `read_receipts_with`, `read_oxide_marker` | Original placement-read, removable-pool metadata match, registry read and parse matches, and both marker child-facts/read matches remain verbatim under `cfg(not(test))`. Their test counterparts perform each original call once and return the same values and errors, adding observations. `control_directory_with` records its stored inspect result. The receipt `Ok(Some(receipt))` push remains verbatim in the non-test arm; the test arm records then pushes the same receipt. Other receipt additions read the already obtained path's component and add no filesystem operation. |
-| `registry.rs` | `read_with_deadline` | The complete original `let bytes = match state::read_bounded(...)` and `let document = serde_json::from_slice(...).map_err(...)?` statements remain verbatim in `cfg(not(test))`. Test branches use the same read and parser once, record their consumed outcomes, and return the same named errors. Validation follows both branches unchanged. |
-| `state.rs` | `read_bounded_inner`, `publish_atomic_with`, `write_and_publish`, `sync_directory`, `now_ms`, `StateLock`, `wait_for_lock`, `read_intents_with_deadline` | The O1 NotFound arms of bounded read, shared lock and intent directory read remain verbatim in non-test branches; test arms return the same absent values after recording. Other read and lock additions observe existing values or error branches. Publication retains the original create, cleanup unlink, write, file sync, rename and directory-sync statements in non-test branches; test branches execute each original operation once through the recorder and retain its error handling. `now_ms` retains its original expression under `cfg(not(test))`; the test branch evaluates it once and returns the recorded value. Intent enumeration uses the existing entry name and preserves its sorted result. |
-| `release.rs` | no tape delta against O1 | Caller clock observations come from `state::now_ms`; release's original calls remain in place. |
-| `lib.rs`, `Cargo.toml`, `tests/tape_eval.rs`, `tape.rs`, `tape_harness.rs` | test-only modules, harness target and recorder | The O1 library declarations remain intact; `lib.rs` adds only `cfg(test)` crate-private tape and harness modules. The Cargo addition is a `[[test]]` target, with no dependency or feature change. `tests/tape_eval.rs` includes the existing library source as test-target modules; the two new recorder modules are test-only. Release compile-away remains unverified. |
-| `effect.rs`, `guard.rs`, `undo_capture.rs` | source-link shadows for the included test target | These are Git symlinks respectively to `space/effect.rs`, `space/guard.rs` and `cache/undo_capture.rs`. The original production child-module declarations remain in their original parents; `lib.rs` adds no top-level declarations for these shadows. They resolve the same existing bytes for the included test-target parent modules. Their actual target/build reachability remains unverified until compilation. |
-
-This map identifies the changes for review; it is not a completed proof that
-every newly added item compiles away. In particular, a textual diff cannot
-prove cfg reachability, and no current-head release compile has run.
-
-The named write helpers are outside the direct plan body: `release::plan` calls
-`plan_observed` (release.rs:358, 387), while effect execution starts at
-`release::execute` (release.rs:1854). `identity.rs:122,284,318` and
-`area.rs:1297,1745,2259,2261,2361` locate random and sync operations in
-identity creation and area mutation paths, rather than by themselves proving
-plan reachability. `set_dir_mode` and `create_child_symlink` are DirOps mutation
-implementations in `os/macos.rs:4362,4403`. Their absence from the concrete
-plan call path follows from the trace below, not merely from their names.
-
-The observed lock branch is narrower than the exclusive mutation branch:
-`release::read_registry` calls `LockSet::observe_registry`, and
-`plan_observed`/`decide_root` call `observe_volume`, `observe_root` or
-`observe_unit` (release.rs:747, 514, 800). Those methods lead to
-`StateLock::shared_if_present` (state.rs:970, 1182–1225), whose `OpenOptions`
-has `read(true)` and no create/write flags; an absent lock returns `None`.
-That does not reach `StateLock::exclusive`'s create/open or the publication
-helpers. `release::plan_observed` calls `area::show`, `resolve_by`,
-`list_names`, `BargeReferences::read`, `OxideSnapshot::read_within`,
-`pending_intents` and `decide_root` (release.rs:404–550). `area::show` reads
-declarations (area.rs:2867, 3167), while `resolve_by` uses
-`walk_folder_chain` (area.rs:1041, 1509); neither call selects a creation
-entry point. Their descendants and the concrete platform callbacks are traced
-below; the tape records a failed write as possibly partial rather than asserting
-that it changed nothing.
-The placement census branch goes from `BargeReferences::read` to
-`cache::read_placements` (reference.rs:277; cache.rs:676), which enumerates
-via `area::read_directory`, reads bounded placement documents, validates and
-returns the set; it does not call the cache adoption or publication methods.
-The Oxide snapshot branch (reference.rs:628) calls `control_directory`,
-`read_registry`, `read_receipts`, `pools_holding` and `PoolCustody::read`;
-the latter reads pool records through `read_pool` and `read_document`
-(pool_custody.rs:129, 192, 394). This branch is observational and does not call
-the state publication helpers. Root custody goes through
-`custody::take_custody_by` → `decide` (custody.rs:403, 644), including hold,
-marker, identity and process-observer checks. The platform leaves are traced
-below; refusals return from these read paths without a cleanup write.
-
-Within `custody::decide` (custody.rs:644), the state operations are hold and
-registry reads. It opens the area and parent, obtains child facts and a
-directory handle, reads the marker, asks for the current pid/start and scans
-descriptors; it does not call a `DirOps` create, publish, rename, unlink or
-sync operation. Its early returns do not run cleanup writes. The area folder
-walk is `walk_folder_chain` → `walk_folder`, using child facts and directory
-opens (area.rs:1041); it reports the remainder when absent, it does not create
-it. `StatePaths::resolve` also constructs paths without initialization
-(state.rs, `StatePaths::resolve`); its separate `initialize` method is not
-called from the harness or plan. At the macOS `DirOps` boundary, `open_path`
-opens a directory; `path_facts` uses `lstat`; `open_child_dir` uses `openat`
-with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW`; `child_facts` uses no-follow
-`fstatat`; `read_child_file` uses read-only no-follow `openat` and reads; and
-`list_children`/`list_names` duplicate the descriptor and use `readdir`
-(os/macos.rs:3647–4263). `dir_facts` and `recheck_dir` only query the open
-descriptor (os/macos.rs:4342, 4383). The mutation methods in that implementation
-are separate: create/publish/remove/rename (os/macos.rs:3803, 3831, 4264,
-4296), plus `set_dir_mode` and `create_child_symlink` (os/macos.rs:4362, 4403).
-The concrete harness supplies `MacOs` for every platform trait, rather than a
-caller-provided mutation callback. Its descriptor scan starts with
-`process_table` and `scan_processes` (os/macos.rs:958, 1015, 2817); the
-production call supplies an empty fault list. Its process table and individual
-identity `sysctl` calls pass a null new-value pointer and zero new-value size,
-and descriptor enumeration uses `proc_pidinfo`/`proc_pidfdinfo` and
-`csops(CS_OPS_STATUS)`. Retry paths re-observe or sleep; they do not write a
-fixture. The process-table allocation before the cap remains separately
-unbounded and is not qualified by this source review. Volume identification
-uses read-only directory opens, `getfsstat`, `fstatfs`, `fstat` and volume UUID
-attribute reads (os/macos.rs:176–415, 445–505, 4480–4680). The volume-flush
-fork and sync path (os/macos.rs:552 onward) is a separate operation, not called
-by those identification methods or `release::plan`.
-
-For this concrete `release::plan` window, the reviewed branches therefore do
-not call a data-mutating operation: its effect set is empty if that source
-trace holds at execution. The excluded publication/effect entry points still
-record their attempts and outcomes when exercised by tests; an attempted write
-is never removed to make a transcript empty. This is a static source finding,
-not a runtime receipt or proof that the fixed tape captures every read.
-
-The separate state publication path is `publish_atomic` →
-`publish_atomic_with` → `write_and_publish` (state.rs:654, 660, 763). It
-records temporary-file create, `write_all`, and rename attempts with their
-actual outcomes; a failed save retains possible partial effects. Between the
-save and rename, the test branch calls `file.sync_all()` once and records its
-returned result at `state::write_and_publish`, without a path stat or inferred
-descriptor identity. The original non-test statement remains verbatim. A
-successful rename remains an effect even if `sync_directory` subsequently
-fails (state.rs:750, 843); the directory sync result is recorded separately.
-Before rename, an error triggers a recorded best-effort temporary-file unlink;
-its failure does not replace the original publication error. `StateLock::exclusive`
-(state.rs:946) records the create/open attempt and outcome; the concrete plan
-uses only shared observation locks. The corresponding descriptor-relative
-publish path records temporary create, save, file sync, rename, directory sync
-and any cleanup unlink in `MacOs::publish_child_file` (os/macos.rs:3831–3963).
-These remain source findings and do not establish native qualification.
+The shared manifest's `expected_effects` entries have kind, site, path and
+`attempted`. Only a declared effect with `attempted: false` can be completed
+parity; a declared attempt is named and never matched. An observed attempt, a
+`partial` row or an unpathable descriptor effect is not completed parity, and a
+repeated completed row is an extra effect. The run summary reports those issues;
+it does not claim dynamic effect reconciliation.
 
 Effect rows carry the call-site file and line separately from the closed
-effect kind. A failed operation records its actual error and
-`partial_effect_possible`; in particular, `write_all` does not report whether
-earlier writes succeeded before an error. This preserves uncertainty instead of claiming
-either a successful full save or no mutation. The row and field are provisional
-wire details pending shared-schema review.
+effect kind. A failed operation records its actual error in the recorder
+document and `partial_effect_possible`; in particular, `write_all` does not
+report whether earlier writes succeeded before an error, so every recorded error
+is emitted as `partial`, never as `failed` or as a completed effect.
 
 The ordinary test suite includes
 `ordinary_account_tests::an_ordinary_build_takes_oxide_directories_from_the_password_database_home`.
@@ -647,32 +575,75 @@ design and review; the tape does not inject a limit or alter evaluator flow.
 
 ### Shared-wire source and limits
 
-The test-only wire parser and canonical vector files are adapted from Oxide
-commit `a35aef84bc3b8cb0ac943dfa005456a45167399b`;
-`src/bin/oxide/capture_wire.rs` there hashes to
-`6c0d4b47779af389f33072a7e397f5799a27002282bc8b23436ea617c1b77c8f`,
-and its vector `SHA256SUMS` hashes to
-`bb50822c3393bb0cb9e8bc53142c821dd1cdfa1a4d4828186c7b90d375099091`.
-The local copy uses Barge's digest implementation and local vector paths. It
-is compiled only in the test tape. The parser checks structure; its vector
-controls do not establish runtime coverage or parity. Clocks, classifications,
-truncation, notes and fixture-capture substructures remain outside its full
-validation. Historical packets with provisional field names are not migrated.
+The test-only wire parser, its completeness rules and the canonical `/2`
+vector files are adapted from Oxide 284, merged at
+`923d01f803cc7708569985cd5217edc294a1189c`:
+`src/bin/oxide/capture_wire.rs` at that commit hashes to
+`9a80201bb603e7fc04a9ac3eb2b6b10627cf8b5f097cb671b55482683acb5c80`, and
+`docs/knowledge/contracts/capture-vectors/v2/SHA256SUMS` hashes to
+`e7018741921f795bc461c96b23a552ddf2d1e1752ff78e70b650104749380d76`
+(48 files: eight valid transcripts, eighteen parser refusals, twelve
+parser-positive completeness failures, three valid and seven invalid
+manifests). The two canonical manifest examples are copied too:
+`capture-examples/v2/manifest-example.json` hashes to
+`8025455c4f84bb7640ba2b802bee48282ca09a7148ccc595a627512ed0c42f33` and
+`manifest-effects-all-kinds.json` to
+`517afc326b27be3e66297a5ebbb9d90dc21342153b1ecb9cded2488f6f5286bf`.
+Barge's copy differs from that source only in its digest implementation
+(`crate::digest::sha256_hex` instead of `sha2`) and its local vector paths, plus
+the `expect`-free base-vector accessor the crate's lint policy requires. The
+local `SHA256SUMS` copy hashes identically to the source's, so the catalog still
+binds every vector byte.
+
+The parser validates the whole `/2` transcript and manifest structure,
+including truncation flags, identity pairs and provenance, effect results,
+holder and clock shapes, fixture entries and the manifest's typed source,
+fixture, dynamic, obligation and expected blocks. Its own vector controls, and
+Barge's emitted-shape regression, use those same bytes; they do not establish
+runtime coverage, parity or completeness. The `/1` fixtures and their
+`SHA256SUMS` are retained unchanged as history and are refused as proof input.
 
 Current recorder identities use `parent_source` and `own_source`: a parent
-held for a descriptor-relative operation is `handle`; the separate receipts
-precheck is `extracted`; other contextual facts are `context`; missing facts
-are `none`. Those labels describe observation provenance, not proof of K1.
-The K1 lifetime premise and mandatory parent obligations remain unqualified.
-Process descriptor rows lacking an identity at the operation remain unproven;
-an earlier classification is not reused as a later listing identity. L1
-adds one metadata call on a held lock; failure leaves the lock held and its
-identity unproven. Schema conformance alone does not establish full capture.
+held for a descriptor-relative operation is `handle`; a site's own production
+precheck stat is `extracted`; the R2/S8/R8 links to an already-open handle are
+`context`; missing facts are `none`. Those labels describe observation
+provenance, not proof of K1. The K1 lifetime premise and mandatory parent
+obligations remain unqualified. Process descriptor rows lacking an identity at
+the operation remain unproven; an earlier classification is not reused as a
+later listing identity. L1 adds one metadata call on a held lock; failure
+leaves the lock held and its identity unproven. Schema conformance alone does
+not establish full capture.
+
+Two accepted observation deviations from the 042/045 apparatus are closed here
+because current source supplies the fact, and no other filesystem operation was
+added for them:
+
+- `area::read_directory` entry rows now bind the parent from that site's own
+  production `symlink_metadata` precheck as `extracted` (`Identity::file`'s
+  own-fact rule is unchanged; no second lookup is made). Its precheck refusal
+  and non-directory refusal keep their existing rows.
+- R2 (`release::decide_root`'s root open) records a `context` link from the
+  opened root's own observed identity to the identity of the area handle the
+  resolution already holds; S8 (`MacOs::duplicate_dir`) and R8
+  (`MacOs::dir_facts`, `MacOs::recheck_dir`) record the descriptor's own
+  `handle` identity with the source handle's identity as their `context`
+  parent. The shared wire has no epoch-reference field, so the link is the
+  observed identity and its provenance, not an epoch cross-reference; a
+  mandatory parent stays unproven.
+- PCF-4 and PCF-5 are pure controls over recorded rows:
+  `laundered_parent_rows` names a row that claims a `handle` parent at a
+  direct-read site, and `incoherent_handle_rereads` names a handle
+  self-observation whose own identity differs from its handle context. Both are
+  tested with real recorder rows and with a doctored row, and neither repairs or
+  suppresses anything.
 
 | Remaining obligation | Current limit |
 | --- | --- |
 | K1 lifetime | Held parent identity is recorded, but lifetime and non-reassignment across the required interval are not qualified. |
-| Direct-reader parents | Path prechecks and opens resolve separately; their parent remains unproven. The per-caller compatibility disposition (19 read call sites in 18 functions, 2 lock sites) is in `oxide-capture-parent-identity.md`, "Route B compatibility disposition"; it is a source-backed recommendation to defer, pending planner ruling R-K2. |
+| Direct-reader parents | Path prechecks and opens resolve separately; their parent remains unproven. The per-caller compatibility disposition (19 read call sites in 18 functions, 2 lock sites) is in `oxide-capture-parent-identity.md`, "Route B compatibility disposition". Tom's answer to decision `0bcedf55` v2 defers the production reader change; R-K2 is not re-asked, and no C1/C1-prime/C2 conversion is activated. |
 | Process and descriptor binding | A listing or vnode read without identity observed at that operation remains unproven, even when a classified pid was read earlier. |
-| Complete shared reconciliation | The copied parser and vectors check their declared surfaces; clocks, classifications, truncation, notes and fixture capture are not fully validated. |
-| Real capture qualification | The retained host exercise is bounded evidence, not native, parity, producer, or adoption qualification. |
+| Recorded holders | This plan does not parse a structured holder object (pool custody ignores it), so real windows emit an empty array; the row shape and its explicit null kernel start and uid are exercised only by the emitted-shape control. No holder lifetime is proven. |
+| Volume device | A volume's numeric device has no inode beside it; the wire's both-or-neither pair rule keeps it in the recorder document. |
+| Shared reconciliation in-window | The shared completeness rules are applied by the harness; the engine-side extra/unbound-observation rules are Oxide's X-S2 work and are not implemented here. |
+| Collapsed wire identity keys | The wire's key is `site|path|component|parent_device|parent_inode`: it has no fd, pid, start, uid or volume UUID. A real custody scan's descriptor and process families collapse onto a handful of keys, so the shared 64-occurrence cap truncates them (the retained real-host window now reports `occurrences_truncated` as well as the read-row and process caps). The window is insufficient by rule and the recorder document keeps the dropped rows. Making those families reconcilable needs the shared key to carry process identity — an Oxide schema question, not something Barge can change from here. |
+| Real capture qualification | The retained host exercise is bounded evidence, not native, parity, producer, or adoption qualification. Its window truncates at the fixed read-row cap and is therefore insufficient by rule. |
