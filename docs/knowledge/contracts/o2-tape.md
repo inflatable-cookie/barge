@@ -559,10 +559,14 @@ The O1 pin `4af9360bd09629e970c143080ca159de8eef2562` and the planning
 base `39064bafbc14b2ba7bd876e286e9752f12583dd1` have no diff under `crates/`,
 workspace manifests, lockfile or toolchain. Source review at this branch restores
 non-test match arms and expressions at the instrumented read sites. A line-level
-O1 diff has no removed source lines after these splits; that check alone does
-not prove that newly added statements compile away or preserve behavior. A
-per-statement equivalence review and release compile remain required before
-acceptance.
+O1-to-this-head diff is **not** removal-free: six non-test lines were
+re-expressed in `cfg(not(test))`/`cfg(test)` splits by the earlier observation
+slices — two in `area::read_directory`, three in `MacOs::read_child_file`, one
+in `state::read_intents_with_deadline` — and the non-test branches keep the
+original statements and behavior. The re-expression is semantically equivalent
+by review, and it means a line-level diff can neither show that newly added
+statements compile away nor prove behavioral preservation. A per-statement
+equivalence review and release compile remain required before acceptance.
 
 The O1-to-planning difference is not empty across the entire repository:
 `scripts/native/release-proof.py` changed in commits `56b067b`, `b966777` and
@@ -606,8 +610,10 @@ every newly added item compiles away. In particular, a textual diff cannot
 prove cfg reachability. The mechanical evidence is the covering
 `effigy rust:compile:release` run recorded in the delivery: a default-feature
 production build names none of these modules or statements, so `cfg(test)`-only
-reachability is compiled out. Apart from those SAFETY comments, no non-test byte
-changed.
+reachability is compiled out. This change adds no non-test statement apart from
+five comment-only SAFETY repairs; the earlier slices' six re-expressed non-test
+lines above are the only other non-test delta against the O1 pin, and they are
+recorded rather than claimed byte-identical.
 
 The named write helpers are outside the direct plan body: `release::plan` calls
 `plan_observed` (release.rs:358, 387), while effect execution starts at
