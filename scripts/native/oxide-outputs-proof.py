@@ -388,6 +388,36 @@ def executed_shapes_problems():
     # refusal such as the checkout absence proof, which runs before custody.
     if '"custody is not proven"' not in driver or '"is live"' not in driver:
         problems.append("A9 does not discriminate custody's live-hold refusal")
+    # The A12 readiness premise is observed, not slept on: the holder sends
+    # its acknowledgement only after its lock is positively held, the case
+    # waits bounded, both A12 branches gate the adapter call on that
+    # observation, and no fixed readiness sleep remains before an adapter
+    # call. Structural checks of the helper's contract; the diagnostic itself
+    # proves the behavior.
+    if "fn wait_for_lock_ready" not in driver:
+        problems.append("the holder readiness acknowledgement helper is missing")
+    if "recv_timeout" not in driver:
+        problems.append("the readiness wait is not bounded")
+    if "LOCK_READY_TIMEOUT" not in driver:
+        problems.append("the readiness wait bound is not declared")
+    if "from_millis(300)" in driver:
+        problems.append("a fixed readiness sleep is still present before an adapter call")
+    locked = driver.split("fn case_locked_outcomes(fixture: &Fixture)", 1)[-1].split(
+        "\n/// How long the case waits", 1
+    )[0]
+    ready_sites = locked.count("wait_for_lock_ready(&ready_rx)")
+    call_sites = locked.count("fixture.call(&intent")
+    gated = locked.count("Ok(()) => fixture.call(&intent")
+    if ready_sites != 2 or call_sites != 2 or gated != 2:
+        problems.append(
+            "both A12 branches must gate exactly one adapter call each behind the observed readiness"
+        )
+    first_ready = locked.find("wait_for_lock_ready(&ready_rx)")
+    first_call = locked.find("fixture.call(&intent")
+    last_ready = locked.rfind("wait_for_lock_ready(&ready_rx)")
+    last_call = locked.rfind("fixture.call(&intent")
+    if first_ready > first_call or last_ready > last_call:
+        problems.append("an adapter call is not gated behind its observed readiness")
     return problems
 
 

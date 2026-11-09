@@ -788,38 +788,57 @@ fn case_locked_outcomes(fixture: &Fixture) -> Result<(), String> {
     // The holder must outlast the design lock wait (state::LOCK_WAIT, 5 s):
     // a shorter hold would let the call acquire the lock and proceed, which
     // is exactly how this path stayed unexercised in earlier occurrences.
-    let holder = std::thread::spawn(move || {
+    // Readiness is observed, not assumed: the holder acknowledges only
+    // after its lock is positively held, and the case fails its own
+    // premise rather than invoking the adapter against a lock nobody
+    // holds.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || -> Result<(), barge::error::Error> {
         let mut locks =
             LockSet::with_deadline(state, Deadline::after(std::time::Duration::from_secs(30)));
         let _lock = locks.lock_volume(&uuid)?;
+        // Acknowledge only after the lock is positively held.
+        let _ = ready_tx.send(());
         std::thread::sleep(HOLD_LONGER_THAN_LOCK_WAIT);
-        Ok::<(), barge::error::Error>(())
+        Ok(())
     });
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    let outcome = fixture.call(&intent, &Fixture::request())?;
+    let ready = wait_for_lock_ready(&ready_rx);
+    let outcome = match ready {
+        Ok(()) => fixture.call(&intent, &Fixture::request()),
+        Err(reason) => Err(reason),
+    };
+    // The holder is joined on every path, whatever the adapter answered.
+    finish_holder(holder)?;
+    let outcome = outcome?;
     if outcome.kind != OutcomeKind::KnownNoEffectLocked {
-        finish_holder(holder)?;
         return Err(format!("expected known_no_effect_locked, got {outcome:?}"));
     }
     if !fixture.root_path.exists() {
         return Err("the locked call deleted the root".to_owned());
     }
-    finish_holder(holder)?;
 
     // With a pending intent for this caller id, a locked call stays pending.
     fixture.publish_record(INTENT_ID, CALLER_ID, IntentPhase::Intent)?;
     let state = fixture.state.clone();
     let uuid = fixture.volume_uuid.clone();
-    let holder = std::thread::spawn(move || {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || -> Result<(), barge::error::Error> {
         let mut locks =
             LockSet::with_deadline(state, Deadline::after(std::time::Duration::from_secs(30)));
         let _lock = locks.lock_volume(&uuid)?;
+        // Acknowledge only after the lock is positively held.
+        let _ = ready_tx.send(());
         std::thread::sleep(HOLD_LONGER_THAN_LOCK_WAIT);
-        Ok::<(), barge::error::Error>(())
+        Ok(())
     });
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    let outcome = fixture.call(&intent, &Fixture::request())?;
+    let ready = wait_for_lock_ready(&ready_rx);
+    let outcome = match ready {
+        Ok(()) => fixture.call(&intent, &Fixture::request()),
+        Err(reason) => Err(reason),
+    };
+    // The holder is joined on every path, whatever the adapter answered.
     finish_holder(holder)?;
+    let outcome = outcome?;
     if outcome.kind != OutcomeKind::Pending || outcome.intent_id.as_deref() != Some(INTENT_ID) {
         return Err(format!(
             "expected pending with the binding, got {outcome:?}"
@@ -836,4 +855,20 @@ fn finish_holder(
         .join()
         .map_err(|error| format!("the holder panicked: {error:?}"))?
         .map_err(|error| format!("the holder failed: {}", error.message()))
+}
+
+/// How long the case waits for the holder's lock-acquired acknowledgement.
+/// Bounded within the case envelope: a holder that has not acquired inside
+/// this window is a failed premise, never an unbounded wait.
+const LOCK_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait for the holder's acknowledgement, which it sends only after its
+/// volume lock is positively held. A timeout or a dead holder is a failed
+/// premise: the case never invokes the adapter without observed readiness.
+fn wait_for_lock_ready(ready: &std::sync::mpsc::Receiver<()>) -> Result<(), String> {
+    ready.recv_timeout(LOCK_READY_TIMEOUT).map_err(|error| {
+        format!(
+            "the holder's lock-acquired acknowledgement did not arrive inside {LOCK_READY_TIMEOUT:?}, so the held-lock premise failed: {error}"
+        )
+    })
 }
