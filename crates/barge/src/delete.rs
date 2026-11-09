@@ -3622,6 +3622,7 @@ pub(crate) fn replay_intent_under_volume_lock(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replay_one(
     state_paths: &StatePaths,
     dirs: &dyn DirOps,

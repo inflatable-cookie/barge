@@ -509,29 +509,14 @@ pub fn execute(call: &AdapterCall<'_>) -> Outcome {
     };
     // The claim's own shape. Every check here is before any lock, read of a
     // journal or effect, so each refusal is effect-free by construction.
-    if let Err(reason) = validate_claim(intent) {
-        return refused(reason);
-    }
+    let volume_uuid = match validate_claim(intent) {
+        Ok(volume_uuid) => volume_uuid,
+        Err(reason) => return refused(reason),
+    };
     let request_digest = match call.request.digest(intent) {
         Ok(digest) => digest,
         Err(error) => return unknown(error.message().to_owned()),
     };
-    // The caller's volume UUID is part of the covered identity; unbound means
-    // the identity predates the covered class.
-    let Some(volume_uuid) = intent
-        .identity
-        .volume_uuid
-        .as_deref()
-        .map(VolumeUuid::parse)
-        .transpose()
-        .expect("the claim's volume UUID parses; validate_claim checked it")
-    else {
-        return refused(
-            "the intent's identity records no volume UUID, so the root is not in the covered class"
-                .to_owned(),
-        );
-    };
-
     // 1. Idempotency: this caller id names at most one record in this
     //    journal, and a record that exists decides the call before anything
     //    else runs.
@@ -1172,7 +1157,7 @@ fn prove_checkout_absent(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OxideLookup {
     /// The stored registry carries the intent.
-    Found(OxideIntent),
+    Found(Box<OxideIntent>),
     /// The registry was read completely and the id is not in it.
     Absent,
     /// The pools are readable and not on the covered class: a legacy or
@@ -1240,7 +1225,7 @@ fn lookup_oxide_intent(
                 );
             }
             match intents.iter().find(|stored| stored.id == intent.id) {
-                Some(stored) => OxideLookup::Found(stored.clone()),
+                Some(stored) => OxideLookup::Found(Box::new(stored.clone())),
                 None => OxideLookup::Absent,
             }
         }
@@ -1303,7 +1288,7 @@ fn compare_stored_intent(
 /// live phase, both digests are SHA-256 hex, the root identity binds an inode,
 /// a nonce and a marker digest, and the volume UUID is present and parses.
 /// Anything else is refused before any read.
-fn validate_claim(intent: &LiveIntent) -> std::result::Result<(), String> {
+fn validate_claim(intent: &LiveIntent) -> std::result::Result<VolumeUuid, String> {
     validate_caller_id(&intent.id)?;
     if intent.phase != LIVE_PHASE {
         return Err(format!(
@@ -1327,22 +1312,20 @@ fn validate_claim(intent: &LiveIntent) -> std::result::Result<(), String> {
                 .to_owned(),
         );
     }
-    match &identity.volume_uuid {
-        Some(raw) => {
-            VolumeUuid::parse(raw).map_err(|error| {
-                format!(
-                    "the intent's volume UUID is not a UUID: {}",
-                    error.message()
-                )
-            })?;
-        }
+    let volume_uuid = match &identity.volume_uuid {
+        Some(raw) => VolumeUuid::parse(raw).map_err(|error| {
+            format!(
+                "the intent's volume UUID is not a UUID: {}",
+                error.message()
+            )
+        })?,
         None => {
             return Err(
                 "the intent's identity binds no volume UUID, which the covered class requires"
                     .to_owned(),
             );
         }
-    }
+    };
     if identity.generation == 0 {
         return Err(
             "the intent's identity binds generation zero, which no root Oxide writes".to_owned(),
@@ -1354,7 +1337,7 @@ fn validate_claim(intent: &LiveIntent) -> std::result::Result<(), String> {
             identity.root.display()
         ));
     }
-    Ok(())
+    Ok(volume_uuid)
 }
 
 /// Whether one string is an Oxide prune-intent id: 128 bits of lowercase hex.

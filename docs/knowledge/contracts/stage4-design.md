@@ -844,6 +844,8 @@ fields are understood by both.
 | `barge.prune` | `/1` | `barge prune --plan` | the command document around the plan, as `barge.maintain/1` wraps `barge.maintain.plan/1`: the plan, its SHA-256, when it was planned, the volume's state and whether the Oxide reference snapshot was complete |
 | `barge.prune.plan` (F6-R1 additions) | `/1`, optional fields | `barge prune --plan --root` | `named_roots` (sorted, unique root ids) and each row's `age_waived`, present only when a root was named; both covered by the digest |
 | `barge.prune.run` | `/1` | `barge prune --plan <file> --plan-sha256 <hex>` | new in F6-R1: the release effect's report, the presented digest, the fresh gate's digest for the same area, the replay's pending count and one outcome per presented eligible row |
+| `barge.area` | `/1`, optional field added | the state directory's `areas/` | adds `outputs_grant` (the area-scoped `oxide_outputs` delegation), carried only by `oxide/outputs`; present or absent is the grant or its withdrawal, and the record's `generation` bounds a caller's request ([the adapter](#the-oxide-outputs-adapter-barge-is-the-covered-classs-only-deleter-2026-11-09)) |
+| `barge.intent` | `/2`, optional fields added | `state/intents/<intent-id>.json` | adds `caller_intent_id` and `caller_request_digest` for the delegated outputs operation; both optional, written together, only on an `oxide_outputs` unit |
 
 The versioning rules are stage 1's: adding an optional field stays inside a
 major; removing one, changing a type or a meaning is a new major.
@@ -926,6 +928,81 @@ the space prune's effect, "if a durable record exists it must verify and agree",
 and a disagreement keeps the root on both paths. The [stage 3 space
 policy](stage3-space-policy.md#pruning-under-the-reserve) states that check in
 its own custody list, so neither contract silently widens the other.
+
+## The Oxide outputs adapter: Barge is the covered class's only deleter (2026-11-09)
+
+Tom selected "Implement the reviewed mechanism-only slice on disposable
+fixtures" in decision `63ad6fc4-52c3-4b75-bdf8-c1a89ac7eb35` v2 on 2026-11-09.
+That ruling accepts, for this slice only: the area-scoped outputs grant as
+deletion authority, Barge-only deletion for the covered root class, and the
+adapter-specific D3 changes (Oxide keeps eligibility and its witnessed
+pool-level writer decision; Barge re-proves unit custody at effect and does not
+re-read Oxide's pool ledger as a gate). The owning protocol is Oxide's `docs/knowledge/contracts/barge-adoption.md`,
+section "Joint protocol for Barge output deletion" (oxide#303, reviewed at
+PR #262 head `2085816e`, merge `0747820e`, with the planner's ruling recorded
+on Oxide main at `50d572bc`); Barge does not edit that file, and this section
+records Barge's half of the protocol without duplicating its tables.
+
+What landed in `crates/barge/src/oxide_outputs.rs`, all default library code:
+
+- **The family.** `MarkerFamily::OxideOutputs` reads `.oxide-output.json`
+  (Oxide's `oxide.outputs.root/2`). Its `validate_grant_shape` grant is a
+  delegation named `oxide_outputs`, and `native_root` is refused for it. The
+  filename is in the recognised marker list, so a claimed or captured unit that
+  gains such a marker is kept, and a nested one stops a walk.
+- **The grant.** An optional `outputs_grant` field on the stored
+  `barge.area/1` record for exactly `oxide/outputs` (a declaration elsewhere
+  refuses to carry it). The record's `generation` is the grant's generation
+  while it is present; a re-declaration that omits the field withdraws it. The
+  adapter reads the stored record itself — a caller's object is never
+  permission — refuses an empty, withdrawn, wrong-family or stale authority,
+  and re-reads it under the exclusive volume lock immediately before the
+  intent. Custody re-checks the same grant at effect, so a revoked grant keeps
+  the unit on every path.
+- **Correlation.** `barge.intent/2` gained optional `caller_intent_id` and
+  `caller_request_digest` fields. The request digest is the SHA-256 of the
+  caller's intent id, the intent's preview digest, the bound root identity
+  (volume UUID, inode, nonce, marker digest) and the recorded grant
+  generation. Only an `oxide_outputs` directory unit under its delegation may
+  carry the fields, and the two are written together. Old records and both
+  scratch families read exactly as before.
+- **The entry points.** `execute` takes the caller's live-intent claim plus the
+  bound request and reports one of: `deleted`, `pending`, `rolled_back`,
+  `refused`, `known_no_effect_locked`, `unknown`. It re-reads the intent from
+  Oxide's own registry (the claim is never permission), refuses a settled or
+  mismatched one, refuses a legacy (`oxide.outputs/2`, `/1` or absent) fence,
+  answers unknown for an unreadable fence, control directory, registry or
+  incomplete registry, and binds the unit by volume UUID + inode + nonce +
+  exact marker bytes. `lookup` answers Barge's four states for one caller id —
+  found pending (with the Barge intent id, which names the
+  `.barge-prune-<intent-id>` quarantine leaf), found terminal, positively
+  absent (a complete journal read under the volume's observation lock, no
+  record, no attributable leaf), or unknown — so Oxide can settle or keep
+  pending without inferring completion from missing bytes.
+- **The single-deleter rule.** Only the adapter constructs, executes, resumes
+  or settles this family. A generic delete — a host release, a sweep, the
+  space prune, a direct library call — refuses an `oxide_outputs` unit before
+  any effect, and every generic replay reports such intents pending without
+  settling, resuming or rolling them back. A host release holding the area
+  grant deletes none of Oxide's roots.
+- **The same-call rule.** This call's own `Locked` return, taken before any
+  durable step and with no journal record for this caller id (re-read after
+  the denial), is the explicit known-no-effect fact. A resumed call under a
+  `Locked` volume lock stays pending. Any second call under an Oxide intent id
+  resumes or reports the one record, never a second unit.
+
+Unchanged, and refused on the adapter path: `oxide.outputs.root/1` markers,
+the legacy fences, an unregistered or non-expendable volume, a device-number
+mismatch (the device is an observation, never a bound identity), a checkout
+under a mount parent whose volume the intent does not name, and the R4 and
+pending-root rules of the generic release gate. Qualification so far is the
+disposable-fixture suite (`effigy rust:test`); the focused adapter native
+proof is prepared as the `outputs:native:*` selectors in `effigy.toml` under
+the qualified shared supervisor, held for separate planner activation, and it
+runs the proof-only synthetic-account build. It does not qualify the
+production account lookup, a live drive, or live adoption; no install, real
+declaration, grant write or existing-data deletion is authorised by this
+slice.
 
 ## Failure, race and cancellation matrix
 

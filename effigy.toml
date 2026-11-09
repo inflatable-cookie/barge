@@ -115,6 +115,13 @@ alias = "barge"
 # and the custody/closure gates, and start no image and no child process.
 "release:native:test" = "python3 scripts/native/release-proof.py --self-check"
 "release:native:plan" = "python3 scripts/native/release-proof.py --plan"
+# The Oxide outputs adapter's proof apparatus, effect-free: the pinned
+# supervisor, the guard containment and argv guard, the case table checked
+# against its named regressions, the proof feature's declarations, the Stash
+# scratch route, the nine premise dispositions and the held bounds. No image,
+# no scratch and no child process.
+"outputs:native:test" = "python3 scripts/native/oxide-outputs-proof.py --self-check"
+"outputs:native:plan" = "python3 scripts/native/oxide-outputs-proof.py --plan"
 # Builds the proof-feature binary of HEAD through Oxide, copies and hashes it into an
 # exclusive directory under the designated Stash scratch, and writes its manifest. It
 # runs no proof and touches no image. It is an explicit staging record only: a native
@@ -137,6 +144,26 @@ run = "python3 scripts/native/release-proof.py counted"
 [tasks."release:native:diagnostic"]
 admission = "heavy"
 run = "python3 scripts/native/release-proof.py diagnostic"
+
+# The Oxide outputs adapter's focused native proof (stage 4, "The Oxide outputs
+# adapter"): the delegated deletion of the covered class on one owned 128 MiB
+# APFS image under the same qualified shared supervisor, reusing the release
+# proof's staging, custody and closure helpers. The staged driver is the
+# proof-synthetic-account build of the example `oxide_outputs_proof`, one case
+# per process. Work stops 30 s before the guard's deadline; detach is ordinary
+# only and uncertain custody retains the image.
+#
+# HELD for owner activation: these declarations activate nothing, and no native
+# receipt exists yet. The planner separately activates one uncounted diagnostic,
+# then one counted author pass, then a distinct retained-reviewer pass, each at
+# an exact reviewed head. A missing receipt is a missing proof.
+[tasks."outputs:native"]
+admission = "heavy"
+run = "python3 scripts/native/oxide-outputs-proof.py counted"
+
+[tasks."outputs:native:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/native/oxide-outputs-proof.py diagnostic"
 
 [test.suites.rust]
 # The library and CLI suites. The budgets are the test route's timeout and
