@@ -50,8 +50,18 @@ const NONCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const CHECKOUT_ID: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 /// The Barge intent id a case's own record carries.
 const INTENT_ID: &str = "ddd0ddd0ddd0ddd0ddd0ddd0ddd0ddd0";
+/// How long an A12 holder keeps the volume lock: strictly longer than the
+/// design lock wait (state::LOCK_WAIT, 5 s), so the call's own wait refuses
+/// with `Locked` instead of acquiring the lock when the holder leaves.
+const HOLD_LONGER_THAN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(7);
 /// The root's name inside the outputs folder, for every case.
 const ROOT_NAME: &str = "root-one";
+/// The boot-volume prefix of the never-created checkout path every fixture
+/// names. A mount-parent path would be refused by the reviewed F2 rule, whose
+/// volume the intent identity does not carry; /private/var/tmp sits on the
+/// boot Data volume, so the absence proof walks real ancestors to an ENOENT
+/// leaf and answers absent.
+const CHECKOUT_PATH_PREFIX: &str = "/private/var/tmp/barge-proof-checkout-";
 
 fn main() -> ExitCode {
     let mut arguments = std::env::args().skip(1);
@@ -199,7 +209,12 @@ impl Fixture {
             .map_err(|error| format!("the root is not created: {error}"))?;
         std::fs::write(root_path.join("payload.txt"), b"outputs")
             .map_err(|error| format!("the payload is not written: {error}"))?;
-        let checkout = bindings.home.join("checkout");
+        // The checkout is the consumer path whose absence the covered class
+        // requires. It is named under the boot volume - never under a mount
+        // parent, whose volume the intent identity does not carry - and it is
+        // never created, so the absence proof walks real ancestors to an
+        // ENOENT leaf. One name per case process.
+        let checkout = PathBuf::from(format!("{CHECKOUT_PATH_PREFIX}{}", std::process::id()));
         let marker = format!(
             r#"{{"version":"{OXIDE_MARKER_V2}","checkout":"{}","checkout_id":"{CHECKOUT_ID}","label":"dev","recipe":"target-debug-v1","kind":"external","volume_uuid":"{}","nonce":"{NONCE}","generation":1,"created_ms":1000}}"#,
             checkout.display(),
@@ -710,6 +725,15 @@ fn case_live_hold_keeps(fixture: &Fixture) -> Result<(), String> {
     if outcome.kind != OutcomeKind::Refused {
         return Err(format!("expected refused, got {outcome:?}"));
     }
+    // The refusal must be custody's own fact - the live hold - and not an
+    // earlier refusal such as the checkout absence proof, which runs before
+    // custody in the delete path. Custody names the holder as live.
+    let reason = outcome.reason.clone().unwrap_or_default();
+    if !reason.contains("custody is not proven") || !reason.contains("is live") {
+        return Err(format!(
+            "the refusal is not custody's live-hold fact, so an unrelated refusal cannot be told from this case's: {reason}"
+        ));
+    }
     if !fixture.root_path.exists() {
         return Err("a held root was deleted".to_owned());
     }
@@ -761,11 +785,14 @@ fn case_locked_outcomes(fixture: &Fixture) -> Result<(), String> {
     // `Locked` return is then the known no-effect fact.
     let state = fixture.state.clone();
     let uuid = fixture.volume_uuid.clone();
+    // The holder must outlast the design lock wait (state::LOCK_WAIT, 5 s):
+    // a shorter hold would let the call acquire the lock and proceed, which
+    // is exactly how this path stayed unexercised in earlier occurrences.
     let holder = std::thread::spawn(move || {
         let mut locks =
             LockSet::with_deadline(state, Deadline::after(std::time::Duration::from_secs(30)));
         let _lock = locks.lock_volume(&uuid)?;
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(HOLD_LONGER_THAN_LOCK_WAIT);
         Ok::<(), barge::error::Error>(())
     });
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -787,7 +814,7 @@ fn case_locked_outcomes(fixture: &Fixture) -> Result<(), String> {
         let mut locks =
             LockSet::with_deadline(state, Deadline::after(std::time::Duration::from_secs(30)));
         let _lock = locks.lock_volume(&uuid)?;
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(HOLD_LONGER_THAN_LOCK_WAIT);
         Ok::<(), barge::error::Error>(())
     });
     std::thread::sleep(std::time::Duration::from_millis(300));

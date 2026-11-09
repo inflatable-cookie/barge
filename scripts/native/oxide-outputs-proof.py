@@ -372,6 +372,22 @@ def executed_shapes_problems():
         driver = handle.read()
     if '"passed"' not in driver:
         problems.append("the driver never prints a passed verdict for the script to parse")
+    # D5: the fixture checkout must be a boot-volume, never-created path. A
+    # checkout under the case home sits on a mount parent whose volume the
+    # intent identity does not carry, so the reviewed F2 rule refuses it and
+    # the covered positive deletion never runs.
+    if 'CHECKOUT_PATH_PREFIX: &str = "/private/var/tmp/barge-proof-checkout-"' not in driver:
+        problems.append("the fixture checkout is not a boot-volume, never-created path")
+    if 'bindings.home.join("checkout")' in driver:
+        problems.append("the fixture checkout still sits under the case home on a mount parent")
+    # D6: the A12 holder must outlast the design lock wait, or the same-call
+    # Locked paths are never exercised (the call acquires the lock instead).
+    if "HOLD_LONGER_THAN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(7)" not in driver:
+        problems.append("the A12 holder does not hold longer than the design lock wait")
+    # D7: A9 must discriminate custody's own live-hold fact from an earlier
+    # refusal such as the checkout absence proof, which runs before custody.
+    if '"custody is not proven"' not in driver or '"is live"' not in driver:
+        problems.append("A9 does not discriminate custody's live-hold refusal")
     return problems
 
 
