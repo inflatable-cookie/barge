@@ -155,6 +155,27 @@ guarded exception. Each selector covers what it names:
   equivalence. HELD for owner activation: the declarations activate nothing; the
   diagnostic runs first, then the counted author pass and a distinct reviewer pass,
   each separately activated at an exact head.
+- `effigy outputs:native:test` and `effigy outputs:native:plan` — the Oxide
+  outputs adapter's proof apparatus, effect-free: the pinned supervisor, the
+  guard containment and argv guard, the case table checked against its named
+  regressions in `crates/barge/src/oxide_outputs/tests.rs`, the proof feature's
+  declarations and the driver's `required-features`, the Stash scratch route,
+  the nine premise dispositions and the held 128 MiB / 300 s / 512 MiB bounds
+  with the 30 s work stop. No image, no scratch and no child process.
+- `effigy outputs:native` and `effigy outputs:native:diagnostic` — the
+  adapter's one bounded native for the delegated deletion, on one owned
+  128 MiB APFS image under the qualified supervisor (300 s, 512 MiB), reusing
+  the release proof's staging, custody and closure helpers. Each run verifies
+  the supervisor's bytes and the verified Stash scratch UUID, refuses any
+  non-guard caller, stages the proof-feature driver build of HEAD inside the
+  guarded run, and runs only that staged file. The guard's image-custody
+  indication is published before the backing exists, work stops 30 s before
+  the deadline, and closure requires the ordinary detach's success and reap
+  plus whole-backing attachment absence, so uncertain custody retains the
+  image and faults the run. It tests the adapter over synthetic AccountFacts
+  and does not establish the production account lookup, a live drive, or any
+  adoption. HELD for owner activation on the same terms as the release proof's
+  natives.
 
 RustQuality strict is active for the Rust source, manifests, tests and their
 documentation: `docs/knowledge/contracts/language-quality-activation.json` opts

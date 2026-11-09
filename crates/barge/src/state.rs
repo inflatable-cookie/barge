@@ -1609,6 +1609,24 @@ pub struct IntentRecord {
     /// path can reappear and a proof is never a cached permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub absence: Option<crate::evidence::AbsenceEvidence>,
+    /// The caller's own prune-intent id, when this intent was written by the
+    /// Oxide outputs adapter (`barge.intent/2` optional addition inside this
+    /// major, like `unit.root_id`).
+    ///
+    /// It is the correlation key the joint protocol names: one Oxide intent id
+    /// names at most one Barge intent, a second adapter call under the same id
+    /// resumes or reports that one, and a generic replay without the live
+    /// Oxide intent never settles or deletes it. Absent on every record the
+    /// ordinary paths wrote, which is how their reading is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_intent_id: Option<String>,
+    /// The SHA-256 of the delegated request the intent was written for: the
+    /// caller's intent id, the intent's preview digest, the bound root identity
+    /// and the recorded grant generation, digested together. Written whenever
+    /// `caller_intent_id` is, and compared by the adapter's resume so a
+    /// different request can never continue this record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_request_digest: Option<String>,
 }
 
 /// The plan's proved evidence a deletion carries into its intent.
@@ -1624,6 +1642,20 @@ pub struct IntentEvidence {
     pub identity: Option<crate::evidence::IdentityEvidence>,
     /// Condition 6's evidence, when a reference required the path's absence.
     pub absence: Option<crate::evidence::AbsenceEvidence>,
+    /// The caller correlation the adapter writes into the record: the live
+    /// Oxide intent id and the request digest it was written for. `None` on
+    /// every path that is not the adapter, which is what keeps their records
+    /// byte-identical to the shapes they always wrote.
+    pub caller: Option<CallerCorrelation>,
+}
+
+/// The adapter's correlation, as one record carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerCorrelation {
+    /// The caller's own prune-intent id.
+    pub caller_intent_id: String,
+    /// The digest of the delegated request.
+    pub request_digest: String,
 }
 
 impl IntentEvidence {
@@ -1747,7 +1779,61 @@ impl IntentRecord {
         for foreign in &self.foreign_captures {
             foreign.validate()?;
         }
-        self.validate_evidence()
+        self.validate_evidence()?;
+        self.validate_caller()
+    }
+
+    /// Validate the caller-correlation fields.
+    ///
+    /// The two fields stand or fall together, the id is one Oxide prune-intent
+    /// id (the same 128-bit lowercase-hex shape Barge's own ids have), the
+    /// digest is a SHA-256, and a record that names a caller is exactly the
+    /// adapter's own shape: a directory unit of the `oxide_outputs` family
+    /// under its area delegation. An ordinary intent never names a caller, and
+    /// a caller-named intent is never any other family.
+    fn validate_caller(&self) -> Result<()> {
+        match (&self.caller_intent_id, &self.caller_request_digest) {
+            (None, None) => return Ok(()),
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "an intent's caller id and request digest are written together".to_owned(),
+                )
+                .with_detail("intent_id", self.intent_id.clone().into()));
+            }
+            (Some(caller), Some(digest)) => {
+                validate_identifier("caller_intent_id", caller)?;
+                if !crate::unit::is_sha256(digest) {
+                    return Err(Error::new(
+                        ErrorKind::UnknownState,
+                        "the intent's request digest is not a SHA-256 hex string".to_owned(),
+                    )
+                    .with_detail("intent_id", self.intent_id.clone().into()));
+                }
+            }
+        }
+        if self.unit.kind != crate::unit::UnitKind::Directory
+            || !matches!(
+                self.unit.marker.as_ref().map(|marker| marker.family),
+                Some(crate::unit::MarkerFamily::OxideOutputs)
+            )
+        {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "only an `oxide_outputs` directory unit carries a caller intent id".to_owned(),
+            )
+            .with_detail("intent_id", self.intent_id.clone().into()));
+        }
+        if self.unit.grant.kind != crate::unit::GrantKind::Delegation
+            || self.unit.grant.reference != crate::unit::MarkerFamily::OxideOutputs.as_str()
+        {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "a caller-named intent's grant is the `oxide_outputs` area delegation".to_owned(),
+            )
+            .with_detail("intent_id", self.intent_id.clone().into()));
+        }
+        Ok(())
     }
 
     /// Validate the two plan-and-intent evidence documents, and that they agree
@@ -1903,6 +1989,9 @@ impl IntentV1 {
             // records nothing about identity or absence to map.
             identity: None,
             absence: None,
+            // v1 predates the adapter and its correlation fields.
+            caller_intent_id: None,
+            caller_request_digest: None,
         })
     }
 }
@@ -3190,6 +3279,8 @@ mod intent_tests {
             foreign_captures: Vec::new(),
             identity: None,
             absence: None,
+            caller_intent_id: None,
+            caller_request_digest: None,
         }
     }
 

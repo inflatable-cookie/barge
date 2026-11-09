@@ -376,6 +376,23 @@ pub fn delete_unit_on_volume(
 
 type EligibilityCheck<'a> = dyn Fn(&registry::VolumeRecord) -> Result<()> + 'a;
 
+/// Who may act on a unit of the `oxide_outputs` family.
+///
+/// Only the adapter (`crate::oxide_outputs`) presents a live Oxide prune intent,
+/// so only it passes [`DeletionAuthority::OxideOutputs`]. Every generic path —
+/// a host release, a scratch sweep, the space prune, a maintain pass, a direct
+/// library call — passes [`DeletionAuthority::Generic`], and the delete path
+/// refuses an `oxide_outputs` unit before any effect. This is the in-crate half
+/// of the single-deleter rule: no other entry point can construct, execute or
+/// settle this family, whatever grants the volume records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeletionAuthority {
+    /// The ordinary paths: the `oxide_outputs` family is refused.
+    Generic,
+    /// The Oxide outputs adapter, with the live intent already verified.
+    OxideOutputs,
+}
+
 /// Whether this call takes the volume's exclusive lock itself, or the caller
 /// already holds it (a space prune holds it for its whole pass).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,6 +427,7 @@ pub(crate) fn delete_unit_authorized(
         unit,
         bounds,
         VolumeLocking::Take,
+        DeletionAuthority::Generic,
         authorize,
         intent_evidence,
     )
@@ -439,6 +457,7 @@ pub(crate) fn delete_unit_under_volume_lock(
     unit: &DeletionUnit,
     bounds: DeleteBounds,
     volume_lock: &crate::state::StateLock,
+    authority: DeletionAuthority,
     authorize: Option<&EligibilityCheck<'_>>,
     intent_evidence: &state::IntentEvidence,
 ) -> Result<DeleteReport> {
@@ -462,6 +481,7 @@ pub(crate) fn delete_unit_under_volume_lock(
         unit,
         bounds,
         VolumeLocking::Held,
+        authority,
         authorize,
         intent_evidence,
     )
@@ -479,6 +499,7 @@ fn delete_unit_locked(
     unit: &DeletionUnit,
     bounds: DeleteBounds,
     volume_locking: VolumeLocking,
+    authority: DeletionAuthority,
     authorize: Option<&EligibilityCheck<'_>>,
     intent_evidence: &state::IntentEvidence,
 ) -> Result<DeleteReport> {
@@ -486,6 +507,18 @@ fn delete_unit_locked(
     // grant and plan digest each have one well-formed shape, and the grant must
     // be the form its marker family needs.
     unit.validate()?;
+    // The single-deleter rule: a generic caller never acts on the `oxide_outputs`
+    // family, whatever grant the volume records. Only the adapter, which
+    // verified the live Oxide intent, reaches this shape.
+    if authority == DeletionAuthority::Generic
+        && unit.marker.as_ref().map(|marker| marker.family) == Some(MarkerFamily::OxideOutputs)
+    {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "an `oxide_outputs` unit is deleted only through its adapter with the live Oxide prune intent, so this caller is refused; nothing was changed",
+        )
+        .with_detail("unit", unit.name.clone().into()));
+    }
     let volume_uuid = unit.volume_uuid.clone();
 
     // Pre-flight, effect-free: an invalid registry, an unregistered or
@@ -684,6 +717,14 @@ fn delete_unit_locked(
         foreign_captures: Vec::new(),
         identity: intent_evidence.identity.clone(),
         absence: intent_evidence.absence.clone(),
+        caller_intent_id: intent_evidence
+            .caller
+            .as_ref()
+            .map(|caller| caller.caller_intent_id.clone()),
+        caller_request_digest: intent_evidence
+            .caller
+            .as_ref()
+            .map(|caller| caller.request_digest.clone()),
     };
     let write = locks.begin_intent_write()?;
     // The first durable step is this intent record, and the lock waits above (and
@@ -2972,6 +3013,29 @@ fn replay_pending_scope(
             });
             continue;
         }
+        // The single-deleter rule, on the replay side: an `oxide_outputs` intent
+        // is settled, resumed or rolled back only through its adapter with the
+        // live Oxide intent. A generic replay reports it and moves on: it
+        // settles nothing and deletes nothing, so a host release run that holds
+        // the area grant still deletes none of Oxide's roots.
+        if intent.unit.marker.as_ref().map(|marker| marker.family)
+            == Some(MarkerFamily::OxideOutputs)
+        {
+            report.pending.push(PendingRow {
+                intent_id: intent.intent_id.clone(),
+                unit_name: intent.unit.name.clone(),
+                unit_kind: intent.unit.kind.as_str().to_owned(),
+                phase: intent.phase,
+                reason: format!(
+                    "the `oxide_outputs` intent {} is resumed only through its adapter with the live Oxide prune intent; this replay settled nothing and changed nothing",
+                    intent
+                        .caller_intent_id
+                        .as_deref()
+                        .unwrap_or("without a recorded caller id")
+                ),
+            });
+            continue;
+        }
         let Some(record) = registry.volume(&intent.volume_uuid).cloned() else {
             report.pending.push(PendingRow {
                 intent_id: intent.intent_id.clone(),
@@ -3096,7 +3160,7 @@ fn expired(deadline: Option<Instant>) -> bool {
 }
 
 /// What one replay decided.
-enum ReplayOutcome {
+pub(crate) enum ReplayOutcome {
     /// The both-absent proof settled it.
     Settled,
     /// The unit was still in place, so the intent was rolled back.
@@ -3526,6 +3590,36 @@ fn prove_again(
             path.display()
         )),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Replay one recorded intent under the caller's already-held exclusive volume
+/// lock: the Oxide outputs adapter's resume form.
+///
+/// A generic replay refuses this family outright, because it cannot name the
+/// live Oxide intent. The adapter can, and its second call under the same
+/// caller id resumes exactly this record: the same preflight, the same
+/// both-absent and removed-phase rules, the same rollback of an `intent`-phase
+/// record whose root is still in place — and nothing else on the volume.
+pub(crate) fn replay_intent_under_volume_lock(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    observer: &dyn ProcessObserver,
+    record: &registry::VolumeRecord,
+    intent: &IntentRecord,
+    bounds: DeleteBounds,
+) -> Result<ReplayOutcome> {
+    replay_one(
+        state_paths,
+        dirs,
+        volumes,
+        observer,
+        record,
+        intent,
+        VolumeLocking::Held,
+        bounds,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4278,8 +4372,8 @@ mod tests {
                 family: match family {
                     MarkerFamily::EffigyScratch => crate::registry::MarkerFamily::EffigyScratch,
                     MarkerFamily::OxideScratch => crate::registry::MarkerFamily::OxideScratch,
-                    MarkerFamily::Barge => {
-                        panic!("a Barge root needs no delegation")
+                    MarkerFamily::Barge | MarkerFamily::OxideOutputs => {
+                        panic!("this family needs no scratch delegation")
                     }
                 },
                 by: "the family's owner".to_owned(),
@@ -4816,6 +4910,8 @@ mod tests {
             foreign_captures: Vec::new(),
             identity: evidence.identity.clone(),
             absence: evidence.absence.clone(),
+            caller_intent_id: None,
+            caller_request_digest: None,
         };
         let mut locks = LockSet::new(fixture.state.clone());
         let _volume = locks
@@ -8805,6 +8901,7 @@ mod tests {
                     .map(|marker| marker.digest.clone()),
             }),
             absence: None,
+            caller: None,
         }
     }
 
@@ -8840,7 +8937,9 @@ mod tests {
         let evidence = state::IntentEvidence {
             identity: evidence_for(&prepared).identity,
             absence: Some(absent_evidence(&prepared, &consumer)),
+            caller: None,
         };
+
         let faults = Faults::new();
         let facts = prepared.fixture.facts();
         let mounts = prepared.fixture.mounts();
@@ -9248,6 +9347,7 @@ mod tests {
             &state::IntentEvidence {
                 identity: evidence_for(&prepared).identity,
                 absence: Some(absence),
+                caller: None,
             },
             prepared.unit.device.get(),
         );
@@ -9286,6 +9386,7 @@ mod tests {
             &state::IntentEvidence {
                 identity: evidence_for(&prepared).identity,
                 absence: Some(absence),
+                caller: None,
             },
             prepared.unit.device.get(),
         );

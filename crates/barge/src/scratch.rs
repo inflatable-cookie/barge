@@ -152,6 +152,7 @@ pub fn scratch_declaration(record: &VolumeRecord, folder: &str) -> AreaDeclarati
             age_seconds: NATIVE_AGE_SECONDS,
         },
         reserve: ReserveParticipation::Counts,
+        outputs_grant: None,
     }
 }
 
@@ -7150,6 +7151,8 @@ mod tests {
                 generation: 1,
                 recorded_ms: now,
                 phase_ms: now,
+                caller_intent_id: None,
+                caller_request_digest: None,
             };
             let mut locks = state::LockSet::new(harness.fixture.state.clone());
             {

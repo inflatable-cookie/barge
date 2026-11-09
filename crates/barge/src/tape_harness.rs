@@ -826,6 +826,7 @@ pub(crate) fn base_declaration() -> AreaDeclaration {
         },
         prune: PrunePolicy::ReleaseOnReference,
         reserve: ReserveParticipation::Excluded,
+        outputs_grant: None,
     }
 }
 

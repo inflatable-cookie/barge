@@ -48,11 +48,19 @@ pub const EFFIGY_SCRATCH_MARKER_FILE: &str = ".effigy-scratch.json";
 /// The Oxide scratch marker's pinned filename.
 pub const OXIDE_SCRATCH_MARKER_FILE: &str = ".oxide-scratch.json";
 
+/// The Oxide build-output root marker's pinned filename.
+///
+/// Oxide owns the format (`reference::OXIDE_MARKER_FILE`); this is the one name
+/// the `oxide_outputs` family is read from, inside a consumer area, never inside
+/// a scratch folder.
+pub const OXIDE_OUTPUT_MARKER_FILE: &str = crate::reference::OXIDE_MARKER_FILE;
+
 /// Every marker filename Barge recognises, in a fixed order.
 pub const RECOGNISED_MARKER_FILES: &[&str] = &[
     BARGE_MARKER_FILE,
     EFFIGY_SCRATCH_MARKER_FILE,
     OXIDE_SCRATCH_MARKER_FILE,
+    OXIDE_OUTPUT_MARKER_FILE,
 ];
 
 /// How many parent components one unit may have.
@@ -123,6 +131,14 @@ pub enum MarkerFamily {
     EffigyScratch,
     /// `.oxide-scratch.json`, concluded by Oxide's supervisor only.
     OxideScratch,
+    /// `.oxide-output.json`, Oxide's build-output root marker.
+    ///
+    /// Its delegation is **not** a `scratch_grants` row: it is the area-scoped
+    /// grant on the stored `oxide/outputs` declaration, and only the Oxide
+    /// adapter entry may construct, execute or resume one of these units. A
+    /// generic release, sweep, space prune or replay never deletes this family
+    /// (`delete` refuses it without that adapter authority).
+    OxideOutputs,
 }
 
 impl MarkerFamily {
@@ -132,6 +148,7 @@ impl MarkerFamily {
             Self::Barge => "barge",
             Self::EffigyScratch => "effigy_scratch",
             Self::OxideScratch => "oxide_scratch",
+            Self::OxideOutputs => "oxide_outputs",
         }
     }
 
@@ -141,6 +158,7 @@ impl MarkerFamily {
             Self::Barge => BARGE_MARKER_FILE,
             Self::EffigyScratch => EFFIGY_SCRATCH_MARKER_FILE,
             Self::OxideScratch => OXIDE_SCRATCH_MARKER_FILE,
+            Self::OxideOutputs => OXIDE_OUTPUT_MARKER_FILE,
         }
     }
 
@@ -150,6 +168,7 @@ impl MarkerFamily {
             BARGE_MARKER_FILE => Some(Self::Barge),
             EFFIGY_SCRATCH_MARKER_FILE => Some(Self::EffigyScratch),
             OXIDE_SCRATCH_MARKER_FILE => Some(Self::OxideScratch),
+            OXIDE_OUTPUT_MARKER_FILE => Some(Self::OxideOutputs),
             _ => None,
         }
     }
@@ -158,10 +177,12 @@ impl MarkerFamily {
     ///
     /// Barge's own family needs no foreign delegation: the marker itself is the
     /// native grant. A foreign family is deletable only through that family's
-    /// recorded delegation in the volume's `scratch_grants`.
+    /// recorded delegation in the volume's `scratch_grants` — except
+    /// `oxide_outputs`, whose grant is the area-scoped one on the stored
+    /// `oxide/outputs` declaration, so it is never a `scratch_grants` row.
     pub const fn delegated(self) -> Option<registry::MarkerFamily> {
         match self {
-            Self::Barge => None,
+            Self::Barge | Self::OxideOutputs => None,
             Self::EffigyScratch => Some(registry::MarkerFamily::EffigyScratch),
             Self::OxideScratch => Some(registry::MarkerFamily::OxideScratch),
         }
@@ -173,6 +194,7 @@ impl MarkerFamily {
             "barge" => Some(Self::Barge),
             "effigy_scratch" => Some(Self::EffigyScratch),
             "oxide_scratch" => Some(Self::OxideScratch),
+            "oxide_outputs" => Some(Self::OxideOutputs),
             _ => None,
         }
     }
@@ -333,10 +355,13 @@ impl UnitGrant {
         match self.kind {
             GrantKind::NativeRoot => Ok(()),
             GrantKind::Delegation => {
-                if MarkerFamily::parse(&self.reference)
-                    .is_some_and(|family| family.delegated().is_some())
-                {
-                    return Ok(());
+                match MarkerFamily::parse(&self.reference) {
+                    Some(family) if family.delegated().is_some() => return Ok(()),
+                    // The outputs family's delegation is the area-scoped grant
+                    // on the stored `oxide/outputs` declaration, never a
+                    // `scratch_grants` row.
+                    Some(MarkerFamily::OxideOutputs) => return Ok(()),
+                    _ => {}
                 }
                 Err(Error::new(
                     ErrorKind::UnknownState,
@@ -859,11 +884,41 @@ mod tests {
         wrong.filename = EFFIGY_SCRATCH_MARKER_FILE.to_owned();
         assert!(wrong.validate().is_err());
         assert_eq!(wrong.family.marker_file(), BARGE_MARKER_FILE);
-        // The recognised filenames are exactly the three families'.
+        // The recognised filenames are exactly the four families'.
         for name in RECOGNISED_MARKER_FILES {
             assert!(MarkerFamily::from_marker_file(name).is_some(), "{name}");
         }
+        assert_eq!(
+            MarkerFamily::from_marker_file(super::OXIDE_OUTPUT_MARKER_FILE),
+            Some(MarkerFamily::OxideOutputs)
+        );
         assert!(MarkerFamily::from_marker_file(".other.json").is_none());
+    }
+
+    #[test]
+    fn an_oxide_outputs_unit_takes_the_area_grant_and_native_root_is_refused() {
+        let unit = unit(
+            UnitKind::Directory,
+            Some(UnitMarker::new(MarkerFamily::OxideOutputs, "f".repeat(64))),
+        );
+        assert_eq!(
+            unit.grant,
+            UnitGrant::delegation(MarkerFamily::OxideOutputs)
+        );
+        assert_eq!(unit.grant.reference, "oxide_outputs");
+        unit.validate().expect("the area delegation is the shape");
+        let mut native = unit.clone();
+        native.grant = UnitGrant::native_root("run-1");
+        assert!(
+            native.validate().is_err(),
+            "native_root is never the outputs grant"
+        );
+        let mut scratch_delegated = unit.clone();
+        scratch_delegated.grant = UnitGrant::delegation(MarkerFamily::OxideScratch);
+        assert!(scratch_delegated.validate().is_err());
+        // The outputs family is not a scratch delegation, so a scratch grant
+        // row never covers it.
+        assert!(MarkerFamily::OxideOutputs.delegated().is_none());
     }
 
     #[test]

@@ -26,6 +26,14 @@ proof-synthetic-account = []
 [lints]
 workspace = true
 
+# The Oxide outputs adapter's proof-only driver (scripts/native/oxide-outputs-proof.py):
+# one case per invocation, over the synthetic account home the proof feature binds.
+# `required-features` keeps it out of every ordinary build, including --all-targets
+# without the feature; only the staged proof build compiles it.
+[[example]]
+name = "oxide_outputs_proof"
+required-features = ["proof-synthetic-account"]
+
 # The F6-O2 B-S1 capture harness (docs/knowledge/contracts/o2-tape.md): a
 # standalone executable whose argv contract is
 # `--fixture-root --manifest --transcript-out --case`. `harness = false` keeps

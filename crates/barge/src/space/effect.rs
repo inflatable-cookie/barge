@@ -1234,6 +1234,7 @@ impl Pass<'_> {
                     ))
                 }
             },
+            crate::delete::DeletionAuthority::Generic,
             Some(&authorize),
             &state::IntentEvidence::none(),
         );
@@ -2219,6 +2220,7 @@ mod tests {
                 },
                 prune: area::PrunePolicy::None,
                 reserve,
+                outputs_grant: None,
             }
         }
 

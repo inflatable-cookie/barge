@@ -2565,6 +2565,8 @@ fn barge_intent_bytes(
         foreign_captures: Vec::new(),
         identity: None,
         absence: None,
+        caller_intent_id: None,
+        caller_request_digest: None,
     };
     record
         .validate()

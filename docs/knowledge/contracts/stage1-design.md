@@ -293,7 +293,10 @@ writes `undeclared`, and every placement or area use on that volume refuses with
 `expendable` and is never treated as one; expending data is a destructive
 permission that is never inferred.
 
-`scratch_grants` is the one place a non-native scratch deletion is authorized:
+`scratch_grants` is the one place a non-native **scratch** deletion is
+authorized. It never covers `oxide_outputs`: that family's authority is the
+area-scoped grant on the stored `oxide/outputs` declaration, and only the
+stage 4 adapter acts on it ([stage 4](stage4-design.md#the-oxide-outputs-adapter-barge-is-the-covered-classs-only-deleter-2026-11-09)).
 
 ```json
 {"delegations": [{"family": "effigy_scratch", "by": "operator", "declared_ms": 0}],
@@ -669,6 +672,7 @@ A *grant* is one of three recorded forms:
 | Native root | Barge, at allocation | one `scratch_run` root it created | [the expiry rule](#expiry) |
 | Foreign delegation | the family's owner, once per family and volume, in the volume's `scratch_grants` | roots carrying that family's marker | that family's own rule, exactly as pinned below |
 | Legacy claim | a human, once per scope, at declaration time | unmarked units in one declared scope | the claim's declared idle age and unit shape |
+| Area-scoped outputs grant | the `oxide/outputs` declaration's owner, in the stored `barge.area/1` record | Oxide's `.oxide-output.json` roots inside the declared folder, on one volume | the live Oxide prune intent the [stage 4 adapter](stage4-design.md#the-oxide-outputs-adapter-barge-is-the-covered-classs-only-deleter-2026-11-09) re-reads; never a `scratch_grants` row, never a generic path |
 
 The three marker families, with the field sets pinned to the sources above:
 

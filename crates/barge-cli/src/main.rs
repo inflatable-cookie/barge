@@ -644,6 +644,7 @@ fn area_declare(mut options: Options) -> Result<Report, Error> {
         absent,
         prune,
         reserve,
+        outputs_grant: None,
     };
     let state = state_paths()?;
     let document = area::declare(&state, &declaration, state::now_ms())?;

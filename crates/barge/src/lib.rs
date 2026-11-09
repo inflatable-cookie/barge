@@ -45,6 +45,7 @@ pub mod evidence;
 pub mod identity;
 pub mod inspect;
 pub mod os;
+pub mod oxide_outputs;
 pub mod pool_custody;
 pub mod prune;
 pub mod reference;

@@ -2088,7 +2088,9 @@ fn delete_candidates(
         let evidence = state::IntentEvidence {
             identity: Some(fresh_row.identity.clone()),
             absence: fresh_row.absence.clone(),
+            caller: None,
         };
+
         let refusal: RefCell<Option<String>> = RefCell::new(None);
         let reprove = |record: &VolumeRecord| -> Result<()> {
             let context = Reprove {
@@ -2126,6 +2128,7 @@ fn delete_candidates(
             &unit,
             bounds,
             &volume_lock,
+            crate::delete::DeletionAuthority::Generic,
             Some(authorize),
             &evidence,
         );
@@ -4144,6 +4147,8 @@ mod tests {
             foreign_captures: Vec::new(),
             identity: None,
             absence: None,
+            caller_intent_id: None,
+            caller_request_digest: None,
         };
         state::publish_intent(&write, &fixture.volume.state, &intent)
             .expect("the intent publishes");

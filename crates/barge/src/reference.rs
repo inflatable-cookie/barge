@@ -494,13 +494,55 @@ impl OxideRow {
     }
 }
 
-/// One unfinished prune intent from Oxide's registry journal.
+/// One unfinished prune intent from Oxide's registry journal, with the identity
+/// facts the adapter binds.
+///
+/// The extra fields carry what the document already stated, through the same
+/// strict parse that produced the reference rows: nothing is re-read, defaulted
+/// or reinterpreted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OxideIntent {
     /// The root the intent names.
     pub root: PathBuf,
     /// The journal phase it records.
     pub phase: String,
+    /// The intent's id: Oxide's 128-bit lowercase-hex nonce.
+    pub id: String,
+    /// The quarantine leaf the root was renamed to.
+    pub quarantine: PathBuf,
+    /// The preview digest that authorised the move.
+    pub preview_sha256: String,
+    /// The intent's pinned root identity.
+    pub identity: OxideIntentIdentity,
+}
+
+/// One intent's pinned root identity, as its document records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OxideIntentIdentity {
+    /// The checkout the root belonged to.
+    pub checkout_id: String,
+    /// The checkout path.
+    pub checkout: PathBuf,
+    /// The receipt path.
+    pub receipt: PathBuf,
+    /// The member the root served.
+    pub member: String,
+    /// The root path.
+    pub root: PathBuf,
+    /// The root kind Oxide records.
+    pub root_kind: String,
+    /// The root's volume UUID, when the identity records one.
+    pub volume_uuid: Option<String>,
+    /// The root's immutable nonce, when the identity records one.
+    pub nonce: Option<String>,
+    /// The root-creation generation.
+    pub generation: u64,
+    /// The device observed at intent time (never a durable identity).
+    pub dev: u64,
+    /// The inode the identity binds.
+    pub ino: u64,
+    /// The marker bytes' digest the identity binds.
+    pub marker_digest: String,
 }
 
 /// The registry, as one reference snapshot read it.
@@ -972,7 +1014,10 @@ fn row_names_root(row: &OxideRow, root_path: &Path, mount_relative_path: &str) -
 /// reading an unreadable record as "no pools" would licence a release it should
 /// keep. Two control directories that both hold outputs are ambiguous for the
 /// same reason and are refused rather than picked between.
-fn control_directory(account: &dyn AccountFacts, deadline: Deadline) -> Result<Option<PathBuf>> {
+pub(crate) fn control_directory(
+    account: &dyn AccountFacts,
+    deadline: Deadline,
+) -> Result<Option<PathBuf>> {
     control_directory_with(account, deadline, &inspect_outputs)
 }
 
@@ -1111,7 +1156,7 @@ fn control_directory_with(
 /// The removable pool lives at `<internal control>/removable`, and its control
 /// directory is the `oxide-managed` folder inside that. An entry there that is
 /// not a real directory is unknown, never skipped.
-fn pools_holding(control: &Path) -> std::result::Result<Vec<PathBuf>, String> {
+pub(crate) fn pools_holding(control: &Path) -> std::result::Result<Vec<PathBuf>, String> {
     let Some(internal) = control.parent() else {
         return Err(format!(
             "{} has no pool directory above it, so its writers are unknown",
@@ -1174,7 +1219,7 @@ fn pools_holding(control: &Path) -> std::result::Result<Vec<PathBuf>, String> {
 }
 
 /// Read Oxide's outputs registry strictly.
-fn read_registry(path: &Path, deadline: Deadline) -> OxideRegistry {
+pub(crate) fn read_registry(path: &Path, deadline: Deadline) -> OxideRegistry {
     let bounds = Bounds::new(REGISTRY_CAP_BYTES, REGISTRY_ROWS, deadline);
     #[cfg(not(test))]
     let bytes = match state::read_bounded(path, &bounds) {
@@ -1575,8 +1620,25 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
             return Err("a prune intent names an unusable root identity for the move".to_owned());
         }
         intents.push(OxideIntent {
-            root: intent.identity.root,
+            root: intent.identity.root.clone(),
             phase: intent.phase,
+            id: intent.id,
+            quarantine: intent.quarantine,
+            preview_sha256: intent.preview_sha256,
+            identity: OxideIntentIdentity {
+                checkout_id: intent.identity.checkout_id,
+                checkout: intent.identity.checkout,
+                receipt: intent.identity.receipt,
+                member: intent.identity.member,
+                root: intent.identity.root,
+                root_kind: intent.identity.root_kind,
+                volume_uuid: intent.identity.volume_uuid,
+                nonce: intent.identity.nonce,
+                generation: intent.identity.generation,
+                dev: intent.identity.dev,
+                ino: intent.identity.ino,
+                marker_digest: intent.identity.marker_digest,
+            },
         });
     }
     if raw.revision == 0 && !rows.is_empty() {
@@ -2328,6 +2390,42 @@ pub fn read_oxide_marker(
     dirs: &dyn DirOps,
     root: &DirHandle,
 ) -> std::result::Result<Option<OxideMarker>, String> {
+    Ok(read_oxide_marker_full(dirs, root)?.map(|full| OxideMarker {
+        checkout: full.checkout,
+        checkout_id: full.checkout_id,
+        checkout_volume: full.checkout_volume,
+    }))
+}
+
+/// One root's Oxide marker, with everything the adapter binds: the exact
+/// bytes' SHA-256, the marker's root nonce and its own volume UUID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OxideMarkerFull {
+    /// The checkout the marker names.
+    pub checkout: PathBuf,
+    /// The checkout's id.
+    pub checkout_id: String,
+    /// The checkout's APFS volume UUID, when the marker records one.
+    pub checkout_volume: Option<VolumeUuid>,
+    /// The root's immutable nonce, when the marker records one.
+    pub nonce: Option<String>,
+    /// The root volume's UUID, when the marker records one.
+    pub volume_uuid: Option<VolumeUuid>,
+    /// The SHA-256 of the exact marker bytes this reading verified.
+    pub digest: String,
+}
+
+/// [`read_oxide_marker`], keeping the fields the adapter binds.
+///
+/// The read and the strictness are the same function's: one bounded,
+/// descriptor-relative, byte-exact read whose digest covers exactly the bytes
+/// the version check and the field check accepted. A `/1` marker is refused
+/// here too: it is not the covered class, and its missing nonce must never be
+/// read as a match.
+pub fn read_oxide_marker_full(
+    dirs: &dyn DirOps,
+    root: &DirHandle,
+) -> std::result::Result<Option<OxideMarkerFull>, String> {
     #[cfg(not(test))]
     let facts = match dirs.child_facts(root, OXIDE_MARKER_FILE) {
         Ok(Some(facts)) => facts,
@@ -2451,10 +2549,20 @@ pub fn read_oxide_marker(
         ),
         None => None,
     };
-    Ok(Some(OxideMarker {
+    let volume_uuid = match raw.volume_uuid.as_deref() {
+        Some(raw) => Some(
+            VolumeUuid::parse(raw)
+                .map_err(|error| format!("the marker's volume is not a UUID: {error}"))?,
+        ),
+        None => None,
+    };
+    Ok(Some(OxideMarkerFull {
         checkout: raw.checkout,
         checkout_id: raw.checkout_id,
         checkout_volume,
+        nonce: raw.nonce,
+        volume_uuid,
+        digest: crate::digest::sha256_hex(&bytes),
     }))
 }
 
