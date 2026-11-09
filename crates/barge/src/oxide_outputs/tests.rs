@@ -4,7 +4,7 @@
 //! real fixture files through the real OS layer, with the caller's records
 //! built exactly as Oxide writes them.
 
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -809,22 +809,47 @@ fn a_live_hold_keeps_the_covered_root() {
     let root = fixture.root("root-one");
     fixture.covered(&root, CALLER_ID);
     // A delegated unit's name is not a Barge root id, so its hold lives in the
-    // unit-name hold directory, exactly where custody reads it.
+    // unit-name hold directory, exactly where custody reads it. The hold is
+    // private state: it must be owner-only, or custody answers unknown and
+    // this test would cover the unknown branch instead of the held one.
     let hold_dir = fixture.volume.state.holds_dir().join("root-one");
     std::fs::create_dir_all(&hold_dir).expect("the hold directory is created");
-    std::fs::write(
-        hold_dir.join("fixture-hold.json"),
-        crate::testkit::VolumeFixture::hold_record(
+    let hold_path = hold_dir.join("fixture-holder.json");
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&hold_path)
+            .expect("the hold is created");
+        file.write_all(&crate::testkit::VolumeFixture::hold_record(
             "root-one",
             "fixture-holder",
             std::process::id(),
             7_000_000,
             crate::testkit::FIXTURE_BOOT,
-        ),
-    )
-    .expect("the hold is written");
+        ))
+        .expect("the hold is written");
+    }
+    let hold_mode = std::fs::metadata(&hold_path)
+        .expect("the hold is statable")
+        .permissions()
+        .mode();
+    assert_eq!(
+        hold_mode & 0o077,
+        0,
+        "the fixture hold is not owner-only, so custody cannot decide it and this test covers the wrong branch"
+    );
     let outcome = run(&fixture, &fixture.live_intent(&root, CALLER_ID));
     assert_eq!(outcome.kind, OutcomeKind::Refused, "{outcome:?}");
+    // The refusal must be custody's live-hold fact, not an unrelated unknown:
+    // a 0644 hold would answer unknown and must fail here.
+    let reason = outcome.reason.clone().unwrap_or_default();
+    assert!(
+        reason.contains("custody is not proven") && reason.contains("is live"),
+        "the refusal is not custody's live-hold fact: {reason}"
+    );
     assert!(root.path.exists(), "a held root is kept");
     // No journal record: the refusal happened before any effect.
     let intents = state::read_intents(&fixture.volume.state, crate::contract::INTENT_ROWS)

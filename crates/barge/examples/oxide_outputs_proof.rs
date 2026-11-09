@@ -42,6 +42,7 @@ use barge::registry::{
 };
 use barge::state::{self, Deadline, IntentPhase, IntentRecord, IntentUnit, LockSet, StatePaths};
 use barge::unit::{DeletionUnit, MarkerFamily, UnitGrant, UnitKind, UnitMarker};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 /// The caller intent id every fixture case presents, as Oxide spells one.
 const CALLER_ID: &str = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
@@ -716,11 +717,32 @@ fn case_live_hold_keeps(fixture: &Fixture) -> Result<(), String> {
         "purpose": "the proof's own live hold",
         "held_ms": state::now_ms(),
     });
-    std::fs::write(
-        hold_dir.join("proof-hold.json"),
-        serde_json::to_vec_pretty(&hold).expect("the hold encodes"),
-    )
-    .map_err(|error| format!("the hold is not written: {error}"))?;
+    // The hold record is private state: custody refuses a hold file whose
+    // mode is not owner-only, so the fixture must create it 0600 for the
+    // held branch to be decidable at all.
+    let hold_path = hold_dir.join("proof-holder.json");
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&hold_path)
+            .map_err(|error| format!("the hold is not created: {error}"))?;
+        file.write_all(&serde_json::to_vec_pretty(&hold).expect("the hold encodes"))
+            .map_err(|error| format!("the hold is not written: {error}"))?;
+    }
+    // The decidable-live premise is observed, not assumed: the hold file on
+    // disk must be owner-only before the call, or custody cannot decide it.
+    let hold_mode = std::fs::metadata(&hold_path)
+        .map_err(|error| format!("the hold's mode is unreadable: {error}"))?
+        .permissions()
+        .mode();
+    if hold_mode & 0o077 != 0 {
+        return Err(format!(
+            "the fixture hold is mode {hold_mode:o}, not owner-only, so custody cannot decide it and this case's premise failed"
+        ));
+    }
     let outcome = fixture.call(&fixture.live_intent(CALLER_ID), &Fixture::request())?;
     if outcome.kind != OutcomeKind::Refused {
         return Err(format!("expected refused, got {outcome:?}"));
