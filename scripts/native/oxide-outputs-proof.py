@@ -175,6 +175,10 @@ CASES = [
      "claim": "this call's own Locked is the known-no-effect fact; with a "
               "pending intent under the same caller id it stays pending",
      "carried_by": "a_pre_intent_lock_refusal_is_known_no_effect_and_a_pending_intent_under_lock_is_pending"},
+    {"id": "A13", "method": "A13",
+     "claim": "an actual deleted record refuses a different request or Barge id "
+              "as unknown for binding, preserves bytes, and recovers the exact request",
+     "carried_by": "the_recovery_checks_pending_and_terminal_operation_bindings"},
 ]
 
 # Spelled apart so this list does not contain the tokens it forbids.

@@ -315,7 +315,10 @@ pub enum BargeLookup {
     },
 }
 
-/// Look one caller intent id up in Barge's journal, bounded.
+/// Look up the exact operation in Barge's journal, bounded.
+/// Both pending and terminal records must match the canonical request and
+/// their stored unit must independently match the expected outputs identity.
+/// There is no caller-id-only compatibility lookup.
 ///
 /// The volume observation lock is taken shared first, so an in-flight write is
 /// denied rather than raced; a denied lock is unknown, never absent. When the
@@ -330,15 +333,22 @@ pub fn lookup(
     facts: &dyn AbsenceVolume,
     mounts: &dyn MountRoot,
     observer: &dyn ProcessObserver,
-    volume_uuid: &VolumeUuid,
-    caller_intent_id: &str,
+    intent: &LiveIntent,
+    request: &DelegatedRequest,
     barge_intent_id: Option<&str>,
 ) -> BargeLookup {
-    if let Err(reason) = validate_caller_id(caller_intent_id) {
-        return BargeLookup::Unknown { reason };
+    let volume_uuid = match validate_claim(intent) {
+        Ok(uuid) => uuid,
+        Err(reason) => return BargeLookup::Unknown { reason },
+    };
+    if let Some(id) = barge_intent_id {
+        if let Err(reason) = validate_caller_id(id) {
+            return BargeLookup::Unknown { reason };
+        }
     }
+    let caller_intent_id = intent.id.as_str();
     let mut locks = LockSet::with_deadline(state_paths.clone(), Deadline::after(state::LOCK_WAIT));
-    let _observation = match locks.observe_volume(volume_uuid) {
+    let _observation = match locks.observe_volume(&volume_uuid) {
         Ok(lock) => lock,
         Err(error) => {
             return BargeLookup::Unknown {
@@ -369,10 +379,16 @@ pub fn lookup(
     let matches: Vec<&IntentRecord> = intents
         .records
         .iter()
-        .filter(|record| record.caller_intent_id.as_deref() == Some(caller_intent_id))
+        .filter(|record| {
+            record.caller_intent_id.as_deref() == Some(caller_intent_id)
+                || barge_intent_id.is_some_and(|id| id == record.intent_id)
+        })
         .collect();
     match matches.as_slice() {
         [record] => {
+            if let Err(reason) = check_binding(record, intent, request, barge_intent_id) {
+                return BargeLookup::Unknown { reason };
+            }
             let leaf = record.unit.capture_name.clone();
             return match record.phase {
                 IntentPhase::Deleted => BargeLookup::FoundTerminal {
@@ -403,12 +419,50 @@ pub fn lookup(
         facts,
         mounts,
         observer,
-        volume_uuid,
+        &volume_uuid,
         barge_intent_id,
     ) {
         Ok(()) => BargeLookup::PositivelyAbsent,
         Err(reason) => BargeLookup::Unknown { reason },
     }
+}
+
+/// Validate both the journal correlation and the independently stored unit.
+/// Device numbers are deliberately excluded: UUID is the durable volume key.
+fn check_binding(
+    record: &IntentRecord,
+    intent: &LiveIntent,
+    request: &DelegatedRequest,
+    barge_intent_id: Option<&str>,
+) -> std::result::Result<(), String> {
+    let uuid = validate_claim(intent)?;
+    let digest = request.digest(intent).map_err(|error| error.to_string())?;
+    let root = record
+        .mount_hint
+        .join(&record.root_dir)
+        .join(&record.folder)
+        .join(&record.unit.parent)
+        .join(&record.unit.name);
+    let marker = UnitMarker::new(
+        MarkerFamily::OxideOutputs,
+        intent.identity.marker_digest.clone(),
+    );
+    if record.volume_uuid != uuid
+        || record.caller_intent_id.as_deref() != Some(intent.id.as_str())
+        || barge_intent_id.is_some_and(|id| id != record.intent_id)
+        || record.caller_request_digest.as_deref() != Some(digest.as_str())
+        || record.plan_digest != digest
+        || record.unit.kind != UnitKind::Directory
+        || record.unit.inode != intent.identity.ino
+        || record.unit.marker.as_ref() != Some(&marker)
+        || record.unit.grant != UnitGrant::delegation(MarkerFamily::OxideOutputs)
+        || record.unit.root_id.is_some()
+        || !record.unit.parent.is_empty()
+        || root != intent.identity.root
+    {
+        return Err("the journal record conflicts with the expected outputs operation binding; keep the caller pending".to_owned());
+    }
+    Ok(())
 }
 
 /// Whether the outputs folder names no quarantine leaf for this operation.
@@ -549,6 +603,9 @@ pub fn execute(call: &AdapterCall<'_>) -> Outcome {
     let resumed = match mine.as_slice() {
         [] => None,
         [record] => {
+            if let Err(reason) = check_binding(record, intent, call.request, None) {
+                return unknown(reason);
+            }
             if record.phase == IntentPhase::Deleted {
                 // Terminal: report the settled outcome. No lock, no re-read,
                 // no second unit.
@@ -561,12 +618,6 @@ pub fn execute(call: &AdapterCall<'_>) -> Outcome {
                             .to_owned(),
                     ),
                 };
-            }
-            if record.caller_request_digest.as_deref() != Some(request_digest.as_str()) {
-                return refused(format!(
-                    "a pending intent already names caller id {} for a different request, so this request is refused",
-                    intent.id
-                ));
             }
             Some(record.intent_id.clone())
         }
@@ -895,6 +946,9 @@ fn resume(
             );
         }
     };
+    if let Err(reason) = check_binding(&journal, intent, call.request, Some(&intent_id)) {
+        return outcome_for(OutcomeKind::Unknown, Some(reason));
+    }
     let volume_uuid = journal.volume_uuid.clone();
     let record = match registry::read(call.state_paths) {
         Ok(registry) => registry,
@@ -1351,6 +1405,11 @@ fn validate_claim(intent: &LiveIntent) -> std::result::Result<VolumeUuid, String
             "the intent's identity binds no root nonce, which the covered class requires"
                 .to_owned(),
         );
+    }
+    if !identity.nonce.as_deref().is_some_and(|nonce| {
+        nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err("the intent's root nonce is not 128-bit hex".to_owned());
     }
     let volume_uuid = match &identity.volume_uuid {
         Some(raw) => VolumeUuid::parse(raw).map_err(|error| {

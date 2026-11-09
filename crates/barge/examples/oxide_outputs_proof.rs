@@ -130,6 +130,7 @@ fn run_case(case: &str) -> Result<(), String> {
         "A10" => case_pre_rename_rollback(&fixture),
         "A11" => case_post_rename_resume_and_lookup(&fixture),
         "A12" => case_locked_outcomes(&fixture),
+        "A13" => case_terminal_binding(&fixture),
         other => Err(format!("`{other}` is not a case this driver runs")),
     }
 }
@@ -420,8 +421,8 @@ impl Fixture {
             &platform,
             &platform,
             &platform,
-            &self.volume_uuid,
-            caller_id,
+            &self.live_intent(caller_id),
+            &Self::request(),
             binding,
         ))
     }
@@ -893,4 +894,66 @@ fn wait_for_lock_ready(ready: &std::sync::mpsc::Receiver<()>) -> Result<(), Stri
             "the holder's lock-acquired acknowledgement did not arrive inside {LOCK_READY_TIMEOUT:?}, so the held-lock premise failed: {error}"
         )
     })
+}
+
+/// Actual native deletion followed by mismatched terminal recovery requests.
+fn case_terminal_binding(fixture: &Fixture) -> Result<(), String> {
+    fixture.covered(CALLER_ID)?;
+    let intent = fixture.live_intent(CALLER_ID);
+    let request = Fixture::request();
+    let deleted = fixture.call(&intent, &request)?;
+    if deleted.kind != OutcomeKind::Deleted {
+        return Err(format!("binding setup expected deleted, got {deleted:?}"));
+    }
+    let id = deleted.intent_id.ok_or("deleted report has no Barge id")?;
+    let path = state::intent_path(&fixture.state, &id).map_err(|error| error.to_string())?;
+    let before = std::fs::read(&path).map_err(|error| error.to_string())?;
+    let mut wrong = intent.clone();
+    wrong.preview_sha256 = "f".repeat(64);
+    let outcome = fixture.call(&wrong, &request)?;
+    if outcome.kind != OutcomeKind::Unknown
+        || !outcome.reason.as_deref().unwrap_or("").contains("binding")
+    {
+        return Err(format!(
+            "wrong terminal request must stay unknown for binding: {outcome:?}"
+        ));
+    }
+    let platform = platform();
+    let answer = oxide_outputs::lookup(
+        &fixture.state,
+        &platform,
+        &platform,
+        &platform,
+        &platform,
+        &wrong,
+        &request,
+        Some(&id),
+    );
+    if !matches!(answer, BargeLookup::Unknown { ref reason } if reason.contains("binding")) {
+        return Err(format!(
+            "wrong terminal lookup must stay unknown for binding: {answer:?}"
+        ));
+    }
+    let other_id = if id == INTENT_ID {
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    } else {
+        INTENT_ID
+    };
+    let answer = fixture.lookup(CALLER_ID, Some(other_id))?;
+    if !matches!(answer, BargeLookup::Unknown { ref reason } if reason.contains("binding")) {
+        return Err(format!(
+            "wrong Barge id must stay unknown for binding: {answer:?}"
+        ));
+    }
+    if !matches!(fixture.lookup(CALLER_ID, Some(&id))?, BargeLookup::FoundTerminal { intent_id } if intent_id == id)
+    {
+        return Err("the exact terminal lookup did not recover its own record".to_owned());
+    }
+    if fixture.call(&intent, &request)?.kind != OutcomeKind::Deleted {
+        return Err("the exact repeated request did not return deleted".to_owned());
+    }
+    if std::fs::read(&path).map_err(|error| error.to_string())? != before {
+        return Err("binding checks rewrote the terminal record".to_owned());
+    }
+    Ok(())
 }
