@@ -271,14 +271,62 @@ def executed_shapes_problems():
     detach = detach.split("\n    def case_environment", 1)[0]
     if "image_attachments(self.backing" not in detach:
         problems.append("the detach census is not filtered to this run's backing")
-    build = text.split('def build_driver(parent, deadline_ns):', 1)[1]
+    # The staging selector's body is the last definition of its own line in
+    # this file, so rsplit takes the real function, never this scan's mention.
+    selector = text.rsplit('def driver_from_build(text):', 1)[1]
+    selector = selector.split("\n\ndef build_driver", 1)[0]
+    if '"example" in (target.get("kind") or [])' not in selector:
+        problems.append("the staging selector does not require the example target kind")
+    if 'target.get("name") == DRIVER_NAME' not in selector:
+        problems.append("the staging selector does not require the driver's target name")
+    if 'and document.get("executable")' not in selector:
+        problems.append("the staging selector accepts an artifact with no executable")
+    build = text.rsplit('def build_driver(parent, deadline_ns):', 1)[1]
     build = build.split("\n\nclass AdapterProof", 1)[0]
     if "base.stage_environment(dict(os.environ), parent)" not in build:
         problems.append("the staged build does not run under the stage environment")
     if build.find("stage_environment_problems") > build.find("base.run(BUILD_COMMAND"):
         problems.append("the stage environment's refusal check does not run before the build")
+    if "found = driver_from_build(result.stdout)" not in build:
+        problems.append("the staged build is not resolved through the driver selector")
     if 'found.get("features") != [PROOF_FEATURE]' not in build:
         problems.append("the staged build's feature list is not checked")
+    # The selection predicate is executed here over synthetic artifact lines,
+    # so the shape it accepts is the shape cargo emits for this example target:
+    # the `barge` bin line, a wrong target name and a missing executable are
+    # all refused, and only the example's own artifact with its features is
+    # selected.
+    artifact = (
+        '{"reason":"compiler-artifact","target":{"kind":["example"],'
+        '"crate_types":["bin"],"name":"' + DRIVER_NAME + '","edition":"2021"},'
+        '"features":["' + PROOF_FEATURE + '"],"executable":"/stage/' + DRIVER_NAME + '"}'
+    )
+    selected = driver_from_build(artifact)
+    if not selected or selected.get("executable") != "/stage/" + DRIVER_NAME:
+        problems.append("the staging selector does not select the driver's example artifact")
+    if selected and selected.get("features") != [PROOF_FEATURE]:
+        problems.append("the staging selector reports features other than the artifact's")
+    bin_line = (
+        '{"reason":"compiler-artifact","target":{"kind":["bin"],'
+        '"crate_types":["bin"],"name":"barge","edition":"2021"},'
+        '"features":["' + PROOF_FEATURE + '"],"executable":"/stage/barge"}'
+    )
+    if driver_from_build(bin_line) is not None:
+        problems.append("the staging selector accepts the barge binary instead of the driver")
+    wrong_name = (
+        '{"reason":"compiler-artifact","target":{"kind":["example"],'
+        '"crate_types":["bin"],"name":"another_example","edition":"2021"},'
+        '"features":["' + PROOF_FEATURE + '"],"executable":"/stage/another_example"}'
+    )
+    if driver_from_build(wrong_name) is not None:
+        problems.append("the staging selector accepts another target's artifact")
+    no_executable = (
+        '{"reason":"compiler-artifact","target":{"kind":["example"],'
+        '"crate_types":["bin"],"name":"' + DRIVER_NAME + '","edition":"2021"},'
+        '"features":["' + PROOF_FEATURE + '"]}'
+    )
+    if driver_from_build(no_executable) is not None:
+        problems.append("the staging selector accepts an artifact with no executable")
     run_case = text.split('def run_case(self, case):\n        """One case, one driver process', 1)[1]
     run_case = run_case.split("\n    def receipt_document", 1)[0]
     if 'verdict.get("status") == "passed"' not in run_case or "result.returncode == 0" not in run_case:
@@ -506,16 +554,48 @@ def plan_document():
     }
 
 
+def driver_from_build(text):
+    """The staged driver's source and features from `oxide build --message-format json`.
+
+    Cargo reports one `compiler-artifact` per target. This build produces an
+    **example** target, not the `barge` binary, so release-proof's own selector
+    (`base.executable_from_build`, which accepts only the `barge` bin) never
+    matches it; this is the same strict shape check with the example target's
+    name and kind. A line whose target is not this exact example, whose kind
+    does not carry `example`, or whose executable is missing is not the
+    driver, whatever else it says.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            document = json.loads(line)
+        except ValueError:
+            continue
+        target = document.get("target") or {}
+        if (
+            document.get("reason") == "compiler-artifact"
+            and target.get("name") == DRIVER_NAME
+            and "example" in (target.get("kind") or [])
+            and document.get("executable")
+        ):
+            return {"executable": document["executable"], "features": document.get("features", [])}
+    return None
+
+
 def build_driver(parent, deadline_ns):
     """Stage the proof-feature driver inside the guard; own bytes, own manifest.
 
     The build runs under base.stage_environment exactly as the release proof's
     staging does: the guard's hooks and every inherited Rust flag variable are
     dropped, the toolchain is pinned, auto-install is disabled and the network
-    is offline, and the refusal check runs before any build starts. The copy is
-    one exclusive directory under the guard's owned root, hashed into its own
-    manifest, and the feature list the compiler reports must be exactly the
-    proof feature.
+    is offline, and the refusal check runs before any build starts. The whole
+    stage spends only the wall the guard still holds, never a minimum that
+    could run past it. The copy is one exclusive directory under the guard's
+    owned root, hashed into its own manifest, and the feature list the
+    compiler reports for the driver's own artifact must be exactly the proof
+    feature.
     """
     remaining = None
     if deadline_ns is not None:
@@ -529,11 +609,14 @@ def build_driver(parent, deadline_ns):
     if problems:
         raise base.Infrastructure("stage", "; ".join(problems))
     stage = tempfile.mkdtemp(prefix="proof-binary-", dir=parent)
-    budget = None if remaining is None else max(10, int(remaining))
+    budget = None if remaining is None else int(remaining)
     result = base.run(BUILD_COMMAND, environment, cwd=REPO_ROOT, timeout=budget)
-    found = base.executable_from_build(result.stdout)
+    found = driver_from_build(result.stdout)
     if found is None:
-        raise base.Infrastructure("stage", "the build reported no driver artifact")
+        raise base.Infrastructure(
+            "stage",
+            f"the build reported no {DRIVER_NAME} example artifact, so no driver can be staged",
+        )
     if found.get("features") != [PROOF_FEATURE]:
         raise base.Infrastructure(
             "stage",

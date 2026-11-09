@@ -297,6 +297,13 @@ pub enum BargeLookup {
     /// and none names this caller id, and the outputs folder holds no
     /// quarantine leaf that could be this operation's. This is a positive
     /// absence: the caller may treat "no journal" as a fact.
+    ///
+    /// **This answer is Barge-side only.** It covers Barge's journal and
+    /// Barge's quarantine leaves and nothing else. The joint protocol's
+    /// positive absence for rollback additionally requires the original root
+    /// present with the recorded identity, which remains the caller's own
+    /// proof, made on its own durable record — so this answer alone is never
+    /// rollback authority.
     PositivelyAbsent,
     /// The lookup could not finish: an unreadable or truncated journal, an
     /// unreadable record, an observation lock that was denied, a volume or

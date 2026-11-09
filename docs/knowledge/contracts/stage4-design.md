@@ -979,6 +979,12 @@ What landed in `crates/barge/src/oxide_outputs.rs`, all default library code:
   absent (a complete journal read under the volume's observation lock, no
   record, no attributable leaf), or unknown — so Oxide can settle or keep
   pending without inferring completion from missing bytes.
+**`PositivelyAbsent` is Barge-side only.** It answers Barge's journal and
+Barge's quarantine leaves and nothing else; the protocol's positive absence
+for rollback additionally requires the original root present with the
+recorded identity, which is the Oxide caller's own proof, made on its own
+durable record. The lookup's answer alone is therefore never rollback
+authority, and a truncated journal is unknown there too, never absent.
 - **The single-deleter rule.** Only the adapter constructs, executes, resumes
   or settles this family. A generic delete — a host release, a sweep, the
   space prune, a direct library call — refuses an `oxide_outputs` unit before
