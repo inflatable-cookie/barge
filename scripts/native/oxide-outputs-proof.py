@@ -333,6 +333,40 @@ def executed_shapes_problems():
     run_case = run_case.split("\n    def receipt_document", 1)[0]
     if 'verdict.get("status") == "passed"' not in run_case or "result.returncode == 0" not in run_case:
         problems.append("a case passes on anything but the driver's own passed verdict")
+    if run_case.find("base.stage_environment") == -1 or "**self.case_environment(case_dir)" not in run_case:
+        problems.append("the case environment does not compose the scrub with the case bindings")
+    elif run_case.find("base.stage_environment") > run_case.find("**self.case_environment(case_dir)"):
+        problems.append("the case bindings are not applied after the stage scrub")
+    # The composition is executed here: the scrub alone drops the guard hook
+    # variables, and the composed environment a case child actually runs under
+    # must still carry both bindings the proof feature's account seam requires
+    # (crates/barge/src/os/proof_account.rs).
+    composed = {
+        **base.stage_environment(
+            {
+                "HOME": "/case/home",
+                "TMPDIR": "/case",
+                "TMP": "/case",
+                "TEMP": "/case",
+                "OXIDE_TASK_SCRATCH_ROOT": "/guard/scratch",
+                "OXIDE_PROOF_EVIDENCE": "/guard/evidence",
+            },
+            "/case",
+        ),
+        **{
+            "HOME": "/case/home",
+            "BARGE_STATE_DIR": "/case/state",
+            "BARGE_ACCOUNT_HOME": "/case/home",
+            "TMPDIR": "/case",
+            "TMP": "/case",
+            "TEMP": "/case",
+            "OXIDE_TASK_SCRATCH_ROOT": "/guard/scratch",
+            "OXIDE_PROOF_EVIDENCE": "/guard/evidence",
+        },
+    }
+    for binding in ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_EVIDENCE", "BARGE_STATE_DIR", "BARGE_ACCOUNT_HOME"):
+        if not composed.get(binding):
+            problems.append(f"the case child loses the required binding {binding}")
     driver_path = os.path.join(REPO_ROOT, "crates", "barge", "examples", f"{DRIVER_NAME}.rs")
     with open(driver_path, encoding="utf-8") as handle:
         driver = handle.read()
@@ -787,7 +821,23 @@ class AdapterProof:
     def run_case(self, case):
         """One case, one driver process, one verdict document."""
         case_dir = tempfile.mkdtemp(prefix=f"case-{case['id']}-", dir=self.run_root)
-        environment = base.stage_environment(self.case_environment(case_dir), case_dir)
+        # The stage scrub exists for the staged build child. A fixture case
+        # child needs the guard's own bindings back on top of it, because the
+        # proof feature's account seam refuses to resolve Oxide's directories
+        # without OXIDE_TASK_SCRATCH_ROOT and OXIDE_PROOF_EVIDENCE. The scrub
+        # runs first and the case bindings win, so the child keeps the toolchain
+        # and flag hygiene of the scrub and still carries exactly the bindings
+        # its fixture requires.
+        scrubbed = base.stage_environment(
+            {
+                "HOME": os.path.join(case_dir, "home"),
+                "TMPDIR": case_dir,
+                "TMP": case_dir,
+                "TEMP": case_dir,
+            },
+            case_dir,
+        )
+        environment = {**scrubbed, **self.case_environment(case_dir)}
         started = time.monotonic()
         result = base.run([self.binary, case["method"]], environment, timeout=60, check=False)
         elapsed = time.monotonic() - started

@@ -585,6 +585,15 @@ fn case_unreadable_registry_is_unknown(fixture: &Fixture) -> Result<(), String> 
     if outcome.kind != OutcomeKind::Unknown {
         return Err(format!("expected unknown, got {outcome:?}"));
     }
+    // The Unknown must be this case's own fact - an unreadable registry - and
+    // not any unrelated unknown: a control directory that cannot even be
+    // resolved must not read as this case's pass.
+    let reason = outcome.reason.clone().unwrap_or_default();
+    if !reason.contains("registry") {
+        return Err(format!(
+            "the Unknown does not name the unreadable registry, so an unrelated unknown cannot be told from this case's: {reason}"
+        ));
+    }
     if !fixture.root_path.exists() {
         return Err("an unknown authority deleted the root".to_owned());
     }
