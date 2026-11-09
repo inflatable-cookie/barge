@@ -245,6 +245,52 @@ def feature_problems():
     return problems
 
 
+def executed_shapes_problems():
+    """The guard half's executed call shapes, read from this script's own source.
+
+    The effect-free self-check must prove the shapes a native run executes, not
+    only the pins: the attach census is backing-filtered before any mount is
+    accepted, custody is live before the attach child runs, the detach census
+    names this backing, the staged build runs under the stage environment with
+    its refusal check before the build, and a case passes only on the driver's
+    own `passed` verdict with a zero exit.
+    """
+    problems = []
+    # The anchors carry each method's own docstring head, so this scan never
+    # matches its own mentions of them.
+    text = source_text()
+    attach = text.split('def attach(self):\n        """Attach one owned 128 MiB image', 1)[1]
+    attach = attach.split("\n    def detach", 1)[0]
+    if "image_attachments(backing" not in attach:
+        problems.append("the attach census is not filtered to this run's backing")
+    if attach.find("self.attached = True") > attach.find("HDIUTIL"):
+        problems.append("custody is not live before the attach child runs")
+    if "-mountpoint" not in attach:
+        problems.append("the attach does not name this run's own mount point")
+    detach = text.split('def detach(self, purpose):\n        """Ordinary detach only', 1)[1]
+    detach = detach.split("\n    def case_environment", 1)[0]
+    if "image_attachments(self.backing" not in detach:
+        problems.append("the detach census is not filtered to this run's backing")
+    build = text.split('def build_driver(parent, deadline_ns):', 1)[1]
+    build = build.split("\n\nclass AdapterProof", 1)[0]
+    if "base.stage_environment(dict(os.environ), parent)" not in build:
+        problems.append("the staged build does not run under the stage environment")
+    if build.find("stage_environment_problems") > build.find("base.run(BUILD_COMMAND"):
+        problems.append("the stage environment's refusal check does not run before the build")
+    if 'found.get("features") != [PROOF_FEATURE]' not in build:
+        problems.append("the staged build's feature list is not checked")
+    run_case = text.split('def run_case(self, case):\n        """One case, one driver process', 1)[1]
+    run_case = run_case.split("\n    def receipt_document", 1)[0]
+    if 'verdict.get("status") == "passed"' not in run_case or "result.returncode == 0" not in run_case:
+        problems.append("a case passes on anything but the driver's own passed verdict")
+    driver_path = os.path.join(REPO_ROOT, "crates", "barge", "examples", f"{DRIVER_NAME}.rs")
+    with open(driver_path, encoding="utf-8") as handle:
+        driver = handle.read()
+    if '"passed"' not in driver:
+        problems.append("the driver never prints a passed verdict for the script to parse")
+    return problems
+
+
 def driver_problems():
     """The driver is safe code that refuses to run without its bindings."""
     problems = []
@@ -334,6 +380,7 @@ def self_check():
     problems += case_table_problems()
     problems += feature_problems()
     problems += driver_problems()
+    problems += executed_shapes_problems()
     if base.SUPERVISOR_SHA256 != "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b":
         problems.append("the imported supervisor pin is not the qualified one")
     if IMAGE_MIB != 128:
@@ -459,21 +506,43 @@ def plan_document():
     }
 
 
-def build_driver(environment, deadline_ns):
-    """Stage the proof-feature driver inside the guard; own bytes, own manifest."""
-    deadline = deadline_ns / 1_000_000_000 if deadline_ns else None
-    if deadline is not None and time.monotonic() >= deadline:
-        raise base.Infrastructure(
-            "stage", "the guard's wall was reached before the driver was staged"
-        )
-    stage = tempfile.mkdtemp(prefix="proof-binary-", dir=environment["TMPDIR"])
-    budget = 120 if deadline is None else max(
-        10, int(deadline - time.monotonic())
-    )
+def build_driver(parent, deadline_ns):
+    """Stage the proof-feature driver inside the guard; own bytes, own manifest.
+
+    The build runs under base.stage_environment exactly as the release proof's
+    staging does: the guard's hooks and every inherited Rust flag variable are
+    dropped, the toolchain is pinned, auto-install is disabled and the network
+    is offline, and the refusal check runs before any build starts. The copy is
+    one exclusive directory under the guard's owned root, hashed into its own
+    manifest, and the feature list the compiler reports must be exactly the
+    proof feature.
+    """
+    remaining = None
+    if deadline_ns is not None:
+        remaining = (deadline_ns - time.monotonic_ns()) / 1e9
+        if remaining <= 0:
+            raise base.Infrastructure(
+                "stage", "no guard wall is left to stage the driver build"
+            )
+    environment = base.stage_environment(dict(os.environ), parent)
+    problems = base.stage_environment_problems(environment)
+    if problems:
+        raise base.Infrastructure("stage", "; ".join(problems))
+    stage = tempfile.mkdtemp(prefix="proof-binary-", dir=parent)
+    budget = None if remaining is None else max(10, int(remaining))
     result = base.run(BUILD_COMMAND, environment, cwd=REPO_ROOT, timeout=budget)
-    executable = base.executable_from_build(result.stdout)
+    found = base.executable_from_build(result.stdout)
+    if found is None:
+        raise base.Infrastructure("stage", "the build reported no driver artifact")
+    if found.get("features") != [PROOF_FEATURE]:
+        raise base.Infrastructure(
+            "stage",
+            f"the driver artifact was built with features {found.get('features')}, "
+            f"not [{PROOF_FEATURE!r}]",
+        )
     staged = os.path.join(stage, DRIVER_NAME)
-    base.run(["cp", executable, staged], environment)
+    base.run(["cp", found["executable"], staged], environment)
+    os.chmod(staged, 0o755)
     manifest = {
         "schema": base.STAGE_SCHEMA,
         "sha256": base.sha256_file(staged),
@@ -481,9 +550,12 @@ def build_driver(environment, deadline_ns):
         "toolchain": TOOLCHAIN_CHANNEL,
         "feature": PROOF_FEATURE,
         "build": BUILD_COMMAND,
+        "source": found["executable"],
+        "path": staged,
     }
     with open(os.path.join(stage, base.STAGE_MANIFEST), "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=1)
+        handle.write("\n")
     return {"path": staged, "manifest": manifest}
 
 
@@ -505,6 +577,7 @@ class AdapterProof:
         self.mount = None
         self.device = None
         self.volume_uuid = None
+        self.backing = None
         self.run_root = None
         self.custody = None
         self.closure = None
@@ -513,57 +586,90 @@ class AdapterProof:
         self.resources = {}
 
     def attach(self):
-        """Attach one owned 128 MiB image inside the run root, custody first."""
+        """Attach one owned 128 MiB image inside the run root, custody first.
+
+        The backing's own path is canonical, the mount is this run's explicit
+        name, and the custody indication is published before the backing
+        exists. Custody is live the moment this process may have attached:
+        `self.attached` is set before the attach child runs, so an interrupted
+        or unreadable attach is retained unknown, never reported as "no
+        attachment was established" and never cleaned up. The census is
+        filtered to this backing, so another image mounted on the host can
+        never be accepted, used or detached.
+        """
         backing = os.path.join(self.run_root, "outputs-image.dmg")
+        if os.path.realpath(backing) != backing:
+            raise base.Infrastructure("attach", "the backing path is not canonical")
         self.custody = base.custody_document(backing, self.run_root, self.evidence)
         with open(os.path.join(self.evidence, base.CUSTODY_NAME), "w", encoding="utf-8") as handle:
             json.dump(self.custody, handle, indent=1)
+        mount = f"/Volumes/barge-outputs-proof-{os.getpid()}-{int(time.time()) % 100000}"
+        if os.path.lexists(mount):
+            raise base.Infrastructure("attach", "the mount name already exists")
+        self.backing = backing
+        self.mount = mount
+        self.attached = True  # An interrupted attach has unknown custody, not absence.
         base.run(
             [base.HDIUTIL, "create", "-quiet", "-size", f"{IMAGE_MIB}m", "-fs", "APFS",
              "-type", "SPARSE", "-volname", IMAGE_VOLUME_NAME, "-o", backing],
             os.environ, timeout=120,
         )
         attach = base.run(
-            [base.HDIUTIL, "attach", "-nobrowse", "-owners", "on", "-plist", backing],
-            os.environ, timeout=120,
+            [base.HDIUTIL, "attach", "-nobrowse", "-owners", "on", "-mountpoint", mount,
+             "-plist", backing],
+            os.environ, timeout=120, check=False,
         )
-        rows = plistlib.loads(attach.stdout.encode())["images"][0]["system-entities"]
-        census = [(entity.get("dev-entry"), entity.get("mount-point")) for entity in rows]
-        mounted = [row for row in census if row[1] is not None]
-        if len(mounted) != 1:
-            raise base.Infrastructure(
-                "attach", f"{len(mounted)} entities of the backing are mounted: {census!r}"
-            )
-        mount, device = mounted[0][1], mounted[0][0]
+        # The census is this backing's own entities, never the host's list of
+        # every mounted image: a foreign image cannot be accepted as ours.
+        census = base.image_attachments(backing, os.environ)
+        device = None
+        if census is not None and attach.returncode == 0:
+            mounted = [row for row in census if row[1] == mount]
+            if len(mounted) == 1:
+                device = mounted[0][0]
         facts = base.attach_document(attach.returncode, True, census, mount, device)
         if facts.get("state") != "attached":
             raise base.Infrastructure("attach", facts.get("reason", "unknown custody"))
-        self.mount = mount
         self.device = device
-        self.volume_uuid = base.volume_uuid(mount)
-        self.attached = True
+        info = base.run([base.DISKUTIL, "info", "-plist", mount], os.environ, timeout=base.INFO_TIMEOUT_SECONDS)
+        parsed = plistlib.loads(info.stdout.encode())
+        uuid = parsed.get(base.VOLUME_UUID_KEY)
+        if not uuid:
+            raise base.Infrastructure("attach", "the owned image did not report its volume UUID")
+        self.volume_uuid = uuid
+        text = base.run([base.DISKUTIL, "info", mount], os.environ, timeout=base.INFO_TIMEOUT_SECONDS).stdout
+        if base.ownership_state(text) != "enabled":
+            raise base.Infrastructure(
+                "attach", f"the image does not state `Owners: Enabled` (reads {base.ownership_state(text)!r})"
+            )
 
     def detach(self, purpose):
-        """Ordinary detach only; closure needs reap plus whole-backing absence."""
-        info = base.run([base.HDIUTIL, "info", "-plist"], os.environ, timeout=base.INFO_TIMEOUT_SECONDS)
-        rows = base.image_attachments(None, os.environ)
+        """Ordinary detach only; closure needs reap plus whole-backing absence.
+
+        The rebind census is this backing's own, read fresh; a foreign image's
+        bindings never authorize this detach. An unreadable census or a binding
+        mismatch retains the image as unknown custody and faults the run rather
+        than detaching anything.
+        """
+        rows = base.image_attachments(self.backing, os.environ)
         if rows is None:
             raise base.Infrastructure("rebind-census", "the pre-detach census is unreadable")
         observed_uuid = base.volume_uuid(self.mount)
-        problems = base.detach_binding_problems(rows, self.mount, self.device, self.volume_uuid, observed_uuid)
+        problems = base.detach_binding_problems(
+            rows, self.mount, self.device, self.volume_uuid, observed_uuid
+        )
         if problems:
             raise base.Infrastructure("rebind-census", "; ".join(problems))
         detach = base.run(
             [base.HDIUTIL, "detach", self.mount], os.environ,
             timeout=base.DETACH_TIMEOUT_SECONDS, check=False,
         )
-        rows_after = base.image_attachments(None, os.environ)
+        rows_after = base.image_attachments(self.backing, os.environ)
         closure = base.closure_document(
             purpose, detach.returncode, True, rows_after,
             not os.path.lexists(self.mount),
         )
         closure["mount"] = self.mount
-        del info
         return closure
 
     def case_environment(self, case_dir):
@@ -647,9 +753,7 @@ def guarded_run(mode, receipt_path, route, deadline_ns, parent, owned):
     """Stage inside the guard, attach one owned image, run the cases, close."""
     evidence = os.path.dirname(os.path.abspath(receipt_path))
     try:
-        build = build_driver(
-            dict(os.environ, TMPDIR=os.environ.get("TMPDIR", parent)), deadline_ns
-        )
+        build = build_driver(parent, deadline_ns)
     except base.Infrastructure as error:
         print(json.dumps({"schema": SCHEMA, "ok": False, "stage": None,
                           "refused": f"staging the driver build failed: {error.detail}"}))

@@ -59,15 +59,18 @@ fn main() -> ExitCode {
         eprintln!("name the case to run");
         return ExitCode::from(ErrorKind::Usage.exit_code());
     };
-    match run_case(&case) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(detail) => {
-            println!(
-                "{}",
-                serde_json::json!({"case": case, "status": "failed", "detail": detail})
-            );
-            ExitCode::from(ErrorKind::UnknownState.exit_code())
-        }
+    // The verdict document is printed on both paths, so the proof script
+    // always parses a status from the case's own stdout: `passed` only when
+    // the case's own assertions all held, `failed` with the reason otherwise.
+    let verdict = match run_case(&case) {
+        Ok(()) => serde_json::json!({"case": case, "status": "passed"}),
+        Err(detail) => serde_json::json!({"case": case, "status": "failed", "detail": detail}),
+    };
+    println!("{verdict}");
+    if verdict["status"] == "passed" {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(ErrorKind::UnknownState.exit_code())
     }
 }
 

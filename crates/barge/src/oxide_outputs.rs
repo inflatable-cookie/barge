@@ -519,13 +519,21 @@ pub fn execute(call: &AdapterCall<'_>) -> Outcome {
     };
     // 1. Idempotency: this caller id names at most one record in this
     //    journal, and a record that exists decides the call before anything
-    //    else runs.
+    //    else runs. A truncated journal is unknown state, never a fresh one:
+    //    records this read could not carry may name this caller id, so no
+    //    idempotency answer and no known-no-effect fact can come out of it.
     let intents = match state::read_intents(call.state_paths, crate::contract::INTENT_ROWS) {
         Ok(intents) => intents,
         Err(error) => {
             return unknown(format!("the intent journal cannot be read: {error}"));
         }
     };
+    if intents.truncated {
+        return unknown(format!(
+            "the intent journal holds more than {} records, so no id can be decided and nothing can be known to have had no effect",
+            crate::contract::INTENT_ROWS
+        ));
+    }
     let mine: Vec<&IntentRecord> = intents
         .records
         .iter()
@@ -613,12 +621,32 @@ pub fn execute(call: &AdapterCall<'_>) -> Outcome {
 
     // 5. The unit: one directory, directly inside the declared folder, bound
     //    by inode, nonce, marker bytes and volume UUID. The request digest is
-    //    the plan digest the journal records.
+    //    the plan digest the journal records. The device is the one the live
+    //    volume reports now, verified by UUID and mount root: it is the
+    //    within-run observation the walk proves containment under, never a
+    //    bound identity, so a remount that changed the device number refuses
+    //    nothing (the joint protocol's remount row; the replay path binds the
+    //    same way).
     let folder = match document.declaration().folder_for(&volume_uuid) {
         Some(folder) => folder.to_owned(),
         None => {
             return refused(format!(
                 "the {AREA_REF} declaration resolves to no folder on volume {volume_uuid}"
+            ));
+        }
+    };
+    let live = match area::VolumeRoot::open_with(
+        call.dirs,
+        call.facts,
+        call.mounts,
+        area::MountLookup::ByUuid(call.facts),
+        &record,
+    ) {
+        Ok(live) => live,
+        Err(error) => {
+            return refused(format!(
+                "volume {volume_uuid} does not verify now, so nothing on it can be acted on: {}",
+                error.message()
             ));
         }
     };
@@ -641,7 +669,7 @@ pub fn execute(call: &AdapterCall<'_>) -> Outcome {
         name: name.to_owned(),
         root_id: None,
         kind: UnitKind::Directory,
-        device: crate::os::DeviceId::new(intent.identity.dev),
+        device: live.identity().device,
         inode: intent.identity.ino,
         marker: Some(UnitMarker::new(
             MarkerFamily::OxideOutputs,
@@ -780,10 +808,15 @@ fn locked_outcome(
         );
     }
     let still_fresh = match state::read_intents(call.state_paths, crate::contract::INTENT_ROWS) {
-        Ok(intents) => !intents
-            .records
-            .iter()
-            .any(|record| record.caller_intent_id.as_deref() == Some(caller_id)),
+        // A truncated journal is exactly the case a no-effect fact must never
+        // come out of: records this re-read could not carry may name this id.
+        Ok(intents) => {
+            !intents.truncated
+                && !intents
+                    .records
+                    .iter()
+                    .any(|record| record.caller_intent_id.as_deref() == Some(caller_id))
+        }
         Err(_) => false,
     };
     if !still_fresh {

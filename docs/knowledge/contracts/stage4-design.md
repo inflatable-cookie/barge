@@ -992,10 +992,15 @@ What landed in `crates/barge/src/oxide_outputs.rs`, all default library code:
   resumes or reports the one record, never a second unit.
 
 Unchanged, and refused on the adapter path: `oxide.outputs.root/1` markers,
-the legacy fences, an unregistered or non-expendable volume, a device-number
-mismatch (the device is an observation, never a bound identity), a checkout
+the legacy fences, an unregistered or non-expendable volume, a checkout
 under a mount parent whose volume the intent does not name, and the R4 and
-pending-root rules of the generic release gate. Qualification so far is the
+pending-root rules of the generic release gate. The **device number is never
+a bound identity**: the adapter verifies the live volume by UUID and mount
+root, takes the device the live volume reports now as the walk's
+within-run containment observation, and refuses nothing because the intent
+identity's `dev` differs — a remount binds by UUID + inode + nonce + marker
+bytes, exactly as the protocol's remount row and Barge's own replay path
+(read `replay_unit`) bind. Qualification so far is the
 disposable-fixture suite (`effigy rust:test`); the focused adapter native
 proof is prepared as the `outputs:native:*` selectors in `effigy.toml` under
 the qualified shared supervisor, held for separate planner activation, and it

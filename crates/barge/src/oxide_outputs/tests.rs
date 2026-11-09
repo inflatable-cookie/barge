@@ -843,7 +843,7 @@ fn a_live_hold_keeps_the_covered_root() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_absent_volume_refuses_without_an_intent_and_a_changed_device_never_binds() {
+fn an_absent_volume_refuses_and_a_remounted_device_still_binds() {
     // Unavailable volume: nothing is deleted, and the caller keeps pending.
     let absent = Fixture::new("adapter-volume-absent");
     let root = absent.root("root-one");
@@ -854,15 +854,89 @@ fn an_absent_volume_refuses_without_an_intent_and_a_changed_device_never_binds()
     assert_eq!(outcome.kind, OutcomeKind::Refused, "{outcome:?}");
     assert!(root.path.exists());
 
-    // The device changed under the claim: a device number is an observation,
-    // never a durable identity, so the mismatch refuses before any effect.
-    let shifted = Fixture::new("adapter-device-shift");
-    let root = shifted.root("root-one");
-    shifted.covered(&root, CALLER_ID);
-    let mut intent = shifted.live_intent(&root, CALLER_ID);
+    // A remount that changed the device number: the joint protocol's remount
+    // row binds UUID + inode + nonce + marker bytes and treats the device as
+    // the live observation. Both the caller's claim and Oxide's stored intent
+    // carry the plan-time device, which no longer matches the live volume's;
+    // the deletion proceeds on the verified live volume regardless.
+    let remounted = Fixture::new("adapter-remount");
+    let root = remounted.root("root-one");
+    remounted.write_control_state(Some("oxide.outputs/3"), 4);
+    let mut stored_intent = remounted.intent_value(&root, CALLER_ID, "intent");
+    stored_intent["identity"]["dev"] = serde_json::json!(root.device + 5_000);
+    remounted.write_registry(&root, vec![stored_intent]);
+    let mut intent = remounted.live_intent(&root, CALLER_ID);
     intent.identity.dev = root.device + 5_000;
-    let outcome = run(&shifted, &intent);
-    assert_eq!(outcome.kind, OutcomeKind::Refused, "{outcome:?}");
+    let outcome = run(&remounted, &intent);
+    assert_eq!(outcome.kind, OutcomeKind::Deleted, "{outcome:?}");
+    assert!(!root.path.exists(), "the remounted root is deleted");
+    let intents = state::read_intents(&remounted.volume.state, crate::contract::INTENT_ROWS)
+        .expect("the journal reads");
+    let record = &intents.records[0];
+    // The journal records the device the live volume reported, not the
+    // claim's stale one.
+    assert_ne!(record.unit.device, intent.identity.dev);
+}
+
+// ---------------------------------------------------------------------------
+// A truncated journal is unknown, never fresh and never no-effect.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_truncated_journal_is_unknown_and_never_known_no_effect() {
+    let fixture = Fixture::new("adapter-truncated-journal");
+    let root = fixture.root("root-one");
+    fixture.covered(&root, CALLER_ID);
+    // Overfill the journal past its read cap with valid records, so the
+    // adapter's scan cannot claim to have seen the whole world.
+    std::fs::create_dir_all(fixture.volume.state.intents_dir())
+        .expect("the journal directory is created");
+    let uuid = fixture.volume.uuid.clone();
+    for index in 0..=crate::contract::INTENT_ROWS {
+        let intent_id = format!("{index:032x}");
+        let record = IntentRecord {
+            schema: INTENT_SCHEMA.to_owned(),
+            intent_id: intent_id.clone(),
+            volume_uuid: uuid.clone(),
+            mount_hint: fixture.volume.root.clone(),
+            root_dir: String::new(),
+            folder: "oxide-outputs".to_owned(),
+            unit: IntentUnit {
+                parent: String::new(),
+                name: format!("t{index:032x}"),
+                kind: UnitKind::Directory,
+                device: 0,
+                inode: 1,
+                marker: Some(UnitMarker::new(MarkerFamily::Barge, "a".repeat(64))),
+                root_id: None,
+                capture_name: format!("{}{intent_id}", state::QUARANTINE_PREFIX),
+                grant: UnitGrant::native_root(format!("t{index:032x}")),
+            },
+            plan_digest: "b".repeat(64),
+            phase: IntentPhase::Deleted,
+            generation: 1,
+            recorded_ms: 1,
+            phase_ms: 1,
+            captures: Vec::new(),
+            foreign_captures: Vec::new(),
+            identity: None,
+            absence: None,
+            caller_intent_id: None,
+            caller_request_digest: None,
+        };
+        let bytes = serde_json::to_vec_pretty(&record).expect("the record encodes");
+        let path = state::intent_path(&fixture.volume.state, &intent_id).expect("the intent path");
+        std::fs::write(path, bytes).expect("the record is written");
+    }
+
+    // The scan answers unknown and keeps everything: no second unit, no
+    // no-effect fact, no deletion.
+    let outcome = run(&fixture, &fixture.live_intent(&root, CALLER_ID));
+    assert_eq!(outcome.kind, OutcomeKind::Unknown, "{outcome:?}");
+    assert!(outcome
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("records")));
     assert!(root.path.exists());
 }
 
