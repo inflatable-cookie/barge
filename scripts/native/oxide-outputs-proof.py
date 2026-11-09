@@ -267,6 +267,8 @@ def executed_shapes_problems():
         problems.append("custody is not live before the attach child runs")
     if "-mountpoint" not in attach:
         problems.append("the attach does not name this run's own mount point")
+    if "outputs-image.sparseimage" not in attach:
+        problems.append("the backing is not named with the suffix hdiutil realizes for -type SPARSE")
     detach = text.split('def detach(self, purpose):\n        """Ordinary detach only', 1)[1]
     detach = detach.split("\n    def case_environment", 1)[0]
     if "image_attachments(self.backing" not in detach:
@@ -604,6 +606,9 @@ def build_driver(parent, deadline_ns):
             raise base.Infrastructure(
                 "stage", "no guard wall is left to stage the driver build"
             )
+    head = base.git_head()
+    if not head:
+        raise base.Infrastructure("stage", "HEAD is unreadable, so the staged build cannot be named")
     environment = base.stage_environment(dict(os.environ), parent)
     problems = base.stage_environment_problems(environment)
     if problems:
@@ -628,6 +633,7 @@ def build_driver(parent, deadline_ns):
     os.chmod(staged, 0o755)
     manifest = {
         "schema": base.STAGE_SCHEMA,
+        "head": head,
         "sha256": base.sha256_file(staged),
         "bytes": os.path.getsize(staged),
         "toolchain": TOOLCHAIN_CHANNEL,
@@ -680,7 +686,11 @@ class AdapterProof:
         filtered to this backing, so another image mounted on the host can
         never be accepted, used or detached.
         """
-        backing = os.path.join(self.run_root, "outputs-image.dmg")
+        # The suffix is the one hdiutil realizes for -type SPARSE: a backing
+        # named without it would be created as <name>.sparseimage while every
+        # later step named the nonexistent <name>, which is exactly how the
+        # first diagnostic lost its attach. Name the real file.
+        backing = os.path.join(self.run_root, "outputs-image.sparseimage")
         if os.path.realpath(backing) != backing:
             raise base.Infrastructure("attach", "the backing path is not canonical")
         self.custody = base.custody_document(backing, self.run_root, self.evidence)
@@ -818,6 +828,7 @@ class AdapterProof:
             "cases": self.results,
             "all_cases_passed": len(passed) == len(CASES),
             "first_fault": self.first_fault,
+            "infrastructure": self.infrastructure,
             "image": {"mib": IMAGE_MIB, "mount": self.mount, "device": self.device},
             "custody": self.custody,
             "closure": self.closure,
