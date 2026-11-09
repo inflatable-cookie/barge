@@ -15,6 +15,7 @@ Tom's scope and authority ruling lives in [vision](docs/knowledge/vision.md). Co
 - Never write scratch to a home folder or a drive root. Use `/Volumes/Stash/scratch/barge/` when the Stash drive is present.
 - Do not change Oxide from this repository. Oxide changes go through Oxide's own Queue project.
 - When a change alters current truth, update its owning knowledge file in the same change. Record operator rulings before yielding.
+- Every pull request adds one short `changelog.d/<task-or-pr>-<slug>.<type>.md` fragment. Keep `CHANGELOG.md`'s `[Unreleased]` section empty; put changelog guidance outside `changelog.d/*.md` because every Markdown file there is treated as a fragment.
 
 ## Layout
 
@@ -72,6 +73,13 @@ guarded exception. Each selector covers what it names:
   installed Northstar skill from the effective account (or repository override)
   and passes its explicit path, so a private fixture `HOME` does not hide it;
   missing or ambiguous skill installations still refuse.
+- `effigy barge:changelog:test` — synthetic CLI controls for validation and
+  deterministic fold/dry-run behavior, using only temporary fixture repositories.
+- `effigy barge:changelog:check` — validates fragment shape and an empty
+  `[Unreleased]` section. `docs:check` includes this check.
+- `effigy barge:changelog:fold --version <x.y.z> [--date YYYY-MM-DD]` —
+  release-preparation fold; use `--dry-run` to preview. Requires the project's
+  existing explicit release authority.
 - `effigy scratch:expiry:test` — the scratch native proof's own apparatus
   self-check: its case map, the hash-pinned supervisor and the premise record.
   No image, no scratch and no child process.

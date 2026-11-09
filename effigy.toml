@@ -5,9 +5,13 @@ alias = "barge"
 "barge:install" = "python3 scripts/barge-install.py"
 "barge:reinstall" = "python3 scripts/barge-install.py --replace"
 "barge:install:test" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-barge-install.py"
+"barge:changelog:check" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/changelog.py check"
+"barge:changelog:fold" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/changelog.py fold {args}"
+"barge:changelog:test" = "bash scripts/changelog.test.sh"
 "docs:check" = [
   "python3 scripts/check-docs.py check-links",
   "python3 scripts/check-docs.py retired-concepts",
+  "PYTHONDONTWRITEBYTECODE=1 python3 scripts/changelog.py check",
   "git diff --check HEAD",
 ]
 # Ordinary Rust selectors run through the installed `oxide`, never raw `cargo`
