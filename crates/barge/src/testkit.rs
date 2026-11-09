@@ -1708,6 +1708,7 @@ impl VolumeFixture {
                 age_seconds: 86_400,
             },
             reserve: area::ReserveParticipation::Counts,
+            outputs_grant: None,
         }
     }
 

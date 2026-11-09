@@ -86,6 +86,107 @@ const LEDGER_VERSION: u32 = 1;
 const CAPACITY_POLICIES: std::ops::RangeInclusive<u32> = 1..=4;
 
 const OWNED_OUTPUTS_FENCES: [&str; 3] = ["oxide.outputs/1", "oxide.outputs/2", "oxide.outputs/3"];
+
+/// The owned-outputs fence the covered delegation class requires.
+///
+/// Oxide's successor fence `oxide.outputs/3` is the one a ready registry is
+/// written behind, and the only one that advances a pool's numeric state
+/// version past its predecessors; the published `/2` and released `/1` fences
+/// are legacy and never covered.
+pub const COVERED_OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/3";
+
+/// Whether the pools' control states carry the covered class's fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputsFence {
+    /// Every pool that was read parses and carries the successor fence.
+    Covered,
+    /// The pools were read completely and at least one is not on the covered
+    /// class: a legacy fence, or no fence at all. A known not-covered is a
+    /// refusal, never an unknown.
+    NotCovered {
+        /// Which pool, and what it carries.
+        reason: String,
+    },
+    /// A pool's state could not be read as a document this build understands,
+    /// or the read did not finish: an unknown fence is unknown, never absent.
+    Unknown {
+        /// Why, for a human.
+        reason: String,
+    },
+}
+
+/// Read every pool's control state and decide the owned-outputs fence.
+///
+/// Nothing is created, locked or repaired. The decision is conjunctive: one
+/// unreadable pool is unknown for the whole set, and one legacy or fenceless
+/// pool keeps the whole set out of the covered class.
+pub fn owned_outputs_fence(pools: &[PathBuf], deadline: Deadline) -> OutputsFence {
+    for pool in pools {
+        let control = pool.join(CONTROL_DIR);
+        let path = control.join(STATE_FILE);
+        let bytes = match read_document(&path, STATE_CAP_BYTES, deadline) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                return OutputsFence::Unknown {
+                    reason: format!(
+                        "{} is not there, so the pool's owned-outputs fence is unknown",
+                        path.display()
+                    ),
+                }
+            }
+            Err(error) => {
+                return OutputsFence::Unknown {
+                    reason: format!("{} cannot be read: {error}", path.display()),
+                }
+            }
+        };
+        let state = match parse_state(&bytes) {
+            Ok(state) => state,
+            Err(reason) => {
+                return OutputsFence::Unknown {
+                    reason: format!(
+                        "{} is not a control state this build reads: {reason}",
+                        path.display()
+                    ),
+                }
+            }
+        };
+        match state.owned_outputs.as_deref() {
+            Some(fence) if fence == COVERED_OWNED_OUTPUTS_FENCE => {
+                // The successor fence is the one that advances the numeric
+                // state version past its predecessors, so a covered pool is
+                // always at version 4 or later; the other fences' own
+                // version pairing was checked by the parse.
+                if state.version < 4 {
+                    return OutputsFence::Unknown {
+                        reason: format!(
+                            "{} carries the successor fence at version {}, which no state Oxide writes does",
+                            path.display(),
+                            state.version
+                        ),
+                    };
+                }
+            }
+            Some(fence) => {
+                return OutputsFence::NotCovered {
+                    reason: format!(
+                        "{} carries the legacy fence {fence}, which is not the covered class",
+                        path.display()
+                    ),
+                }
+            }
+            None => {
+                return OutputsFence::NotCovered {
+                    reason: format!(
+                        "{} records no owned-outputs fence, so its pool never opted in and is not the covered class",
+                        path.display()
+                    ),
+                }
+            }
+        }
+    }
+    OutputsFence::Covered
+}
 const RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
 const ONE_USE_FENCE: &str = "oxide.one-use/1";
 const EVICTION_ACCOUNTING_FENCE: &str = "oxide.eviction-accounting/1";

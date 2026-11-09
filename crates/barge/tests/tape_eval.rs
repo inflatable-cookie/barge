@@ -108,6 +108,8 @@ mod identity;
 mod inspect;
 #[path = "../src/os/mod.rs"]
 mod os;
+#[path = "../src/oxide_outputs.rs"]
+mod oxide_outputs;
 #[path = "../src/pool_custody.rs"]
 mod pool_custody;
 #[path = "../src/prune.rs"]

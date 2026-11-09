@@ -99,6 +99,62 @@ const MAX_PURPOSE_BYTES: usize = 256;
 /// cannot represent is refused rather than silently truncated.
 const MAX_PRUNE_AGE_SECONDS: u64 = 100 * 365 * 24 * 60 * 60;
 
+/// The area-scoped grant that authorises the `oxide_outputs` marker family.
+///
+/// It is one field of the stored `oxide/outputs` declaration, never a
+/// `scratch_grants` row, and it is the only deletion authority for that family.
+/// The declaration generation that carries the grant is the grant's own
+/// generation: a re-declaration that keeps the grant bumps it, and a
+/// re-declaration that omits the field withdraws it. A caller records the
+/// generation it acted on, and the adapter refuses a request whose recorded
+/// generation is newer than the stored record's — a store that knows an older
+/// grant than the caller is not the authority the request names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputsGrant {
+    /// The marker family this grant covers: exactly `oxide_outputs`. Anything
+    /// else is a document this build refuses, never a family it guesses at.
+    pub family: String,
+    /// Who declared it, for the record.
+    pub by: String,
+    /// When it was declared.
+    pub declared_ms: u64,
+}
+
+impl OutputsGrant {
+    /// The family name this grant's `family` field must carry.
+    pub const FAMILY: &str = crate::unit::MarkerFamily::OxideOutputs.as_str();
+
+    /// The grant a re-declaration of `oxide/outputs` carries.
+    pub fn new(by: impl Into<String>, declared_ms: u64) -> Self {
+        Self {
+            family: Self::FAMILY.to_owned(),
+            by: by.into(),
+            declared_ms,
+        }
+    }
+
+    /// Validate the record strictly: the family is pinned, the declarer is
+    /// bounded text.
+    pub fn validate(&self) -> Result<()> {
+        if self.family != Self::FAMILY {
+            return Err(invalid(
+                "an outputs grant covers exactly the `oxide_outputs` family",
+                "outputs_grant.family",
+                &self.family,
+            ));
+        }
+        if self.by.is_empty() || self.by.len() > 256 || self.by.chars().any(char::is_control) {
+            return Err(invalid(
+                "an outputs grant's declarer is 1 to 256 bytes of text",
+                "outputs_grant.by",
+                &self.by,
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// What a caller sees when the volume holding an area is absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -195,6 +251,11 @@ pub struct AreaDeclaration {
     pub prune: PrunePolicy,
     /// Whether this area's bytes count toward the volume's reserve.
     pub reserve: ReserveParticipation,
+    /// The area-scoped `oxide_outputs` grant, when this declaration carries it.
+    ///
+    /// Only `oxide/outputs` may carry one; a declaration elsewhere refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs_grant: Option<OutputsGrant>,
 }
 
 impl AreaDeclaration {
@@ -263,6 +324,21 @@ impl AreaDeclaration {
                 ));
             }
         }
+        if let Some(grant) = &self.outputs_grant {
+            grant.validate()?;
+            // The grant is scoped to the one area the joint protocol names. A
+            // declaration elsewhere never carries it, so no other area can grow
+            // an authority no reader of this record would look for.
+            if self.namespace != crate::oxide_outputs::AREA_NAMESPACE
+                || self.area != crate::oxide_outputs::AREA_NAME
+            {
+                return Err(invalid(
+                    "an outputs grant is carried only by the oxide/outputs declaration",
+                    "outputs_grant",
+                    &format!("{}/{}", self.namespace, self.area),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -293,6 +369,7 @@ impl AreaDeclaration {
             absent: self.absent,
             prune: self.prune,
             reserve: self.reserve,
+            outputs_grant: self.outputs_grant,
             declared_ms,
             generation,
         })
@@ -319,6 +396,13 @@ pub struct AreaDocument {
     pub prune: PrunePolicy,
     /// Whether the area's bytes count toward the reserve.
     pub reserve: ReserveParticipation,
+    /// The area-scoped `oxide_outputs` grant, when the record carries one.
+    ///
+    /// The record's `generation` is the grant's generation while it is present:
+    /// keeping the grant through a re-declaration bumps the generation, and
+    /// omitting the field withdraws the grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs_grant: Option<OutputsGrant>,
     /// When the declaration was written.
     pub declared_ms: u64,
     /// Increases on every change to the same declaration.
@@ -336,6 +420,7 @@ impl AreaDocument {
             absent: self.absent.clone(),
             prune: self.prune.clone(),
             reserve: self.reserve,
+            outputs_grant: self.outputs_grant.clone(),
         }
     }
 
@@ -1452,6 +1537,9 @@ fn declaration_differences(
     }
     if caller.reserve != stored.reserve {
         fields.push("reserve");
+    }
+    if caller.outputs_grant != stored.outputs_grant {
+        fields.push("outputs_grant");
     }
     fields
 }
@@ -6545,6 +6633,7 @@ mod tests {
                     age_seconds: 86_400,
                 },
                 reserve: super::ReserveParticipation::Counts,
+                outputs_grant: None,
             }
         }
 

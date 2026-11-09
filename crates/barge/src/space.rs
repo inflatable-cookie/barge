@@ -2513,6 +2513,7 @@ mod tests {
             },
             prune: area::PrunePolicy::None,
             reserve,
+            outputs_grant: None,
         }
     }
 

@@ -721,7 +721,7 @@ fn decide(
     // The recorded grant must still be on this volume: a delegation or claim
     // removed between the plan and the effect keeps the unit (design failure
     // matrix), so the registry the effect re-reads is where it is decided.
-    if let Err(reason) = grant_still_recorded(&record, unit) {
+    if let Err(reason) = grant_still_recorded(state_paths, &record, unit) {
         return Err(Refusal::refuse_unknown(reason));
     }
     let opened = area::open_folder_by(
@@ -954,13 +954,13 @@ fn decide(
     })
 }
 
-/// Whether the grant the unit records is still recorded on the volume and covers
-/// this unit's place on it.
+/// Whether the grant the unit records is still recorded and covers this unit's
+/// place.
 ///
 /// A native root needs no entry: Barge's own marker is its grant, checked as a
-/// marker, and S3 created Barge roots in declared areas too. The other two grants
-/// are **scratch** authority, so they are bound to the volume's own scratch folder
-/// (`folders.scratch`, default `scratch/`):
+/// marker, and S3 created Barge roots in declared areas too. The two **scratch**
+/// grants are bound to the volume's own scratch folder (`folders.scratch`,
+/// default `scratch/`):
 ///
 /// - a foreign family's delegation covers that family's marked units *inside the
 ///   scratch folder* and nothing elsewhere on the volume; and
@@ -971,9 +971,17 @@ fn decide(
 ///   scope, so a `project` claim never authorizes a top-level entry and the
 ///   reverse.
 ///
-/// A grant revoked, or a unit moved outside the scope it was declared for, between
-/// the plan and the effect keeps the unit rather than being trusted from the plan.
+/// The `oxide_outputs` family is the one exception: its grant is the
+/// area-scoped field on the stored `oxide/outputs` declaration, read from the
+/// state directory here, and it covers a unit only inside the folder that
+/// declaration resolves to on this volume. A withdrawn, mismatched or
+/// out-of-area grant keeps the unit.
+///
+/// A grant revoked, or a unit moved outside the scope it was declared for,
+/// between the plan and the effect keeps the unit rather than being trusted
+/// from the plan.
 fn grant_still_recorded(
+    state_paths: &StatePaths,
     record: &registry::VolumeRecord,
     unit: &DeletionUnit,
 ) -> std::result::Result<(), String> {
@@ -986,6 +994,9 @@ fn grant_still_recorded(
                     unit.grant.reference
                 ));
             };
+            if family == MarkerFamily::OxideOutputs {
+                return outputs_grant_covers(state_paths, record, unit);
+            }
             if !inside_scratch(record, unit) {
                 return Err(format!(
                     "the unit `{}` is outside volume {}'s scratch folder, so the `{}` delegation does not cover it",
@@ -1047,6 +1058,87 @@ fn grant_still_recorded(
             ))
         }
     }
+}
+
+/// Whether the stored `oxide/outputs` declaration still grants this unit's
+/// family, on the folder it resolves to for this volume.
+///
+/// The state directory is read here, so the record — not a caller's object —
+/// decides. The grant must be present, its family exactly `oxide_outputs`, the
+/// unit directly inside the declared folder (never in a scratch folder and
+/// never under a parent), and the unit's folder the declaration resolves to on
+/// this volume. Everything else keeps the unit.
+fn outputs_grant_covers(
+    state_paths: &StatePaths,
+    record: &registry::VolumeRecord,
+    unit: &DeletionUnit,
+) -> std::result::Result<(), String> {
+    let document = match crate::area::show(
+        state_paths,
+        crate::oxide_outputs::AREA_NAMESPACE,
+        crate::oxide_outputs::AREA_NAME,
+    ) {
+        Ok(Some(document)) => document,
+        Ok(None) => {
+            return Err(format!(
+                "the {} area is not declared, so nothing carries the `oxide_outputs` grant and the unit `{}` is kept",
+                crate::oxide_outputs::AREA_REF,
+                unit.name
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "the {} declaration cannot be read, so the unit `{}` is kept: {error}",
+                crate::oxide_outputs::AREA_REF,
+                unit.name
+            ));
+        }
+    };
+    let grant = match &document.outputs_grant {
+        Some(grant) => grant,
+        None => {
+            return Err(format!(
+                "the {} declaration carries no outputs grant at generation {}, so the unit `{}` is kept",
+                crate::oxide_outputs::AREA_REF,
+                document.generation,
+                unit.name
+            ));
+        }
+    };
+    if grant.family != crate::area::OutputsGrant::FAMILY {
+        return Err(format!(
+            "the {} declaration's grant covers `{}`, not `oxide_outputs`, so the unit `{}` is kept",
+            crate::oxide_outputs::AREA_REF,
+            grant.family,
+            unit.name
+        ));
+    }
+    let folder = match document.declaration().folder_for(&unit.volume_uuid) {
+        Some(folder) => folder.to_owned(),
+        None => {
+            return Err(format!(
+                "the {} declaration resolves to no folder on volume {}, so the unit `{}` is kept",
+                crate::oxide_outputs::AREA_REF,
+                unit.volume_uuid,
+                unit.name
+            ));
+        }
+    };
+    if record.root_dir != unit.root_dir
+        || folder != unit.folder
+        || !unit.parent.is_empty()
+        || unit.kind != UnitKind::Directory
+    {
+        return Err(format!(
+            "the unit `{}` at `{}/{}/{}` is outside the {} folder the grant covers, so it is kept",
+            unit.name,
+            unit.root_dir,
+            unit.folder,
+            unit.parent,
+            crate::oxide_outputs::AREA_REF
+        ));
+    }
+    Ok(())
 }
 
 /// The unit's folder inside the volume: `root_dir`, the area folder and the unit's
@@ -1776,7 +1868,9 @@ mod tests {
                 crate::registry::MarkerFamily::EffigyScratch
             }
             crate::unit::MarkerFamily::OxideScratch => crate::registry::MarkerFamily::OxideScratch,
-            crate::unit::MarkerFamily::Barge => panic!("a Barge root needs no delegation"),
+            crate::unit::MarkerFamily::Barge | crate::unit::MarkerFamily::OxideOutputs => {
+                panic!("this family needs no scratch delegation")
+            }
         };
         crate::registry::ScratchGrants {
             delegations: vec![crate::registry::ScratchDelegation {

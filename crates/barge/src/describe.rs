@@ -1987,6 +1987,7 @@ mod tests {
             absent: crate::area::AbsentPolicy::FallbackLocal { path: fallback },
             prune: crate::area::PrunePolicy::None,
             reserve: crate::area::ReserveParticipation::Counts,
+            outputs_grant: None,
         };
         crate::area::declare(&state, &declaration, 1_000).expect("the area is declared");
         let resolved = crate::area::resolve(
@@ -2077,6 +2078,7 @@ mod tests {
             absent: crate::area::AbsentPolicy::Wait,
             prune: crate::area::PrunePolicy::OldestIdleAfter { age_seconds: 3600 },
             reserve: crate::area::ReserveParticipation::Excluded,
+            outputs_grant: None,
         };
         crate::area::declare(&state, &declaration, 1_792_525_019_847)
             .expect("the area is declared");
