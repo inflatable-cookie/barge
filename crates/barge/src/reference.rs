@@ -66,7 +66,9 @@ pub const OXIDE_MARKER: &str = "oxide_marker";
 /// names the root as wanted; unknown keeps the set incomplete.
 pub const OXIDE_WRITER_CUSTODY: &str = "oxide_writer_custody";
 
-/// Oxide's current outputs registry.
+/// Oxide's explicit deletion-route registry.
+pub const OXIDE_REGISTRY_V3: &str = "oxide.outputs.registry/3";
+/// The historical outputs registry without deletion routes.
 pub const OXIDE_REGISTRY_V2: &str = "oxide.outputs.registry/2";
 /// Oxide's predecessor outputs registry, read as its own field set.
 pub const OXIDE_REGISTRY_V1: &str = "oxide.outputs.registry/1";
@@ -514,6 +516,20 @@ pub struct OxideIntent {
     pub preview_sha256: String,
     /// The intent's pinned root identity.
     pub identity: OxideIntentIdentity,
+    /// The explicit schema-3 route; historical formats carry no inferred route.
+    pub deletion_route: Option<DeletionRoute>,
+}
+
+/// A validated schema-3 deletion route. This is routing evidence, not authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeletionRoute {
+    /// Oxide owns this operation; the Barge adapter must refuse it.
+    Local,
+    /// Barge owns deletion, bound to immutable original-request metadata.
+    Barge {
+        /// SHA-256 of the exact request-sidecar bytes, not the preview or request digest.
+        request_sha256: String,
+    },
 }
 
 /// One intent's pinned root identity, as its document records it.
@@ -1301,9 +1317,34 @@ struct RawRegistry {
     rows: Vec<RawRow>,
     #[serde(default)]
     intents: Vec<RawIntent>,
+    #[serde(default, deserialize_with = "read_routes")]
+    deletion_routes: Option<Vec<RawDeletionRoute>>,
     #[serde(default)]
     #[allow(dead_code)]
     cancelled_overflow: Vec<String>,
+}
+
+/// An explicitly present route array must be an array, including when empty.
+fn read_routes<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<RawDeletionRoute>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::deserialize(deserializer).map(Some)
+}
+
+/// The exact wire alternatives: no implicit local route or extra fields.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "deleter", rename_all = "snake_case", deny_unknown_fields)]
+enum RawDeletionRoute {
+    Local {
+        intent_id: String,
+    },
+    Barge {
+        intent_id: String,
+        request_sha256: String,
+    },
 }
 
 /// Oxide's own record of why a registry is sticky-incomplete.
@@ -1476,7 +1517,7 @@ struct RawRow {
 fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
     let raw: RawRegistry = serde_json::from_slice(bytes)
         .map_err(|error| format!("the registry is not the field set Oxide writes: {error}"))?;
-    if raw.version != OXIDE_REGISTRY_V2 && raw.version != OXIDE_REGISTRY_V1 {
+    if ![OXIDE_REGISTRY_V1, OXIDE_REGISTRY_V2, OXIDE_REGISTRY_V3].contains(&raw.version.as_str()) {
         return Err(format!(
             "`{}` is not a version this build reads",
             raw.version
@@ -1489,6 +1530,43 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
             "a `{OXIDE_REGISTRY_V2}` registry states format {}",
             raw.schema
         ));
+    }
+    let routed = raw.version == OXIDE_REGISTRY_V3;
+    let mut routes = std::collections::BTreeMap::new();
+    if routed {
+        if raw.schema != 3 {
+            return Err("a schema-3 registry must state numeric schema 3".to_owned());
+        }
+        let entries = raw
+            .deletion_routes
+            .ok_or_else(|| "a schema-3 registry omits deletion_routes".to_owned())?;
+        if raw.intents.len() > 256 || entries.len() != raw.intents.len() {
+            return Err(
+                "deletion routes must cover exactly the retained intents within the 256-intent cap"
+                    .to_owned(),
+            );
+        }
+        for entry in entries {
+            let (id, route) = match entry {
+                RawDeletionRoute::Local { intent_id } => (intent_id, DeletionRoute::Local),
+                RawDeletionRoute::Barge {
+                    intent_id,
+                    request_sha256,
+                } => {
+                    if !is_hex64(&request_sha256) {
+                        return Err(
+                            "a Barge route has no lowercase SHA-256 request binding".to_owned()
+                        );
+                    }
+                    (intent_id, DeletionRoute::Barge { request_sha256 })
+                }
+            };
+            if !is_hex32(&id) || routes.insert(id, route).is_some() {
+                return Err("a deletion route has an invalid or duplicate intent id".to_owned());
+            }
+        }
+    } else if raw.deletion_routes.is_some() {
+        return Err("a historical registry cannot carry deletion_routes".to_owned());
     }
     if raw.rows.len() > REGISTRY_ROWS {
         return Err(format!(
@@ -1619,7 +1697,17 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
         {
             return Err("a prune intent names an unusable root identity for the move".to_owned());
         }
+        let deletion_route = if routed {
+            Some(
+                routes
+                    .remove(&intent.id)
+                    .ok_or_else(|| "an intent has no unique matching deletion route".to_owned())?,
+            )
+        } else {
+            None
+        };
         intents.push(OxideIntent {
+            deletion_route,
             root: intent.identity.root.clone(),
             phase: intent.phase,
             id: intent.id,
@@ -1640,6 +1728,9 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
                 marker_digest: intent.identity.marker_digest,
             },
         });
+    }
+    if !routes.is_empty() {
+        return Err("deletion_routes names an intent outside the registry".to_owned());
     }
     if raw.revision == 0 && !rows.is_empty() {
         return Err("a non-empty registry states revision 0".to_owned());
@@ -2598,6 +2689,161 @@ struct RawMarker {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A schema-3 document with the same unchanged prune-intent field set.
+    fn routed_registry() -> serde_json::Value {
+        serde_json::json!({
+            "version": OXIDE_REGISTRY_V3, "schema": 3, "revision": 1,
+            "complete": true, "created_by": "oxide", "rows": [],
+            "intents": [{
+                "version": OXIDE_INTENT_V1, "id": "1".repeat(32),
+                "identity": {
+                    "checkout_id": "c".repeat(64), "checkout": "/c", "receipt": "/r",
+                    "member": "target", "root": "/o", "root_kind": "external",
+                    "generation": 1, "dev": 7, "ino": 42, "marker_digest": "a".repeat(64)
+                },
+                "phase": "intent", "quarantine": "/q", "preview_sha256": "0".repeat(64),
+                "created_ms": 1, "updated_ms": 2
+            }],
+            "deletion_routes": [{"intent_id": "1".repeat(32), "deleter": "barge", "request_sha256": "b".repeat(64)}]
+        })
+    }
+
+    #[test]
+    fn schema_three_routes_are_explicit_for_every_retained_phase() {
+        for phase in [
+            "intent",
+            "renamed",
+            "deleting",
+            "marker_last",
+            "deleted",
+            "resolved",
+        ] {
+            for route in [
+                serde_json::json!({"intent_id": "1".repeat(32), "deleter": "local"}),
+                serde_json::json!({"intent_id": "1".repeat(32), "deleter": "barge", "request_sha256": "b".repeat(64)}),
+            ] {
+                let mut document = routed_registry();
+                document["intents"][0]["phase"] = serde_json::json!(phase);
+                document["deletion_routes"][0] = route.clone();
+                let reading =
+                    parse_registry(&serde_json::to_vec(&document).expect("fixture encodes"));
+                let Ok(OxideRegistry::Read { intents, .. }) = reading else {
+                    panic!("valid explicit route reads: {reading:?}")
+                };
+                assert_eq!(intents[0].phase, phase);
+                let expected = if route["deleter"] == "local" {
+                    DeletionRoute::Local
+                } else {
+                    DeletionRoute::Barge {
+                        request_sha256: "b".repeat(64),
+                    }
+                };
+                assert_eq!(intents[0].deletion_route, Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_incomplete_routes_never_read_as_absence() {
+        let valid = routed_registry();
+        let route = valid["deletion_routes"][0].clone();
+        let mut cases = vec![
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!([route.clone(), route.clone()]),
+        ];
+        for (field, value) in [
+            ("intent_id", serde_json::json!("2".repeat(32))),
+            ("intent_id", serde_json::json!("bad")),
+            ("deleter", serde_json::json!("unknown")),
+            ("request_sha256", serde_json::json!("A".repeat(64))),
+            ("request_sha256", serde_json::json!("g".repeat(64))),
+            ("request_sha256", serde_json::json!("b".repeat(63))),
+            ("invented", serde_json::json!(true)),
+        ] {
+            let mut changed = route.clone();
+            changed[field] = value;
+            cases.push(serde_json::json!([changed]));
+        }
+        cases.push(serde_json::json!([{"intent_id":"1".repeat(32),"deleter":"barge"}]));
+        cases.push(serde_json::json!([{"intent_id":"1".repeat(32),"deleter":"local","request_sha256":"b".repeat(64)}]));
+        for routes in cases {
+            let mut document = valid.clone();
+            document["deletion_routes"] = routes;
+            assert!(
+                parse_registry(&serde_json::to_vec(&document).expect("fixture encodes")).is_err()
+            );
+        }
+        let mut missing = valid.clone();
+        missing
+            .as_object_mut()
+            .expect("object")
+            .remove("deletion_routes");
+        assert!(parse_registry(&serde_json::to_vec(&missing).expect("fixture encodes")).is_err());
+        for schema in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(2),
+            serde_json::json!(4),
+        ] {
+            let mut document = valid.clone();
+            document["schema"] = schema;
+            assert!(
+                parse_registry(&serde_json::to_vec(&document).expect("fixture encodes")).is_err()
+            );
+        }
+        let mut duplicate_intent = valid;
+        let intent = duplicate_intent["intents"][0].clone();
+        duplicate_intent["intents"] = serde_json::json!([intent.clone(), intent]);
+        duplicate_intent["deletion_routes"] =
+            serde_json::json!([route.clone(), {"intent_id":"2".repeat(32),"deleter":"local"}]);
+        assert!(
+            parse_registry(&serde_json::to_vec(&duplicate_intent).expect("fixture encodes"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn routes_share_the_intent_cap_and_do_not_change_historical_formats() {
+        let mut document = routed_registry();
+        let mut intents = Vec::new();
+        let mut routes = Vec::new();
+        for index in 0..257 {
+            let id = format!("{index:032x}");
+            let mut intent = document["intents"][0].clone();
+            intent["id"] = serde_json::json!(id);
+            intents.push(intent);
+            routes.push(serde_json::json!({"intent_id":id,"deleter":"local"}));
+            if index >= 255 {
+                document["intents"] = serde_json::json!(intents);
+                document["deletion_routes"] = serde_json::json!(routes);
+                assert_eq!(
+                    parse_registry(&serde_json::to_vec(&document).expect("fixture encodes"))
+                        .is_ok(),
+                    index == 255
+                );
+            }
+        }
+        for (version, schema) in [(OXIDE_REGISTRY_V1, 1), (OXIDE_REGISTRY_V2, 2)] {
+            let mut historical = routed_registry();
+            historical["version"] = serde_json::json!(version);
+            historical["schema"] = serde_json::json!(schema);
+            assert!(
+                parse_registry(&serde_json::to_vec(&historical).expect("fixture encodes")).is_err()
+            );
+            historical
+                .as_object_mut()
+                .expect("object")
+                .remove("deletion_routes");
+            let Ok(OxideRegistry::Read { intents, .. }) =
+                parse_registry(&serde_json::to_vec(&historical).expect("fixture encodes"))
+            else {
+                panic!("historical document reads")
+            };
+            assert_eq!(intents[0].deletion_route, None);
+        }
+    }
 
     #[test]
     fn a_registry_row_that_is_not_settled_names_its_root() {

@@ -706,7 +706,7 @@ single root. `barge inspect` already reads Oxide's state in place and reports
 observations; stage 4 adds one bounded, read-only observation:
 
 ```text
-<internal pool>/outputs/registry.json   oxide.outputs.registry/2 (and /1)
+<internal pool>/outputs/registry.json   oxide.outputs.registry/3 (and /2, /1)
 ```
 
 with, per row: the recorded root path, `volume_uuid`, `nonce`, `generation`,
@@ -1045,6 +1045,83 @@ author and retained-reviewer occurrences; Barge051's older evidence does not
 qualify it. Synthetic account facts remain a gap.
 
 
+### Explicit recovery routes and absence-only observation (2026-11-10)
+
+Tom selected the explicit recovery-format upgrade on disposable fixtures in
+`60a85553-3e61-4280-9037-0f3965d5ff65` v2, extending `63ad6fc4` v2. Barge's
+reader/API implementation supplies the prerequisite for Oxide's caller; it
+is not a claim that the Oxide representation writer has shipped. The read-only
+source binding is Oxide PR 263 head `661aba1d03e936e51a56e88d9f43fa0787efc0fd`,
+`docs/knowledge/contracts/barge-adoption.md`, SHA-256
+`f248c984d40482be8b7d86866f31fa2415a8c83bfc02636bea1689be7b9f33a6`.
+The predecessor is Barge052 reviewed `9a65089e8114860d498c5721c8f19ca93a07e481`
+and published `594494061b18bef4821ab19723f4adfff6119d51`, identical tree
+`1b219ce8a760e8403ea123f258022016dc919e7d`.
+
+The exact successor registry is `oxide.outputs.registry/3`, numeric schema 3.
+It requires `deletion_routes`, with exactly one entry per retained intent,
+including terminal intents, and no extra ids. The serialized entries are:
+
+```json
+{"intent_id":"<32 lowercase hex>","deleter":"local"}
+{"intent_id":"<32 lowercase hex>","deleter":"barge","request_sha256":"<64 lowercase hex>"}
+```
+
+These are exact field sets. Unknown fields/tags, missing, extra or duplicate
+routes and malformed hashes make the whole registry Unknown. Routes share the
+256-intent and 4 MiB registry caps and existing read deadline. Prune-intent/1
+keeps its exact fields, real quarantine path and actual preview hash. Historical
+registry /1 and /2 never infer routes and reject the successor field.
+`reference::OxideIntent::deletion_route` is None only for historical documents;
+otherwise it exposes validated `DeletionRoute::Local` or
+`DeletionRoute::Barge { request_sha256 }`.
+
+Pool fence `oxide.outputs/4` joins /3 in the covered predicate without raising
+the numeric control-state version. Earlier fence meanings are preserved.
+Recognizing /4 gives generic release no new permission: the outputs family
+remains exclusively adapter-owned. Old readers refuse the successor formats.
+
+`DelegatedRequest` adds `request_sha256: Option<String>`, the immutable original
+sidecar's byte SHA-256. For schema 3 execution and replay it must equal this
+intent's validated Barge route; local routes and missing/wrong bindings refuse
+before effects, including the Deleted fast path. That fast path also compares
+Oxide's stored phase, preview and every durable identity field to the original
+claim, after checking the Barge journal. All stored-intent comparisons exclude
+device numbers, which are remount observations rather than operation identity.
+Historical requests use None.
+This hash is separate from `DelegatedRequest::digest`, whose canonical fields
+remain unchanged (including original grant generation). Oxide owns strict
+sidecar reading and publication; Barge neither reads nor writes the sidecar.
+The caller must validate those bytes against the original identity, preview,
+generation and canonical request digest. Merely supplying a byte hash is not
+permission to replace an original request or borrow a current grant. All052
+journal/unit/request/optional-id checks remain in force.
+
+`lookup_absence(state_paths, dirs, facts, mounts, observer, intent)` takes the
+original `LiveIntent` with its caller, volume and root identity, but no
+`DelegatedRequest`. Its result `AbsenceLookup` is only `PositivelyAbsent` or
+`Unknown { reason }`. Under the existing shared volume observation lock,
+positive absence requires a completely read bounded journal with no matching
+caller record and no attributable or ambiguous quarantine. A matching pending
+or terminal record, malformed/truncated state, lock refusal, uncertain volume,
+location or exhausted bounds stays Unknown. It never returns a record,
+executes, replays, settles, removes a journal or manufactures a request.
+Oxide must additionally prove the original root present with its recorded
+identity before rolling back tagged unavailable metadata. A new operation
+requires a new preview and intent; the unavailable record cannot acquire a
+replacement request. Remounts preserve UUID and volume-relative location;
+identity or location substitutions remain conservative.
+
+The source regressions and effect-free native apparatus extend A1–A13 with
+A14 (schema3 Barge deletion), A15 (local/missing/invalid route refusal) and
+A16 (absence-only positive and matching-record refusal). Native/image sessions,
+in-guard staging, diagnostic, author and distinct retained-reviewer proofs
+remain separately activated and must bind the actual exact head. None is
+credited by source controls. The existing 128 MiB image, 300 s / 512 MiB guard,
+30 s work stop, supervisor pin, pre-backing custody and detach/reap/whole-backing
+closure gates remain. Production account lookup, O2/O3, parent-reader conversion,
+installation, real grants/registration, migration and live adoption remain held.
+
 ## Failure, race and cancellation matrix
 
 Every row is a rule the implementation must carry a test for. "Keeps" means the
@@ -1279,7 +1356,7 @@ What the reference readers read, and where. Barge's own: every placement record
 plan is built under (current when its policy never releases a root), and the
 root's hold records, which the caller reads under the root's own lock (a live or
 undecidable hold is current; a positively stale one is not). Oxide's, read in place and never written: the outputs registry
-`oxide.outputs.registry/2` and its `/1` predecessor, every checkout receipt
+`oxide.outputs.registry/3` and its `/2` and `/1` predecessors, every checkout receipt
 (`oxide.outputs.transition/1`, `/2` and `/3`, each read for its own selection
 site), and one root marker `oxide.outputs.root/2` (a `/1` marker is unknown,
 because its field set predates the nonce and the checkout volume). A registry
@@ -1921,7 +1998,7 @@ are proposed for the implementation slices.
 | The gate | each of the six conditions alone blocks a delete | six counterfactuals, one per condition, each proving the root survives with its reason; plus one proving all six together authorize it |
 | References | receipts, registry flags and Barge's own records decide "current" | an incomplete reference set keeps the whole batch; a selected, reserved, pruning or cancelling row keeps its root |
 | Plan and intent | canonical plan, digest, evidence on every row | a changed digest, a changed marker digest, a changed identity and a reappeared consumer path each stop the affected row only; a replay after a device change settles from the recorded identity |
-| Oxide census | strict bounded reading of `oxide.outputs.registry/2` and `/1` | a version-1 row, an incomplete registry, a duplicated UUID and a row whose volume is away each report the honest verdict; nothing is written and no row becomes authoritative |
+| Oxide census | strict bounded reading of `oxide.outputs.registry/3`, `/2` and `/1` | a version-1 row, an incomplete registry, a duplicated UUID and a row whose volume is away each report the honest verdict; nothing is written and no row becomes authoritative |
 | Caches and scratch | the identity rule reaches every root kind | a `scratch_run` root concluded under generation 2 verifies; an adopted `held-root` with `origin: adopted_existing` verifies; a `cache_root` with a changed inode is kept |
 
 The regression test the carried finding needs is a named pair: a fixture root

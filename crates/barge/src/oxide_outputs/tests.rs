@@ -258,6 +258,7 @@ impl Fixture {
 /// The request every positive fixture call makes.
 fn request() -> DelegatedRequest {
     DelegatedRequest {
+        request_sha256: None,
         grant_generation: 1,
     }
 }
@@ -509,6 +510,7 @@ fn an_undeclared_withdrawn_mismatched_or_stale_grant_is_refused_before_any_effec
     let observer = stale.volume.observer();
     let mounts = stale.mounts_of();
     let stale_request = DelegatedRequest {
+        request_sha256: None,
         grant_generation: 9,
     };
     let outcome = execute(&AdapterCall {
@@ -1135,6 +1137,7 @@ fn a_resumed_call_refuses_a_settled_or_withdrawn_caller_and_a_different_request(
     let mounts = fixture.mounts_of();
     let later_intent = fixture.live_intent(&root, CALLER_ID);
     let other_request = DelegatedRequest {
+        request_sha256: None,
         grant_generation: 7,
     };
     let outcome = execute(&AdapterCall {
@@ -1761,3 +1764,9 @@ fn the_entire_recorded_relative_path_binds_pending_and_terminal_units() {
         std::fs::write(path, original).unwrap();
     }
 }
+
+#[path = "tests/absence.rs"]
+mod absence;
+
+#[path = "tests/routes.rs"]
+mod routes;

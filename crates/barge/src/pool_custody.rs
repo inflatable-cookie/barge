@@ -85,7 +85,12 @@ const LEDGER_VERSION: u32 = 1;
 /// The capacity-policy fences Oxide's ledger writes (`1..=4`).
 const CAPACITY_POLICIES: std::ops::RangeInclusive<u32> = 1..=4;
 
-const OWNED_OUTPUTS_FENCES: [&str; 3] = ["oxide.outputs/1", "oxide.outputs/2", "oxide.outputs/3"];
+const OWNED_OUTPUTS_FENCES: [&str; 4] = [
+    "oxide.outputs/1",
+    "oxide.outputs/2",
+    "oxide.outputs/3",
+    "oxide.outputs/4",
+];
 
 /// The owned-outputs fence the covered delegation class requires.
 ///
@@ -94,6 +99,9 @@ const OWNED_OUTPUTS_FENCES: [&str; 3] = ["oxide.outputs/1", "oxide.outputs/2", "
 /// version past its predecessors; the published `/2` and released `/1` fences
 /// are legacy and never covered.
 pub const COVERED_OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/3";
+
+/// The explicit deletion-route fence; it does not raise the numeric state version.
+pub const ROUTED_OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/4";
 
 /// Whether the pools' control states carry the covered class's fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,7 +160,8 @@ pub fn owned_outputs_fence(pools: &[PathBuf], deadline: Deadline) -> OutputsFenc
             }
         };
         match state.owned_outputs.as_deref() {
-            Some(fence) if fence == COVERED_OWNED_OUTPUTS_FENCE => {
+            Some(fence)
+                if [COVERED_OWNED_OUTPUTS_FENCE, ROUTED_OWNED_OUTPUTS_FENCE].contains(&fence) => {
                 // The successor fence is the one that advances the numeric
                 // state version past its predecessors, so a covered pool is
                 // always at version 4 or later; the other fences' own
@@ -985,6 +994,44 @@ mod tests {
             reading.unattributed().is_some(),
             "expected a pool-wide unknown, got none"
         );
+    }
+
+    #[test]
+    fn explicit_route_fence_preserves_numeric_version_and_legacy_coverage() {
+        let (fixture, pool) = fixture("routed-output-fence");
+        for (fence, covered) in [
+            ("oxide.outputs/1", false),
+            ("oxide.outputs/2", false),
+            ("oxide.outputs/3", true),
+            ("oxide.outputs/4", true),
+        ] {
+            let mut document: serde_json::Value =
+                serde_json::from_str(&state(&[], "")).expect("state encodes");
+            document["owned_outputs"] = serde_json::json!(fence);
+            let bytes = serde_json::to_vec(&document).expect("state encodes");
+            assert!(parse_state(&bytes).is_ok());
+            std::fs::write(pool.join(CONTROL_DIR).join(STATE_FILE), bytes)
+                .expect("fixture state writes");
+            let reading = owned_outputs_fence(
+                std::slice::from_ref(&pool),
+                Deadline::after(Duration::from_secs(10)),
+            );
+            assert_eq!(matches!(reading, OutputsFence::Covered), covered);
+        }
+        let mut unknown: serde_json::Value =
+            serde_json::from_str(&state(&[], "")).expect("state encodes");
+        unknown["owned_outputs"] = serde_json::json!("oxide.outputs/5");
+        assert!(parse_state(&serde_json::to_vec(&unknown).expect("state encodes")).is_err());
+        std::fs::write(
+            pool.join(CONTROL_DIR).join(STATE_FILE),
+            serde_json::to_vec(&unknown).expect("state encodes"),
+        )
+        .expect("fixture state writes");
+        assert!(matches!(
+            owned_outputs_fence(&[pool], Deadline::after(Duration::from_secs(10))),
+            OutputsFence::Unknown { .. }
+        ));
+        drop(fixture);
     }
 
     #[test]
