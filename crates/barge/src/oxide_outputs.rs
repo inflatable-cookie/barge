@@ -41,6 +41,7 @@ use crate::area::{self, OutputsGrant};
 use crate::delete::{self, DeleteBounds, DeleteReport, DeletionAuthority, ReplayOutcome};
 use crate::digest::sha256_hex;
 use crate::error::{Error, ErrorKind, Result};
+use crate::evidence::AbsenceEvidence;
 use crate::os::{
     self, AbsenceVolume, AccountFacts, AncestorExpected, DirOps, MountRoot, ProcessObserver,
     VolumeUuid,
@@ -836,9 +837,9 @@ pub fn execute(call: &AdapterCall<'_>) -> Outcome {
     //    the stored grant again, the exact marker again — version, digest,
     //    nonce, volume UUID, checkout — and the checkout's absence.
     let refusal: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
-    let authorize = |record: &registry::VolumeRecord| -> Result<()> {
+    let authorize = |record: &registry::VolumeRecord| -> Result<Option<AbsenceEvidence>> {
         match reprove(call, &volume_uuid, record, &unit, intent) {
-            Ok(()) => Ok(()),
+            Ok(proof) => Ok(Some(proof)),
             Err(reason) => {
                 *refusal.borrow_mut() = Some(reason.clone());
                 Err(Error::new(
@@ -1023,6 +1024,9 @@ fn resume(
     ) {
         return outcome_for(OutcomeKind::Unknown, Some(reason));
     }
+    if let Err(reason) = reprove_recorded_checkout(call, &journal) {
+        return outcome_for(OutcomeKind::Pending, Some(reason));
+    }
     let volume_uuid = journal.volume_uuid.clone();
     let record = match registry::read(call.state_paths) {
         Ok(registry) => registry,
@@ -1169,7 +1173,7 @@ fn reprove(
     record: &registry::VolumeRecord,
     unit: &DeletionUnit,
     intent: &LiveIntent,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<AbsenceEvidence, String> {
     // The grant is read again from the state directory under the volume lock,
     // immediately before the intent write: a re-declare that withdrew it
     // between the first read and here keeps the root.
@@ -1271,54 +1275,131 @@ fn reprove(
         ));
     }
 
-    // The checkout's absence, the fact Oxide required for coverage, proved
-    // again now through Barge's own absence primitive. The intent's identity
-    // names no checkout volume, so a checkout under a mount parent cannot be
-    // proved against a registered volume here and refuses; a checkout under
-    // the boot volume proves normally.
-    let proof = prove_checkout_absent(call.dirs, call.facts, &intent.identity.checkout).map_err(
-        |error| {
-            format!(
-                "the checkout's absence cannot be proved: {}",
-                error.message()
-            )
-        },
-    )?;
-    if proof != "absent" {
-        return Err(format!(
-            "the checkout {} is not positively absent (verdict `{proof}`), so the covered premise does not hold",
-            intent.identity.checkout.display()
-        ));
-    }
-    let _ = area_path;
-    Ok(())
+    // Only the strictly read, digest-bound marker supplies checkout volume.
+    prove_checkout_absent(
+        call.dirs,
+        call.facts,
+        &marker.checkout,
+        marker.checkout_volume.as_ref(),
+    )
+    .map_err(|error| format!("the checkout's absence cannot be proved: {error}"))
 }
 
-/// Prove one checkout path absent.
-///
-/// The same rule a release plan's absence proof takes: a path under the
-/// platform's mount parent needs the volume its record names, and the intent
-/// identity carries none, so such a checkout refuses; a path without a mount
-/// parent is proved against the boot volume. The verdict string is the
-/// proof's own.
+/// Establish actual absence, preserving the live anchor and relative path so
+/// replay can locate the same volume even after another remount.
 fn prove_checkout_absent(
     dirs: &dyn DirOps,
     facts: &dyn AbsenceVolume,
     checkout: &Path,
-) -> Result<String> {
-    match facts.volume_prefix(checkout) {
-        Some(_) => Err(Error::new(
+    volume: Option<&VolumeUuid>,
+) -> Result<AbsenceEvidence> {
+    let prefix = facts.volume_prefix(checkout);
+    let expected = match prefix.as_ref() {
+        Some(prefix) => AncestorExpected::Registered {
+            uuid: volume.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::UnknownState,
+                    "the mount-parent checkout marker names no checkout volume",
+                )
+            })?,
+            recorded_mount: prefix,
+        },
+        None => AncestorExpected::BootData,
+    };
+    let proof = os::prove_absence(dirs, facts, checkout, expected)?;
+    if proof.verdict() != "absent" {
+        return Err(Error::new(
             ErrorKind::UnknownState,
             format!(
-                "the checkout {} is under a mount parent its intent does not name, so its absence cannot be proved against a registered volume",
-                checkout.display()
+                "the checkout {} is not positively absent ({}: {})",
+                checkout.display(),
+                proof.verdict(),
+                proof.reason().unwrap_or("no reason")
             ),
-        )),
-        None => {
-            let proof = os::prove_absence(dirs, facts, checkout, AncestorExpected::BootData)?;
-            Ok(proof.verdict().to_owned())
-        }
+        ));
     }
+    let value = serde_json::to_value(proof).map_err(|error| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!("cannot encode absence evidence: {error}"),
+        )
+    })?;
+    let mut evidence: AbsenceEvidence = serde_json::from_value(value).map_err(|error| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!("cannot read absence evidence: {error}"),
+        )
+    })?;
+    // The primitive walks the UUID's live anchor while retaining the input
+    // spelling in `path`. Persist the same relative components under that
+    // observed anchor, so replay does not depend on the former mount name.
+    if let Some(prefix) = prefix {
+        let relative = checkout.strip_prefix(prefix).map_err(|_| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the checkout is outside its mount prefix",
+            )
+        })?;
+        evidence.path = evidence.anchor.path.join(relative);
+    }
+    evidence.validate()?;
+    Ok(evidence)
+}
+
+/// An old journal without evidence cannot acquire the missing premise from a
+/// replacement marker. The original request binds the path; the journal binds
+/// the volume and ancestor observed by the deciding check.
+fn reprove_recorded_checkout(
+    call: &AdapterCall<'_>,
+    journal: &IntentRecord,
+) -> std::result::Result<(), String> {
+    let evidence = journal.absence.as_ref().ok_or_else(|| {
+        "the pending outputs intent has no recorded checkout absence evidence".to_owned()
+    })?;
+    evidence.validate().map_err(|error| error.to_string())?;
+    let ancestor = evidence
+        .ancestor
+        .as_ref()
+        .ok_or_else(|| "the absence evidence has no ancestor".to_owned())?;
+    let checkout = &call.intent.identity.checkout;
+    let registered = ancestor.volume.kind == "registered";
+    let path_matches = if registered {
+        evidence.anchor.kind == "registered"
+            && call.facts.volume_prefix(checkout).is_some_and(|prefix| {
+                checkout.strip_prefix(prefix).ok()
+                    == evidence.path.strip_prefix(&evidence.anchor.path).ok()
+            })
+    } else {
+        evidence.anchor.kind == "root"
+            && call.facts.volume_prefix(checkout).is_none()
+            && evidence.path == *checkout
+    };
+    if evidence.verdict != "absent" || !path_matches {
+        return Err("the recorded absence is not bound to this checkout and route".to_owned());
+    }
+    let uuid =
+        VolumeUuid::parse(&ancestor.volume.volume_uuid).map_err(|error| error.to_string())?;
+    let fresh = prove_checkout_absent(
+        call.dirs,
+        call.facts,
+        &evidence.path,
+        registered.then_some(&uuid),
+    )
+    .map_err(|error| error.to_string())?;
+    let current = fresh
+        .ancestor
+        .as_ref()
+        .ok_or_else(|| "the fresh proof has no ancestor".to_owned())?;
+    let same_path = if registered {
+        ancestor.path.strip_prefix(&evidence.anchor.path).ok()
+            == current.path.strip_prefix(&fresh.anchor.path).ok()
+    } else {
+        ancestor.path == current.path
+    };
+    if !same_path || ancestor.inode != current.inode || ancestor.volume != current.volume {
+        return Err("the checkout absence ancestor or volume changed".to_owned());
+    }
+    Ok(())
 }
 
 /// What Oxide's own records answer for one caller intent id.

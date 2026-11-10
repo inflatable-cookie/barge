@@ -1214,6 +1214,7 @@ impl Pass<'_> {
                 now_ms, wall,
             )
             .map_err(&refuse)
+            .map(|()| None)
         };
         let result = delete::delete_unit_under_volume_lock(
             self.paths,

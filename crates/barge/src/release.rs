@@ -2092,7 +2092,7 @@ fn delete_candidates(
         };
 
         let refusal: RefCell<Option<String>> = RefCell::new(None);
-        let reprove = |record: &VolumeRecord| -> Result<()> {
+        let reprove = |record: &VolumeRecord| -> Result<Option<AbsenceEvidence>> {
             let context = Reprove {
                 state_paths,
                 dirs,
@@ -2107,7 +2107,7 @@ fn delete_candidates(
                 now_ms: request.release.now_ms,
                 reference_wall: request.release.bounds.reference_wall,
             };
-            reprove_row(&context).map_err(|reason| {
+            reprove_row(&context).map(|()| None).map_err(|reason| {
                 *refusal.borrow_mut() = Some(reason.clone());
                 Error::new(
                     ErrorKind::RefusedBoundary,
@@ -2116,7 +2116,7 @@ fn delete_candidates(
                 .with_detail("volume_uuid", record.volume_uuid.as_str().into())
             })
         };
-        let authorize: &dyn Fn(&VolumeRecord) -> Result<()> = &reprove;
+        let authorize = &reprove;
         let outcome = delete::delete_unit_under_volume_lock(
             state_paths,
             dirs,

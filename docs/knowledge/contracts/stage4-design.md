@@ -1019,8 +1019,8 @@ authority, and a truncated journal is unknown there too, never absent.
   resumes or reports the one record, never a second unit.
 
 Unchanged, and refused on the adapter path: `oxide.outputs.root/1` markers,
-the legacy fences, an unregistered or non-expendable volume, a checkout
-under a mount parent whose volume the intent does not name, and the R4 and
+the legacy fences, an unregistered or non-expendable output volume, a checkout
+under a mount parent without a verified marker-recorded checkout UUID, and the R4 and
 pending-root rules of the generic release gate. The **device number is never
 a bound identity**: the adapter verifies the live volume by UUID and mount
 root, takes the device the live volume reports now as the walk's
@@ -1121,6 +1121,48 @@ credited by source controls. The existing 128 MiB image, 300 s / 512 MiB guard,
 30 s work stop, supervisor pin, pre-backing custody and detach/reap/whole-backing
 closure gates remain. Production account lookup, O2/O3, parent-reader conversion,
 installation, real grants/registration, migration and live adoption remain held.
+
+### Delegated checkout absence bound to its volume (2026-11-10)
+
+The deciding adapter check uses `checkout_volume_uuid` from the strictly read,
+identity- and digest-verified `oxide.outputs.root/2` marker. Previously it read
+that field but dropped it, refusing every checkout under a mount parent. The
+strict prune-intent/1 format remains unchanged. A mount-parent checkout now
+uses the existing `os::prove_absence` registered-volume rule: locate the recorded
+UUID, verify its actual mount and ancestor through descriptors, and walk the
+recorded relative components. A remount may change the mount spelling and
+device; it cannot change the UUID or ancestor identity. A missing, malformed,
+mismatched, unavailable or duplicate UUID, an unreadable/present checkout,
+changed ancestor or exhausted bound keeps the root. An unresolved registered
+path never falls back to BootData. Non-mount-parent paths retain their actual
+BootData identity checks.
+
+The deciding proof is carried in the existing typed `barge.intent/2.absence`
+evidence, with no second journal or caller-supplied volume authority. Before
+any pending replay, Barge re-establishes the saved checkout path and expected
+volume, including the same ancestor inode and UUID/filesystem/kind, with
+relative path binding across remounts. This applies before rollback, renamed
+partial deletion, marker-last recovery and final settlement. Once marker-last
+has removed the marker, the saved evidence still supplies the original
+checkout premise. Older pending records without sufficient evidence stay
+pending/Unknown; they cannot acquire invented volume evidence. Stored grants,
+lock order, exact request/route/preview binding and quarantine meanings remain
+unchanged.
+
+The focused apparatus retains A1–A16 and adds A17 for digest-bound mounted
+checkout UUID substitutions and actual matching deletion, and A18 for saved
+absence refusals, actual same-UUID ancestor replacement and marker-removed
+replay after restoring the original ancestor. All native fixture checkout paths
+are now absent leaves in the run-owned Stash home, whose UUID is read from its
+actual ancestor descriptor; output roots remain on the one owned image.
+No BootData replacement or test-only positive evaluator supplies this join.
+The apparatus records actual checkout and output UUIDs and the substituted
+marker facts. These source controls are not native credit: exact-head source
+review, an adequate uncounted diagnostic, counted author and distinct retained
+reviewer proofs remain separate activation gates under the unchanged envelope.
+Barge051/052/053 evidence retains its accepted limits and is not integrated
+credit. Production account lookup, deployment, live adoption and integrated
+proof remain unresolved; O2/O3 and production parent-reader conversion stay held.
 
 ## Failure, race and cancellation matrix
 

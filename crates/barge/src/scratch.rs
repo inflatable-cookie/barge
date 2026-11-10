@@ -2202,6 +2202,7 @@ pub fn expire_plan(
                 row,
                 now_ms,
             )
+            .map(|()| None)
         };
         match delete::delete_unit_authorized(
             state_paths,
@@ -6832,7 +6833,7 @@ mod tests {
             "owner",
         )
         .expect("release");
-        let current = |_record: &crate::registry::VolumeRecord| Ok(());
+        let current = |_record: &crate::registry::VolumeRecord| Ok(None);
         let report = crate::delete::delete_unit_authorized(
             &harness.fixture.state,
             &platform,

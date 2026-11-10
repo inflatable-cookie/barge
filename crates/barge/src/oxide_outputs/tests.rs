@@ -329,6 +329,26 @@ fn publish_record(
     caller_id: &str,
     phase: IntentPhase,
 ) -> IntentRecord {
+    let proof = crate::os::prove_absence(
+        &platform(),
+        &fixture.volume.facts(),
+        &fixture.checkout,
+        crate::os::AncestorExpected::BootData,
+    )
+    .expect("the checkout proof");
+    let absence = serde_json::from_value(serde_json::to_value(proof).expect("proof encodes"))
+        .expect("evidence decodes");
+    publish_record_with_absence(fixture, root, intent_id, caller_id, phase, Some(absence))
+}
+
+fn publish_record_with_absence(
+    fixture: &Fixture,
+    root: &RootFixture,
+    intent_id: &str,
+    caller_id: &str,
+    phase: IntentPhase,
+    absence: Option<crate::evidence::AbsenceEvidence>,
+) -> IntentRecord {
     let request_digest = request()
         .digest(&fixture.live_intent(root, caller_id))
         .expect("the fixture request digests");
@@ -367,7 +387,7 @@ fn publish_record(
         captures: Vec::new(),
         foreign_captures: Vec::new(),
         identity: None,
-        absence: None,
+        absence,
         caller_intent_id: Some(caller_id.to_owned()),
         caller_request_digest: Some(request_digest),
     };
@@ -1770,3 +1790,6 @@ mod absence;
 
 #[path = "tests/routes.rs"]
 mod routes;
+
+#[path = "tests/checkout_volume.rs"]
+mod checkout_volume;

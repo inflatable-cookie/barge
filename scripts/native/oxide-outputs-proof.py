@@ -20,7 +20,7 @@ host's Stash scratch route are verified, and under that supervisor (pinned
 below, executed with the same interpreter), it creates one private run root
 inside the guard's owned scratch, stages the `proof-synthetic-account` driver
 build of HEAD inside the guard, attaches one owned APFS sparse image of 128 MiB
-with ownership enabled, and runs sixteen adapter cases through the staged
+with ownership enabled, and runs eighteen adapter cases through the staged
 driver against a private HOME, a private state directory and a synthetic
 account home. Each case is one delegated-deletion fact of the joint protocol
 (Oxide `barge-adoption.md`, "Joint protocol for Barge output deletion"): the
@@ -188,6 +188,12 @@ CASES = [
     {"id": "A16", "method": "A16",
      "claim": "absence-only proves an empty journal and clear folder, but refuses a matching pending record without changing it",
      "carried_by": "pending_and_terminal_records_both_refuse_without_returning_a_record"},
+    {"id": "A17", "method": "A17",
+     "claim": "actual Stash checkout UUID permits image-root deletion; missing, malformed and image-UUID substitutions with rebound digests preserve payload and write no journal",
+     "carried_by": "mounted_checkout_volume_is_bound_at_effect"},
+    {"id": "A18", "method": "A18",
+     "claim": "marker-removed replay keeps the quarantine and phase with missing or changed saved evidence and an actual same-UUID ancestor replacement, then settles with the restored original Stash ancestor",
+     "carried_by": "mounted_checkout_replay_requires_saved_absence"},
 ]
 
 # Spelled apart so this list does not contain the tokens it forbids.
@@ -382,14 +388,13 @@ def executed_shapes_problems():
         driver = handle.read()
     if '"passed"' not in driver:
         problems.append("the driver never prints a passed verdict for the script to parse")
-    # D5: the fixture checkout must be a boot-volume, never-created path. A
-    # checkout under the case home sits on a mount parent whose volume the
-    # intent identity does not carry, so the reviewed F2 rule refuses it and
-    # the covered positive deletion never runs.
-    if 'CHECKOUT_PATH_PREFIX: &str = "/private/var/tmp/barge-proof-checkout-"' not in driver:
-        problems.append("the fixture checkout is not a boot-volume, never-created path")
-    if 'bindings.home.join("checkout")' in driver:
-        problems.append("the fixture checkout still sits under the case home on a mount parent")
+    # The deciding F2 join uses the real Stash ancestor, never a BootData
+    # replacement. Its UUID is descriptor-observed and carried by the marker.
+    for premise in ('bindings.home.join("checkouts")', 'identify_directory(', '"checkout_volume_uuid"', 'AncestorExpected::Registered'):
+        if premise not in driver:
+            problems.append(f"the mounted-checkout fixture loses {premise}")
+    if 'CHECKOUT_PATH_PREFIX' in driver:
+        problems.append("the fixture retains the old BootData checkout workaround")
     # D6: the A12 holder must outlast the design lock wait, or the same-call
     # Locked paths are never exercised (the call acquires the lock instead).
     if "HOLD_LONGER_THAN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(7)" not in driver:
@@ -471,7 +476,7 @@ def premise_dispositions():
             "scratch, and a private home that is not the account home; each "
             "case's Oxide records, including A14/A15's schema3 registry routes, "
             "are written inside that home only; A16 queries only the same "
-            "private Barge journal and owned image folder"
+            "private Barge journal and owned image folder; A17/A18 use only the run-owned Stash home checkout leaf, its descriptor-observed UUID and the owned image"
         ),
         "environment": (
             "the guarded half runs under base.stage_environment's scrub of "
