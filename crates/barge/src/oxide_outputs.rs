@@ -653,9 +653,11 @@ pub fn execute(call: &AdapterCall<'_>) -> Outcome {
                     intent,
                     call.request,
                 ) {
-                    // The checked journal above binds the durable request/unit;
-                    // do not compare the captured device to a remount observation.
-                    OxideLookup::Found(_) => {}
+                    OxideLookup::Found(stored) => {
+                        if let Err(reason) = compare_stored_intent(intent, &stored) {
+                            return refused(reason);
+                        }
+                    }
                     OxideLookup::Absent => {
                         return refused("the terminal call has no live Oxide intent".to_owned())
                     }
@@ -1416,7 +1418,8 @@ fn lookup_oxide_intent(
     }
 }
 
-/// Compare the stored intent with the caller's claim, field for field.
+/// Compare the stored operation with the caller's claim. Device numbers are
+/// within-run observations, so remounts do not change this durable binding.
 ///
 /// A settled or advanced phase refuses, and so does any identity or preview
 /// difference: this adapter acts on one exact intent, not on one that looks
@@ -1445,7 +1448,6 @@ fn compare_stored_intent(
         && identity.volume_uuid == claim.volume_uuid
         && identity.nonce == claim.nonce
         && identity.generation == claim.generation
-        && identity.dev == claim.dev
         && identity.ino == claim.ino
         && identity.marker_digest == claim.marker_digest;
     if same {

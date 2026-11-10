@@ -1009,6 +1009,51 @@ fn case_routed_deletion(fixture: &Fixture) -> Result<(), String> {
     if fixture.record(&id)?.phase != IntentPhase::Deleted {
         return Err("the routed deletion did not settle its own record".to_owned());
     }
+    let journal_path =
+        state::intent_path(&fixture.state, &id).map_err(|error| error.to_string())?;
+    let journal = std::fs::read(&journal_path).map_err(|error| error.to_string())?;
+    let registry_path = fixture.control().join("outputs/registry.json");
+    let original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry_path).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    let intent = fixture.live_intent(CALLER_ID);
+    for dimension in 0..3 {
+        let mut changed = original.clone();
+        match dimension {
+            0 => changed["intents"][0]["preview_sha256"] = serde_json::json!("d".repeat(64)),
+            1 => changed["intents"][0]["phase"] = serde_json::json!("deleting"),
+            _ => {
+                changed["intents"][0]["identity"]["ino"] =
+                    serde_json::json!(intent.identity.ino + 1)
+            }
+        }
+        let bytes = serde_json::to_vec(&changed).map_err(|error| error.to_string())?;
+        std::fs::write(&registry_path, &bytes).map_err(|error| error.to_string())?;
+        let refused = fixture.call(&intent, &request)?;
+        if refused.kind != OutcomeKind::Refused
+            || std::fs::read(&journal_path).map_err(|error| error.to_string())? != journal
+            || std::fs::read(&registry_path).map_err(|error| error.to_string())? != bytes
+            || fixture.root_path.exists()
+        {
+            return Err(format!(
+                "terminal stored-operation mismatch did not refuse unchanged: {refused:?}"
+            ));
+        }
+    }
+    std::fs::write(
+        &registry_path,
+        serde_json::to_vec(&original).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut remounted = intent;
+    remounted.identity.dev += 5000;
+    if fixture.call(&remounted, &request)?.kind != OutcomeKind::Deleted
+        || std::fs::read(&journal_path).map_err(|error| error.to_string())? != journal
+    {
+        return Err(
+            "exact terminal recovery did not tolerate a remount device observation".to_owned(),
+        );
+    }
     Ok(())
 }
 

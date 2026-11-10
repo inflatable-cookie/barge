@@ -1084,7 +1084,11 @@ remains exclusively adapter-owned. Old readers refuse the successor formats.
 `DelegatedRequest` adds `request_sha256: Option<String>`, the immutable original
 sidecar's byte SHA-256. For schema 3 execution and replay it must equal this
 intent's validated Barge route; local routes and missing/wrong bindings refuse
-before effects, including the Deleted fast path. Historical requests use None.
+before effects, including the Deleted fast path. That fast path also compares
+Oxide's stored phase, preview and every durable identity field to the original
+claim, after checking the Barge journal. All stored-intent comparisons exclude
+device numbers, which are remount observations rather than operation identity.
+Historical requests use None.
 This hash is separate from `DelegatedRequest::digest`, whose canonical fields
 remain unchanged (including original grant generation). Oxide owns strict
 sidecar reading and publication; Barge neither reads nor writes the sidecar.
