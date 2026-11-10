@@ -1053,6 +1053,120 @@ mid-write without a hold is a consumer Barge cannot see, which is exactly the
 limit above and the reason adoption is explicit and holds are the documented
 protocol.
 
+### Bounded shared descriptor listing (design only, 2026-11-10)
+
+Tom selected “Design bounded shared listing” in decision
+`9e68c8ce-ac61-4190-a31c-b45f99fd6ecd` v2. This is source-only design and
+independent exact-head review. Runtime remains unchanged: 4096 entries per
+listing, 4096 processes, 65,536 descriptors and 10 s. Implementation and native
+activation need new scoped briefs.
+
+**Source binding.** Barge published
+`63163686d212e6e5a900d6cc2ddfcce65b475890`, tree
+`8a3b368e7883be862fe8319bb34e9f987e38731b`; anchors below use that source.
+Authenticated Oxide [PR 263 source](https://github.com/inflatable-cookie/oxide/blob/39211b4e1cef4abf9ea07f2ef1a4814ce6b0d3a0/docs/knowledge/contracts/barge-adoption.md#connected-caller-and-recovery-source-oxide304)
+(`39211b4e1cef4abf9ea07f2ef1a4814ce6b0d3a0`, adoption-contract blob
+`6ddce39d26ff69b915570d0a10f205947b564d2a`) and actual retained
+[review 6776170175](https://github.com/inflatable-cookie/oxide/pull/263#issuecomment-6776170175)
+bind the consumer and recommendation, not a shipped listing amendment.
+Two recorded 600 s diagnostics refused before effect at the per-process bound
+(473/11,524 and 458/11,278 processes/descriptors); all 43 rows remained
+unexecuted. This identifies no process, leak/load, transient cause or defect.
+Seven spent failures, no-launch refusal, original limits/charges/unknowns and
+four retained images stand; no proof credit transfers.
+
+| Shared call chain (macos.rs line anchors below) | Present behavior → proposed budget route |
+| --- | --- |
+| `scan_open_descriptors` 958 → `scan_processes` 1015 → `scan_table` 1040 → `settle_descriptors` 1450 → `list_descriptors` 2134 | Kernel table first; one original `scan_table` start/deadline (currently after table/account reads), 4096-process admission and one mutable descriptor-work budget. Never reset them. |
+| `settle_descriptors` initial and EPERM loop 1483–1639 | Same helper on every attempt; preserve 250 ms window and 25/75/100 ms backoffs. Growth shares that window. |
+| `observe_descriptor` 1661 → `settle_pair` 1734 → listing 1776 | Closed initial or retry pair relists through the helper, under the original scan deadline/budget; retain three paired attempts, 10 ms backoffs. |
+| `settle_dead_handle` 1929 → `settle_pair(ClosedAfterDead)` 2056 | Same relisting route; retain dead-handle window, failure precedence and no recursive dead settlement. |
+| Test entry points 987/1005; `StatedListing` 2288; `dead_handle_candidates` 2961 → listing 2974 | Injected errnos must enter the same checked adapter. Candidate search gets one bounded context (512 candidates, at most 65,536 work rows/10 s), accepts only complete listings and remains test discovery, never custody. |
+| `custody::decide` 861–940; `cache.rs` 2755–2812; `diagnostic.rs` 89–161 | Complete-empty alone can support custody/cache replacement; Bounded/Unreadable refuse. Census remains diagnostic infrastructure on refusal, never Safe. |
+
+**Minimum private delta.** Add `ScanBudget { deadline, remaining }`;
+`list_descriptors(classified: ProcessIdentity, budget: &mut ScanBudget,
+local_deadline: Option<Instant>, faults: &mut [StatedListing])` returns
+explicit complete, bounded,
+gone or unreadable. Thread it through `settle_descriptors`, `observe_descriptor`,
+`settle_pair` and `settle_dead_handle`. `SettledListing::Listed` must carry the
+verified identity used by subsequent per-fd/platform checks: today EPERM can
+update `start` locally while `scan_table` still uses the original identity.
+Carry bound reasons through `SettledListing`/`Observed`, replacing both
+4096-length sentinels. Public `ProcessObserver`, `DescriptorScanRequest` and
+`DescriptorScan` shapes need no change.
+
+**Accounting and growth.** Remaining means unspent returned listing rows,
+including non-vnodes, repeats across attempts, discarded full prefixes and relists; never
+refund them or charge final per-fd iteration twice. Today only final iteration
+is counted. Keep its public `descriptors` count; document the stricter private
+work limit in request/capability text. Clamp requested budgets/time to the existing totals (smaller requests stay
+smaller); use checked deadline construction. Keep process-count semantics and
+refuse before another same-uid listing once its process allowance is exhausted.
+Zero remaining refuses before a listing, even for a potentially empty process.
+Start at `min(4096, remaining)`; after a full response charge it, discard it,
+and request `min(checked_double(previous), remaining)` only if strictly larger.
+With at most 65,536 rows this permits at most four reads per growth sequence.
+A full response at available capacity is Bounded, never Complete. No OS
+open-file-limit premise applies.
+
+**Identity and completion.** Before and after every kernel listing, including
+growth/relisting, read PID/start/effective UID from the kernel table. Accept
+rows only for the same positively bound identity; only the final short listing
+is evaluated, never a union of stale prefixes. Growth/relist identity or UID
+changes refuse Unknown. Preserve EPERM's existing positive gone/foreign
+settlement and bounded same-uid replacement re-evaluation, carrying the new
+identity. An initial stale start refuses; unreadable identity/UID refuses.
+Positive gone before a read, ESRCH on listing, or gone after a valid answer
+settles gone; an unrelated failed/malformed answer cannot be erased by later
+gone. Foreign UID remains the named blind spot. Descriptor churn can fill each
+attempt and exhaust the budget; same-identity churn is still a sampled
+observation, never an atomic census. Check scan/local deadlines before and
+after allocation, reads and final identity, and before Complete, including
+empty/last-process paths. Retain existing window/scan refusal precedence.
+Blocking kernel calls are not preempted by these checks; runtime fit is unknown.
+
+| Allocation/answer obligation | Proposed deciding rule |
+| --- | --- |
+| Capacity, PID and bytes | Checked multiplication by `size_of::<proc_fdinfo>()`; positive PID and exact checked PID/byte conversions to `c_int`, no saturation/substitution. Fallible `try_reserve_exact`, then initialize only reserved entries; allocation/conversion/overflow failure is Unreadable. |
+| Return value and errno | Clear errno, capture immediately. Negative always Unreadable except explicit ESRCH/EPERM handling; negative without errno never means empty. Zero + clear errno is empty only after identity/deadline checks; ESRCH is gone; EPERM uses only the existing listing-settlement policy (relist EPERM remains unreadable); ENOENT/other errno refuses. Positive + nonzero errno is ambiguous and refuses. |
+| Positive byte count | Require `0 < written <= requested_bytes` and entry-size alignment before slicing/counting; partial entry, oversized count or malformed answer refuses. Equal is full; aligned smaller is a complete kernel listing sample, not lifetime closure. Reject negative fd numbers and duplicate fd entries as malformed (in-place unstable sort/check, preserving every valid row); unknown fd types retain existing non-vnode handling. |
+| Requested memory | Drop each full buffer before allocating its successor; no growth copy. A closed-fd relist can coexist with the outer iteration buffer: at most two requests of 65,536 × entry size, plus existing scan/evidence/process-table storage. Allocator rounding/retention and kernel/internal allocations prevent a hard RSS claim. |
+
+**Compatibility.** This affects scratch expiry, cache swaps, maintain, generic
+release, replay and delegated outputs wherever they use custody. Keep holds,
+self-exclusion, blind-spot/dead-handle rules, grants, unknown/refusal and every
+[stage 4 adapter/recovery boundary](stage4-design.md#the-oxide-outputs-adapter-barge-is-the-covered-classs-only-deleter-2026-11-09).
+Keep describe/evidence schemas and observed counts; update capability prose.
+Tape records each actual attempt and its bound without raising tape caps;
+overflow remains insufficient. Test seams compile away; adapt vnode-index injections to sorted rows. Comparison stays deferred.
+Stronger lifetime/atomicity guarantees or wider totals require an explicit ruling.
+
+**Validation proposal, not activation.** First source-review shared paths and
+fallible allocation/identity/accounting. Then ordinary regressions inject raw
+kernel returns, allocation/clock/identity through the actual production helper:
+small, full→grown, exact-full/zero budget; partial/malformed/negative/empty,
+overflow/allocation failure; EPERM/gone/unreadable; PID/UID/churn/deadline races;
+initial/retry/relist aggregate exhaustion and custody/cache refusal. Preserve
+existing dead/blind-spot controls. Separately review native readiness for one
+owned child holding 4097–8191 total descriptors under the qualified supervisor
+(proposed 300 s/512 MiB, owned Stash scratch), with a below-threshold control,
+complete positive listing outside the target, held-writer refusal inside it
+and exhausted-budget refusal,
+PID/start/UID brackets, actual returned counts, child reap and resource closure.
+If existing fixture limits cannot support it, readiness refuses: no assumed
+RLIMIT, limit raising or simulated kernel credit. Targeted kernel listing
+credit is distinct from whole-host custody completion and integrated fit. Future custody/deletion work
+remains Elevated: source review, separately activated uncounted diagnostic,
+counted author and distinct reviewer proof; no 600 s fit promise. This design
+runs only `effigy docs:check`.
+
+Source anchors: [macos.rs](../../../crates/barge/src/os/macos.rs),
+[custody.rs](../../../crates/barge/src/custody.rs),
+[os/facts.rs](../../../crates/barge/src/os/facts.rs) (`ProcessIdentity` 696,
+request 722, scan 1008), [cache.rs](../../../crates/barge/src/cache.rs),
+[diagnostic.rs](../../../crates/barge/src/diagnostic.rs).
+
 ### Whole-unit deletion, Finder metadata and quarantine
 
 Deletion is whole-unit only, of units the plan named with a matching grant,
