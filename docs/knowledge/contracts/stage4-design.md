@@ -977,7 +977,14 @@ What landed in `crates/barge/src/oxide_outputs.rs`, all default library code:
   volume/caller-id arguments, plus the optional expected Barge intent id.
   Both pending and terminal matches validate volume UUID, caller id, supplied
   Barge id, canonical request and plan digests, outputs family/delegation,
-  directory kind, inode, marker digest and recorded root path. The canonical
+  directory kind, inode, marker digest and exact volume-relative location.
+  The location is checked against the UUID's registered root directory and
+  declared outputs folder, then against the original request's path suffix.
+  The journal's mount hint and the request's original mount prefix need not
+  match: a first effect after remount records the new mount. Neither mount
+  hint nor device number is durable identity. Missing registration/declaration
+  or a changed relative location stays unknown; this reads location binding,
+  not a new grant or eligibility policy. The canonical
   digest also binds nonce, preview and grant generation. A correct digest
   cannot hide a different stored unit. Missing, malformed or conflicting
   binding returns Unknown and preserves records; no caller-id-only fallback.

@@ -1561,3 +1561,91 @@ fn duplicate_or_truncated_binding_is_unknown_without_writes() {
         );
     }
 }
+
+/// The caller keeps its original request while the writer observes a new
+/// mount prefix. Exercise actual adapter deletion and pending replay with
+/// the same inode/marker/UUID across the directory rename.
+#[test]
+fn a_changed_mount_prefix_preserves_exact_pending_and_terminal_recovery() {
+    for pending in [true, false] {
+        let mut fixture = Fixture::new("adapter-remount-path");
+        let root = fixture.root("root-one");
+        fixture.covered(&root, CALLER_ID);
+        let intent = fixture.live_intent(&root, CALLER_ID);
+        let old_mount = fixture.volume.root.clone();
+        let new_mount = fixture.volume.dir.path().join("remounted-volume");
+        std::fs::rename(&old_mount, &new_mount).unwrap();
+        fixture.volume.root = new_mount.clone();
+        fixture.outputs = new_mount.join("oxide-outputs");
+        let live_root = fixture.outputs.join("root-one");
+
+        let record = if pending {
+            let record =
+                publish_record(&fixture, &root, INTENT_ID, CALLER_ID, IntentPhase::Renamed);
+            std::fs::rename(&live_root, fixture.outputs.join(&record.unit.capture_name)).unwrap();
+            record
+        } else {
+            let outcome = run(&fixture, &intent);
+            assert_eq!(outcome.kind, OutcomeKind::Deleted, "{outcome:?}");
+            record_of(&fixture, outcome.intent_id.as_deref().unwrap())
+        };
+        assert_eq!(record.mount_hint, new_mount);
+        assert!(intent.identity.root.starts_with(&old_mount));
+        let path = state::intent_path(&fixture.volume.state, &record.intent_id).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let lookup_exact = || {
+            lookup(
+                &fixture.volume.state,
+                &platform(),
+                &fixture.volume.facts(),
+                &fixture.volume.mounts(),
+                &fixture.volume.observer(),
+                &intent,
+                &request(),
+                Some(&record.intent_id),
+            )
+        };
+        let answer = lookup_exact();
+        if pending {
+            assert!(
+                matches!(answer, BargeLookup::FoundPending { .. }),
+                "{answer:?}"
+            );
+        } else {
+            assert!(
+                matches!(answer, BargeLookup::FoundTerminal { .. }),
+                "{answer:?}"
+            );
+        }
+        // Each relative location component remains independently bound even
+        // though the two mount prefixes differ.
+        for dimension in 0..3 {
+            let mut changed = record.clone();
+            match dimension {
+                0 => changed.root_dir = "different-root-dir".to_owned(),
+                1 => changed.folder = "different-area".to_owned(),
+                2 => changed.unit.name = "different-unit".to_owned(),
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec_pretty(&changed).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(matches!(lookup_exact(), BargeLookup::Unknown { .. }));
+            assert_eq!(run(&fixture, &intent).kind, OutcomeKind::Unknown);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        std::fs::write(&path, &original).unwrap();
+        let outcome = run(&fixture, &intent);
+        assert_eq!(outcome.kind, OutcomeKind::Deleted, "{outcome:?}");
+        assert!(matches!(lookup_exact(), BargeLookup::FoundTerminal { .. }));
+        assert_eq!(
+            state::read_intents(&fixture.volume.state, crate::contract::INTENT_ROWS)
+                .unwrap()
+                .records
+                .len(),
+            1
+        );
+        if !pending {
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+}

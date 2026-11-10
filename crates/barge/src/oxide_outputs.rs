@@ -386,7 +386,7 @@ pub fn lookup(
         .collect();
     match matches.as_slice() {
         [record] => {
-            if let Err(reason) = check_binding(record, intent, request, barge_intent_id) {
+            if let Err(reason) = check_binding(state_paths, record, intent, request, barge_intent_id) {
                 return BargeLookup::Unknown { reason };
             }
             let leaf = record.unit.capture_name.clone();
@@ -430,6 +430,7 @@ pub fn lookup(
 /// Validate both the journal correlation and the independently stored unit.
 /// Device numbers are deliberately excluded: UUID is the durable volume key.
 fn check_binding(
+    state_paths: &StatePaths,
     record: &IntentRecord,
     intent: &LiveIntent,
     request: &DelegatedRequest,
@@ -437,11 +438,25 @@ fn check_binding(
 ) -> std::result::Result<(), String> {
     let uuid = validate_claim(intent)?;
     let digest = request.digest(intent).map_err(|error| error.to_string())?;
-    let root = record
-        .mount_hint
-        .join(&record.root_dir)
-        .join(&record.folder)
-        .join(&record.unit.parent)
+    // The request retains its original absolute path, while the writer's
+    // mount_hint is the mount observed at effect. Neither prefix is a durable
+    // identity. Derive the exact relative area from the UUID's registration
+    // and declaration, not from an arbitrary suffix chosen by the journal.
+    let registry = registry::read(state_paths)
+        .map_err(|error| format!("the recovery volume binding cannot be read: {error}"))?;
+    let volume = registry
+        .volume(&uuid)
+        .ok_or_else(|| "the recovery volume binding is not registered".to_owned())?;
+    let document = area::show(state_paths, AREA_NAMESPACE, AREA_NAME)
+        .map_err(|error| format!("the recovery area binding cannot be read: {error}"))?
+        .ok_or_else(|| "the recovery area binding is not declared".to_owned())?;
+    let folder = document
+        .declaration()
+        .folder_for(&uuid)
+        .ok_or_else(|| "the recovery area binding has no folder on this volume".to_owned())?
+        .to_owned();
+    let relative_root = Path::new(&volume.root_dir)
+        .join(&folder)
         .join(&record.unit.name);
     let marker = UnitMarker::new(
         MarkerFamily::OxideOutputs,
@@ -458,7 +473,9 @@ fn check_binding(
         || record.unit.grant != UnitGrant::delegation(MarkerFamily::OxideOutputs)
         || record.unit.root_id.is_some()
         || !record.unit.parent.is_empty()
-        || root != intent.identity.root
+        || record.root_dir != volume.root_dir
+        || record.folder != folder
+        || !intent.identity.root.ends_with(&relative_root)
     {
         return Err("the journal record conflicts with the expected outputs operation binding; keep the caller pending".to_owned());
     }
@@ -603,7 +620,8 @@ pub fn execute(call: &AdapterCall<'_>) -> Outcome {
     let resumed = match mine.as_slice() {
         [] => None,
         [record] => {
-            if let Err(reason) = check_binding(record, intent, call.request, None) {
+            if let Err(reason) = check_binding(call.state_paths, record, intent, call.request, None)
+            {
                 return unknown(reason);
             }
             if record.phase == IntentPhase::Deleted {
@@ -946,7 +964,13 @@ fn resume(
             );
         }
     };
-    if let Err(reason) = check_binding(&journal, intent, call.request, Some(&intent_id)) {
+    if let Err(reason) = check_binding(
+        call.state_paths,
+        &journal,
+        intent,
+        call.request,
+        Some(&intent_id),
+    ) {
         return outcome_for(OutcomeKind::Unknown, Some(reason));
     }
     let volume_uuid = journal.volume_uuid.clone();
