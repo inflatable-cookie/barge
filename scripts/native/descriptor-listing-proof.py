@@ -9,16 +9,19 @@ is used. Ordinary compilation uses Oxide's managed output pool.
 
 import argparse
 import contextlib
+import errno
 import importlib.util
 import json
 import math
 import os
 from pathlib import Path
 import resource
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+import types
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -50,6 +53,9 @@ SMALL_OPENS = 32
 # Standard streams plus a generous fixed implementation margin. This is only
 # an admission prerequisite; the kernel's actual count decides every case.
 REQUIRED_SOFT_FDS = LARGE_OPENS + 64
+MAX_SUPPORTED_SOFT_FDS = 1_048_576
+HOLDER_SCHEMA = "barge.descriptor-listing.holder/1"
+REPORT_BYTES = 65536
 BUILD_COMMAND = [
     "oxide", "build", "-p", "barge", "--locked", "--offline", "--features", FEATURE,
     "--example", DRIVER, "--message-format", "json",
@@ -213,16 +219,87 @@ class DirectChildren(space_images.Images):
 
 
 def own_limit():
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    adequate = soft == resource.RLIM_INFINITY or soft >= REQUIRED_SOFT_FDS
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError, AttributeError, TypeError, OverflowError) as error:
+        return {"soft": None, "hard": None, "required_soft": REQUIRED_SOFT_FDS,
+                "maximum_supported_soft": MAX_SUPPORTED_SOFT_FDS,
+                "execution_ready": False,
+                "missing_prerequisite": f"the existing caller RLIMIT_NOFILE is unreadable: {type(error).__name__}: {error}"}
+    supported_soft = (type(soft) is int and soft != resource.RLIM_INFINITY
+                      and REQUIRED_SOFT_FDS <= soft <= MAX_SUPPORTED_SOFT_FDS)
+    supported_hard = (type(hard) is int and (hard == resource.RLIM_INFINITY or hard >= soft)) \
+        if type(soft) is int else False
+    adequate = supported_soft and supported_hard
+    if not supported_soft:
+        missing = (f"the existing caller RLIMIT_NOFILE soft limit {soft} is outside the finite supported "
+                   f"range {REQUIRED_SOFT_FDS}..{MAX_SUPPORTED_SOFT_FDS}; no limit change is allowed")
+    elif not supported_hard:
+        missing = (f"the existing caller RLIMIT_NOFILE hard limit {hard!r} is unreadable or inconsistent "
+                   f"with its soft limit {soft}; no limit change is allowed")
+    else:
+        missing = None
     return {"soft": soft, "hard": hard, "required_soft": REQUIRED_SOFT_FDS,
+            "maximum_supported_soft": MAX_SUPPORTED_SOFT_FDS,
             "execution_ready": adequate,
-            "missing_prerequisite": None if adequate else
-            f"the existing caller RLIMIT_NOFILE soft limit {soft} is below {REQUIRED_SOFT_FDS}; no raising is allowed"}
+            "missing_prerequisite": missing}
+
+
+def holder_declarations(record):
+    """Validate the fixed holder wire and return its exact declared descriptor set."""
+    def refuse(reason):
+        raise base.Infrastructure("child", f"the owned holder declaration is invalid: {reason}")
+    if not isinstance(record, dict) or set(record) != {
+            "schema", "pid", "uid", "opened", "payload_fds", "standard_fds",
+            "payload_identity", "soft_limit", "baseline_closed"}:
+        refuse("fields")
+    if (record["schema"] != HOLDER_SCHEMA or type(record["pid"]) is not int or record["pid"] <= 0
+            or type(record["uid"]) is not int or record["uid"] < 0
+            or type(record["opened"]) is not int or record["opened"] not in (SMALL_OPENS, LARGE_OPENS)
+            or record["baseline_closed"] is not True
+            or type(record["soft_limit"]) is not int
+            or not REQUIRED_SOFT_FDS <= record["soft_limit"] <= MAX_SUPPORTED_SOFT_FDS):
+        refuse("identity, finite limit or baseline closure")
+    payload = record["payload_fds"]
+    if (not isinstance(payload, list) or len(payload) != record["opened"]
+            or any(type(fd) is not int or not 3 <= fd < record["soft_limit"] for fd in payload)
+            or payload != sorted(set(payload))):
+        refuse("payload descriptor numbers")
+    standards = record["standard_fds"]
+    if not isinstance(standards, list) or len(standards) != 3:
+        refuse("standard stream facts")
+    for expected, facts in enumerate(standards):
+        if (not isinstance(facts, dict) or set(facts) != {"fd", "kind", "device", "inode", "uid"}
+                or type(facts["fd"]) is not int or facts["fd"] != expected
+                or facts["kind"] != ("fifo" if expected == 0 else "regular")
+                or any(type(facts[key]) is not int or facts[key] < 0 for key in ("device", "inode", "uid"))
+                or facts["uid"] != record["uid"]):
+            refuse("missing or swapped standard stream")
+    if any(standards[1][key] != standards[2][key] for key in ("device", "inode", "uid")):
+        refuse("stdout and stderr do not name the same owned log")
+    payload_identity = record["payload_identity"]
+    if (not isinstance(payload_identity, dict) or set(payload_identity) != {"device", "inode", "uid"}
+            or any(type(payload_identity[key]) is not int or payload_identity[key] < 0
+                   for key in ("device", "inode", "uid"))
+            or payload_identity["uid"] != record["uid"]
+            or all(payload_identity[key] == standards[1][key] for key in ("device", "inode"))):
+        refuse("payload identity")
+    return sorted([facts["fd"] for facts in standards] + payload)
+
+
+def validate_ready(record, pid, uid, count, log_facts):
+    holder_declarations(record)
+    if record["pid"] != pid or record["uid"] != uid or record["opened"] != count:
+        raise base.Infrastructure("child", "the holder readiness PID/effective UID/count binding changed")
+    for facts in record["standard_fds"][1:]:
+        if (facts["device"], facts["inode"], facts["uid"]) != (
+                log_facts.st_dev, log_facts.st_ino, log_facts.st_uid):
+            raise base.Infrastructure("child", "the holder standard streams do not match the parent's owned log")
 
 
 def check_report(case, report, holder, previous_identity=None):
     """The fixed oracle consumes actual production-endpoint evidence, never copies a scan."""
+    declared_fds = holder_declarations(holder)
     identity = report.get("identity")
     if not isinstance(identity, dict) or identity.get("pid") != holder["pid"] \
             or identity.get("effective_uid") != holder["uid"] or not identity.get("start"):
@@ -255,13 +332,40 @@ def check_report(case, report, holder, previous_identity=None):
         raise base.Infrastructure("observation", f"the endpoint observation is {outcome!r}: {reason}")
     if outcome == "bounded" and (case["id"] != "L4" or reason != "descriptor work"):
         raise base.Infrastructure("observation", f"the endpoint reached an unexpected bound: {reason}")
+    matching_fds = report.get("matching_fd_numbers")
+    if (not isinstance(matching_fds, list)
+            or any(type(fd) is not int or not 0 <= fd < holder["soft_limit"] for fd in matching_fds)
+            or matching_fds != sorted(set(matching_fds))
+            or type(report.get("open_count")) is not int or report["open_count"] != len(matching_fds)):
+        raise base.Infrastructure("report", "the endpoint's matching descriptor numbers are malformed")
     if case["id"] == "L4":
         passed = (outcome == "bounded" and reason == "descriptor work" and work == 4096
                   and len(attempts) == 1 and attempts[0]["capacity"] == 4096
-                  and report.get("custody") == "unknown")
+                  and report.get("custody") == "unknown"
+                  and report.get("fd_numbers") is None and report.get("fd_type_counts") is None
+                  and not matching_fds and report["open_count"] == 0)
     else:
         count = report.get("final_count", -1)
-        passed = (report.get("outcome") == "complete" and count == holder["opened"] + 3
+        observed_fds = report.get("fd_numbers")
+        type_counts = report.get("fd_type_counts")
+        if (not isinstance(observed_fds, list)
+                or any(type(fd) is not int or not 0 <= fd < holder["soft_limit"] for fd in observed_fds)
+                or observed_fds != sorted(set(observed_fds))
+                or type(count) is not int or count != len(observed_fds)):
+            raise base.Infrastructure("report", "the endpoint's final descriptor numbers are malformed")
+        if (not isinstance(type_counts, list) or not type_counts
+                or any(not isinstance(pair, list) or len(pair) != 2
+                       or type(pair[0]) is not int or not 0 <= pair[0] <= 0xffffffff
+                       or type(pair[1]) is not int or pair[1] <= 0 for pair in type_counts)
+                or [pair[0] for pair in type_counts] != sorted({pair[0] for pair in type_counts})
+                or sum(pair[1] for pair in type_counts) != count):
+            raise base.Infrastructure("report", "the endpoint's final descriptor type counts are malformed")
+        if not set(matching_fds).issubset(observed_fds):
+            raise base.Infrastructure("report", "a matching descriptor is absent from the final listing")
+        # An extra or missing descriptor is a residual oracle failure, never a
+        # relaxed total or a filtered row. Malformed observations above abort.
+        passed = (report.get("outcome") == "complete" and observed_fds == declared_fds
+                  and count == len(declared_fds)
                   and count == attempts[-1]["rows"]
                   and count < attempts[-1]["capacity"]
                   and report.get("capacity") == attempts[-1]["capacity"])
@@ -272,15 +376,33 @@ def check_report(case, report, holder, previous_identity=None):
                       and [row["capacity"] for row in attempts] == [4096, 8192]
                       and attempts[0]["rows"] == 4096)
         if case["inside"]:
-            passed = passed and report.get("open_count", 0) >= holder["opened"] \
+            passed = passed and report.get("open_count") == holder["opened"] \
+                and matching_fds == holder["payload_fds"] \
                 and report.get("custody") == "unsafe"
         else:
-            passed = passed and report.get("open_count") == 0 and report.get("custody") == "safe_sample"
+            passed = passed and not matching_fds and report.get("open_count") == 0 \
+                and report.get("custody") == "safe_sample"
     return passed, identity
 
 
+def standard_stream_facts():
+    facts = []
+    for expected, stream in enumerate((sys.stdin, sys.stdout, sys.stderr)):
+        if type(stream.fileno()) is not int or stream.fileno() != expected:
+            raise base.Infrastructure("holder", "the owned holder's standard stream descriptor was swapped")
+        metadata = os.fstat(expected)
+        expected_kind = stat.S_ISFIFO if expected == 0 else stat.S_ISREG
+        if not expected_kind(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise base.Infrastructure("holder", "the owned holder's standard stream facts are not positively bound")
+        facts.append({"fd": expected, "kind": "fifo" if expected == 0 else "regular",
+                      "device": metadata.st_dev, "inode": metadata.st_ino, "uid": metadata.st_uid})
+    if any(facts[1][key] != facts[2][key] for key in ("device", "inode", "uid")):
+        raise base.Infrastructure("holder", "the owned holder's stdout/stderr do not name the same log")
+    return facts
+
+
 def holder_main(count, path, ready):
-    """One owned child, exactly three streams and `count` real vnode descriptors."""
+    """Construct one fresh owned child with a finite, declared descriptor set."""
     root = os.environ.get("BARGE_LISTING_PROOF_ROOT", "")
     if (count not in (SMALL_OPENS, LARGE_OPENS) or not root
             or os.path.realpath(root) != root
@@ -289,20 +411,71 @@ def holder_main(count, path, ready):
             or path != os.path.join(root, "inside", "held")
             or ready != os.path.join(root, f"holder-{count}.json")):
         raise base.Infrastructure("holder", "the holder is not bound to the owned fixture")
+    limits = own_limit()
+    if not limits["execution_ready"]:
+        raise base.Infrastructure("holder", limits["missing_prerequisite"])
+    # Only this dedicated fresh --holder child reaches this code. Popen's
+    # close_fds=True already removed inherited nonstandard descriptors; after
+    # startup we close its own nonstandard range again, without changing the
+    # environment, standard streams, a parent or the supervising process.
+    initial_standards = standard_stream_facts()
+    for descriptor in range(3, limits["soft"]):
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            if error.errno != errno.EBADF:
+                raise base.Infrastructure("holder", f"own nonstandard descriptor closure failed at {descriptor}: {error}") from error
+    payload_metadata = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(payload_metadata.st_mode) or payload_metadata.st_uid != os.geteuid():
+        raise base.Infrastructure("holder", "the owned payload is not a regular file of this effective UID")
     descriptors = []
     try:
         for _ in range(count):
-            descriptors.append(os.open(path, os.O_RDONLY | os.O_NOFOLLOW))
-        with open(ready + ".pending", "x", encoding="utf-8") as handle:
-            json.dump({"pid": os.getpid(), "uid": os.geteuid(), "opened": len(descriptors)}, handle)
-        # Publication happens only after closing the readiness descriptor, so
-        # the actual listing has exactly the three streams plus opened fds.
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            if type(descriptor) is not int or descriptor < 3 or descriptor in descriptors:
+                raise base.Infrastructure("holder", "the payload open returned a malformed or duplicate descriptor")
+            descriptors.append(descriptor)
+            if descriptor >= limits["soft"]:
+                raise base.Infrastructure("holder", "the payload descriptor exceeds the existing finite soft limit")
+        # A marker is created and CLOSED before any final declaration is
+        # collected. The record then uses only the already-open stdout log;
+        # no temporary readiness descriptor can enter the sampled set.
+        with open(ready + ".pending", "xb"):
+            pass
+        standards = standard_stream_facts()
+        if standards != initial_standards:
+            raise base.Infrastructure("holder", "the owned holder's standard stream identities changed during setup")
+        for descriptor in descriptors:
+            metadata = os.fstat(descriptor)
+            if (not stat.S_ISREG(metadata.st_mode)
+                    or (metadata.st_dev, metadata.st_ino, metadata.st_uid)
+                    != (payload_metadata.st_dev, payload_metadata.st_ino, payload_metadata.st_uid)):
+                raise base.Infrastructure("holder", "an owned payload descriptor changed identity before readiness")
+        record = {"schema": HOLDER_SCHEMA, "pid": os.getpid(), "uid": os.geteuid(),
+                  "opened": len(descriptors), "payload_fds": sorted(descriptors),
+                  "standard_fds": standards,
+                  "payload_identity": {"device": payload_metadata.st_dev,
+                                       "inode": payload_metadata.st_ino, "uid": payload_metadata.st_uid},
+                  "soft_limit": limits["soft"], "baseline_closed": True}
+        holder_declarations(record)
+        encoded = json.dumps(record, separators=(",", ":")) + "\n"
+        if len(encoded.encode("utf-8")) > REPORT_BYTES:
+            raise base.Infrastructure("holder", "the complete holder declaration exceeds its fixed byte bound")
+        sys.stdout.write(encoded)
+        sys.stdout.flush()
         os.replace(ready + ".pending", ready)
-        sys.stdin.buffer.read(1)
+        if sys.stdin.buffer.read(1) != b"":
+            raise base.Infrastructure("holder", "ordinary holder closure requires parent EOF, not a data byte")
         return 0
     finally:
+        closure_error = None
         for descriptor in descriptors:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                closure_error = closure_error or error
+        if closure_error is not None:
+            raise base.Infrastructure("holder", f"an owned payload descriptor did not close: {closure_error}") from closure_error
 
 
 def start_holder(children, root, count):
@@ -318,14 +491,22 @@ def start_holder(children, root, count):
         while raw_now() < stop:
             if child.poll() is not None:
                 raise base.Infrastructure("child", f"the holder exited before ready ({child.returncode})")
-            try:
-                with open(ready, encoding="utf-8") as handle:
-                    record = json.load(handle)
-            except (FileNotFoundError, ValueError):
+            if not os.path.isfile(ready):
                 time.sleep(0.01)
                 continue
-            if record != {"pid": child.pid, "uid": os.geteuid(), "opened": count}:
-                raise base.Infrastructure("child", "the holder readiness binding is malformed")
+            try:
+                marker = os.lstat(ready)
+                if (not stat.S_ISREG(marker.st_mode) or marker.st_uid != os.geteuid()
+                        or marker.st_size != 0 or os.path.realpath(ready) != ready):
+                    raise ValueError("readiness marker is not the empty owned regular file")
+                with open(log.name, "rb") as handle:
+                    encoded = handle.read(REPORT_BYTES + 1)
+                if len(encoded) > REPORT_BYTES:
+                    raise ValueError("holder declaration exceeds its complete byte bound")
+                record = json.loads(encoded)
+            except (OSError, ValueError, UnicodeError) as error:
+                raise base.Infrastructure("child", f"the holder readiness declaration is unreadable: {error}") from error
+            validate_ready(record, child.pid, os.geteuid(), count, os.fstat(log.fileno()))
             return child, log, record
         raise base.Infrastructure("child", "the holder did not become ready inside its work allowance")
     except BaseException:
@@ -539,7 +720,7 @@ def premise_dispositions():
         "cargo_external_argv": "n/a: no fake Cargo external subcommand; BUILD_COMMAND calls the accepted Oxide build route directly",
         "owned_image": "n/a: no image is created, attached, inspected or detached by any path",
         "compiler_flags": "base.stage_environment scrubs RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS/DYLD_INSERT_LIBRARIES; driver_environment does the same",
-        "temporary_storage": "all fixture and staged files use explicit fresh guard scratch parents; TMPDIR/TMP/TEMP are equal in driver children; compiler outputs retain ordinary Oxide placement",
+        "temporary_storage": "all fixture and staged files use explicit fresh guard scratch parents; TMPDIR/TMP/TEMP are equal in driver children; compiler outputs retain ordinary Oxide placement; only the fresh holder closes its own finite nonstandard range after startup, then records exact payload/standard descriptors after closing the temporary marker; the parent binds the owned log and the endpoint must match that declared set",
         "macos_mktemp": "no shell mktemp; stage and fixture use tempfile.mkdtemp(dir=explicit_owned_parent); self-check uses only a fresh child of caller TMPDIR",
     }
 
@@ -551,6 +732,8 @@ def plan_document():
             "bounds": {"wall_seconds": LIMIT_SECONDS, "scratch_mib": SCRATCH_MIB,
                        "work_stop_seconds": WORK_STOP_SECONDS, "images": 0,
                        "holder_opens": [SMALL_OPENS, LARGE_OPENS], "concurrent_holders": 1,
+                       "holder_normalization_close_attempts": 2 * (MAX_SUPPORTED_SOFT_FDS - 3),
+                       "holder_readiness_seconds": 5,
                        "inspections": 4, "total_listing_work_ceiling": 4 * 65536},
             "finite_phase_plan": [
                 "0-210 s proposed: fresh locked/offline source-bound stage through ordinary Oxide, including waits; no fit promise",
@@ -561,12 +744,322 @@ def plan_document():
             "resource_plan": {"fixture_bytes": "one small payload, two holder logs/readiness files, private empty homes; <1 MiB planned",
                               "staged_binary": "one fresh binary+manifest inside guard scratch; actual bytes recorded; no assumed build/RSS fit",
                               "compiler_storage": "ordinary Oxide pool placement, outside the guard's fixture scratch accounting; compiler temp files use guard scratch",
-                              "fds": "one holder at a time; 32 then5000 actual file opens plus three standard streams; actual total kernel count decides threshold"},
+                              "fds": "one fresh holder at a time; finite existing soft limit5064..1048576; two holders perform at most2,097,146 own nonstandard close attempts after startup, then declare actual32/5000 payload fd numbers and positive0/1/2stream facts; exact kernel set must match",
+                              "normalization_fit": "fixture setup, not product scan budget; each holder retains the existing5s readiness window; timing/fit unmeasured, no experiment or fit promise"},
             "cases": CASES, "premises": premise_dispositions(), "limitation": LIMITATION,
             "remaining_gates": ["independent exact-head source/readiness review", "separately activated adequate uncounted diagnostic",
                                 "separately activated counted author and distinct retained-reviewer kernel proofs",
                                 "final exact-head judgment and separate supervisor group closure"]}
 
+
+
+
+def holder_receiver_controls(declaration, check, problems):
+    """Drive the actual marker/log receiver and ordinary child cleanup."""
+    root = base.DESIGNATED_SCRATCH + "/effect-free-holder"
+    log_path = os.path.join(root, f"holder-{SMALL_OPENS}.log")
+    ready_path = os.path.join(root, f"holder-{SMALL_OPENS}.json")
+    for fault in (None, "nonempty_marker", "symlink_marker", "foreign_marker",
+                  "oversize_log", "wrong_log", "invalid_declared_set"):
+        candidate = json.loads(json.dumps(declaration))
+        if fault == "invalid_declared_set":
+            candidate["payload_fds"][-1] = candidate["payload_fds"][-2]
+        encoded = (json.dumps(candidate) + "\n").encode("utf-8")
+        if fault == "oversize_log":
+            encoded = b"x" * (REPORT_BYTES + 1)
+
+        class Log:
+            name = log_path
+            closes = 0
+            def fileno(self):
+                return 91
+            def close(self):
+                self.closes += 1
+        log = Log()
+
+        class Reader:
+            def __enter__(self):
+                return self
+            def read(self, size):
+                check(size == REPORT_BYTES + 1, "holder readiness log read was not exactly bounded")
+                return encoded
+            def __exit__(self, *_):
+                return False
+
+        class Input:
+            closes = 0
+            def close(self):
+                self.closes += 1
+
+        class Child:
+            pid = 42
+            stdin = Input()
+            waits = 0
+            def poll(self):
+                return None
+            def wait(self, timeout):
+                check(0 < timeout <= 5, "receiver child cleanup escaped its original guard remainder")
+                self.waits += 1
+                return 0
+        child = Child()
+        environment = {"fixture": "only"}
+        children = DirectChildren(root, environment, 102_000_000_000, 105_000_000_000)
+
+        def files(path, mode):
+            check(path == log_path, "holder receiver read or wrote outside its own log")
+            if mode == "xb":
+                return log
+            check(mode == "rb", "holder receiver used unexpected log transport flags")
+            return Reader()
+
+        marker = types.SimpleNamespace(
+            st_mode=(stat.S_IFLNK if fault == "symlink_marker" else stat.S_IFREG) | 0o600,
+            st_uid=502 if fault == "foreign_marker" else 501,
+            st_size=1 if fault == "nonempty_marker" else 0,
+        )
+        parent_log = types.SimpleNamespace(st_dev=1, st_ino=999 if fault == "wrong_log" else 22,
+                                           st_uid=501)
+        failed = None
+        with mock.patch("builtins.open", side_effect=files), \
+                mock.patch.object(subprocess, "Popen", return_value=child) as spawn, \
+                mock.patch.object(os.path, "isfile", return_value=True), \
+                mock.patch.object(os.path, "realpath", side_effect=lambda path: path), \
+                mock.patch.object(os, "lstat", return_value=marker) as marker_read, \
+                mock.patch.object(os, "fstat", return_value=parent_log), \
+                mock.patch.object(os, "geteuid", return_value=501), \
+                mock.patch.object(time, "clock_gettime_ns", return_value=100_000_000_000):
+            try:
+                observed_child, observed_log, record = start_holder(children, root, SMALL_OPENS)
+            except base.Infrastructure as error:
+                failed = error
+            if fault is None:
+                check(failed is None and observed_child is child and observed_log is log
+                      and record == declaration and child in children.children,
+                      "actual holder readiness receiver rejected its stable declaration")
+                closure = close_holder(children, observed_child, observed_log)
+                check(closure["reaped"], "valid receiver control did not ordinarily reap its holder")
+            check(spawn.call_args.args[0] == [
+                    sys.executable, SCRIPT_PATH, "--holder", str(SMALL_OPENS),
+                    os.path.join(root, "inside", "held"), ready_path],
+                  "holder receiver changed its fixed child argv")
+            bindings = spawn.call_args.kwargs
+            check(bindings["env"] is environment and bindings["cwd"] == root
+                  and bindings["stdin"] is subprocess.PIPE
+                  and bindings["stdout"] is log and bindings["stderr"] is log
+                  and bindings["close_fds"] is True,
+                  "holder receiver lost direct-child stream/environment/close_fds binding")
+            check(marker_read.call_args.args == (ready_path,),
+                  "holder receiver did not positively read its own marker")
+        check(not children.children and not children.unknown and child.stdin.closes == 1
+              and child.waits == 1 and log.closes == 1,
+              "holder receiver failure did not preserve exactly one ordinary EOF/wait cleanup")
+        if fault is not None:
+            check(failed is not None, f"holder receiver accepted injected {fault}")
+
+def holder_controls(check, problems):
+    """Actual holder body with only OS/resource/file/stream operations injected."""
+    root = base.DESIGNATED_SCRATCH + "/effect-free-holder"
+    payload_path = os.path.join(root, "inside", "held")
+    ready_path = os.path.join(root, f"holder-{SMALL_OPENS}.json")
+
+    class Fixture:
+        def __init__(self, fault=None):
+            self.fault = fault
+            self.soft = REQUIRED_SOFT_FDS
+            self.closed = []
+            self.opens = 0
+            self.marker_closed = False
+            self.flushed = False
+            self.published = False
+            self.output = ""
+            self.fds = {0: self.metadata(stat.S_IFIFO, 11),
+                        1: self.metadata(stat.S_IFREG, 22),
+                        2: self.metadata(stat.S_IFREG, 22),
+                        7: self.metadata(stat.S_IFREG, 77)}
+
+        @staticmethod
+        def metadata(kind, inode):
+            return types.SimpleNamespace(st_mode=kind | 0o600, st_dev=1,
+                                         st_ino=inode, st_uid=501)
+
+        def close(self, descriptor):
+            check(type(descriptor) is int and descriptor >= 3,
+                  "holder closure touched a standard stream or malformed fd")
+            self.closed.append(descriptor)
+            if self.fault == "baseline_close" and descriptor == 7 and not self.opens:
+                raise OSError(errno.EIO, "synthetic own-close failure")
+            if self.fault == "payload_close" and descriptor == 3 and self.published:
+                raise OSError(errno.EIO, "synthetic payload-close failure")
+            if descriptor not in self.fds:
+                raise OSError(errno.EBADF, "synthetic closed descriptor")
+            del self.fds[descriptor]
+
+        def open_payload(self, path, flags):
+            check(path == payload_path and flags == os.O_RDONLY | os.O_NOFOLLOW,
+                  "holder payload open changed its owned path or flags")
+            if not self.opens:
+                check(self.closed == list(range(3, self.soft)),
+                      "holder payload opened before its finite baseline closure completed")
+            self.opens += 1
+            if self.fault == "duplicate" and self.opens == 2:
+                return 3
+            if self.fault == "malformed":
+                return True
+            if self.fault == "out_of_range":
+                descriptor = self.soft
+            else:
+                descriptor = next(fd for fd in range(3, self.soft) if fd not in self.fds)
+            self.fds[descriptor] = self.metadata(stat.S_IFREG, 33)
+            return descriptor
+
+        def fstat(self, descriptor):
+            if self.opens:
+                check(self.marker_closed, "final holder facts preceded temporary readiness descriptor closure")
+            if (self.fault == "missing_stream" and descriptor == 0
+                    or self.fault == "missing_payload" and descriptor == 3 and self.opens):
+                raise OSError(errno.EBADF, "synthetic missing descriptor")
+            facts = self.fds[descriptor]
+            if self.marker_closed and (
+                    self.fault == "swapped_payload" and descriptor == 3
+                    or self.fault == "changed_stream" and descriptor == 1):
+                return self.metadata(stat.S_IFREG, 999)
+            return facts
+
+        def marker(self, path, mode):
+            check(path == ready_path + ".pending" and mode == "xb",
+                  "holder readiness marker escaped its exclusive owned file")
+            fixture = self
+            class Marker:
+                def __enter__(self):
+                    self.descriptor = next(fd for fd in range(3, fixture.soft) if fd not in fixture.fds)
+                    fixture.fds[self.descriptor] = fixture.metadata(stat.S_IFREG, 44)
+                    return self
+                def __exit__(self, *_):
+                    del fixture.fds[self.descriptor]
+                    fixture.marker_closed = True
+            return Marker()
+
+        def replace(self, source, destination):
+            check(source == ready_path + ".pending" and destination == ready_path
+                  and self.marker_closed and self.flushed and self.output.endswith("\n"),
+                  "holder readiness was published before descriptor closure or record flush")
+            self.published = True
+
+        def stream(self, number):
+            fixture = self
+            class Stream:
+                def fileno(self):
+                    return 2 if fixture.fault == "swapped_stream" and number == 1 else number
+                def write(self, value):
+                    check(number == 1, "holder declaration used a new output descriptor")
+                    fixture.output += value
+                    return len(value)
+                def flush(self):
+                    fixture.flushed = True
+                def read(self, count):
+                    check(number == 0 and count == 1 and fixture.published,
+                          "holder wait started before stable readiness")
+                    return b"x" if fixture.fault == "non_eof" else b""
+            stream = Stream()
+            stream.buffer = stream
+            return stream
+
+    valid_record = None
+    for fault in (None, "missing_stream", "swapped_stream", "changed_stream",
+                  "duplicate", "malformed", "out_of_range", "missing_payload",
+                  "swapped_payload", "baseline_close", "payload_close", "non_eof"):
+        fixture = Fixture(fault)
+        failure = None
+        with mock.patch.dict(os.environ, {"BARGE_LISTING_PROOF_ROOT": root, "TMPDIR": root}, clear=True), \
+                mock.patch.object(resource, "getrlimit", return_value=(fixture.soft, fixture.soft)), \
+                mock.patch.object(os.path, "realpath", side_effect=lambda path: path), \
+                mock.patch.object(os, "close", side_effect=fixture.close), \
+                mock.patch.object(os, "open", side_effect=fixture.open_payload), \
+                mock.patch.object(os, "fstat", side_effect=fixture.fstat), \
+                mock.patch.object(os, "stat", return_value=fixture.metadata(stat.S_IFREG, 33)), \
+                mock.patch.object(os, "geteuid", return_value=501), \
+                mock.patch.object(os, "getpid", return_value=42), \
+                mock.patch("builtins.open", side_effect=fixture.marker), \
+                mock.patch.object(os, "replace", side_effect=fixture.replace), \
+                mock.patch.object(sys, "stdin", fixture.stream(0)), \
+                mock.patch.object(sys, "stdout", fixture.stream(1)), \
+                mock.patch.object(sys, "stderr", fixture.stream(2)):
+            try:
+                result = holder_main(SMALL_OPENS, payload_path, ready_path)
+            except (base.Infrastructure, OSError) as error:
+                failure = error
+        if fault is None:
+            check(failure is None and result == 0 and fixture.published,
+                  "actual deterministic holder construction failed")
+            check(fixture.closed[:fixture.soft - 3] == list(range(3, fixture.soft)),
+                  "holder did not close its exact finite own nonstandard range")
+            check(set(fixture.fds) == {0, 1, 2}, "holder payload closure left undeclared descriptors")
+            valid_record = json.loads(fixture.output)
+            validate_ready(valid_record, 42, 501, SMALL_OPENS, fixture.metadata(stat.S_IFREG, 22))
+        else:
+            check(failure is not None, f"holder construction accepted injected {fault}")
+            check(fixture.published is (fault in ("payload_close", "non_eof")),
+                  f"holder published readiness despite injected {fault}")
+
+    for soft in (64, resource.RLIM_INFINITY, MAX_SUPPORTED_SOFT_FDS + 1, True):
+        with mock.patch.object(resource, "getrlimit", return_value=(soft, soft)):
+            check(not own_limit()["execution_ready"], "unsupported/infinite existing own limit was accepted")
+    for soft in (REQUIRED_SOFT_FDS, MAX_SUPPORTED_SOFT_FDS):
+        with mock.patch.object(resource, "getrlimit", return_value=(soft, soft)):
+            check(own_limit()["execution_ready"], "supported finite own limit was rejected")
+    for hard in (REQUIRED_SOFT_FDS - 1, None, "unknown"):
+        with mock.patch.object(resource, "getrlimit", return_value=(REQUIRED_SOFT_FDS, hard)):
+            limits = own_limit()
+            check(not limits["execution_ready"] and "hard limit" in limits["missing_prerequisite"],
+                  "an inconsistent/unknown hard limit was misreported as a soft-limit range failure")
+    for error in (OSError(errno.EIO, "synthetic missing limit"), ValueError("synthetic invalid limit")):
+        with mock.patch.object(resource, "getrlimit", side_effect=error):
+            limits = own_limit()
+            check(not limits["execution_ready"] and limits["soft"] is None
+                  and "unreadable" in limits["missing_prerequisite"],
+                  "unreadable own limit did not produce an exact readiness refusal")
+    if valid_record is None:
+        # No fabricated passing declaration can rescue a failed body control.
+        raise AssertionError("the actual holder body produced no valid declaration")
+    malformed_records = []
+    for change in ("missing", "duplicate", "out_of_range", "malformed", "swapped", "log"):
+        candidate = json.loads(json.dumps(valid_record))
+        if change == "missing":
+            del candidate["standard_fds"]
+        elif change == "duplicate":
+            candidate["payload_fds"][-1] = candidate["payload_fds"][-2]
+        elif change == "out_of_range":
+            candidate["payload_fds"][-1] = candidate["soft_limit"]
+        elif change == "malformed":
+            candidate["payload_fds"][-1] = "not a descriptor"
+        elif change == "swapped":
+            candidate["standard_fds"][0], candidate["standard_fds"][1] = (
+                candidate["standard_fds"][1], candidate["standard_fds"][0])
+        else:
+            candidate["standard_fds"][1]["inode"] += 1
+        malformed_records.append(candidate)
+    for candidate in malformed_records:
+        try:
+            validate_ready(candidate, 42, 501, SMALL_OPENS, Fixture.metadata(stat.S_IFREG, 22))
+        except base.Infrastructure:
+            pass
+        else:
+            problems.append("malformed or swapped actual holder readiness declaration was accepted")
+    for bindings in ((43, 501, SMALL_OPENS), (42, 502, SMALL_OPENS), (42, 501, LARGE_OPENS)):
+        try:
+            validate_ready(valid_record, *bindings, Fixture.metadata(stat.S_IFREG, 22))
+        except base.Infrastructure:
+            pass
+        else:
+            problems.append("holder readiness lost its PID/effective UID/opened-count binding")
+    try:
+        validate_ready(valid_record, 42, 501, SMALL_OPENS, Fixture.metadata(stat.S_IFREG, 999))
+    except base.Infrastructure:
+        pass
+    else:
+        problems.append("holder readiness accepted another stdout/stderr log")
+    holder_receiver_controls(valid_record, check, problems)
+    return valid_record
 
 def self_check():
     """Tiny synthetic files/fake external executors drive the actual apparatus."""
@@ -574,6 +1067,7 @@ def self_check():
     def check(condition, description):
         if not condition:
             problems.append(description)
+    small_holder = holder_controls(check, problems)
     check(base.SUPERVISOR_SHA256 == "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b", "supervisor pin drift")
     problems += base.installed_supervisor_problems()
     env = driver_environment({"HOME": "/original", "PATH": "/bin", "OXIDE_POOL": "host",
@@ -650,16 +1144,44 @@ def self_check():
         else:
             problems.append("unknown holder closure accepted")
     identity = {"pid": 42, "start": 12, "effective_uid": 501}
-    holder = {"pid": 42, "uid": 501, "opened": LARGE_OPENS}
+    holder = json.loads(json.dumps(small_holder))
+    holder.update(opened=LARGE_OPENS, payload_fds=list(range(3, LARGE_OPENS + 3)))
+    declared_fds = holder_declarations(holder)
     report = {"identity": identity, "outcome": "complete", "final_count": 5003,
               "capacity": 8192, "returned_row_work": 9099, "limit_ms": 10000,
               "custody": "safe_sample", "open_count": 0,
+              "fd_numbers": declared_fds, "fd_type_counts": [[1, 5002], [6, 1]],
+              "matching_fd_numbers": [],
               "attempts": [{"capacity": cap, "rows": rows, "identity_before": identity, "identity_after": identity}
                            for cap, rows in [(4096, 4096), (8192, 5003)]]}
     check(check_report(CASES[1], report, holder)[0], "actual endpoint oracle rejected valid growth")
     check(not check_report(CASES[2], report, holder)[0], "outside sample laundered held-writer refusal")
+    # Keep the same complete inventory/declaration while changing only the
+    # actual growth transcript. No inventory count can replace these bounds.
+    one_attempt = json.loads(json.dumps(report))
+    one_attempt["attempts"] = [one_attempt["attempts"][-1]]
+    one_attempt["returned_row_work"] = one_attempt["final_count"]
+    wrong_growth_capacity = json.loads(json.dumps(report))
+    wrong_growth_capacity["attempts"][-1]["capacity"] = 8193
+    wrong_growth_capacity["capacity"] = 8193
+    short_first_attempt = json.loads(json.dumps(report))
+    short_first_attempt["attempts"][0]["rows"] = 4095
+    short_first_attempt["returned_row_work"] = 9098
+    for adverse_growth in (one_attempt, wrong_growth_capacity, short_first_attempt):
+        check(not check_report(CASES[1], adverse_growth, holder)[0],
+              "the exact inventory replaced the original fixed growth assertion")
+    excessive_attempts = json.loads(json.dumps(report))
+    excessive_attempts["attempts"] = [excessive_attempts["attempts"][0]] * 5
+    excessive_attempts["returned_row_work"] = 5 * 4096
+    try:
+        check_report(CASES[1], excessive_attempts, holder)
+    except base.Infrastructure:
+        pass
+    else:
+        problems.append("more than four actual listing attempts did not fatally refuse")
     budget_report = dict(report, outcome="bounded", reason="descriptor work", custody="unknown",
                          returned_row_work=4096, final_count=0, capacity=0,
+                         fd_numbers=None, fd_type_counts=None,
                          attempts=[report["attempts"][0]])
     check(check_report(CASES[-1], budget_report, holder)[0], "actual row-bound oracle rejected exact work exhaustion")
     for candidate_case, candidate, expected_kind in (
@@ -683,6 +1205,43 @@ def self_check():
         pass
     else:
         problems.append("discarded full prefix was not charged by report oracle")
+    inside_report = dict(report, custody="unsafe", open_count=LARGE_OPENS,
+                         matching_fd_numbers=holder["payload_fds"])
+    check(check_report(CASES[2], inside_report, holder, identity)[0],
+          "the actual held-payload set did not support the fixed inside refusal")
+    swapped_match = dict(inside_report, matching_fd_numbers=[0] + holder["payload_fds"][1:])
+    check(not check_report(CASES[2], swapped_match, holder, identity)[0],
+          "matching count alone replaced the exact held-payload set")
+    extra_report = json.loads(json.dumps(report))
+    extra_report["fd_numbers"].append(LARGE_OPENS + 3)
+    extra_report["final_count"] += 1
+    extra_report["attempts"][-1]["rows"] += 1
+    extra_report["returned_row_work"] += 1
+    extra_report["fd_type_counts"][0][1] += 1
+    check(not check_report(CASES[1], extra_report, holder)[0],
+          "an extra descriptor was filtered or accepted through a relaxed total")
+    # Equal cardinality is not set identity: replacing a single declared or
+    # observed fd must fail even when count/type/work/growth remain valid.
+    swapped_inventory = dict(report, fd_numbers=declared_fds[:-1] + [LARGE_OPENS + 3])
+    check(not check_report(CASES[1], swapped_inventory, holder)[0],
+          "equal-sized but swapped observed set was reduced to a count oracle")
+    swapped_declaration = json.loads(json.dumps(holder))
+    swapped_declaration["payload_fds"][-1] = LARGE_OPENS + 3
+    check(not check_report(CASES[1], report, swapped_declaration)[0],
+          "equal-sized but swapped declaration was reduced to a count oracle")
+    for malformed_report in (
+            dict(report, fd_numbers=declared_fds[:-1] + [declared_fds[-2]]),
+            dict(report, fd_numbers=declared_fds[:-1] + [holder["soft_limit"]]),
+            dict(report, fd_numbers=declared_fds[:-1] + ["malformed"]),
+            dict(report, fd_type_counts=[[1, 5002], [1, 1]]),
+            dict(report, fd_type_counts=[[1, 5001], [6, 1]]),
+            dict(report, matching_fd_numbers=[holder["soft_limit"]], open_count=1)):
+        try:
+            check_report(CASES[1], malformed_report, holder)
+        except base.Infrastructure:
+            pass
+        else:
+            problems.append("malformed descriptor inventory/type/matching declarations were accepted")
     # Drive the actual endpoint-command adapter through the actual imported
     # direct-child helper. Only the external executable is faked.
     child = FakeChild()

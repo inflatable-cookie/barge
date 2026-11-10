@@ -69,8 +69,9 @@ guarded exception. Each selector covers what it names:
   For fixture-bound runs, set `BARGE_TEST_SCRATCH_ROOT` and `TMPDIR`/`TMP`/`TEMP`
   to the same fresh Stash scratch directory; compiler output stays in Oxide's pool.
 - `effigy rust:test:listing` — focused actual shared-helper and macOS adapter
-  controls; `rust:test:listing:proof` exercises the feature-gated endpoint's
-  fixture/argument refusals without a process read or native proof.
+  controls; `rust:compile:listing:proof` checks the driver with only its proof
+  feature. `rust:test:listing:proof` exercises the endpoint's fixture/argument
+  refusals and lossless bounded reporting without a process read or native proof.
 - `effigy os:volumes:probe` — the read-only OS-layer diagnostic:
   `BARGE_OS_PROBE_PATH` names one directory on a volume, whose facts are read
   and then verified against that identity; nothing is written. Evidence, not a

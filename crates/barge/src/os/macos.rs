@@ -202,6 +202,9 @@ impl MacOs {
         let mut final_count = 0usize;
         let mut capacity = 0usize;
         let mut reason = None;
+        let mut fd_numbers = None;
+        let mut fd_type_counts = None;
+        let mut matching_fd_numbers = Vec::new();
         let outcome = match self.list_descriptors(identity, &mut budget, None, &mut []) {
             DescriptorListing::Complete {
                 identity: verified,
@@ -210,6 +213,17 @@ impl MacOs {
             } => {
                 capacity = final_capacity;
                 final_count = fds.len();
+                let inventory = listing_proof_fd_inventory(&fds)?;
+                fd_numbers = Some(inventory.numbers);
+                fd_type_counts = Some(inventory.type_counts);
+                matching_fd_numbers
+                    .try_reserve_exact(fds.len())
+                    .map_err(|error| {
+                        Error::new(
+                            ErrorKind::ResourceBound,
+                            format!("proof matching-fd allocation failed: {error}"),
+                        )
+                    })?;
                 let mut vnode_index = 0usize;
                 let mut failure = None;
                 for fd in fds {
@@ -228,7 +242,10 @@ impl MacOs {
                         &RETRY_BACKOFFS,
                         &mut [],
                     ) {
-                        Observed::Path(path) if path_is_at_or_under(&path, root) => open_count += 1,
+                        Observed::Path(path) if path_is_at_or_under(&path, root) => {
+                            open_count += 1;
+                            matching_fd_numbers.push(fd.proc_fd);
+                        }
                         Observed::Path(_) | Observed::Closed | Observed::Dead(_) => {}
                         Observed::Opaque => {
                             failure = Some("hidden descriptor in targeted proof".to_owned());
@@ -280,14 +297,24 @@ impl MacOs {
             "capacity": attempt.capacity, "rows": attempt.rows, "outcome": attempt.outcome,
             "identity_before": encode_identity(attempt.before), "identity_after": attempt.after.map(encode_identity),
         })).collect();
-        Ok(serde_json::json!({
+        let report = serde_json::json!({
             "schema": "barge.proof.descriptor-listing/1", "outcome": outcome, "reason": reason,
             "identity": encode_identity(identity), "final_count": final_count, "capacity": capacity,
             "returned_row_work": allowance - budget.remaining, "attempts": attempts,
             "open_count": open_count, "limit_ms": budget.timeout.as_millis(),
+            "fd_numbers": fd_numbers, "fd_type_counts": fd_type_counts,
+            "matching_fd_numbers": matching_fd_numbers,
             "custody": if outcome != "complete" { "unknown" } else if open_count > 0 { "unsafe" } else { "safe_sample" },
             "whole_host_custody": false,
-        }))
+        });
+        listing_proof_report_bound(&report)?;
+        if outcome == "complete" && budget.expired() {
+            return Err(Error::new(
+                ErrorKind::ResourceBound,
+                "proof listing deadline expired while reporting",
+            ));
+        }
+        Ok(report)
     }
 
     /// The platform implementation behind the `os` traits.
@@ -2343,6 +2370,74 @@ impl MacOs {
         }
         listing
     }
+}
+
+#[cfg(feature = "proof-descriptor-listing")]
+#[derive(Debug)]
+struct ListingProofInventory {
+    numbers: Vec<i32>,
+    type_counts: Vec<(u32, usize)>,
+}
+
+/// Lossless final-listing metadata for the targeted proof only. No discarded
+/// prefix is substituted for a complete set, and unknown fd types stay visible.
+#[cfg(feature = "proof-descriptor-listing")]
+fn listing_proof_fd_inventory(fds: &[libc::proc_fdinfo]) -> Result<ListingProofInventory> {
+    if fds.len() > descriptor_listing::MAX_ROWS {
+        return Err(Error::new(
+            ErrorKind::ResourceBound,
+            "proof fd inventory exceeds the original row ceiling",
+        ));
+    }
+    let mut numbers = Vec::new();
+    numbers.try_reserve_exact(fds.len()).map_err(|error| {
+        Error::new(
+            ErrorKind::ResourceBound,
+            format!("proof fd inventory allocation failed: {error}"),
+        )
+    })?;
+    let mut types = std::collections::BTreeMap::new();
+    for fd in fds {
+        if fd.proc_fd < 0
+            || numbers
+                .last()
+                .is_some_and(|previous| *previous >= fd.proc_fd)
+        {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "proof fd inventory is not a valid sorted unique set",
+            ));
+        }
+        numbers.push(fd.proc_fd);
+        *types.entry(fd.proc_fdtype).or_insert(0usize) += 1;
+    }
+    Ok(ListingProofInventory {
+        numbers,
+        type_counts: types.into_iter().collect(),
+    })
+}
+
+/// The driver emits one compact JSON document and one newline. Exceeding the
+/// existing 64 KiB endpoint ceiling refuses; no fd or type row is trimmed.
+#[cfg(feature = "proof-descriptor-listing")]
+fn listing_proof_report_bound(report: &serde_json::Value) -> Result<()> {
+    let bytes = serde_json::to_vec(report).map_err(|error| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!("proof listing report is unreadable: {error}"),
+        )
+    })?;
+    if bytes
+        .len()
+        .checked_add(1)
+        .is_none_or(|length| length > 65_536)
+    {
+        return Err(Error::new(
+            ErrorKind::ResourceBound,
+            "proof listing report exceeds 64 KiB",
+        ));
+    }
+    Ok(())
 }
 
 /// Proof-only routing guard, before any process read. The native entry owns
