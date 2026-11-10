@@ -1958,6 +1958,16 @@ impl MacOs {
                             faults,
                             "around the descriptor re-listing",
                         );
+                        if let Err(reason) = identity {
+                            return Observed::Unreadable(reason);
+                        }
+                        if local_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                            return Observed::Unreadable(dead_window_closed(
+                                pid,
+                                descriptor,
+                                classified.start,
+                            ));
+                        }
                         if started.elapsed() >= timeout {
                             return Observed::Bounded("time");
                         }

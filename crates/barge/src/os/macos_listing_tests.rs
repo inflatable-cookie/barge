@@ -60,6 +60,30 @@ fn closed() -> StatedVnodeRead {
 }
 
 #[test]
+fn a_dead_to_closed_pair_cannot_reset_its_original_local_window() {
+    let identity = self_identity();
+    let mut budget =
+        ScanBudget::new(Instant::now(), 10, Duration::from_secs(10)).expect("original scan budget");
+    let mut faults = [StatedListing {
+        pid: identity.pid,
+        ..StatedListing::default()
+    }];
+    let answer = MacOs.settle_pair(
+        identity,
+        0,
+        0,
+        &mut budget,
+        &[],
+        &mut faults,
+        SettleFrom::ClosedAfterDead,
+        Some(Instant::now()),
+    );
+    assert!(matches!(answer, Observed::Unreadable(reason) if reason.contains("window")));
+    assert_eq!(budget.remaining, 10);
+    assert_eq!(faults[0].list_calls, 0);
+}
+
+#[test]
 fn initial_listing_refuses_zero_and_exact_full_but_accepts_short() {
     let identity = self_identity();
     let root = scratch();
