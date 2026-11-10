@@ -30,7 +30,7 @@ use std::process::ExitCode;
 use barge::area::{self, OutputsGrant, PrunePolicy};
 use barge::digest::sha256_hex;
 use barge::error::ErrorKind;
-use barge::os::{platform, DirOps, ProcessObserver, VolumeUuid};
+use barge::os::{platform, AbsenceVolume, AncestorExpected, DirOps, ProcessObserver, VolumeUuid};
 use barge::oxide_outputs::{
     self, AbsenceLookup, AdapterBounds, AdapterCall, BargeLookup, DelegatedRequest, LiveIntent,
     Outcome, OutcomeKind, AREA_NAME, AREA_NAMESPACE, LIVE_PHASE,
@@ -57,12 +57,6 @@ const INTENT_ID: &str = "ddd0ddd0ddd0ddd0ddd0ddd0ddd0ddd0";
 const HOLD_LONGER_THAN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(7);
 /// The root's name inside the outputs folder, for every case.
 const ROOT_NAME: &str = "root-one";
-/// The boot-volume prefix of the never-created checkout path every fixture
-/// names. A mount-parent path would be refused by the reviewed F2 rule, whose
-/// volume the intent identity does not carry; /private/var/tmp sits on the
-/// boot Data volume, so the absence proof walks real ancestors to an ENOENT
-/// leaf and answers absent.
-const CHECKOUT_PATH_PREFIX: &str = "/private/var/tmp/barge-proof-checkout-";
 
 fn main() -> ExitCode {
     let mut arguments = std::env::args().skip(1);
@@ -116,7 +110,7 @@ fn bindings() -> Result<Bindings, String> {
 
 fn run_case(case: &str) -> Result<(), String> {
     let bindings = bindings()?;
-    let fixture = Fixture::prepare(&bindings)?;
+    let mut fixture = Fixture::prepare(&bindings)?;
     match case {
         "A1" => case_positive_deletion(&fixture),
         "A2" => case_withdrawn_grant_refuses(&fixture),
@@ -134,6 +128,8 @@ fn run_case(case: &str) -> Result<(), String> {
         "A14" => case_routed_deletion(&fixture),
         "A15" => case_route_refusals(&fixture),
         "A16" => case_absence_only(&fixture),
+        "A17" => case_mounted_checkout(&mut fixture),
+        "A18" => case_mounted_replay(&fixture),
         other => Err(format!("`{other}` is not a case this driver runs")),
     }
 }
@@ -150,6 +146,7 @@ struct Fixture {
     device: u64,
     checkout: PathBuf,
     volume_uuid: VolumeUuid,
+    checkout_volume_uuid: VolumeUuid,
     volume_record: VolumeRecord,
     declaration: area::AreaDeclaration,
 }
@@ -214,16 +211,30 @@ impl Fixture {
             .map_err(|error| format!("the root is not created: {error}"))?;
         std::fs::write(root_path.join("payload.txt"), b"outputs")
             .map_err(|error| format!("the payload is not written: {error}"))?;
-        // The checkout is the consumer path whose absence the covered class
-        // requires. It is named under the boot volume - never under a mount
-        // parent, whose volume the intent identity does not carry - and it is
-        // never created, so the absence proof walks real ancestors to an
-        // ENOENT leaf. One name per case process.
-        let checkout = PathBuf::from(format!("{CHECKOUT_PATH_PREFIX}{}", std::process::id()));
+        // The checkout is an absent leaf in this run's private Stash home.
+        // Its UUID comes from the actual held ancestor descriptor, independently
+        // of the owned image that carries the output root.
+        let checkout_parent = bindings.home.join("checkouts");
+        std::fs::create_dir(&checkout_parent).map_err(|e| e.to_string())?;
+        let checkout = checkout_parent.join("checkout");
+        let checkout_volume_uuid = platform
+            .identify_directory(
+                &platform
+                    .open_path(&checkout_parent)
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+            .volume_uuid
+            .ok_or("the checkout ancestor reports no UUID")?;
         let marker = format!(
-            r#"{{"version":"{OXIDE_MARKER_V2}","checkout":"{}","checkout_id":"{CHECKOUT_ID}","label":"dev","recipe":"target-debug-v1","kind":"external","volume_uuid":"{}","nonce":"{NONCE}","generation":1,"created_ms":1000}}"#,
+            r#"{{"version":"{OXIDE_MARKER_V2}","checkout":"{}","checkout_id":"{CHECKOUT_ID}","label":"dev","recipe":"target-debug-v1","kind":"external","volume_uuid":"{}","checkout_volume_uuid":"{}","nonce":"{NONCE}","generation":1,"created_ms":1000}}"#,
             checkout.display(),
             bindings.volume_uuid,
+            checkout_volume_uuid,
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"checkout": checkout, "expected_checkout_uuid": checkout_volume_uuid.as_str(), "actual_output_uuid": bindings.volume_uuid.as_str(), "absence": "leaf not created"})
         );
         let marker_digest = sha256_hex(marker.as_bytes());
         std::fs::write(root_path.join(barge::reference::OXIDE_MARKER_FILE), &marker)
@@ -248,6 +259,7 @@ impl Fixture {
             device: device.get(),
             checkout,
             volume_uuid: bindings.volume_uuid.clone(),
+            checkout_volume_uuid,
             volume_record,
             declaration,
         })
@@ -477,7 +489,7 @@ impl Fixture {
             captures: Vec::new(),
             foreign_captures: Vec::new(),
             identity: None,
-            absence: None,
+            absence: Some(self.checkout_absence()?),
             caller_intent_id: Some(caller_id.to_owned()),
             caller_request_digest: Some(
                 Fixture::request()
@@ -503,6 +515,31 @@ impl Fixture {
                 .map_err(|error| format!("the phase does not advance: {error}"))?;
         }
         Ok(published)
+    }
+
+    /// The actual platform proof that a pending fixture must retain for replay.
+    fn checkout_absence(&self) -> Result<barge::release::AbsenceEvidence, String> {
+        let platform = platform();
+        let prefix = platform
+            .volume_prefix(&self.checkout)
+            .ok_or("the native checkout is not under a mount parent")?;
+        let proof = barge::os::prove_absence(
+            &platform,
+            &platform,
+            &self.checkout,
+            AncestorExpected::Registered {
+                uuid: &self.checkout_volume_uuid,
+                recorded_mount: &prefix,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        if proof.verdict() != "absent" {
+            return Err(format!(
+                "the native checkout premise is not absent: {proof:?}"
+            ));
+        }
+        serde_json::from_value(serde_json::to_value(proof).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())
     }
 
     fn declare_without_grant(&self) -> Result<(), String> {
@@ -1116,6 +1153,178 @@ fn case_absence_only(fixture: &Fixture) -> Result<(), String> {
         || !fixture.root_path.join("payload.txt").exists()
     {
         return Err("absence-only changed the journal or root".to_owned());
+    }
+    Ok(())
+}
+
+/// Reach deciding F2 with digest-bound marker substitutions on the real volumes.
+fn case_mounted_checkout(fixture: &mut Fixture) -> Result<(), String> {
+    let marker_path = fixture.root_path.join(barge::reference::OXIDE_MARKER_FILE);
+    let original = std::fs::read(&marker_path).map_err(|e| e.to_string())?;
+    let marker: serde_json::Value = serde_json::from_slice(&original).map_err(|e| e.to_string())?;
+    if fixture.checkout_volume_uuid == fixture.volume_uuid {
+        return Err(
+            "the Stash checkout and owned image unexpectedly have the same UUID".to_owned(),
+        );
+    }
+    for replacement in [
+        serde_json::Value::Null,
+        serde_json::json!("bad"),
+        serde_json::json!(fixture.volume_uuid.as_str()),
+    ] {
+        let mut changed = marker.clone();
+        if replacement.is_null() {
+            changed
+                .as_object_mut()
+                .ok_or("marker is not an object")?
+                .remove("checkout_volume_uuid");
+        } else {
+            changed["checkout_volume_uuid"] = replacement;
+        }
+        eprintln!(
+            "{}",
+            serde_json::json!({"checkout": fixture.checkout, "actual_checkout_uuid": fixture.checkout_volume_uuid.as_str(), "recorded_checkout_uuid": changed.get("checkout_volume_uuid"), "digest_rebound": true})
+        );
+        let bytes = serde_json::to_vec(&changed).map_err(|e| e.to_string())?;
+        std::fs::write(&marker_path, &bytes).map_err(|e| e.to_string())?;
+        fixture.marker_digest = sha256_hex(&bytes);
+        fixture.covered(CALLER_ID)?;
+        let outcome = fixture.call(&fixture.live_intent(CALLER_ID), &Fixture::request())?;
+        if !matches!(outcome.kind, OutcomeKind::Refused | OutcomeKind::Unknown)
+            || std::fs::read(&marker_path).map_err(|e| e.to_string())? != bytes
+            || std::fs::read(fixture.root_path.join("payload.txt")).map_err(|e| e.to_string())?
+                != b"outputs"
+            || !state::read_intents(&fixture.state, barge::contract::INTENT_ROWS)
+                .map_err(|e| e.to_string())?
+                .records
+                .is_empty()
+        {
+            return Err(format!(
+                "a digest-bound invalid checkout UUID changed bytes or journal: {outcome:?}"
+            ));
+        }
+    }
+    std::fs::write(&marker_path, &original).map_err(|e| e.to_string())?;
+    fixture.marker_digest = sha256_hex(&original);
+    fixture.covered(CALLER_ID)?;
+    let outcome = fixture.call(&fixture.live_intent(CALLER_ID), &Fixture::request())?;
+    if outcome.kind != OutcomeKind::Deleted || fixture.root_path.exists() {
+        return Err(format!(
+            "the actual matching registered checkout volume did not reach deletion: {outcome:?}"
+        ));
+    }
+    let record = fixture.record(
+        outcome
+            .intent_id
+            .as_deref()
+            .ok_or("deletion has no journal id")?,
+    )?;
+    if record
+        .absence
+        .as_ref()
+        .and_then(|a| a.ancestor.as_ref())
+        .map(|a| a.volume.volume_uuid.as_str())
+        != Some(fixture.checkout_volume_uuid.as_str())
+    {
+        return Err("the deletion did not retain the actual checkout UUID".to_owned());
+    }
+    Ok(())
+}
+
+/// Replay after marker removal must use the retained real absence premise.
+fn case_mounted_replay(fixture: &Fixture) -> Result<(), String> {
+    fixture.covered(CALLER_ID)?;
+    let record = fixture.publish_record(INTENT_ID, CALLER_ID, IntentPhase::MarkerLast)?;
+    let quarantine = fixture.outputs.join(&record.unit.capture_name);
+    std::fs::rename(&fixture.root_path, &quarantine).map_err(|e| e.to_string())?;
+    std::fs::remove_file(quarantine.join("payload.txt")).map_err(|e| e.to_string())?;
+    std::fs::remove_file(quarantine.join(barge::reference::OXIDE_MARKER_FILE))
+        .map_err(|e| e.to_string())?;
+    let path = state::intent_path(&fixture.state, INTENT_ID).map_err(|e| e.to_string())?;
+    let original = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let document: serde_json::Value =
+        serde_json::from_slice(&original).map_err(|e| e.to_string())?;
+    for missing in [true, false] {
+        let mut changed = document.clone();
+        if missing {
+            changed
+                .as_object_mut()
+                .ok_or("journal is not an object")?
+                .remove("absence");
+        } else {
+            changed["absence"]["ancestor"]["volume"]["volume_uuid"] =
+                serde_json::json!(fixture.volume_uuid.as_str());
+        }
+        eprintln!(
+            "{}",
+            serde_json::json!({"checkout": fixture.checkout, "actual_checkout_uuid": fixture.checkout_volume_uuid.as_str(), "saved_evidence": changed.get("absence"), "case": "A18"})
+        );
+        let bytes = serde_json::to_vec(&changed).map_err(|e| e.to_string())?;
+        std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+        let outcome = fixture.call(&fixture.live_intent(CALLER_ID), &Fixture::request())?;
+        if !matches!(outcome.kind, OutcomeKind::Pending | OutcomeKind::Unknown)
+            || std::fs::read(&path).map_err(|e| e.to_string())? != bytes
+            || !quarantine.is_dir()
+        {
+            return Err(format!(
+                "replay without its matching saved volume changed bytes or phase: {outcome:?}"
+            ));
+        }
+    }
+    std::fs::write(&path, &original).map_err(|e| e.to_string())?;
+    // Change the actual nearest ancestor without substituting a volume fact.
+    // Both directories are created by this case, on the same verified Stash
+    // volume; preserving the old inode beside its replacement makes reuse
+    // impossible. Neither retained directory is deleted.
+    let platform = platform();
+    let parent = fixture.checkout.parent().ok_or("checkout has no parent")?;
+    let saved_parent = fixture.home.join("checkouts-original");
+    let displaced_parent = fixture.home.join("checkouts-replacement");
+    let before = platform.open_path(parent).map_err(|e| e.to_string())?;
+    let before_volume = platform
+        .identify_directory(&before)
+        .map_err(|e| e.to_string())?;
+    std::fs::rename(parent, &saved_parent).map_err(|e| e.to_string())?;
+    std::fs::create_dir(parent).map_err(|e| e.to_string())?;
+    let after = platform.open_path(parent).map_err(|e| e.to_string())?;
+    let after_volume = platform
+        .identify_directory(&after)
+        .map_err(|e| e.to_string())?;
+    if before.identity().inode == after.identity().inode
+        || before_volume.volume_uuid != Some(fixture.checkout_volume_uuid.clone())
+        || after_volume.volume_uuid != before_volume.volume_uuid
+    {
+        return Err("the actual changed-ancestor premise was not established".to_owned());
+    }
+    eprintln!(
+        "{}",
+        serde_json::json!({"case": "A18", "checkout": fixture.checkout, "expected_ancestor_inode": before.identity().inode, "actual_ancestor_inode": after.identity().inode, "expected_uuid": fixture.checkout_volume_uuid.as_str(), "actual_uuid": after_volume.volume_uuid.as_ref().map(VolumeUuid::as_str)})
+    );
+    let outcome = fixture.call(&fixture.live_intent(CALLER_ID), &Fixture::request())?;
+    if outcome.kind != OutcomeKind::Pending
+        || std::fs::read(&path).map_err(|e| e.to_string())? != original
+        || !quarantine.is_dir()
+        || std::fs::read_dir(&quarantine)
+            .map_err(|e| e.to_string())?
+            .next()
+            .is_some()
+    {
+        return Err(format!(
+            "actual changed-ancestor replay changed journal or empty capture: {outcome:?}"
+        ));
+    }
+    drop(after);
+    drop(before);
+    std::fs::rename(parent, &displaced_parent).map_err(|e| e.to_string())?;
+    std::fs::rename(&saved_parent, parent).map_err(|e| e.to_string())?;
+    let outcome = fixture.call(&fixture.live_intent(CALLER_ID), &Fixture::request())?;
+    if outcome.kind != OutcomeKind::Deleted
+        || quarantine.exists()
+        || fixture.record(INTENT_ID)?.phase != IntentPhase::Deleted
+    {
+        return Err(format!(
+            "marker-removed replay with actual matching volume did not settle: {outcome:?}"
+        ));
     }
     Ok(())
 }

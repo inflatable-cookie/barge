@@ -1637,6 +1637,7 @@ fn run(
                         &area_plan.policy,
                         request.now_ms,
                     )
+                    .map(|()| None)
                 };
                 match delete::delete_unit_authorized(
                     state_paths,

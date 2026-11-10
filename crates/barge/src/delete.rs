@@ -374,7 +374,10 @@ pub fn delete_unit_on_volume(
     )
 }
 
-type EligibilityCheck<'a> = dyn Fn(&registry::VolumeRecord) -> Result<()> + 'a;
+// An effect-time check may return the absence it actually established. Carry
+// that proof into the same journal write; ordinary gates keep supplied evidence.
+type EligibilityCheck<'a> =
+    dyn Fn(&registry::VolumeRecord) -> Result<Option<crate::evidence::AbsenceEvidence>> + 'a;
 
 /// Who may act on a unit of the `oxide_outputs` family.
 ///
@@ -637,9 +640,10 @@ fn delete_unit_locked(
         .with_detail("volume_uuid", record.volume_uuid.as_str().into()));
     }
     record.declared_durability()?;
-    if let Some(authorize) = authorize {
-        authorize(&record)?;
-    }
+    let deciding_absence = match authorize {
+        Some(authorize) => authorize(&record)?,
+        None => None,
+    };
     let Some((area_path, area_handle)) = area::open_folder_by(
         lookup,
         dirs,
@@ -716,7 +720,7 @@ fn delete_unit_locked(
         captures: Vec::new(),
         foreign_captures: Vec::new(),
         identity: intent_evidence.identity.clone(),
-        absence: intent_evidence.absence.clone(),
+        absence: deciding_absence.or_else(|| intent_evidence.absence.clone()),
         caller_intent_id: intent_evidence
             .caller
             .as_ref()
