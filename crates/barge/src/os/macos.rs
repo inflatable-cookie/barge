@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use super::descriptor_listing::{self, Listing as DescriptorListing, ScanBudget};
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::facts::{
     AccountFacts, BlindSpotEvidence, ChildEntry, ChildListing, ChildRemoval, DeadHandle,
@@ -74,11 +75,6 @@ const CS_OPS_STATUS: libc::c_uint = 0;
 /// binaries carry. It is the one fact that explains a hidden descriptor path
 /// (Tom, 2026-10-26, decision e528a712).
 const CS_PLATFORM_BINARY: u32 = 0x0400_0000;
-
-/// How many descriptors one process may hold before the scan is bounded: the
-/// platform's own open-file limit is far below this, so reaching it means the
-/// observation cannot be complete.
-const SCAN_DESCRIPTORS_PER_PROCESS: usize = 4096;
 
 /// The backoff before each re-observation: of one process whose descriptor
 /// listing answered `EPERM`, and of one dead-handle candidate. The settle is
@@ -166,6 +162,134 @@ struct VnodeFdInfo {
 pub struct MacOs;
 
 impl MacOs {
+    /// A targeted proof-only sample of the actual shared listing and per-fd
+    /// observation. It grants no custody capability and never substitutes a
+    /// filtered process table into the production observer.
+    #[cfg(feature = "proof-descriptor-listing")]
+    pub fn proof_descriptor_listing(
+        &self,
+        pid: u32,
+        root: &Path,
+        max_rows: usize,
+        remaining_ms: u64,
+    ) -> Result<serde_json::Value> {
+        let started = Instant::now();
+        listing_proof_context(pid, root)?;
+        if descriptor_listing::arguments(pid, 1).is_none() || !root.is_absolute() {
+            return Err(Error::new(
+                ErrorKind::Usage,
+                "proof listing needs a positive PID and absolute root",
+            ));
+        }
+        let identity = kinfo_process(pid)?
+            .ok_or_else(|| Error::new(ErrorKind::UnknownState, "proof child is gone"))?
+            .identity;
+        if identity.effective_uid != Some(self.effective_uid()?) {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "proof child is not positively this account's process",
+            ));
+        }
+        let mut budget = ScanBudget::new(started, max_rows, Duration::from_millis(remaining_ms))
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::UnknownState,
+                    "proof listing deadline is not representable",
+                )
+            })?;
+        let allowance = budget.remaining;
+        let mut open_count = 0usize;
+        let mut final_count = 0usize;
+        let mut capacity = 0usize;
+        let mut reason = None;
+        let outcome = match self.list_descriptors(identity, &mut budget, None, &mut []) {
+            DescriptorListing::Complete {
+                identity: verified,
+                fds,
+                capacity: final_capacity,
+            } => {
+                capacity = final_capacity;
+                final_count = fds.len();
+                let mut vnode_index = 0usize;
+                let mut failure = None;
+                for fd in fds {
+                    if budget.expired() {
+                        failure = Some("time".to_owned());
+                        break;
+                    }
+                    if libc::c_int::try_from(fd.proc_fdtype).ok() != Some(libc::PROX_FDTYPE_VNODE) {
+                        continue;
+                    }
+                    match self.observe_descriptor(
+                        verified,
+                        fd.proc_fd,
+                        vnode_index,
+                        &mut budget,
+                        &RETRY_BACKOFFS,
+                        &mut [],
+                    ) {
+                        Observed::Path(path) if path_is_at_or_under(&path, root) => open_count += 1,
+                        Observed::Path(_) | Observed::Closed | Observed::Dead(_) => {}
+                        Observed::Opaque => {
+                            failure = Some("hidden descriptor in targeted proof".to_owned());
+                            break;
+                        }
+                        Observed::Unreadable(message) => {
+                            failure = Some(message);
+                            break;
+                        }
+                        Observed::Bounded(bound) => {
+                            failure = Some(bound.to_owned());
+                            break;
+                        }
+                    }
+                    vnode_index += 1;
+                }
+                if budget.expired() {
+                    failure = Some("time".to_owned());
+                }
+                // Bind the sample at its final deciding boundary as well.
+                let after = kinfo_process(pid)?;
+                if after.as_ref().map(|row| row.identity) != Some(verified) {
+                    failure = Some(
+                        "proof child identity changed after descriptor observation".to_owned(),
+                    );
+                }
+                if budget.expired() {
+                    failure = Some("time".to_owned());
+                }
+                if let Some(failure) = failure {
+                    reason = Some(failure);
+                    "unreadable"
+                } else {
+                    "complete"
+                }
+            }
+            DescriptorListing::Bounded(bound) => {
+                reason = Some(bound.to_owned());
+                "bounded"
+            }
+            DescriptorListing::Gone { .. } => "gone",
+            DescriptorListing::Unreadable(error) => {
+                reason = Some(error.to_string());
+                "unreadable"
+            }
+        };
+        let encode_identity = |identity: ProcessIdentity| serde_json::json!({ "pid": identity.pid, "start": identity.start, "effective_uid": identity.effective_uid });
+        let attempts: Vec<_> = budget.attempts.iter().map(|attempt| serde_json::json!({
+            "capacity": attempt.capacity, "rows": attempt.rows, "outcome": attempt.outcome,
+            "identity_before": encode_identity(attempt.before), "identity_after": attempt.after.map(encode_identity),
+        })).collect();
+        Ok(serde_json::json!({
+            "schema": "barge.proof.descriptor-listing/1", "outcome": outcome, "reason": reason,
+            "identity": encode_identity(identity), "final_count": final_count, "capacity": capacity,
+            "returned_row_work": allowance - budget.remaining, "attempts": attempts,
+            "open_count": open_count, "limit_ms": budget.timeout.as_millis(),
+            "custody": if outcome != "complete" { "unknown" } else if open_count > 0 { "unsafe" } else { "safe_sample" },
+            "whole_host_custody": false,
+        }))
+    }
+
     /// The platform implementation behind the `os` traits.
     pub const fn new() -> Self {
         Self
@@ -1047,6 +1171,15 @@ impl MacOs {
         retry: &mut RetryEvidence,
     ) -> Result<DescriptorScan> {
         let started = Instant::now();
+        let Some(mut budget) = ScanBudget::new(started, request.max_descriptors, request.timeout)
+        else {
+            return Ok(DescriptorScan::Bounded {
+                processes: 0,
+                descriptors: 0,
+                bound: "time",
+                retry: retry.clone(),
+            });
+        };
         // The kernel reports canonical paths, so the root is matched under both
         // the spelling the walk reached and the one the filesystem resolves.
         let mut roots = vec![request.root.to_path_buf()];
@@ -1067,7 +1200,7 @@ impl MacOs {
         // left out, so the scan answers unreadable rather than complete.
         let mut self_excluded = false;
         for identity in table.iter().copied() {
-            if started.elapsed() >= request.timeout {
+            if budget.expired() {
                 return Ok(DescriptorScan::Bounded {
                     processes,
                     descriptors,
@@ -1119,13 +1252,20 @@ impl MacOs {
             // identity before it is decided, never assumed: the count says how
             // many processes needed it and the bounded record says which ones
             // and how each resolved.
-            let settled =
-                self.settle_descriptors(identity, uid, started, request.timeout, backoffs, faults);
+            if processes >= request.max_processes.min(descriptor_listing::MAX_PROCESSES) {
+                return Ok(DescriptorScan::Bounded {
+                    processes,
+                    descriptors,
+                    bound: "processes",
+                    retry: retry.clone(),
+                });
+            }
+            let settled = self.settle_descriptors(identity, uid, &mut budget, backoffs, faults);
             if let Some(record) = settled.record {
                 retry.record(record);
             }
-            let fds = match settled.listing {
-                SettledListing::Listed(fds) => fds,
+            let (fds, identity) = match settled.listing {
+                SettledListing::Listed { fds, identity } => (fds, identity),
                 // The kernel reports no such process: it is positively gone, so
                 // nothing it held is open.
                 SettledListing::Gone => continue,
@@ -1137,11 +1277,11 @@ impl MacOs {
                 }
                 // The scan's own time bound would have been crossed by another
                 // retry, so the observation cannot be completed.
-                SettledListing::Bounded => {
+                SettledListing::Bounded(bound) => {
                     return Ok(DescriptorScan::Bounded {
                         processes,
                         descriptors,
-                        bound: "time",
+                        bound,
                         retry: retry.clone(),
                     })
                 }
@@ -1155,22 +1295,6 @@ impl MacOs {
                 }
             };
             processes = processes.saturating_add(1);
-            if processes > request.max_processes {
-                return Ok(DescriptorScan::Bounded {
-                    processes,
-                    descriptors,
-                    bound: "processes",
-                    retry: retry.clone(),
-                });
-            }
-            if fds.len() >= SCAN_DESCRIPTORS_PER_PROCESS {
-                return Ok(DescriptorScan::Bounded {
-                    processes,
-                    descriptors,
-                    bound: "descriptors per process",
-                    retry: retry.clone(),
-                });
-            }
             // The vnode descriptors the platform hides for this process. They
             // are counted, never assumed safe: only a process the platform's own
             // code-signing status verifies as a platform binary may have them,
@@ -1180,7 +1304,7 @@ impl MacOs {
             let mut opaque = 0usize;
             let mut vnodes = 0usize;
             for fd in fds {
-                if started.elapsed() >= request.timeout {
+                if budget.expired() {
                     return Ok(DescriptorScan::Bounded {
                         processes,
                         descriptors,
@@ -1189,14 +1313,6 @@ impl MacOs {
                     });
                 }
                 descriptors = descriptors.saturating_add(1);
-                if descriptors > request.max_descriptors {
-                    return Ok(DescriptorScan::Bounded {
-                        processes,
-                        descriptors,
-                        bound: "descriptors",
-                        retry: retry.clone(),
-                    });
-                }
                 if libc::c_int::try_from(fd.proc_fdtype).ok() != Some(libc::PROX_FDTYPE_VNODE) {
                     continue;
                 }
@@ -1207,8 +1323,7 @@ impl MacOs {
                     identity,
                     descriptor,
                     vnode_index,
-                    started,
-                    request.timeout,
+                    &mut budget,
                     backoffs,
                     faults,
                 ) {
@@ -1242,11 +1357,11 @@ impl MacOs {
                             retry: retry.clone(),
                         })
                     }
-                    Observed::Bounded => {
+                    Observed::Bounded(bound) => {
                         return Ok(DescriptorScan::Bounded {
                             processes,
                             descriptors,
-                            bound: "time",
+                            bound,
                             retry: retry.clone(),
                         })
                     }
@@ -1309,6 +1424,14 @@ impl MacOs {
                 });
             }
         }
+        if budget.expired() {
+            return Ok(DescriptorScan::Bounded {
+                processes,
+                descriptors,
+                bound: "time",
+                retry: retry.clone(),
+            });
+        }
         Ok(DescriptorScan::Complete {
             processes,
             descriptors,
@@ -1355,7 +1478,7 @@ impl MacOs {
                 reason: format!("the kernel reports no process at pid {pid}"),
             });
         };
-        if before.identity.start != classified.start {
+        if before.identity != classified {
             #[cfg(test)]
             crate::tape::platform(
                 "MacOs::platform_status",
@@ -1387,7 +1510,7 @@ impl MacOs {
                 reason: format!("the kernel reports no process at pid {pid} any more"),
             });
         };
-        if after.identity.start != classified.start {
+        if after.identity != classified {
             #[cfg(test)]
             crate::tape::platform(
                 "MacOs::platform_status",
@@ -1451,11 +1574,12 @@ impl MacOs {
         &self,
         classified: ProcessIdentity,
         uid: u32,
-        started: Instant,
-        timeout: Duration,
+        budget: &mut ScanBudget,
         backoffs: &[Duration],
         faults: &mut [StatedListing],
     ) -> Settled {
+        let started = budget.started;
+        let timeout = budget.timeout;
         let pid = classified.pid;
         #[cfg(test)]
         crate::tape::observed_process(
@@ -1467,6 +1591,15 @@ impl MacOs {
         );
         let settle_started = Instant::now();
         let mut start = classified.start;
+        let mut classified = classified;
+        let Some(local_deadline) = settle_started.checked_add(SETTLE_WINDOW) else {
+            return Settled {
+                listing: SettledListing::Unreadable(
+                    "descriptor listing settle deadline is not representable".to_owned(),
+                ),
+                record: None,
+            };
+        };
         #[cfg(test)]
         let mut last_observed = classified;
         let mut retries = 0usize;
@@ -1481,20 +1614,24 @@ impl MacOs {
         loop {
             #[cfg(test)]
             crate::tape::process_context(pid, last_observed.start, last_observed.effective_uid);
-            let listing = match stated_errno(faults, pid) {
-                Some(errno) => DescriptorListing::from_errno(errno),
-                None => self.list_descriptors(pid),
-            };
+            let listing = self.list_descriptors(classified, budget, Some(local_deadline), faults);
             match listing {
-                DescriptorListing::Listed(fds) => {
+                DescriptorListing::Complete { fds, identity, .. } => {
                     record.resolution = RetryResolution::Listed;
                     return settle(
                         record,
-                        SettledListing::Listed(fds),
+                        SettledListing::Listed { fds, identity },
                         settle_started,
                         started,
                         timeout,
                     );
+                }
+                DescriptorListing::Bounded(bound) => {
+                    record.resolution = RetryResolution::Bounded;
+                    return Settled {
+                        listing: SettledListing::Bounded(bound),
+                        record: retried(record),
+                    };
                 }
                 DescriptorListing::Gone { errno } => {
                     // A retried listing that answers `ESRCH` is the positive fact
@@ -1599,6 +1736,7 @@ impl MacOs {
                     // the pid: it is re-evaluated under this same rule, inside
                     // this same bounded budget, so a churning pid can never keep
                     // the scan busy.
+                    classified = now.identity;
                     if now.identity.start != start {
                         record.identity_changes = record.identity_changes.saturating_add(1);
                         start = now.identity.start;
@@ -1620,7 +1758,7 @@ impl MacOs {
                         Some(RetryStop::Bounded) => {
                             record.resolution = RetryResolution::Bounded;
                             return Settled {
-                                listing: SettledListing::Bounded,
+                                listing: SettledListing::Bounded("time"),
                                 record: retried(record),
                             };
                         }
@@ -1633,7 +1771,7 @@ impl MacOs {
                         Some(RetryStop::Bounded) => {
                             record.resolution = RetryResolution::Bounded;
                             return Settled {
-                                listing: SettledListing::Bounded,
+                                listing: SettledListing::Bounded("time"),
                                 record: retried(record),
                             };
                         }
@@ -1663,8 +1801,7 @@ impl MacOs {
         identity: ProcessIdentity,
         descriptor: i32,
         vnode_index: usize,
-        started: Instant,
-        timeout: Duration,
+        budget: &mut ScanBudget,
         backoffs: &[Duration],
         faults: &mut [StatedListing],
     ) -> Observed {
@@ -1688,30 +1825,24 @@ impl MacOs {
                 identity,
                 descriptor,
                 vnode_index,
-                started,
-                timeout,
+                budget,
                 backoffs,
                 faults,
                 SettleFrom::Closed,
+                None,
             ),
-            Ok(DescriptorReading::Dead) => self.settle_dead_handle(
-                identity,
-                descriptor,
-                vnode_index,
-                started,
-                timeout,
-                backoffs,
-                faults,
-            ),
+            Ok(DescriptorReading::Dead) => {
+                self.settle_dead_handle(identity, descriptor, vnode_index, budget, backoffs, faults)
+            }
             Ok(DescriptorReading::Disagreed { path, facts }) => self.settle_pair(
                 identity,
                 descriptor,
                 vnode_index,
-                started,
-                timeout,
+                budget,
                 backoffs,
                 faults,
                 SettleFrom::Disagreed { path, facts },
+                None,
             ),
             Err(error) => Observed::Unreadable(error.message().to_owned()),
         }
@@ -1736,29 +1867,48 @@ impl MacOs {
         classified: ProcessIdentity,
         descriptor: i32,
         vnode_index: usize,
-        started: Instant,
-        timeout: Duration,
+        budget: &mut ScanBudget,
         backoffs: &[Duration],
         faults: &mut [StatedListing],
         from: SettleFrom,
+        local_deadline: Option<Instant>,
     ) -> Observed {
+        let started = budget.started;
+        let timeout = budget.timeout;
         let pid = classified.pid;
         let after_dead = matches!(from, SettleFrom::ClosedAfterDead);
         let mut last = from;
         for _ in 1..PAIR_RETRY_ATTEMPTS {
+            if local_deadline.is_some_and(|deadline| {
+                Instant::now()
+                    .checked_add(PAIR_RETRY_BACKOFF)
+                    .is_none_or(|next| next >= deadline)
+            }) {
+                return Observed::Unreadable(dead_window_closed(pid, descriptor, classified.start));
+            }
             if started.elapsed().saturating_add(PAIR_RETRY_BACKOFF) >= timeout {
-                return Observed::Bounded;
+                return Observed::Bounded("time");
             }
             std::thread::sleep(PAIR_RETRY_BACKOFF);
             if started.elapsed() >= timeout {
-                return Observed::Bounded;
+                return Observed::Bounded("time");
             }
-            match self.pair_identity(
+            let identity = self.pair_identity(
                 classified,
                 descriptor,
                 faults,
                 "when the disagreeing descriptor was re-read",
-            ) {
+            );
+            if let Err(reason) = identity {
+                return Observed::Unreadable(reason);
+            }
+            if local_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Observed::Unreadable(dead_window_closed(pid, descriptor, classified.start));
+            }
+            if budget.expired() {
+                return Observed::Bounded("time");
+            }
+            match identity {
                 Ok(None) => return Observed::Closed,
                 Ok(Some(())) => {}
                 Err(reason) => return Observed::Unreadable(reason),
@@ -1772,16 +1922,26 @@ impl MacOs {
                 Err(error) => return Observed::Unreadable(error.message().to_owned()),
             };
             if matches!(reading, DescriptorReading::Closed) {
-                let listing = match faults
-                    .iter_mut()
-                    .find(|fault| fault.pid == pid)
-                    .and_then(|fault| fault.relist_errno.take())
-                {
-                    Some(errno) => DescriptorListing::from_errno(errno),
-                    None => self.list_descriptors(pid),
-                };
-                if started.elapsed() >= timeout {
-                    return Observed::Bounded;
+                if let Some(fault) = faults.iter_mut().find(|fault| fault.pid == pid) {
+                    if let Some(errno) = fault.relist_errno.take() {
+                        fault.errnos.insert(0, errno);
+                    }
+                }
+                let listing = self.list_descriptors(classified, budget, local_deadline, faults);
+                if let DescriptorListing::Unreadable(ref error) = listing {
+                    return Observed::Unreadable(
+                        unreadable_descriptors(pid, error).message().to_owned(),
+                    );
+                }
+                if local_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Observed::Unreadable(dead_window_closed(
+                        pid,
+                        descriptor,
+                        classified.start,
+                    ));
+                }
+                if budget.expired() {
+                    return Observed::Bounded("time");
                 }
                 match listing {
                     DescriptorListing::Gone { .. } => return Observed::Closed,
@@ -1790,10 +1950,8 @@ impl MacOs {
                             unreadable_descriptors(pid, &error).message().to_owned(),
                         );
                     }
-                    DescriptorListing::Listed(fds) => {
-                        if fds.len() >= SCAN_DESCRIPTORS_PER_PROCESS {
-                            return Observed::Bounded;
-                        }
+                    DescriptorListing::Bounded(bound) => return Observed::Bounded(bound),
+                    DescriptorListing::Complete { fds, .. } => {
                         let identity = self.pair_identity(
                             classified,
                             descriptor,
@@ -1801,7 +1959,7 @@ impl MacOs {
                             "around the descriptor re-listing",
                         );
                         if started.elapsed() >= timeout {
-                            return Observed::Bounded;
+                            return Observed::Bounded("time");
                         }
                         match identity {
                             Ok(None) => return Observed::Closed,
@@ -1817,20 +1975,36 @@ impl MacOs {
                             Err(error) => return Observed::Unreadable(error.message().to_owned()),
                         };
                         if started.elapsed() >= timeout {
-                            return Observed::Bounded;
+                            return Observed::Bounded("time");
                         }
                     }
                 }
             }
-            match self.pair_identity(
+            let identity = self.pair_identity(
                 classified,
                 descriptor,
                 faults,
                 "around the disagreeing descriptor's re-read",
-            ) {
+            );
+            if let Err(reason) = identity {
+                return Observed::Unreadable(reason);
+            }
+            if local_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Observed::Unreadable(dead_window_closed(pid, descriptor, classified.start));
+            }
+            if budget.expired() {
+                return Observed::Bounded("time");
+            }
+            match identity {
                 Ok(None) => return Observed::Closed,
                 Ok(Some(())) => {}
                 Err(reason) => return Observed::Unreadable(reason),
+            }
+            if local_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Observed::Unreadable(dead_window_closed(pid, descriptor, classified.start));
+            }
+            if budget.expired() {
+                return Observed::Bounded("time");
             }
             match reading {
                 DescriptorReading::Path(next) => return Observed::Path(next),
@@ -1850,8 +2024,7 @@ impl MacOs {
                         classified,
                         descriptor,
                         vnode_index,
-                        started,
-                        timeout,
+                        budget,
                         backoffs,
                         faults,
                     )
@@ -1931,13 +2104,17 @@ impl MacOs {
         classified: ProcessIdentity,
         descriptor: i32,
         vnode_index: usize,
-        started: Instant,
-        timeout: Duration,
+        budget: &mut ScanBudget,
         backoffs: &[Duration],
         faults: &mut [StatedListing],
     ) -> Observed {
+        let started = budget.started;
+        let timeout = budget.timeout;
         let pid = classified.pid;
         let settle_started = Instant::now();
+        let Some(local_deadline) = settle_started.checked_add(SETTLE_WINDOW) else {
+            return Observed::Unreadable(dead_window_closed(pid, descriptor, classified.start));
+        };
         // Whether a settled answer may be accepted. Every read below can be slow,
         // so both deadlines are checked when the answer arrives and not only
         // around the backoff: an answer read after the process's settle window
@@ -1953,7 +2130,7 @@ impl MacOs {
             Some(RetryStop::Unreadable) => {
                 Observed::Unreadable(dead_window_closed(pid, descriptor, classified.start))
             }
-            Some(RetryStop::Bounded) => Observed::Bounded,
+            Some(RetryStop::Bounded) => Observed::Bounded("time"),
             None => observed,
         };
         // No backoff left is both the exhausted schedule and the counterfactual:
@@ -1980,7 +2157,7 @@ impl MacOs {
                     "the settle window would close before the re-observation",
                 ))
             }
-            Some(RetryStop::Bounded) => return Observed::Bounded,
+            Some(RetryStop::Bounded) => return Observed::Bounded("time"),
             None => {}
         }
         std::thread::sleep(backoff);
@@ -1993,7 +2170,7 @@ impl MacOs {
                     "the settle window closed before the re-observation",
                 ))
             }
-            Some(RetryStop::Bounded) => return Observed::Bounded,
+            Some(RetryStop::Bounded) => return Observed::Bounded("time"),
             None => {}
         }
         // The kernel's own identity for the pid, read before the second
@@ -2064,11 +2241,11 @@ impl MacOs {
                     classified,
                     descriptor,
                     vnode_index,
-                    started,
-                    timeout,
+                    budget,
                     backoffs,
                     faults,
                     SettleFrom::ClosedAfterDead,
+                    Some(local_deadline),
                 )
             }
             // Still dead for the classified identity, which was just re-read: it
@@ -2130,127 +2307,163 @@ impl MacOs {
         Ok(Some(now))
     }
 
-    /// One process's descriptors, as `PROC_PIDLISTFDS` answers them.
-    fn list_descriptors(&self, pid: u32) -> DescriptorListing {
-        let mut fds = vec![
-            libc::proc_fdinfo {
-                proc_fd: 0,
-                proc_fdtype: 0,
-            };
-            SCAN_DESCRIPTORS_PER_PROCESS
-        ];
-        let fds_bytes = fds
-            .len()
-            .saturating_mul(std::mem::size_of::<libc::proc_fdinfo>());
-        // `proc_pidinfo` answers zero bytes on failure and leaves the reason in
-        // errno, so the error is cleared first and read after: a process that
-        // holds no descriptors at all also answers zero bytes. Reading zero
-        // bytes as "nothing open" without that distinction would turn an
-        // unreadable process into evidence of absence.
-        // SAFETY: `__error` returns this thread's errno cell, which is writable
-        // for this thread and outlives the call.
-        unsafe { *libc::__error() = 0 };
-        // SAFETY: `fds` is a writable slice whose exact byte length is passed,
-        // so the kernel writes only inside it.
-        let written = unsafe {
-            libc::proc_pidinfo(
-                libc::c_int::try_from(pid).unwrap_or(libc::c_int::MAX),
-                libc::PROC_PIDLISTFDS,
-                0,
-                fds.as_mut_ptr().cast(),
-                libc::c_int::try_from(fds_bytes).unwrap_or(libc::c_int::MAX),
-            )
-        };
-        if written <= 0 {
-            let error = io::Error::last_os_error();
-            #[cfg(test)]
-            match error.raw_os_error() {
-                Some(libc::ESRCH) => crate::tape::fd_list(
-                    "MacOs::list_descriptors",
-                    pid,
-                    crate::tape::Outcome::answer("gone"),
-                ),
-                Some(0) | None => crate::tape::fd_list(
-                    "MacOs::list_descriptors",
-                    pid,
-                    crate::tape::Outcome::listed(0, 0, false),
-                ),
-                _ => crate::tape::fd_list(
-                    "MacOs::list_descriptors",
-                    pid,
-                    crate::tape::Outcome::refused(crate::tape::errno_class(&error)),
-                ),
-            }
-            return match error.raw_os_error() {
-                // The kernel reports no such process: it is positively gone, so
-                // nothing it held is open.
-                Some(libc::ESRCH) => DescriptorListing::Gone {
-                    errno: Some(libc::ESRCH),
-                },
-                // No error at all: the process genuinely holds no descriptors.
-                Some(0) | None => DescriptorListing::Listed(Vec::new()),
-                _ => DescriptorListing::Unreadable(error),
-            };
-        }
-        let written = written as usize;
-        if written >= fds_bytes {
-            // The buffer filled, so the listing cannot be complete. The caller
-            // answers the per-process bound.
-            #[cfg(test)]
-            crate::tape::fd_list(
-                "MacOs::list_descriptors",
-                pid,
-                crate::tape::Outcome::refused("buffer_bound"),
-            );
-            return DescriptorListing::Listed(fds);
-        }
-        fds.truncate(written / std::mem::size_of::<libc::proc_fdinfo>());
-        #[cfg(test)]
-        for fd in &fds {
-            crate::tape::fd_entry("MacOs::list_descriptors", pid, fd.proc_fd, fd.proc_fdtype);
-        }
-        #[cfg(test)]
-        crate::tape::fd_list(
-            "MacOs::list_descriptors",
-            pid,
-            crate::tape::Outcome::listed(fds.len(), fds.len(), false),
+    /// Every listing attempt, including a full prefix and a closed-fd relist,
+    /// uses the original scan budget through this same checked kernel adapter.
+    fn list_descriptors(
+        &self,
+        classified: ProcessIdentity,
+        budget: &mut ScanBudget,
+        local_deadline: Option<Instant>,
+        faults: &mut [StatedListing],
+    ) -> DescriptorListing {
+        let listing = descriptor_listing::list(
+            &mut KernelListing { faults },
+            classified,
+            budget,
+            local_deadline,
         );
-        DescriptorListing::Listed(fds)
+        #[cfg(test)]
+        if let DescriptorListing::Bounded(bound) = &listing {
+            crate::tape::scalar(
+                "MacOs::list_descriptors",
+                "listing_bound",
+                crate::tape::Identity::none(),
+                bound,
+            );
+        }
+        listing
     }
 }
 
-/// One descriptor listing's answer for one process.
-#[derive(Debug)]
-enum DescriptorListing {
-    /// The process's descriptors, listed inside the per-process buffer.
-    Listed(Vec<libc::proc_fdinfo>),
-    /// The kernel reports no such process, with the errno that said so when the
-    /// listing itself answered it.
-    Gone {
-        /// `ESRCH`, when the listing answered it, so a retried sequence records
-        /// the fact that ended it. `None` is a pid the kernel's own table no
-        /// longer reports.
-        errno: Option<i32>,
-    },
-    /// The listing could not be read, with the kernel's own reason. `EPERM` is
-    /// the intermittent answer the scan re-observes; every other reason is
-    /// unknown at once.
-    Unreadable(io::Error),
+/// Proof-only routing guard, before any process read. The native entry owns
+/// child custody; this endpoint accepts only its explicitly named child and
+/// paths in its owned fixture under the supervisor's selected scratch.
+#[cfg(feature = "proof-descriptor-listing")]
+fn listing_proof_context(pid: u32, target: &Path) -> Result<()> {
+    let refuse = || {
+        Error::new(
+            ErrorKind::UnknownState,
+            "targeted listing requires its guarded owned-child fixture context",
+        )
+    };
+    let env_path = |name| std::env::var_os(name).map(PathBuf::from).ok_or_else(refuse);
+    let scratch = env_path("OXIDE_TASK_SCRATCH_ROOT")?;
+    let fixture = env_path("BARGE_LISTING_PROOF_ROOT")?;
+    let evidence = env_path("OXIDE_PROOF_EVIDENCE")?;
+    if std::env::var("BARGE_LISTING_PROOF_PID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        != Some(pid)
+        || std::env::var("OXIDE_PROOF_DEADLINE_NS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_none_or(|value| value == 0)
+        || !scratch.is_absolute()
+        || !fixture.starts_with(&scratch)
+        || fixture == scratch
+        || !target.starts_with(&fixture)
+        || evidence.parent() != scratch.parent()
+    {
+        return Err(refuse());
+    }
+    for path in [&scratch, &fixture, &evidence] {
+        let metadata = std::fs::symlink_metadata(path).map_err(|_| refuse())?;
+        if !metadata.is_dir()
+            || metadata.uid() != MacOs.effective_uid()?
+            || metadata.mode() & 0o022 != 0
+            || std::fs::canonicalize(path).map_err(|_| refuse())? != *path
+        {
+            return Err(refuse());
+        }
+    }
+    if std::fs::canonicalize(target).map_err(|_| refuse())? != target {
+        return Err(refuse());
+    }
+    Ok(())
 }
 
-impl DescriptorListing {
-    /// The listing one errno stands for, classified the way `PROC_PIDLISTFDS` is
-    /// classified, so a stated answer means exactly what the kernel's own would.
-    fn from_errno(errno: i32) -> Self {
-        match errno {
-            // The kernel reports no such process: positively gone.
-            libc::ESRCH => Self::Gone {
-                errno: Some(libc::ESRCH),
-            },
-            // No error at all: the process holds no descriptors.
-            0 => Self::Listed(Vec::new()),
-            _ => Self::Unreadable(io::Error::from_raw_os_error(errno)),
+struct KernelListing<'a> {
+    faults: &'a mut [StatedListing],
+}
+
+impl descriptor_listing::Source for KernelListing<'_> {
+    fn identity(&mut self, pid: u32) -> io::Result<Option<ProcessIdentity>> {
+        // Listing brackets do not consume the older per-fd settlement controls.
+        // Those controls describe re-observation, not extra kernel reads.
+        let Some(mut now) =
+            kinfo_process(pid).map_err(|error| io::Error::other(error.message().to_owned()))?
+        else {
+            return Ok(None);
+        };
+        if let Some(stated) = self.faults.iter().find(|fault| fault.pid == pid) {
+            if stated.identity_reads > 0
+                && stated
+                    .start_after
+                    .is_none_or(|after| stated.identity_reads > after)
+            {
+                if let Some(start) = stated.start {
+                    now.identity.start = start;
+                }
+                if let Some(uid) = stated.uid {
+                    now.identity.effective_uid = Some(uid);
+                }
+            }
         }
+        #[cfg(test)]
+        crate::tape::observed_process(
+            "MacOs::list_descriptors",
+            pid,
+            now.identity.start,
+            now.identity.effective_uid,
+            "listing_identity",
+        );
+        Ok(Some(now.identity))
+    }
+
+    fn read(&mut self, pid: libc::c_int, fds: &mut [libc::proc_fdinfo]) -> (i32, i32) {
+        // The checked listing algorithm has already proved this positive PID
+        // and the slice's exact byte count are representable by the kernel ABI.
+        #[cfg(test)]
+        if let Some(fault) = self.faults.iter_mut().find(|fault| fault.pid == pid as u32) {
+            fault.list_calls += 1;
+        }
+        if let Some(errno) = stated_errno(self.faults, pid as u32) {
+            return (0, errno);
+        }
+        #[cfg(test)]
+        if let Some(fault) = self.faults.iter_mut().find(|fault| fault.pid == pid as u32) {
+            if !fault.raw_listings.is_empty() {
+                let (written, errno, rows) = fault.raw_listings.remove(0);
+                for (fd, (number, kind)) in fds.iter_mut().zip(rows) {
+                    fd.proc_fd = number;
+                    fd.proc_fdtype = kind;
+                }
+                return (written, errno);
+            }
+        }
+        let Ok(bytes) = libc::c_int::try_from(std::mem::size_of_val(fds)) else {
+            return (-1, libc::EOVERFLOW);
+        };
+        // SAFETY: __error returns this thread's writable errno cell, alive for
+        // both immediate accesses on this thread.
+        unsafe { *libc::__error() = 0 };
+        // SAFETY: the initialized writable slice is one live allocation,
+        // correctly aligned, exclusively borrowed for this call, and its exact
+        // checked positive byte length is passed. The kernel cannot write past
+        // that range; no Rust reference reads it during the call.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                fds.as_mut_ptr().cast(),
+                bytes,
+            )
+        };
+        // SAFETY: this thread's errno cell remains alive, and is read before any
+        // other syscall can change the captured answer.
+        let errno = unsafe { *libc::__error() };
+        (written, errno)
     }
 }
 
@@ -2266,14 +2479,21 @@ struct Settled {
 /// descriptors; every other answer is a resolved fact, never an assumption.
 #[derive(Debug)]
 enum SettledListing {
-    Listed(Vec<libc::proc_fdinfo>),
+    Listed {
+        fds: Vec<libc::proc_fdinfo>,
+        identity: ProcessIdentity,
+    },
     Gone,
     Foreign,
-    Bounded,
+    Bounded(&'static str),
     /// The observation cannot be completed, for this reason. The bounded retry
     /// record travels beside it.
     Unreadable(String),
 }
+
+/// A raw kernel return and its written rows, only in the test adapter.
+#[cfg(test)]
+type StatedRawListing = (i32, i32, Vec<(i32, u32)>);
 
 /// What a test states about one process's descriptor listing.
 ///
@@ -2287,6 +2507,12 @@ enum SettledListing {
 pub(crate) struct StatedListing {
     /// The pid the statement is about.
     pub(crate) pid: u32,
+    /// Raw answers enter the production allocation/byte/row/identity adapter.
+    #[cfg(test)]
+    pub(crate) raw_listings: Vec<StatedRawListing>,
+    /// Actual adapter read attempts, including discarded full prefixes.
+    #[cfg(test)]
+    pub(crate) list_calls: usize,
     /// The errno of each descriptor listing, in order, before the kernel's own
     /// answer. `EPERM` is the answer the scan re-observes; any other entry is
     /// refused at once, exactly as a real one would be.
@@ -2644,7 +2870,7 @@ fn settle(
         Some(RetryStop::Bounded) => {
             record.resolution = RetryResolution::Bounded;
             return Settled {
-                listing: SettledListing::Bounded,
+                listing: SettledListing::Bounded("time"),
                 record: retried(record),
             };
         }
@@ -2966,12 +3192,24 @@ impl MacOs {
         let uid = self.effective_uid()?;
         let self_pid = std::process::id();
         let mut found = Vec::new();
+        let Some(mut budget) = ScanBudget::new(
+            Instant::now(),
+            descriptor_listing::MAX_ROWS,
+            descriptor_listing::MAX_TIME,
+        ) else {
+            return Ok(found);
+        };
         for row in rows
             .iter()
             .filter(|row| row.identity.effective_uid == Some(uid) && row.identity.pid != self_pid)
             .take(Self::DEAD_HANDLE_SEARCH_PROCESSES)
         {
-            let DescriptorListing::Listed(fds) = self.list_descriptors(row.identity.pid) else {
+            if budget.expired() || budget.remaining == 0 {
+                break;
+            }
+            let DescriptorListing::Complete { fds, .. } =
+                self.list_descriptors(row.identity, &mut budget, None, &mut [])
+            else {
                 continue;
             };
             for fd in fds {
@@ -3373,7 +3611,7 @@ enum Observed {
     /// dead handle.
     Unreadable(String),
     /// The scan's own time bound would be crossed: bounded, never a dead handle.
-    Bounded,
+    Bounded(&'static str),
 }
 
 /// The refusal for a dead-handle re-observation that produced its answer after
@@ -5496,3 +5734,11 @@ mod locator_bounds_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "macos_listing_tests.rs"]
+mod listing_tests;
+
+#[cfg(all(test, feature = "proof-descriptor-listing"))]
+#[path = "listing_proof_tests.rs"]
+mod listing_proof_tests;

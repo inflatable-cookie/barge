@@ -97,7 +97,8 @@ pub const CAPABILITY: &str = "cooperative_holds_plus_same_uid_descriptor_observa
 /// How many same-uid processes one scan may observe before it is bounded.
 pub const SCAN_PROCESSES: usize = 4096;
 
-/// How many descriptors one scan may observe before it is bounded.
+/// How many returned listing rows one scan may spend before it is bounded.
+/// Discarded full prefixes and repeated listings spend the same allowance.
 pub const SCAN_DESCRIPTORS: usize = 65_536;
 
 /// How long one descriptor scan may take before it is bounded.
@@ -197,7 +198,9 @@ pub struct CustodyBounds {
     pub holds: usize,
     /// How many same-uid processes the scan may observe.
     pub processes: usize,
-    /// How many descriptors the scan may observe.
+    /// The scan's returned-listing-row work allowance, including discarded full
+    /// prefixes and repeated listings. Observed-descriptor evidence keeps its
+    /// final-listing meaning.
     pub descriptors: usize,
     /// How long the scan may take.
     pub timeout: Duration,
@@ -1363,6 +1366,7 @@ pub fn capability_report() -> CustodyReport {
         establishes: vec![
             "every recorded hold for the deletion unit is released or positively stale; Barge holds are keyed by a Barge root id, so a unit Barge never created has none to read".to_owned(),
             "a bounded scan of this account's open descriptors is complete and finds none at or under the unit".to_owned(),
+            "that scan shares one original deadline and at most 4096 same-uid processes, 65536 returned listing rows and 10 s across initial listings, bounded buffer growth and relistings; discarded prefixes, repeated rows and non-vnodes spend the same private work allowance, while observed-descriptor counts keep their final-listing meaning, so work exhaustion can refuse earlier; accepted listings bracket PID, start and effective uid, and full, malformed, ambiguous or expired answers never prove completion".to_owned(),
             "that scan classifies each process by the effective uid the kernel's own process table reports, before it inspects any descriptor, and reports how many processes of another effective uid it classified".to_owned(),
             "that scan excludes the calling barge process's own descriptors, by its pid and the start identity read once and verified, and no other process: another barge process, its child or its parent is observed like any other same-uid writer".to_owned(),
             "that scan re-observes a same-uid process whose descriptor listing the kernel answers EPERM for, by re-reading the kernel's pid, start identity and effective uid and listing again at most three times inside a 250 ms settle window, with both that window and the scan's own deadline rechecked after every backoff, and settles it only on a positive fact: a later listing, a process the kernel reports gone, a changed start identity re-evaluated as the different process it now names, or a changed effective uid counted as the named blind spot; the same identity still answering EPERM is unknown and refuses, and elapsed time is never taken as proof".to_owned(),

@@ -27,6 +27,7 @@ alias = "barge"
 # here (docs/knowledge/contracts/o2-tape.md).
 "rust:compile:release" = "oxide check --release --workspace --bins --locked"
 "rust:format" = "oxide fmt --all -- --check"
+"rust:format:apply" = "oxide fmt --all"
 "rust:lint" = "oxide clippy --workspace --all-targets --all-features --locked -- -D warnings"
 # Capture-only covering exception; planner activates these with the pinned Cargo,
 # offline dependencies and the qualified supervisor. Ordinary selectors stay on Oxide.
@@ -46,6 +47,8 @@ alias = "barge"
 # Individually bounded target runs support exact-head covering evidence.
 "rust:test:prewarm" = "oxide test --admission-budget 300s --execution-budget 600s --workspace --all-targets --locked --no-run"
 "rust:test:lib" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib"
+"rust:test:listing" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib listing"
+"rust:test:listing:proof" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --features proof-descriptor-listing --lib listing_proof_guard"
 # The B-S1 capture tape's pure self-tests (recorder roundtrip, caps, refusal
 # document, statement discipline) plus the embedded end-to-end fixture
 # exercise of the actual harness (docs/knowledge/contracts/o2-tape.md).
@@ -122,6 +125,9 @@ alias = "barge"
 # no scratch and no child process.
 "outputs:native:test" = "python3 scripts/native/oxide-outputs-proof.py --self-check"
 "outputs:native:plan" = "python3 scripts/native/oxide-outputs-proof.py --plan"
+# Targeted listing apparatus only; neither selector starts a native or stages.
+"listing:native:test" = "python3 scripts/native/descriptor-listing-proof.py --self-check"
+"listing:native:plan" = "python3 scripts/native/descriptor-listing-proof.py --plan"
 # Builds the proof-feature binary of HEAD through Oxide, copies and hashes it into an
 # exclusive directory under the designated Stash scratch, and writes its manifest. It
 # runs no proof and touches no image. It is an explicit staging record only: a native
@@ -164,6 +170,17 @@ run = "python3 scripts/native/oxide-outputs-proof.py counted"
 [tasks."outputs:native:diagnostic"]
 admission = "heavy"
 run = "python3 scripts/native/oxide-outputs-proof.py diagnostic"
+
+# HELD: each diagnostic/author/reviewer occurrence needs separate activation.
+# No image, no host census, no limit changes; one owned child's actual kernel
+# listing under the qualified 300 s / 512 MiB guard, staged inside that guard.
+[tasks."listing:native"]
+admission = "heavy"
+run = "python3 scripts/native/descriptor-listing-proof.py counted"
+
+[tasks."listing:native:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/native/descriptor-listing-proof.py diagnostic"
 
 [test.suites.rust]
 # The library and CLI suites. The budgets are the test route's timeout and
