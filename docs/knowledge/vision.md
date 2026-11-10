@@ -76,3 +76,9 @@ from Oxide's external-drive machinery, with Oxide becoming a consumer. Tom
 owns scope and naming. Moving live data, changing host settings and deleting
 existing data each need explicit operator approval until a placement kind is
 qualified.
+
+Tom selected source-only bounded shared descriptor-listing design in decision
+`9e68c8ce-ac61-4190-a31c-b45f99fd6ecd` v2 (2026-11-10), within the existing
+scan totals. The [writer-custody design](contracts/stage1-design.md#bounded-shared-descriptor-listing-design-only-2026-11-10)
+requires independent exact-head review; runtime caps remain unchanged.
+Implementation, capacity changes and native/live activation need new scoped authority.
