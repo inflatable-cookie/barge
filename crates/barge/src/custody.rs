@@ -1402,8 +1402,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        capability_report, take_custody, CustodyBounds, CustodyEvidence, CustodyVerdict,
-        PendingIntent, CAPABILITY,
+        capability_report, take_custody, CustodyBounds, CustodyVerdict, PendingIntent, CAPABILITY,
     };
     use crate::area::RootKind;
     use crate::error::{Error, ErrorKind, Result};

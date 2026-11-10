@@ -243,8 +243,20 @@ def check_report(case, report, holder, previous_identity=None):
         raise base.Infrastructure("report", "the endpoint's actual row work does not compose with this budget")
     if not isinstance(report.get("limit_ms"), int) or not 0 < report["limit_ms"] <= 10000:
         raise base.Infrastructure("report", "the endpoint did not retain its original bounded local deadline")
+    outcome = report.get("outcome")
+    reason = report.get("reason")
+    # Diagnostic collection may continue only over a positive, safely
+    # classified oracle mismatch. An unknown observation, vanished holder or
+    # any deadline is not such a mismatch, even if earlier listing brackets
+    # still contain the expected identity.
+    if reason == "time":
+        raise base.Infrastructure("deadline", "the endpoint exhausted its original observation deadline")
+    if outcome not in ("complete", "bounded"):
+        raise base.Infrastructure("observation", f"the endpoint observation is {outcome!r}: {reason}")
+    if outcome == "bounded" and (case["id"] != "L4" or reason != "descriptor work"):
+        raise base.Infrastructure("observation", f"the endpoint reached an unexpected bound: {reason}")
     if case["id"] == "L4":
-        passed = (report.get("outcome") == "bounded" and work == 4096
+        passed = (outcome == "bounded" and reason == "descriptor work" and work == 4096
                   and len(attempts) == 1 and attempts[0]["capacity"] == 4096
                   and report.get("custody") == "unknown")
     else:
@@ -646,6 +658,24 @@ def self_check():
                            for cap, rows in [(4096, 4096), (8192, 5003)]]}
     check(check_report(CASES[1], report, holder)[0], "actual endpoint oracle rejected valid growth")
     check(not check_report(CASES[2], report, holder)[0], "outside sample laundered held-writer refusal")
+    budget_report = dict(report, outcome="bounded", reason="descriptor work", custody="unknown",
+                         returned_row_work=4096, final_count=0, capacity=0,
+                         attempts=[report["attempts"][0]])
+    check(check_report(CASES[-1], budget_report, holder)[0], "actual row-bound oracle rejected exact work exhaustion")
+    for candidate_case, candidate, expected_kind in (
+            (CASES[1], dict(report, outcome="unreadable", reason="child identity changed after observation"), "observation"),
+            (CASES[1], dict(report, outcome="gone", reason=None), "observation"),
+            (CASES[1], dict(report, outcome="unknown", reason="unclassified"), "observation"),
+            (CASES[1], dict(report, outcome="unreadable", reason="time"), "deadline"),
+            (CASES[1], budget_report, "observation"),
+            (CASES[-1], dict(budget_report, reason="time"), "deadline"),
+            (CASES[-1], dict(budget_report, reason="unclassified bound"), "observation")):
+        try:
+            check_report(candidate_case, candidate, holder)
+        except base.Infrastructure as error:
+            check(error.check == expected_kind, "unknown/deadline report lost its fatal classification")
+        else:
+            problems.append("unknown, gone, deadline or unexpected bound became a keep-going oracle mismatch")
     malformed = dict(report, returned_row_work=5003)
     try:
         check_report(CASES[1], malformed, holder)
