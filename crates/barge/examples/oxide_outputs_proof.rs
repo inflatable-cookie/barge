@@ -32,8 +32,8 @@ use barge::digest::sha256_hex;
 use barge::error::ErrorKind;
 use barge::os::{platform, DirOps, ProcessObserver, VolumeUuid};
 use barge::oxide_outputs::{
-    self, AdapterBounds, AdapterCall, BargeLookup, DelegatedRequest, LiveIntent, Outcome,
-    OutcomeKind, AREA_NAME, AREA_NAMESPACE, LIVE_PHASE,
+    self, AbsenceLookup, AdapterBounds, AdapterCall, BargeLookup, DelegatedRequest, LiveIntent,
+    Outcome, OutcomeKind, AREA_NAME, AREA_NAMESPACE, LIVE_PHASE,
 };
 use barge::reference::{OXIDE_INTENT_V1, OXIDE_MARKER_V2, OXIDE_REGISTRY_V2};
 use barge::registry::{
@@ -131,6 +131,9 @@ fn run_case(case: &str) -> Result<(), String> {
         "A11" => case_post_rename_resume_and_lookup(&fixture),
         "A12" => case_locked_outcomes(&fixture),
         "A13" => case_terminal_binding(&fixture),
+        "A14" => case_routed_deletion(&fixture),
+        "A15" => case_route_refusals(&fixture),
+        "A16" => case_absence_only(&fixture),
         other => Err(format!("`{other}` is not a case this driver runs")),
     }
 }
@@ -279,6 +282,7 @@ impl Fixture {
     fn request() -> DelegatedRequest {
         DelegatedRequest {
             grant_generation: 1,
+            request_sha256: None,
         }
     }
 
@@ -560,6 +564,7 @@ fn case_withdrawn_grant_refuses(fixture: &Fixture) -> Result<(), String> {
 fn case_stale_generation_refuses(fixture: &Fixture) -> Result<(), String> {
     fixture.covered(CALLER_ID)?;
     let request = DelegatedRequest {
+        request_sha256: None,
         grant_generation: 9,
     };
     let outcome = fixture.call(&fixture.live_intent(CALLER_ID), &request)?;
@@ -954,6 +959,118 @@ fn case_terminal_binding(fixture: &Fixture) -> Result<(), String> {
     }
     if std::fs::read(&path).map_err(|error| error.to_string())? != before {
         return Err("binding checks rewrote the terminal record".to_owned());
+    }
+    Ok(())
+}
+
+/// Schema 3 binds sidecar bytes separately from the canonical request digest.
+fn routed_request() -> DelegatedRequest {
+    DelegatedRequest {
+        grant_generation: 1,
+        request_sha256: Some("c".repeat(64)),
+    }
+}
+
+/// Publish the successor representation in this private fixture only.
+fn write_routes(fixture: &Fixture, routes: serde_json::Value) -> Result<(), String> {
+    fixture.covered(CALLER_ID)?;
+    fixture.write_control_state(Some("oxide.outputs/4"), 4)?;
+    let path = fixture.control().join("outputs/registry.json");
+    let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    document["version"] = serde_json::json!("oxide.outputs.registry/3");
+    document["schema"] = serde_json::json!(3);
+    document["deletion_routes"] = routes;
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&document).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn case_routed_deletion(fixture: &Fixture) -> Result<(), String> {
+    let request = routed_request();
+    write_routes(
+        fixture,
+        serde_json::json!([{
+            "intent_id": CALLER_ID, "deleter": "barge", "request_sha256": request.request_sha256
+        }]),
+    )?;
+    let outcome = fixture.call(&fixture.live_intent(CALLER_ID), &request)?;
+    if outcome.kind != OutcomeKind::Deleted || fixture.root_path.exists() {
+        return Err(format!(
+            "the exact schema3 Barge route did not delete: {outcome:?}"
+        ));
+    }
+    let id = outcome
+        .intent_id
+        .ok_or("the routed deletion has no Barge id")?;
+    if fixture.record(&id)?.phase != IntentPhase::Deleted {
+        return Err("the routed deletion did not settle its own record".to_owned());
+    }
+    Ok(())
+}
+
+fn case_route_refusals(fixture: &Fixture) -> Result<(), String> {
+    let request = routed_request();
+    let marker = std::fs::read(fixture.root_path.join(barge::reference::OXIDE_MARKER_FILE))
+        .map_err(|error| error.to_string())?;
+    for routes in [
+        serde_json::json!([{"intent_id": CALLER_ID, "deleter": "local"}]),
+        serde_json::json!([]),
+        serde_json::json!([{"intent_id": CALLER_ID, "deleter": "barge", "request_sha256": "bad"}]),
+        serde_json::json!([{"intent_id": CALLER_ID, "deleter": "barge", "request_sha256": "d".repeat(64)}]),
+    ] {
+        write_routes(fixture, routes)?;
+        let outcome = fixture.call(&fixture.live_intent(CALLER_ID), &request)?;
+        if !matches!(outcome.kind, OutcomeKind::Refused | OutcomeKind::Unknown) {
+            return Err(format!("a prohibited route did not refuse: {outcome:?}"));
+        }
+        if !fixture.root_path.join("payload.txt").exists()
+            || std::fs::read(fixture.root_path.join(barge::reference::OXIDE_MARKER_FILE))
+                .map_err(|error| error.to_string())?
+                != marker
+        {
+            return Err("a route refusal changed the root".to_owned());
+        }
+        let journal = state::read_intents(&fixture.state, barge::contract::INTENT_ROWS)
+            .map_err(|error| error.to_string())?;
+        if journal.truncated || !journal.records.is_empty() {
+            return Err("a route refusal wrote a journal record".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn case_absence_only(fixture: &Fixture) -> Result<(), String> {
+    let platform = platform();
+    let intent = fixture.live_intent(CALLER_ID);
+    let query = || {
+        oxide_outputs::lookup_absence(
+            &fixture.state,
+            &platform,
+            &platform,
+            &platform,
+            &platform,
+            &intent,
+        )
+    };
+    if !matches!(query(), AbsenceLookup::PositivelyAbsent) {
+        return Err("an empty complete journal and clear folder did not prove absence".to_owned());
+    }
+    let record = fixture.publish_record(INTENT_ID, CALLER_ID, IntentPhase::Intent)?;
+    let path =
+        state::intent_path(&fixture.state, &record.intent_id).map_err(|error| error.to_string())?;
+    let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+    if !matches!(query(), AbsenceLookup::Unknown { ref reason } if reason.contains("pending or terminal record"))
+    {
+        return Err("absence-only did not refuse the matching pending record".to_owned());
+    }
+    if std::fs::read(&path).map_err(|error| error.to_string())? != bytes
+        || !fixture.root_path.join("payload.txt").exists()
+    {
+        return Err("absence-only changed the journal or root".to_owned());
     }
     Ok(())
 }

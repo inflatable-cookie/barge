@@ -46,10 +46,14 @@ use crate::os::{
     VolumeUuid,
 };
 use crate::pool_custody::{self, OutputsFence};
-use crate::reference::{self, OxideIntent};
+use crate::reference::{self, DeletionRoute, OxideIntent};
+
+#[path = "oxide_outputs/absence.rs"]
+mod absence;
 use crate::registry::{self, Durability};
 use crate::state::{self, Deadline, IntentPhase, IntentRecord, LockSet, StatePaths};
 use crate::unit::{DeletionUnit, MarkerFamily, UnitGrant, UnitKind, UnitMarker};
+pub use absence::{lookup_absence, AbsenceLookup};
 
 /// The namespace of the one area this adapter acts on.
 pub const AREA_NAMESPACE: &str = "oxide";
@@ -103,6 +107,9 @@ pub struct LiveIntent {
 /// never continue this record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegatedRequest {
+    /// Exact immutable Oxide sidecar byte SHA-256 for schema 3. Historical
+    /// registries use None. This is separate from the canonical request digest.
+    pub request_sha256: Option<String>,
     /// The declaration generation whose grant the caller acted on. A stored
     /// generation older than this is a store that knows less than the caller:
     /// refused, never resolved in the caller's favour.
@@ -640,7 +647,22 @@ pub fn execute(call: &AdapterCall<'_>) -> Outcome {
                 return unknown(reason);
             }
             if record.phase == IntentPhase::Deleted {
-                // Terminal: report the settled outcome. No lock, no re-read,
+                match lookup_oxide_intent(
+                    call.account,
+                    call.bounds.reference_wall,
+                    intent,
+                    call.request,
+                ) {
+                    // The checked journal above binds the durable request/unit;
+                    // do not compare the captured device to a remount observation.
+                    OxideLookup::Found(_) => {}
+                    OxideLookup::Absent => {
+                        return refused("the terminal call has no live Oxide intent".to_owned())
+                    }
+                    OxideLookup::NotCovered { reason } => return refused(reason),
+                    OxideLookup::Unknown { reason } => return unknown(reason),
+                }
+                // Terminal: report the checked settled outcome. No deletion lock,
                 // no second unit.
                 return Outcome {
                     kind: OutcomeKind::Deleted,
@@ -694,7 +716,12 @@ pub fn execute(call: &AdapterCall<'_>) -> Outcome {
 
     // 4. The live intent, re-read from Oxide's own registry. The caller's
     //    object is the claim; this stored document is the permission.
-    match lookup_oxide_intent(call.account, call.bounds.reference_wall, intent) {
+    match lookup_oxide_intent(
+        call.account,
+        call.bounds.reference_wall,
+        intent,
+        call.request,
+    ) {
         OxideLookup::Found(stored) => {
             if let Err(reason) = compare_stored_intent(intent, &stored) {
                 return refused(reason);
@@ -947,7 +974,12 @@ fn resume(
     // The live intent must still be live: a settled or advanced Oxide intent
     // is refused, and the exclusion the caller dropped stays dropped until the
     // journal record is settled by its own adapter.
-    match lookup_oxide_intent(call.account, call.bounds.reference_wall, intent) {
+    match lookup_oxide_intent(
+        call.account,
+        call.bounds.reference_wall,
+        intent,
+        call.request,
+    ) {
         OxideLookup::Found(stored) => {
             if let Err(reason) = compare_stored_intent(intent, &stored) {
                 return outcome_for(OutcomeKind::Refused, Some(reason));
@@ -1313,6 +1345,7 @@ fn lookup_oxide_intent(
     account: &dyn AccountFacts,
     wall: Duration,
     intent: &LiveIntent,
+    request: &DelegatedRequest,
 ) -> OxideLookup {
     let unknown = |reason: String| OxideLookup::Unknown { reason };
     let deadline = Deadline::after(wall);
@@ -1359,7 +1392,17 @@ fn lookup_oxide_intent(
                 );
             }
             match intents.iter().find(|stored| stored.id == intent.id) {
-                Some(stored) => OxideLookup::Found(Box::new(stored.clone())),
+                Some(stored) => {
+                    match &stored.deletion_route {
+                        None => {}
+                        Some(DeletionRoute::Barge { request_sha256 })
+                            if request.request_sha256.as_deref() == Some(request_sha256.as_str()) => {}
+                        _ => return OxideLookup::NotCovered {
+                            reason: "the intent has no matching Barge deletion route and immutable request-sidecar binding".to_owned(),
+                        },
+                    }
+                    OxideLookup::Found(Box::new(stored.clone()))
+                }
                 None => OxideLookup::Absent,
             }
         }

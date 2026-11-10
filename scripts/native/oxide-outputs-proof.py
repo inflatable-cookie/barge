@@ -20,7 +20,7 @@ host's Stash scratch route are verified, and under that supervisor (pinned
 below, executed with the same interpreter), it creates one private run root
 inside the guard's owned scratch, stages the `proof-synthetic-account` driver
 build of HEAD inside the guard, attaches one owned APFS sparse image of 128 MiB
-with ownership enabled, and runs twelve adapter cases through the staged
+with ownership enabled, and runs sixteen adapter cases through the staged
 driver against a private HOME, a private state directory and a synthetic
 account home. Each case is one delegated-deletion fact of the joint protocol
 (Oxide `barge-adoption.md`, "Joint protocol for Barge output deletion"): the
@@ -179,6 +179,15 @@ CASES = [
      "claim": "an actual deleted record refuses a different request or Barge id "
               "as unknown for binding, preserves bytes, and recovers the exact request",
      "carried_by": "the_recovery_checks_pending_and_terminal_operation_bindings"},
+    {"id": "A14", "method": "A14",
+     "claim": "schema3's exact Barge route and immutable sidecar hash permit actual deletion and settlement",
+     "carried_by": "schema3_barge_route_requires_exact_immutable_request_binding"},
+    {"id": "A15", "method": "A15",
+     "claim": "schema3 local, missing, malformed and mismatched routes keep the root and write no journal",
+     "carried_by": "schema3_local_missing_and_invalid_routes_never_delete"},
+    {"id": "A16", "method": "A16",
+     "claim": "absence-only proves an empty journal and clear folder, but refuses a matching pending record without changing it",
+     "carried_by": "pending_and_terminal_records_both_refuse_without_returning_a_record"},
 ]
 
 # Spelled apart so this list does not contain the tokens it forbids.
@@ -193,21 +202,18 @@ def source_text():
 def rust_test_names():
     """The test names this proof names, read from the real Rust source.
 
-    The suite's tests are `fn a_...()`, `fn an_...()`, `fn the_...()` and
-    `fn unreadable_...()` declarations; a line scan is enough to prove a
-    carried_by name is a real test.
+    Read the main suite and its nested route/absence regression modules;
+    a line scan binds each carried name to an actual source declaration.
     """
-    path = os.path.join(REPO_ROOT, "crates", "barge", "src", "oxide_outputs", "tests.rs")
+    from pathlib import Path
+    root = Path(REPO_ROOT) / "crates" / "barge" / "src" / "oxide_outputs"
+    paths = [root / "tests.rs", *sorted((root / "tests").glob("*.rs"))]
     names = set()
-    with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
+    for path in paths:
+        for line in path.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
             if stripped.startswith("fn ") and "(" in stripped:
-                name = stripped[3:].split("(")[0].strip()
-                # The suite's test names begin with one of these articles or
-                # the one long noun name; helper fns never do.
-                if name.startswith(("a_", "an_", "the_", "unreadable_")):
-                    names.add(name)
+                names.add(stripped[3:].split("(")[0].strip())
     return names
 
 
@@ -223,7 +229,7 @@ def case_table_problems():
         if case["carried_by"] not in names:
             problems.append(
                 f"case {case['id']} carries no named regression "
-                f"({case['carried_by']} is not a test in oxide_outputs/tests.rs)"
+                f"({case['carried_by']} is not a test in oxide_outputs/tests)"
             )
     for token in FORBIDDEN_TOKENS:
         if token in text:
@@ -431,6 +437,9 @@ def driver_problems():
     driver_path = os.path.join(REPO_ROOT, "crates", "barge", "examples", f"{DRIVER_NAME}.rs")
     with open(driver_path, encoding="utf-8") as handle:
         driver = handle.read()
+    for case in CASES:
+        if f'"{case["method"]}" =>' not in driver:
+            problems.append(f"the driver does not dispatch {case['id']}")
     for binding in ("BARGE_PROOF_VOLUME_UUID", "BARGE_PROOF_VOLUME_MOUNT", "BARGE_STATE_DIR"):
         if binding not in driver:
             problems.append(f"the driver never checks {binding}")
@@ -460,7 +469,9 @@ def premise_dispositions():
             "validated synthetic home (crates/barge/src/os/proof_account.rs), "
             "which refuses an unbound run, an escape from the supervisor's "
             "scratch, and a private home that is not the account home; each "
-            "case's Oxide records are written inside that home only"
+            "case's Oxide records, including A14/A15's schema3 registry routes, "
+            "are written inside that home only; A16 queries only the same "
+            "private Barge journal and owned image folder"
         ),
         "environment": (
             "the guarded half runs under base.stage_environment's scrub of "
