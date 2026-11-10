@@ -973,7 +973,28 @@ What landed in `crates/barge/src/oxide_outputs.rs`, all default library code:
   mismatched one, refuses a legacy (`oxide.outputs/2`, `/1` or absent) fence,
   answers unknown for an unreadable fence, control directory, registry or
   incomplete registry, and binds the unit by volume UUID + inode + nonce +
-  exact marker bytes. `lookup` answers Barge's four states for one caller id —
+  exact marker bytes. `lookup` now takes the existing LiveIntent and DelegatedRequest instead of bare
+  volume/caller-id arguments, plus the optional expected Barge intent id.
+  Both pending and terminal matches validate volume UUID, caller id, supplied
+  Barge id, canonical request and plan digests, outputs family/delegation,
+  directory kind, inode, marker digest and exact volume-relative location.
+  The location is checked against the UUID's registered root directory and
+  declared outputs folder, then against every component below the original request's recorded mount
+  prefix, identified by the platform's mount-parent rule. An extra component
+  before the area is a mismatch; an unidentifiable prefix stays unknown.
+  The journal's mount hint and the request's original mount prefix need not
+  match: a first effect after remount records the new mount. Neither mount
+  hint nor device number is durable identity. Missing registration/declaration
+  or a changed relative location stays unknown; this reads location binding,
+  not a new grant or eligibility policy. The canonical
+  digest also binds nonce, preview and grant generation. A correct digest
+  cannot hide a different stored unit. Missing, malformed or conflicting
+  binding returns Unknown and preserves records; no caller-id-only fallback.
+  execute applies the same check before its terminal return and again to
+  the replay record read under the exclusive lock. Device numbers remain
+  observations. Oxide must consume this source-breaking checked API rather
+  than parse journals or trust the former caller-id-only result.
+  The four states remain —
   found pending (with the Barge intent id, which names the
   `.barge-prune-<intent-id>` quarantine leaf), found terminal, positively
   absent (a complete journal read under the volume's observation lock, no
@@ -1014,6 +1035,15 @@ runs the proof-only synthetic-account build. It does not qualify the
 production account lookup, a live drive, or live adoption; no install, real
 declaration, grant write or existing-data deletion is authorised by this
 slice.
+
+
+The focused outputs native apparatus retains A1–A12 and adds A13: after an
+actual adapter deletion, wrong preview/request and wrong Barge-id lookups
+remain unknown for binding, terminal bytes stay unchanged, and the exact
+request still recovers. This dimension awaits separately activated diagnostic,
+author and retained-reviewer occurrences; Barge051's older evidence does not
+qualify it. Synthetic account facts remain a gap.
+
 
 ## Failure, race and cancellation matrix
 

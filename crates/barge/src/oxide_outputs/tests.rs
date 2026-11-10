@@ -266,10 +266,22 @@ fn run(fixture: &Fixture, intent: &LiveIntent) -> super::Outcome {
     run_with_facts(fixture, &fixture.volume.facts(), intent)
 }
 
-fn run_with_facts(fixture: &Fixture, facts: &FakeVolume, intent: &LiveIntent) -> super::Outcome {
+fn run_with_facts(
+    fixture: &Fixture,
+    facts: &dyn crate::os::AbsenceVolume,
+    intent: &LiveIntent,
+) -> super::Outcome {
+    run_request(fixture, facts, intent, &request())
+}
+
+fn run_request(
+    fixture: &Fixture,
+    facts: &dyn crate::os::AbsenceVolume,
+    intent: &LiveIntent,
+    request: &DelegatedRequest,
+) -> super::Outcome {
     let observer = fixture.volume.observer();
     let mounts = fixture.mounts_of();
-    let request = request();
     execute(&AdapterCall {
         state_paths: &fixture.volume.state,
         dirs: &platform(),
@@ -278,7 +290,7 @@ fn run_with_facts(fixture: &Fixture, facts: &FakeVolume, intent: &LiveIntent) ->
         observer: &observer,
         account: &fixture.account,
         intent,
-        request: &request,
+        request,
         bounds: AdapterBounds::design(),
     })
 }
@@ -1043,8 +1055,8 @@ fn a_pre_rename_pending_intent_rolls_back_and_the_root_stays() {
             &fixture.volume.facts(),
             &fixture.volume.mounts(),
             &fixture.volume.observer(),
-            &fixture.volume.uuid,
-            CALLER_ID,
+            &fixture.live_intent(&root, CALLER_ID),
+            &request(),
             Some(INTENT_ID),
         ),
         BargeLookup::PositivelyAbsent
@@ -1117,7 +1129,7 @@ fn a_resumed_call_refuses_a_settled_or_withdrawn_caller_and_a_different_request(
         "the refusal changed nothing"
     );
 
-    // A different request under the same caller id: refused.
+    // A different request under the same caller id: conflicting recovery stays unknown.
     fixture.covered(&root, CALLER_ID);
     let observer = fixture.volume.observer();
     let mounts = fixture.mounts_of();
@@ -1136,11 +1148,11 @@ fn a_resumed_call_refuses_a_settled_or_withdrawn_caller_and_a_different_request(
         request: &other_request,
         bounds: AdapterBounds::design(),
     });
-    assert_eq!(outcome.kind, OutcomeKind::Refused, "{outcome:?}");
+    assert_eq!(outcome.kind, OutcomeKind::Unknown, "{outcome:?}");
     assert!(outcome
         .reason
         .as_deref()
-        .is_some_and(|reason| reason.contains("different request")));
+        .is_some_and(|reason| reason.contains("binding")));
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,8 +1173,8 @@ fn the_lookup_answers_the_four_states() {
             &fixture.volume.facts(),
             &fixture.volume.mounts(),
             &fixture.volume.observer(),
-            &fixture.volume.uuid,
-            CALLER_ID,
+            &fixture.live_intent(&root, CALLER_ID),
+            &request(),
             None,
         ),
         BargeLookup::PositivelyAbsent
@@ -1176,8 +1188,8 @@ fn the_lookup_answers_the_four_states() {
         &fixture.volume.facts(),
         &fixture.volume.mounts(),
         &fixture.volume.observer(),
-        &fixture.volume.uuid,
-        CALLER_ID,
+        &fixture.live_intent(&root, CALLER_ID),
+        &request(),
         Some(INTENT_ID),
     ) {
         BargeLookup::FoundPending {
@@ -1224,8 +1236,8 @@ fn the_lookup_answers_the_four_states() {
             &fixture.volume.facts(),
             &fixture.volume.mounts(),
             &fixture.volume.observer(),
-            &fixture.volume.uuid,
-            CALLER_ID,
+            &fixture.live_intent(&root, CALLER_ID),
+            &request(),
             Some(INTENT_ID),
         ),
         BargeLookup::FoundTerminal {
@@ -1247,8 +1259,8 @@ fn the_lookup_answers_the_four_states() {
             &orphan.volume.facts(),
             &orphan.volume.mounts(),
             &orphan.volume.observer(),
-            &orphan.volume.uuid,
-            CALLER_ID,
+            &orphan.live_intent(&root, CALLER_ID),
+            &request(),
             None,
         ),
         BargeLookup::Unknown { .. }
@@ -1263,8 +1275,8 @@ fn the_lookup_answers_the_four_states() {
             &orphan.volume.facts(),
             &orphan.volume.mounts(),
             &orphan.volume.observer(),
-            &orphan.volume.uuid,
-            CALLER_ID,
+            &orphan.live_intent(&root, CALLER_ID),
+            &request(),
             Some("e".repeat(32).as_str()),
         ),
         BargeLookup::PositivelyAbsent
@@ -1394,4 +1406,358 @@ fn a_malformed_claim_refuses_before_any_read() {
     let mut no_volume = fixture.live_intent(&root, CALLER_ID);
     no_volume.identity.volume_uuid = None;
     assert_eq!(run(&fixture, &no_volume).kind, OutcomeKind::Refused);
+}
+
+// Real journal records exercise the public lookup and execute entries. Each
+// variant changes one dimension; even a valid stored digest cannot mask a
+// different stored unit. No failed binding may write or start a second intent.
+#[test]
+fn the_recovery_checks_pending_and_terminal_operation_bindings() {
+    for phase in [IntentPhase::Intent, IntentPhase::Deleted] {
+        let fixture = Fixture::new("adapter-binding");
+        let root = fixture.root("root-one");
+        fixture.covered(&root, CALLER_ID);
+        let record = publish_record(&fixture, &root, INTENT_ID, CALLER_ID, phase);
+        let path = state::intent_path(&fixture.volume.state, INTENT_ID).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let intent = fixture.live_intent(&root, CALLER_ID);
+        for dimension in 0..22 {
+            let mut expected = intent.clone();
+            let mut request = request();
+            let mut stored = record.clone();
+            let mut id = Some(INTENT_ID);
+            match dimension {
+                0 => {
+                    expected.identity.volume_uuid =
+                        Some("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE".to_owned())
+                }
+                1 => id = Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+                2 => expected.identity.root = root.path.with_file_name("another-root"),
+                3 => expected.identity.ino += 1,
+                4 => expected.identity.nonce = Some("f".repeat(32)),
+                5 => expected.identity.marker_digest = "f".repeat(64),
+                6 => expected.preview_sha256 = "f".repeat(64),
+                7 => request.grant_generation += 1,
+                8 => expected.identity.volume_uuid = None,
+                9 => {
+                    stored.volume_uuid =
+                        VolumeUuid::parse("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE").unwrap()
+                }
+                10 => stored.unit.name = "another-root".to_owned(),
+                11 => stored.unit.inode += 1,
+                12 => {
+                    stored.unit.marker =
+                        Some(UnitMarker::new(MarkerFamily::OxideOutputs, "f".repeat(64)))
+                }
+                13 => stored.folder = "another-area".to_owned(),
+                14 => stored.caller_request_digest = Some("f".repeat(64)),
+                15 => stored.caller_request_digest = None,
+                16 => stored.plan_digest = "f".repeat(64),
+                17 => {
+                    stored.unit.marker = Some(UnitMarker::new(
+                        MarkerFamily::OxideScratch,
+                        root.marker_digest.clone(),
+                    ))
+                }
+                18 => expected.preview_sha256 = "malformed".to_owned(),
+                19 => expected.id = OTHER_CALLER_ID.to_owned(),
+                20 => expected.identity.nonce = Some("malformed".to_owned()),
+                21 => stored.caller_intent_id = Some(OTHER_CALLER_ID.to_owned()),
+                _ => unreachable!(),
+            }
+            std::fs::write(&path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let answer = lookup(
+                &fixture.volume.state,
+                &platform(),
+                &fixture.volume.facts(),
+                &fixture.volume.mounts(),
+                &fixture.volume.observer(),
+                &expected,
+                &request,
+                id,
+            );
+            assert!(
+                matches!(answer, BargeLookup::Unknown { .. }),
+                "phase {phase:?} dimension {dimension}: {answer:?}"
+            );
+            // execute has no expected Barge id argument; that dimension belongs
+            // to lookup only. All other mismatches must fail here too.
+            if !matches!(dimension, 1 | 19 | 21) {
+                let outcome = run_request(&fixture, &fixture.volume.facts(), &expected, &request);
+                assert!(
+                    matches!(outcome.kind, OutcomeKind::Unknown | OutcomeKind::Refused),
+                    "phase {phase:?} dimension {dimension}: {outcome:?}"
+                );
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(root.path.exists());
+            assert_eq!(
+                std::fs::read_dir(fixture.volume.state.intents_dir())
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
+        std::fs::write(&path, &original).unwrap();
+        // Device is an observation, excluded from durable correlation.
+        let mut remounted = intent.clone();
+        remounted.identity.dev += 5000;
+        let answer = lookup(
+            &fixture.volume.state,
+            &platform(),
+            &fixture.volume.facts(),
+            &fixture.volume.mounts(),
+            &fixture.volume.observer(),
+            &remounted,
+            &request(),
+            Some(INTENT_ID),
+        );
+        assert!(matches!(
+            answer,
+            BargeLookup::FoundPending { .. } | BargeLookup::FoundTerminal { .. }
+        ));
+        if phase == IntentPhase::Deleted {
+            assert_eq!(run(&fixture, &remounted).kind, OutcomeKind::Deleted);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+}
+
+#[test]
+fn duplicate_or_truncated_binding_is_unknown_without_writes() {
+    for duplicate in [true, false] {
+        let fixture = Fixture::new("adapter-binding-incomplete");
+        let root = fixture.root("root-one");
+        fixture.covered(&root, CALLER_ID);
+        publish_record(&fixture, &root, INTENT_ID, CALLER_ID, IntentPhase::Deleted);
+        let other = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        if duplicate {
+            publish_record(&fixture, &root, other, CALLER_ID, IntentPhase::Intent);
+        } else {
+            std::fs::write(
+                state::intent_path(&fixture.volume.state, other).unwrap(),
+                b"{",
+            )
+            .unwrap();
+        }
+        let intent = fixture.live_intent(&root, CALLER_ID);
+        assert!(matches!(
+            lookup(
+                &fixture.volume.state,
+                &platform(),
+                &fixture.volume.facts(),
+                &fixture.volume.mounts(),
+                &fixture.volume.observer(),
+                &intent,
+                &request(),
+                Some(INTENT_ID),
+            ),
+            BargeLookup::Unknown { .. }
+        ));
+        assert_eq!(run(&fixture, &intent).kind, OutcomeKind::Unknown);
+        assert!(root.path.exists());
+        assert_eq!(
+            std::fs::read_dir(fixture.volume.state.intents_dir())
+                .unwrap()
+                .count(),
+            2
+        );
+    }
+}
+
+/// The caller keeps its original request while the writer observes a new
+/// mount prefix. Exercise actual adapter deletion and pending replay with
+/// the same inode/marker/UUID across the directory rename.
+#[test]
+fn a_changed_mount_prefix_preserves_exact_pending_and_terminal_recovery() {
+    for pending in [true, false] {
+        let mut fixture = Fixture::new("adapter-remount-path");
+        let root = fixture.root("root-one");
+        fixture.covered(&root, CALLER_ID);
+        let intent = fixture.live_intent(&root, CALLER_ID);
+        let old_mount = fixture.volume.root.clone();
+        let new_mount = fixture.volume.dir.path().join("remounted-volume");
+        std::fs::rename(&old_mount, &new_mount).unwrap();
+        fixture.volume.root = new_mount.clone();
+        fixture.outputs = new_mount.join("oxide-outputs");
+        let facts = RecordedMountFacts {
+            current: fixture.volume.facts(),
+            recorded: old_mount.clone(),
+        };
+        let live_root = fixture.outputs.join("root-one");
+
+        let record = if pending {
+            let record =
+                publish_record(&fixture, &root, INTENT_ID, CALLER_ID, IntentPhase::Renamed);
+            std::fs::rename(&live_root, fixture.outputs.join(&record.unit.capture_name)).unwrap();
+            record
+        } else {
+            let outcome = run_with_facts(&fixture, &facts, &intent);
+            assert_eq!(outcome.kind, OutcomeKind::Deleted, "{outcome:?}");
+            record_of(&fixture, outcome.intent_id.as_deref().unwrap())
+        };
+        assert_eq!(record.mount_hint, new_mount);
+        assert!(intent.identity.root.starts_with(&old_mount));
+        let path = state::intent_path(&fixture.volume.state, &record.intent_id).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let lookup_exact = || {
+            lookup(
+                &fixture.volume.state,
+                &platform(),
+                &facts,
+                &fixture.volume.mounts(),
+                &fixture.volume.observer(),
+                &intent,
+                &request(),
+                Some(&record.intent_id),
+            )
+        };
+        let answer = lookup_exact();
+        if pending {
+            assert!(
+                matches!(answer, BargeLookup::FoundPending { .. }),
+                "{answer:?}"
+            );
+        } else {
+            assert!(
+                matches!(answer, BargeLookup::FoundTerminal { .. }),
+                "{answer:?}"
+            );
+        }
+        // Each relative location component remains independently bound even
+        // though the two mount prefixes differ.
+        for dimension in 0..3 {
+            let mut changed = record.clone();
+            match dimension {
+                0 => changed.root_dir = "different-root-dir".to_owned(),
+                1 => changed.folder = "different-area".to_owned(),
+                2 => changed.unit.name = "different-unit".to_owned(),
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec_pretty(&changed).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(matches!(lookup_exact(), BargeLookup::Unknown { .. }));
+            assert_eq!(
+                run_with_facts(&fixture, &facts, &intent).kind,
+                OutcomeKind::Unknown
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        std::fs::write(&path, &original).unwrap();
+        let outcome = run_with_facts(&fixture, &facts, &intent);
+        assert_eq!(outcome.kind, OutcomeKind::Deleted, "{outcome:?}");
+        assert!(matches!(lookup_exact(), BargeLookup::FoundTerminal { .. }));
+        assert_eq!(
+            state::read_intents(&fixture.volume.state, crate::contract::INTENT_ROWS)
+                .unwrap()
+                .records
+                .len(),
+            1
+        );
+        if !pending {
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+}
+
+/// A fixture mount-parent rule that recognizes a previous mount name as well
+/// as the current one. All live volume facts still come from the current mount.
+struct RecordedMountFacts {
+    current: FakeVolume,
+    recorded: PathBuf,
+}
+
+impl crate::os::VolumeFacts for RecordedMountFacts {
+    fn identify(&self, path: &std::path::Path) -> crate::error::Result<crate::os::VolumeIdentity> {
+        self.current.identify(path)
+    }
+    fn mount_census(&self, uuid: &VolumeUuid) -> crate::error::Result<Vec<PathBuf>> {
+        self.current.mount_census(uuid)
+    }
+}
+impl crate::os::VolumeLocator for RecordedMountFacts {
+    fn mounts_for_uuid(
+        &self,
+        uuid: &VolumeUuid,
+    ) -> crate::error::Result<Vec<crate::os::MountPoint>> {
+        self.current.mounts_for_uuid(uuid)
+    }
+}
+impl crate::os::MountRoot for RecordedMountFacts {
+    fn mount_root(&self, path: &std::path::Path) -> crate::error::Result<crate::os::MountPoint> {
+        self.current.mount_root(path)
+    }
+}
+impl crate::os::AbsenceVolume for RecordedMountFacts {
+    fn volume_prefix(&self, path: &std::path::Path) -> Option<PathBuf> {
+        if path.starts_with(&self.recorded) {
+            Some(self.recorded.clone())
+        } else {
+            self.current.volume_prefix(path)
+        }
+    }
+    fn identify_directory(
+        &self,
+        handle: &crate::os::DirHandle,
+    ) -> crate::error::Result<crate::os::VolumeIdentity> {
+        self.current.identify_directory(handle)
+    }
+    fn boot_data(&self) -> crate::error::Result<crate::os::VolumeIdentity> {
+        self.current.boot_data()
+    }
+}
+
+#[test]
+fn the_entire_recorded_relative_path_binds_pending_and_terminal_units() {
+    for phase in [IntentPhase::Intent, IntentPhase::Deleted] {
+        let fixture = Fixture::new("adapter-relative-binding");
+        let root = fixture.root("root-one");
+        fixture.covered(&root, CALLER_ID);
+        let record = publish_record(&fixture, &root, INTENT_ID, CALLER_ID, phase);
+        let path = state::intent_path(&fixture.volume.state, INTENT_ID).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        for unknown_prefix in [false, true] {
+            let mut intent = fixture.live_intent(&root, CALLER_ID);
+            intent.identity.root = if unknown_prefix {
+                fixture
+                    .volume
+                    .dir
+                    .path()
+                    .join("not-a-mount/oxide-outputs/root-one")
+            } else {
+                fixture.volume.root.join("nested/oxide-outputs/root-one")
+            };
+            // Keep the digest consistent with the request: it cannot vouch for
+            // the independently stored unit's different relative location.
+            let digest = request().digest(&intent).unwrap();
+            let mut changed = record.clone();
+            changed.caller_request_digest = Some(digest.clone());
+            changed.plan_digest = digest;
+            let bytes = serde_json::to_vec_pretty(&changed).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let answer = lookup(
+                &fixture.volume.state,
+                &platform(),
+                &fixture.volume.facts(),
+                &fixture.volume.mounts(),
+                &fixture.volume.observer(),
+                &intent,
+                &request(),
+                Some(INTENT_ID),
+            );
+            assert!(matches!(answer, BargeLookup::Unknown { .. }), "{answer:?}");
+            let outcome = run(&fixture, &intent);
+            assert_eq!(outcome.kind, OutcomeKind::Unknown, "{outcome:?}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(root.path.exists());
+            assert_eq!(
+                std::fs::read_dir(fixture.volume.state.intents_dir())
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
+        std::fs::write(path, original).unwrap();
+    }
 }
