@@ -386,7 +386,7 @@ pub fn lookup(
         .collect();
     match matches.as_slice() {
         [record] => {
-            if let Err(reason) = check_binding(state_paths, record, intent, request, barge_intent_id) {
+            if let Err(reason) = check_binding(state_paths, facts, record, intent, request, barge_intent_id) {
                 return BargeLookup::Unknown { reason };
             }
             let leaf = record.unit.capture_name.clone();
@@ -431,6 +431,7 @@ pub fn lookup(
 /// Device numbers are deliberately excluded: UUID is the durable volume key.
 fn check_binding(
     state_paths: &StatePaths,
+    facts: &dyn AbsenceVolume,
     record: &IntentRecord,
     intent: &LiveIntent,
     request: &DelegatedRequest,
@@ -458,6 +459,14 @@ fn check_binding(
     let relative_root = Path::new(&volume.root_dir)
         .join(&folder)
         .join(&record.unit.name);
+    let recorded_mount = facts.volume_prefix(&intent.identity.root).ok_or_else(|| {
+        "the request's recorded mount prefix is unidentifiable; keep pending".to_owned()
+    })?;
+    let recorded_relative = intent
+        .identity
+        .root
+        .strip_prefix(&recorded_mount)
+        .map_err(|_| "the request is outside its recorded mount prefix; keep pending".to_owned())?;
     let marker = UnitMarker::new(
         MarkerFamily::OxideOutputs,
         intent.identity.marker_digest.clone(),
@@ -475,7 +484,7 @@ fn check_binding(
         || !record.unit.parent.is_empty()
         || record.root_dir != volume.root_dir
         || record.folder != folder
-        || !intent.identity.root.ends_with(&relative_root)
+        || recorded_relative != relative_root
     {
         return Err("the journal record conflicts with the expected outputs operation binding; keep the caller pending".to_owned());
     }
@@ -620,8 +629,14 @@ pub fn execute(call: &AdapterCall<'_>) -> Outcome {
     let resumed = match mine.as_slice() {
         [] => None,
         [record] => {
-            if let Err(reason) = check_binding(call.state_paths, record, intent, call.request, None)
-            {
+            if let Err(reason) = check_binding(
+                call.state_paths,
+                call.facts,
+                record,
+                intent,
+                call.request,
+                None,
+            ) {
                 return unknown(reason);
             }
             if record.phase == IntentPhase::Deleted {
@@ -966,6 +981,7 @@ fn resume(
     };
     if let Err(reason) = check_binding(
         call.state_paths,
+        call.facts,
         &journal,
         intent,
         call.request,

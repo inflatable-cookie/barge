@@ -266,13 +266,17 @@ fn run(fixture: &Fixture, intent: &LiveIntent) -> super::Outcome {
     run_with_facts(fixture, &fixture.volume.facts(), intent)
 }
 
-fn run_with_facts(fixture: &Fixture, facts: &FakeVolume, intent: &LiveIntent) -> super::Outcome {
+fn run_with_facts(
+    fixture: &Fixture,
+    facts: &dyn crate::os::AbsenceVolume,
+    intent: &LiveIntent,
+) -> super::Outcome {
     run_request(fixture, facts, intent, &request())
 }
 
 fn run_request(
     fixture: &Fixture,
-    facts: &FakeVolume,
+    facts: &dyn crate::os::AbsenceVolume,
     intent: &LiveIntent,
     request: &DelegatedRequest,
 ) -> super::Outcome {
@@ -1577,6 +1581,10 @@ fn a_changed_mount_prefix_preserves_exact_pending_and_terminal_recovery() {
         std::fs::rename(&old_mount, &new_mount).unwrap();
         fixture.volume.root = new_mount.clone();
         fixture.outputs = new_mount.join("oxide-outputs");
+        let facts = RecordedMountFacts {
+            current: fixture.volume.facts(),
+            recorded: old_mount.clone(),
+        };
         let live_root = fixture.outputs.join("root-one");
 
         let record = if pending {
@@ -1585,7 +1593,7 @@ fn a_changed_mount_prefix_preserves_exact_pending_and_terminal_recovery() {
             std::fs::rename(&live_root, fixture.outputs.join(&record.unit.capture_name)).unwrap();
             record
         } else {
-            let outcome = run(&fixture, &intent);
+            let outcome = run_with_facts(&fixture, &facts, &intent);
             assert_eq!(outcome.kind, OutcomeKind::Deleted, "{outcome:?}");
             record_of(&fixture, outcome.intent_id.as_deref().unwrap())
         };
@@ -1597,7 +1605,7 @@ fn a_changed_mount_prefix_preserves_exact_pending_and_terminal_recovery() {
             lookup(
                 &fixture.volume.state,
                 &platform(),
-                &fixture.volume.facts(),
+                &facts,
                 &fixture.volume.mounts(),
                 &fixture.volume.observer(),
                 &intent,
@@ -1630,11 +1638,14 @@ fn a_changed_mount_prefix_preserves_exact_pending_and_terminal_recovery() {
             let bytes = serde_json::to_vec_pretty(&changed).unwrap();
             std::fs::write(&path, &bytes).unwrap();
             assert!(matches!(lookup_exact(), BargeLookup::Unknown { .. }));
-            assert_eq!(run(&fixture, &intent).kind, OutcomeKind::Unknown);
+            assert_eq!(
+                run_with_facts(&fixture, &facts, &intent).kind,
+                OutcomeKind::Unknown
+            );
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
         }
         std::fs::write(&path, &original).unwrap();
-        let outcome = run(&fixture, &intent);
+        let outcome = run_with_facts(&fixture, &facts, &intent);
         assert_eq!(outcome.kind, OutcomeKind::Deleted, "{outcome:?}");
         assert!(matches!(lookup_exact(), BargeLookup::FoundTerminal { .. }));
         assert_eq!(
@@ -1647,5 +1658,106 @@ fn a_changed_mount_prefix_preserves_exact_pending_and_terminal_recovery() {
         if !pending {
             assert_eq!(std::fs::read(&path).unwrap(), original);
         }
+    }
+}
+
+/// A fixture mount-parent rule that recognizes a previous mount name as well
+/// as the current one. All live volume facts still come from the current mount.
+struct RecordedMountFacts {
+    current: FakeVolume,
+    recorded: PathBuf,
+}
+
+impl crate::os::VolumeFacts for RecordedMountFacts {
+    fn identify(&self, path: &std::path::Path) -> crate::error::Result<crate::os::VolumeIdentity> {
+        self.current.identify(path)
+    }
+    fn mount_census(&self, uuid: &VolumeUuid) -> crate::error::Result<Vec<PathBuf>> {
+        self.current.mount_census(uuid)
+    }
+}
+impl crate::os::VolumeLocator for RecordedMountFacts {
+    fn mounts_for_uuid(
+        &self,
+        uuid: &VolumeUuid,
+    ) -> crate::error::Result<Vec<crate::os::MountPoint>> {
+        self.current.mounts_for_uuid(uuid)
+    }
+}
+impl crate::os::MountRoot for RecordedMountFacts {
+    fn mount_root(&self, path: &std::path::Path) -> crate::error::Result<crate::os::MountPoint> {
+        self.current.mount_root(path)
+    }
+}
+impl crate::os::AbsenceVolume for RecordedMountFacts {
+    fn volume_prefix(&self, path: &std::path::Path) -> Option<PathBuf> {
+        if path.starts_with(&self.recorded) {
+            Some(self.recorded.clone())
+        } else {
+            self.current.volume_prefix(path)
+        }
+    }
+    fn identify_directory(
+        &self,
+        handle: &crate::os::DirHandle,
+    ) -> crate::error::Result<crate::os::VolumeIdentity> {
+        self.current.identify_directory(handle)
+    }
+    fn boot_data(&self) -> crate::error::Result<crate::os::VolumeIdentity> {
+        self.current.boot_data()
+    }
+}
+
+#[test]
+fn the_entire_recorded_relative_path_binds_pending_and_terminal_units() {
+    for phase in [IntentPhase::Intent, IntentPhase::Deleted] {
+        let fixture = Fixture::new("adapter-relative-binding");
+        let root = fixture.root("root-one");
+        fixture.covered(&root, CALLER_ID);
+        let record = publish_record(&fixture, &root, INTENT_ID, CALLER_ID, phase);
+        let path = state::intent_path(&fixture.volume.state, INTENT_ID).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        for unknown_prefix in [false, true] {
+            let mut intent = fixture.live_intent(&root, CALLER_ID);
+            intent.identity.root = if unknown_prefix {
+                fixture
+                    .volume
+                    .dir
+                    .path()
+                    .join("not-a-mount/oxide-outputs/root-one")
+            } else {
+                fixture.volume.root.join("nested/oxide-outputs/root-one")
+            };
+            // Keep the digest consistent with the request: it cannot vouch for
+            // the independently stored unit's different relative location.
+            let digest = request().digest(&intent).unwrap();
+            let mut changed = record.clone();
+            changed.caller_request_digest = Some(digest.clone());
+            changed.plan_digest = digest;
+            let bytes = serde_json::to_vec_pretty(&changed).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let answer = lookup(
+                &fixture.volume.state,
+                &platform(),
+                &fixture.volume.facts(),
+                &fixture.volume.mounts(),
+                &fixture.volume.observer(),
+                &intent,
+                &request(),
+                Some(INTENT_ID),
+            );
+            assert!(matches!(answer, BargeLookup::Unknown { .. }), "{answer:?}");
+            let outcome = run(&fixture, &intent);
+            assert_eq!(outcome.kind, OutcomeKind::Unknown, "{outcome:?}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(root.path.exists());
+            assert_eq!(
+                std::fs::read_dir(fixture.volume.state.intents_dir())
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
+        std::fs::write(path, original).unwrap();
     }
 }

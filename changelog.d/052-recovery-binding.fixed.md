@@ -1,1 +1,1 @@
-Fix Oxide outputs recovery to validate the exact request and stored unit before returning pending or deleted results. Lookup now requires the live intent and delegated request. Recovery preserves exact operations across changed volume mount paths.
+Fix Oxide outputs recovery to validate the exact request and stored unit before returning pending or deleted results. Lookup now requires the live intent and delegated request. Recovery preserves exact operations across changed volume mount paths and compares every component below the recorded mount.

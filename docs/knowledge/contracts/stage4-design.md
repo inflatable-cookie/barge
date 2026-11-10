@@ -979,7 +979,9 @@ What landed in `crates/barge/src/oxide_outputs.rs`, all default library code:
   Barge id, canonical request and plan digests, outputs family/delegation,
   directory kind, inode, marker digest and exact volume-relative location.
   The location is checked against the UUID's registered root directory and
-  declared outputs folder, then against the original request's path suffix.
+  declared outputs folder, then against every component below the original request's recorded mount
+  prefix, identified by the platform's mount-parent rule. An extra component
+  before the area is a mismatch; an unidentifiable prefix stays unknown.
   The journal's mount hint and the request's original mount prefix need not
   match: a first effect after remount records the new mount. Neither mount
   hint nor device number is durable identity. Missing registration/declaration
