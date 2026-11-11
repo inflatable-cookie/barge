@@ -1644,22 +1644,33 @@ def composition_controls():
 
     # The real reader: the containment checks must hold against the REAL
     # InnerEffects.guard_facts — where the symlink regression sat — on a tiny
-    # real private fixture in the verified barge scratch, with only the
-    # external route query faked. No subprocess, no child, no stage, no
-    # guarded launch. The owned root is a direct child of the designated
-    # scratch, so the reference geometry holds for the fixture itself.
-    import shutil as _shutil
-    fixture = tempfile.mkdtemp(prefix="journal-facts-", dir=DESIGNATED_SCRATCH)
+    # real private fixture, with only the external route query, the clock and
+    # the storage faked. No subprocess, no child, no stage, no guarded
+    # launch. The fixture is one fresh per-run directory under this task's
+    # private TMPDIR; the module's DESIGNATED_SCRATCH points at the fixture's
+    # own realpath for the duration (restored after), so the reference
+    # geometry — the owned root a direct child of the designated scratch —
+    # holds for the fixture without touching the shared designated scratch.
+    tmp = tempfile.TemporaryDirectory(prefix="journal-facts-")
+    fixture_parent = os.path.realpath(tmp.name)
+    saved_designated = DESIGNATED_SCRATCH
+    parent_alias = None
+    evidence_link = None
+    globals()["DESIGNATED_SCRATCH"] = fixture_parent
     try:
-        scratch = os.path.join(fixture, "scratch")
-        evidence = os.path.join(fixture, "evidence")
+        owned = os.path.join(fixture_parent, "owned-root")
+        scratch = os.path.join(owned, "scratch")
+        evidence = os.path.join(owned, "evidence")
         os.makedirs(scratch, mode=0o755)
         os.makedirs(evidence, mode=0o755)
-        os.chmod(fixture, 0o700)
-        link = os.path.join(fixture, "scratch-alias")
+        os.chmod(owned, 0o700)
+        link = os.path.join(owned, "scratch-alias")
         os.symlink(scratch, link)
-        outside = os.path.join(DESIGNATED_SCRATCH,
-                               "journal-facts-outside-evidence")
+        evidence_link = os.path.join(owned, "evidence-alias")
+        os.symlink(evidence, evidence_link)
+        parent_alias = os.path.join(fixture_parent, "parent-alias")
+        os.symlink(owned, parent_alias)
+        outside = os.path.join(fixture_parent, "outside-evidence")
         os.makedirs(outside, mode=0o755)
 
         saved_route_query = base.scratch_route_facts
@@ -1681,27 +1692,12 @@ def composition_controls():
             expect(any("symlink" in problem for problem in symlink_problems),
                    "the real reader accepted a symlinked scratch leaf")
 
-            outside_facts = real_effects.guard_facts(scratch, outside)
-            outside_problems = guard_containment_problems(outside_facts)
-            expect(any("outside the guard's owned root" in problem
-                       for problem in outside_problems),
-                   "the real reader accepted evidence outside the owned root")
-
-            # A symlinked evidence leaf refuses on its own raw-path fact.
-            evidence_link = os.path.join(fixture, "evidence-alias")
-            os.symlink(evidence, evidence_link)
             linked_evidence = real_effects.guard_facts(scratch, evidence_link)
             evidence_symlink_problems = guard_containment_problems(linked_evidence)
             expect(any("symlink" in problem
                        for problem in evidence_symlink_problems),
                    "the real reader accepted a symlinked evidence leaf")
 
-            # A symlinked owned-root parent — an alias route to the very same
-            # layout — refuses on the raw-path alias facts: the scratch path
-            # resolves elsewhere and the parent itself is a symlink.
-            parent_alias = os.path.join(DESIGNATED_SCRATCH,
-                                        "journal-facts-parent-alias")
-            os.symlink(fixture, parent_alias)
             via_alias = os.path.join(parent_alias, "scratch")
             alias_facts = real_effects.guard_facts(via_alias, evidence)
             alias_problems = guard_containment_problems(alias_facts)
@@ -1709,16 +1705,27 @@ def composition_controls():
                        or "is a symlink" in problem
                        for problem in alias_problems),
                    "the real reader accepted a parent-alias route")
+
+            outside_facts = real_effects.guard_facts(scratch, outside)
+            outside_problems = guard_containment_problems(outside_facts)
+            expect(any("outside the guard's owned root" in problem
+                       for problem in outside_problems),
+                   "the real reader accepted evidence outside the owned root")
         finally:
             base.scratch_route_facts = saved_route_query
     finally:
+        # The designated scratch is restored before anything tears down, and
+        # every cleanup name was initialised before the try: an early failure
+        # removes only the symlinks this control created (if any) and closes
+        # the fresh fixture, never raising past this point.
+        globals()["DESIGNATED_SCRATCH"] = saved_designated
         for leftover in (parent_alias, evidence_link):
-            try:
-                os.remove(leftover)
-            except OSError:
-                pass
-        _shutil.rmtree(fixture, ignore_errors=True)
-        _shutil.rmtree(outside, ignore_errors=True)
+            if leftover:
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+        tmp.cleanup()
 
     # Report failure: an unwritable receipt unqualifies the inner.
     harness = control_harness()
@@ -1985,7 +1992,9 @@ def main(argv):
             return 1
         print(f"journal-proof apparatus: OK ({len(CASES)} case groups, "
               f"{sum(len(c['carried_by']) for c in CASES)} named regressions, "
-              "entry composition controls passed, no image, no scratch, no child process)")
+              "entry composition controls passed, no image, no guarded "
+              "launch, no child process; the only storage is one fresh "
+              "private per-run fixture directory)")
         return 0
     if arguments.plan:
         print(json.dumps(plan_document(), indent=2))
