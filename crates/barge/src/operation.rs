@@ -274,6 +274,72 @@ pub struct DeclarationAuthority {
     pub grant: UnitGrant,
 }
 
+/// Original provenance and evidence policy for a Barge-owned plan. Only the
+/// originating checked Barge path constructs this binding; a digest is never
+/// itself permission to delete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedPlanBinding {
+    pub(crate) plan_digest: String,
+    pub(crate) identity: Option<crate::evidence::IdentityEvidence>,
+    pub(crate) requires_identity: bool,
+    pub(crate) requires_absence: bool,
+}
+
+impl OwnedPlanBinding {
+    /// Called only by a Barge gate after validating the presented plan and
+    /// re-proving its selected row. The caller states which original
+    /// predicates were required; replay never substitutes current evidence.
+    pub(crate) fn from_checked_plan(
+        plan_digest: String,
+        identity: Option<crate::evidence::IdentityEvidence>,
+        requires_identity: bool,
+        requires_absence: bool,
+    ) -> Self {
+        Self {
+            plan_digest,
+            identity,
+            requires_identity,
+            requires_absence,
+        }
+    }
+
+    fn validate(
+        &self,
+        unit: &OperationUnit,
+        absence: Option<&crate::evidence::AbsenceEvidence>,
+    ) -> Result<()> {
+        if !crate::unit::is_sha256(&self.plan_digest)
+            || (self.requires_identity && self.identity.is_none())
+            || (self.requires_absence && absence.is_none())
+            || unit.marker.as_ref().map(|marker| marker.family)
+                == Some(crate::unit::MarkerFamily::OxideOutputs)
+        {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "the original owned plan binding is incomplete",
+            ));
+        }
+        if let Some(identity) = &self.identity {
+            identity.validate()?;
+            if identity.verdict != "verified"
+                || identity.inode != Some(unit.inode)
+                || identity.marker_digest.as_deref()
+                    != unit.marker.as_ref().map(|marker| marker.digest.as_str())
+                || unit.marker.as_ref().map(|marker| marker.family)
+                    != Some(crate::unit::MarkerFamily::Barge)
+                || unit.kind != crate::unit::UnitKind::Directory
+            {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "the owned plan identity differs from the unit",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl DeclarationAuthority {
     /// Validate the binding without reading or interpreting caller payloads.
     pub fn validate(&self, unit: &OperationUnit) -> Result<()> {
@@ -547,6 +613,15 @@ impl OperationUnit {
         right.capture_name = None;
         left == right
     }
+
+    /// Compare durable unit identity while tolerating a moved mount and a new
+    /// device observation after the same UUID is verified.
+    pub(crate) fn same_remounted_binding(&self, other: &Self) -> bool {
+        let mut normalized = other.clone();
+        normalized.mount_hint = self.mount_hint.clone();
+        normalized.device = self.device;
+        self.same_binding(&normalized)
+    }
 }
 
 /// One numbered `barge.operation/1` record: the single durable authority for
@@ -595,6 +670,10 @@ pub struct OperationRecord {
     /// never implicitly upgraded from a current declaration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declaration: Option<DeclarationAuthority>,
+    /// Original Barge-owned plan binding; old records may omit it but cannot
+    /// be replayed by inventing replacement provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_plan: Option<OwnedPlanBinding>,
     /// Whether the hook is owed, acknowledged, or released by cancellation.
     pub finalize_status: FinalizeStatus,
     /// The exact unit the operation binds.
@@ -688,6 +767,15 @@ impl OperationRecord {
             .with_detail("sequence", self.sequence.into()));
         }
         self.unit.validate(self.sequence)?;
+        if let Some(plan) = &self.owned_plan {
+            if self.resume != ResumePolicy::Barge {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "a delegated operation cannot carry Barge-owned plan authority",
+                ));
+            }
+            plan.validate(&self.unit, self.absence.as_ref())?;
+        }
         if let Some(declaration) = &self.declaration {
             declaration.validate(&self.unit)?;
         }
@@ -872,6 +960,7 @@ pub struct BeginRequest {
     /// Original declaration and grant authority, when a checked effect will
     /// be requested. A missing binding cannot authorize a delegated effect.
     pub declaration: Option<DeclarationAuthority>,
+    pub(crate) owned_plan: Option<OwnedPlanBinding>,
     /// The exact unit binding, without its sequence-derived capture name yet.
     pub unit: OperationUnit,
 }
@@ -893,6 +982,7 @@ impl BeginRequest {
             finalize: Some(finalize),
             absence: None,
             declaration: None,
+            owned_plan: None,
             unit,
         }
     }
@@ -907,6 +997,7 @@ impl BeginRequest {
             finalize: None,
             absence: None,
             declaration: None,
+            owned_plan: None,
             unit,
         }
     }
@@ -964,6 +1055,15 @@ impl BeginRequest {
         }
         if let Some(declaration) = &self.declaration {
             declaration.validate(&self.unit)?;
+        }
+        if let Some(plan) = &self.owned_plan {
+            if self.resume != ResumePolicy::Barge {
+                return Err(Error::new(
+                    ErrorKind::Usage,
+                    "delegated requests cannot carry Barge-owned plan authority",
+                ));
+            }
+            plan.validate(&self.unit, self.absence.as_ref())?;
         }
         if let Some(absence) = &self.absence {
             absence.validate()?;
@@ -1961,6 +2061,15 @@ pub(crate) fn begin_operation_locked(
         .find(|record| record.binds_conflict() && record.unit.same_binding(&request.unit))
     {
         if request.resume == ResumePolicy::Barge && existing.resume == ResumePolicy::Barge {
+            if existing.owned_plan != request.owned_plan
+                || existing.declaration != request.declaration
+                || existing.absence != request.absence
+            {
+                return Err(Error::new(
+                    ErrorKind::RefusedBoundary,
+                    "the Barge-owned unit already binds a different original plan",
+                ));
+            }
             return Ok(Begun::Already(existing.clone()));
         }
         return Err(Error::new(
@@ -2008,6 +2117,7 @@ pub(crate) fn begin_operation_locked(
         finalize: request.finalize.clone(),
         absence: request.absence.clone(),
         declaration: request.declaration.clone(),
+        owned_plan: request.owned_plan.clone(),
         finalize_status: FinalizeStatus::Owed,
         unit,
         phase: OperationPhase::Intent,
@@ -3827,6 +3937,39 @@ mod tests {
     }
 
     #[test]
+    fn owned_plan_binding_is_retained_and_never_replaced_on_retry() {
+        let (_dir, state, uuid) = fixture("operation-owned-plan-binding");
+        init(&state);
+        let mut owned_unit = unit(&uuid, 4_242);
+        owned_unit.marker = Some(crate::unit::UnitMarker::new(
+            crate::unit::MarkerFamily::Barge,
+            "a".repeat(64),
+        ));
+        owned_unit.grant = crate::unit::UnitGrant::native_root(owned_unit.name.clone());
+        let mut request = BeginRequest::barge_owned(owned_unit);
+        request.owned_plan = Some(super::OwnedPlanBinding {
+            plan_digest: DIGEST.to_owned(),
+            identity: None,
+            requires_identity: false,
+            requires_absence: false,
+        });
+        let record = begin(&platform(), &state, request.clone()).record().clone();
+        let read = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
+            .expect("read")
+            .expect("initialized");
+        assert_eq!(read.records[0].owned_plan, request.owned_plan);
+        assert!(matches!(
+            begin(&platform(), &state, request.clone()),
+            Begun::Already(_)
+        ));
+        let mut changed = request;
+        changed.owned_plan.as_mut().expect("plan").plan_digest = "b".repeat(64);
+        let error = begin_refused(&platform(), &platform(), &state, changed);
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        assert_eq!(read.records[0], record);
+    }
+
+    #[test]
     fn checked_dispatch_reenters_without_a_lock_and_preserves_other_conflicts() {
         struct Hook<'a> {
             state: &'a StatePaths,
@@ -4855,6 +4998,7 @@ mod tests {
             finalize: Some(finalize()),
             absence: None,
             declaration: None,
+            owned_plan: None,
             finalize_status: FinalizeStatus::Owed,
             unit: bound,
             phase: OperationPhase::Intent,
@@ -4880,6 +5024,7 @@ mod tests {
             finalize: None,
             absence: None,
             declaration: None,
+            owned_plan: None,
             finalize_status: FinalizeStatus::Owed,
             unit: bound,
             phase: OperationPhase::Intent,
@@ -4905,6 +5050,7 @@ mod tests {
             finalize: Some(finalize()),
             absence: None,
             declaration: None,
+            owned_plan: None,
             finalize_status: FinalizeStatus::Released,
             unit,
             phase: OperationPhase::Cancelled,

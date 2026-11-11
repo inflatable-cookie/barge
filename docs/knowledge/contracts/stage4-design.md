@@ -1228,8 +1228,22 @@ For the staged compatibility period, a successor begin or replay refuses an
 overlapping pending legacy intent. A legacy delete or replay consults the
 successor journal without waiting while it holds volume custody and refuses a
 busy, unknown or overlapping successor record. No old record is converted or
-discarded. Barge-owned successor replay is not yet connected: drain reports it
-pending rather than manufacturing a request binding.
+discarded. Barge-owned release operations retain the original canonical plan
+digest, identity and absence evidence in the same record. Their checked begin
+and execution use the original release gate; replay requires that stored plan
+binding and repeats the applicable authority, identity, absence and custody
+checks. An untouched original root and absent capture can be retained as a
+no-effect cancellation. A record lacking its original plan evidence refuses;
+replay never manufactures a binding from the current declaration.
+The opt-in `release::begin_owned_operation` accepts the canonical original
+release plan and digest, root id and original declaration generation; it
+publishes an intent only after the release gate rechecks that selection.
+`release::execute_owned_operation` repeats that gate before capture. A drain
+can finish a captured Barge-owned operation using its stored evidence; it does
+not need a caller hook. The legacy release entry and its pending intent reader
+remain available during transition. Records without `owned_plan` retain their
+old encoding and cannot acquire Barge-owned replay authority from current
+state; older strict readers refuse records containing the new field.
 
 The in-progress caller surface is `begin_checked_delegated` with an original
 `BeginRequest`, `checked_operation_state` for an exact bound observation,

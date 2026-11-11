@@ -1,1 +1,1 @@
-Add a checked durable caller finalization seam for operation coordination.
+Add checked operation coordination, replay and durable caller finalization on the successor journal.
