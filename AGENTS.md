@@ -177,6 +177,27 @@ guarded exception. Each selector covers what it names:
   adoption. HELD for owner activation on the same terms as the release proof's
   natives.
 
+- `effigy journal:native:test` and `effigy journal:native:plan` — the
+  operation journal's proof apparatus, effect-free: the pinned supervisor, the
+  twelve-group case table checked against its named regressions in
+  `crates/barge/src/operation.rs`, the `proof-journal` feature's declarations,
+  the verified Stash route, the nine premises with dispositions, the held
+  bounds, and composition controls that drive the actual `run_native` entry —
+  launch, stage, case driver, verdict parsing, report publication and receipt
+  composition — with only the external executors, clock, identity and storage
+  faked. No image, no scratch and no child process.
+- `effigy journal:native` and `effigy journal:native:diagnostic` — the
+  operation journal's one bounded native, journal-only, on fresh private
+  filesystem fixtures inside the guard's owned scratch under the same
+  qualified supervisor. Each run verifies the supervisor's bytes and the
+  verified Stash scratch UUID, stages the proof-journal build of HEAD with a
+  source-bound manifest (head, tree, lock, toolchain, feature, source and
+  binary digests), and runs the twelve case groups as direct children of the
+  inner runner. Counted fail-fast preserves skipped/unexecuted states;
+  diagnostic keeps going within custody and budget and is always
+  `qualified: false` and nonzero. HELD for owner activation on the same terms
+  as the release and outputs proofs.
+
 RustQuality strict is active for the Rust source, manifests, tests and their
 documentation: `docs/knowledge/contracts/language-quality-activation.json` opts
 in, `rust-quality-profile.json` declares the strict profile and its MSRV

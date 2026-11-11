@@ -59,7 +59,7 @@ use crate::contract::{
     OPERATION_PAYLOAD_CAP_BYTES, OPERATION_SCHEMA,
 };
 use crate::error::{Error, ErrorKind, Result};
-use crate::os::{DirHandle, DirOps, EntryKind, VolumeUuid};
+use crate::os::{DirHandle, DirOps, EntryKind, ProcessObserver, VolumeUuid};
 use crate::state::{
     is_identifier, now_ms, validate_entry_name, CaptureRecord, Deadline, ForeignCapture,
     IntentWrite, LockSet, StatePaths, INTENT_CAPTURES, INTENT_FOREIGN_CAPTURES, QUARANTINE_PREFIX,
@@ -980,6 +980,10 @@ const PROBE_LIST_CAP: usize = 64;
 /// is refused, never repaired.
 struct JournalRoot<'a> {
     dirs: &'a dyn DirOps,
+    /// The trusted current account: the platform's own effective-uid fact,
+    /// read once at open and compared against every owner fact below. Never a
+    /// uid from a request, a record or a path.
+    current_uid: u32,
     /// The state directory's handle; `None` when the state directory itself
     /// is absent, which reads as an unbound journal and refuses every write.
     state_root: Option<DirHandle>,
@@ -987,11 +991,13 @@ struct JournalRoot<'a> {
     operations: Option<DirHandle>,
 }
 
-/// Verify one opened directory handle is a real, private directory.
+/// Verify one opened directory handle is a real, private directory owned by
+/// the trusted current account.
 fn verify_private_directory(
     dirs: &dyn DirOps,
     handle: &DirHandle,
     name: &'static str,
+    current_uid: u32,
 ) -> Result<()> {
     let facts = dirs.dir_facts(handle)?;
     if facts.kind != EntryKind::Directory {
@@ -1009,7 +1015,24 @@ fn verify_private_directory(
             ),
         ));
     }
-    Ok(())
+    verify_owner(facts.uid, current_uid, name)
+}
+
+/// Compare one owner fact with the trusted current account. Private modes are
+/// never ownership evidence: a `0700` directory owned by another account is
+/// someone else's data, and the journal refuses it rather than reading it.
+fn verify_owner(facts_uid: u32, current_uid: u32, name: &str) -> Result<()> {
+    if facts_uid == current_uid {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::ForeignOwner,
+        format!(
+            "{name} is owned by uid {facts_uid}, not by this account (uid {current_uid}); another account's journal state is refused, never read or written"
+        ),
+    )
+    .with_detail("owner_uid", facts_uid.into())
+    .with_detail("current_uid", current_uid.into()))
 }
 
 /// Open the journal's custody: the state directory, then the journal
@@ -1020,12 +1043,26 @@ fn verify_private_directory(
 /// missing journal directory opens as `None` at that level (an unbound
 /// journal reads as such), while a symbolic link, another kind, or an
 /// unsafe mode at either name is an [`ErrorKind::UnknownState`] refusal.
-fn open_journal_root<'a>(dirs: &'a dyn DirOps, state: &StatePaths) -> Result<JournalRoot<'a>> {
+fn open_journal_root<'a>(
+    dirs: &'a dyn DirOps,
+    observer: &'a dyn ProcessObserver,
+    state: &StatePaths,
+) -> Result<JournalRoot<'a>> {
+    // The trusted current account, read once from the platform's own fact.
+    // An undecided account refuses every access: unknown is never a match.
+    let current_uid = observer.effective_uid().map_err(|error| {
+        Error::new(
+            ErrorKind::UnknownState,
+            format!(
+                "the executing account cannot be decided, so journal ownership cannot be compared: {error}"
+            ),
+        )
+    })?;
     let state_root = match dirs.path_facts(state.root())? {
         None => None,
         Some(facts) if facts.kind == EntryKind::Directory => {
             let handle = dirs.open_path(state.root())?;
-            verify_private_directory(dirs, &handle, "the state directory")?;
+            verify_private_directory(dirs, &handle, "the state directory", current_uid)?;
             Some(handle)
         }
         Some(_) => {
@@ -1043,7 +1080,12 @@ fn open_journal_root<'a>(dirs: &'a dyn DirOps, state: &StatePaths) -> Result<Jou
         (None, _) | (_, None) => None,
         (Some(root), Some(facts)) if facts.kind == EntryKind::Directory => {
             let handle = dirs.open_child_dir(root, "operations")?;
-            verify_private_directory(dirs, &handle, "the operation journal directory")?;
+            verify_private_directory(
+                dirs,
+                &handle,
+                "the operation journal directory",
+                current_uid,
+            )?;
             Some(handle)
         }
         (Some(_), Some(_)) => {
@@ -1059,6 +1101,7 @@ fn open_journal_root<'a>(dirs: &'a dyn DirOps, state: &StatePaths) -> Result<Jou
     };
     Ok(JournalRoot {
         dirs,
+        current_uid,
         state_root,
         operations,
     })
@@ -1105,6 +1148,13 @@ impl JournalRoot<'_> {
                 ),
             ));
         }
+        // A verified parent never proves a child's owner: every leaf is
+        // compared with the trusted account on its own facts.
+        verify_owner(
+            facts.uid,
+            self.current_uid,
+            &format!("the journal document `{name}`"),
+        )?;
         self.dirs.read_child_file(parent, name, INTENT_CAP_BYTES)
     }
 
@@ -1443,15 +1493,17 @@ fn account_sequences(records: &[OperationRecord], watermark: u64) -> Result<Opti
 /// no authority to read rather than authority that failed to read.
 pub fn read_operations(
     dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
     state: &StatePaths,
     max: usize,
 ) -> Result<Option<JournalView>> {
-    read_operations_with_deadline(dirs, state, max, Deadline::after(READ_DEADLINE))
+    read_operations_with_deadline(dirs, observer, state, max, Deadline::after(READ_DEADLINE))
 }
 
 /// The body of [`read_operations`] with the caller's remaining budget.
 pub(crate) fn read_operations_with_deadline(
     dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
     state: &StatePaths,
     max: usize,
     deadline: Deadline,
@@ -1462,7 +1514,7 @@ pub(crate) fn read_operations_with_deadline(
             "the operation journal read deadline expired",
         ));
     }
-    let root = open_journal_root(dirs, state)?;
+    let root = open_journal_root(dirs, observer, state)?;
     let identity = root.read_identity()?;
     let epoch = root.read_epoch()?;
     let (identity, epoch) = match (identity, epoch) {
@@ -1587,11 +1639,12 @@ fn advance_watermark(root: &JournalRoot<'_>, epoch: &JournalEpoch, watermark: u6
 /// creates it); this call creates no directory and never auto-initializes.
 pub fn init_operation_journal(
     dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
     state: &StatePaths,
     locks: &mut LockSet,
 ) -> Result<()> {
     let _lock = locks.lock_operations()?;
-    let root = open_journal_root(dirs, state)?;
+    let root = open_journal_root(dirs, observer, state)?;
     let identity = root.read_identity()?;
     let epoch = root.read_epoch()?;
     match (identity, epoch) {
@@ -1733,6 +1786,7 @@ fn publish_operation(
 /// tail before it allocates.
 pub fn begin_operation(
     dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
     state: &StatePaths,
     locks: &mut LockSet,
     request: BeginRequest,
@@ -1740,8 +1794,9 @@ pub fn begin_operation(
     request.validate()?;
     let _lock = locks.lock_operations()?;
     let deadline = Deadline::after(READ_DEADLINE);
-    let root = open_journal_root(dirs, state)?;
-    let Some(view) = read_operations_with_deadline(dirs, state, INTENT_ROWS, deadline)? else {
+    let root = open_journal_root(dirs, observer, state)?;
+    let Some(view) = read_operations_with_deadline(dirs, observer, state, INTENT_ROWS, deadline)?
+    else {
         return Err(uninitialized_error());
     };
     // Crash-consistent allocation: the tail is reconciled before anything
@@ -1918,6 +1973,7 @@ fn same_request(existing: &OperationRecord, request: &BeginRequest) -> bool {
 pub(crate) fn advance_operation(
     write: &IntentWrite,
     dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
     state: &StatePaths,
     record: &OperationRecord,
     phase: OperationPhase,
@@ -1951,7 +2007,7 @@ pub(crate) fn advance_operation(
     if phase == OperationPhase::Cancelled {
         next.finalize_status = FinalizeStatus::Released;
     }
-    let root = open_journal_root(dirs, state)?;
+    let root = open_journal_root(dirs, observer, state)?;
     publish_operation(write, &root, &next)?;
     Ok(next)
 }
@@ -1970,43 +2026,45 @@ pub mod proof {
         CaptureRecord, ForeignCapture, IntentWrite, OperationPhase, OperationRecord, Result,
         StatePaths, INTENT_CAPTURES,
     };
-    use crate::os::DirOps;
+    use crate::os::{DirOps, ProcessObserver};
 
     /// Advance one operation to the next phase, exactly as the crate-private
     /// writer does.
     pub fn advance(
         write: &IntentWrite,
         dirs: &dyn DirOps,
+        observer: &dyn ProcessObserver,
         state: &StatePaths,
         record: &OperationRecord,
         phase: OperationPhase,
     ) -> Result<OperationRecord> {
-        advance_operation(write, dirs, state, record, phase)
+        advance_operation(write, dirs, observer, state, record, phase)
     }
 
     /// Record verified captures, exactly as the crate-private writer does.
     pub fn record_captures(
         write: &IntentWrite,
         dirs: &dyn DirOps,
+        observer: &dyn ProcessObserver,
         state: &StatePaths,
         record: &OperationRecord,
         captures: &[CaptureRecord],
     ) -> Result<OperationRecord> {
-        if captures.len() > INTENT_CAPTURES {
-            // The bound is the writer's own; the delegation keeps it.
-        }
-        record_operation_captures(write, dirs, state, record, captures)
+        let bound_holds = captures.len() <= INTENT_CAPTURES;
+        debug_assert!(bound_holds, "the writer enforces its own capture bound");
+        record_operation_captures(write, dirs, observer, state, record, captures)
     }
 
     /// Record one failed capture, exactly as the crate-private writer does.
     pub fn record_foreign_capture(
         write: &IntentWrite,
         dirs: &dyn DirOps,
+        observer: &dyn ProcessObserver,
         state: &StatePaths,
         record: &OperationRecord,
         foreign: &ForeignCapture,
     ) -> Result<OperationRecord> {
-        record_operation_foreign_capture(write, dirs, state, record, foreign)
+        record_operation_foreign_capture(write, dirs, observer, state, record, foreign)
     }
 }
 
@@ -2017,6 +2075,7 @@ pub mod proof {
 pub(crate) fn record_operation_captures(
     write: &IntentWrite,
     dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
     state: &StatePaths,
     record: &OperationRecord,
     captures: &[CaptureRecord],
@@ -2032,7 +2091,7 @@ pub(crate) fn record_operation_captures(
     next.captures = captures.to_vec();
     next.generation = record.generation.saturating_add(1);
     next.phase_ms = now_ms().max(record.phase_ms);
-    let root = open_journal_root(dirs, state)?;
+    let root = open_journal_root(dirs, observer, state)?;
     publish_operation(write, &root, &next)?;
     Ok(next)
 }
@@ -2044,6 +2103,7 @@ pub(crate) fn record_operation_captures(
 pub(crate) fn record_operation_foreign_capture(
     write: &IntentWrite,
     dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
     state: &StatePaths,
     record: &OperationRecord,
     foreign: &ForeignCapture,
@@ -2070,7 +2130,7 @@ pub(crate) fn record_operation_foreign_capture(
     }
     next.generation = record.generation.saturating_add(1);
     next.phase_ms = now_ms().max(record.phase_ms);
-    let root = open_journal_root(dirs, state)?;
+    let root = open_journal_root(dirs, observer, state)?;
     publish_operation(write, &root, &next)?;
     Ok(next)
 }
@@ -2088,12 +2148,13 @@ pub(crate) fn record_operation_foreign_capture(
 ///   refuses its publication — admission never waits on the journal.
 pub fn consult_operations(
     dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
     state: &StatePaths,
     locks: &mut LockSet,
     max: usize,
 ) -> Result<Option<JournalView>> {
     let _observation = locks.try_observe_operations()?;
-    read_operations(dirs, state, max)
+    read_operations(dirs, observer, state, max)
 }
 
 /// One record the diagnostic could read, summarized.
@@ -2253,11 +2314,12 @@ impl JournalDiagnostic {
 /// being repaired, renumbered or recreated by the diagnosis.
 pub fn inspect_operation_journal(
     dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
     state: &StatePaths,
     max: usize,
 ) -> Result<JournalDiagnostic> {
     let mut findings = Vec::new();
-    let root = match open_journal_root(dirs, state) {
+    let root = match open_journal_root(dirs, observer, state) {
         Ok(root) => root,
         Err(error) => {
             findings.push(JournalFinding::CustodyRefused {
@@ -2489,7 +2551,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use std::os::unix::fs::PermissionsExt as _;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -2504,8 +2566,8 @@ mod tests {
         INTENT_ROWS, JOURNAL_EPOCH_SCHEMA, JOURNAL_IDENTITY_SCHEMA, OPERATION_PAYLOAD_CAP_BYTES,
         OPERATION_SCHEMA,
     };
-    use crate::error::ErrorKind;
-    use crate::os::{platform, DirOps, VolumeUuid};
+    use crate::error::{Error, ErrorKind};
+    use crate::os::{platform, DirHandle, DirOps, ProcessObserver, VolumeUuid};
     use crate::state::{
         now_ms, publish_intent, read_intents, CaptureRecord, CaptureVerdict, ForeignCapture,
         IntentPhase, IntentRecord, IntentUnit, LockSet, PutBackOutcome, StatePaths,
@@ -2573,21 +2635,24 @@ mod tests {
 
     fn init(state: &StatePaths) {
         let mut locks = LockSet::new(state.clone());
-        init_operation_journal(&platform(), state, &mut locks).expect("the journal initializes");
+        init_operation_journal(&platform(), &platform(), state, &mut locks)
+            .expect("the journal initializes");
     }
 
     fn begin(dirs: &dyn DirOps, state: &StatePaths, request: BeginRequest) -> Begun {
         let mut locks = LockSet::new(state.clone());
-        begin_operation(dirs, state, &mut locks, request).expect("the operation begins")
+        begin_operation(dirs, &platform(), state, &mut locks, request)
+            .expect("the operation begins")
     }
 
     fn begin_refused(
         dirs: &dyn DirOps,
+        observer: &dyn ProcessObserver,
         state: &StatePaths,
         request: BeginRequest,
     ) -> crate::error::Error {
         let mut locks = LockSet::new(state.clone());
-        begin_operation(dirs, state, &mut locks, request).expect_err("the begin refuses")
+        begin_operation(dirs, observer, state, &mut locks, request).expect_err("the begin refuses")
     }
 
     /// The intent-write step, ordered after the volume lock, as the mutating
@@ -2601,7 +2666,7 @@ mod tests {
     fn explicit_initialization_publishes_one_pair_and_repeats_as_a_no_op() {
         let (_dir, state, _uuid) = fixture("operation-init");
         init(&state);
-        let binding = read_operations(&platform(), &state, INTENT_ROWS)
+        let binding = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the journal reads")
             .expect("an initialized journal answers");
         assert_eq!(binding.epoch.watermark, 0);
@@ -2610,7 +2675,7 @@ mod tests {
         assert!(binding.records.is_empty());
         // An explicit re-run is a no-op with the same identity.
         init(&state);
-        let again = read_operations(&platform(), &state, INTENT_ROWS)
+        let again = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the journal reads")
             .expect("an initialized journal answers");
         assert_eq!(binding.identity.creation_id, again.identity.creation_id);
@@ -2619,9 +2684,15 @@ mod tests {
     #[test]
     fn an_uninitialized_journal_reads_as_none_and_never_auto_initializes() {
         let (_dir, state, _uuid) = fixture("operation-unbound");
-        let read = read_operations(&platform(), &state, INTENT_ROWS).expect("the read answers");
+        let read = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
+            .expect("the read answers");
         assert!(read.is_none(), "an unbound journal is a defined non-answer");
-        let error = begin_refused(&platform(), &state, delegated_request(&read_dummy_uuid()));
+        let error = begin_refused(
+            &platform(),
+            &platform(),
+            &state,
+            delegated_request(&read_dummy_uuid()),
+        );
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
 
@@ -2638,7 +2709,7 @@ mod tests {
         publish_epoch_fixture(&state, &epoch);
         // A genuinely empty journal may be finished by an explicit re-run.
         init(&state);
-        let view = read_operations(&platform(), &state, INTENT_ROWS)
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the journal reads")
             .expect("the pair is complete");
         assert_eq!(view.identity.creation_id, epoch.creation_id);
@@ -2656,7 +2727,7 @@ mod tests {
         };
         publish_epoch_fixture(&state2, &epoch2);
         write_fixture_record(&state2, &cancelled_record(&uuid2, 1), 1);
-        let error = init_operation_journal(&platform(), &state2, &mut locks2)
+        let error = init_operation_journal(&platform(), &platform(), &state2, &mut locks2)
             .expect_err("records are never bound after the fact");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
@@ -2668,10 +2739,10 @@ mod tests {
         init(&state);
         std::fs::remove_file(state.root().join("operations").join(EPOCH_FILE_NAME))
             .expect("the fixture drops the epoch");
-        let error = read_operations(&platform(), &state, INTENT_ROWS)
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect_err("a destroyed journal is unknown, never empty");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
-        let error = init_operation_journal(&platform(), &state, &mut locks)
+        let error = init_operation_journal(&platform(), &platform(), &state, &mut locks)
             .expect_err("initialization never re-creates a bound journal");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
@@ -2681,7 +2752,7 @@ mod tests {
         let (_dir, state, _uuid) = fixture("operation-epoch-only");
         let epoch = JournalEpoch::new("deadbeef".repeat(4), now_ms());
         publish_epoch_fixture(&state, &epoch);
-        let error = read_operations(&platform(), &state, INTENT_ROWS)
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect_err("incomplete authority is unknown");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
@@ -2697,8 +2768,8 @@ mod tests {
             created_ms: 1,
         };
         publish_identity_fixture(&state, &binding);
-        let error =
-            read_operations(&platform(), &state, INTENT_ROWS).expect_err("the pair disagrees");
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
+            .expect_err("the pair disagrees");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
 
@@ -2718,7 +2789,7 @@ mod tests {
             record.unit.capture_name.as_deref(),
             Some(format!("{QUARANTINE_PREFIX}1").as_str())
         );
-        let view = read_operations(&platform(), &state, INTENT_ROWS)
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the journal reads")
             .expect("initialized");
         assert_eq!(view.epoch.watermark, 1);
@@ -2762,7 +2833,7 @@ mod tests {
             panic!("a barge-owned repeat binds the existing operation");
         };
         assert_eq!(existing.sequence, first.sequence);
-        let view = read_operations(&platform(), &state, INTENT_ROWS)
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the journal reads")
             .expect("initialized");
         assert_eq!(view.records.len(), 1, "no second pending record");
@@ -2770,7 +2841,7 @@ mod tests {
         // The unit is spoken for: a delegated begin for the same unit refuses.
         let mut same_unit = delegated_request(&uuid);
         same_unit.unit.inode = 7;
-        let error = begin_refused(&platform(), &state, same_unit);
+        let error = begin_refused(&platform(), &platform(), &state, same_unit);
         assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
     }
 
@@ -2783,10 +2854,11 @@ mod tests {
         let mut second = delegated_request(&uuid);
         second.key = Some("prune-run-2".to_owned());
         second.request_digest = Some("6".repeat(64));
-        let error = begin_refused(&platform(), &state, second);
+        let error = begin_refused(&platform(), &platform(), &state, second);
         assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
         // A barge-owned begin for the same unit refuses too.
         let error = begin_refused(
+            &platform(),
             &platform(),
             &state,
             BeginRequest::barge_owned(unit(&uuid, 4_242)),
@@ -2813,6 +2885,7 @@ mod tests {
         advance_operation(
             &write,
             &platform(),
+            &platform(),
             &state,
             &record,
             OperationPhase::Cancelled,
@@ -2835,12 +2908,12 @@ mod tests {
         // Records exist, no pair at all: the unbound read refuses as unknown.
         let (_dir, state, uuid) = fixture("operation-records-no-pair");
         write_fixture_record(&state, &cancelled_record(&uuid, 1), 1);
-        let error = read_operations(&platform(), &state, INTENT_ROWS)
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect_err("records without a pair are unknown");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
         // Initialization refuses the same way, never with a row bound.
         let mut locks = LockSet::new(state.clone());
-        let error = init_operation_journal(&platform(), &state, &mut locks)
+        let error = init_operation_journal(&platform(), &platform(), &state, &mut locks)
             .expect_err("initialization never binds over records");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
 
@@ -2851,7 +2924,7 @@ mod tests {
         publish_epoch_fixture(&state2, &epoch);
         write_fixture_record(&state2, &cancelled_record(&uuid2, 1), 1);
         let mut locks2 = LockSet::new(state2.clone());
-        let error = init_operation_journal(&platform(), &state2, &mut locks2)
+        let error = init_operation_journal(&platform(), &platform(), &state2, &mut locks2)
             .expect_err("an epoch-only journal with records never finishes");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
@@ -2872,13 +2945,13 @@ mod tests {
         // A different digest under the same key never continues the record.
         let mut other = delegated_request(&uuid);
         other.request_digest = Some("5".repeat(64));
-        let error = begin_refused(&platform(), &state, other);
+        let error = begin_refused(&platform(), &platform(), &state, other);
         assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
 
         // A different unit binding under the same key refuses too.
         let mut moved = delegated_request(&uuid);
         moved.unit.inode = 9_999;
-        let error = begin_refused(&platform(), &state, moved);
+        let error = begin_refused(&platform(), &platform(), &state, moved);
         assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
 
         // A different hook kind refuses.
@@ -2888,7 +2961,7 @@ mod tests {
             version: "1".to_owned(),
             payload: "{}".to_owned(),
         });
-        let error = begin_refused(&platform(), &state, hook);
+        let error = begin_refused(&platform(), &platform(), &state, hook);
         assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
 
         // A different payload refuses.
@@ -2898,11 +2971,11 @@ mod tests {
             version: "1".to_owned(),
             payload: "{\"checkout\":\"other\"}".to_owned(),
         });
-        let error = begin_refused(&platform(), &state, payload);
+        let error = begin_refused(&platform(), &platform(), &state, payload);
         assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
 
         // The record is untouched by every refusal.
-        let view = read_operations(&platform(), &state, INTENT_ROWS)
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the journal reads")
             .expect("initialized");
         assert_eq!(view.records.len(), 1);
@@ -2918,7 +2991,7 @@ mod tests {
         let mut second = delegated_request(&uuid);
         second.caller = Some("other.caller".to_owned());
         second.key = Some("other-key".to_owned());
-        let error = begin_refused(&platform(), &state, second);
+        let error = begin_refused(&platform(), &platform(), &state, second);
         assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
     }
 
@@ -2927,9 +3000,9 @@ mod tests {
         let (_dir, state, uuid) = fixture("operation-begin-fail");
         init(&state);
         super::fail_next_document_publish(std::io::Error::from_raw_os_error(28));
-        let error = begin_refused(&platform(), &state, delegated_request(&uuid));
+        let error = begin_refused(&platform(), &platform(), &state, delegated_request(&uuid));
         assert_eq!(error.kind(), ErrorKind::Io);
-        let view = read_operations(&platform(), &state, INTENT_ROWS)
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the journal still reads")
             .expect("initialized");
         assert_eq!(view.epoch.watermark, 0);
@@ -2948,7 +3021,7 @@ mod tests {
             matches!(begun, Begun::Began(_)),
             "the record is confirmed durable"
         );
-        let view = read_operations(&platform(), &state, INTENT_ROWS)
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the tail state reads")
             .expect("initialized");
         assert_eq!(view.epoch.watermark, 0);
@@ -2966,7 +3039,7 @@ mod tests {
         second.unit.inode = 4_243;
         let begun = begin(&platform(), &state, second);
         assert_eq!(begun.record().sequence, 2);
-        let view = read_operations(&platform(), &state, INTENT_ROWS)
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the journal reads")
             .expect("initialized");
         assert_eq!(view.epoch.watermark, 2);
@@ -2985,7 +3058,7 @@ mod tests {
         begin(&platform(), &state, second);
         // The first record disappears: the gap proves its loss.
         std::fs::remove_file(record_path(&state, 1)).expect("the fixture drops a record");
-        let error = read_operations(&platform(), &state, INTENT_ROWS)
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect_err("a gap is unknown, never a short answer");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
         assert!(error.message().contains("record 1 is missing"));
@@ -3005,12 +3078,12 @@ mod tests {
             OperationPhase::Removed,
             OperationPhase::Deleted,
         ] {
-            record = advance_operation(&write, &platform(), &state, &record, phase)
+            record = advance_operation(&write, &platform(), &platform(), &state, &record, phase)
                 .expect("the ladder advances");
         }
         assert!(record.is_pending() && record.finalization_owed());
         std::fs::remove_file(record_path(&state, 1)).expect("the fixture drops the record");
-        let error = read_operations(&platform(), &state, INTENT_ROWS)
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect_err("the loss is a gap, never silence");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
@@ -3025,7 +3098,7 @@ mod tests {
             write_fixture_record(&state, &record, sequence);
         }
         // (Both records carry `barge.operation/1` already.)
-        let error = read_operations(&platform(), &state, INTENT_ROWS)
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect_err("two unwatermarked records refuse");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
 
@@ -3034,7 +3107,7 @@ mod tests {
         init(&state2);
         let record = cancelled_record(&uuid2, 2);
         write_fixture_record(&state2, &record, 2);
-        let error = read_operations(&platform(), &state2, INTENT_ROWS)
+        let error = read_operations(&platform(), &platform(), &state2, INTENT_ROWS)
             .expect_err("a record beyond watermark + 1 refuses");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
@@ -3047,7 +3120,7 @@ mod tests {
         // A malformed record.
         std::fs::write(record_path(&state, 1), "{\"schema\": \"barge.operation/1\"")
             .expect("the fixture writes");
-        let error = read_operations(&platform(), &state, INTENT_ROWS)
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect_err("a malformed record refuses");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
 
@@ -3056,15 +3129,15 @@ mod tests {
         let intent = legacy_intent_record(&uuid);
         let bytes = serde_json::to_vec_pretty(&intent).expect("the fixture encodes");
         std::fs::write(record_path(&state, 1), bytes).expect("the fixture writes");
-        let error = read_operations(&platform(), &state, INTENT_ROWS)
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect_err("a foreign format refuses");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
 
         // A record whose content sequence is not its file name.
         let moved = cancelled_record(&uuid, 1);
         write_fixture_record(&state, &moved, 3);
-        let error =
-            read_operations(&platform(), &state, INTENT_ROWS).expect_err("a name mismatch refuses");
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
+            .expect_err("a name mismatch refuses");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
 
@@ -3077,14 +3150,14 @@ mod tests {
             "not a journal entry",
         )
         .expect("the fixture writes");
-        let error =
-            read_operations(&platform(), &state, INTENT_ROWS).expect_err("a stray entry refuses");
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
+            .expect_err("a stray entry refuses");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
         std::fs::remove_file(state.root().join("operations").join("notes.txt"))
             .expect("the fixture cleans");
         std::fs::write(state.root().join("operations").join("01.json"), "{}")
             .expect("the fixture writes");
-        let error = read_operations(&platform(), &state, INTENT_ROWS)
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect_err("a leading-zero name refuses");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
@@ -3099,7 +3172,7 @@ mod tests {
             .expect("the fixture writes");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .expect("the fixture is private");
-        let error = read_operations(&platform(), &state, INTENT_ROWS)
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect_err("an over-cap record refuses");
         assert_eq!(error.kind(), ErrorKind::ResourceBound);
     }
@@ -3130,7 +3203,7 @@ mod tests {
         publish_identity_fixture(&state, &identity);
 
         // The journal at its cap answers, but never allocates again.
-        let view = read_operations(&platform(), &state, INTENT_ROWS)
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the full journal answers")
             .expect("initialized");
         assert_eq!(view.records.len(), INTENT_ROWS);
@@ -3140,11 +3213,11 @@ mod tests {
         fresh.key = Some("prune-run-fresh".to_owned());
         fresh.request_digest = Some("8".repeat(64));
         fresh.unit.inode = 8_001;
-        let error = begin_refused(&platform(), &state, fresh);
+        let error = begin_refused(&platform(), &platform(), &state, fresh);
         assert_eq!(error.kind(), ErrorKind::ResourceBound);
 
         // A read under the cap refuses rather than truncating.
-        let error = read_operations(&platform(), &state, INTENT_ROWS - 1)
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS - 1)
             .expect_err("a short read is refused, never silent");
         assert_eq!(error.kind(), ErrorKind::ResourceBound);
     }
@@ -3159,14 +3232,22 @@ mod tests {
         let write = write_token(&mut locks, &uuid);
 
         // A rewind refuses before anything is written.
-        let error = advance_operation(&write, &platform(), &state, &record, OperationPhase::Intent)
-            .expect_err("the ladder never rewinds");
+        let error = advance_operation(
+            &write,
+            &platform(),
+            &platform(),
+            &state,
+            &record,
+            OperationPhase::Intent,
+        )
+        .expect_err("the ladder never rewinds");
         assert_eq!(error.kind(), ErrorKind::Usage);
 
         // Skipping is refused: every phase is its own durable evidence, and a
         // publish that skipped one would stand in for the evidence it skipped.
         let error = advance_operation(
             &write,
+            &platform(),
             &platform(),
             &state,
             &record,
@@ -3176,6 +3257,7 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Usage);
         let error = advance_operation(
             &write,
+            &platform(),
             &platform(),
             &state,
             &record,
@@ -3192,9 +3274,9 @@ mod tests {
             OperationPhase::Removed,
             OperationPhase::Deleted,
         ] {
-            record = advance_operation(&write, &platform(), &state, &record, phase)
+            record = advance_operation(&write, &platform(), &platform(), &state, &record, phase)
                 .expect("the ladder advances");
-            let read = read_operations(&platform(), &state, INTENT_ROWS)
+            let read = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
                 .expect("the journal reads")
                 .expect("initialized");
             assert_eq!(
@@ -3208,6 +3290,7 @@ mod tests {
         let error = advance_operation(
             &write,
             &platform(),
+            &platform(),
             &state,
             &record,
             OperationPhase::Cancelled,
@@ -3219,6 +3302,7 @@ mod tests {
         record = advance_operation(
             &write,
             &platform(),
+            &platform(),
             &state,
             &record,
             OperationPhase::Complete,
@@ -3229,6 +3313,7 @@ mod tests {
         assert!(!record.binds_conflict());
         let error = advance_operation(
             &write,
+            &platform(),
             &platform(),
             &state,
             &record,
@@ -3249,6 +3334,7 @@ mod tests {
         let cancelled = advance_operation(
             &write,
             &platform(),
+            &platform(),
             &state,
             &record,
             OperationPhase::Cancelled,
@@ -3259,7 +3345,7 @@ mod tests {
         assert!(!cancelled.binds_conflict());
 
         // The record is retained: the gapless inventory is unchanged.
-        let view = read_operations(&platform(), &state, INTENT_ROWS)
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the journal reads")
             .expect("initialized");
         assert_eq!(view.records.len(), 1);
@@ -3267,7 +3353,7 @@ mod tests {
 
         // The spent key refuses; the digest no longer binds; a fresh key with
         // the same digest begins again.
-        let error = begin_refused(&platform(), &state, delegated_request(&uuid));
+        let error = begin_refused(&platform(), &platform(), &state, delegated_request(&uuid));
         assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
         let mut fresh = delegated_request(&uuid);
         fresh.key = Some("prune-run-2".to_owned());
@@ -3280,6 +3366,7 @@ mod tests {
         // A cancelled record never advances again.
         let error = advance_operation(
             &write,
+            &platform(),
             &platform(),
             &state,
             &cancelled,
@@ -3309,6 +3396,7 @@ mod tests {
         let next = record_operation_captures(
             &write,
             &platform(),
+            &platform(),
             &state,
             &record,
             std::slice::from_ref(&capture),
@@ -3316,7 +3404,7 @@ mod tests {
         .expect("the capture chain publishes");
         assert_eq!(next.generation, record.generation + 1);
         assert_eq!(next.phase, record.phase);
-        let view = read_operations(&platform(), &state, INTENT_ROWS)
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the journal reads")
             .expect("initialized");
         assert_eq!(view.records[0].captures.len(), 1);
@@ -3331,15 +3419,22 @@ mod tests {
             put_back: PutBackOutcome::Pending,
             reason: "the captured object was not the observed one".to_owned(),
         };
-        let next =
-            super::record_operation_foreign_capture(&write, &platform(), &state, &next, &foreign)
-                .expect("the foreign capture publishes before its put-back");
+        let next = super::record_operation_foreign_capture(
+            &write,
+            &platform(),
+            &platform(),
+            &state,
+            &next,
+            &foreign,
+        )
+        .expect("the foreign capture publishes before its put-back");
         assert_eq!(next.foreign_captures.len(), 1);
 
         // The bounds are the shipped ones.
         let many: Vec<CaptureRecord> = (0..21).map(|_| capture.clone()).collect();
-        let error = record_operation_captures(&write, &platform(), &state, &record, &many)
-            .expect_err("the capture bound refuses");
+        let error =
+            record_operation_captures(&write, &platform(), &platform(), &state, &record, &many)
+                .expect_err("the capture bound refuses");
         assert_eq!(error.kind(), ErrorKind::ResourceBound);
     }
 
@@ -3363,17 +3458,29 @@ mod tests {
             .recv()
             .expect("the holder took the lock before the consult");
         let mut busy_locks = LockSet::new(state.clone());
-        let error = consult_operations(&platform(), &state, &mut busy_locks, INTENT_ROWS)
-            .expect_err("a busy journal is refused immediately");
+        let error = consult_operations(
+            &platform(),
+            &platform(),
+            &state,
+            &mut busy_locks,
+            INTENT_ROWS,
+        )
+        .expect_err("a busy journal is refused immediately");
         drop(busy_locks);
         assert_eq!(error.kind(), ErrorKind::Locked);
         holder.join().expect("the holder finishes");
 
         // With the journal free, the consult answers the authoritative read.
         let mut consult_locks = LockSet::new(state.clone());
-        let view = consult_operations(&platform(), &state, &mut consult_locks, INTENT_ROWS)
-            .expect("the consult answers when free")
-            .expect("the journal is bound");
+        let view = consult_operations(
+            &platform(),
+            &platform(),
+            &state,
+            &mut consult_locks,
+            INTENT_ROWS,
+        )
+        .expect("the consult answers when free")
+        .expect("the journal is bound");
         assert_eq!(view.records.len(), 1);
     }
 
@@ -3384,8 +3491,9 @@ mod tests {
         // The layout exists but the journal was never initialized and no
         // writer ever locked: no lock file exists.
         assert!(!state.operations_lock_path().exists());
-        let consulted = consult_operations(&platform(), &state, &mut locks, INTENT_ROWS)
-            .expect("the consult answers");
+        let consulted =
+            consult_operations(&platform(), &platform(), &state, &mut locks, INTENT_ROWS)
+                .expect("the consult answers");
         assert!(
             consulted.is_none(),
             "an unbound journal is a defined non-answer"
@@ -3406,7 +3514,7 @@ mod tests {
             .permissions();
         permissions.set_mode(0o644);
         std::fs::set_permissions(&epoch, permissions).expect("the fixture widens the mode");
-        let error = read_operations(&platform(), &state, INTENT_ROWS)
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect_err("an exposed document refuses");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
         let mut permissions = std::fs::metadata(&epoch)
@@ -3420,7 +3528,7 @@ mod tests {
         std::fs::write(&elsewhere, "{}").expect("the fixture writes a target");
         std::fs::remove_file(&epoch).expect("the fixture drops the epoch");
         std::os::unix::fs::symlink(&elsewhere, &epoch).expect("the fixture links");
-        let error = read_operations(&platform(), &state, INTENT_ROWS)
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect_err("a linked document refuses");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
@@ -3438,7 +3546,7 @@ mod tests {
         begin(&platform(), &state, delegated_request(&uuid));
         let intents = read_intents(&state, INTENT_ROWS).expect("the shipped journal reads");
         assert_eq!(intents.records.len(), 1);
-        let view = read_operations(&platform(), &state, INTENT_ROWS)
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the successor journal reads")
             .expect("initialized");
         assert_eq!(view.records.len(), 1);
@@ -3452,7 +3560,7 @@ mod tests {
 
         // A healthy journal is authoritative, and the tail is reported as
         // recoverable when the watermark lags.
-        let report = inspect_operation_journal(&platform(), &state, INTENT_ROWS)
+        let report = inspect_operation_journal(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the diagnosis reads");
         assert!(report.authoritative());
         assert!(report.findings.is_empty());
@@ -3466,7 +3574,7 @@ mod tests {
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .collect();
-        let report = inspect_operation_journal(&platform(), &state, INTENT_ROWS)
+        let report = inspect_operation_journal(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the diagnosis reads");
         assert!(!report.authoritative());
         assert!(report
@@ -3483,14 +3591,14 @@ mod tests {
         // An unbound journal reports as not authoritative for delegation, and
         // an over-cap journal names its bound.
         let (_dir2, state2, _uuid2) = fixture("operation-diagnostic-unbound");
-        let report2 = inspect_operation_journal(&platform(), &state2, INTENT_ROWS)
+        let report2 = inspect_operation_journal(&platform(), &platform(), &state2, INTENT_ROWS)
             .expect("the diagnosis reads");
         assert!(report2.findings.is_empty());
         let (_dir3, state3, uuid3) = fixture("operation-diagnostic-tail");
         init(&state3);
         super::fail_next_watermark_publish(std::io::Error::from_raw_os_error(28));
         begin(&platform(), &state3, delegated_request(&uuid3));
-        let report3 = inspect_operation_journal(&platform(), &state3, INTENT_ROWS)
+        let report3 = inspect_operation_journal(&platform(), &platform(), &state3, INTENT_ROWS)
             .expect("the diagnosis reads");
         assert!(
             report3.authoritative(),
@@ -3512,11 +3620,11 @@ mod tests {
             version: "1".to_owned(),
             payload: "x".repeat(OPERATION_PAYLOAD_CAP_BYTES + 1),
         });
-        let error = begin_refused(&platform(), &state, over);
+        let error = begin_refused(&platform(), &platform(), &state, over);
         assert_eq!(error.kind(), ErrorKind::ResourceBound);
         let mut preset = delegated_request(&uuid);
         preset.unit.capture_name = Some(format!("{QUARANTINE_PREFIX}1"));
-        let error = begin_refused(&platform(), &state, preset);
+        let error = begin_refused(&platform(), &platform(), &state, preset);
         assert_eq!(error.kind(), ErrorKind::Usage);
     }
 
@@ -3564,7 +3672,7 @@ mod tests {
                 created_ms: epoch.created_ms,
             },
         );
-        let before = read_operations(&platform(), &state, INTENT_ROWS)
+        let before = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the full journal answers")
             .expect("initialized");
 
@@ -3594,7 +3702,7 @@ mod tests {
         let mut mismatched = delegated_request(&uuid);
         mismatched.key = Some("prune-run-live".to_owned());
         mismatched.request_digest = Some("7".repeat(64));
-        let error = begin_refused(&platform(), &state, mismatched);
+        let error = begin_refused(&platform(), &platform(), &state, mismatched);
         assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
 
         // A genuinely new allocation refuses, and writes nothing.
@@ -3602,9 +3710,9 @@ mod tests {
         fresh.key = Some("prune-run-fresh".to_owned());
         fresh.request_digest = Some("8".repeat(64));
         fresh.unit.inode = 8_001;
-        let error = begin_refused(&platform(), &state, fresh);
+        let error = begin_refused(&platform(), &platform(), &state, fresh);
         assert_eq!(error.kind(), ErrorKind::ResourceBound);
-        let after = read_operations(&platform(), &state, INTENT_ROWS)
+        let after = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the journal still answers")
             .expect("initialized");
         assert_eq!(after.records.len(), before.records.len());
@@ -3623,13 +3731,13 @@ mod tests {
         let original = state.root().join("operations-original");
         std::fs::rename(state.operations_dir(), &original).expect("the fixture moves");
         std::os::unix::fs::symlink(&substitute, state.operations_dir()).expect("the fixture links");
-        let error = read_operations(&platform(), &state, INTENT_ROWS)
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect_err("a linked journal directory refuses reads");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
-        let error = begin_refused(&platform(), &state, delegated_request(&uuid));
+        let error = begin_refused(&platform(), &platform(), &state, delegated_request(&uuid));
         assert_eq!(error.kind(), ErrorKind::UnknownState);
         let mut locks = LockSet::new(state.clone());
-        let error = init_operation_journal(&platform(), &state, &mut locks)
+        let error = init_operation_journal(&platform(), &platform(), &state, &mut locks)
             .expect_err("a linked journal directory refuses init");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
         let entries = std::fs::read_dir(&substitute)
@@ -3639,7 +3747,7 @@ mod tests {
         // The real directory still answers through its own name.
         std::fs::remove_file(state.operations_dir()).expect("the fixture drops the link");
         std::fs::rename(&original, state.operations_dir()).expect("the fixture restores");
-        let view = read_operations(&platform(), &state, INTENT_ROWS)
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect("the restored journal reads")
             .expect("initialized");
         assert_eq!(view.records.len(), 1);
@@ -3655,10 +3763,10 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(state.operations_dir(), permissions)
             .expect("the fixture widens the mode");
-        let error = read_operations(&platform(), &state, INTENT_ROWS)
+        let error = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
             .expect_err("an exposed journal directory refuses reads");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
-        let error = begin_refused(&platform(), &state, delegated_request(&uuid));
+        let error = begin_refused(&platform(), &platform(), &state, delegated_request(&uuid));
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
 
@@ -3666,13 +3774,378 @@ mod tests {
     fn a_missing_journal_directory_reads_unbound_and_refuses_writes() {
         let (_dir, state, _uuid) = fixture("operation-missing-dir");
         std::fs::remove_dir(state.operations_dir()).expect("the fixture drops the directory");
-        let read = read_operations(&platform(), &state, INTENT_ROWS).expect("the read answers");
+        let read = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
+            .expect("the read answers");
         assert!(read.is_none(), "no journal directory is the unbound state");
-        let error = begin_refused(&platform(), &state, delegated_request(&read_dummy_uuid()));
+        let error = begin_refused(
+            &platform(),
+            &platform(),
+            &state,
+            delegated_request(&read_dummy_uuid()),
+        );
         assert_eq!(error.kind(), ErrorKind::UnknownState);
         let mut locks = LockSet::new(state.clone());
-        let error = init_operation_journal(&platform(), &state, &mut locks)
+        let error = init_operation_journal(&platform(), &platform(), &state, &mut locks)
             .expect_err("initialization never creates a directory");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+    }
+
+    /// A platform seam whose every directory and document fact reports one
+    /// foreign owner: the injected substitute for another account's files, so
+    /// no host chown or privilege experiment is ever run.
+    struct ForeignOwned {
+        inner: crate::os::MacOs,
+        foreign_uid: u32,
+    }
+
+    impl DirOps for ForeignOwned {
+        fn open_path(&self, path: &Path) -> crate::error::Result<crate::os::DirHandle> {
+            self.inner.open_path(path)
+        }
+        fn path_facts(&self, path: &Path) -> crate::error::Result<Option<crate::os::EntryFacts>> {
+            Ok(self.inner.path_facts(path)?.map(|mut facts| {
+                facts.uid = self.foreign_uid;
+                facts
+            }))
+        }
+        fn open_child_dir(
+            &self,
+            parent: &DirHandle,
+            name: &str,
+        ) -> crate::error::Result<DirHandle> {
+            self.inner.open_child_dir(parent, name)
+        }
+        fn duplicate_dir(&self, handle: &DirHandle) -> crate::error::Result<DirHandle> {
+            self.inner.duplicate_dir(handle)
+        }
+        fn child_facts(
+            &self,
+            parent: &DirHandle,
+            name: &str,
+        ) -> crate::error::Result<Option<crate::os::EntryFacts>> {
+            Ok(self.inner.child_facts(parent, name)?.map(|mut facts| {
+                facts.uid = self.foreign_uid;
+                facts
+            }))
+        }
+        fn create_child_dir(
+            &self,
+            parent: &DirHandle,
+            name: &str,
+            mode: u32,
+        ) -> crate::error::Result<crate::os::DirId> {
+            self.inner.create_child_dir(parent, name, mode)
+        }
+        fn publish_child_file(
+            &self,
+            parent: &DirHandle,
+            name: &str,
+            bytes: &[u8],
+            mode: u32,
+        ) -> crate::error::Result<()> {
+            self.inner.publish_child_file(parent, name, bytes, mode)
+        }
+        fn read_child_file(
+            &self,
+            parent: &DirHandle,
+            name: &str,
+            cap: usize,
+        ) -> crate::error::Result<Option<Vec<u8>>> {
+            self.inner.read_child_file(parent, name, cap)
+        }
+        fn list_children(
+            &self,
+            parent: &DirHandle,
+            max_names: usize,
+        ) -> crate::error::Result<crate::os::ChildListing> {
+            self.inner.list_children(parent, max_names)
+        }
+        fn list_names(
+            &self,
+            parent: &DirHandle,
+            max_names: usize,
+        ) -> crate::error::Result<crate::os::DirNames> {
+            self.inner.list_names(parent, max_names)
+        }
+        fn remove_child(
+            &self,
+            parent: &DirHandle,
+            name: &str,
+            kind: crate::os::RemoveKind,
+        ) -> crate::error::Result<crate::os::ChildRemoval> {
+            self.inner.remove_child(parent, name, kind)
+        }
+        fn rename_child(
+            &self,
+            parent: &DirHandle,
+            from: &str,
+            to: &str,
+        ) -> crate::error::Result<crate::os::RenameOutcome> {
+            self.inner.rename_child(parent, from, to)
+        }
+        fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> crate::error::Result<()> {
+            self.inner.set_dir_mode(handle, mode)
+        }
+        fn dir_facts(&self, handle: &DirHandle) -> crate::error::Result<crate::os::EntryFacts> {
+            let mut facts = self.inner.dir_facts(handle)?;
+            facts.uid = self.foreign_uid;
+            Ok(facts)
+        }
+        fn recheck_dir(&self, handle: &DirHandle) -> crate::error::Result<crate::os::DirId> {
+            self.inner.recheck_dir(handle)
+        }
+        fn create_child_symlink(
+            &self,
+            parent: &DirHandle,
+            name: &str,
+            target: &Path,
+        ) -> crate::error::Result<()> {
+            self.inner.create_child_symlink(parent, name, target)
+        }
+        fn read_link(&self, path: &Path) -> crate::error::Result<Option<PathBuf>> {
+            self.inner.read_link(path)
+        }
+        fn random_bytes(&self, length: usize) -> crate::error::Result<Vec<u8>> {
+            self.inner.random_bytes(length)
+        }
+    }
+
+    /// An observer that cannot decide the executing account at all.
+    struct UndecidedAccount;
+
+    impl crate::os::ProcessObserver for UndecidedAccount {
+        fn effective_uid(&self) -> crate::error::Result<u32> {
+            Err(Error::new(
+                ErrorKind::Io,
+                "the injected account fact is unreadable",
+            ))
+        }
+        fn boot_identity(&self) -> crate::error::Result<String> {
+            Ok("fixture-boot".to_owned())
+        }
+        fn process_start(&self, _pid: u32) -> crate::error::Result<Option<u64>> {
+            Ok(None)
+        }
+        fn verify_platform_binary(
+            &self,
+            _classified: crate::os::ProcessIdentity,
+        ) -> crate::error::Result<crate::os::PlatformStatus> {
+            Err(Error::new(ErrorKind::Io, "unused in this fixture"))
+        }
+        fn scan_open_descriptors(
+            &self,
+            _request: &crate::os::DescriptorScanRequest<'_>,
+        ) -> crate::error::Result<crate::os::DescriptorScan> {
+            Err(Error::new(ErrorKind::Io, "unused in this fixture"))
+        }
+    }
+
+    /// An observer that names one foreign account as this one's.
+    struct ForeignAccount;
+
+    impl crate::os::ProcessObserver for ForeignAccount {
+        fn effective_uid(&self) -> crate::error::Result<u32> {
+            Ok(4_242_424)
+        }
+        fn boot_identity(&self) -> crate::error::Result<String> {
+            Ok("fixture-boot".to_owned())
+        }
+        fn process_start(&self, _pid: u32) -> crate::error::Result<Option<u64>> {
+            Ok(None)
+        }
+        fn verify_platform_binary(
+            &self,
+            _classified: crate::os::ProcessIdentity,
+        ) -> crate::error::Result<crate::os::PlatformStatus> {
+            Err(Error::new(ErrorKind::Io, "unused in this fixture"))
+        }
+        fn scan_open_descriptors(
+            &self,
+            _request: &crate::os::DescriptorScanRequest<'_>,
+        ) -> crate::error::Result<crate::os::DescriptorScan> {
+            Err(Error::new(ErrorKind::Io, "unused in this fixture"))
+        }
+    }
+
+    #[test]
+    fn a_foreign_owned_journal_refuses_as_someone_elses_data() {
+        let (_dir, state, uuid) = fixture("operation-foreign-owner");
+        init(&state);
+        begin(&platform(), &state, delegated_request(&uuid));
+        // Every fact the custody opens reports another account's ownership:
+        // the state directory, the journal directory, and every leaf.
+        let foreign = ForeignOwned {
+            inner: platform(),
+            foreign_uid: 4_242_424,
+        };
+        let error = read_operations(&foreign, &platform(), &state, INTENT_ROWS)
+            .expect_err("a foreign-owned journal is never read");
+        assert_eq!(error.kind(), ErrorKind::ForeignOwner);
+        let error = begin_refused(&foreign, &platform(), &state, delegated_request(&uuid));
+        assert_eq!(error.kind(), ErrorKind::ForeignOwner);
+        let mut locks = LockSet::new(state.clone());
+        let error = init_operation_journal(&foreign, &platform(), &state, &mut locks)
+            .expect_err("a foreign-owned journal is never re-initialized");
+        assert_eq!(error.kind(), ErrorKind::ForeignOwner);
+        // The real account still reads its own journal untouched.
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
+            .expect("the journal reads")
+            .expect("initialized");
+        assert_eq!(view.records.len(), 1);
+
+        // The mirror case: our own files, but the executing account names
+        // itself as someone else — the same refusal, from the account side.
+        let error = read_operations(&platform(), &ForeignAccount, &state, INTENT_ROWS)
+            .expect_err("a journal is never read for another account");
+        assert_eq!(error.kind(), ErrorKind::ForeignOwner);
+    }
+
+    #[test]
+    fn a_foreign_owned_document_leaf_refuses_even_under_a_verified_parent() {
+        let (_dir, state, uuid) = fixture("operation-foreign-leaf");
+        init(&state);
+        begin(&platform(), &state, delegated_request(&uuid));
+        // The directories verify as this account's, but the epoch leaf is
+        // another account's: a verified parent never proves a child's owner.
+        struct ForeignLeaf {
+            inner: crate::os::MacOs,
+        }
+        impl crate::os::DirOps for ForeignLeaf {
+            fn open_path(&self, path: &Path) -> crate::error::Result<crate::os::DirHandle> {
+                self.inner.open_path(path)
+            }
+            fn path_facts(
+                &self,
+                path: &Path,
+            ) -> crate::error::Result<Option<crate::os::EntryFacts>> {
+                self.inner.path_facts(path)
+            }
+            fn open_child_dir(
+                &self,
+                parent: &DirHandle,
+                name: &str,
+            ) -> crate::error::Result<DirHandle> {
+                self.inner.open_child_dir(parent, name)
+            }
+            fn child_facts(
+                &self,
+                parent: &DirHandle,
+                name: &str,
+            ) -> crate::error::Result<Option<crate::os::EntryFacts>> {
+                Ok(self.inner.child_facts(parent, name)?.map(|mut facts| {
+                    if name == EPOCH_FILE_NAME {
+                        facts.uid = 4_242_424;
+                    }
+                    facts
+                }))
+            }
+            fn duplicate_dir(&self, handle: &DirHandle) -> crate::error::Result<DirHandle> {
+                self.inner.duplicate_dir(handle)
+            }
+            fn create_child_dir(
+                &self,
+                parent: &DirHandle,
+                name: &str,
+                mode: u32,
+            ) -> crate::error::Result<crate::os::DirId> {
+                self.inner.create_child_dir(parent, name, mode)
+            }
+            fn publish_child_file(
+                &self,
+                parent: &DirHandle,
+                name: &str,
+                bytes: &[u8],
+                mode: u32,
+            ) -> crate::error::Result<()> {
+                self.inner.publish_child_file(parent, name, bytes, mode)
+            }
+            fn read_child_file(
+                &self,
+                parent: &DirHandle,
+                name: &str,
+                cap: usize,
+            ) -> crate::error::Result<Option<Vec<u8>>> {
+                self.inner.read_child_file(parent, name, cap)
+            }
+            fn list_children(
+                &self,
+                parent: &DirHandle,
+                max_names: usize,
+            ) -> crate::error::Result<crate::os::ChildListing> {
+                self.inner.list_children(parent, max_names)
+            }
+            fn list_names(
+                &self,
+                parent: &DirHandle,
+                max_names: usize,
+            ) -> crate::error::Result<crate::os::DirNames> {
+                self.inner.list_names(parent, max_names)
+            }
+            fn remove_child(
+                &self,
+                parent: &DirHandle,
+                name: &str,
+                kind: crate::os::RemoveKind,
+            ) -> crate::error::Result<crate::os::ChildRemoval> {
+                self.inner.remove_child(parent, name, kind)
+            }
+            fn rename_child(
+                &self,
+                parent: &DirHandle,
+                from: &str,
+                to: &str,
+            ) -> crate::error::Result<crate::os::RenameOutcome> {
+                self.inner.rename_child(parent, from, to)
+            }
+            fn set_dir_mode(&self, handle: &DirHandle, mode: u32) -> crate::error::Result<()> {
+                self.inner.set_dir_mode(handle, mode)
+            }
+            fn dir_facts(&self, handle: &DirHandle) -> crate::error::Result<crate::os::EntryFacts> {
+                self.inner.dir_facts(handle)
+            }
+            fn recheck_dir(&self, handle: &DirHandle) -> crate::error::Result<crate::os::DirId> {
+                self.inner.recheck_dir(handle)
+            }
+            fn create_child_symlink(
+                &self,
+                parent: &DirHandle,
+                name: &str,
+                target: &Path,
+            ) -> crate::error::Result<()> {
+                self.inner.create_child_symlink(parent, name, target)
+            }
+            fn read_link(&self, path: &Path) -> crate::error::Result<Option<PathBuf>> {
+                self.inner.read_link(path)
+            }
+            fn random_bytes(&self, length: usize) -> crate::error::Result<Vec<u8>> {
+                self.inner.random_bytes(length)
+            }
+        }
+        let leaf = ForeignLeaf { inner: platform() };
+        let error = read_operations(&leaf, &platform(), &state, INTENT_ROWS)
+            .expect_err("a foreign-owned leaf is never read");
+        assert_eq!(error.kind(), ErrorKind::ForeignOwner);
+    }
+
+    #[test]
+    fn an_undecided_current_account_refuses_every_access() {
+        let (_dir, state, _uuid) = fixture("operation-undecided-account");
+        init(&state);
+        let undecided = UndecidedAccount;
+        let error = read_operations(&platform(), &undecided, &state, INTENT_ROWS)
+            .expect_err("an undecided account never matches");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(error.message().contains("cannot be decided"));
+        let error = begin_refused(
+            &platform(),
+            &undecided,
+            &state,
+            delegated_request(&read_dummy_uuid()),
+        );
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        let mut locks = LockSet::new(state.clone());
+        let error = init_operation_journal(&platform(), &undecided, &state, &mut locks)
+            .expect_err("initialization refuses an undecided account");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
     }
 

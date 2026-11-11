@@ -196,7 +196,7 @@ fn delegated_request(uuid: &VolumeUuid, key: &str, inode: u64) -> BeginRequest {
 
 fn begin(f: &Fixture, request: BeginRequest) -> Result<Begun, barge::error::Error> {
     let mut locks = LockSet::new(f.state.clone());
-    begin_operation(&f.dirs, &f.state, &mut locks, request)
+    begin_operation(&f.dirs, &f.dirs, &f.state, &mut locks, request)
 }
 
 fn begin_result(
@@ -204,11 +204,13 @@ fn begin_result(
     request: BeginRequest,
 ) -> Result<Result<Begun, barge::error::Error>, String> {
     let mut locks = LockSet::new(f.state.clone());
-    Ok(begin_operation(&f.dirs, &f.state, &mut locks, request))
+    Ok(begin_operation(
+        &f.dirs, &f.dirs, &f.state, &mut locks, request,
+    ))
 }
 
 fn read(f: &Fixture) -> Result<barge::operation::JournalView, String> {
-    read_operations(&f.dirs, &f.state, INTENT_ROWS)
+    read_operations(&f.dirs, &f.dirs, &f.state, INTENT_ROWS)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "the journal read as unbound".to_owned())
 }
@@ -340,7 +342,7 @@ fn init_and_binding(_injections: &mut Vec<&'static str>) -> Result<String, Strin
     let f = fixture("j1")?;
     let mut locks = LockSet::new(f.state.clone());
     step!(
-        init_operation_journal(&f.dirs, &f.state, &mut locks),
+        init_operation_journal(&f.dirs, &f.dirs, &f.state, &mut locks),
         "init"
     );
     let view = read(&f)?;
@@ -353,7 +355,7 @@ fn init_and_binding(_injections: &mut Vec<&'static str>) -> Result<String, Strin
         "the pair carries one creation id",
     )?;
     step!(
-        init_operation_journal(&f.dirs, &f.state, &mut locks),
+        init_operation_journal(&f.dirs, &f.dirs, &f.state, &mut locks),
         "re-init"
     );
     let again = read(&f)?;
@@ -397,7 +399,8 @@ fn request_identity(_injections: &mut Vec<&'static str>) -> Result<String, Strin
 
 fn init(f: &Fixture) -> Result<(), String> {
     let mut locks = LockSet::new(f.state.clone());
-    init_operation_journal(&f.dirs, &f.state, &mut locks).map_err(|error| error.to_string())
+    init_operation_journal(&f.dirs, &f.dirs, &f.state, &mut locks)
+        .map_err(|error| error.to_string())
 }
 
 fn full_capacity_retry(injections: &mut Vec<&'static str>) -> Result<String, String> {
@@ -534,7 +537,7 @@ fn gap_and_loss(injections: &mut Vec<&'static str>) -> Result<String, String> {
         OperationPhase::Deleted,
     ] {
         record = step!(
-            proof::advance(&write, &f2.dirs, &f2.state, &record, phase),
+            proof::advance(&write, &f2.dirs, &f2.dirs, &f2.state, &record, phase),
             "the ladder advances"
         );
     }
@@ -555,12 +558,21 @@ fn retained_terminals(injections: &mut Vec<&'static str>) -> Result<String, Stri
     let write = write_token(&f)?;
     // Skipping is refused: every phase is its own durable evidence.
     expect(
-        proof::advance(&write, &f.dirs, &f.state, &record, OperationPhase::Deleted).is_err(),
+        proof::advance(
+            &write,
+            &f.dirs,
+            &f.dirs,
+            &f.state,
+            &record,
+            OperationPhase::Deleted,
+        )
+        .is_err(),
         "the ladder never skips to deleted",
     )?;
     let cancelled = step!(
         proof::advance(
             &write,
+            &f.dirs,
             &f.dirs,
             &f.state,
             &record,
@@ -585,12 +597,19 @@ fn retained_terminals(injections: &mut Vec<&'static str>) -> Result<String, Stri
         OperationPhase::Deleted,
     ] {
         record = step!(
-            proof::advance(&write, &f.dirs, &f.state, &record, phase),
+            proof::advance(&write, &f.dirs, &f.dirs, &f.state, &record, phase),
             "the ladder advances"
         );
     }
     let settled = step!(
-        proof::advance(&write, &f.dirs, &f.state, &record, OperationPhase::Complete),
+        proof::advance(
+            &write,
+            &f.dirs,
+            &f.dirs,
+            &f.state,
+            &record,
+            OperationPhase::Complete
+        ),
         "the ack settles"
     );
     expect(
@@ -660,7 +679,7 @@ fn directory_custody(injections: &mut Vec<&'static str>) -> Result<String, Strin
     )?;
     let mut locks = LockSet::new(f.state.clone());
     expect(
-        init_operation_journal(&f.dirs, &f.state, &mut locks).is_err(),
+        init_operation_journal(&f.dirs, &f.dirs, &f.state, &mut locks).is_err(),
         "a linked journal directory refuses init",
     )?;
     let substitute_entries = std::fs::read_dir(&substitute)
@@ -686,7 +705,7 @@ fn directory_custody(injections: &mut Vec<&'static str>) -> Result<String, Strin
     let f2 = fixture("j9b")?;
     std::fs::remove_dir(f2.state.operations_dir()).map_err(|e| e.to_string())?;
     expect(
-        read_operations(&f2.dirs, &f2.state, INTENT_ROWS)
+        read_operations(&f2.dirs, &f2.dirs, &f2.state, INTENT_ROWS)
             .map_err(|e| e.to_string())?
             .is_none(),
         "a missing journal directory reads as unbound",
@@ -715,7 +734,7 @@ fn consult_and_legacy(injections: &mut Vec<&'static str>) -> Result<String, Stri
         .recv()
         .map_err(|_| "the holder never locked".to_owned())?;
     let mut busy = LockSet::new(f.state.clone());
-    let error = consult_operations(&f.dirs, &f.state, &mut busy, INTENT_ROWS)
+    let error = consult_operations(&f.dirs, &f.dirs, &f.state, &mut busy, INTENT_ROWS)
         .err()
         .ok_or("a busy journal must refuse the consult")?;
     expect(
@@ -726,7 +745,7 @@ fn consult_and_legacy(injections: &mut Vec<&'static str>) -> Result<String, Stri
         .join()
         .map_err(|_| "the holder panicked".to_owned())?;
     let mut free = LockSet::new(f.state.clone());
-    let view = consult_operations(&f.dirs, &f.state, &mut free, INTENT_ROWS)
+    let view = consult_operations(&f.dirs, &f.dirs, &f.state, &mut free, INTENT_ROWS)
         .map_err(|e| e.to_string())?
         .ok_or("the free consult answers")?;
     expect(
@@ -773,6 +792,7 @@ fn capture_evidence(injections: &mut Vec<&'static str>) -> Result<String, String
         proof::record_captures(
             &write,
             &f.dirs,
+            &f.dirs,
             &f.state,
             &record,
             std::slice::from_ref(&capture)
@@ -794,7 +814,7 @@ fn capture_evidence(injections: &mut Vec<&'static str>) -> Result<String, String
         reason: "the captured object was not the observed one".to_owned(),
     };
     step!(
-        proof::record_foreign_capture(&write, &f.dirs, &f.state, &next, &foreign),
+        proof::record_foreign_capture(&write, &f.dirs, &f.dirs, &f.state, &next, &foreign),
         "the foreign capture publishes before its put-back"
     );
     let view = read(&f)?;
@@ -811,7 +831,7 @@ fn diagnostic(injections: &mut Vec<&'static str>) -> Result<String, String> {
     init(&f)?;
     begin(&f, delegated_request(&f.uuid, "prune-run-1", 4_242)).map_err(|e| e.to_string())?;
     let report = step!(
-        inspect_operation_journal(&f.dirs, &f.state, INTENT_ROWS),
+        inspect_operation_journal(&f.dirs, &f.dirs, &f.state, INTENT_ROWS),
         "the diagnosis reads"
     );
     expect(
@@ -824,7 +844,7 @@ fn diagnostic(injections: &mut Vec<&'static str>) -> Result<String, String> {
         .map_err(|e| e.to_string())?
         .count();
     let report = step!(
-        inspect_operation_journal(&f.dirs, &f.state, INTENT_ROWS),
+        inspect_operation_journal(&f.dirs, &f.dirs, &f.state, INTENT_ROWS),
         "the diagnosis reads the gap"
     );
     expect(!report.authoritative(), "a proven gap blocks reads")?;

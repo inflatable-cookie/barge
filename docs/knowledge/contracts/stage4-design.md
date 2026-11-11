@@ -1226,9 +1226,14 @@ no effect behind it:
   real-directory kind and the private permission set through the handles, and
   lists, reads and publishes every document through the handle it verified —
   so a replaced or linked directory is refused, no publication lands in a
-  substitute, and leaf checks never stand in for parent custody. The owner
-  boundary is the private permission set (state directory `0700`, documents
-  `0600`); anything wider is refused, never repaired.
+  substitute, and leaf checks never stand in for parent custody.
+  **Ownership is compared, not assumed:** the journal reads the platform's
+  own effective-uid fact once at open (the existing `ProcessObserver` seam)
+  and refuses — as `foreign_owner` — any opened directory handle or document
+  leaf whose `uid` is not that account, so private modes (`0700`/`0600`,
+  still required) are never mistaken for ownership; an undecided account
+  refuses every access, and each leaf is compared on its own facts, never
+  inherited from its parent.
 - **Actual API for the next dependent slice (059, the checked
   coordinator):** the public store surface is
   `init_operation_journal(dirs, state, locks)`,
