@@ -25,7 +25,8 @@ Contracts own durable interfaces and formats:
   diagnostic that answers the carried "device or inode changed" finding, the
   read-only Oxide output-registry census and its drift report, the stage 4
   matrix and bounds, the Oxide compatibility reading of the absence rule, the
-  stage 4 slices and the proposed validation.
+  stage 4 slices and the proposed validation, and the proposed
+  one-operation-journal recovery design for delegated deletion.
 - [Descriptor-bound parent observations](contracts/oxide-capture-parent-identity.md) owns
   the design for binding parent identity, child component, descriptor identity
   and observed bytes to one attributable operation at the release planner's read

@@ -86,3 +86,12 @@ scope covers implementation, ordinary checks and native readiness, with
 independent exact-head review. Diagnostic, author and distinct reviewer native
 occurrences each require separate planner activation before merge. No
 installation, live adoption, capacity increase or retained-image cleanup follows.
+
+Tom asked for simpler shared recovery on 2026-11-10 (decision
+`1d4a7aee-a8e6-4a75-96f0-b142c4176db2` v2): the delegated-deletion machinery
+must shrink in both products, and a later consumer must not rebuild the
+recovery protocol. The proposed answer — one Barge-owned operation journal
+with typed durable caller hooks — is recorded design-only in the
+[stage 4 design](contracts/stage4-design.md#one-operation-journal-for-delegated-recovery-proposed-2026-11-10);
+design review authorizes neither implementation, migration, native execution
+nor live adoption.
