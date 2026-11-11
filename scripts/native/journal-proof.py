@@ -779,6 +779,16 @@ def run_cases_inner(mode, run_root, effects, deadline_ns):
                 cases.append({"case": case["id"], "status": "failed",
                               "kind": "case", "detail": str(error)})
 
+    if fault is not None and not any(case.get("case") for case in cases):
+        # The stage faulted before any case ran: the counted receipt still
+        # accounts for every fixed group, recorded as never executed.
+        recorded = {case.get("case") for case in cases}
+        for case in CASES:
+            if case["id"] not in recorded:
+                cases.append({"case": case["id"], "status": "unexecuted",
+                              "detail": "the stage faulted before this case"})
+        cases.sort(key=lambda case: case.get("case") or "")
+
     remaining_at_publication = remaining_seconds(effects, deadline_ns)
     clean = (mode == "counted" and fault is None and len(passed) == len(CASES)
              and len(cases) == len(CASES))
@@ -829,7 +839,13 @@ def inner_half(mode, effects):
                 "qualified_inner": False, "cases": [], "refused": containment}
     scratch_real = (facts.get("scratch_facts") or {}).get("realpath") or scratch
 
-    run_root = effects.make_directory(scratch_real, RUN_ROOT_PREFIX)
+    try:
+        run_root = effects.make_directory(scratch_real, RUN_ROOT_PREFIX)
+    except OSError as error:
+        return {"schema": SCHEMA, "stage": "inner", "mode": mode,
+                "qualified_inner": False, "cases": [],
+                "refused": [f"the run root could not be created inside the "
+                            f"owned scratch: {error}"]}
     if not os.path.realpath(run_root).startswith(scratch_real + os.sep):
         return {"schema": SCHEMA, "stage": "inner", "mode": mode,
                 "qualified_inner": False, "cases": [],
@@ -1347,8 +1363,9 @@ def composition_controls():
     harness.scratch_islink = True
     harness.scratch_real_target = (DESIGNATED_SCRATCH
                                    + "/journal-guard/other-scratch")
-    exit_code = outer_half("counted", harness.outer_effects())
-    expect(exit_code != 0, "a symlinked scratch did not fail the run")
+    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
+    expect(isinstance(exit_code, int) and exit_code != 0,
+           "a symlinked scratch did not fail the run")
     inner = harness.inner_receipt or {}
     expect(any("symlink" in refusal for refusal in inner.get("refused", [])),
            "the symlinked scratch was not refused as a symlink")
@@ -1357,8 +1374,9 @@ def composition_controls():
     # itself is the verified layout.
     harness = control_harness()
     harness.evidence_real_target = "/elsewhere/evidence"
-    exit_code = outer_half("counted", harness.outer_effects())
-    expect(exit_code != 0, "evidence outside the owned root did not fail the run")
+    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
+    expect(isinstance(exit_code, int) and exit_code != 0,
+           "evidence outside the owned root did not fail the run")
     inner = harness.inner_receipt or {}
     expect(any("outside the guard's owned root" in refusal
                for refusal in inner.get("refused", [])),
@@ -1623,6 +1641,56 @@ def composition_controls():
            "the scripted symlink fact did not refuse the alias")
     if not any("symlink" in problem for problem in symlink_problems):
         problems.extend(symlink_problems)
+
+    # The real reader: the containment checks must hold against the REAL
+    # InnerEffects.guard_facts — where the symlink regression sat — on a tiny
+    # real private fixture in the verified barge scratch, with only the
+    # external route query faked. No subprocess, no child, no stage, no
+    # guarded launch. The owned root is a direct child of the designated
+    # scratch, so the reference geometry holds for the fixture itself.
+    import shutil as _shutil
+    fixture = tempfile.mkdtemp(prefix="journal-facts-", dir=DESIGNATED_SCRATCH)
+    try:
+        scratch = os.path.join(fixture, "scratch")
+        evidence = os.path.join(fixture, "evidence")
+        os.makedirs(scratch, mode=0o755)
+        os.makedirs(evidence, mode=0o755)
+        os.chmod(fixture, 0o700)
+        link = os.path.join(fixture, "scratch-alias")
+        os.symlink(scratch, link)
+        outside = os.path.join(DESIGNATED_SCRATCH,
+                               "journal-facts-outside-evidence")
+        os.makedirs(outside, mode=0o755)
+
+        saved_route_query = base.scratch_route_facts
+        try:
+            base.scratch_route_facts = lambda path, mount: {
+                "path": path, "volume_uuid": ROUTE_UUID,
+                "owner_uid": os.getuid(), "uid": os.getuid(),
+                "mode": 0o755, "present": True,
+                "realpath": os.path.realpath(path),
+            }
+            real_effects = InnerEffects.from_environment()
+
+            accepted = real_effects.guard_facts(scratch, evidence)
+            expect(guard_containment_problems(accepted) == [],
+                   "the real reader refused the actual 0755/0700 layout")
+
+            symlinked = real_effects.guard_facts(link, evidence)
+            symlink_problems = guard_containment_problems(symlinked)
+            expect(any("symlink" in problem for problem in symlink_problems),
+                   "the real reader accepted a symlinked scratch leaf")
+
+            outside_facts = real_effects.guard_facts(scratch, outside)
+            outside_problems = guard_containment_problems(outside_facts)
+            expect(any("outside the guard's owned root" in problem
+                       for problem in outside_problems),
+                   "the real reader accepted evidence outside the owned root")
+        finally:
+            base.scratch_route_facts = saved_route_query
+    finally:
+        _shutil.rmtree(fixture, ignore_errors=True)
+        _shutil.rmtree(outside, ignore_errors=True)
 
     # Report failure: an unwritable receipt unqualifies the inner.
     harness = control_harness()
