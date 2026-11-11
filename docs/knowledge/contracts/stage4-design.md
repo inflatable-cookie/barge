@@ -1166,16 +1166,16 @@ proof remain unresolved; O2/O3 and production parent-reader conversion stay held
 
 ## One operation journal for delegated recovery (proposed, 2026-11-10)
 
-**Status: proposed design, source-only; revised twice after exact-head review.**
-Tom asked on 2026-11-10 (decision `1d4a7aee-a8e6-4a75-96f0-b142c4176db2` v2)
-for delegated-deletion recovery that is dependable and simpler in *both*
-products, because the machinery will recur with every new integration. This is
-Barge's owning answer, proposing the successor to the two adapter sections
-above; everything below is PROPOSED and changes no shipped behavior until
-implementation briefs land reviewed code. Oxide's owning contract is not
-edited from here; its needed reconciliation text is quoted at the end.
-Sources: Barge at this repository's HEAD; Oxide read-only at PR 263 head
-`39211b4e1cef4abf9ea07f2ef1a4814ce6b0d3a0`.
+**Status: proposed design, source-only; revised three times after exact-head
+review.** Tom asked on 2026-11-10 (decision
+`1d4a7aee-a8e6-4a75-96f0-b142c4176db2` v2) for delegated-deletion recovery
+that is dependable and simpler in *both* products, because the machinery will
+recur with every new integration. This is Barge's owning answer, proposing the
+successor to the two adapter sections above; everything below is PROPOSED and
+changes no shipped behavior until implementation briefs land reviewed code.
+Oxide's owning contract is not edited from here; its needed reconciliation text
+is quoted at the end. Sources: Barge at this repository's HEAD; Oxide
+read-only at PR 263 head `39211b4e1cef4abf9ea07f2ef1a4814ce6b0d3a0`.
 
 One delegated deletion is coordinated today by five durable facts across two
 products: Oxide's `prune-intent/1` journal, the registry's schema-3
@@ -1194,39 +1194,42 @@ operation: whether it is in progress, what it binds, whether its caller still
 owes a finalization, and whether conflicting work may enter. Ordinary domain
 state stays put: Oxide's registry and receipts keep describing what exists and
 what is selected, stay reconstructible from Oxide's own settlement writes, and
-never decide recovery. There is no index, no sidecar, no cache, no derived
-projection: every consult reads this one journal under the rules of the
-fail-closed section below, and the hook acknowledgement is a field transition
-inside the same record, not a third ledger.
+never decide whether an operation exists or is owed. There is no index, no
+sidecar, no cache, no derived projection: every consult reads this one journal
+under the fail-closed rules below, and the hook acknowledgement is a field
+transition inside the same record, not a third ledger.
 
-    caller (eligibility under its publication guard)   Barge
+    caller                                             Barge
     ---------------------------------------------     --------------------------------------
-    lock the checkout binding; take the               re-proof, then ONE operation record
-    publication guard; compute the eligibility        intent > renamed > marker_last
-    verdict; begin; release the guard          -->    > removed > deleted > complete
-    (prune holds the binding across begin)            owed finalize --ack--> complete
-    drain(hooks) <--- dispatch, no Barge locks
+    binding lock; guard: verdict; release;            re-proof, then ONE sequence-numbered
+    begin; guard: re-affirm by revision;      -->     record: intent > renamed > marker_last
+    release; effect runs                              > removed > deleted > complete
+    drain(hooks) <--- dispatch, no Barge locks        owed finalize --ack--> complete
 
 ### Phases and transitions (PROPOSED)
 
 | Phase | Meaning | Written |
 | --- | --- | --- |
-| `intent` | begin published; no effect yet; finalize owed | begin, after the re-proof and the guarded eligibility verdict |
+| `intent` | begin published; no effect yet; finalize owed | begin, after the re-proof and the caller's guarded verdict |
 | `renamed` → `marker_last` | today's effect phases, unchanged (`state.rs:1398`) | the effect, under the exclusive volume lock |
-| `removed` | the leaf is captured, verified and **authorized** for its private removal; every content capture is already journalled | durably **before** the private leaf's unlink |
-| `deleted` | the leaf's bytes are gone; finalize still owed | the effect |
+| `removed` | **Barge's own final unlink of the verified captured leaf succeeded** — positive completion evidence, recorded after that unlink, exactly as today | the effect |
+| `deleted` | the durable completion fact; finalize still owed | the effect |
 | `complete` | hook acknowledged; the record is settled | drain, after the ack |
 | (record removed) | pre-effect cancellation only: `intent` phase, root present, re-proof failed | begin or resume |
 
-The ordering rule this table encodes: **every destructive step is journalled
-before it happens** — each capture before its unlink (stage 1 design, "Durable
-custody of captured objects"), and the leaf's own removal authorization before
-its unlink. Removing a pre-effect record stays today's only removal (stage 1
-design, "A settled intent is kept"); a post-effect record is never removed, so
-a terminal deletion cannot lose an unfinished finalization — the owed hook
-travels in the record from begin, before any effect exists. A delegated record
-carries `resume: caller` (the delegated begin's default and only delegated
-value); Barge's own roots keep today's `resume: barge`.
+The shipped safe deleter's evidence rule is preserved verbatim: every capture
+is journalled before its unlink, and only the durable `removed` phase —
+written after Barge's own unlink — proves the leaf is gone. Absence alone
+never resolves anything, and the unlink-to-publication window stays
+conservative: a stop there leaves the record at `marker_last` with the leaf's
+capture recorded, the recorded private name gone reads `Unknown`, and the
+operation stays pending — never acknowledged, never settled. Removing a
+pre-effect record stays today's only removal (stage 1 design, "A settled
+intent is kept"); a post-effect record is never removed, so a terminal
+deletion cannot lose an unfinished finalization — the owed hook travels in the
+record from begin. Each record carries its journal `sequence`, assigned at
+begin (below); a delegated record carries `resume: caller` (the delegated
+begin's only value); Barge's own roots keep `resume: barge`.
 
 ### Begin: the no-gap ordering
 
@@ -1241,41 +1244,59 @@ preview, grant generation and original identity travel inside the typed
 payload, so no refreshed grant or current root substitutes for original
 authority.
 
-**Caller eligibility is computed under the caller's own publication custody
-(named decision; PROPOSED).** The caller takes `store::publication_guard`,
-computes the eligibility verdict with its own code and its own rules — the
-same complete-group verification `journal_intent_with_route` performs under
-that guard (`prune.rs:7118`: complete registry, expected revision match,
-per-row flags clear and identity matching) plus the receipt committed and not
-placing the root and unknown-free pool custody — and calls begin while still
-holding the guard. Begin binds the observed registry revision into the record.
-Because **every** registry writer takes the same publication guard, no
-writer — of any checkout — can add or select a reference to this root between
-the verdict and the record's publication: the eligibility-to-begin boundary is
-serialized against all of them, not only the named checkout's binding. Barge
-never reads the caller's registry in begin and never takes a caller lock: the
-guard is a caller lock held across Barge's bounded lock wait, one direction,
-so no Barge → caller → Barge cycle exists, and admission locks stay released
-across begin (today's rule). The guard is released when begin returns; it
-re-enters only inside the handler's settlement, where no Barge lock is held.
-The verdict is computed by the caller's own in-process code, the same trust
-that calls begin at all; what begin adds is Barge's own re-proof — stored
-grant, unit custody, absence, exact binding — under its locks.
+**Caller eligibility, serialized against every registry writer without
+holding admission across a Barge wait (named decision; PROPOSED).** At the
+bound Oxide source, `store::publication_guard` **is** the internal pool's
+existing admission lock, made reentrant (`store.rs:6548`–`:6577`) — so it is
+never held across Barge's lock wait, and the joint rule that no Oxide
+admission lock waits on a Barge lock is preserved verbatim. The handoff is a
+guarded verdict plus a revision re-affirmation:
+
+1. The caller takes the binding lock and the publication guard, computes the
+   eligibility verdict with its own code and its own rules — the complete-group
+   verification `journal_intent_with_route` performs under that guard
+   (`prune.rs:7118`: complete registry, per-row flags clear, identity matching)
+   plus the receipt committed and not placing the root and unknown-free pool
+   custody — records the observed registry revision, and releases the guard.
+2. It calls begin with the verdict and revision. Barge's begin re-proves its
+   own facts — stored grant, unit custody, absence, exact binding — under its
+   locks, with no Oxide lock held, and publishes the record bound to that
+   revision. Barge never reads the caller's registry in begin and never takes
+   a caller lock; every cross-lock direction stays caller → Barge, so no
+   Barge → caller → Barge cycle exists. Admission locks stay released across
+   begin.
+3. Before the effect starts, the caller re-takes the guard for a bounded
+   **re-affirmation**: compares the live registry revision to the record's.
+   Unchanged → the verdict stands and the effect may run. Advanced → the
+   caller re-runs the complete guarded eligibility: still eligible (the
+   change did not reference this root) → the record's bound revision is
+   updated under Barge locks — no Oxide lock held — and the effect runs;
+   the root became referenced or selected → the record is cancelled pre-effect
+   (the one removal) and the root refuses.
+
+Because every registry writer takes the same guard, a reference added by any
+writer between the verdict and the effect is visible to the re-affirmation's
+revision comparison; the effect starts only after a re-affirmation that saw no
+such reference, and changes after that are excluded by the pending record and
+the in-lock consults, exactly as today's pending intent and `pruning` flag
+exclude them. The verdict is computed by the caller's own in-process code —
+the same trust that calls begin at all. The guard re-enters afterwards only
+inside the handler's settlement, where no Barge lock is held.
 
 **No caller durable state precedes begin, and effects never precede the
 record.** Effects are strictly ordered after the begin record's durable
-publication, so a world with no record and no epoch violation is the
-pre-effect world: nothing happened, no exclusion is owed, and a fresh prune
-may rerun eligibility and begin again under a new key — the unconfirmed-begin
-window is safe by construction, not by retry. A begin whose publish cannot
-confirm its directory sync — `publish_atomic` renames and then syncs
-(`state.rs:787`) — reports `Unknown`, never `Began` and never no-effect: the
-caller keeps the root excluded and a later begin under the same key binds one
-operation (the record landed → idempotent resume; it did not → a fresh begin,
-still safe because no effect preceded it). A captured unit can never be
-re-begun: its original path is positively gone, so the begin re-proof refuses.
-Same-call `Locked`-rollback machinery does not exist here, and a `Locked`
-begin is a plain retry.
+publication, so a world with no record is the pre-effect world: nothing
+happened, no exclusion is owed, and a fresh prune may rerun eligibility and
+begin again under a new key — the unconfirmed-begin window is safe by
+construction, not by retry. A begin whose publish cannot confirm its
+directory sync — `publish_atomic` renames and then syncs (`state.rs:787`) —
+reports `Unknown`, never `Began` and never no-effect: the caller keeps the
+root excluded and a later begin under the same key binds one operation (the
+record landed → idempotent resume; it did not → a fresh begin, still safe
+because no effect preceded it). A captured unit can never be re-begun: its
+original path is positively gone, so the begin re-proof refuses. Same-call
+`Locked`-rollback machinery does not exist here, and a `Locked` begin is a
+plain retry.
 
 ### Serialization: the atomic handoff at every conflicting entry point
 
@@ -1293,11 +1314,12 @@ the same binding. This closes the found interleaving on both sides:
   `adopt` (inside the admission barrier, `outputs.rs:2300`) and the second
   prune (`prune_one_barrier`, `prune.rs:6591`). The in-lock consult sees the
   pending record and refuses; unknown refuses.
-- *Prune first.* The prune holds the binding across eligibility, begin and the
-  effect; a waiting command acquires only after the prune releases, and its
-  in-lock consult reads the settled world: a `complete` record binds nothing,
-  and the handler's settlement has already made the registry and receipt
-  consistent, so the command's own domain view has no dangling reference.
+- *Prune first.* The prune holds the binding across eligibility, begin, the
+  re-affirmation and the effect; a waiting command acquires only after the
+  prune releases, and its in-lock consult reads the settled world: a
+  `complete` record binds nothing, and the handler's settlement has already
+  made the registry and receipt consistent, so the command's own domain view
+  has no dangling reference.
 - *Barge-alone replay.* Replay takes Barge's exclusive volume lock and
   resumes only records that exist; it never begins. A command's in-lock
   consult takes Barge's shared observation lock while holding the caller's
@@ -1311,42 +1333,41 @@ the same binding. This closes the found interleaving on both sides:
 
 The generic reader treats a missing journal as an empty store
 (`read_intents`, `state.rs:2609`); recovery may not inherit that default, and
-directory presence alone detects no per-record loss. Three rules close the
-windows:
+directory presence detects no loss. Two journal facts close the windows:
 
-1. **Directory identity.** State initialization writes one small epoch
+1. **Creation identity.** State initialization writes one small epoch
    document, `barge.journal/1` (PROPOSED), into the intents directory and
    syncs it; the consult, begin and drain require it. `is_initialized`
-   (`state.rs:230`) checks only the state root's existence and detects no
-   recreation, so the epoch is the journal's own format identity: an absent,
-   unreadable or stale epoch — including a recreated directory, which cannot
-   carry the old epoch — is unknown, never "no operation". The epoch
-   identifies the journal; it is not a second authority and derives nothing.
-2. **Effects never precede the journal.** Every destructive step is journalled
-   before it runs (the phases table's ordering rule). The windows are then:
-   before the begin record — no effect, nothing owed, safe to admit; between
-   the capture rename and the `removed` record — the record exists at
-   `marker_last`, the visible leaf is gone under an unrecorded private name,
-   and today's conservative rule keeps it pending and uninterruptible ("a
-   private `.barge-del-*` name with no record … stays pending"): the consult
-   sees a pending record and refuses; after the `removed` record — the record
-   was durable **before** the unlink, so the bytes cannot be gone while the
-   record is absent.
-3. **The named residual.** A record that vanishes after it was durably
-   written — storage corruption — is outside every journal's failure model,
-   including today's two-journal design, where losing the `prune-intent/1`
-   image after the unlink has the same consequence class. Its consequence here
-   is bounded and stated: the root's bytes are gone, no second deleter can act
-   on them (any future operation binds a fresh identity through a fresh
-   begin), and Oxide's rows for that root stay non-terminal — stale domain
-   rows, repairable by Oxide's ordinary row hygiene, never a deletion
-   authority. This is the same accepted-limit honesty as Q-012's
-   all-writes-refused case, not a detection claim.
+   (`state.rs:230`) checks only the state root's existence, so the epoch is
+   what a recreated directory cannot carry: absent, unreadable or stale →
+   unknown, never "no operation". The epoch identifies the journal; it is not
+   a second authority and derives nothing.
+2. **Sequence completeness.** Begin assigns each record the next integer from
+   the epoch's `sequence` watermark and publishes the record before the
+   watermark advance is confirmed; a record numbered above the watermark is an
+   unwatermarked tail, kept pending until recovery verifies it and advances
+   the watermark. A complete journal read must then show every sequence
+   `1..=watermark` exactly once (settled records are retained, so the set is
+   gapless). **A gap is proven individual-record loss** — including a record
+   lost after the final unlink and before the hook completed — and reads as
+   `Unknown`: admission, recovery and drain refuse for delegated work until
+   the gap is resolved. Resolution is explicit and operator-owned: the
+   journal's gap refusal is the authority that something is lost; the
+   caller's own non-terminal rows for positively absent roots may *name*
+   candidate scopes for the operator (domain state informing a refusal's
+   scope, never deciding that an operation exists), and a bounded operator
+   resolution command for a proven gap is named in the implementation split.
+   This is the missing-state rule the brief requires: a terminal deletion with
+   an owed finalization can never appear as no pending operation, because its
+   disappearance is a detectable gap, not silence.
 
 An unattributable `.barge-prune-*` leaf anywhere is a live deletion, never an
 absence (`oxide_outputs.rs`, `quarantine_leaf`); an unreadable, truncated or
-over-cap (`INTENT_ROWS`, `contract.rs:50`) journal is unknown. The journal is
-the only recovery authority and nothing derives from it.
+over-cap (`INTENT_ROWS`, `contract.rs:50`) journal is unknown; the
+unlink-to-publication window stays pending and visible, as the phases table
+states. The journal is the only recovery authority and nothing derives from
+it; the loss machinery is two fields and one counter document inside the one
+journal, not a second journal or a caller-side per-operation fact.
 
 ### The hook contract (PROPOSED)
 
@@ -1381,7 +1402,7 @@ inside a hook, no caller lock inside a Barge lock, no Barge → caller → Barge
 cycle. Double dispatch is safe because handlers are idempotent by contract and
 the ack is idempotent; begin refuses a request whose digest matches a record
 with an owed finalize, so an operation cannot nest inside its own settlement.
-The payload budget is 2 KiB inside the existing 4 KiB record cap
+The payload budget is 2.5 KiB inside the existing 4 KiB record cap
 (`contract.rs:47`), reserving the remainder for phase and capture fields; a
 payload or group beyond the budget refuses at begin, before any durable step,
 so there is no partial begin and no truncation. Settled `complete` records are
@@ -1393,18 +1414,19 @@ resume this family (`delete.rs:385`). The record's `resume: caller` policy
 keeps the safety that mattered and drops the second journal: a delegated
 record at `intent` — the root still in place — is refused to generic replay
 and to every path except a caller-authenticated resume, which re-runs the
-caller's guarded eligibility verdict and full recheck (whole group, writer
-custody under the checkout barrier: `prune_barge.rs:336` today) before the
-effect starts. A caller that never returns leaves an intelligibly pending
-`intent`-phase record; Barge-alone never guesses it. Once the capture rename
-has happened, the remaining phases are Barge-owned replay for any caller's
-record: the bytes are already under Barge's private name, unrecoverable if
-abandoned, and Barge's own replay re-proves the captured object's identity,
-marker, holds and writer custody — which after the rename is the operative
-custody check, since writers of the checkout hold the captured inodes. The
-authority replay preserves is the record's: the begin that produced it froze
-the guarded eligibility, and replay never widens what that record authorized.
-A generic delete that is not a record's replay still refuses a delegated unit
+guarded verdict, the revision re-affirmation and the full recheck (whole
+group, writer custody under the checkout barrier) before the effect starts. A
+caller that never returns leaves an intelligibly pending `intent`-phase
+record; Barge-alone never guesses it. Once the capture rename has happened,
+the remaining phases are Barge-owned replay for any caller's record: the bytes
+are already under Barge's private name, unrecoverable if abandoned, and
+Barge's own replay re-proves the captured object's identity, marker, holds and
+writer custody — which after the rename is the operative custody check, since
+writers of the checkout hold the captured inodes — and settles only on the
+durable `removed` evidence plus positive absence, never on absence alone. The
+authority replay preserves is the record's: the begin that produced it carried
+the guarded verdict, and replay never widens what that record authorized. A
+generic delete that is not a record's replay still refuses a delegated unit
 (`delete.rs:452`, `:516`): this is the operation architecture, not a waiver of
 the existing safe deleter.
 
@@ -1413,55 +1435,66 @@ the existing safe deleter.
 The payload must carry what the handler needs after any crash. The delegated
 payload (PROPOSED) carries: the original identity and preview, the grant
 generation, the caller key, the checkout id and receipt path, the group rows
-as `{member, generation, nonce}` (at most eight; a larger group refuses at
-begin and is not covered), and the fixed `terminal_ms`. Group identity is
-justified by the registry's own row facts: a row is identified by
-`(checkout_id, root, member)` and disambiguated across recreated roots by
-`generation` and `nonce` (`recheck` compares exactly these, `prune_barge.rs:336`);
-the unit's device, inode and marker are **not** in the payload because the
-settlement writes no volume bytes — that binding lives in the record's unit
-fields, which Barge's custody re-proves, and the row facts are what the
-registry revisions read and write.
+as `{member, generation, nonce, root_ino, marker_digest}` (at most six; a
+larger group refuses at begin and is not covered — the budget holds at 2.5 KiB),
+the fixed `terminal_ms`, and the begin-bound registry revision. The group
+facts are the registry's and recheck's own comparison set: `recheck`
+(`prune_barge.rs:336`) compares flags, `nonce`, `generation`, `root_ino` and
+`marker_digest` per row and rejects another live root reference, so the
+handler can reproduce that exact verification; the unit's device is the one
+excluded observation, as everywhere in this design.
 
 The handler mirrors the shipped settlement's two revisions and its released-
-receipt branch, reading and writing only Oxide's registry and receipt:
+receipt branch, reading and writing only Oxide's registry and receipt, with a
+**complete guarded verification before every write**:
 
-1. Read the registry completely; unknown stays owed (never partial-guess).
-2. **Verify the group.** Collect rows matching `(checkout_id, root)` whose
-   `member`, `generation` and `nonce` match the payload. Rows of a recreated
-   root at the same path carry a different nonce and are never ours; they are
-   not counted, matched, marked or removed, so another current selection is
-   untouched. Our rows absent entirely → the removal already happened: go to 5
-   with nothing to mark.
-3. **Receipt rule, read-only.** If the receipt is pruning or its current
-   selection places this root, refuse and stay owed — the covered begin
-   required the receipt not to place the root, so this is anomalous drift and
-   today's rule ("a released root is history in its receipt", `prune.rs:7527`)
-   is the guard: the handler never rewrites a receipt a current selection
-   owns. Otherwise the released-root receipt step is a no-op — deliberately
-   the same branch `settle_receipt` takes, and the reason the delegated handler
-   does **not** reuse `publish_terminal_receipt`: that function persists its
-   commitment in the Oxide intent this design removes.
-4. **Terminal marking revision** (under `store::publication_guard`, fresh read
-   inside): clear `selected`/`pending`/`pruning` and set
-   `pruned_ms = terminal_ms` on exactly our rows — the recorded fixed
-   timestamp makes re-marking idempotent, as `complete_intent` marks today
-   (`prune.rs:7361`).
-5. **Removal revision** (under the guard): remove exactly our terminal-marked
-   rows — `settle_receipt`'s removal with the intent and route steps gone
-   (`prune.rs:7545`).
+1. Take the publication guard and read the registry completely, fresh, inside
+   it; unknown stays owed (never partial-guess).
+2. **Verify the complete group under the guard.** Every payload member must be
+   present as a row of `(checkout_id, root)` with matching `nonce`,
+   `generation`, `root_ino` and `marker_digest` and clear
+   selection/pending/reservation/cancelling/pruning flags, and no other live
+   root reference may exist — `recheck`'s comparisons, minus the intent.
+   **All members present and matching** → continue. **Any member absent or
+   changed while others are present** — a partial or foreign group — is
+   `Unknown`: mark nothing, ack nothing, stay owed, intelligibly. **All
+   members absent** → the group was never observed post-begin at this
+   revision; without a durable settlement fact (step 5's tombstone) this is
+   anomalous, not proof of removal → `Unknown`, stay owed.
+3. **Receipt check under the same guard.** If the receipt is pruning or its
+   current selection places this root, refuse and stay owed — the covered
+   begin required the receipt not to place the root, and today's rule ("a
+   released root is history in its receipt", `prune.rs:7527`) is the guard:
+   the handler never rewrites a receipt a current selection owns. Otherwise
+   the released-root receipt step is a no-op — deliberately the same branch
+   `settle_receipt` takes, and the reason the delegated handler does **not**
+   reuse `publish_terminal_receipt`: that function persists its commitment in
+   the Oxide intent this design removes.
+4. **Terminal marking revision**, still under the guard: clear
+   `selected`/`pending`/`pruning` and set `pruned_ms = terminal_ms` on exactly
+   the verified rows — the recorded fixed timestamp makes re-marking
+   idempotent, as `complete_intent` marks today (`prune.rs:7361`).
+5. **Removal revision**, under the guard with a fresh read: verify the rows
+   are still ours, still matching, and marked with our `terminal_ms`; remove
+   exactly those; then append the operation's tombstone (`append_tombstone`,
+   shipped at `prune.rs:7585`, recording checkout, root, nonce and outcome) as
+   the durable settlement fact of the caller's own domain history.
 6. Barge re-takes its locks and records `complete`.
 
-Crash between any two steps replays the same steps from fresh reads: after 4,
-rows are marked and step 2 finds them, step 4 re-applies the same
-`terminal_ms`, step 5 removes; after 5 and before the ack, step 2 finds no
-rows and step 3's no-op branch acks. The lost-acknowledgement trace ends in
-the same place from every interruption: **settle-then-ack**, where ack is a
-no-op if another dispatcher wrote it. Concurrent dispatch serializes on the
-publication guard; the two revisions are whole images under that guard, so no
-partial registry write exists. The durable facts live only in Barge's record
-and Oxide's own registry and receipt — no third journal, no new file beyond
-the journal's own epoch document.
+Every re-entry re-runs the same guarded verifications from fresh reads, so
+the crash cases close exactly: after 4 — rows marked, step 2 re-verifies the
+complete group, step 4 re-applies the same `terminal_ms`, step 5 removes;
+after 5 and before the ack — step 2 finds the members absent **but step 5's
+tombstone is the durable settlement fact** that this handler removed them, so
+the ack proceeds; without the tombstone, absent rows stay `Unknown` and owed.
+A lost acknowledgement therefore converges to settle-then-ack from every
+interruption. Concurrent dispatch serializes on the guard; each dispatcher
+re-runs the same complete verification and the tombstone makes the second one
+a no-op. The two revisions and the tombstone are whole images under that
+guard, so no partial registry write exists. The durable facts live only in
+Barge's record and Oxide's own registry, receipt and tombstone history — no
+third journal; the tombstone is today's shipped domain record, now also the
+handler's idempotency fact.
 
 ### Crash and concurrency traces
 
@@ -1469,13 +1502,12 @@ the journal's own epoch document.
 | --- | --- | --- |
 | begin refused pre-publication | nothing anywhere | a later prune re-runs eligibility; no exclusion was published |
 | begin publish sync unverified (`state.rs:787`) | unknown; record may or may not exist | caller keeps the root excluded; no effect preceded it, so a same-key retry or a fresh key are both safe; the captured unit can never be re-begun |
-| begin published, no effect | record at `intent`, `resume: caller` | only a caller-authenticated resume (guarded verdict + full recheck) starts the effect; conflicting commands refuse at the in-lock consult |
-| capture rename → before `removed` durable | record at `marker_last`; leaf under an unrecorded private name | pending forever, intelligibly; the consult refuses (pending record); the unrecorded private name is never unlinked |
-| `removed` durable → before the private unlink | leaf bytes still on disk, record authorizes removal | replay completes the one authorized unlink, records `deleted` |
-| after the leaf's bytes are gone | record necessarily present (ordering rule), finalize owed | the next drain dispatches; the handler settles; the ack is recorded |
-| caller settled, before ack recorded | registry rows removed, receipt untouched, record still owed | drain re-dispatches; step 2 finds no rows; step 3's released branch acks |
+| begin published, re-affirmation not yet run | record at `intent`, bound revision; no effect | the caller's re-affirmation decides: re-run the guarded eligibility, re-affirm, or cancel pre-effect; conflicting commands refuse at the in-lock consult |
+| capture rename → before `removed` durable | record at `marker_last`, the leaf's capture recorded; the recorded private name gone reads `Unknown` | pending, exactly today's conservative rule; never acknowledged; the consult refuses |
+| Barge's unlink done, `removed` durable | positive evidence in the record; finalize owed | the next drain dispatches; the handler settles; the ack is recorded |
+| caller settled, before ack recorded | rows removed, tombstone written, record still owed | drain re-dispatches; step 2 finds the members absent, step 5's tombstone proves the settlement; ack |
 | handler unregistered / version mismatch | owed, intelligibly named | pending with caller, key, kind and version; never guessed, never executes unloaded code, never adds deletion authority |
-| journal lost / epoch absent (`state.rs:2609`) | unknown, never "no operation" | the fail-closed rules refuse admission until the journal reads completely again |
+| journal record lost (sequence gap) | `Unknown`, never "no operation" | delegated admission, recovery and drain refuse until the operator resolves the proven gap |
 | volume absent | pending; the consult refuses | attach; nothing is inferred |
 
 Concurrency: two begins on one key — the second reads the first's record and
@@ -1483,15 +1515,17 @@ resumes or reports it, under the binding. Begin versus adopt — the in-lock
 consult refuses adopt while a pending record binds the checkout; the found
 interleaving (consult before the lock) is closed by the re-consult inside it.
 Drain versus begin — the ack write re-reads the record and does nothing if it
-is already `complete`. Every cross-lock direction is caller → Barge; no cycle
-exists.
+is already `complete`; concurrent handlers serialize on the guard and
+converge on the tombstone. Every cross-lock direction is caller → Barge; no
+cycle exists, and no Oxide admission or publication lock is ever held while
+waiting for a Barge lock.
 
 ### Who triggers recovery
 
 **Oxide running:** its admission consults inside its serialization and drains
-its namespace, its prune path begins or resumes its operations (guarded
-verdict + full recheck before an `intent`-phase effect), its handler settles.
-**Barge alone** (CLI, `maintain` host job): generic replay resumes
+its namespace, its prune path begins, re-affirms and resumes its operations
+(guarded verdict + full recheck before an `intent`-phase effect), its handler
+settles. **Barge alone** (CLI, `maintain` host job): generic replay resumes
 post-capture phases of any pending record — including another caller's —
 reports owed finalizations and `intent`-phase delegated records by namespace;
 it dispatches nothing, settles nothing, and never starts a delegated effect.
@@ -1505,7 +1539,7 @@ caller's code is linked and registered in that process.
 | Oxide schema-3 `deletion_routes`, and Barge's route reader (`DeletionRoute`, `reference.rs:525`; `OXIDE_REGISTRY_V3`, `:70`) | routing recorded once in the record | removed, both sides |
 | `prune-delegation/1` sidecars; Oxide `RequestStore` (225 lines) and `prune_request.rs` (334 lines, `Ready`/`Unavailable`) | the record's typed payload, persisted by Barge at begin | removed; the `Unavailable` variant and its absence-only lookup (`lookup_absence`, `oxide_outputs/absence.rs`) go with it — Barge unavailable means begin never happened, so Oxide skips the root with no durable state |
 | Oxide's covered-path `prune-intent/1`, the four-state `lookup` (`oxide_outputs.rs:338`), the same-call `Locked` rule and the reply correlation (`prune_barge.rs:154`–`:336`, `:593`) | one idempotent begin/state/drain answer | removed from the covered path; Oxide keeps its journal for local roots |
-| eligibility re-read inside `execute` (`lookup_oxide_intent`); the guarded revision CAS of `journal_intent_with_route` (`prune.rs:7118`) | the caller's guarded eligibility verdict at begin, bound with the observed registry revision | preserved and moved to begin, serialized against every registry writer by the caller's publication guard |
+| eligibility re-read inside `execute` (`lookup_oxide_intent`); the guarded revision CAS of `journal_intent_with_route` (`prune.rs:7118`) | the caller's guarded verdict at begin plus the guarded re-affirmation by revision before the effect | preserved and moved to begin, serialized against every registry writer, with the admission lock never held across a Barge wait |
 | pre-effect delegated replay by the adapter only (`delete.rs:385`) | `resume: caller` two-tier policy: pre-effect replay is caller-authenticated, post-capture replay is Barge-owned | preserved as policy on the record, generalized to any caller |
 | `unsettled_for` exclusion consulted before the binding (`outputs.rs:6237`, `:4486`) | one bounded in-lock consult of Barge pending records at the same sites | simplified; same call count, one authority, atomic handoff specified |
 | paired-pool `/4` upgrade orchestration (`store.rs:2702`–`:2865`) and schema-3 validation | one-time adoption fence only | reduced; per-operation upgrade machinery removed |
@@ -1513,17 +1547,18 @@ caller's code is linked and registered in that process.
 | `Outcome`'s six kinds and `BargeLookup`'s four states (`oxide_outputs.rs:223`–`:337`) | `Begun` / `OperationState` / `DrainReport` | replaced |
 
 Retained, with the caller's kept duties stated honestly: Barge's whole safe
-deleter and replay windows (`delete.rs`), the `oxide_outputs` marker family
-and area grant (`unit.rs:141`, `:326`), settled records and the row and byte
-caps, the fence and old-reader refusal, Oxide's registry/receipt history as
-domain state, and Oxide's local prune path with its own journal; on the
-caller's side, eligibility policy, the binding serialization and guarded
-verbs (`CleanMode`, `store.rs:525`), the guarded eligibility verdict and
-whole-group recheck (`prune.rs:7118`, `prune_barge.rs:336`), the positive
-checkout-absence re-proof at begin and every replay, live and unknown-writer
-refusal, grant revocation (a revoked grant never resumes), whole-root group
-semantics, no local-delete fallback for delegated roots, and the exact
-root/volume/request binding.
+deleter, replay windows and positive-completion evidence rule (`delete.rs`,
+stage 1 design), the `oxide_outputs` marker family and area grant
+(`unit.rs:141`, `:326`), settled records and the row and byte caps, the fence
+and old-reader refusal, Oxide's registry/receipt/tombstone history as domain
+state, and Oxide's local prune path with its own journal; on the caller's
+side, eligibility policy, the binding serialization and guarded verbs
+(`CleanMode`, `store.rs:525`), the guarded verdict, the re-affirmation pass
+and the whole-group recheck (`prune.rs:7118`, `prune_barge.rs:336`), the
+positive checkout-absence re-proof at begin and every replay, live and
+unknown-writer refusal, grant revocation (a revoked grant never resumes),
+whole-root group semantics, no local-delete fallback for delegated roots, and
+the exact root/volume/request binding.
 
 ### Accounting, on a consistent basis
 
@@ -1531,54 +1566,61 @@ Separate the categories and count the same named things on both sides.
 **Independent recovery authorities:** two journals that must be reconciled
 (`prune-intent/1` and `barge.intent/2`) → one. **Per-operation durable
 artifacts:** three (the Oxide registry intent-and-route image, the request
-sidecar, the Barge record) → one (the record), plus one static epoch document
-per state directory (not per operation). **Static compatibility metadata:**
-the adoption fence — retained, not per-operation, not counted as an artifact.
-**Coordination writes per covered operation** (the released-receipt case,
-which is the covered class; both sides count Barge's records and the caller's
-settlement revisions): before — sidecar, registry intent-and-route image,
-complete_intent's marking revision, settle_receipt's removal revision, five
-Barge phase records = **nine**; after — `intent`, `renamed`, `marker_last`,
-`removed`, `deleted`, `complete` = six Barge records, plus the handler's
-marking and removal revisions = **eight**. The write count is near-flat; the
-reduction is not there. **Phase states across the joined stores:** before,
-eleven named phases (six Oxide — `intent`, `renamed`, `deleting`,
-`marker_last`, `deleted`, `resolved` — plus five Barge) with a receipt-settled
-flag, a route presence bit and four sidecar wire states (`ready`,
-`unavailable`, partial, orphan) beside them; after, six phases in one store
-(`intent`, `renamed`, `marker_last`, `removed`, `deleted`, `complete`) and one
-pre-effect removal rule. **Caller obligations:** publish sidecar, intent and
-route; first-versus-resumed `Locked` discrimination; four-state lookup;
-absence-only lookup; recovery dispatch; dual resolve prechecks; compaction and
-upgrade orchestration → eligibility verdict under the guard, one begin under
-the binding, one idempotent handler, one in-lock consult. **Recovery
-boundaries:** the owning amendment names twelve; the traces above subsume
-them in ten windows across one store. Against the corrections: begin gained
-the guard's held span and the verdict hand-off, the journal gained its epoch
-document and the reordered `removed` phase, and the handler grew its marking
-revision — counted above, on both sides. The net reduction survives on
-authorities, artifacts, states, obligations and removed machinery; the write
-count is honestly near-flat.
+sidecar, the Barge record) → one (the record), plus two static journal
+documents per state directory (epoch and watermark — not per operation).
+**Static compatibility metadata:** the adoption fence — retained, not
+per-operation, not counted as an artifact. **Coordination writes per covered
+operation** (the released-receipt case, which is the covered class; both
+sides count Barge's records and the caller's settlement revisions; tombstones
+excluded on both sides as best-effort diagnostics): before — sidecar, registry
+intent-and-route image, `complete_intent`'s marking revision,
+`settle_receipt`'s removal revision, five Barge phase records = **nine**;
+after — six Barge records (`intent`, `renamed`, `marker_last`, `removed`,
+`deleted`, `complete`), the handler's marking and removal revisions, and the
+begin's watermark advance = **nine**. The write count is flat, and the
+watermark advance is what buys per-record loss detection; the reduction is
+not in writes. **Phase states across the joined stores:** before, eleven
+named phases (six Oxide — `intent`, `renamed`, `deleting`, `marker_last`,
+`deleted`, `resolved` — plus five Barge) with a receipt-settled flag, a route
+presence bit and four sidecar wire states (`ready`, `unavailable`, partial,
+orphan) beside them; after, six phases in one store (`intent`, `renamed`,
+`marker_last`, `removed`, `deleted`, `complete`) and one pre-effect removal
+rule. **Caller obligations:** publish sidecar, intent and route;
+first-versus-resumed `Locked` discrimination; four-state lookup; absence-only
+lookup; recovery dispatch; dual resolve prechecks; compaction and upgrade
+orchestration → guarded verdict, begin, re-affirmation, one idempotent
+handler, one in-lock consult (**seven → five**). **Recovery boundaries:** the
+owning amendment names twelve; the traces above subsume them in nine windows
+across one store. Against the corrections: the positive-completion rule is
+restored rather than reordered, loss detection is bought with the sequence
+watermark (one added write), the settlement gained the guarded complete
+re-verification and the tombstone-as-settlement-fact, and the lock handoff
+gained the re-affirmation pass — all counted above. The net reduction
+survives on authorities, artifacts, states, obligations and removed
+machinery; writes are honestly flat.
 
 A second caller does not rebuild the protocol: a hypothetical Effigy scratch
 delegation declares its area grant, takes its own serialization, computes its
 verdict under its own guard, calls begin with caller `"effigy.scratch"` and
-hook `"conclude-run/1"` carrying its run ids within the payload budget, and
-registers one handler that settles its run roots idempotently; exclusion,
-recovery and finalization come from the same journal, the same consult rule
-and the same drain.
+hook `"conclude-run/1"` carrying its run ids within the payload budget,
+re-affirms by revision, and registers one handler that settles its run roots
+idempotently; exclusion, recovery, loss detection and finalization come from
+the same journal, the same consult rule and the same drain.
 
 ### Counterexample considered
 
-The strongest case against: exclusion migrates from Oxide's journal to
-Barge's, so Oxide admission gains a dependency on Barge's state directory.
-But exclusion already required Barge-side facts at rollback and resolve
-today, the consult is one read whose bounded refusal already exists, and the
-in-lock re-consult costs one read inside a section the caller already holds —
-nothing is relocated that was not already joined; the two journals become
-one. If review finds the guarded-verdict begin or the two-tier replay
-unsound, the precise fallback is the shipped two-journal execution unchanged;
-there is no middle state to drift into.
+The brief directs a precise counterexample where the candidate cannot deliver.
+The one that shaped this revision: a single journal cannot detect the loss of
+an individual record from its content alone — a readable directory proves
+nothing about which records once existed — so the candidate carries a
+sequence watermark, and a gap is the proven-loss fact that fails closed. With
+that, and with the positive-completion rule restored, the remaining failure
+modes are: the unlink-to-publication window (conservative and visible, as
+shipped), and whole-journal corruption beyond any durable record's failure
+model (the epoch makes it unknown, never "no operation"). If review still
+finds the guarded-verdict begin, the sequence machinery or the two-tier
+replay unsound, the precise fallback is the shipped two-journal execution
+unchanged; there is no middle state to drift into.
 
 ### Compatibility and staged delivery
 
@@ -1592,19 +1634,21 @@ fence; new format numbers are set by implementation briefs, not guessed here.
 Pending two-journal operations drain under the shipped protocol before any
 successor format activates — the no-unfinished-predecessor rule, applied
 once. Implementation splits into: (1) Barge prerequisites — the operation
-record major with `resume` policy, payload budget and the reordered
-`removed` phase; the journal epoch document; begin/state/drain with the
-fail-closed rules; the narrow post-capture replay extension; regressions per
-trace; (2) Oxide caller work — the guarded verdict and begin under the
-binding, the in-lock consults at the four sites, the handler (mirroring
-`complete_intent` and `settle_receipt`'s released-root branch), and the
+record major with `resume` policy, sequence field, payload budget and
+today's positive-completion phases; the journal epoch-and-watermark document
+with the gapless read rule and its bounded operator gap-resolution command;
+begin/state/drain with the fail-closed rules; the narrow post-capture replay
+extension; regressions per trace; (2) Oxide caller work — the guarded
+verdict, begin and re-affirmation under the binding, the in-lock consults at
+the four sites, the handler (mirroring `complete_intent` and
+`settle_receipt`'s released-root branch, tombstone included), and the
 removals in the map; (3) bounded validation — crash-injection fixtures per
-window including journal and epoch loss, uncertain publication, the
-interleaving traces both directions, concurrency traces, oversize,
-unregistered-handler, mismatch and refusal cases. Named risks: the journal
-now gates Oxide admission (loss conservatively blocks; refuse-safe),
-payload-budget refusals, retention growth. No native apparatus is authored or
-activated by this design.
+window including sequence-gap loss, uncertain publication, the interleaving
+traces both directions, concurrency traces, oversize, unregistered-handler,
+mismatch and refusal cases. Named risks: the journal now gates Oxide
+admission (loss conservatively blocks; refuse-safe), payload-budget
+refusals, retention growth. No native apparatus is authored or activated by
+this design.
 
 ### Owning-contract reconciliation text for Oxide (not edited here)
 
@@ -1612,22 +1656,26 @@ activated by this design.
 > review (oxide#304)" and "Recovery, retention and crash boundaries" are
 > superseded for the covered class by Barge's stage 4 design, "One operation
 > journal for delegated recovery": the caller keeps eligibility policy —
-> computed under its publication guard and presented to Barge's begin — its
-> binding serialization and guarded verbs, the whole-group recheck before an
+> computed under its publication guard, released before Barge is called, and
+> re-affirmed by registry revision before any effect — its binding
+> serialization and guarded verbs, the whole-group recheck before an
 > `intent`-phase effect, and one idempotent finalize handler mirroring
-> `complete_intent` and `settle_receipt`'s released-root branch; it moves its
-> exclusion consults inside the binding section, and drops route publication,
-> the request sidecar, the covered-path intent journal, the absence-only
-> query, the same-call rule and the per-operation upgrade. The adoption-time
-> fence and old-reader refusal keep their meanings.
+> `complete_intent` and `settle_receipt`'s released-root branch with the
+> tombstone as its settlement fact; it moves its exclusion consults inside
+> the binding section, and drops route publication, the request sidecar, the
+> covered-path intent journal, the absence-only query, the same-call rule and
+> the per-operation upgrade. No Oxide admission or publication lock is ever
+> held while waiting for a Barge lock. The adoption-time fence and old-reader
+> refusal keep their meanings.
 
 **Acceptance recommendation:** adopt the one-journal candidate as the target
 architecture for delegated recovery, delivered through the implementation
 split above under separate briefs and review. It is a net reduction, not a
 relocation: the second journal, the sidecar store, routes, the lookup pair and
-the same-call rule are removed, while the guarded verdict, the `resume`
-policy, the epoch document and the hook add bounded, counted machinery to a
-record that already exists.
+the same-call rule are removed, while the guarded verdict and
+re-affirmation, the sequence watermark, the restored positive-completion
+evidence and the hook add bounded, counted machinery to a record that already
+exists.
 ## Failure, race and cancellation matrix
 
 Every row is a rule the implementation must carry a test for. "Keeps" means the
