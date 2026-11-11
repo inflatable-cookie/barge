@@ -12,7 +12,18 @@ environment, stage receiver, case receiver and report/closure composition
 with fake process, image, Git and clock-facing boundaries. Its writer control
 exercises the actual readiness receiver with a fake direct child and a private
 file. `effigy coordinator:native:plan` prints the held case map and bounds.
-Neither attaches, builds a binary or proves a kernel outcome.
+Neither attaches, builds a binary or proves a kernel outcome. The actual
+environment helper creates fresh home and state directories with verified
+owner, no-follow identity and mode `0700` before invoking the driver. Build
+and case receipts preserve exact argv and exit/reap status plus bounded stdout
+and stderr prefixes with byte counts, SHA-256 and truncation flags. A failed
+writer terminal message before readiness is retained as failure evidence.
+
+The author diagnostic at `898bb00` was spent with all 14 cases failed
+([review 6807984080](https://github.com/inflatable-cookie/barge/pull/59#issuecomment-6807984080)).
+Its raw driver and build output was unavailable, so the first refusal and
+actual fixture permissions remain unknown. Its separately observed image and
+group closure remain historical evidence; this correction grants no new run.
 
 ## Proposed fixed case map
 

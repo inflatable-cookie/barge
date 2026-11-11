@@ -84,7 +84,7 @@ def source_identity(deadline_ns):
 
 
 def external_process(argv, env, timeout):
-    return subprocess.run(argv, cwd=ROOT, env=env, capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(argv, cwd=ROOT, env=env, capture_output=True, timeout=timeout)
 
 
 def external_guarded(argv, env):
@@ -160,12 +160,100 @@ def verified_image_binding(proof, run_root):
             "backing": backing, "backing_uid": info.st_uid, "custody": custody}
 
 
+OUTPUT_LIMIT = 4096
+
+
+def text_output(value):
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else (value or "")
+
+
+def output_evidence(value):
+    # Digest the complete captured bytes; the receipt contains only a bounded prefix.
+    if value is None:
+        return {"available": False}
+    raw = value if isinstance(value, bytes) else value.encode("utf-8", "surrogateescape")
+    return {"available": True, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+            "prefix": raw[:OUTPUT_LIMIT].decode("utf-8", "replace"),
+            "retained_bytes": min(len(raw), OUTPUT_LIMIT), "truncated": len(raw) > OUTPUT_LIMIT}
+
+
+def process_evidence(result):
+    terminals = []
+    count = 0
+    for line in text_output(result.stdout).splitlines():
+        try:
+            document = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(document, dict) and "case" in document and "status" in document:
+            count += 1
+            if len(terminals) < 4:
+                terminals.append(output_evidence(line))
+    return {"argv": list(result.args), "exit": result.returncode,
+            "reaped": result.returncode is not None,
+            "stdout": output_evidence(result.stdout), "stderr": output_evidence(result.stderr),
+            "terminal_count": count, "terminals": terminals, "terminals_truncated": count > 4}
+
+
+def private_case_environment(proof, case_dir):
+    # Only create new children of the freshly owned case directory. Open with
+    # no-follow and verify the descriptor and path still name the same object.
+    parent = os.open(case_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    bindings = {}
+    try:
+        parent_info = os.fstat(parent)
+        if (not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != os.getuid()
+                or os.path.realpath(case_dir) != case_dir):
+            raise ValueError("case directory ownership or containment changed")
+        for name in ("home", "state"):
+            os.mkdir(name, 0o700, dir_fd=parent)
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            try:
+                os.fchmod(fd, 0o700)
+                info = os.fstat(fd)
+                path_info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                        or stat.S_IMODE(info.st_mode) != 0o700
+                        or (info.st_dev, info.st_ino) != (path_info.st_dev, path_info.st_ino)):
+                    raise ValueError("private fixture directory identity or permissions changed")
+                bindings[name] = {"path": os.path.join(case_dir, name), "uid": info.st_uid,
+                                  "mode": stat.S_IMODE(info.st_mode), "device": info.st_dev, "inode": info.st_ino}
+            finally:
+                os.close(fd)
+        env = proof.case_environment(case_dir)
+        if (env.get("HOME") != bindings["home"]["path"]
+                or env.get("BARGE_ACCOUNT_HOME") != bindings["home"]["path"]
+                or env.get("BARGE_STATE_DIR") != bindings["state"]["path"]):
+            raise ValueError("fixture environment changed its private directory bindings")
+        for name in ("home", "state"):
+            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o700
+                    or (info.st_dev, info.st_ino) != (bindings[name]["device"], bindings[name]["inode"])):
+                raise ValueError("fixture environment replaced a private directory")
+        current_parent = os.stat(case_dir, follow_symlinks=False)
+        if ((current_parent.st_dev, current_parent.st_ino) != (parent_info.st_dev, parent_info.st_ino)
+                or not stat.S_ISDIR(current_parent.st_mode)):
+            raise ValueError("fixture parent changed during environment setup")
+        return env, bindings
+    finally:
+        os.close(parent)
+
+
+class WriterFailure(ValueError):
+    def __init__(self, message, evidence):
+        super().__init__(message)
+        self.evidence = evidence
+
+
 def external_writer_child(binary, case, env, timeout, mount):
     """Bind and reap a real holder and coordinator as direct guarded children."""
     child = subprocess.Popen([binary, case], cwd=ROOT, env=env, stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              close_fds=True)
     holder = None
+    first = b""
+    ready_lines = {}
     started = time.monotonic()
 
     def time_left():
@@ -179,10 +267,14 @@ def external_writer_child(binary, case, env, timeout, mount):
         if not ready:
             raise TimeoutError("a direct child did not publish readiness")
         line = process.stdout.readline()
+        ready_lines[process] = line
         return line, json.loads(line)
 
     try:
         first, message = read_ready(child)
+        if message.get("case") == case and message.get("status") == "failed":
+            out, err = child.communicate(timeout=time_left())
+            return subprocess.CompletedProcess([binary, case], child.returncode, first + out, err)
         payload = message.get("payload")
         root = os.path.realpath(mount)
         if (message.get("case") != case or message.get("stage") != "writer-ready"
@@ -194,20 +286,20 @@ def external_writer_child(binary, case, env, timeout, mount):
         holder_env = dict(env, BARGE_PROOF_HOLDER_PATH=payload)
         holder = subprocess.Popen([binary, "__hold"], cwd=ROOT, env=holder_env,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, text=True, close_fds=True)
+                                  stderr=subprocess.PIPE, close_fds=True)
         _holder_line, observed = read_ready(holder)
         if (observed.get("stage") != "holder-ready" or observed.get("pid") != holder.pid
                 or observed.get("uid") != os.getuid() or observed.get("device") != facts.st_dev
                 or observed.get("inode") != facts.st_ino or not isinstance(observed.get("start"), int)
                 or not isinstance(observed.get("fd"), int) or observed["fd"] < 0):
             raise ValueError("the direct holder did not bind its real process and file identities")
-        out, err = child.communicate(json.dumps(observed) + "\n", timeout=time_left())
-        holder_out, holder_err = holder.communicate("release\n", timeout=time_left())
+        out, err = child.communicate((json.dumps(observed) + "\n").encode(), timeout=time_left())
+        holder_out, holder_err = holder.communicate(b"release\n", timeout=time_left())
         holder_result = subprocess.CompletedProcess([binary, "__hold"], holder.returncode, holder_out, holder_err)
         verdict(holder_result, "__hold")
         if case == "unknown-writer":
             observations = []
-            for line in out.splitlines():
+            for line in text_output(out).splitlines():
                 try:
                     document = json.loads(line)
                 except ValueError:
@@ -221,14 +313,31 @@ def external_writer_child(binary, case, env, timeout, mount):
                 raise ValueError("the labelled read failure did not bind and consume the owned holder")
         result = subprocess.CompletedProcess([binary, case], child.returncode, first + out, err)
         result.proof_holder = {**observed, "reaped": True, "exit": holder.returncode}
+        result.proof_holder_process = process_evidence(
+            subprocess.CompletedProcess([binary, "__hold"], holder.returncode, _holder_line + holder_out, holder_err))
         return result
-    except Exception:
+    except Exception as error:
+        closure = []
         for process in (child, holder):
-            if process is not None:
+            if process is None:
+                continue
+            out, err = None, None
+            try:
                 if process.poll() is None:
                     process.kill()  # Only the exact direct children created above.
-                    process.communicate()
-        raise
+                out, err = process.communicate(timeout=time_left())
+                reaped = True
+            except Exception as cleanup_error:
+                reaped = None
+                out = getattr(cleanup_error, "stdout", None)
+                err = getattr(cleanup_error, "stderr", None)
+            prefix = ready_lines.get(process, b"")
+            if prefix:
+                out = prefix + (out or b"")
+            closure.append({"argv": [binary, case if process is child else "__hold"],
+                            "exit": process.returncode, "reaped": reaped,
+                            "stdout": output_evidence(out), "stderr": output_evidence(err)})
+        raise WriterFailure(str(error), closure) from error
 
 
 def external_receipt(path):
@@ -252,9 +361,9 @@ def budget(deadline_ns, maximum):
 
 def artifact(result):
     if result.returncode != 0:
-        raise ValueError(f"the in-guard build exited {result.returncode}: {result.stderr[-300:]}")
+        raise ValueError(f"the in-guard build exited {result.returncode}: {text_output(result.stderr)[-300:]}")
     found = []
-    for line in result.stdout.splitlines():
+    for line in text_output(result.stdout).splitlines():
         try:
             document = json.loads(line)
         except ValueError:
@@ -268,7 +377,7 @@ def artifact(result):
     return found[0]["executable"]
 
 
-def stage(effects, run_root, deadline_ns):
+def stage(effects, run_root, deadline_ns, receipt):
     before = effects.identity(deadline_ns)
     stage_dir = effects.mkdir(run_root, "stage-")
     if not os.path.realpath(stage_dir).startswith(os.path.realpath(run_root) + os.sep):
@@ -278,7 +387,14 @@ def stage(effects, run_root, deadline_ns):
     problems = base.stage_environment_problems(environment)
     if problems:
         raise ValueError("; ".join(problems))
-    result = effects.process(BUILD, environment, budget(deadline_ns, 360))
+    try:
+        result = effects.process(BUILD, environment, budget(deadline_ns, 360))
+    except Exception as error:
+        receipt["build"] = {"argv": BUILD, "exit": None, "reaped": None,
+                            "stdout": output_evidence(getattr(error, "stdout", None)),
+                            "stderr": output_evidence(getattr(error, "stderr", None))}
+        raise
+    receipt["build"] = process_evidence(result)
     source = artifact(result)
     source_hash = journal.external_sha256_file(source)
     binary = os.path.join(stage_dir, DRIVER)
@@ -298,7 +414,7 @@ def stage(effects, run_root, deadline_ns):
 
 def verdict(result, case):
     documents = []
-    for line in result.stdout.splitlines():
+    for line in text_output(result.stdout).splitlines():
         try:
             document = json.loads(line)
         except ValueError:
@@ -306,7 +422,7 @@ def verdict(result, case):
         if isinstance(document, dict) and document.get("case") == case and "status" in document:
             documents.append(document)
     if len(documents) != 1 or result.returncode != 0 or documents[0].get("status") != "passed":
-        raise ValueError(f"case {case} did not return one passing verdict: {result.stderr[-300:]}")
+        raise ValueError(f"case {case} did not return one passing verdict: {text_output(result.stderr)[-300:]}")
     result_document = documents[0]
     faults = {"intent-capture": "post-rename phase publication failure",
               "renamed-replay": "stop after durable renamed phase",
@@ -359,7 +475,7 @@ def inner_half(mode, effects):
         run_root = effects.mkdir(os.path.realpath(scratch), "coordinator-proof-")
         if not os.path.realpath(run_root).startswith(os.path.realpath(scratch) + os.sep):
             raise ValueError("the run root escaped guarded scratch")
-        binary, manifest = stage(effects, run_root, deadline_ns)
+        binary, manifest = stage(effects, run_root, deadline_ns, receipt)
         receipt["manifest"] = manifest
         if journal.external_sha256_file(binary) != manifest["binary_sha256"]:
             raise ValueError("the staged driver changed before use")
@@ -377,6 +493,8 @@ def inner_half(mode, effects):
                 if failed and mode == "counted":
                     receipt["cases"].append({"case": case, "status": "skipped"})
                     continue
+                result = None
+                bindings = None
                 try:
                     timeout = budget(deadline_ns, 60)
                     case_dir = effects.mkdir(run_root, f"case-{case}-")
@@ -386,12 +504,31 @@ def inner_half(mode, effects):
                     for name in list(env):
                         if name.startswith(("BARGE_", "OXIDE_", "XDG_")):
                             env.pop(name)
-                    env.update(proof.case_environment(case_dir))
+                    case_environment, bindings = private_case_environment(proof, case_dir)
+                    env.update(case_environment)
                     result = (effects.writer(binary, case, env, timeout, proof.mount)
                               if case in ("held-writer", "unknown-writer") else effects.process([binary, case], env, timeout))
-                    receipt["cases"].append(verdict(result, case))
+                    document = verdict(result, case)
+                    document["process"] = process_evidence(result)
+                    document["fixture"] = bindings
+                    if hasattr(result, "proof_holder_process"):
+                        document["holder_process"] = result.proof_holder_process
+                    receipt["cases"].append(document)
                 except Exception as error:  # bounded case failure, never a pass
-                    receipt["cases"].append({"case": case, "status": "failed", "detail": str(error)[:400]})
+                    failure = {"case": case, "status": "failed", "detail": str(error)[:400],
+                               "fixture": bindings}
+                    if result is not None:
+                        failure["process"] = process_evidence(result)
+                        if hasattr(result, "proof_holder_process"):
+                            failure["holder_process"] = result.proof_holder_process
+                    elif isinstance(error, WriterFailure):
+                        failure["process"] = error.evidence[0] if error.evidence else None
+                        failure["direct_children"] = error.evidence
+                    else:
+                        failure["process"] = {"argv": [binary, case], "reaped": None,
+                                              "exit": None, "stdout": output_evidence(getattr(error, "stdout", None)),
+                                              "stderr": output_evidence(getattr(error, "stderr", None))}
+                    receipt["cases"].append(failure)
                     failed = True
             receipt["image_closure"] = detach_with_budget(proof, deadline_ns)
         except Exception:
@@ -528,7 +665,7 @@ def composition_controls():
         handle.write(b"fake external compiler artifact; never executable\n")
     calls = {"stage": 0, "cases": 0, "writer": 0, "attach": 0, "detach": 0}
     options = {"stage_ok": True, "attach_ok": True, "image_closed": True,
-               "group_closed": True, "case_ok": True}
+               "group_closed": True, "case_ok": True, "terminal_failure": False, "stage_nonzero": False}
     normal_env = dict(os.environ)
     guard_env = dict(normal_env, OXIDE_TASK_SCRATCH_ROOT=scratch, OXIDE_PROOF_EVIDENCE=evidence)
     route = {"path": fixture, "realpath": fixture, "present": True, "volume_uuid": journal.ROUTE_UUID,
@@ -536,10 +673,12 @@ def composition_controls():
 
     class FakeImage:
         mount = fixture
+        parent = scratch
         device = "/dev/fake-proof"
         volume_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
         def __init__(self, run_root):
+            self.evidence = evidence
             self.backing = os.path.join(run_root, "fake-backing")
             with open(self.backing, "wb") as handle:
                 handle.write(b"fixture")
@@ -555,13 +694,7 @@ def composition_controls():
             return {"closed": options["image_closed"], "backing_attached": not options["image_closed"]}
 
         def case_environment(self, case_dir):
-            home, state = os.path.join(case_dir, "home"), os.path.join(case_dir, "state")
-            os.mkdir(home)
-            os.mkdir(state)
-            return {"HOME": home, "BARGE_ACCOUNT_HOME": home, "BARGE_STATE_DIR": state,
-                    "BARGE_PROOF_VOLUME_UUID": self.volume_uuid, "BARGE_PROOF_VOLUME_MOUNT": self.mount,
-                    "TMPDIR": case_dir, "TMP": case_dir, "TEMP": case_dir,
-                    "OXIDE_TASK_SCRATCH_ROOT": scratch, "OXIDE_PROOF_EVIDENCE": evidence}
+            return image_helpers.AdapterProof.case_environment(self, case_dir)
 
     def process(command, _env, _timeout):
         if command == BUILD:
@@ -569,10 +702,15 @@ def composition_controls():
             if not (_env.get("TMPDIR") == _env.get("TMP") == _env.get("TEMP")
                     and os.path.realpath(_env["TMPDIR"]).startswith(scratch + os.sep)):
                 raise ValueError("stage temporary variables escaped guarded scratch")
+            if options["stage_nonzero"]:
+                return subprocess.CompletedProcess(command, 7, b"build refusal on stdout", b"build stderr")
             artifact_line = {"reason": "compiler-artifact", "target": {"name": DRIVER, "kind": ["example"]},
                              "features": FEATURES, "executable": fake_binary}
             return subprocess.CompletedProcess(command, 0, json.dumps(artifact_line) if options["stage_ok"] else "", "")
         calls["cases"] += 1
+        if options["terminal_failure"]:
+            return subprocess.CompletedProcess(command, 3,
+                json.dumps({"case": command[1], "status": "failed", "detail": "driver refusal"}).encode(), b"")
         name = command[1] if options["case_ok"] else "foreign-case"
         return subprocess.CompletedProcess(command, 0, json.dumps({"case": name, "status": "passed"}), "")
 
@@ -625,6 +763,47 @@ def composition_controls():
         if not passed.get("qualified") or calls != {"stage": 1, "cases": len(CASES), "writer": 2,
                                                        "attach": 1, "detach": 1}:
             raise ValueError(f"the real entry composition did not pass: {passed}, {calls}")
+        # Simulate a permissive creator without changing the process umask.
+        # The real environment helper and descriptor-based verifier still run.
+        permissive_case = tempfile.mkdtemp(prefix="permissive-case-", dir=fixture)
+        original_mkdir = os.mkdir
+        def permissive_mkdir(path, mode=0o777, *, dir_fd=None):
+            return original_mkdir(path, 0o777, dir_fd=dir_fd)
+        with patch.object(os, "mkdir", side_effect=permissive_mkdir):
+            _env, private = private_case_environment(FakeImage(permissive_case), permissive_case)
+        if any(private[name]["mode"] != 0o700 for name in ("home", "state")):
+            raise ValueError("permissive directory creation escaped the private mode check")
+        for entry in passed["inner"]["cases"]:
+            if any(entry["fixture"][name]["mode"] != 0o700 for name in ("home", "state")):
+                raise ValueError("actual case environment did not retain private modes")
+            if entry["process"]["reaped"] is not True:
+                raise ValueError("case process reap was not retained")
+        truncated = output_evidence("x" * (OUTPUT_LIMIT + 9))
+        if not truncated["truncated"] or truncated["bytes"] != OUTPUT_LIMIT + 9 or truncated["retained_bytes"] != OUTPUT_LIMIT:
+            raise ValueError("bounded output accounting did not retain the actual length")
+        failed_result = subprocess.CompletedProcess([fake_binary, "positive"], 7,
+            "x" * (OUTPUT_LIMIT + 1) + "\n" +
+            json.dumps({"case": "positive", "status": "failed", "detail": "first refusal"}), "")
+        try:
+            verdict(failed_result, "positive")
+        except ValueError:
+            captured = process_evidence(failed_result)
+            if captured["exit"] != 7 or "first refusal" not in captured["terminals"][0]["prefix"]:
+                raise ValueError("failed terminal evidence was lost")
+        else:
+            raise ValueError("a failed terminal verdict passed")
+        options["terminal_failure"] = True
+        failed_case = outer_half("counted")["inner"]["cases"][0]
+        options["terminal_failure"] = False
+        if (failed_case["status"] != "failed" or failed_case["process"]["exit"] != 3
+                or "driver refusal" not in failed_case["process"]["stdout"]["prefix"]):
+            raise ValueError("the actual case receiver dropped failure output")
+        options["stage_nonzero"] = True
+        failed_build = outer_half("counted")["inner"]
+        options["stage_nonzero"] = False
+        if (failed_build["build"]["exit"] != 7
+                or "build refusal" not in failed_build["build"]["stdout"]["prefix"]):
+            raise ValueError("the actual stage receiver dropped build failure output")
         options["group_closed"] = False
         if outer_half("counted").get("qualified"):
             raise ValueError("a non-joined group census was accepted")
@@ -680,7 +859,7 @@ def composition_controls():
                                "fd": 7, "device": facts.st_dev, "inode": facts.st_ino}
                 else:
                     message = {"case": "unknown-writer", "stage": "writer-ready", "payload": path}
-                self.stdout = io.StringIO(json.dumps(message) + "\n")
+                self.stdout = io.BytesIO((json.dumps(message) + "\n").encode())
                 self.returncode = 0
                 self.killed = False
                 self.reaped = False
@@ -688,15 +867,15 @@ def composition_controls():
             def communicate(self, data=None, timeout=None):
                 self.reaped = True
                 if self.role == "holder":
-                    if data is not None and data != "release\n":
+                    if data is not None and data != b"release\n":
                         raise ValueError("wrong holder release")
-                    return json.dumps({"case": "__hold", "status": "passed"}), ""
+                    return json.dumps({"case": "__hold", "status": "passed"}).encode(), b""
                 if data is None:
-                    return "", ""
+                    return b"", b""
                 identity = json.loads(data)
                 injection = {**identity, "case": "unknown-writer", "stage": "injection",
                              "reader": "descriptor-path-eio", "consumed": self.consume}
-                return json.dumps(injection) + "\n" + json.dumps({"case": "unknown-writer", "status": "passed"}), ""
+                return (json.dumps(injection) + "\n" + json.dumps({"case": "unknown-writer", "status": "passed"})).encode(), b""
 
             def poll(self):
                 return None if not self.reaped else self.returncode
@@ -704,6 +883,14 @@ def composition_controls():
             def kill(self):
                 self.killed = True
 
+        child = FakeChild("driver", payload)
+        child.stdout = io.BytesIO((json.dumps({"case": "unknown-writer", "status": "failed",
+                                               "detail": "early refusal"}) + "\n").encode())
+        child.returncode = 3
+        with patch.object(subprocess, "Popen", return_value=child), patch.object(select, "select", return_value=([child.stdout], [], [])):
+            early = actual_writer(fake_binary, "unknown-writer", {}, 5, fixture)
+        if not child.reaped or early.returncode != 3 or b"early refusal" not in early.stdout:
+            raise ValueError("early writer failure was not retained and reaped")
         child, holder = FakeChild("driver", payload), FakeChild("holder", payload)
         with patch.object(subprocess, "Popen", side_effect=[child, holder]), patch.object(select, "select", side_effect=lambda files, *_args: (files, [], [])):
             received = actual_writer(fake_binary, "unknown-writer", {}, 5, fixture)
