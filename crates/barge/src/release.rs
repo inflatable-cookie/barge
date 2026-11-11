@@ -1784,6 +1784,265 @@ pub struct ReleaseRunRequest<'a> {
     pub delete: DeleteBounds,
 }
 
+/// Begin one Barge-owned successor operation from an actual canonical release
+/// plan. This stages no deletion: the existing release gate is re-run and the
+/// selected row is re-proved under the unit lock before the journal publish.
+/// The caller retains the original declaration generation across retries.
+#[allow(clippy::too_many_arguments)]
+pub fn begin_owned_operation(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn AbsenceVolume,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    account: &dyn crate::os::AccountFacts,
+    request: &ReleaseRunRequest<'_>,
+    root_id: &str,
+    declaration_generation: u64,
+) -> Result<crate::operation::Begun> {
+    if !crate::unit::is_sha256(request.plan_digest)
+        || sha256_hex(request.plan_bytes) != request.plan_digest
+    {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "the original plan bytes and digest differ",
+        ));
+    }
+    let presented = read_prune_plan(request.plan_bytes)?;
+    if canonical_plan_bytes(&presented)?.as_slice() != request.plan_bytes
+        || presented.area.namespace != request.release.namespace
+        || presented.area.area != request.release.area
+        || presented.volume_uuid != request.release.volume_uuid.as_str()
+    {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the original canonical plan names another area or volume",
+        ));
+    }
+    let mut selected = presented.eligible().filter(|row| row.root_id == root_id);
+    let row = selected.next().ok_or_else(|| {
+        Error::new(
+            ErrorKind::RefusedBoundary,
+            "the original plan does not select this root",
+        )
+    })?;
+    if selected.next().is_some() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the original plan selects the root more than once",
+        ));
+    }
+    let fresh_request = ReleaseRequest {
+        named_roots: &presented.named_roots,
+        ..request.release
+    };
+    let (fresh, observed) = plan_observed(
+        state_paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        account,
+        &fresh_request,
+    )?;
+    if fresh.plan.named_roots != presented.named_roots
+        || fresh.volume.state != VolumeState::Present
+        || fresh.volume.loud
+        || !fresh.oxide.complete
+        || fresh.plan.timed_out
+        || fresh.plan.truncated
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the fresh release gate is incomplete or the volume is unavailable",
+        ));
+    }
+    let (_index, observed_root) = matching_fresh_row(row, &fresh, &observed)
+        .map_err(|reason| Error::new(ErrorKind::RefusedBoundary, reason))?;
+    let document = area::show(state_paths, request.release.namespace, request.release.area)?
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the original area declaration is absent",
+            )
+        })?;
+    if declaration_generation == 0 || document.generation < declaration_generation {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the area declaration is older than the original authority",
+        ));
+    }
+    let mut original_declaration = document.clone();
+    original_declaration.generation = declaration_generation;
+    let mut unit = observed_root.unit.clone();
+    unit.plan_digest = request.plan_digest.to_owned();
+    let evidence = state::IntentEvidence {
+        identity: Some(row.identity.clone()),
+        absence: row.absence.clone(),
+        caller: None,
+    };
+    let uid = observer.effective_uid()?;
+    let reprove = |_volume: &VolumeRecord| -> Result<Option<AbsenceEvidence>> {
+        let context = Reprove {
+            state_paths,
+            dirs,
+            facts,
+            observer,
+            account,
+            document: &document,
+            row,
+            observed: observed_root,
+            volume_uuid: request.release.volume_uuid,
+            uid,
+            now_ms: request.release.now_ms,
+            reference_wall: request.release.bounds.reference_wall,
+        };
+        reprove_row(&context)
+            .map(|()| None)
+            .map_err(|reason| Error::new(ErrorKind::RefusedBoundary, reason))
+    };
+    crate::delete::begin_owned_from_checked_plan(
+        state_paths,
+        dirs,
+        facts,
+        observer,
+        &unit,
+        &original_declaration,
+        &evidence,
+        true,
+        row.absence.is_some(),
+        &reprove,
+        request.delete,
+    )
+}
+
+/// Execute a Barge-owned successor operation only through the original
+/// canonical release plan and a freshly repeated release gate. The regular
+/// legacy release entry remains available for its supported pending intents.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_owned_operation(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    facts: &dyn AbsenceVolume,
+    mounts: &dyn MountRoot,
+    observer: &dyn ProcessObserver,
+    account: &dyn crate::os::AccountFacts,
+    request: &ReleaseRunRequest<'_>,
+    root_id: &str,
+    declaration_generation: u64,
+) -> Result<crate::delete::DeleteReport> {
+    let begun = begin_owned_operation(
+        state_paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        account,
+        request,
+        root_id,
+        declaration_generation,
+    )?;
+    let original = begun.record().clone();
+    let presented = read_prune_plan(request.plan_bytes)?;
+    let row = presented
+        .eligible()
+        .find(|row| row.root_id == root_id)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::RefusedBoundary,
+                "the original plan does not select this root",
+            )
+        })?;
+    let fresh_request = ReleaseRequest {
+        named_roots: &presented.named_roots,
+        ..request.release
+    };
+    let (fresh, observed) = plan_observed(
+        state_paths,
+        dirs,
+        facts,
+        mounts,
+        observer,
+        account,
+        &fresh_request,
+    )?;
+    if fresh.volume.state != VolumeState::Present
+        || fresh.volume.loud
+        || !fresh.oxide.complete
+        || fresh.plan.timed_out
+        || fresh.plan.truncated
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the fresh release gate is incomplete or the volume is unavailable",
+        ));
+    }
+    let (_index, observed_root) = matching_fresh_row(row, &fresh, &observed)
+        .map_err(|reason| Error::new(ErrorKind::RefusedBoundary, reason))?;
+    let document = area::show(state_paths, request.release.namespace, request.release.area)?
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the original area declaration is absent",
+            )
+        })?;
+    let uid = observer.effective_uid()?;
+    let reprove = |_volume: &VolumeRecord| -> Result<Option<AbsenceEvidence>> {
+        let context = Reprove {
+            state_paths,
+            dirs,
+            facts,
+            observer,
+            account,
+            document: &document,
+            row,
+            observed: observed_root,
+            volume_uuid: request.release.volume_uuid,
+            uid,
+            now_ms: request.release.now_ms,
+            reference_wall: request.release.bounds.reference_wall,
+        };
+        reprove_row(&context)
+            .map(|()| None)
+            .map_err(|reason| Error::new(ErrorKind::RefusedBoundary, reason))
+    };
+    let mut locks = state::LockSet::new(state_paths.clone());
+    let view = crate::operation::consult_operations(
+        dirs,
+        observer,
+        state_paths,
+        &mut locks,
+        crate::contract::INTENT_ROWS,
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnknownState,
+            "the operation journal is not initialized",
+        )
+    })?;
+    let current = view
+        .records
+        .iter()
+        .find(|record| record.sequence == original.sequence)
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "the owned operation is missing"))?;
+    if *current != original {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the owned operation changed before execution",
+        ));
+    }
+    crate::delete::execute_bound_operation(
+        state_paths,
+        dirs,
+        facts,
+        observer,
+        &view.identity,
+        current,
+        Some(&reprove),
+        request.delete,
+    )
+}
+
 /// One presented eligible row's outcome in a release run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4892,6 +5151,119 @@ mod tests {
             .unwrap_or("")
             .contains("no longer listed"));
         assert_eq!(intent_records(&fixture).len(), 1, "no second intent");
+    }
+
+    #[test]
+    fn owned_successor_begin_comes_from_the_actual_release_gate() {
+        let fixture = Fixture::new("release-owned-successor");
+        let root = fixture.root();
+        let report = fixture.plan();
+        assert!(row(&report, &root).eligible);
+        let (bytes, digest) = presented(&report);
+        let platform = fixture.volume.platform();
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let state = &fixture.volume.state;
+        let mut locks = state::LockSet::new(state.clone());
+        crate::operation::init_operation_journal(&platform, &observer, state, &mut locks)
+            .expect("journal");
+        let request = ReleaseRunRequest {
+            plan_bytes: &bytes,
+            plan_digest: &digest,
+            release: fixture.request(fixture.overdue()),
+            delete: DeleteBounds::default(),
+        };
+        let begun = super::begin_owned_operation(
+            state,
+            &platform,
+            &facts,
+            &fixture.volume.mounts(),
+            &observer,
+            &fixture.account,
+            &request,
+            &root.root_id,
+            1,
+        )
+        .expect("real release gate");
+        let record = begun.record();
+        assert_eq!(record.resume, crate::operation::ResumePolicy::Barge);
+        assert!(record.owned_plan.is_some());
+        assert!(root.path.exists(), "begin has no destructive effect");
+        assert!(state::read_intents(state, crate::contract::INTENT_ROWS)
+            .expect("legacy")
+            .records
+            .is_empty());
+        let rows = crate::delete::drain_checked_operations(
+            state,
+            &platform,
+            &facts,
+            &observer,
+            &[],
+            DeleteBounds::default(),
+        )
+        .expect("drain");
+        assert!(matches!(
+            rows[0].outcome,
+            crate::delete::OperationDrainOutcome::Cancelled
+        ));
+        assert!(root.path.exists());
+    }
+
+    #[test]
+    fn owned_successor_executes_the_real_release_plan_and_drains() {
+        let fixture = Fixture::new("release-owned-successor-execute");
+        let root = fixture.root();
+        let report = fixture.plan();
+        assert!(row(&report, &root).eligible);
+        let (bytes, digest) = presented(&report);
+        let platform = fixture.volume.platform();
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let state = &fixture.volume.state;
+        let mut locks = state::LockSet::new(state.clone());
+        crate::operation::init_operation_journal(&platform, &observer, state, &mut locks)
+            .expect("journal");
+        let request = ReleaseRunRequest {
+            plan_bytes: &bytes,
+            plan_digest: &digest,
+            release: fixture.request(fixture.overdue()),
+            delete: DeleteBounds::default(),
+        };
+        let result = super::execute_owned_operation(
+            state,
+            &platform,
+            &facts,
+            &fixture.volume.mounts(),
+            &observer,
+            &fixture.account,
+            &request,
+            &root.root_id,
+            1,
+        )
+        .expect("owned execution");
+        assert_eq!(
+            result.outcome,
+            crate::delete::DeleteOutcome::Deleted,
+            "{result:?}"
+        );
+        assert!(!root.path.exists());
+        let rows = crate::delete::drain_checked_operations(
+            state,
+            &platform,
+            &facts,
+            &observer,
+            &[],
+            DeleteBounds::default(),
+        )
+        .expect("drain");
+        assert!(matches!(
+            rows[0].outcome,
+            crate::delete::OperationDrainOutcome::Completed
+        ));
+        assert!(state::read_intents(state, crate::contract::INTENT_ROWS)
+            .expect("legacy")
+            .records
+            .is_empty());
     }
 
     #[test]

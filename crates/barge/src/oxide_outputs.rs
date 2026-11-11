@@ -1287,7 +1287,7 @@ fn reprove(
 
 /// Establish actual absence, preserving the live anchor and relative path so
 /// replay can locate the same volume even after another remount.
-fn prove_checkout_absent(
+pub(crate) fn prove_checkout_absent(
     dirs: &dyn DirOps,
     facts: &dyn AbsenceVolume,
     checkout: &Path,

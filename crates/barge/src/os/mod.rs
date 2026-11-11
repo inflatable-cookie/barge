@@ -39,6 +39,10 @@ pub use space::{Flush, SpaceFacts, SpaceMeasurement};
 #[cfg(target_os = "macos")]
 pub use macos::MacOs;
 
+/// Explicitly scoped proof-only failure at one real descriptor read.
+#[cfg(all(feature = "proof-journal", target_os = "macos"))]
+pub use macos::{proof_fail_descriptor_query, ProofDescriptorFault};
+
 /// The parts of the macOS scan the crate's own tests state for themselves: an
 /// `EPERM` answer sequence, the per-fd answers of one vnode descriptor, and the
 /// backoff schedule they are settled on. Nothing outside a test build can reach

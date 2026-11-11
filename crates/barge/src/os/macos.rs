@@ -57,6 +57,142 @@ const LIST_ENTRY_LIMIT: usize = 200_000;
 /// Distinguishes temporary names issued in one process.
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+// Proof-only: one scoped failure at a real, identity-bound descriptor read.
+// The production scanner still enumerates the entire kernel process table.
+#[cfg(any(test, feature = "proof-journal"))]
+thread_local! {
+    static PROOF_DESCRIPTOR_FAULT: std::cell::RefCell<Option<ProofDescriptorTarget>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "proof-journal"))]
+struct ProofDescriptorTarget {
+    process: ProcessIdentity,
+    descriptor: i32,
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    consumed: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+#[cfg(any(test, feature = "proof-journal"))]
+impl ProofDescriptorTarget {
+    fn matches(&self, process: ProcessIdentity, descriptor: i32) -> bool {
+        self.process == process && self.descriptor == descriptor
+    }
+}
+
+/// Scoped proof-only descriptor query failure. Drop always disarms it.
+#[cfg(any(test, feature = "proof-journal"))]
+#[derive(Debug)]
+pub struct ProofDescriptorFault {
+    consumed: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+#[cfg(any(test, feature = "proof-journal"))]
+impl ProofDescriptorFault {
+    /// Whether the exact, freshly rechecked descriptor consumed the injection.
+    pub fn consumed(&self) -> bool {
+        self.consumed.get()
+    }
+}
+
+#[cfg(any(test, feature = "proof-journal"))]
+impl Drop for ProofDescriptorFault {
+    fn drop(&mut self) {
+        PROOF_DESCRIPTOR_FAULT.with(|slot| {
+            let _ = slot.borrow_mut().take();
+        });
+    }
+}
+
+/// Arm one explicitly scoped proof-only unreadable path query. The actual
+/// process and descriptor must already identify the specified owned file.
+/// This is not controlled by environment and cannot produce a safe answer.
+#[cfg(any(test, feature = "proof-journal"))]
+pub fn proof_fail_descriptor_query(
+    process: ProcessIdentity,
+    descriptor: i32,
+    path: &Path,
+    device: u64,
+    inode: u64,
+) -> Result<ProofDescriptorFault> {
+    let consumed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let target = ProofDescriptorTarget {
+        process,
+        descriptor,
+        path: std::fs::canonicalize(path)
+            .map_err(|error| Error::new(ErrorKind::UnknownState, error.to_string()))?,
+        device,
+        inode,
+        consumed: consumed.clone(),
+    };
+    if !proof_target_is_current(&target) {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the proof descriptor identity is not current",
+        ));
+    }
+    PROOF_DESCRIPTOR_FAULT.with(|slot| {
+        let mut held = slot.borrow_mut();
+        if held.is_some() {
+            return Err(Error::new(
+                ErrorKind::RefusedBoundary,
+                "a proof descriptor fault is already armed",
+            ));
+        }
+        *held = Some(target);
+        Ok(ProofDescriptorFault { consumed })
+    })
+}
+
+#[cfg(any(test, feature = "proof-journal"))]
+fn proof_target_is_current(target: &ProofDescriptorTarget) -> bool {
+    let Ok(Some(info)) = bsd_info(target.process.pid) else {
+        return false;
+    };
+    if target.process.start != bsd_start(&info)
+        || target.process.effective_uid != Some(info.pbi_uid)
+        || target.process.effective_uid != MacOs::new().effective_uid().ok()
+    {
+        return false;
+    }
+    let Ok(DescriptorReading::Path(path)) =
+        read_descriptor(target.process.pid, target.descriptor, None)
+    else {
+        return false;
+    };
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(facts) = std::fs::metadata(&path) else {
+        return false;
+    };
+    path == target.path
+        && facts.is_file()
+        && facts.dev() == target.device
+        && facts.ino() == target.inode
+}
+
+#[cfg(any(test, feature = "proof-journal"))]
+fn proof_descriptor_read(process: ProcessIdentity, descriptor: i32) -> Option<StatedVnodeRead> {
+    PROOF_DESCRIPTOR_FAULT.with(|slot| {
+        let held = slot.borrow();
+        let target = held.as_ref()?;
+        if target.consumed.get()
+            || !target.matches(process, descriptor)
+            || !proof_target_is_current(target)
+        {
+            return None;
+        }
+        target.consumed.set(true);
+        Some(StatedVnodeRead {
+            path: StatedCall::Failed(libc::EIO),
+            facts: StatedCall::Real,
+            once: true,
+        })
+    })
+}
+
 /// A generous fixed buffer for one `fgetattrlist` volume attribute: the kernel
 /// writes a 4-byte length followed by the attribute's value.
 const VOLUME_ATTRIBUTE_BYTES: usize = 32;
@@ -1841,6 +1977,8 @@ impl MacOs {
             "classified",
         );
         let stated = stated_vnode_read(faults, identity.pid, vnode_index);
+        #[cfg(any(test, feature = "proof-journal"))]
+        let stated = stated.or_else(|| proof_descriptor_read(identity, descriptor));
         match read_descriptor(identity.pid, descriptor, stated) {
             Ok(DescriptorReading::Path(path)) => Observed::Path(path),
             Ok(DescriptorReading::Opaque) => Observed::Opaque,
@@ -5803,6 +5941,73 @@ mod tests {
     use super::fixture_account_home;
     use crate::error::ErrorKind;
     use crate::testkit::TempDir;
+
+    #[test]
+    fn proof_descriptor_fault_is_scoped_consumed_and_disarmed() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let fixture = TempDir::new("scoped-proof-descriptor");
+        let path = fixture.write("payload", b"private fixture");
+        let file = std::fs::File::open(&path).expect("fixture descriptor");
+        let facts = std::fs::metadata(&path).expect("fixture facts");
+        let pid = std::process::id();
+        let info = super::bsd_info(pid)
+            .expect("process facts")
+            .expect("live process");
+        let identity = crate::os::ProcessIdentity {
+            pid,
+            start: super::bsd_start(&info),
+            effective_uid: Some(info.pbi_uid),
+        };
+        let mut wrong = identity;
+        wrong.start = wrong.start.saturating_add(1);
+        assert!(super::proof_fail_descriptor_query(
+            wrong,
+            file.as_raw_fd(),
+            &path,
+            facts.dev(),
+            facts.ino()
+        )
+        .is_err());
+        let guard = super::proof_fail_descriptor_query(
+            identity,
+            file.as_raw_fd(),
+            &path,
+            facts.dev(),
+            facts.ino(),
+        )
+        .expect("bind the real descriptor");
+        assert!(super::proof_descriptor_read(wrong, file.as_raw_fd()).is_none());
+        assert!(super::proof_descriptor_read(identity, file.as_raw_fd() + 1).is_none());
+        assert!(!guard.consumed());
+        let fault =
+            super::proof_descriptor_read(identity, file.as_raw_fd()).expect("targeted read");
+        assert!(super::read_descriptor(pid, file.as_raw_fd(), Some(fault)).is_err());
+        assert!(guard.consumed());
+        assert!(super::proof_descriptor_read(identity, file.as_raw_fd()).is_none());
+        drop(guard);
+        assert!(super::proof_descriptor_read(identity, file.as_raw_fd()).is_none());
+        assert!(super::proof_fail_descriptor_query(
+            identity,
+            file.as_raw_fd(),
+            &path,
+            facts.dev(),
+            facts.ino().saturating_add(1)
+        )
+        .is_err());
+        {
+            let unconsumed = super::proof_fail_descriptor_query(
+                identity,
+                file.as_raw_fd(),
+                &path,
+                facts.dev(),
+                facts.ino(),
+            )
+            .expect("rearm the same bound descriptor");
+            assert!(!unconsumed.consumed());
+        }
+        assert!(super::proof_descriptor_read(identity, file.as_raw_fd()).is_none());
+    }
 
     #[test]
     fn a_fixture_account_home_must_be_an_absolute_real_directory() {

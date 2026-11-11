@@ -106,6 +106,8 @@ mod evidence;
 mod identity;
 #[path = "../src/inspect.rs"]
 mod inspect;
+#[path = "../src/operation.rs"]
+mod operation;
 #[path = "../src/os/mod.rs"]
 mod os;
 #[path = "../src/oxide_outputs.rs"]

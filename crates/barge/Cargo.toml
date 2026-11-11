@@ -55,6 +55,10 @@ name = "journal_proof"
 required-features = ["proof-journal"]
 
 [[example]]
+name = "operation_coordinator_proof"
+required-features = ["proof-journal", "proof-synthetic-account"]
+
+[[example]]
 name = "descriptor_listing_proof"
 required-features = ["proof-descriptor-listing"]
 

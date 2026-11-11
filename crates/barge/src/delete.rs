@@ -111,6 +111,39 @@ use crate::state::{
 };
 use crate::unit::{self, DeletionUnit, MarkerFamily, UnitKind};
 
+#[cfg(any(test, feature = "proof-journal"))]
+thread_local! {
+    static FAIL_AFTER_OPERATION_UNLINK: Cell<bool> = const { Cell::new(false) };
+    static FAIL_AFTER_OPERATION_CAPTURE: Cell<bool> = const { Cell::new(false) };
+    static STOP_AFTER_OPERATION_RENAMED: Cell<bool> = const { Cell::new(false) };
+    static STOP_AFTER_OPERATION_REMOVED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Inject a publication failure immediately after the successor walk's own
+/// final unlink. This proof-only seam never runs in an ordinary build.
+#[cfg(any(test, feature = "proof-journal"))]
+pub fn fail_after_operation_unlink() {
+    FAIL_AFTER_OPERATION_UNLINK.with(|armed| armed.set(true));
+}
+
+/// Inject refusal to publish the captured phase after the real rename.
+#[cfg(any(test, feature = "proof-journal"))]
+pub fn fail_after_operation_capture() {
+    FAIL_AFTER_OPERATION_CAPTURE.with(|armed| armed.set(true));
+}
+
+/// Stop after the captured phase is durable, before the first unlink.
+#[cfg(any(test, feature = "proof-journal"))]
+pub fn stop_after_operation_renamed() {
+    STOP_AFTER_OPERATION_RENAMED.with(|armed| armed.set(true));
+}
+
+/// Stop after Barge's unlink is durably recorded, before deleted publication.
+#[cfg(any(test, feature = "proof-journal"))]
+pub fn stop_after_operation_removed() {
+    STOP_AFTER_OPERATION_REMOVED.with(|armed| armed.set(true));
+}
+
 /// How deep a whole-root delete walks (design, "Bounded resources").
 pub const DELETE_DEPTH: usize = 12;
 
@@ -374,9 +407,2016 @@ pub fn delete_unit_on_volume(
     )
 }
 
+/// Retain a delegated operation as cancelled only after proving under its
+/// deletion locks that the original unit is still present and its private
+/// capture is absent. A phase alone cannot prove that a rename did not happen.
+pub fn cancel_delegated_operation(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    observer: &dyn ProcessObserver,
+    request: &crate::operation::BeginRequest,
+) -> Result<crate::operation::OperationRecord> {
+    use crate::operation::{self, OperationPhase};
+
+    request.validate()?;
+    let (Some(caller), Some(key)) = (request.caller.as_deref(), request.key.as_deref()) else {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "cancellation requires a delegated request",
+        ));
+    };
+    let mut locks = LockSet::new(state_paths.clone());
+    let _journal = locks.lock_operations()?;
+    let view =
+        operation::read_operations(dirs, observer, state_paths, INTENT_ROWS)?.ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the operation journal is not initialized",
+            )
+        })?;
+    let record = view.find_operation(caller, key).ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnknownState,
+            "the operation to cancel is missing",
+        )
+    })?;
+    if !operation::same_request(record, request) {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the cancellation request differs from the recorded binding",
+        ));
+    }
+    if record.phase == OperationPhase::Cancelled {
+        return Ok(record.clone());
+    }
+    if record.phase != OperationPhase::Intent
+        || !record.captures.is_empty()
+        || !record.foreign_captures.is_empty()
+    {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the operation is not positively pre-effect",
+        ));
+    }
+    let unit = DeletionUnit {
+        volume_uuid: record.unit.volume_uuid.clone(),
+        root_dir: record.unit.root_dir.clone(),
+        folder: record.unit.folder.clone(),
+        parent: record.unit.parent.clone(),
+        name: record.unit.name.clone(),
+        kind: record.unit.kind,
+        device: DeviceId::new(record.unit.device),
+        inode: record.unit.inode,
+        marker: record.unit.marker.clone(),
+        root_id: record.unit.root_id.clone(),
+        grant: record.unit.grant.clone(),
+        plan_digest: record.request_digest.clone().ok_or_else(|| {
+            Error::new(ErrorKind::UnknownState, "the original request is missing")
+        })?,
+    };
+    let _volume = locks.lock_volume(&unit.volume_uuid)?;
+    let _unit = lock_deletion_unit(&mut locks, &unit)?;
+    let write = locks.begin_intent_write()?;
+    let journal = CaptureJournal::for_operation(&write, state_paths, dirs, observer, record)?;
+    let intent = journal.intent();
+    let volume = locate_walk_volume(volumes, &intent)
+        .map_err(|reason| Error::new(ErrorKind::UnknownState, reason))?;
+    let Some((_path, area)) = area::open_folder_on_mount(
+        dirs,
+        observer,
+        &volume.mount,
+        volume.device,
+        &intent.root_dir,
+        &intent.folder,
+    )?
+    else {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the operation area is absent",
+        ));
+    };
+    let live_unit = intent.replay_unit(volume.device);
+    let Some(parent) = live_unit.open_parent(dirs, &area)? else {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the operation parent is absent",
+        ));
+    };
+    if dirs.child_facts(&parent, intent.capture_name())?.is_some()
+        || !unit_still_in_place(dirs, observer, &intent, &parent, volume.device)?
+        || dirs.child_facts(&parent, intent.capture_name())?.is_some()
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the original unit and absent capture do not prove cancellation is effect-free",
+        ));
+    }
+    operation::advance_operation(
+        &write,
+        dirs,
+        observer,
+        state_paths,
+        record,
+        OperationPhase::Cancelled,
+    )
+}
+
+/// Re-read the bound declaration and grant. This is separate from caller
+/// eligibility and never interprets the caller's opaque finalization payload.
+fn verify_operation_authority(
+    state_paths: &StatePaths,
+    original: &crate::operation::OperationUnit,
+    request_digest: Option<&str>,
+    declaration: Option<&crate::operation::DeclarationAuthority>,
+    volume: &registry::VolumeRecord,
+    unit: &DeletionUnit,
+) -> Result<()> {
+    let binding = declaration.ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnknownState,
+            "the operation has no original declaration authority",
+        )
+    })?;
+    binding.validate(original)?;
+    if unit.volume_uuid != original.volume_uuid
+        || unit.root_dir != original.root_dir
+        || unit.folder != original.folder
+        || unit.parent != original.parent
+        || unit.name != original.name
+        || unit.kind != original.kind
+        || unit.inode != original.inode
+        || unit.marker != original.marker
+        || unit.root_id != original.root_id
+        || unit.grant != original.grant
+        || request_digest != Some(unit.plan_digest.as_str())
+    {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the live unit differs from the original operation",
+        ));
+    }
+    if unit.marker.as_ref().map(|marker| marker.family) == Some(MarkerFamily::OxideOutputs)
+        && (binding.namespace != crate::oxide_outputs::AREA_NAMESPACE
+            || binding.area != crate::oxide_outputs::AREA_NAME)
+    {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the outputs grant belongs to a different declaration",
+        ));
+    }
+    let document =
+        area::show(state_paths, &binding.namespace, &binding.area)?.ok_or_else(|| {
+            Error::new(
+                ErrorKind::RefusedBoundary,
+                "the original declaration is absent",
+            )
+        })?;
+    if document.generation < binding.generation {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the declaration is older than the original authority",
+        ));
+    }
+    if document.declaration().folder_for(&unit.volume_uuid) != Some(unit.folder.as_str())
+        || volume.root_dir != unit.root_dir
+    {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the original declaration no longer covers the unit's location",
+        ));
+    }
+    custody::grant_still_recorded(state_paths, volume, unit)
+        .map_err(|reason| Error::new(ErrorKind::RefusedBoundary, reason))
+}
+
+/// Re-prove the original absence on its verified volume and ancestor. The
+/// timestamp and device number are observations, never replacement authority.
+fn verify_operation_absence(
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    original: &crate::evidence::AbsenceEvidence,
+) -> Result<()> {
+    original.validate()?;
+    if original.verdict != "absent" {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the original absence was not proved",
+        ));
+    }
+    let ancestor = original.ancestor.as_ref().ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnknownState,
+            "the original absence ancestor is missing",
+        )
+    })?;
+    let uuid = VolumeUuid::parse(&ancestor.volume.volume_uuid)?;
+    let registered = ancestor.volume.kind == "registered";
+    let path = if registered {
+        if original.anchor.kind != "registered" {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "the absence anchor is inconsistent",
+            ));
+        }
+        let relative = original
+            .path
+            .strip_prefix(&original.anchor.path)
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::UnknownState,
+                    "the absence path escaped its original anchor",
+                )
+            })?;
+        let live = crate::os::locate_volume(volumes, volumes, volumes, &uuid)?;
+        live.path().join(relative)
+    } else {
+        if original.anchor.kind != "root" || ancestor.volume.kind != "boot_data" {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "the original absence volume is unknown",
+            ));
+        }
+        original.path.clone()
+    };
+    let fresh = crate::oxide_outputs::prove_checkout_absent(
+        dirs,
+        volumes,
+        &path,
+        registered.then_some(&uuid),
+    )?;
+    let current = fresh.ancestor.as_ref().ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnknownState,
+            "the fresh absence ancestor is missing",
+        )
+    })?;
+    let same_path = if registered {
+        ancestor
+            .path
+            .strip_prefix(&original.anchor.path)
+            .ok()
+            .zip(current.path.strip_prefix(&fresh.anchor.path).ok())
+            .is_some_and(|(left, right)| left == right)
+    } else {
+        ancestor.path == current.path
+    };
+    if !same_path
+        || ancestor.inode != current.inode
+        || ancestor.volume != current.volume
+        || original.leaf != fresh.leaf
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the consumer absence ancestor, volume or leaf changed",
+        ));
+    }
+    Ok(())
+}
+
+/// Bind the consumer path in the original absence observation to the exact
+/// covered marker. This reads only the unit's marker, never caller registry or
+/// hook payload; later replay uses the already-bound observation.
+fn verify_operation_checkout_marker(
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    parent: &DirHandle,
+    unit: &DeletionUnit,
+    absence: &crate::evidence::AbsenceEvidence,
+) -> Result<()> {
+    let root = dirs.open_child_dir(parent, &unit.name)?;
+    let identity = root.identity();
+    if identity.device != unit.device || identity.inode != unit.inode {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the opened root differs from the recorded unit",
+        ));
+    }
+    let marker = crate::reference::read_oxide_marker_full(dirs, &root)
+        .map_err(|reason| Error::new(ErrorKind::UnknownState, reason))?
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the original outputs marker is absent",
+            )
+        })?;
+    let expected = unit.marker.as_ref().ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnknownState,
+            "the original marker binding is absent",
+        )
+    })?;
+    let ancestor = absence.ancestor.as_ref().ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnknownState,
+            "the original absence ancestor is absent",
+        )
+    })?;
+    let path_matches = if ancestor.volume.kind == "registered" {
+        volumes
+            .volume_prefix(&marker.checkout)
+            .and_then(|prefix| {
+                marker
+                    .checkout
+                    .strip_prefix(prefix)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
+            .zip(absence.path.strip_prefix(&absence.anchor.path).ok())
+            .is_some_and(|(left, right)| left.as_path() == right)
+            && marker
+                .checkout_volume
+                .as_ref()
+                .is_some_and(|uuid| uuid.as_str() == ancestor.volume.volume_uuid)
+    } else {
+        marker.checkout == absence.path
+            && marker
+                .checkout_volume
+                .as_ref()
+                .is_none_or(|uuid| uuid.as_str() == ancestor.volume.volume_uuid)
+    };
+    if marker.digest != expected.digest
+        || marker.volume_uuid.as_ref() != Some(&unit.volume_uuid)
+        || marker.nonce.is_none()
+        || !path_matches
+    {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the original marker and checkout absence binding differ",
+        ));
+    }
+    Ok(())
+}
+
+/// During the staged transition, a legacy effect must not race an overlapping
+/// successor operation. This try-shared read never waits while a volume lock
+/// is held; missing initialized custody, a gap, or a busy writer refuses.
+fn refuse_successor_overlap(
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    state_paths: &StatePaths,
+    unit: &DeletionUnit,
+) -> Result<()> {
+    let mut locks = LockSet::new(state_paths.clone());
+    let Some(view) =
+        crate::operation::consult_operations(dirs, observer, state_paths, &mut locks, INTENT_ROWS)?
+    else {
+        return Ok(());
+    };
+    for record in view.nonterminal() {
+        let pending = PendingIntent {
+            intent_id: record.sequence.to_string(),
+            volume_uuid: record.unit.volume_uuid.clone(),
+            root_dir: record.unit.root_dir.clone(),
+            folder: record.unit.folder.clone(),
+            parent: record.unit.parent.clone(),
+            name: record.unit.name.clone(),
+        };
+        if pending.overlaps(unit) {
+            return Err(Error::new(
+                ErrorKind::RefusedBoundary,
+                "a successor operation overlaps this legacy deletion",
+            )
+            .with_detail("sequence", record.sequence.into()));
+        }
+    }
+    Ok(())
+}
+
+/// Check and durably begin a delegated operation without a destructive effect.
+/// The caller supplies its original request after its own guarded verdict and
+/// must re-affirm that verdict before asking for execution.
+pub fn begin_checked_delegated(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    observer: &dyn ProcessObserver,
+    request: crate::operation::BeginRequest,
+    bounds: DeleteBounds,
+) -> Result<crate::operation::Begun> {
+    use crate::operation::{self, ResumePolicy};
+    request.validate()?;
+    if request.resume != ResumePolicy::Caller || request.declaration.is_none() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "a checked delegated begin needs the original declaration authority",
+        ));
+    }
+    let mut locks = LockSet::new(state_paths.clone());
+    let journal_lock = locks.lock_operations()?;
+    let view =
+        operation::read_operations(dirs, observer, state_paths, INTENT_ROWS)?.ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the operation journal is not initialized",
+            )
+        })?;
+    if let (Some(caller), Some(key)) = (request.caller.as_deref(), request.key.as_deref()) {
+        if view.find_operation(caller, key).is_some() {
+            return operation::begin_operation_locked(
+                dirs,
+                observer,
+                state_paths,
+                &mut locks,
+                &journal_lock,
+                request,
+            );
+        }
+    }
+    let digest = request
+        .request_digest
+        .clone()
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "the original request is missing"))?;
+    let original = &request.unit;
+    let unit = DeletionUnit {
+        volume_uuid: original.volume_uuid.clone(),
+        root_dir: original.root_dir.clone(),
+        folder: original.folder.clone(),
+        parent: original.parent.clone(),
+        name: original.name.clone(),
+        kind: original.kind,
+        device: DeviceId::new(original.device),
+        inode: original.inode,
+        marker: original.marker.clone(),
+        root_id: original.root_id.clone(),
+        grant: original.grant.clone(),
+        plan_digest: digest,
+    };
+    unit.validate()?;
+    let _volume = locks.lock_volume(&unit.volume_uuid)?;
+    let _unit = lock_deletion_unit(&mut locks, &unit)?;
+    let volume = area::registered_volume(state_paths, &unit.volume_uuid)?;
+    if !volume.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the volume is not currently expendable",
+        ));
+    }
+    volume.declared_durability()?;
+    verify_operation_authority(
+        state_paths,
+        original,
+        request.request_digest.as_deref(),
+        request.declaration.as_ref(),
+        &volume,
+        &unit,
+    )?;
+    let Some((_path, area)) = area::open_folder_by(
+        MountLookup::ByUuid(volumes),
+        dirs,
+        volumes,
+        volumes,
+        observer,
+        &volume,
+        &unit.root_dir,
+        &unit.folder,
+    )?
+    else {
+        return Err(Error::new(
+            ErrorKind::VolumeAbsent,
+            "the operation area is absent",
+        ));
+    };
+    let Some(parent) = unit.open_parent(dirs, &area)? else {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the operation parent is absent",
+        ));
+    };
+    if unit.marker.as_ref().map(|marker| marker.family) == Some(MarkerFamily::OxideOutputs) {
+        let absence = request.absence.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the original checkout absence is missing",
+            )
+        })?;
+        verify_operation_checkout_marker(dirs, volumes, &parent, &unit, absence)?;
+    }
+    if let Some(absence) = &request.absence {
+        verify_operation_absence(dirs, volumes, absence)?;
+    }
+    let legacy = state::read_intents(state_paths, INTENT_ROWS)?;
+    let mut pending = PendingIntent::pending(&legacy.records);
+    pending.extend(view.nonterminal().map(|record| PendingIntent {
+        intent_id: record.sequence.to_string(),
+        volume_uuid: record.unit.volume_uuid.clone(),
+        root_dir: record.unit.root_dir.clone(),
+        folder: record.unit.folder.clone(),
+        parent: record.unit.parent.clone(),
+        name: record.unit.name.clone(),
+    }));
+    unit_custody(
+        dirs,
+        volumes,
+        volumes,
+        observer,
+        MountLookup::ByUuid(volumes),
+        state_paths,
+        &unit,
+        &pending,
+        bounds.custody,
+    )
+    .into_evidence()?;
+    // The bounded scan can outlive the earlier declaration and checkout
+    // observations. Re-read them before publishing the operation.
+    let fresh_volume = area::registered_volume(state_paths, &unit.volume_uuid)?;
+    if !fresh_volume.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the volume stopped permitting deletion before begin",
+        ));
+    }
+    verify_operation_authority(
+        state_paths,
+        original,
+        request.request_digest.as_deref(),
+        request.declaration.as_ref(),
+        &fresh_volume,
+        &unit,
+    )?;
+    if unit.marker.as_ref().map(|marker| marker.family) == Some(MarkerFamily::OxideOutputs) {
+        let absence = request.absence.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the original checkout absence is missing",
+            )
+        })?;
+        verify_operation_checkout_marker(dirs, volumes, &parent, &unit, absence)?;
+    }
+    if let Some(absence) = &request.absence {
+        verify_operation_absence(dirs, volumes, absence)?;
+    }
+    if expired(bounds.deadline) {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the run deadline was reached before begin",
+        ));
+    }
+    operation::begin_operation_locked(
+        dirs,
+        observer,
+        state_paths,
+        &mut locks,
+        &journal_lock,
+        request,
+    )
+}
+
+/// Called by a Barge-owned plan gate only after it has validated the presented
+/// plan and freshly selected this exact unit. The supplied reproof is the
+/// originating gate's real eligibility check, run again under unit custody.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn begin_owned_from_checked_plan(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    observer: &dyn ProcessObserver,
+    unit: &DeletionUnit,
+    declaration: &area::AreaDocument,
+    evidence: &state::IntentEvidence,
+    requires_identity: bool,
+    requires_absence: bool,
+    reprove: &EligibilityCheck<'_>,
+    bounds: DeleteBounds,
+) -> Result<crate::operation::Begun> {
+    use crate::operation::{
+        self, BeginRequest, DeclarationAuthority, OperationUnit, OwnedPlanBinding,
+    };
+    unit.validate()?;
+    if evidence.caller.is_some() {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "a Barge-owned plan cannot carry delegated caller authority",
+        ));
+    }
+    let mount = crate::os::locate_volume(volumes, volumes, volumes, &unit.volume_uuid)?;
+    if mount.identity().device != unit.device {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the planned volume observation changed",
+        ));
+    }
+    let original = OperationUnit {
+        volume_uuid: unit.volume_uuid.clone(),
+        mount_hint: mount.path().to_path_buf(),
+        root_dir: unit.root_dir.clone(),
+        folder: unit.folder.clone(),
+        parent: unit.parent.clone(),
+        name: unit.name.clone(),
+        kind: unit.kind,
+        device: unit.device.get(),
+        inode: unit.inode,
+        marker: unit.marker.clone(),
+        root_id: unit.root_id.clone(),
+        capture_name: None,
+        grant: unit.grant.clone(),
+    };
+    let mut request = BeginRequest::barge_owned(original);
+    request.declaration = Some(DeclarationAuthority {
+        namespace: declaration.namespace.clone(),
+        area: declaration.area.clone(),
+        generation: declaration.generation,
+        grant: unit.grant.clone(),
+    });
+    request.absence = evidence.absence.clone();
+    request.owned_plan = Some(OwnedPlanBinding::from_checked_plan(
+        unit.plan_digest.clone(),
+        evidence.identity.clone(),
+        requires_identity,
+        requires_absence,
+    ));
+    request.validate()?;
+    let mut locks = LockSet::new(state_paths.clone());
+    let journal_lock = locks.lock_operations()?;
+    let view =
+        operation::read_operations(dirs, observer, state_paths, INTENT_ROWS)?.ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the operation journal is not initialized",
+            )
+        })?;
+    if let Some(existing) = view.nonterminal().find(|record| {
+        record.resume == operation::ResumePolicy::Barge
+            && record.unit.same_remounted_binding(&request.unit)
+    }) {
+        // The current device and mount are observations, not replacements for
+        // the original binding. Preserve the record's original values before
+        // the store compares the immutable plan and evidence.
+        request.unit.mount_hint = existing.unit.mount_hint.clone();
+        request.unit.device = existing.unit.device;
+        return operation::begin_operation_locked(
+            dirs,
+            observer,
+            state_paths,
+            &mut locks,
+            &journal_lock,
+            request,
+        );
+    }
+    let _volume = locks.lock_volume(&unit.volume_uuid)?;
+    let _unit = lock_deletion_unit(&mut locks, unit)?;
+    let volume = area::registered_volume(state_paths, &unit.volume_uuid)?;
+    if !volume.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the volume is not currently expendable",
+        ));
+    }
+    volume.declared_durability()?;
+    verify_operation_authority(
+        state_paths,
+        &request.unit,
+        Some(unit.plan_digest.as_str()),
+        request.declaration.as_ref(),
+        &volume,
+        unit,
+    )?;
+    reprove(&volume)?;
+    if let Some(absence) = &request.absence {
+        verify_operation_absence(dirs, volumes, absence)?;
+    }
+    let legacy = state::read_intents(state_paths, INTENT_ROWS)?;
+    let mut pending = PendingIntent::pending(&legacy.records);
+    pending.extend(view.nonterminal().map(|record| PendingIntent {
+        intent_id: record.sequence.to_string(),
+        volume_uuid: record.unit.volume_uuid.clone(),
+        root_dir: record.unit.root_dir.clone(),
+        folder: record.unit.folder.clone(),
+        parent: record.unit.parent.clone(),
+        name: record.unit.name.clone(),
+    }));
+    unit_custody(
+        dirs,
+        volumes,
+        volumes,
+        observer,
+        MountLookup::ByUuid(volumes),
+        state_paths,
+        unit,
+        &pending,
+        bounds.custody,
+    )
+    .into_evidence()?;
+    let fresh = area::registered_volume(state_paths, &unit.volume_uuid)?;
+    if !fresh.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the volume stopped permitting deletion before begin",
+        ));
+    }
+    verify_operation_authority(
+        state_paths,
+        &request.unit,
+        Some(unit.plan_digest.as_str()),
+        request.declaration.as_ref(),
+        &fresh,
+        unit,
+    )?;
+    reprove(&fresh)?;
+    if let Some(absence) = &request.absence {
+        verify_operation_absence(dirs, volumes, absence)?;
+    }
+    if expired(bounds.deadline) {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the run deadline was reached before begin",
+        ));
+    }
+    operation::begin_operation_locked(
+        dirs,
+        observer,
+        state_paths,
+        &mut locks,
+        &journal_lock,
+        request,
+    )
+}
+
+/// Caller-owned guarded eligibility re-affirmation. The implementation must
+/// hold its own binding barrier and use its publication guard as documented;
+/// Barge never holds a Barge lock while this callback runs.
+pub trait OperationReaffirmation {
+    /// Re-affirm the exact originally selected operation under caller custody.
+    fn reaffirm(&self, record: &crate::operation::OperationRecord) -> Result<()>;
+}
+
+/// Execute an exact delegated intent only after the linked caller re-affirms
+/// it. Barge rechecks the journal, original authority, checkout absence and
+/// live writer custody under its own locks before the first rename.
+pub fn execute_checked_delegated(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    observer: &dyn ProcessObserver,
+    request: &crate::operation::BeginRequest,
+    reaffirmation: &dyn OperationReaffirmation,
+    bounds: DeleteBounds,
+) -> Result<DeleteReport> {
+    use crate::operation::{self, OperationPhase};
+    request.validate()?;
+    let (Some(caller), Some(key)) = (request.caller.as_deref(), request.key.as_deref()) else {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "execution requires a delegated request",
+        ));
+    };
+    let mut observation_locks = LockSet::new(state_paths.clone());
+    let snapshot = operation::consult_operations(
+        dirs,
+        observer,
+        state_paths,
+        &mut observation_locks,
+        INTENT_ROWS,
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnknownState,
+            "the operation journal is not initialized",
+        )
+    })?;
+    let observed = snapshot
+        .find_operation(caller, key)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the operation to execute is missing",
+            )
+        })?
+        .clone();
+    if !operation::same_request(&observed, request) {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the execution request differs from the original operation",
+        ));
+    }
+    if observed.phase != OperationPhase::Intent {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "only an intent may start execution",
+        ));
+    }
+    // No Barge lock survives checked_operation_state. The caller supplies its
+    // own guarded domain verdict, then Barge acquires fresh locks in order.
+    reaffirmation.reaffirm(&observed)?;
+    execute_bound_operation(
+        state_paths,
+        dirs,
+        volumes,
+        observer,
+        &snapshot.identity,
+        &observed,
+        None,
+        bounds,
+    )
+}
+
+/// Execute a snapshot after the originating caller or Barge plan gate has
+/// re-proved eligibility. The owned-plan reproof is repeated under custody.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_bound_operation(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    observer: &dyn ProcessObserver,
+    identity: &crate::operation::JournalIdentity,
+    observed: &crate::operation::OperationRecord,
+    reprove: Option<&EligibilityCheck<'_>>,
+    bounds: DeleteBounds,
+) -> Result<DeleteReport> {
+    use crate::operation::{self, OperationPhase, ResumePolicy};
+    if observed.phase != OperationPhase::Intent
+        || (observed.resume == ResumePolicy::Barge
+            && (observed.owned_plan.is_none() || reprove.is_none()))
+    {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the original operation is not authorized for execution",
+        ));
+    }
+    let mut locks = LockSet::new(state_paths.clone());
+    let _journal_lock = locks.lock_operations()?;
+    let view =
+        operation::read_operations(dirs, observer, state_paths, INTENT_ROWS)?.ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the operation journal is not initialized",
+            )
+        })?;
+    if &view.identity != identity {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the operation journal changed after caller re-affirmation",
+        ));
+    }
+    let current = view
+        .records
+        .iter()
+        .find(|record| record.sequence == observed.sequence)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the operation disappeared before execution",
+            )
+        })?;
+    if current != observed {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the operation changed after caller re-affirmation",
+        ));
+    }
+    let original = &current.unit;
+    let digest = current
+        .request_digest
+        .clone()
+        .or_else(|| {
+            current
+                .owned_plan
+                .as_ref()
+                .map(|plan| plan.plan_digest.clone())
+        })
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "the original request is missing"))?;
+    let initial = DeletionUnit {
+        volume_uuid: original.volume_uuid.clone(),
+        root_dir: original.root_dir.clone(),
+        folder: original.folder.clone(),
+        parent: original.parent.clone(),
+        name: original.name.clone(),
+        kind: original.kind,
+        device: DeviceId::new(original.device),
+        inode: original.inode,
+        marker: original.marker.clone(),
+        root_id: original.root_id.clone(),
+        grant: original.grant.clone(),
+        plan_digest: digest,
+    };
+    let _volume = locks.lock_volume(&initial.volume_uuid)?;
+    let _unit = lock_deletion_unit(&mut locks, &initial)?;
+    let volume_record = area::registered_volume(state_paths, &initial.volume_uuid)?;
+    if !volume_record.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the volume is not currently expendable",
+        ));
+    }
+    volume_record.declared_durability()?;
+    let Some((area_path, area_handle)) = area::open_folder_by(
+        MountLookup::ByUuid(volumes),
+        dirs,
+        volumes,
+        volumes,
+        observer,
+        &volume_record,
+        &initial.root_dir,
+        &initial.folder,
+    )?
+    else {
+        return Err(Error::new(
+            ErrorKind::VolumeAbsent,
+            "the operation area is absent",
+        ));
+    };
+    let mut unit = initial;
+    unit.device = area_handle.identity().device;
+    verify_operation_authority(
+        state_paths,
+        original,
+        Some(unit.plan_digest.as_str()),
+        current.declaration.as_ref(),
+        &volume_record,
+        &unit,
+    )?;
+    if let Some(reprove) = reprove {
+        reprove(&volume_record)?;
+    }
+    let Some(parent) = unit.open_parent(dirs, &area_handle)? else {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the operation parent is absent",
+        ));
+    };
+    let capture = original
+        .capture_name
+        .as_deref()
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "the capture name is missing"))?;
+    let captured = dirs.child_facts(&parent, capture)?;
+    if captured.is_some() && current.resume == ResumePolicy::Barge {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "an interrupted Barge-owned capture must be handled by generic replay",
+        ));
+    }
+    let legacy = state::read_intents(state_paths, INTENT_ROWS)?;
+    let mut pending = PendingIntent::pending(&legacy.records);
+    pending.extend(
+        view.nonterminal()
+            .filter(|record| record.sequence != current.sequence)
+            .map(|record| PendingIntent {
+                intent_id: record.sequence.to_string(),
+                volume_uuid: record.unit.volume_uuid.clone(),
+                root_dir: record.unit.root_dir.clone(),
+                folder: record.unit.folder.clone(),
+                parent: record.unit.parent.clone(),
+                name: record.unit.name.clone(),
+            }),
+    );
+    if let Some(facts) = captured {
+        // A crash can land after rename but before publishing `renamed`.
+        // Only this caller-authenticated path may recover that window.
+        if !current.captures.is_empty()
+            || !current.foreign_captures.is_empty()
+            || pending.iter().any(|other| other.overlaps(&unit))
+            || dirs.child_facts(&parent, &unit.name)?.is_some()
+            || facts.device != unit.device
+            || facts.inode != unit.inode
+            || facts.kind != unit.kind.entry_kind()
+            || facts.uid != observer.effective_uid()?
+        {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "the interrupted capture cannot be bound to this original unit",
+            ));
+        }
+        if let Err(reason) = custody::unit_holds_clear(state_paths, observer, &unit, bounds.custody)
+        {
+            return Err(Error::new(ErrorKind::RefusedBoundary, reason));
+        }
+        let write = locks.begin_intent_write()?;
+        let journal = CaptureJournal::for_operation(&write, state_paths, dirs, observer, current)?;
+        let intent = journal.intent();
+        let live_mount = crate::os::locate_volume(volumes, volumes, volumes, &unit.volume_uuid)?;
+        if live_mount.identity().device != unit.device {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "the volume changed before capture recovery",
+            ));
+        }
+        let volume = WalkVolume {
+            mount: live_mount.path().to_path_buf(),
+            device: unit.device,
+        };
+        if let Some(reason) = renamed_leaf_mismatch(dirs, &parent, &intent, &volume) {
+            return Err(Error::new(ErrorKind::UnknownState, reason));
+        }
+        if let Some(marker) = &unit.marker {
+            let root = dirs.open_child_dir(&parent, capture)?;
+            if root.identity().inode != unit.inode || root.identity().device != unit.device {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "the captured unit changed while opening",
+                ));
+            }
+            let digest = Some(leaf_marker_digest(
+                dirs,
+                observer,
+                &intent,
+                &root,
+                &marker.filename,
+            )?);
+            if !marker_matches(&digest, &intent) {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "the captured marker differs from the original",
+                ));
+            }
+        }
+        if unit.marker.as_ref().map(|marker| marker.family) == Some(MarkerFamily::OxideOutputs) {
+            let absence = current.absence.as_ref().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::UnknownState,
+                    "the original checkout absence is missing",
+                )
+            })?;
+            let mut captured_unit = unit.clone();
+            captured_unit.name = capture.to_owned();
+            verify_operation_checkout_marker(dirs, volumes, &parent, &captured_unit, absence)?;
+        }
+        if let Some(absence) = &current.absence {
+            verify_operation_absence(dirs, volumes, absence)?;
+        }
+        let parent_path = if unit.parent.is_empty() {
+            area_path
+        } else {
+            area_path.join(&unit.parent)
+        };
+        check_captured_writers(observer, &parent_path.join(capture), &unit, bounds.custody)?;
+        if expired(bounds.deadline) {
+            return Err(Error::new(
+                ErrorKind::RefusedBoundary,
+                "the run deadline was reached before capture recovery",
+            ));
+        }
+        let fresh = area::registered_volume(state_paths, &unit.volume_uuid)?;
+        if !fresh.durability.permits_pruning() {
+            return Err(Error::new(
+                ErrorKind::RefusedBoundary,
+                "the volume stopped permitting deletion",
+            ));
+        }
+        verify_operation_authority(
+            state_paths,
+            original,
+            Some(unit.plan_digest.as_str()),
+            current.declaration.as_ref(),
+            &fresh,
+            &unit,
+        )?;
+        if let Some(absence) = &current.absence {
+            verify_operation_absence(dirs, volumes, absence)?;
+        }
+        if dirs.child_facts(&parent, &unit.name)?.is_some()
+            || renamed_leaf_mismatch(dirs, &parent, &intent, &volume).is_some()
+        {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "the captured unit changed before recovery",
+            ));
+        }
+        if expired(bounds.deadline) {
+            return Err(Error::new(
+                ErrorKind::RefusedBoundary,
+                "the run deadline was reached before capture recovery",
+            ));
+        }
+        let renamed = journal.advance(IntentPhase::Renamed)?;
+        return Ok(finish_deletion(
+            &journal,
+            dirs,
+            volumes,
+            observer,
+            &renamed,
+            &parent_path,
+            &parent,
+            bounds,
+            &volume,
+        ));
+    }
+    if unit.marker.as_ref().map(|marker| marker.family) == Some(MarkerFamily::OxideOutputs) {
+        let absence = current.absence.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the original checkout absence is missing",
+            )
+        })?;
+        verify_operation_checkout_marker(dirs, volumes, &parent, &unit, absence)?;
+    }
+    if let Some(absence) = &current.absence {
+        verify_operation_absence(dirs, volumes, absence)?;
+    }
+    let evidence = unit_custody(
+        dirs,
+        volumes,
+        volumes,
+        observer,
+        MountLookup::ByUuid(volumes),
+        state_paths,
+        &unit,
+        &pending,
+        bounds.custody,
+    )
+    .into_evidence()?;
+    // The bounded scan can be slow. Repeat the original authority and absence
+    // checks immediately before the first destructive step.
+    let fresh_volume = area::registered_volume(state_paths, &unit.volume_uuid)?;
+    if !fresh_volume.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the volume stopped permitting deletion",
+        ));
+    }
+    verify_operation_authority(
+        state_paths,
+        original,
+        Some(unit.plan_digest.as_str()),
+        current.declaration.as_ref(),
+        &fresh_volume,
+        &unit,
+    )?;
+    if let Some(reprove) = reprove {
+        reprove(&fresh_volume)?;
+    }
+    if unit.marker.as_ref().map(|marker| marker.family) == Some(MarkerFamily::OxideOutputs) {
+        let absence = current.absence.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the original checkout absence is missing",
+            )
+        })?;
+        verify_operation_checkout_marker(dirs, volumes, &parent, &unit, absence)?;
+    }
+    if let Some(absence) = &current.absence {
+        verify_operation_absence(dirs, volumes, absence)?;
+    }
+    if expired(bounds.deadline) {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the run deadline was reached before capture",
+        ));
+    }
+    let write = locks.begin_intent_write()?;
+    let journal = CaptureJournal::for_operation(&write, state_paths, dirs, observer, current)?;
+    let intent = journal.intent();
+    let parent_path = if unit.parent.is_empty() {
+        area_path
+    } else {
+        area_path.join(&unit.parent)
+    };
+    let quarantine = parent_path.join(capture);
+    let live_mount = crate::os::locate_volume(volumes, volumes, volumes, &unit.volume_uuid)?;
+    if live_mount.identity().device != unit.device {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the volume identity changed before capture",
+        ));
+    }
+    let volume = WalkVolume {
+        mount: live_mount.path().to_path_buf(),
+        device: unit.device,
+    };
+    if expired(bounds.deadline) {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the run deadline was reached before capture",
+        ));
+    }
+    match dirs.rename_child(&parent, &unit.name, capture) {
+        Ok(RenameOutcome::Renamed) => {}
+        Ok(RenameOutcome::TargetExists) => {
+            return Ok(pending_report(
+                &intent,
+                quarantine,
+                Counts::default(),
+                "the capture name is already taken".to_owned(),
+                Some(evidence),
+            ))
+        }
+        Err(error) => {
+            return Ok(pending_report(
+                &intent,
+                quarantine,
+                Counts::default(),
+                format!("the capture rename failed: {error}"),
+                Some(evidence),
+            ))
+        }
+    }
+    if let Some(reason) = renamed_leaf_mismatch(dirs, &parent, &intent, &volume) {
+        return Ok(pending_report(
+            &intent,
+            quarantine,
+            Counts::default(),
+            reason,
+            Some(evidence),
+        ));
+    }
+    #[cfg(any(test, feature = "proof-journal"))]
+    FAIL_AFTER_OPERATION_CAPTURE.with(|armed| {
+        if armed.replace(false) {
+            crate::operation::fail_next_document_publish(std::io::Error::other(
+                "injected post-capture publication failure",
+            ));
+        }
+    });
+    let renamed = match journal.advance(IntentPhase::Renamed) {
+        Ok(record) => record,
+        Err(error) => {
+            return Ok(pending_report(
+                &intent,
+                quarantine,
+                Counts::default(),
+                format!("the captured phase could not be published: {error}"),
+                Some(evidence),
+            ))
+        }
+    };
+    #[cfg(any(test, feature = "proof-journal"))]
+    if STOP_AFTER_OPERATION_RENAMED.with(|armed| armed.replace(false)) {
+        return Ok(pending_report(
+            &renamed,
+            quarantine,
+            Counts::default(),
+            "injected stop after durable capture".to_owned(),
+            Some(evidence),
+        ));
+    }
+    let mut report = finish_deletion(
+        &journal,
+        dirs,
+        volumes,
+        observer,
+        &renamed,
+        &parent_path,
+        &parent,
+        bounds,
+        &volume,
+    );
+    report.custody = Some(evidence);
+    Ok(report)
+}
+
+/// Outcome of one checked post-capture replay.
+#[derive(Debug)]
+pub enum OperationReplay {
+    /// The operation has durable deletion evidence and is ready for finalization.
+    Deleted,
+    /// The original unit was positively unchanged before any effect, so its
+    /// Barge-owned operation was retained as cancelled.
+    Cancelled,
+    /// The existing capture walk ran and reports its exact outcome.
+    Walked(Box<DeleteReport>),
+    /// Replay kept the operation pending with its reason.
+    Pending(String),
+}
+
+fn check_captured_writers(
+    observer: &dyn ProcessObserver,
+    path: &Path,
+    unit: &DeletionUnit,
+    bounds: CustodyBounds,
+) -> Result<()> {
+    let pid = std::process::id();
+    let start = observer.process_start(pid)?.ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnknownState,
+            "the calling process identity is unavailable",
+        )
+    })?;
+    let scan = observer.scan_open_descriptors(&crate::os::DescriptorScanRequest {
+        root: path,
+        root_device: unit.device,
+        root_inode: unit.inode,
+        max_processes: bounds.processes.min(crate::custody::SCAN_PROCESSES),
+        max_descriptors: bounds.descriptors.min(crate::custody::SCAN_DESCRIPTORS),
+        timeout: bounds.timeout.min(crate::custody::SCAN_TIMEOUT),
+        self_exclusion: Some(crate::os::SelfExclusion { pid, start }),
+    })?;
+    match scan {
+        crate::os::DescriptorScan::Complete { open, .. } if open.is_empty() => Ok(()),
+        crate::os::DescriptorScan::Complete { .. } => Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "a live writer holds the captured unit",
+        )),
+        crate::os::DescriptorScan::Bounded { .. }
+        | crate::os::DescriptorScan::Unreadable { .. } => Err(Error::new(
+            ErrorKind::UnknownState,
+            "captured-unit writer custody is unknown",
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_removed_operation(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    observer: &dyn ProcessObserver,
+    write: &IntentWrite,
+    record: &crate::operation::OperationRecord,
+    unit: &DeletionUnit,
+    bounds: DeleteBounds,
+) -> Result<OperationReplay> {
+    if expired(bounds.deadline) {
+        return Ok(OperationReplay::Pending(WALL_CLOCK_REASON.to_owned()));
+    }
+    let fresh = area::registered_volume(state_paths, &unit.volume_uuid)?;
+    if !fresh.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the volume stopped permitting deletion",
+        ));
+    }
+    verify_operation_authority(
+        state_paths,
+        &record.unit,
+        Some(unit.plan_digest.as_str()),
+        record.declaration.as_ref(),
+        &fresh,
+        unit,
+    )?;
+    if let Some(absence) = &record.absence {
+        verify_operation_absence(dirs, volumes, absence)?;
+    }
+    if expired(bounds.deadline) {
+        return Ok(OperationReplay::Pending(WALL_CLOCK_REASON.to_owned()));
+    }
+    crate::operation::advance_operation(
+        write,
+        dirs,
+        observer,
+        state_paths,
+        record,
+        crate::operation::OperationPhase::Deleted,
+    )?;
+    Ok(OperationReplay::Deleted)
+}
+
+/// Resume only a post-capture delegated operation. Intent-phase recovery is
+/// reserved for a fresh caller-authenticated verdict and reaffirmation.
+pub fn replay_checked_operation(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    observer: &dyn ProcessObserver,
+    request: &crate::operation::BeginRequest,
+    bounds: DeleteBounds,
+) -> Result<OperationReplay> {
+    use crate::operation;
+    request.validate()?;
+    let (Some(caller), Some(key)) = (request.caller.as_deref(), request.key.as_deref()) else {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "replay requires a delegated request",
+        ));
+    };
+    let mut locks = LockSet::new(state_paths.clone());
+    let _journal_lock = locks.lock_operations()?;
+    let view =
+        operation::read_operations(dirs, observer, state_paths, INTENT_ROWS)?.ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the operation journal is not initialized",
+            )
+        })?;
+    let record = view
+        .find_operation(caller, key)
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "the operation is missing"))?;
+    if !operation::same_request(record, request) {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the replay request differs from the original operation",
+        ));
+    }
+    replay_locked_operation(
+        state_paths,
+        dirs,
+        volumes,
+        observer,
+        &mut locks,
+        &view,
+        record,
+        bounds,
+    )
+}
+
+/// Replay under the exclusive successor-journal lock held by the entry point.
+#[allow(clippy::too_many_arguments)]
+fn replay_locked_operation(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    observer: &dyn ProcessObserver,
+    locks: &mut LockSet,
+    view: &crate::operation::JournalView,
+    record: &crate::operation::OperationRecord,
+    bounds: DeleteBounds,
+) -> Result<OperationReplay> {
+    use crate::operation::{OperationPhase, ResumePolicy};
+    if record.resume == ResumePolicy::Barge && record.owned_plan.is_none() {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the Barge-owned operation lacks its original plan binding",
+        ));
+    }
+    match record.phase {
+        OperationPhase::Deleted | OperationPhase::Complete => return Ok(OperationReplay::Deleted),
+        OperationPhase::Intent if record.resume == ResumePolicy::Caller => {
+            return Err(Error::new(
+                ErrorKind::RefusedBoundary,
+                "intent replay needs the caller's fresh guarded verdict and reaffirmation",
+            ))
+        }
+        OperationPhase::Intent => {}
+        OperationPhase::Cancelled => {
+            return Err(Error::new(
+                ErrorKind::RefusedBoundary,
+                "a cancelled operation cannot replay",
+            ))
+        }
+        OperationPhase::Renamed | OperationPhase::MarkerLast | OperationPhase::Removed => {}
+    }
+    if expired(bounds.deadline) {
+        return Ok(OperationReplay::Pending(WALL_CLOCK_REASON.to_owned()));
+    }
+    let original = &record.unit;
+    let digest = record
+        .request_digest
+        .clone()
+        .or_else(|| {
+            record
+                .owned_plan
+                .as_ref()
+                .map(|plan| plan.plan_digest.clone())
+        })
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "the original request is missing"))?;
+    let mut unit = DeletionUnit {
+        volume_uuid: original.volume_uuid.clone(),
+        root_dir: original.root_dir.clone(),
+        folder: original.folder.clone(),
+        parent: original.parent.clone(),
+        name: original.name.clone(),
+        kind: original.kind,
+        device: DeviceId::new(original.device),
+        inode: original.inode,
+        marker: original.marker.clone(),
+        root_id: original.root_id.clone(),
+        grant: original.grant.clone(),
+        plan_digest: digest,
+    };
+    let _volume = locks.lock_volume(&unit.volume_uuid)?;
+    let _unit = lock_deletion_unit(locks, &unit)?;
+    let volume_record = area::registered_volume(state_paths, &unit.volume_uuid)?;
+    if !volume_record.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the volume is not currently expendable",
+        ));
+    }
+    volume_record.declared_durability()?;
+    verify_operation_authority(
+        state_paths,
+        original,
+        Some(unit.plan_digest.as_str()),
+        record.declaration.as_ref(),
+        &volume_record,
+        &unit,
+    )?;
+    if unit.marker.as_ref().map(|marker| marker.family) == Some(MarkerFamily::OxideOutputs)
+        && record.absence.is_none()
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the original checkout absence is missing",
+        ));
+    }
+    if let Some(absence) = &record.absence {
+        verify_operation_absence(dirs, volumes, absence)?;
+    }
+    let legacy = state::read_intents(state_paths, INTENT_ROWS)?;
+    if PendingIntent::pending(&legacy.records)
+        .iter()
+        .any(|pending| pending.overlaps(&unit))
+    {
+        return Ok(OperationReplay::Pending(
+            "a legacy deletion overlaps this operation".to_owned(),
+        ));
+    }
+    if view.nonterminal().any(|other| {
+        other.sequence != record.sequence
+            && PendingIntent {
+                intent_id: other.sequence.to_string(),
+                volume_uuid: other.unit.volume_uuid.clone(),
+                root_dir: other.unit.root_dir.clone(),
+                folder: other.unit.folder.clone(),
+                parent: other.unit.parent.clone(),
+                name: other.unit.name.clone(),
+            }
+            .overlaps(&unit)
+    }) {
+        return Ok(OperationReplay::Pending(
+            "another successor operation overlaps this operation".to_owned(),
+        ));
+    }
+    let write = locks.begin_intent_write()?;
+    let journal = CaptureJournal::for_operation(&write, state_paths, dirs, observer, record)?;
+    let intent = journal.intent();
+    let volume = locate_walk_volume(volumes, &intent)
+        .map_err(|reason| Error::new(ErrorKind::UnknownState, reason))?;
+    unit.device = volume.device;
+    let area = area::open_folder_on_mount(
+        dirs,
+        observer,
+        &volume.mount,
+        volume.device,
+        &intent.root_dir,
+        &intent.folder,
+    )?;
+    let Some((area_path, area_handle)) = area else {
+        if record.phase == OperationPhase::Removed {
+            return settle_removed_operation(
+                state_paths,
+                dirs,
+                volumes,
+                observer,
+                &write,
+                record,
+                &unit,
+                bounds,
+            );
+        }
+        return Ok(OperationReplay::Pending(
+            "the area is absent without recorded removal".to_owned(),
+        ));
+    };
+    let Some(parent) = unit.open_parent(dirs, &area_handle)? else {
+        if record.phase == OperationPhase::Removed {
+            return settle_removed_operation(
+                state_paths,
+                dirs,
+                volumes,
+                observer,
+                &write,
+                record,
+                &unit,
+                bounds,
+            );
+        }
+        return Ok(OperationReplay::Pending(
+            "the parent is absent without recorded removal".to_owned(),
+        ));
+    };
+    let leaf = dirs.child_facts(&parent, intent.capture_name())?;
+    if record.phase == OperationPhase::Intent && leaf.is_none() {
+        if !record.captures.is_empty()
+            || !record.foreign_captures.is_empty()
+            || !unit_still_in_place(dirs, observer, &intent, &parent, volume.device)?
+            || dirs.child_facts(&parent, intent.capture_name())?.is_some()
+        {
+            return Ok(OperationReplay::Pending(
+                "the owned intent is not positively effect-free".to_owned(),
+            ));
+        }
+        if expired(bounds.deadline) {
+            return Ok(OperationReplay::Pending(WALL_CLOCK_REASON.to_owned()));
+        }
+        crate::operation::advance_operation(
+            &write,
+            dirs,
+            observer,
+            state_paths,
+            record,
+            OperationPhase::Cancelled,
+        )?;
+        return Ok(OperationReplay::Cancelled);
+    }
+    if record.phase == OperationPhase::Removed {
+        if leaf.is_some() {
+            return Ok(OperationReplay::Pending(
+                "the removed capture is present again".to_owned(),
+            ));
+        }
+        return settle_removed_operation(
+            state_paths,
+            dirs,
+            volumes,
+            observer,
+            &write,
+            record,
+            &unit,
+            bounds,
+        );
+    }
+    let Some(facts) = leaf else {
+        return Ok(OperationReplay::Pending(
+            "the capture is absent without Barge's recorded removal".to_owned(),
+        ));
+    };
+    if record.phase == OperationPhase::Intent
+        && (dirs.child_facts(&parent, &unit.name)?.is_some()
+            || !record.captures.is_empty()
+            || !record.foreign_captures.is_empty())
+    {
+        return Ok(OperationReplay::Pending(
+            "the owned intent's capture is ambiguous".to_owned(),
+        ));
+    }
+    if facts.device != volume.device
+        || facts.inode != unit.inode
+        || facts.kind != unit.kind.entry_kind()
+    {
+        return Ok(OperationReplay::Pending(
+            "the captured unit identity changed".to_owned(),
+        ));
+    }
+    let handle = if unit.kind == UnitKind::Directory {
+        Some(dirs.open_child_dir(&parent, intent.capture_name())?)
+    } else {
+        None
+    };
+    if let Some(handle) = &handle {
+        if handle.identity().device != volume.device || handle.identity().inode != unit.inode {
+            return Ok(OperationReplay::Pending(
+                "the captured unit changed while opening".to_owned(),
+            ));
+        }
+    }
+    // Restore only the modes bound to verified recorded captures before any
+    // marker or identity refusal can leave those directories widened.
+    if let Some(reason) =
+        restore_recorded_modes(dirs, &parent, handle.as_ref(), &intent, volume.device)?
+    {
+        return Ok(OperationReplay::Pending(reason));
+    }
+    if record
+        .owned_plan
+        .as_ref()
+        .is_some_and(|plan| plan.requires_identity)
+    {
+        if let Err(reason) =
+            reestablish_identity(state_paths, dirs, observer, &intent, &parent, &volume)
+        {
+            return Ok(OperationReplay::Pending(reason));
+        }
+    }
+    if let Err(reason) = custody::unit_holds_clear(state_paths, observer, &unit, bounds.custody) {
+        return Ok(OperationReplay::Pending(reason));
+    }
+    if let Some(reason) = recorded_mismatch(&intent.foreign_captures) {
+        return Ok(OperationReplay::Pending(reason));
+    }
+    if record.phase == OperationPhase::MarkerLast && unit.marker.is_some() {
+        let (Some(handle), Some(marker)) = (&handle, &unit.marker) else {
+            return Ok(OperationReplay::Pending(
+                "the captured marker cannot be checked".to_owned(),
+            ));
+        };
+        let digest = Some(leaf_marker_digest(
+            dirs,
+            observer,
+            &intent,
+            handle,
+            &marker.filename,
+        )?);
+        if !marker_absent(&digest, &intent) {
+            return Ok(OperationReplay::Pending(
+                "the marker is not positively absent".to_owned(),
+            ));
+        }
+    }
+    let parent_path = if unit.parent.is_empty() {
+        area_path
+    } else {
+        area_path.join(&unit.parent)
+    };
+    let captured_path = parent_path.join(intent.capture_name());
+    check_captured_writers(observer, &captured_path, &unit, bounds.custody)?;
+    if expired(bounds.deadline) {
+        return Ok(OperationReplay::Pending(WALL_CLOCK_REASON.to_owned()));
+    }
+    let fresh_volume = area::registered_volume(state_paths, &unit.volume_uuid)?;
+    if !fresh_volume.durability.permits_pruning() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the volume stopped permitting deletion",
+        ));
+    }
+    verify_operation_authority(
+        state_paths,
+        original,
+        Some(unit.plan_digest.as_str()),
+        record.declaration.as_ref(),
+        &fresh_volume,
+        &unit,
+    )?;
+    if let Some(absence) = &record.absence {
+        verify_operation_absence(dirs, volumes, absence)?;
+    }
+    if expired(bounds.deadline) {
+        return Ok(OperationReplay::Pending(WALL_CLOCK_REASON.to_owned()));
+    }
+    let replay_intent = if record.phase == OperationPhase::Intent {
+        // The original Barge plan authorized this operation, but the rename
+        // may have preceded its phase write. Prove the original capture and
+        // marker before promoting it; never infer an effect from absence.
+        if let Some(marker) = &unit.marker {
+            let Some(handle) = &handle else {
+                return Ok(OperationReplay::Pending(
+                    "the captured marker cannot be checked".to_owned(),
+                ));
+            };
+            let digest = Some(leaf_marker_digest(
+                dirs,
+                observer,
+                &intent,
+                handle,
+                &marker.filename,
+            )?);
+            if !marker_matches(&digest, &intent) {
+                return Ok(OperationReplay::Pending(
+                    "the captured marker differs from the original".to_owned(),
+                ));
+            }
+        }
+        if dirs.child_facts(&parent, &unit.name)?.is_some()
+            || renamed_leaf_mismatch(dirs, &parent, &intent, &volume).is_some()
+        {
+            return Ok(OperationReplay::Pending(
+                "the owned capture changed during replay".to_owned(),
+            ));
+        }
+        journal.advance(IntentPhase::Renamed)?
+    } else {
+        intent
+    };
+    Ok(OperationReplay::Walked(Box::new(finish_deletion(
+        &journal,
+        dirs,
+        volumes,
+        observer,
+        &replay_intent,
+        &parent_path,
+        &parent,
+        bounds,
+        &volume,
+    ))))
+}
+
+/// One operation considered by a bounded drain.
+#[derive(Debug)]
+pub struct OperationDrainRow {
+    /// Journal sequence of this retained operation.
+    pub sequence: u64,
+    /// Caller namespace, when the operation is delegated.
+    pub caller: Option<String>,
+    /// Original caller key, when the operation is delegated.
+    pub key: Option<String>,
+    /// The action's exact outcome.
+    pub outcome: OperationDrainOutcome,
+}
+
+/// A drain never turns an unknown or failed step into completion.
+#[derive(Debug)]
+pub enum OperationDrainOutcome {
+    /// The linked caller hook was acknowledged.
+    Finalized,
+    /// A Barge-owned deletion was durably completed without a caller hook.
+    Completed,
+    /// A Barge-owned operation was positively cancelled before an effect.
+    Cancelled,
+    /// The operation needs a caller, a retry, or a decision named here.
+    Pending(String),
+}
+
+fn acknowledge_owned_operation(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    identity: &crate::operation::JournalIdentity,
+    expected: &crate::operation::OperationRecord,
+) -> Result<()> {
+    use crate::operation::{self, OperationPhase, ResumePolicy};
+    let mut locks = LockSet::new(state_paths.clone());
+    let _journal = locks.lock_operations()?;
+    let view =
+        operation::read_operations(dirs, observer, state_paths, INTENT_ROWS)?.ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the operation journal is not initialized",
+            )
+        })?;
+    if &view.identity != identity {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the operation journal identity changed",
+        ));
+    }
+    let current = view
+        .records
+        .iter()
+        .find(|record| record.sequence == expected.sequence)
+        .ok_or_else(|| Error::new(ErrorKind::UnknownState, "the owned operation is missing"))?;
+    if current.resume != ResumePolicy::Barge
+        || current.unit != expected.unit
+        || current.owned_plan != expected.owned_plan
+        || current.owned_plan.is_none()
+        || current.absence != expected.absence
+        || current.declaration != expected.declaration
+    {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the original owned operation binding changed",
+        ));
+    }
+    if current.phase == OperationPhase::Complete {
+        return Ok(());
+    }
+    if current.phase != OperationPhase::Deleted {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the owned operation is not durably deleted",
+        ));
+    }
+    let write = locks.begin_intent_write()?;
+    operation::advance_operation(
+        &write,
+        dirs,
+        observer,
+        state_paths,
+        current,
+        OperationPhase::Complete,
+    )?;
+    Ok(())
+}
+
+/// Observe the complete bounded journal, then replay post-capture delegated
+/// operations and dispatch their owed hooks. Intent-phase work stays for the
+/// caller's guarded reaffirmation; no lock spans a hook invocation.
+pub fn drain_checked_operations(
+    state_paths: &StatePaths,
+    dirs: &dyn DirOps,
+    volumes: &dyn AbsenceVolume,
+    observer: &dyn ProcessObserver,
+    hooks: &[&dyn crate::operation::FinalizeHook],
+    bounds: DeleteBounds,
+) -> Result<Vec<OperationDrainRow>> {
+    use crate::operation::{self, BeginRequest, OperationPhase, ResumePolicy};
+    let mut locks = LockSet::new(state_paths.clone());
+    let view = operation::consult_operations(dirs, observer, state_paths, &mut locks, INTENT_ROWS)?
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the operation journal is not initialized",
+            )
+        })?;
+    let identity = view.identity.clone();
+    let mut rows = Vec::new();
+    for record in view
+        .records
+        .into_iter()
+        .filter(|record| record.is_pending())
+    {
+        let mut row = OperationDrainRow {
+            sequence: record.sequence,
+            caller: record.caller.clone(),
+            key: record.key.clone(),
+            outcome: OperationDrainOutcome::Pending(String::new()),
+        };
+        if expired(bounds.deadline) {
+            row.outcome = OperationDrainOutcome::Pending(WALL_CLOCK_REASON.to_owned());
+            rows.push(row);
+            continue;
+        }
+        let (Some(caller), Some(key)) = (record.caller.as_deref(), record.key.as_deref()) else {
+            let mut owned_locks = LockSet::new(state_paths.clone());
+            let owned_result = (|| -> Result<OperationReplay> {
+                let _journal = owned_locks.lock_operations()?;
+                let current_view =
+                    operation::read_operations(dirs, observer, state_paths, INTENT_ROWS)?
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::UnknownState,
+                                "the operation journal is not initialized",
+                            )
+                        })?;
+                if current_view.identity != identity {
+                    return Err(Error::new(
+                        ErrorKind::UnknownState,
+                        "the operation journal identity changed",
+                    ));
+                }
+                let current = current_view
+                    .records
+                    .iter()
+                    .find(|item| item.sequence == record.sequence)
+                    .ok_or_else(|| {
+                        Error::new(ErrorKind::UnknownState, "the owned operation is missing")
+                    })?;
+                if *current != record {
+                    return Err(Error::new(
+                        ErrorKind::UnknownState,
+                        "the owned operation changed before replay",
+                    ));
+                }
+                replay_locked_operation(
+                    state_paths,
+                    dirs,
+                    volumes,
+                    observer,
+                    &mut owned_locks,
+                    &current_view,
+                    current,
+                    bounds,
+                )
+            })();
+            row.outcome = match owned_result {
+                Ok(OperationReplay::Cancelled) => OperationDrainOutcome::Cancelled,
+                Ok(OperationReplay::Deleted) => match acknowledge_owned_operation(
+                    state_paths,
+                    dirs,
+                    observer,
+                    &identity,
+                    &record,
+                ) {
+                    Ok(()) => OperationDrainOutcome::Completed,
+                    Err(error) => OperationDrainOutcome::Pending(error.to_string()),
+                },
+                Ok(OperationReplay::Walked(report)) if report.is_deleted() => {
+                    match acknowledge_owned_operation(
+                        state_paths,
+                        dirs,
+                        observer,
+                        &identity,
+                        &record,
+                    ) {
+                        Ok(()) => OperationDrainOutcome::Completed,
+                        Err(error) => OperationDrainOutcome::Pending(error.to_string()),
+                    }
+                }
+                Ok(OperationReplay::Walked(report)) => OperationDrainOutcome::Pending(
+                    report
+                        .reason
+                        .unwrap_or_else(|| "the owned walk remains pending".to_owned()),
+                ),
+                Ok(OperationReplay::Pending(reason)) => OperationDrainOutcome::Pending(reason),
+                Err(error) => OperationDrainOutcome::Pending(error.to_string()),
+            };
+            rows.push(row);
+            continue;
+        };
+        if record.phase == OperationPhase::Intent {
+            row.outcome = OperationDrainOutcome::Pending(
+                "caller verdict and reaffirmation are required".to_owned(),
+            );
+            rows.push(row);
+            continue;
+        }
+        let mut unit = record.unit.clone();
+        unit.capture_name = None;
+        let request = BeginRequest {
+            resume: ResumePolicy::Caller,
+            caller: record.caller.clone(),
+            key: record.key.clone(),
+            request_digest: record.request_digest.clone(),
+            finalize: record.finalize.clone(),
+            absence: record.absence.clone(),
+            declaration: record.declaration.clone(),
+            owned_plan: None,
+            unit,
+        };
+        let pending_reason = if record.phase == OperationPhase::Deleted {
+            None
+        } else {
+            match replay_checked_operation(state_paths, dirs, volumes, observer, &request, bounds) {
+                Ok(OperationReplay::Deleted) => None,
+                Ok(OperationReplay::Walked(report)) if report.is_deleted() => None,
+                Ok(OperationReplay::Walked(report)) => Some(
+                    report
+                        .reason
+                        .unwrap_or_else(|| "the capture walk remains pending".to_owned()),
+                ),
+                Ok(OperationReplay::Pending(reason)) => Some(reason),
+                Ok(OperationReplay::Cancelled) => {
+                    Some("a delegated replay cannot cancel an operation".to_owned())
+                }
+                Err(error) => Some(error.to_string()),
+            }
+        };
+        row.outcome = match pending_reason {
+            None => {
+                match operation::finalize_operation(dirs, observer, state_paths, caller, key, hooks)
+                {
+                    Ok(_) => OperationDrainOutcome::Finalized,
+                    Err(error) => OperationDrainOutcome::Pending(error.to_string()),
+                }
+            }
+            Some(reason) => OperationDrainOutcome::Pending(reason),
+        };
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 // An effect-time check may return the absence it actually established. Carry
 // that proof into the same journal write; ordinary gates keep supplied evidence.
-type EligibilityCheck<'a> =
+pub(crate) type EligibilityCheck<'a> =
     dyn Fn(&registry::VolumeRecord) -> Result<Option<crate::evidence::AbsenceEvidence>> + 'a;
 
 /// Who may act on a unit of the `oxide_outputs` family.
@@ -620,6 +2660,7 @@ fn delete_unit_locked(
         VolumeLocking::Held => None,
     };
     let _unit_lock = lock_deletion_unit(&mut locks, unit)?;
+    refuse_successor_overlap(dirs, observer, state_paths, unit)?;
 
     // The registry is re-read under the locks before the intent is written, so a
     // record that changed while the plan ran is refused rather than trusted.
@@ -831,9 +2872,9 @@ fn delete_unit_locked(
     }
     intent = state::advance_intent(&write, state_paths, &intent, IntentPhase::Renamed)?;
 
+    let journal = CaptureJournal::new(&write, state_paths, &intent);
     let mut report = finish_deletion(
-        &write,
-        state_paths,
+        &journal,
         dirs,
         facts,
         observer,
@@ -999,8 +3040,7 @@ fn renamed_leaf_mismatch(
 /// Delete one quarantined unit whole, from the phase the intent reached.
 #[allow(clippy::too_many_arguments)]
 fn finish_deletion(
-    write: &IntentWrite,
-    state_paths: &StatePaths,
+    journal: &CaptureJournal<'_>,
     dirs: &dyn DirOps,
     facts: &dyn VolumeFacts,
     observer: &dyn ProcessObserver,
@@ -1170,7 +3210,6 @@ fn finish_deletion(
         }
     }
 
-    let journal = CaptureJournal::new(write, state_paths, &current);
     // The leaf's own mode: a directory whose owner cannot write into it cannot
     // have its contents removed. Its mode is published before the change and a
     // guard puts it back on every abort, and a replay restores it first.
@@ -1243,7 +3282,7 @@ fn finish_deletion(
         volume.device,
         volume.mount.clone(),
         bounds,
-        &journal,
+        journal,
         base_chain,
         intent
             .unit
@@ -1330,15 +3369,9 @@ fn finish_deletion(
         // A file unit has no contents and no marker: its own identity, checked
         // against the record above, is the whole unit, so the phase moves
         // straight to `marker_last` and the captured leaf is removed next.
-        match state::advance_intent(
-            write,
-            state_paths,
-            &journal.intent(),
-            IntentPhase::MarkerLast,
-        ) {
+        match journal.advance(IntentPhase::MarkerLast) {
             Ok(next) => {
                 current = next;
-                journal.advanced(current.clone());
             }
             Err(error) => {
                 return pending_report(
@@ -1371,6 +3404,16 @@ fn finish_deletion(
             )
         }
     }
+    #[cfg(any(test, feature = "proof-journal"))]
+    if matches!(&journal.backend, CaptureBackend::Operation { .. }) {
+        FAIL_AFTER_OPERATION_UNLINK.with(|armed| {
+            if armed.replace(false) {
+                crate::operation::fail_next_document_publish(std::io::Error::other(
+                    "injected post-unlink publication failure",
+                ));
+            }
+        });
+    }
     if current.unit.kind == UnitKind::Directory {
         counts.directories = counts.directories.saturating_add(1);
     }
@@ -1392,10 +3435,9 @@ fn finish_deletion(
             None,
         );
     }
-    match state::advance_intent(write, state_paths, &journal.intent(), IntentPhase::Removed) {
+    match journal.advance(IntentPhase::Removed) {
         Ok(removed) => {
-            current = removed.clone();
-            journal.advanced(removed);
+            current = removed;
         }
         Err(error) => {
             return pending_report(
@@ -1407,6 +3449,18 @@ fn finish_deletion(
             )
         }
     }
+    #[cfg(any(test, feature = "proof-journal"))]
+    if matches!(&journal.backend, CaptureBackend::Operation { .. })
+        && STOP_AFTER_OPERATION_REMOVED.with(|armed| armed.replace(false))
+    {
+        return pending_report(
+            &current,
+            quarantine,
+            counts,
+            "injected stop after durable removal".to_owned(),
+            None,
+        );
+    }
     if expired(bounds.deadline) {
         return pending_report(
             &current,
@@ -1416,7 +3470,7 @@ fn finish_deletion(
             None,
         );
     }
-    match state::advance_intent(write, state_paths, &current, IntentPhase::Deleted) {
+    match journal.advance(IntentPhase::Deleted) {
         Ok(settled) => DeleteReport {
             volume_uuid: settled.volume_uuid.to_string(),
             unit_name: settled.unit.name.clone(),
@@ -1575,6 +3629,16 @@ struct CaptureJournal<'a> {
     write: &'a IntentWrite,
     state_paths: &'a StatePaths,
     intent: RefCell<IntentRecord>,
+    backend: CaptureBackend<'a>,
+}
+
+enum CaptureBackend<'a> {
+    Legacy,
+    Operation {
+        dirs: &'a dyn DirOps,
+        observer: &'a dyn ProcessObserver,
+        record: Box<RefCell<crate::operation::OperationRecord>>,
+    },
 }
 
 impl<'a> CaptureJournal<'a> {
@@ -1588,7 +3652,106 @@ impl<'a> CaptureJournal<'a> {
             write,
             state_paths,
             intent: RefCell::new(intent.clone()),
+            backend: CaptureBackend::Legacy,
         }
+    }
+
+    /// Bind the existing walk to the successor's one durable operation. The
+    /// intent is an in-memory view for the existing identity and walk code; it
+    /// is never published to the legacy journal.
+    fn for_operation(
+        write: &'a IntentWrite,
+        state_paths: &'a StatePaths,
+        dirs: &'a dyn DirOps,
+        observer: &'a dyn ProcessObserver,
+        record: &crate::operation::OperationRecord,
+    ) -> Result<Self> {
+        record.validate()?;
+        let phase = match record.phase {
+            crate::operation::OperationPhase::Intent => IntentPhase::Intent,
+            crate::operation::OperationPhase::Renamed => IntentPhase::Renamed,
+            crate::operation::OperationPhase::MarkerLast => IntentPhase::MarkerLast,
+            crate::operation::OperationPhase::Removed => IntentPhase::Removed,
+            crate::operation::OperationPhase::Deleted => IntentPhase::Deleted,
+            crate::operation::OperationPhase::Complete
+            | crate::operation::OperationPhase::Cancelled => {
+                return Err(Error::new(
+                    ErrorKind::RefusedBoundary,
+                    "a terminal operation cannot enter the deletion walk",
+                ));
+            }
+        };
+        let plan_digest = record
+            .request_digest
+            .clone()
+            .or_else(|| {
+                record
+                    .owned_plan
+                    .as_ref()
+                    .map(|plan| plan.plan_digest.clone())
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::RefusedBoundary,
+                    "the operation has no original delegated request",
+                )
+            })?;
+        let intent = IntentRecord {
+            schema: crate::contract::INTENT_SCHEMA.to_owned(),
+            intent_id: record.sequence.to_string(),
+            volume_uuid: record.unit.volume_uuid.clone(),
+            mount_hint: record.unit.mount_hint.clone(),
+            root_dir: record.unit.root_dir.clone(),
+            folder: record.unit.folder.clone(),
+            unit: IntentUnit {
+                parent: record.unit.parent.clone(),
+                name: record.unit.name.clone(),
+                kind: record.unit.kind,
+                device: record.unit.device,
+                inode: record.unit.inode,
+                marker: record.unit.marker.clone(),
+                root_id: record.unit.root_id.clone(),
+                capture_name: record.unit.capture_name.clone().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::UnknownState,
+                        "the operation capture name is missing",
+                    )
+                })?,
+                grant: record.unit.grant.clone(),
+            },
+            plan_digest,
+            phase,
+            generation: record.generation,
+            recorded_ms: record.recorded_ms,
+            phase_ms: record.phase_ms,
+            captures: record.captures.clone(),
+            foreign_captures: record.foreign_captures.clone(),
+            identity: record
+                .owned_plan
+                .as_ref()
+                .and_then(|plan| plan.identity.clone()),
+            absence: record.absence.clone(),
+            caller_intent_id: None,
+            caller_request_digest: None,
+        };
+        Ok(Self {
+            write,
+            state_paths,
+            intent: RefCell::new(intent),
+            backend: CaptureBackend::Operation {
+                dirs,
+                observer,
+                record: Box::new(RefCell::new(record.clone())),
+            },
+        })
+    }
+
+    fn update_operation(&self, next: &crate::operation::OperationRecord) {
+        let mut intent = self.intent.borrow_mut();
+        intent.generation = next.generation;
+        intent.phase_ms = next.phase_ms;
+        intent.captures.clone_from(&next.captures);
+        intent.foreign_captures.clone_from(&next.foreign_captures);
     }
 
     /// Publish one capture whose verification failed, before its put-back.
@@ -1596,6 +3759,24 @@ impl<'a> CaptureJournal<'a> {
     /// A later record of the same capture replaces the earlier one, so the
     /// put-back answer is added rather than duplicated.
     fn record_foreign(&self, foreign: ForeignCapture) -> Result<()> {
+        if let CaptureBackend::Operation {
+            dirs,
+            observer,
+            record,
+        } = &self.backend
+        {
+            let next = crate::operation::record_operation_foreign_capture(
+                self.write,
+                *dirs,
+                *observer,
+                self.state_paths,
+                &record.borrow(),
+                &foreign,
+            )?;
+            self.update_operation(&next);
+            *record.borrow_mut() = next;
+            return Ok(());
+        }
         let next = {
             let current = self.intent.borrow();
             state::record_foreign_capture(self.write, self.state_paths, &current, &foreign)?
@@ -1610,6 +3791,24 @@ impl<'a> CaptureJournal<'a> {
     /// unlinked only while the intent records its capture and verification, with
     /// the mode Barge is about to change, so a replay re-verifies the same object.
     fn record_captures(&self, captures: &[CaptureRecord]) -> Result<()> {
+        if let CaptureBackend::Operation {
+            dirs,
+            observer,
+            record,
+        } = &self.backend
+        {
+            let next = crate::operation::record_operation_captures(
+                self.write,
+                *dirs,
+                *observer,
+                self.state_paths,
+                &record.borrow(),
+                captures,
+            )?;
+            self.update_operation(&next);
+            *record.borrow_mut() = next;
+            return Ok(());
+        }
         let next = {
             let current = self.intent.borrow();
             state::record_captures(self.write, self.state_paths, &current, captures)?
@@ -1623,10 +3822,38 @@ impl<'a> CaptureJournal<'a> {
         self.intent.borrow().clone()
     }
 
-    /// Take a phase the caller published through the journal's own token, so a
-    /// later report from the journal names the phase that is actually durable.
-    fn advanced(&self, intent: IntentRecord) {
-        *self.intent.borrow_mut() = intent;
+    /// Publish the next phase in the journal that owns this walk.
+    fn advance(&self, phase: IntentPhase) -> Result<IntentRecord> {
+        if let CaptureBackend::Operation {
+            dirs,
+            observer,
+            record,
+        } = &self.backend
+        {
+            let target = match phase {
+                IntentPhase::Intent => crate::operation::OperationPhase::Intent,
+                IntentPhase::Renamed => crate::operation::OperationPhase::Renamed,
+                IntentPhase::MarkerLast => crate::operation::OperationPhase::MarkerLast,
+                IntentPhase::Removed => crate::operation::OperationPhase::Removed,
+                IntentPhase::Deleted => crate::operation::OperationPhase::Deleted,
+            };
+            let next = crate::operation::advance_operation(
+                self.write,
+                *dirs,
+                *observer,
+                self.state_paths,
+                &record.borrow(),
+                target,
+            )?;
+            self.update_operation(&next);
+            *record.borrow_mut() = next;
+            self.intent.borrow_mut().phase = phase;
+            return Ok(self.intent());
+        }
+        let next =
+            state::advance_intent(self.write, self.state_paths, &self.intent.borrow(), phase)?;
+        *self.intent.borrow_mut() = next.clone();
+        Ok(next)
     }
 }
 
@@ -3653,6 +5880,13 @@ fn replay_one(
         VolumeLocking::Take => Some(locks.lock_volume(&intent.volume_uuid)?),
         VolumeLocking::Held => None,
     };
+    if let Err(error) =
+        refuse_successor_overlap(dirs, observer, state_paths, &intent.deletion_unit())
+    {
+        return Ok(ReplayOutcome::Pending(format!(
+            "successor operation custody is unknown: {error}"
+        )));
+    }
     // The volume is found by the UUID the intent recorded — refusing a duplicated
     // mount rather than choosing one — and the area folder is then walked from that
     // live mount, so a reconnect that moved the mount point does not strand the
@@ -3857,9 +6091,9 @@ fn replay_one(
                 }
                 let renamed =
                     state::advance_intent(&write, state_paths, intent, IntentPhase::Renamed)?;
+                let journal = CaptureJournal::new(&write, state_paths, &renamed);
                 let report = finish_deletion(
-                    &write,
-                    state_paths,
+                    &journal,
                     dirs,
                     volumes,
                     observer,
@@ -3900,9 +6134,9 @@ fn replay_one(
                 return Ok(ReplayOutcome::Pending(reason));
             }
             if leaf_matches && marker_matches(&marker_digest, intent) {
+                let journal = CaptureJournal::new(&write, state_paths, intent);
                 let report = finish_deletion(
-                    &write,
-                    state_paths,
+                    &journal,
                     dirs,
                     volumes,
                     observer,
@@ -4080,19 +6314,31 @@ fn unit_still_in_place(
     if facts.kind != intent.unit.kind.entry_kind()
         || facts.device != device
         || facts.inode != intent.unit.inode
+        || facts.uid != observer.effective_uid()?
     {
         return Ok(false);
     }
     let Some(marker) = &intent.unit.marker else {
         // A markerless unit records no bytes to match; the recorded identity above
         // is what it was rolled back on.
-        return Ok(true);
+        return Ok(dirs
+            .child_facts(parent, intent.unit_name())?
+            .is_some_and(|entry| {
+                entry.kind == facts.kind
+                    && entry.device == facts.device
+                    && entry.inode == facts.inode
+                    && entry.uid == facts.uid
+            }));
     };
     if intent.unit.kind != UnitKind::Directory {
         return Ok(false);
     }
     let unit_dir = dirs.open_child_dir(parent, intent.unit_name())?;
-    Ok(marker_matches(
+    let opened = unit_dir.identity();
+    if opened.device != device || opened.inode != intent.unit.inode {
+        return Ok(false);
+    }
+    let marker_matches = marker_matches(
         &Some(leaf_marker_digest(
             dirs,
             observer,
@@ -4101,7 +6347,15 @@ fn unit_still_in_place(
             &marker.filename,
         )?),
         intent,
-    ))
+    );
+    let after = dirs.child_facts(parent, intent.unit_name())?;
+    Ok(marker_matches
+        && after.is_some_and(|entry| {
+            entry.kind == intent.unit.kind.entry_kind()
+                && entry.device == device
+                && entry.inode == intent.unit.inode
+                && entry.uid == facts.uid
+        }))
 }
 
 /// Whether the captured leaf's marker is exactly the bytes the intent recorded.
@@ -4856,6 +7110,1531 @@ mod tests {
             &state::IntentEvidence::none(),
             prepared.unit.device.get(),
         )
+    }
+
+    fn operation_request(prepared: &Prepared) -> crate::operation::BeginRequest {
+        use crate::operation::{BeginRequest, FinalizeSpec, OperationUnit};
+        let unit = &prepared.unit;
+        BeginRequest::delegated(
+            "test.caller",
+            "key",
+            PLAN,
+            FinalizeSpec {
+                kind: "test.finalize".to_owned(),
+                version: "1".to_owned(),
+                payload: String::new(),
+            },
+            OperationUnit {
+                volume_uuid: unit.volume_uuid.clone(),
+                mount_hint: prepared.fixture.root.clone(),
+                root_dir: unit.root_dir.clone(),
+                folder: unit.folder.clone(),
+                parent: unit.parent.clone(),
+                name: unit.name.clone(),
+                kind: unit.kind,
+                device: unit.device.get(),
+                inode: unit.inode,
+                marker: unit.marker.clone(),
+                root_id: unit.root_id.clone(),
+                capture_name: None,
+                grant: unit.grant.clone(),
+            },
+        )
+    }
+
+    #[test]
+    fn operation_journal_owns_the_actual_capture_walk() {
+        use crate::operation::{self, OperationPhase};
+
+        let prepared = prepared("operation-capture-walk");
+        prepared.payload("payload", b"fixture");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let unit = &prepared.unit;
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks)
+            .expect("initialize successor journal");
+        let request = operation_request(&prepared);
+        let mut locks = LockSet::new(state.clone());
+        let begun = operation::begin_operation(&dirs, &observer, state, &mut locks, request)
+            .expect("begin");
+        let record = begun.record().clone();
+        let capture = record.unit.capture_name.as_ref().expect("capture name");
+        std::fs::rename(prepared.unit_path(), prepared.parent_path().join(capture))
+            .expect("fixture capture");
+        let mut locks = LockSet::new(state.clone());
+        let _journal_lock = locks.lock_operations().expect("journal lock");
+        let _volume = locks.lock_volume(&unit.volume_uuid).expect("volume lock");
+        let _unit = super::lock_deletion_unit(&mut locks, unit).expect("unit lock");
+        let write = locks.begin_intent_write().expect("write token");
+        let renamed = operation::advance_operation(
+            &write,
+            &dirs,
+            &observer,
+            state,
+            &record,
+            OperationPhase::Renamed,
+        )
+        .expect("renamed");
+        let journal =
+            super::CaptureJournal::for_operation(&write, state, &dirs, &observer, &renamed)
+                .expect("operation walk");
+        let parent = dirs.open_path(&prepared.parent_path()).expect("parent");
+        let volume = super::WalkVolume {
+            mount: prepared.fixture.root.clone(),
+            device: unit.device,
+        };
+        let report = super::finish_deletion(
+            &journal,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &journal.intent(),
+            &prepared.parent_path(),
+            &parent,
+            prepared.bounds(),
+            &volume,
+        );
+        assert_eq!(report.outcome, DeleteOutcome::Deleted, "{report:?}");
+        let view =
+            operation::read_operations(&dirs, &observer, state, crate::contract::INTENT_ROWS)
+                .expect("read")
+                .expect("initialized");
+        assert_eq!(view.records[0].phase, OperationPhase::Deleted);
+        assert!(state::read_intents(state, crate::contract::INTENT_ROWS)
+            .expect("legacy read")
+            .records
+            .is_empty());
+    }
+
+    #[test]
+    fn cancellation_requires_the_original_unit_and_no_capture() {
+        use crate::operation::{self, OperationPhase};
+        for captured in [false, true] {
+            let prepared = prepared("operation-cancel-custody");
+            let dirs = Faults::new();
+            let observer = prepared.fixture.observer();
+            let state = &prepared.fixture.state;
+            let request = operation_request(&prepared);
+            let mut locks = LockSet::new(state.clone());
+            operation::init_operation_journal(&dirs, &observer, state, &mut locks)
+                .expect("initialize");
+            let mut locks = LockSet::new(state.clone());
+            let record =
+                operation::begin_operation(&dirs, &observer, state, &mut locks, request.clone())
+                    .expect("begin")
+                    .record()
+                    .clone();
+            if captured {
+                std::fs::rename(
+                    prepared.unit_path(),
+                    prepared
+                        .parent_path()
+                        .join(record.unit.capture_name.as_ref().expect("capture")),
+                )
+                .expect("capture fixture");
+            }
+            let outcome = super::cancel_delegated_operation(
+                state,
+                &dirs,
+                &prepared.fixture.facts(),
+                &observer,
+                &request,
+            );
+            if captured {
+                assert_eq!(
+                    outcome.expect_err("capture prevents cancellation").kind(),
+                    ErrorKind::UnknownState
+                );
+            } else {
+                assert_eq!(
+                    outcome.expect("no-effect cancellation").phase,
+                    OperationPhase::Cancelled
+                );
+                assert!(prepared.unit_path().exists());
+            }
+        }
+    }
+
+    #[test]
+    fn declaration_authority_keeps_original_generation_and_scope() {
+        use crate::operation::{self, DeclarationAuthority};
+        let prepared = prepared("operation-authority");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let first = crate::area::declare(state, &prepared.declaration, 1).expect("declaration");
+        let mut request = operation_request(&prepared);
+        request.declaration = Some(DeclarationAuthority {
+            namespace: first.namespace.clone(),
+            area: first.area.clone(),
+            generation: first.generation,
+            grant: prepared.unit.grant.clone(),
+        });
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks).expect("initialize");
+        let mut locks = LockSet::new(state.clone());
+        let record =
+            operation::begin_operation(&dirs, &observer, state, &mut locks, request.clone())
+                .expect("begin")
+                .record()
+                .clone();
+        let verify = |record: &crate::operation::OperationRecord| {
+            super::verify_operation_authority(
+                state,
+                &record.unit,
+                record.request_digest.as_deref(),
+                record.declaration.as_ref(),
+                &prepared.fixture.record,
+                &prepared.unit,
+            )
+        };
+        verify(&record).expect("same authority");
+        let second =
+            crate::area::declare(state, &prepared.declaration, 2).expect("same authority renewed");
+        assert!(second.generation > first.generation);
+        verify(&record).expect("newer same authority");
+        let mut older = record.clone();
+        older.declaration.as_mut().expect("authority").generation = second.generation + 1;
+        assert!(verify(&older).is_err());
+        let mut missing = record.clone();
+        missing.declaration = None;
+        assert!(verify(&missing).is_err());
+        let mut wrong = request;
+        wrong.declaration.as_mut().expect("authority").generation += 1;
+        assert!(operation::checked_operation_state(&dirs, &observer, state, &wrong).is_err());
+    }
+
+    #[test]
+    fn checked_begin_proves_custody_without_starting_an_effect() {
+        use crate::operation::{self, DeclarationAuthority, OperationPhase};
+        let prepared = prepared("checked-begin");
+        prepared.payload("payload", b"fixture");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+        let mut request = operation_request(&prepared);
+        request.declaration = Some(DeclarationAuthority {
+            namespace: declared.namespace,
+            area: declared.area,
+            generation: declared.generation,
+            grant: prepared.unit.grant.clone(),
+        });
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks).expect("initialize");
+        let result = super::begin_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            request.clone(),
+            prepared.bounds(),
+        )
+        .expect("checked begin");
+        assert_eq!(result.record().phase, OperationPhase::Intent);
+        assert!(prepared.unit_path().join("payload").exists());
+        let again = super::begin_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            request,
+            prepared.bounds(),
+        )
+        .expect("idempotent begin");
+        assert!(matches!(again, operation::Begun::Already(_)));
+        assert!(state::read_intents(state, crate::contract::INTENT_ROWS)
+            .expect("legacy read")
+            .records
+            .is_empty());
+    }
+
+    #[test]
+    fn checked_begin_handles_missing_gap_and_partial_allocation_without_effect() {
+        use crate::operation::{self, DeclarationAuthority, OperationPhase};
+        for scenario in ["missing", "gap", "tail"] {
+            let prepared = prepared("checked-begin-journal-integrity");
+            prepared.payload("payload", b"fixture");
+            let dirs = Faults::new();
+            let observer = prepared.fixture.observer();
+            let state = &prepared.fixture.state;
+            let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+            let mut request = operation_request(&prepared);
+            request.declaration = Some(DeclarationAuthority {
+                namespace: declared.namespace,
+                area: declared.area,
+                generation: declared.generation,
+                grant: prepared.unit.grant.clone(),
+            });
+            if scenario != "missing" {
+                let mut locks = LockSet::new(state.clone());
+                operation::init_operation_journal(&dirs, &observer, state, &mut locks)
+                    .expect("initialize");
+                if scenario == "tail" {
+                    operation::fail_next_watermark_publish(std::io::Error::other(
+                        "fixture watermark fault",
+                    ));
+                }
+                let begun = super::begin_checked_delegated(
+                    state,
+                    &dirs,
+                    &prepared.fixture.facts(),
+                    &observer,
+                    request.clone(),
+                    prepared.bounds(),
+                )
+                .expect("original begin");
+                assert_eq!(begun.record().phase, OperationPhase::Intent);
+                if scenario == "gap" {
+                    std::fs::remove_file(state.operations_dir().join("1.json"))
+                        .expect("fixture record loss");
+                } else {
+                    let retry = super::begin_checked_delegated(
+                        state,
+                        &dirs,
+                        &prepared.fixture.facts(),
+                        &observer,
+                        request.clone(),
+                        prepared.bounds(),
+                    )
+                    .expect("reconcile the confirmed tail");
+                    assert!(matches!(retry, operation::Begun::Already(_)));
+                }
+            }
+            if scenario != "tail" {
+                let error = super::begin_checked_delegated(
+                    state,
+                    &dirs,
+                    &prepared.fixture.facts(),
+                    &observer,
+                    request,
+                    prepared.bounds(),
+                )
+                .expect_err("missing or gapped journal refuses");
+                assert_eq!(error.kind(), ErrorKind::UnknownState);
+            }
+            assert!(prepared.unit_path().join("payload").exists());
+        }
+    }
+
+    #[test]
+    fn checked_execution_reaffirms_without_locks_and_deletes_through_one_journal() {
+        use crate::operation::{self, DeclarationAuthority, OperationPhase};
+        struct Reaffirm<'a> {
+            state: &'a state::StatePaths,
+        }
+        impl super::OperationReaffirmation for Reaffirm<'_> {
+            fn reaffirm(&self, record: &operation::OperationRecord) -> crate::error::Result<()> {
+                let mut locks = LockSet::new(self.state.clone());
+                let view = operation::consult_operations(
+                    &crate::os::platform(),
+                    &crate::os::platform(),
+                    self.state,
+                    &mut locks,
+                    crate::contract::INTENT_ROWS,
+                )?
+                .ok_or_else(|| {
+                    crate::error::Error::new(ErrorKind::UnknownState, "missing journal")
+                })?;
+                assert_eq!(view.records[0], *record);
+                Ok(())
+            }
+        }
+        let prepared = prepared("checked-execute");
+        prepared.payload("payload", b"fixture");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+        let mut request = operation_request(&prepared);
+        request.declaration = Some(DeclarationAuthority {
+            namespace: declared.namespace,
+            area: declared.area,
+            generation: declared.generation,
+            grant: prepared.unit.grant.clone(),
+        });
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks).expect("initialize");
+        super::begin_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            request.clone(),
+            prepared.bounds(),
+        )
+        .expect("begin");
+        let report = super::execute_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &request,
+            &Reaffirm { state },
+            prepared.bounds(),
+        )
+        .expect("execute");
+        assert_eq!(report.outcome, DeleteOutcome::Deleted, "{report:?}");
+        assert!(!prepared.unit_path().exists());
+        let record = operation::checked_operation_state(&dirs, &observer, state, &request)
+            .expect("read")
+            .expect("record");
+        assert_eq!(record.phase, OperationPhase::Deleted);
+        assert!(state::read_intents(state, crate::contract::INTENT_ROWS)
+            .expect("legacy read")
+            .records
+            .is_empty());
+    }
+
+    #[test]
+    fn checked_execution_refuses_authority_withdrawn_during_reaffirmation() {
+        use crate::operation::{self, DeclarationAuthority, OperationPhase};
+        struct Withdraw<'a> {
+            state: &'a state::StatePaths,
+            declaration: crate::area::AreaDeclaration,
+        }
+        impl super::OperationReaffirmation for Withdraw<'_> {
+            fn reaffirm(&self, _: &operation::OperationRecord) -> crate::error::Result<()> {
+                let mut changed = self.declaration.clone();
+                changed.folder = "example/withdrawn".to_owned();
+                crate::area::declare(self.state, &changed, 2)?;
+                Ok(())
+            }
+        }
+
+        let prepared = prepared("checked-withdraw-during-reaffirmation");
+        prepared.payload("payload", b"fixture");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+        let mut request = operation_request(&prepared);
+        request.declaration = Some(DeclarationAuthority {
+            namespace: declared.namespace,
+            area: declared.area,
+            generation: declared.generation,
+            grant: prepared.unit.grant.clone(),
+        });
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks).expect("initialize");
+        super::begin_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            request.clone(),
+            prepared.bounds(),
+        )
+        .expect("begin");
+        let error = super::execute_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &request,
+            &Withdraw {
+                state,
+                declaration: prepared.declaration.clone(),
+            },
+            prepared.bounds(),
+        )
+        .expect_err("withdrawn authority refuses before capture");
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        assert!(prepared.unit_path().join("payload").exists());
+        assert_eq!(
+            operation::checked_operation_state(&dirs, &observer, state, &request)
+                .expect("read")
+                .expect("record")
+                .phase,
+            OperationPhase::Intent
+        );
+    }
+
+    #[test]
+    fn phase_faults_preserve_caller_intent_and_enable_post_capture_replay() {
+        use crate::operation::{self, DeclarationAuthority, OperationPhase, OperationRecord};
+        struct Reaffirm;
+        impl super::OperationReaffirmation for Reaffirm {
+            fn reaffirm(&self, _: &OperationRecord) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+        for intent_window in [true, false] {
+            let prepared = prepared("operation-phase-fault");
+            prepared.payload("payload", b"fixture");
+            let dirs = Faults::new();
+            let observer = prepared.fixture.observer();
+            let state = &prepared.fixture.state;
+            let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+            let mut request = operation_request(&prepared);
+            request.declaration = Some(DeclarationAuthority {
+                namespace: declared.namespace,
+                area: declared.area,
+                generation: declared.generation,
+                grant: prepared.unit.grant.clone(),
+            });
+            let mut locks = LockSet::new(state.clone());
+            operation::init_operation_journal(&dirs, &observer, state, &mut locks)
+                .expect("initialize");
+            super::begin_checked_delegated(
+                state,
+                &dirs,
+                &prepared.fixture.facts(),
+                &observer,
+                request.clone(),
+                prepared.bounds(),
+            )
+            .expect("begin");
+            if intent_window {
+                super::fail_after_operation_capture();
+            } else {
+                super::stop_after_operation_renamed();
+            }
+            let stopped = super::execute_checked_delegated(
+                state,
+                &dirs,
+                &prepared.fixture.facts(),
+                &observer,
+                &request,
+                &Reaffirm,
+                prepared.bounds(),
+            )
+            .expect("stop");
+            assert_eq!(stopped.outcome, DeleteOutcome::Pending);
+            let current = operation::checked_operation_state(&dirs, &observer, state, &request)
+                .expect("read")
+                .expect("record");
+            assert_eq!(
+                current.phase,
+                if intent_window {
+                    OperationPhase::Intent
+                } else {
+                    OperationPhase::Renamed
+                }
+            );
+            let replay = super::replay_checked_operation(
+                state,
+                &dirs,
+                &prepared.fixture.facts(),
+                &observer,
+                &request,
+                prepared.bounds(),
+            );
+            if intent_window {
+                assert!(replay.is_err());
+                let report = super::execute_checked_delegated(
+                    state,
+                    &dirs,
+                    &prepared.fixture.facts(),
+                    &observer,
+                    &request,
+                    &Reaffirm,
+                    prepared.bounds(),
+                )
+                .expect("reauthorize");
+                assert_eq!(report.outcome, DeleteOutcome::Deleted);
+            } else {
+                assert!(
+                    matches!(replay.expect("replay"), super::OperationReplay::Walked(report)
+                    if report.outcome == DeleteOutcome::Deleted)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recorded_removal_after_real_unlink_can_settle_on_replay() {
+        use crate::operation::{self, DeclarationAuthority, OperationPhase, OperationRecord};
+        struct Reaffirm;
+        impl super::OperationReaffirmation for Reaffirm {
+            fn reaffirm(&self, _: &OperationRecord) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+        let prepared = prepared("operation-positive-removed");
+        prepared.payload("payload", b"fixture");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+        let mut request = operation_request(&prepared);
+        request.declaration = Some(DeclarationAuthority {
+            namespace: declared.namespace,
+            area: declared.area,
+            generation: declared.generation,
+            grant: prepared.unit.grant.clone(),
+        });
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks).expect("initialize");
+        super::begin_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            request.clone(),
+            prepared.bounds(),
+        )
+        .expect("begin");
+        super::stop_after_operation_removed();
+        let stopped = super::execute_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &request,
+            &Reaffirm,
+            prepared.bounds(),
+        )
+        .expect("stop");
+        assert_eq!(stopped.outcome, DeleteOutcome::Pending);
+        assert!(!prepared.unit_path().exists());
+        assert_eq!(
+            operation::checked_operation_state(&dirs, &observer, state, &request)
+                .expect("read")
+                .expect("record")
+                .phase,
+            OperationPhase::Removed
+        );
+        assert!(matches!(
+            super::replay_checked_operation(
+                state,
+                &dirs,
+                &prepared.fixture.facts(),
+                &observer,
+                &request,
+                prepared.bounds()
+            )
+            .expect("replay"),
+            super::OperationReplay::Deleted
+        ));
+    }
+
+    #[test]
+    fn deleted_operation_still_owes_finalization_after_authority_withdrawal() {
+        use crate::operation::{
+            self, DeclarationAuthority, FinalizationContext, FinalizeHook, OperationPhase,
+            OperationRecord,
+        };
+        struct Reaffirm;
+        impl super::OperationReaffirmation for Reaffirm {
+            fn reaffirm(&self, _: &OperationRecord) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+        struct Hook;
+        impl FinalizeHook for Hook {
+            fn kind(&self) -> &str {
+                "test.finalize"
+            }
+            fn version(&self) -> &str {
+                "1"
+            }
+            fn finalize(
+                &self,
+                _: &FinalizationContext,
+                _: &OperationRecord,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+
+        let prepared = prepared("checked-withdraw-after-deleted");
+        prepared.payload("payload", b"fixture");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+        let mut request = operation_request(&prepared);
+        request.declaration = Some(DeclarationAuthority {
+            namespace: declared.namespace,
+            area: declared.area,
+            generation: declared.generation,
+            grant: prepared.unit.grant.clone(),
+        });
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks).expect("initialize");
+        super::begin_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            request.clone(),
+            prepared.bounds(),
+        )
+        .expect("begin");
+        let report = super::execute_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &request,
+            &Reaffirm,
+            prepared.bounds(),
+        )
+        .expect("execute");
+        assert_eq!(report.outcome, DeleteOutcome::Deleted);
+        let mut changed = prepared.declaration.clone();
+        changed.folder = "example/withdrawn".to_owned();
+        crate::area::declare(state, &changed, 2).expect("withdraw");
+        let rows = super::drain_checked_operations(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &[&Hook],
+            prepared.bounds(),
+        )
+        .expect("drain");
+        assert!(matches!(
+            rows[0].outcome,
+            super::OperationDrainOutcome::Finalized
+        ));
+        assert_eq!(
+            operation::checked_operation_state(&dirs, &observer, state, &request)
+                .expect("read")
+                .expect("record")
+                .phase,
+            OperationPhase::Complete
+        );
+    }
+
+    #[test]
+    fn checked_replay_resumes_capture_and_refuses_unproved_absence() {
+        use crate::operation::{self, DeclarationAuthority, OperationPhase};
+        for absent in [false, true] {
+            let prepared = prepared("checked-replay");
+            prepared.payload("payload", b"fixture");
+            let dirs = Faults::new();
+            let observer = prepared.fixture.observer();
+            let state = &prepared.fixture.state;
+            let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+            let mut request = operation_request(&prepared);
+            request.declaration = Some(DeclarationAuthority {
+                namespace: declared.namespace,
+                area: declared.area,
+                generation: declared.generation,
+                grant: prepared.unit.grant.clone(),
+            });
+            let mut locks = LockSet::new(state.clone());
+            operation::init_operation_journal(&dirs, &observer, state, &mut locks)
+                .expect("initialize");
+            let record = super::begin_checked_delegated(
+                state,
+                &dirs,
+                &prepared.fixture.facts(),
+                &observer,
+                request.clone(),
+                prepared.bounds(),
+            )
+            .expect("begin")
+            .record()
+            .clone();
+            let capture = prepared
+                .parent_path()
+                .join(record.unit.capture_name.as_ref().expect("capture"));
+            std::fs::rename(prepared.unit_path(), &capture).expect("fixture capture");
+            let mut locks = LockSet::new(state.clone());
+            let _journal = locks.lock_operations().expect("journal lock");
+            let _volume = locks
+                .lock_volume(&prepared.unit.volume_uuid)
+                .expect("volume lock");
+            let _unit = super::lock_deletion_unit(&mut locks, &prepared.unit).expect("unit lock");
+            let write = locks.begin_intent_write().expect("write");
+            let mut advanced = operation::advance_operation(
+                &write,
+                &dirs,
+                &observer,
+                state,
+                &record,
+                OperationPhase::Renamed,
+            )
+            .expect("renamed");
+            if absent {
+                advanced = operation::advance_operation(
+                    &write,
+                    &dirs,
+                    &observer,
+                    state,
+                    &advanced,
+                    OperationPhase::MarkerLast,
+                )
+                .expect("marker last");
+                std::fs::rename(&capture, prepared.parent_path().join("other-fixture-name"))
+                    .expect("move without deletion");
+            }
+            drop(_unit);
+            drop(_volume);
+            drop(_journal);
+            let result = super::replay_checked_operation(
+                state,
+                &dirs,
+                &prepared.fixture.facts(),
+                &observer,
+                &request,
+                prepared.bounds(),
+            )
+            .expect("replay");
+            if absent {
+                assert!(matches!(result, super::OperationReplay::Pending(_)));
+                let read = operation::checked_operation_state(&dirs, &observer, state, &request)
+                    .expect("read")
+                    .expect("record");
+                assert_eq!(read, advanced);
+            } else {
+                let super::OperationReplay::Walked(report) = result else {
+                    panic!("expected walk");
+                };
+                assert_eq!(report.outcome, DeleteOutcome::Deleted, "{report:?}");
+            }
+            assert!(state::read_intents(state, crate::contract::INTENT_ROWS)
+                .expect("legacy read")
+                .records
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn interrupted_intent_requires_caller_reaffirmation_before_capture_recovery() {
+        use crate::operation::{self, DeclarationAuthority, OperationPhase};
+        struct Reaffirm;
+        impl super::OperationReaffirmation for Reaffirm {
+            fn reaffirm(&self, _: &operation::OperationRecord) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+        let prepared = prepared("checked-intent-recovery");
+        prepared.payload("payload", b"fixture");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+        let mut request = operation_request(&prepared);
+        request.declaration = Some(DeclarationAuthority {
+            namespace: declared.namespace,
+            area: declared.area,
+            generation: declared.generation,
+            grant: prepared.unit.grant.clone(),
+        });
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks).expect("initialize");
+        let record = super::begin_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            request.clone(),
+            prepared.bounds(),
+        )
+        .expect("begin")
+        .record()
+        .clone();
+        std::fs::rename(
+            prepared.unit_path(),
+            prepared
+                .parent_path()
+                .join(record.unit.capture_name.as_ref().expect("capture")),
+        )
+        .expect("fixture capture");
+        let error = super::replay_checked_operation(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &request,
+            prepared.bounds(),
+        )
+        .expect_err("generic intent replay refuses");
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        let report = super::execute_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &request,
+            &Reaffirm,
+            prepared.bounds(),
+        )
+        .expect("caller-authenticated recovery");
+        assert_eq!(report.outcome, DeleteOutcome::Deleted, "{report:?}");
+        assert_eq!(
+            operation::checked_operation_state(&dirs, &observer, state, &request)
+                .expect("state")
+                .expect("record")
+                .phase,
+            OperationPhase::Deleted
+        );
+    }
+
+    #[test]
+    fn checked_drain_replays_then_finalizes_without_a_second_journal() {
+        use crate::operation::{
+            self, DeclarationAuthority, FinalizationContext, FinalizeHook, OperationPhase,
+            OperationRecord, SettlementConsult,
+        };
+        struct Hook<'a>(&'a state::StatePaths);
+        impl FinalizeHook for Hook<'_> {
+            fn kind(&self) -> &str {
+                "test.finalize"
+            }
+            fn version(&self) -> &str {
+                "1"
+            }
+            fn finalize(
+                &self,
+                context: &FinalizationContext,
+                _: &OperationRecord,
+            ) -> crate::error::Result<()> {
+                let result = operation::consult_settlement(
+                    &crate::os::platform(),
+                    &crate::os::platform(),
+                    self.0,
+                    context,
+                )?;
+                assert!(matches!(result, SettlementConsult::Owed(_)));
+                Ok(())
+            }
+        }
+        let prepared = prepared("checked-drain");
+        prepared.payload("payload", b"fixture");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+        let mut request = operation_request(&prepared);
+        request.declaration = Some(DeclarationAuthority {
+            namespace: declared.namespace,
+            area: declared.area,
+            generation: declared.generation,
+            grant: prepared.unit.grant.clone(),
+        });
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks).expect("initialize");
+        let record = super::begin_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            request.clone(),
+            prepared.bounds(),
+        )
+        .expect("begin")
+        .record()
+        .clone();
+        std::fs::rename(
+            prepared.unit_path(),
+            prepared
+                .parent_path()
+                .join(record.unit.capture_name.as_ref().expect("capture")),
+        )
+        .expect("capture fixture");
+        let mut locks = LockSet::new(state.clone());
+        let journal = locks.lock_operations().expect("journal lock");
+        let volume = locks
+            .lock_volume(&prepared.unit.volume_uuid)
+            .expect("volume lock");
+        let unit = super::lock_deletion_unit(&mut locks, &prepared.unit).expect("unit lock");
+        let write = locks.begin_intent_write().expect("write");
+        operation::advance_operation(
+            &write,
+            &dirs,
+            &observer,
+            state,
+            &record,
+            OperationPhase::Renamed,
+        )
+        .expect("renamed");
+        drop(unit);
+        drop(volume);
+        drop(journal);
+        let rows = super::drain_checked_operations(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &[&Hook(state)],
+            prepared.bounds(),
+        )
+        .expect("drain");
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            rows[0].outcome,
+            super::OperationDrainOutcome::Finalized
+        ));
+        assert_eq!(
+            operation::checked_operation_state(&dirs, &observer, state, &request)
+                .expect("state")
+                .expect("record")
+                .phase,
+            OperationPhase::Complete
+        );
+        assert!(state::read_intents(state, crate::contract::INTENT_ROWS)
+            .expect("legacy read")
+            .records
+            .is_empty());
+    }
+
+    #[test]
+    fn legacy_and_successor_deletions_refuse_overlapping_pending_work() {
+        use crate::operation::{self, DeclarationAuthority};
+        for legacy_first in [false, true] {
+            let prepared = prepared("operation-legacy-overlap");
+            prepared.payload("payload", b"fixture");
+            let dirs = Faults::new();
+            let observer = prepared.fixture.observer();
+            let state = &prepared.fixture.state;
+            let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+            let mut request = operation_request(&prepared);
+            request.declaration = Some(DeclarationAuthority {
+                namespace: declared.namespace,
+                area: declared.area,
+                generation: declared.generation,
+                grant: prepared.unit.grant.clone(),
+            });
+            let mut locks = LockSet::new(state.clone());
+            operation::init_operation_journal(&dirs, &observer, state, &mut locks)
+                .expect("initialize");
+            if legacy_first {
+                publish(&prepared, &[]);
+                assert!(super::begin_checked_delegated(
+                    state,
+                    &dirs,
+                    &prepared.fixture.facts(),
+                    &observer,
+                    request,
+                    prepared.bounds()
+                )
+                .is_err());
+            } else {
+                super::begin_checked_delegated(
+                    state,
+                    &dirs,
+                    &prepared.fixture.facts(),
+                    &observer,
+                    request,
+                    prepared.bounds(),
+                )
+                .expect("begin");
+                let error = delete_unit_on_volume(
+                    state,
+                    &dirs,
+                    &prepared.fixture.facts(),
+                    &prepared.fixture.mounts(),
+                    &observer,
+                    &prepared.declaration,
+                    &prepared.unit,
+                    prepared.bounds(),
+                )
+                .expect_err("successor excludes legacy deletion");
+                assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+            }
+            assert!(prepared.unit_path().join("payload").exists());
+        }
+    }
+
+    #[test]
+    fn checked_execution_refuses_unknown_writer_custody_without_a_rename() {
+        use crate::operation::{self, DeclarationAuthority, OperationPhase};
+        struct Reaffirm;
+        impl super::OperationReaffirmation for Reaffirm {
+            fn reaffirm(&self, _: &operation::OperationRecord) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+        let prepared = prepared("operation-unknown-writer");
+        prepared.payload("payload", b"fixture");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+        let mut request = operation_request(&prepared);
+        request.declaration = Some(DeclarationAuthority {
+            namespace: declared.namespace,
+            area: declared.area,
+            generation: declared.generation,
+            grant: prepared.unit.grant.clone(),
+        });
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks).expect("initialize");
+        super::begin_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            request.clone(),
+            prepared.bounds(),
+        )
+        .expect("begin");
+        let mut unknown = prepared.fixture.observer();
+        unknown.scan = crate::testkit::ScanMode::Unreadable;
+        assert!(super::execute_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &unknown,
+            &request,
+            &Reaffirm,
+            prepared.bounds()
+        )
+        .is_err());
+        assert!(prepared.unit_path().join("payload").exists());
+        assert_eq!(
+            operation::checked_operation_state(&dirs, &observer, state, &request)
+                .expect("state")
+                .expect("record")
+                .phase,
+            OperationPhase::Intent
+        );
+    }
+
+    #[test]
+    fn captured_replay_refuses_live_or_unknown_writer_custody() {
+        use crate::operation::{self, DeclarationAuthority, OperationPhase};
+        for unreadable in [false, true] {
+            let prepared = prepared("operation-replay-writer");
+            prepared.payload("payload", b"fixture");
+            let dirs = Faults::new();
+            let observer = prepared.fixture.observer();
+            let state = &prepared.fixture.state;
+            let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+            let mut request = operation_request(&prepared);
+            request.declaration = Some(DeclarationAuthority {
+                namespace: declared.namespace,
+                area: declared.area,
+                generation: declared.generation,
+                grant: prepared.unit.grant.clone(),
+            });
+            let mut locks = LockSet::new(state.clone());
+            operation::init_operation_journal(&dirs, &observer, state, &mut locks)
+                .expect("initialize");
+            let record = super::begin_checked_delegated(
+                state,
+                &dirs,
+                &prepared.fixture.facts(),
+                &observer,
+                request.clone(),
+                prepared.bounds(),
+            )
+            .expect("begin")
+            .record()
+            .clone();
+            let capture = prepared
+                .parent_path()
+                .join(record.unit.capture_name.as_ref().expect("capture"));
+            std::fs::rename(prepared.unit_path(), &capture).expect("capture fixture");
+            let mut locks = LockSet::new(state.clone());
+            let journal = locks.lock_operations().expect("journal lock");
+            let volume = locks
+                .lock_volume(&prepared.unit.volume_uuid)
+                .expect("volume lock");
+            let unit = super::lock_deletion_unit(&mut locks, &prepared.unit).expect("unit lock");
+            let write = locks.begin_intent_write().expect("write");
+            operation::advance_operation(
+                &write,
+                &dirs,
+                &observer,
+                state,
+                &record,
+                OperationPhase::Renamed,
+            )
+            .expect("renamed");
+            drop(unit);
+            drop(volume);
+            drop(journal);
+            let mut blocked = prepared.fixture.observer();
+            blocked.scan = if unreadable {
+                crate::testkit::ScanMode::Unreadable
+            } else {
+                crate::testkit::ScanMode::Open(vec![crate::os::OpenDescriptor {
+                    pid: 777,
+                    descriptor: 3,
+                    path: capture.join("payload"),
+                }])
+            };
+            assert!(super::replay_checked_operation(
+                state,
+                &dirs,
+                &prepared.fixture.facts(),
+                &blocked,
+                &request,
+                prepared.bounds()
+            )
+            .is_err());
+            assert!(capture.join("payload").exists());
+            assert_eq!(
+                operation::checked_operation_state(&dirs, &observer, state, &request)
+                    .expect("state")
+                    .expect("record")
+                    .phase,
+                OperationPhase::Renamed
+            );
+        }
+    }
+
+    #[test]
+    fn owned_replay_requires_plan_and_preserves_no_effect_cancellation() {
+        use crate::operation::{
+            self, BeginRequest, DeclarationAuthority, OperationPhase, OwnedPlanBinding,
+        };
+        for mode in 0..3 {
+            let prepared = prepared("operation-owned-replay");
+            prepared.payload("payload", b"fixture");
+            let dirs = Faults::new();
+            let observer = prepared.fixture.observer();
+            let state = &prepared.fixture.state;
+            let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+            let mut request = BeginRequest::barge_owned(operation_request(&prepared).unit);
+            request.declaration = Some(DeclarationAuthority {
+                namespace: declared.namespace,
+                area: declared.area,
+                generation: declared.generation,
+                grant: prepared.unit.grant.clone(),
+            });
+            if mode != 0 {
+                request.owned_plan = Some(OwnedPlanBinding {
+                    plan_digest: PLAN.to_owned(),
+                    identity: None,
+                    requires_identity: false,
+                    requires_absence: false,
+                });
+            }
+            let mut locks = LockSet::new(state.clone());
+            operation::init_operation_journal(&dirs, &observer, state, &mut locks)
+                .expect("initialize");
+            let mut locks = LockSet::new(state.clone());
+            let record = operation::begin_operation(&dirs, &observer, state, &mut locks, request)
+                .expect("test-only store setup")
+                .record()
+                .clone();
+            if mode == 2 {
+                std::fs::rename(
+                    prepared.unit_path(),
+                    prepared
+                        .parent_path()
+                        .join(record.unit.capture_name.as_ref().expect("capture")),
+                )
+                .expect("capture fixture");
+                let mut locks = LockSet::new(state.clone());
+                let journal = locks.lock_operations().expect("journal lock");
+                let volume = locks
+                    .lock_volume(&prepared.unit.volume_uuid)
+                    .expect("volume lock");
+                let unit =
+                    super::lock_deletion_unit(&mut locks, &prepared.unit).expect("unit lock");
+                let write = locks.begin_intent_write().expect("write");
+                operation::advance_operation(
+                    &write,
+                    &dirs,
+                    &observer,
+                    state,
+                    &record,
+                    OperationPhase::Renamed,
+                )
+                .expect("renamed");
+                drop(unit);
+                drop(volume);
+                drop(journal);
+            }
+            let rows = super::drain_checked_operations(
+                state,
+                &dirs,
+                &prepared.fixture.facts(),
+                &observer,
+                &[],
+                prepared.bounds(),
+            )
+            .expect("drain");
+            assert_eq!(rows.len(), 1);
+            match mode {
+                0 => {
+                    assert!(matches!(
+                        rows[0].outcome,
+                        super::OperationDrainOutcome::Pending(_)
+                    ));
+                    assert!(prepared.unit_path().exists());
+                }
+                1 => {
+                    assert!(matches!(
+                        rows[0].outcome,
+                        super::OperationDrainOutcome::Cancelled
+                    ));
+                    assert!(prepared.unit_path().exists());
+                }
+                _ => {
+                    assert!(matches!(
+                        rows[0].outcome,
+                        super::OperationDrainOutcome::Completed
+                    ));
+                    assert!(!prepared.unit_path().exists());
+                }
+            }
+            let view =
+                operation::read_operations(&dirs, &observer, state, crate::contract::INTENT_ROWS)
+                    .expect("read")
+                    .expect("initialized");
+            assert_eq!(
+                view.records[0].phase,
+                match mode {
+                    0 => OperationPhase::Intent,
+                    1 => OperationPhase::Cancelled,
+                    _ => OperationPhase::Complete,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn owned_replay_restores_recorded_mode_before_identity_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::operation::{self, OperationPhase};
+        let prepared = prepared("owned-replay-mode-before-identity");
+        plant_unit_contents(&prepared);
+        std::fs::set_permissions(prepared.unit_path(), std::fs::Permissions::from_mode(0o500))
+            .expect("the original unit is read-only");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+        let evidence = evidence_for(&prepared);
+        let reprove = |_: &crate::registry::VolumeRecord| Ok(None);
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks).expect("initialize");
+        let begun = super::begin_owned_from_checked_plan(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &prepared.unit,
+            &declared,
+            &evidence,
+            true,
+            false,
+            &reprove,
+            prepared.bounds(),
+        )
+        .expect("checked owned begin");
+        let view =
+            operation::read_operations(&dirs, &observer, state, crate::contract::INTENT_ROWS)
+                .expect("journal reads")
+                .expect("initialized");
+        dirs.failing_listing_after_mode();
+        let stopped = super::execute_bound_operation(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &view.identity,
+            begun.record(),
+            Some(&reprove),
+            prepared.bounds(),
+        )
+        .expect("the interrupted walk reports its outcome");
+        assert_eq!(stopped.outcome, DeleteOutcome::Pending, "{stopped:?}");
+        let leaf = stopped.quarantine;
+        assert_eq!(mode_of(&leaf), 0o500, "the abort guard restored the mode");
+        let before =
+            operation::read_operations(&dirs, &observer, state, crate::contract::INTENT_ROWS)
+                .expect("journal reads")
+                .expect("initialized")
+                .records
+                .remove(0);
+        assert_eq!(before.phase, OperationPhase::Renamed);
+        assert!(before.owned_plan.as_ref().expect("plan").requires_identity);
+        assert!(before
+            .captures
+            .iter()
+            .any(|capture| capture.mode == Some(0o040500)));
+
+        // Model a stop after the recorded chmod, and invalidate the original
+        // marker before replay. The recorded inode still identifies the leaf.
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o700))
+            .expect("the interrupted leaf is widened");
+        let marker_path = leaf.join(ROOT_MARKER_FILE);
+        let mut marker: crate::area::RootMarker =
+            serde_json::from_slice(&std::fs::read(&marker_path).expect("the marker reads"))
+                .expect("the marker decodes");
+        marker.created_ms = marker.created_ms.saturating_add(1);
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&marker).expect("encode marker"),
+        )
+        .expect("the changed marker is written");
+
+        let rows = super::drain_checked_operations(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &[],
+            prepared.bounds(),
+        )
+        .expect("drain");
+        assert!(
+            matches!(&rows[0].outcome, super::OperationDrainOutcome::Pending(reason)
+            if reason.contains("marker is not the recorded bytes")),
+            "{rows:?}"
+        );
+        assert_eq!(
+            mode_of(&leaf),
+            0o500,
+            "identity refusal restores the recorded mode"
+        );
+        assert!(leaf.join("payload.txt").is_file(), "nothing was unlinked");
+        let after =
+            operation::read_operations(&dirs, &observer, state, crate::contract::INTENT_ROWS)
+                .expect("journal reads")
+                .expect("initialized")
+                .records
+                .remove(0);
+        assert_eq!(after, before, "the pending operation is not advanced");
+    }
+
+    #[test]
+    fn owned_replay_refuses_a_reappeared_original_consumer() {
+        use crate::operation::{
+            self, BeginRequest, DeclarationAuthority, OperationPhase, OwnedPlanBinding,
+        };
+        let prepared = prepared("owned-replay-consumer");
+        prepared.payload("payload", b"fixture");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+        let consumer = prepared.fixture.root.join("consumer/checkout");
+        std::fs::create_dir_all(consumer.parent().expect("parent")).expect("fixture parent");
+        let mut request = BeginRequest::barge_owned(operation_request(&prepared).unit);
+        request.declaration = Some(DeclarationAuthority {
+            namespace: declared.namespace,
+            area: declared.area,
+            generation: declared.generation,
+            grant: prepared.unit.grant.clone(),
+        });
+        request.absence = Some(absent_evidence(&prepared, &consumer));
+        request.owned_plan = Some(OwnedPlanBinding {
+            plan_digest: PLAN.to_owned(),
+            identity: None,
+            requires_identity: false,
+            requires_absence: true,
+        });
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks).expect("initialize");
+        let mut locks = LockSet::new(state.clone());
+        let record = operation::begin_operation(&dirs, &observer, state, &mut locks, request)
+            .expect("test-only store setup")
+            .record()
+            .clone();
+        let capture = prepared
+            .parent_path()
+            .join(record.unit.capture_name.as_ref().expect("capture"));
+        std::fs::rename(prepared.unit_path(), &capture).expect("fixture capture");
+        let mut locks = LockSet::new(state.clone());
+        let journal = locks.lock_operations().expect("journal lock");
+        let volume = locks
+            .lock_volume(&prepared.unit.volume_uuid)
+            .expect("volume lock");
+        let unit = super::lock_deletion_unit(&mut locks, &prepared.unit).expect("unit lock");
+        let write = locks.begin_intent_write().expect("write");
+        operation::advance_operation(
+            &write,
+            &dirs,
+            &observer,
+            state,
+            &record,
+            OperationPhase::Renamed,
+        )
+        .expect("renamed");
+        drop(unit);
+        drop(volume);
+        drop(journal);
+        std::fs::create_dir(&consumer).expect("consumer returns");
+        let rows = super::drain_checked_operations(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &[],
+            prepared.bounds(),
+        )
+        .expect("drain");
+        assert!(matches!(
+            rows[0].outcome,
+            super::OperationDrainOutcome::Pending(_)
+        ));
+        assert!(capture.join("payload").exists());
+    }
+
+    #[test]
+    fn post_unlink_publication_failure_never_infers_completion() {
+        use crate::operation::{self, DeclarationAuthority, OperationPhase};
+        struct Reaffirm;
+        impl super::OperationReaffirmation for Reaffirm {
+            fn reaffirm(&self, _: &operation::OperationRecord) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+        let prepared = prepared("operation-post-unlink");
+        prepared.payload("payload", b"fixture");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+        let mut request = operation_request(&prepared);
+        request.declaration = Some(DeclarationAuthority {
+            namespace: declared.namespace,
+            area: declared.area,
+            generation: declared.generation,
+            grant: prepared.unit.grant.clone(),
+        });
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks).expect("initialize");
+        super::begin_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            request.clone(),
+            prepared.bounds(),
+        )
+        .expect("begin");
+        super::fail_after_operation_unlink();
+        let report = super::execute_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &request,
+            &Reaffirm,
+            prepared.bounds(),
+        )
+        .expect("bounded report");
+        assert_ne!(report.outcome, DeleteOutcome::Deleted);
+        let record = operation::checked_operation_state(&dirs, &observer, state, &request)
+            .expect("state")
+            .expect("record");
+        assert_eq!(record.phase, OperationPhase::MarkerLast);
+        assert!(!prepared
+            .parent_path()
+            .join(record.unit.capture_name.as_ref().expect("capture"))
+            .exists());
+        let replay = super::replay_checked_operation(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &request,
+            prepared.bounds(),
+        )
+        .expect("replay");
+        assert!(matches!(replay, super::OperationReplay::Pending(_)));
+        assert_eq!(
+            operation::checked_operation_state(&dirs, &observer, state, &request)
+                .expect("state")
+                .expect("record")
+                .phase,
+            OperationPhase::MarkerLast
+        );
     }
 
     /// Publish one intent that records a device other than the live one and the
