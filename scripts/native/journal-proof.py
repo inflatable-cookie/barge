@@ -24,7 +24,9 @@ release and outputs proofs:
 - **Inner (guarded).** The inner validates that it really is the guard's run:
   the scratch and evidence directories the supervisor supplied exist, are
   canonical, sit inside the designated barge scratch on the verified private
-  Stash volume, are owned by this account and owner-only, and the wall
+  Stash volume, are owned by this account and free of group/other write
+  bits — the guard creates them 0755, and the guard's owned root must be
+  private 0700 — and the wall
   deadline the outer minted is present and well formed. It then creates its
   fixture and stage roots inside the owned scratch, stages the `proof-journal`
   feature build of HEAD through the managed Oxide build, mints the
@@ -252,7 +254,8 @@ PREMISES = (
      "the inner creates its run root, case directories and stage temporaries "
      "inside the guard-supplied OXIDE_TASK_SCRATCH_ROOT, which it verifies "
      "resolves onto the pinned Stash volume inside the designated barge "
-     "scratch, owned by this account and owner-only"),
+     "scratch, owned by this account and free of group/other write bits — the "
+     "guard creates it 0755, and the guard's owned root must be private 0700"),
     ("fresh mkdtemp fixture directories under the owned root",
      "every case group's fixture is one fresh mkdtemp directory under the "
      "owned run root"),
@@ -361,36 +364,35 @@ class InnerEffects:
             return digest.hexdigest()
 
         def guard_facts(scratch, evidence):
-            """What the host says about the guard-supplied directories: the
-            scratch's route facts (volume, owner, mode, canonical path) and
-            both directories' presence and kinds. Read-only."""
+            """What the host says about the guard-supplied directories, in the
+            reference helper's shape: the scratch and evidence facts, the owned
+            root that parents them, the verified scratch parent, the scratch
+            volume's UUID, and this account's uid. Read-only."""
             scratch_real = os.path.realpath(scratch)
             evidence_real = os.path.realpath(evidence)
             route = base.scratch_route_facts(scratch_real, base.SCRATCH_VOLUME_MOUNT)
-            designated = os.path.realpath(DESIGNATED_SCRATCH)
+            owned_root = os.path.dirname(scratch_real)
+
+            def directory_facts(path):
+                exists = os.path.exists(path)
+                info = os.lstat(path) if exists else None
+                return {
+                    "path": path, "realpath": os.path.realpath(path),
+                    "present": exists,
+                    "isdir": os.path.isdir(path) and not os.path.islink(path),
+                    "islink": os.path.islink(path),
+                    "uid": info.st_uid if info else None,
+                    "mode": info.st_mode & 0o777 if info else None,
+                }
+
             facts = {
                 "uid": os.getuid(),
                 "volume_uuid": route.get("volume_uuid"),
                 "path": scratch,
-                "scratch_facts": {
-                    "path": scratch, "realpath": scratch_real,
-                    "present": os.path.exists(scratch),
-                    "isdir": os.path.isdir(scratch),
-                    "islink": os.path.islink(scratch),
-                    "uid": route.get("owner_uid"),
-                    "mode": route.get("mode"),
-                },
-                "evidence_facts": {
-                    "path": evidence, "realpath": evidence_real,
-                    "present": os.path.exists(evidence),
-                    "isdir": os.path.isdir(evidence),
-                    "islink": os.path.islink(evidence),
-                },
-                "root_facts": {"realpath": os.path.dirname(scratch_real)},
-                "within_designated": scratch_real == designated
-                or scratch_real.startswith(designated + os.sep),
-                "evidence_within": evidence_real.startswith(
-                    os.path.dirname(scratch_real) + os.sep),
+                "root_parent": os.path.realpath(DESIGNATED_SCRATCH),
+                "scratch_facts": directory_facts(scratch_real),
+                "evidence_facts": directory_facts(evidence_real),
+                "root_facts": directory_facts(owned_root),
             }
             return facts
 
@@ -506,55 +508,93 @@ def designated_route_problems(facts):
     return problems
 
 
-def guard_containment_problems(facts):
-    """Why the guard-created directories are not this occurrence's own.
+def _guard_private_directory_problems(name, facts, uid, owner_only=False):
+    """Why one guard-set directory is not this occurrence's canonical directory.
 
-    The scratch must be on the verified Stash volume, canonical, inside the
-    designated barge scratch, owned by this account and owner-only; the
-    evidence directory must be a sibling inside the same guard-owned root and
-    must not alias the scratch."""
+    Mirrors the reference helper: a symlink, a non-directory, a non-absolute or
+    non-canonical path, another account's ownership, or group/other write bits
+    (owner_only: any group/other bit at all) each refuse. The pinned supervisor
+    creates the scratch and evidence directories 0755, so ordinary read/
+    execute bits for group and other are accepted — ownership is the boundary,
+    never the read bits."""
     problems = []
+    if isinstance(facts, dict) and facts.get("islink") is True:
+        return [f"the {name} {facts.get('path')!r} is a symlink"]
+    if not isinstance(facts, dict) or facts.get("present") is not True \
+            or facts.get("isdir") is not True:
+        return [f"the {name} is not a directory"]
+    path = facts.get("path")
+    if not isinstance(path, str) or not os.path.isabs(path) \
+            or os.path.normpath(path) != path:
+        problems.append(f"the {name} {path!r} is not an absolute canonical path")
+    if facts.get("realpath") != path:
+        problems.append(f"the {name} {path!r} resolves to {facts.get('realpath')!r}, "
+                        "so its path is an alias or a symlink")
+    if facts.get("uid") != uid:
+        problems.append(f"the {name} {path!r} is not owned by this account")
+    mode = facts.get("mode")
+    writable = 0o077 if owner_only else 0o022
+    if not isinstance(mode, int) or mode & writable:
+        problems.append(f"the {name} {path!r} mode {mode!r} is not private")
+    return problems
+
+
+def guard_owned_root(scratch_path):
+    """The guard's monitored owned root: the parent of the scratch directory
+    the supervisor sets (the pinned bytes create one `oxide-proof.*` root
+    under `--root-parent` and then `scratch/` inside it)."""
+    if not isinstance(scratch_path, str) or not os.path.isabs(scratch_path):
+        return None
+    parent = os.path.dirname(os.path.normpath(scratch_path))
+    return parent if parent not in ("", os.sep) else None
+
+
+def guard_containment_problems(facts):
+    """Why the guard-created layout is not this occurrence's monitored one.
+
+    Mirrors the reference helper: the scratch and evidence directories must be
+    canonical, un-symlinked, directories, owned by this account and free of
+    group/other write bits (the guard creates them 0755); the owned root that
+    parents them must be a direct child of the verified designated scratch and
+    private 0700; the evidence must live inside that owned root, must not
+    alias it or the scratch; and the scratch's volume must be the verified
+    private Stash UUID. A layout the pinned supervisor would not have created
+    refuses, and one it does create — 0755 scratch and evidence over a 0700
+    owned root — passes."""
+    problems = []
+    uid = facts.get("uid")
+    root_parent = facts.get("root_parent")
     scratch = facts.get("scratch_facts") or {}
-    evidence = facts.get("evidence_facts") or {}
-    root = facts.get("root_facts") or {}
-    if scratch.get("present") is not True or scratch.get("isdir") is not True:
-        problems.append(f"OXIDE_TASK_SCRATCH_ROOT {scratch.get('path')!r} is "
-                        "absent or not a directory")
-        return problems
-    if scratch.get("islink") is True:
-        problems.append(f"OXIDE_TASK_SCRATCH_ROOT {scratch.get('path')!r} is a symlink")
-    if scratch.get("realpath") != scratch.get("path"):
-        problems.append(f"OXIDE_TASK_SCRATCH_ROOT resolves to {scratch.get('realpath')!r}, "
-                        "so its path is not canonical")
+    problems += _guard_private_directory_problems(
+        "scratch directory", scratch, uid, owner_only=False)
+    problems += _guard_private_directory_problems(
+        "evidence directory", facts.get("evidence_facts"), uid, owner_only=False)
+    problems += _guard_private_directory_problems(
+        "owned root", facts.get("root_facts"), uid, owner_only=True)
+    scratch_path = scratch.get("path") if isinstance(scratch, dict) else None
+    owned_root = guard_owned_root(scratch_path)
+    if not owned_root:
+        problems.append("the scratch directory does not name a guarded owned root")
+    else:
+        if os.path.dirname(owned_root) != root_parent:
+            problems.append(f"the owned root {owned_root} is not directly under "
+                            f"the verified scratch parent {root_parent}")
+    evidence = facts.get("evidence_facts")
+    evidence_path = evidence.get("path") if isinstance(evidence, dict) else None
+    if not evidence_path:
+        problems.append("the evidence directory is absent")
+    else:
+        if owned_root and evidence_path == owned_root:
+            problems.append("the evidence directory names the owned root itself")
+        scratch_real = scratch.get("realpath") or ""
+        if owned_root and scratch_real \
+                and os.path.normpath(evidence_path) == os.path.normpath(scratch_real):
+            problems.append("the evidence directory aliases the scratch directory")
     if facts.get("volume_uuid") != ROUTE_UUID:
         problems.append(
-            f"the scratch root's volume is {facts.get('volume_uuid')}, "
+            f"the scratch volume is {facts.get('volume_uuid')}, "
             f"not the verified private Stash {ROUTE_UUID}"
         )
-    if scratch.get("uid") is not None and facts.get("uid") is not None \
-            and scratch.get("uid") != facts.get("uid"):
-        problems.append("the guard scratch is not owned by this account")
-    if isinstance(scratch.get("mode"), int) and scratch["mode"] & 0o077:
-        problems.append(f"the guard scratch mode {scratch['mode']!r} is not owner-only")
-    root_real = root.get("realpath") or ""
-    evidence_real = evidence.get("realpath") or ""
-    scratch_real = scratch.get("realpath") or ""
-    if facts.get("within_designated") is False:
-        problems.append(
-            f"the scratch root {scratch.get('path')!r} is not inside the designated "
-            f"barge scratch {DESIGNATED_SCRATCH}"
-        )
-    if facts.get("evidence_within") is False:
-        problems.append(f"the evidence directory {evidence.get('path')!r} is outside "
-                        f"the guard's owned root {root_real!r}")
-    if evidence.get("present") is not True or evidence.get("isdir") is not True:
-        problems.append(f"OXIDE_PROOF_EVIDENCE {evidence.get('path')!r} is absent "
-                        "or not a directory")
-    elif not root_real or not evidence_real.startswith(root_real + os.sep):
-        problems.append(f"the evidence directory {evidence.get('path')!r} is outside "
-                        f"the guard's owned root {root_real!r}")
-    if root_real and scratch_real and evidence_real == scratch_real:
-        problems.append("the evidence directory aliases the scratch directory")
     return problems
 
 
@@ -645,6 +685,11 @@ def run_cases_inner(mode, run_root, effects, deadline_ns):
                 raise Fault("drift", "the staged binary changed after the stage")
         except Fault as error:
             fault = error
+        except subprocess.TimeoutExpired:
+            fault = Fault("stage",
+                          "the guard's wall expired while staging the proof build")
+        except OSError as error:
+            fault = Fault("stage", f"the stage build could not start: {error}")
 
     if fault is None:
         for case in CASES:
@@ -960,12 +1005,17 @@ class ControlHarness:
         self.wall_deadline_override = None
         self.scratch_volume_uuid = ROUTE_UUID
         self.scratch_owner_uid = os.getuid()
-        self.scratch_mode = 0o700
+        self.scratch_mode = 0o755
         self.scratch_canonical = True
         self.scratch_present = True
-        self.scratch_within = True
-        self.evidence_within = True
+        self.evidence_mode = 0o755
+        self.evidence_owner_uid = os.getuid()
+        self.evidence_canonical = True
         self.evidence_present = True
+        self.root_mode = 0o700
+        self.root_owner_uid = os.getuid()
+        self.root_canonical = True
+        self.root_present = True
         self.stage_fault = None
         self.case_results = {}
         self.identity_drift_after_capture = False
@@ -1032,33 +1082,38 @@ class ControlHarness:
                             self.write_file)
 
     def guard_facts(self, scratch, evidence):
-        """The scripted answers for the guard-supplied directories: presence,
-        kinds, owner, mode, volume and containment, as the controls set them."""
-        facts = {
+        """The scripted answers for the guard-supplied layout, in the
+        reference shape: the scratch and evidence facts (0755 by default, as
+        the pinned supervisor creates them), the owned root that parents the
+        scratch (0700 by default), the verified scratch parent, and the
+        scratch volume's UUID."""
+        guard_root = os.path.dirname(self.guard_scratch)
+        owned_root = os.path.dirname(scratch)
+
+        def directory_facts(path, mode, owner, canonical, present):
+            return {"path": path,
+                    "realpath": path if canonical else path + ".elsewhere",
+                    "present": present, "isdir": present, "islink": False,
+                    "uid": owner, "mode": mode}
+
+        return {
             "uid": os.getuid(),
             "volume_uuid": self.scratch_volume_uuid,
             "path": scratch,
-            "scratch_facts": {
-                "path": scratch,
-                "realpath": scratch if self.scratch_canonical else scratch + ".elsewhere",
-                "present": self.scratch_present,
-                "isdir": self.scratch_present,
-                "islink": False,
-                "uid": self.scratch_owner_uid,
-                "mode": self.scratch_mode,
-            },
-            "evidence_facts": {
-                "path": evidence,
-                "realpath": evidence if self.evidence_within else "/elsewhere/evidence",
-                "present": self.evidence_present,
-                "isdir": self.evidence_present,
-                "islink": False,
-            },
-            "root_facts": {"realpath": os.path.dirname(self.guard_scratch)},
-            "within_designated": self.scratch_within,
-            "evidence_within": self.evidence_within,
+            "root_parent": DESIGNATED_SCRATCH,
+            "scratch_facts": directory_facts(scratch, self.scratch_mode,
+                                             self.scratch_owner_uid,
+                                             self.scratch_canonical,
+                                             self.scratch_present),
+            "evidence_facts": directory_facts(evidence, self.evidence_mode,
+                                              self.evidence_owner_uid,
+                                              self.evidence_canonical,
+                                              self.evidence_present),
+            "root_facts": directory_facts(owned_root, self.root_mode,
+                                          self.root_owner_uid,
+                                          self.root_canonical,
+                                          self.root_present),
         }
-        return facts
 
     def monotonic_ns(self):
         if self.clock and len(self.clock) > 1:
@@ -1144,7 +1199,8 @@ def composition_controls():
     # preserved, and the inner really ran inside the guarded child.
     harness = control_harness()
     receipt_exit, outer_receipt = outer_half("counted", harness.outer_effects())
-    expect(receipt_exit == 0, "a clean counted pass did not exit zero")
+    expect(isinstance(receipt_exit, int) and receipt_exit == 0,
+           "a clean counted pass did not exit zero")
     expect(outer_receipt.get("qualified") is True,
            "the outer receipt did not qualify the clean pass")
     expect(harness.guarded_launches == 1, "the outer did not launch exactly one guard")
@@ -1205,7 +1261,7 @@ def composition_controls():
     refusal_cases = [
         ("foreign volume", {"scratch_volume_uuid": "1" * 8 + ROUTE_UUID[8:]}),
         ("foreign owner", {"scratch_owner_uid": os.getuid() + 1}),
-        ("open mode", {"scratch_mode": 0o755}),
+        ("group-writable mode", {"scratch_mode": 0o775}),
         ("non-canonical", {"scratch_canonical": False}),
         ("absent scratch", {"scratch_present": False}),
     ]
@@ -1218,12 +1274,49 @@ def composition_controls():
             stdout=json.dumps({"case": "J1", "status": "passed", "detail": "x"}) + "\n",
             stderr="")}
         exit_code, receipt = outer_half("counted", harness.outer_effects())
-        expect(exit_code != 0, f"the inner binding refusal ({name}) did not fail the run")
+        expect(isinstance(exit_code, int) and exit_code != 0,
+               f"the inner binding refusal ({name}) did not fail the run")
         inner = harness.inner_receipt or {}
         expect(inner.get("qualified_inner") is not True,
                f"the inner binding refusal ({name}) still qualified the inner")
         expect(harness.sequence.count("stage") == 0,
                f"the inner binding refusal ({name}) still staged")
+
+    # The actual guard layout passes: 0755 scratch and evidence over a 0700
+    # owned root is exactly what the pinned supervisor creates, and the
+    # ownership comparison — never the read bits — is the boundary.
+    harness = control_harness()
+    harness.scratch_mode = 0o755
+    harness.evidence_mode = 0o755
+    harness.root_mode = 0o700
+    layout_exit, _layout_receipt = outer_half("counted", harness.outer_effects())
+    expect(isinstance(layout_exit, int) and layout_exit == 0,
+           "the actual guard layout (0755/0700) did not qualify")
+    inner = harness.inner_receipt or {}
+    expect(inner.get("qualified_inner") is True,
+           "the actual guard layout did not qualify the inner")
+
+    # The owned root must be private 0700: 0755 there refuses, as the
+    # reference helper requires for the monitored root alone.
+    harness = control_harness()
+    harness.root_mode = 0o755
+    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
+    expect(exit_code != 0, "a non-private owned root did not fail the run")
+    inner = harness.inner_receipt or {}
+    expect(any("owned root" in refusal for refusal in inner.get("refused", [])),
+           "the owned-root refusal was not named")
+
+    # A foreign-owned owned root refuses too.
+    harness = control_harness()
+    harness.root_owner_uid = os.getuid() + 1
+    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
+    expect(exit_code != 0, "a foreign owned root did not fail the run")
+
+    # The owned root must be a direct child of the verified scratch parent.
+    harness = control_harness()
+    harness.guard_scratch = "/Volumes/Stash/scratch/barge/nested/deeper/scratch"
+    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
+    expect(exit_code != 0, "an off-parent owned root did not fail the run")
 
     # Missing guard-supplied scratch or evidence: not the guard's run.
     for name, strip in (("scratch", "OXIDE_TASK_SCRATCH_ROOT"),
@@ -1428,6 +1521,37 @@ def composition_controls():
     exit_code, receipt = outer_half("counted", harness.outer_effects())
     expect(exit_code != 0, "an unknown-case verdict did not fail the run")
 
+    # Stage executor exceptions: a remaining-capped stage timeout and a
+    # failed stage spawn both become bounded stage faults — the inner
+    # publishes its receipt and never crashes without evidence.
+    harness = control_harness()
+
+    def stage_timeout_expired(env, run_root, timeout):
+        raise subprocess.TimeoutExpired(["oxide", "build"], timeout)
+    harness.run_stage_child = stage_timeout_expired
+    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
+    expect(exit_code != 0, "a stage timeout did not fail the run")
+    inner = harness.inner_receipt or {}
+    expect(inner.get("fault", {}).get("kind") == "stage",
+           "the stage timeout was not recorded as a bounded stage fault")
+    expect("receipt_path" in inner,
+           "the stage timeout published no bounded receipt")
+    expect(not any(c.get("status") == "passed" for c in inner.get("cases", [])),
+           "a stage-timeout run still passed cases")
+
+    harness = control_harness()
+
+    def stage_spawn_oserror(env, run_root, timeout):
+        raise OSError("the injected stage spawn failure")
+    harness.run_stage_child = stage_spawn_oserror
+    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
+    expect(exit_code != 0, "a stage spawn failure did not fail the run")
+    inner = harness.inner_receipt or {}
+    expect(inner.get("fault", {}).get("kind") == "stage",
+           "the stage spawn failure was not recorded as a bounded stage fault")
+    expect("receipt_path" in inner,
+           "the stage spawn failure published no bounded receipt")
+
     # Report failure: an unwritable receipt unqualifies the inner.
     harness = control_harness()
     harness.fail_report_write = True
@@ -1620,13 +1744,18 @@ def plan_document():
                      "Stash route metadata, mints the wall deadline once, "
                      "launches one guarded child, and returns the actual guard "
                      "exit; it creates no fixture, stage root or receipt",
-            "inner": "guarded: validates the guard-supplied scratch/evidence "
-                     "containment, owner, mode and wall deadline, creates the "
-                     "fixture and stage roots inside the owned scratch, stages "
-                     "through the managed Oxide build, mints the manifest and "
-                     "compares it with the pre-stage identity, re-hashes the "
-                     "staged binary, runs the cases, and publishes the receipt "
-                     "into the guard evidence before any cleanup",
+            "inner": "guarded: validates the guard-supplied layout with the "
+                     "reference semantics (scratch and evidence canonical, "
+                     "un-symlinked, owned by this account, free of group/other "
+                     "write bits — the guard creates them 0755; the owned root "
+                     "that parents them private 0700 and a direct child of the "
+                     "verified scratch parent; the scratch volume the verified "
+                     "Stash UUID) plus the wall deadline, creates the fixture "
+                     "and stage roots inside the owned scratch, stages through "
+                     "the managed Oxide build, mints the manifest and compares "
+                     "it with the pre-stage identity, re-hashes the staged "
+                     "binary, runs the cases, and publishes the receipt into "
+                     "the guard evidence before any cleanup",
             "clock_domain": "time.monotonic_ns() in both halves; the wall "
                             "deadline is BARGE_PROOF_WALL_DEADLINE_NS, minted "
                             "once by the outer before the launch; the "
