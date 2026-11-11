@@ -1662,7 +1662,7 @@ pub enum OperationReplay {
     /// Barge-owned operation was retained as cancelled.
     Cancelled,
     /// The existing capture walk ran and reports its exact outcome.
-    Walked(DeleteReport),
+    Walked(Box<DeleteReport>),
     /// Replay kept the operation pending with its reason.
     Pending(String),
 }
@@ -2144,7 +2144,7 @@ fn replay_locked_operation(
     } else {
         intent
     };
-    Ok(OperationReplay::Walked(finish_deletion(
+    Ok(OperationReplay::Walked(Box::new(finish_deletion(
         &journal,
         dirs,
         volumes,
@@ -2154,7 +2154,7 @@ fn replay_locked_operation(
         &parent,
         bounds,
         &volume,
-    )))
+    ))))
 }
 
 /// One operation considered by a bounded drain.
@@ -3635,7 +3635,7 @@ enum CaptureBackend<'a> {
     Operation {
         dirs: &'a dyn DirOps,
         observer: &'a dyn ProcessObserver,
-        record: RefCell<crate::operation::OperationRecord>,
+        record: Box<RefCell<crate::operation::OperationRecord>>,
     },
 }
 
@@ -3739,7 +3739,7 @@ impl<'a> CaptureJournal<'a> {
             backend: CaptureBackend::Operation {
                 dirs,
                 observer,
-                record: RefCell::new(record.clone()),
+                record: Box::new(RefCell::new(record.clone())),
             },
         })
     }
@@ -7347,6 +7347,74 @@ mod tests {
             .expect("legacy read")
             .records
             .is_empty());
+    }
+
+    #[test]
+    fn checked_begin_handles_missing_gap_and_partial_allocation_without_effect() {
+        use crate::operation::{self, DeclarationAuthority, OperationPhase};
+        for scenario in ["missing", "gap", "tail"] {
+            let prepared = prepared("checked-begin-journal-integrity");
+            prepared.payload("payload", b"fixture");
+            let dirs = Faults::new();
+            let observer = prepared.fixture.observer();
+            let state = &prepared.fixture.state;
+            let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+            let mut request = operation_request(&prepared);
+            request.declaration = Some(DeclarationAuthority {
+                namespace: declared.namespace,
+                area: declared.area,
+                generation: declared.generation,
+                grant: prepared.unit.grant.clone(),
+            });
+            if scenario != "missing" {
+                let mut locks = LockSet::new(state.clone());
+                operation::init_operation_journal(&dirs, &observer, state, &mut locks)
+                    .expect("initialize");
+                if scenario == "tail" {
+                    operation::fail_next_watermark_publish(std::io::Error::other(
+                        "fixture watermark fault",
+                    ));
+                }
+                let begun = super::begin_checked_delegated(
+                    state,
+                    &dirs,
+                    &prepared.fixture.facts(),
+                    &observer,
+                    request.clone(),
+                    prepared.bounds(),
+                )
+                .expect("original begin");
+                assert_eq!(begun.record().phase, OperationPhase::Intent);
+                if scenario == "gap" {
+                    std::fs::remove_file(state.operations_dir().join("1.json"))
+                        .expect("fixture record loss");
+                } else {
+                    let retry = super::begin_checked_delegated(
+                        state,
+                        &dirs,
+                        &prepared.fixture.facts(),
+                        &observer,
+                        request.clone(),
+                        prepared.bounds(),
+                    )
+                    .expect("reconcile the confirmed tail");
+                    assert!(matches!(retry, operation::Begun::Already(_)));
+                }
+            }
+            if scenario != "tail" {
+                let error = super::begin_checked_delegated(
+                    state,
+                    &dirs,
+                    &prepared.fixture.facts(),
+                    &observer,
+                    request,
+                    prepared.bounds(),
+                )
+                .expect_err("missing or gapped journal refuses");
+                assert_eq!(error.kind(), ErrorKind::UnknownState);
+            }
+            assert!(prepared.unit_path().join("payload").exists());
+        }
     }
 
     #[test]

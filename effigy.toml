@@ -56,11 +56,13 @@ alias = "barge"
 "rust:test:operation-drain" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib drain_reports_missing_handlers_without_losing_the_owed_record"
 "rust:test:operation-authority" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib declaration_authority_keeps_original_generation_and_scope"
 "rust:test:operation-begin" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib checked_begin_proves_custody_without_starting_an_effect"
+"rust:test:operation-begin-integrity" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib checked_begin_handles_missing_gap_and_partial_allocation_without_effect"
 "rust:test:operation-execute" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib checked_execution_reaffirms_without_locks_and_deletes_through_one_journal"
 "rust:test:operation-withdrawal" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib checked_execution_refuses_authority_withdrawn_during_reaffirmation"
 "rust:test:operation-withdrawn-finalize" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib deleted_operation_still_owes_finalization_after_authority_withdrawal"
 "rust:test:operation-phase-faults" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib phase_faults_preserve_caller_intent_and_enable_post_capture_replay"
 "rust:test:operation-removed-evidence" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib recorded_removal_after_real_unlink_can_settle_on_replay"
+"rust:test:operation-proof-fault" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib proof_descriptor_fault_is_scoped_consumed_and_disarmed"
 "rust:test:operation-replay" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib checked_replay_resumes_capture_and_refuses_unproved_absence"
 "rust:test:operation-intent-recovery" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib interrupted_intent_requires_caller_reaffirmation_before_capture_recovery"
 "rust:test:operation-integrated-drain" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib checked_drain_replays_then_finalizes_without_a_second_journal"
@@ -163,6 +165,8 @@ alias = "barge"
 # effects, and the held bounds. No image, no scratch and no child process.
 "journal:native:test" = "python3 scripts/native/journal-proof.py --self-check"
 "journal:native:plan" = "python3 scripts/native/journal-proof.py --plan"
+"coordinator:native:test" = "python3 scripts/native/operation-coordinator-proof.py --self-check"
+"coordinator:native:plan" = "python3 scripts/native/operation-coordinator-proof.py --plan"
 
 # Targeted listing apparatus only; neither selector starts a native or stages.
 "listing:native:test" = "python3 scripts/native/descriptor-listing-proof.py --self-check"
@@ -228,6 +232,16 @@ run = "python3 scripts/native/journal-proof.py counted"
 [tasks."journal:native:diagnostic"]
 admission = "heavy"
 run = "python3 scripts/native/journal-proof.py diagnostic"
+
+# HELD: diagnostic, counted author and distinct reviewer native occurrences
+# each need prospective owner activation after exact-head source readiness.
+[tasks."coordinator:native"]
+admission = "heavy"
+run = "python3 scripts/native/operation-coordinator-proof.py counted"
+
+[tasks."coordinator:native:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/native/operation-coordinator-proof.py diagnostic"
 
 # HELD: each diagnostic/author/reviewer occurrence needs separate activation.
 # No image, no host census, no limit changes; one owned child's actual kernel

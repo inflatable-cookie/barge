@@ -231,6 +231,10 @@ guarded exception. Each selector covers what it names:
   diagnostic keeps going within custody and budget and is always
   `qualified: false` and nonzero. HELD for owner activation on the same terms
   as the release and outputs proofs.
+- `effigy coordinator:native:test` and `effigy coordinator:native:plan` —
+  effect-free preparation controls and the held case plan for the coordinator
+  proof. The [proof contract](docs/knowledge/contracts/operation-coordinator-proof.md)
+  records the remaining readiness gap. No image or native run is activated.
 
 RustQuality strict is active for the Rust source, manifests, tests and their
 documentation: `docs/knowledge/contracts/language-quality-activation.json` opts

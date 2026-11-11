@@ -1260,6 +1260,8 @@ deleted, owed record while returning all other pending operations. Hooks must
 make their own guarded settlement idempotent, including a lost acknowledgment.
 The original caller/key, digest, unit, absence, declaration, hook kind,
 version and payload are matched before any state or terminal answer.
+The separately held [coordinator proof preparation](operation-coordinator-proof.md)
+records the fixed fixture cases, source binding and remaining readiness gap.
 
 The persistence/integrity prerequisite of the split's first part is
 implemented in `crates/barge/src/operation.rs`. The checked effect paths

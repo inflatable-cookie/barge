@@ -32,7 +32,11 @@ fn main() -> ExitCode {
         eprintln!("a coordinator proof case is required");
         return ExitCode::from(2);
     };
-    let result = run_case(&case);
+    let result = if case == "__hold" {
+        hold_file()
+    } else {
+        run_case(&case)
+    };
     let verdict = match &result {
         Ok(()) => serde_json::json!({"case": case, "status": "passed"}),
         Err(reason) => serde_json::json!({"case": case, "status": "failed", "detail": reason}),
@@ -45,12 +49,62 @@ fn main() -> ExitCode {
     }
 }
 
+fn hold_file() -> Result<(), String> {
+    use barge::os::ProcessObserver as _;
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let platform = platform();
+    platform
+        .tool_cache_dir("oxide")
+        .map_err(|e| e.to_string())?;
+    let mount = std::env::var_os("BARGE_PROOF_VOLUME_MOUNT")
+        .map(PathBuf::from)
+        .ok_or("mount missing")?;
+    let raw = std::env::var_os("BARGE_PROOF_HOLDER_PATH")
+        .map(PathBuf::from)
+        .ok_or("holder path missing")?;
+    let path = std::fs::canonicalize(raw).map_err(|e| e.to_string())?;
+    let mount = std::fs::canonicalize(mount).map_err(|e| e.to_string())?;
+    if !path.starts_with(&mount) || path == mount {
+        return Err("holder path escapes image".to_owned());
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    let facts = file.metadata().map_err(|e| e.to_string())?;
+    let pid = std::process::id();
+    let start = platform
+        .process_start(pid)
+        .map_err(|e| e.to_string())?
+        .ok_or("holder start missing")?;
+    let uid = platform.effective_uid().map_err(|e| e.to_string())?;
+    println!(
+        "{}",
+        serde_json::json!({"stage":"holder-ready", "pid":pid, "start":start,
+        "uid":uid, "fd":file.as_raw_fd(), "device":facts.dev(), "inode":facts.ino()})
+    );
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| e.to_string())?;
+    if input.trim() != "release" {
+        return Err("holder release missing".to_owned());
+    }
+    drop(file);
+    Ok(())
+}
+
 struct Fixture {
     state: StatePaths,
     request: BeginRequest,
     root: PathBuf,
     declaration: area::AreaDeclaration,
     settlement: PathBuf,
+    binding: std::sync::Mutex<()>,
 }
 
 impl Fixture {
@@ -208,6 +262,7 @@ impl Fixture {
             root,
             declaration,
             settlement: home.join("synthetic-settlement.json"),
+            binding: std::sync::Mutex::new(()),
         })
     }
 
@@ -232,7 +287,7 @@ impl Fixture {
             &platform,
             &platform,
             &self.request,
-            &Reaffirm,
+            &Reaffirm(self),
             DeleteBounds::default(),
         )
         .map_err(|e| e.to_string())?;
@@ -265,9 +320,25 @@ impl Fixture {
     }
 }
 
-struct Reaffirm;
-impl OperationReaffirmation for Reaffirm {
-    fn reaffirm(&self, _: &OperationRecord) -> barge::error::Result<()> {
+struct Reaffirm<'a>(&'a Fixture);
+impl OperationReaffirmation for Reaffirm<'_> {
+    fn reaffirm(&self, record: &OperationRecord) -> barge::error::Result<()> {
+        let platform = platform();
+        let current = operation::checked_operation_state(
+            &platform,
+            &platform,
+            &self.0.state,
+            &self.0.request,
+        )?;
+        if current.as_ref() != Some(record)
+            || self.0.settlement.exists()
+            || record.finalize.as_ref().map(|spec| spec.payload.as_str()) != Some("{}")
+        {
+            return Err(barge::error::Error::new(
+                barge::error::ErrorKind::UnknownState,
+                "the synthetic caller's guarded verdict changed",
+            ));
+        }
         Ok(())
     }
 }
@@ -376,28 +447,24 @@ fn finalize_case(fixture: &Fixture, case: &str) -> Result<(), String> {
     }
     let guard = std::sync::Mutex::new(());
     let good = hook(fixture, &guard, "1", case == "lost-ack");
-    if case == "owed" {
-        if fixture.finalize(&[]).is_ok()
+    if case == "owed"
+        && (fixture.finalize(&[]).is_ok()
             || fixture
                 .finalize(&[&hook(fixture, &guard, "2", false)])
                 .is_ok()
             || fixture
                 .finalize(&[&hook(fixture, &guard, "1", true)])
                 .is_ok()
-            || fixture.record()?.phase != OperationPhase::Deleted
-        {
-            return Err(
-                "a missing, unsupported or failing hook lost the owed operation".to_owned(),
-            );
-        }
+            || fixture.record()?.phase != OperationPhase::Deleted)
+    {
+        return Err("a missing, unsupported or failing hook lost the owed operation".to_owned());
     }
-    if case == "lost-ack" {
-        if fixture.finalize(&[&good]).is_ok()
+    if case == "lost-ack"
+        && (fixture.finalize(&[&good]).is_ok()
             || !fixture.settlement.exists()
-            || fixture.record()?.phase != OperationPhase::Deleted
-        {
-            return Err("the lost reply did not preserve the owed operation".to_owned());
-        }
+            || fixture.record()?.phase != OperationPhase::Deleted)
+    {
+        return Err("the lost reply did not preserve the owed operation".to_owned());
     }
     let done = fixture.finalize(&[&good])?;
     if done.phase != OperationPhase::Complete || !fixture.settlement.exists() {
@@ -423,6 +490,7 @@ fn run_case(case: &str) -> Result<(), String> {
             | "concurrent"
             | "busy"
             | "held-writer"
+            | "unknown-writer"
             | "cancel"
             | "withdraw"
             | "mismatch"
@@ -435,6 +503,9 @@ fn run_case(case: &str) -> Result<(), String> {
         return Err(format!("case {case} is not yet implemented"));
     }
     let fixture = Fixture::prepare(case)?;
+    // The synthetic caller keeps its own binding barrier across begin,
+    // reaffirmation and effect; the hook has a separate publication guard.
+    let _binding = fixture.binding.lock().map_err(|e| e.to_string())?;
     match case {
         "positive" | "owed" | "lost-ack" => finalize_case(&fixture, case),
         "busy" => {
@@ -457,8 +528,13 @@ fn run_case(case: &str) -> Result<(), String> {
             Ok(())
         }
         "concurrent" => concurrent_case(&fixture),
-        "held-writer" => {
+        "held-writer" | "unknown-writer" => {
+            use barge::os::ProcessObserver as _;
             use std::io::Write as _;
+            use std::os::unix::fs::MetadataExt as _;
+            if case == "unknown-writer" {
+                fixture.begin()?;
+            }
             let payload = fixture.root.join("payload");
             println!(
                 "{}",
@@ -469,14 +545,87 @@ fn run_case(case: &str) -> Result<(), String> {
             std::io::stdin()
                 .read_line(&mut signal)
                 .map_err(|e| e.to_string())?;
-            if signal.trim() != "writer-open" {
-                return Err("the supervisor did not bind the writer".to_owned());
+            let info: serde_json::Value =
+                serde_json::from_str(&signal).map_err(|e| e.to_string())?;
+            let number = |name: &str| {
+                info.get(name)
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| format!("holder {name} is missing"))
+            };
+            let pid = u32::try_from(number("pid")?).map_err(|e| e.to_string())?;
+            let start = number("start")?;
+            let uid = u32::try_from(number("uid")?).map_err(|e| e.to_string())?;
+            let fd = i32::try_from(number("fd")?).map_err(|e| e.to_string())?;
+            let device = number("device")?;
+            let inode = number("inode")?;
+            let platform = platform();
+            let facts = std::fs::metadata(&payload).map_err(|e| e.to_string())?;
+            if uid != platform.effective_uid().map_err(|e| e.to_string())?
+                || platform.process_start(pid).map_err(|e| e.to_string())? != Some(start)
+                || facts.dev() != device
+                || facts.ino() != inode
+            {
+                return Err("the real holder identity or file binding changed".to_owned());
             }
-            let error = fixture.begin().expect_err("a real open writer must refuse");
-            if !error.contains("holds descriptor") || !payload.exists() {
-                return Err(format!(
-                    "the refusal did not identify the open writer: {error}"
-                ));
+            if case == "held-writer" {
+                let error = fixture.begin().expect_err("a real open writer must refuse");
+                if !error.contains(&format!("pid {pid} holds descriptor {fd} open"))
+                    || !payload.exists()
+                {
+                    return Err(format!(
+                        "the refusal did not identify the owned writer: {error}"
+                    ));
+                }
+            } else {
+                let process = barge::os::ProcessIdentity {
+                    pid,
+                    start,
+                    effective_uid: Some(uid),
+                };
+                let fault =
+                    barge::os::proof_fail_descriptor_query(process, fd, &payload, device, inode)
+                        .map_err(|e| e.to_string())?;
+                let error = delete::execute_checked_delegated(
+                    &fixture.state,
+                    &platform,
+                    &platform,
+                    &platform,
+                    &fixture.request,
+                    &Reaffirm(&fixture),
+                    DeleteBounds::default(),
+                )
+                .expect_err("the targeted unreadable query must refuse");
+                let record = fixture.record()?;
+                let capture = fixture.root.parent().ok_or("root parent missing")?.join(
+                    record
+                        .unit
+                        .capture_name
+                        .as_ref()
+                        .ok_or("capture name missing")?,
+                );
+                if !fault.consumed()
+                    || error.kind() != barge::error::ErrorKind::CustodyNotProven
+                    || !error.message().contains("scan is unreadable")
+                    || !error
+                        .message()
+                        .contains(&format!("descriptors of pid {pid} are unreadable"))
+                    || !payload.exists()
+                    || record.phase != OperationPhase::Intent
+                    || !record.captures.is_empty()
+                    || !record.foreign_captures.is_empty()
+                    || capture.exists()
+                    || fixture.settlement.exists()
+                {
+                    return Err(format!(
+                        "the labelled unknown was not consumed or preserved: {error}"
+                    ));
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({"case":case, "stage":"injection", "pid":pid,
+                    "start":start, "uid":uid, "fd":fd, "device":device, "inode":inode,
+                    "reader":"descriptor-path-eio", "consumed":true})
+                );
             }
             Ok(())
         }
@@ -522,7 +671,7 @@ fn run_case(case: &str) -> Result<(), String> {
                     &platform,
                     &platform,
                     &changed,
-                    &Reaffirm,
+                    &Reaffirm(&fixture),
                     DeleteBounds::default(),
                 )
                 .is_ok()
@@ -566,7 +715,7 @@ fn run_case(case: &str) -> Result<(), String> {
                 &platform,
                 &platform,
                 &fixture.request,
-                &Reaffirm,
+                &Reaffirm(&fixture),
                 DeleteBounds::default(),
             )
             .map_err(|e| e.to_string())?;
