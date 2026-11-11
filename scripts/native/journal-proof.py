@@ -65,6 +65,7 @@ import contextlib
 import gc
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -1072,16 +1073,18 @@ def bounded_receipt_line(receipt):
     """One bounded compact JSON line carrying the inner receipt: the guarded
     child's stdout handoff to the unguarded outer. A document that exceeds
     the bound falls back to a small honest refusal rather than an unparseable
-    or unbounded line."""
+    or unbounded one. Returns the line and whether the fallback fired — a
+    fallback means the handed-off document is not the real receipt, and the
+    caller must exit nonzero."""
     line = json.dumps(receipt, separators=(",", ":"))
     if len(line) <= RECEIPT_LINE_BOUND:
-        return line
+        return line, False
     bounded = {"schema": SCHEMA, "stage": "inner",
                "mode": receipt.get("mode"), "qualified_inner": False,
                "fault": {"kind": "receipt",
                          "detail": "the inner receipt exceeded the bounded "
                                    "stdout line"}}
-    return json.dumps(bounded, separators=(",", ":"))
+    return json.dumps(bounded, separators=(",", ":")), True
 
 
 def run_inner(arguments):
@@ -1092,8 +1095,9 @@ def run_inner(arguments):
     zero only for a clean counted pass."""
     effects = InnerEffects.from_environment()
     receipt = inner_half(arguments.inner, effects)
-    line = bounded_receipt_line(receipt)
-    clean = (arguments.inner == "counted" and receipt.get("qualified_inner")
+    line, fell_back = bounded_receipt_line(receipt)
+    clean = (not fell_back and arguments.inner == "counted"
+             and receipt.get("qualified_inner")
              and not receipt.get("refused") and not receipt.get("fault"))
     return (0 if clean else 1), line
 
@@ -2155,11 +2159,12 @@ def composition_controls():
     expect(inner.get("qualified_inner") is not True,
            "a failed receipt write still qualified the inner")
 
-    # The guarded runner's stdout handoff: the real `run_inner` entry (the
-    # exact function `--inner` invokes) returns one bounded JSON receipt line
-    # beside its exit code — on a clean counted pass, on a guarded fault,
-    # on a publication failure and in diagnostic mode — because the
-    # unguarded outer parses exactly this channel.
+    # The guarded runner's stdout handoff, through the ACTUAL main dispatch:
+    # `main(["--inner", ...])` must print exactly one bounded JSON receipt
+    # line on stdout and return the matching exit code — for a clean counted
+    # pass, an oversized receipt (fallback forces nonzero), a guarded fault,
+    # a publication failure and diagnostic mode — because the unguarded
+    # outer parses exactly this channel.
     def handoff_harness():
         harness = control_harness()
         harness.env.update({
@@ -2169,33 +2174,56 @@ def composition_controls():
         })
         return harness
 
+    def main_stdout(harness, arguments):
+        buffer = io.StringIO()
+        with harness.real_factory(), contextlib.redirect_stdout(buffer):
+            code = main(list(arguments))
+        printed = buffer.getvalue()
+        return code, printed
+
     harness = handoff_harness()
     try:
-        with harness.real_factory():
-            code, line = run_inner(argument_parser().parse_args(["--inner", "counted"]))
-        expect(code == 0, "a clean counted inner did not exit zero")
-        expect("\n" not in line, "the receipt handoff is not one line")
-        document = json.loads(line)
+        code, printed = main_stdout(harness, ["--inner", "counted"])
+        expect(code == 0, "a clean counted main did not exit zero")
+        expect(printed.count("\n") == 1 and printed.endswith("\n"),
+               "the receipt handoff is not exactly one line")
+        document = json.loads(printed)
         expect(document.get("qualified_inner") is True,
                "the handed-off receipt does not qualify the clean pass")
         expect(document.get("stage") == "inner"
                and len(document.get("cases", [])) == len(CASES),
                "the handed-off receipt does not carry the twelve groups")
-        expect(len(line) <= RECEIPT_LINE_BOUND, "the receipt line is not bounded")
-        oversized = {"cases": [{"detail": "x" * (RECEIPT_LINE_BOUND + 1)}]}
-        fallback = bounded_receipt_line(oversized)
-        expect("\n" not in fallback and "bounded" in fallback,
-               "the oversized receipt did not fall back to the bounded line")
+        expect(len(printed) <= RECEIPT_LINE_BOUND, "the receipt line is not bounded")
+    finally:
+        harness.cleanup()
+
+    harness = handoff_harness()
+    harness.case_results = {
+        case["id"]: types.SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"case": case["id"], "status": "passed",
+                               "detail": "x" * 8000, "injections": []}) + "\n",
+            stderr="")
+        for case in CASES
+    }
+    try:
+        code, printed = main_stdout(harness, ["--inner", "counted"])
+        expect(code == 1,
+               "an oversized counted receipt did not force a nonzero exit")
+        expect(printed.count("\n") == 1, "the oversized handoff is not one line")
+        document = json.loads(printed)
+        expect(document.get("fault", {}).get("kind") == "receipt"
+               and document.get("qualified_inner") is not True,
+               "the oversized handoff does not carry the bounded receipt fault")
     finally:
         harness.cleanup()
 
     harness = handoff_harness()
     harness.stage_fault = ("stage", "the injected handoff fault")
     try:
-        with harness.real_factory():
-            code, line = run_inner(argument_parser().parse_args(["--inner", "counted"]))
+        code, printed = main_stdout(harness, ["--inner", "counted"])
         expect(code == 1, "a faulted inner did not exit nonzero")
-        document = json.loads(line)
+        document = json.loads(printed)
         expect(document.get("fault", {}).get("kind") == "stage",
                "the faulted handoff does not carry the guarded fault")
         expect(all_cases_unexecuted(document),
@@ -2206,10 +2234,9 @@ def composition_controls():
     harness = handoff_harness()
     harness.fail_report_write = True
     try:
-        with harness.real_factory():
-            code, line = run_inner(argument_parser().parse_args(["--inner", "counted"]))
+        code, printed = main_stdout(harness, ["--inner", "counted"])
         expect(code == 1, "a publication failure did not exit nonzero")
-        document = json.loads(line)
+        document = json.loads(printed)
         expect(bool(document.get("receipt_write_fault")),
                "the publication failure is not recorded in the handed-off receipt")
         expect(document.get("qualified_inner") is not True,
@@ -2219,10 +2246,9 @@ def composition_controls():
 
     harness = handoff_harness()
     try:
-        with harness.real_factory():
-            code, line = run_inner(argument_parser().parse_args(["--inner", "diagnostic"]))
+        code, printed = main_stdout(harness, ["--inner", "diagnostic"])
         expect(code == 1, "the diagnostic inner did not stay nonzero")
-        document = json.loads(line)
+        document = json.loads(printed)
         expect(document.get("mode") == "diagnostic"
                and len(document.get("cases", [])) == len(CASES),
                "the diagnostic handoff does not carry its mode and groups")

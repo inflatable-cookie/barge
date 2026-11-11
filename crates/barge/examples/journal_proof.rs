@@ -43,7 +43,8 @@ use barge::operation::{
 use barge::os::{platform, VolumeUuid};
 use barge::state::{
     now_ms, publish_intent, read_intents, CaptureRecord, CaptureVerdict, ForeignCapture,
-    IntentPhase, IntentRecord, IntentUnit, LockSet, PutBackOutcome, StatePaths, QUARANTINE_PREFIX,
+    IntentPhase, IntentRecord, IntentUnit, LockSet, PutBackOutcome, StatePaths, CAPTURE_PREFIX,
+    QUARANTINE_PREFIX,
 };
 
 const UUID: &str = "a6ac3ed7-33ea-46b4-8082-7254cf291ed2";
@@ -798,7 +799,11 @@ fn capture_evidence(injections: &mut Vec<&'static str>) -> Result<String, String
     let record = begun.record().clone();
     let write = write_token(&f)?;
     let capture = CaptureRecord {
-        private: format!("{QUARANTINE_PREFIX}{}", "c".repeat(32)),
+        // A child capture names a private `.barge-del-<nonce>` leaf: the
+        // CAPTURE_PREFIX plus a 32-hex-digit nonce, exactly what the capture
+        // validator accepts. (The unit's capture_name keeps QUARANTINE_PREFIX:
+        // the journal records the intent's own quarantine leaf there.)
+        private: format!("{CAPTURE_PREFIX}{}", "c".repeat(32)),
         original: "child.txt".to_owned(),
         device: record.unit.device,
         inode: 77,
