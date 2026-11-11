@@ -183,7 +183,7 @@ def stage_driver(parent, owned, deadline_ns, attempt=None, binding=source_bindin
         before = binding()
         attempt["source_before"] = before
         logs = tempfile.mkdtemp(prefix="listing-stage-logs-", dir=parent)
-        executor = StageExecutor(logs, deadline_ns, attempt)
+        executor = StageExecutor(logs, deadline_ns)
         manifest, resources = base.stage_proof_binary(
             parent, owned, deadline_ns=stage_deadline(deadline_ns), runner=executor.run
         )
@@ -282,10 +282,9 @@ class ProducerSet(set):
 
 class StageExecutor:
     """Adapt Images.run to the stage helper's runner interface, without spawning a new scope."""
-    def __init__(self, logs, deadline_ns, attempt):
+    def __init__(self, logs, deadline_ns):
         self.logs = logs
         self.deadline_ns = deadline_ns
-        self.attempt = attempt
         self.record = {"started": False, "pid": None, "returncode": None,
                        "reaped": None, "scope": "Unknown", "custody_known": False,
                        "stdout": None, "stderr": None}
@@ -1232,7 +1231,7 @@ def stage_controls(check, problems):
     artifact = os.path.join(parent, "synthetic-artifact")
     Path(artifact).write_bytes(b"inert stage control, never executed\n")
     for fault in (None, "timeout", "nonzero", "wrong_artifact", "wrong_features", "duplicate_artifact",
-                  "source_drift", "bad_manifest", "unreaped", "foreign_scope", "spawn",
+                  "source_drift", "dirty_source", "bad_manifest", "unreaped", "foreign_scope", "unreadable_scope", "spawn",
                   "overflow", "late", "no_time"):
         root = tempfile.mkdtemp(prefix="case-", dir=parent)
         clock = [100_000_000_000]
@@ -1241,7 +1240,7 @@ def stage_controls(check, problems):
             check(command[:3] == ["git", "-C", REPO_ROOT], "stage invoked an unexpected external command")
             answer = {("rev-parse", "HEAD"): ("c" if drift[0] else "a") * 40,
                       ("rev-parse", "HEAD^{tree}"): "b" * 40,
-                      ("status", "--porcelain"): ""}[tuple(command[3:])]
+                      ("status", "--porcelain"): " M Cargo.lock" if fault == "dirty_source" else ""}[tuple(command[3:])]
             return subprocess.CompletedProcess(command, 0, answer + "\n", "")
         row = {"reason": "compiler-artifact", "target": {"name": DRIVER, "kind": ["example"]},
                "features": [FEATURE], "executable": artifact}
@@ -1288,7 +1287,9 @@ def stage_controls(check, problems):
         with mock.patch.object(subprocess, "run", side_effect=fake_git), \
                 mock.patch.object(subprocess, "Popen", side_effect=spawn) as popen, \
                 mock.patch.object(os, "getpgrp", return_value=5), \
-                mock.patch.object(os, "getpgid", return_value=6 if fault == "foreign_scope" else 5), \
+                mock.patch.object(os, "getpgid", return_value=6 if fault == "foreign_scope" else 5,
+                                  side_effect=OSError("synthetic unreadable producer scope")
+                                  if fault == "unreadable_scope" else None), \
                 mock.patch.object(os, "getsid", return_value=5), \
                 mock.patch.object(time, "clock_gettime_ns", side_effect=lambda *_: clock[0]), \
                 mock.patch("builtins.open", side_effect=files):
@@ -1305,16 +1306,17 @@ def stage_controls(check, problems):
         else:
             check(failure is not None and attempt["status"] == "failed", f"stage accepted injected {fault}")
         producer = attempt["producer"]
-        if fault == "no_time":
-            check(popen.call_count == 0 and producer is None, "exhausted stage budget spawned a producer")
+        if fault in ("no_time", "dirty_source"):
+            check(popen.call_count == 0 and producer is None,
+                  "exhausted budget or dirty source spawned a producer")
             continue
         check(attempt["source_before"]["toolchain"] == "1.97.1"
               and len(attempt["source_before"]["lock_sha256"]) == 64,
               "failed stage lost partial tool/source/lock provenance")
         check(producer is not None and producer["custody_known"] is
-              (fault not in ("timeout", "unreaped", "foreign_scope", "spawn")),
+              (fault not in ("timeout", "unreaped", "foreign_scope", "unreadable_scope", "spawn")),
               f"stage producer custody was fabricated or erased for {fault}")
-        if fault in ("timeout", "foreign_scope", "unreaped"):
+        if fault in ("timeout", "foreign_scope", "unreadable_scope", "unreaped"):
             check(producer["unreaped_pids"] == ([42] if fault != "unreaped" else [])
                   and producer["returncode"] is None and producer["reaped"] is not True,
                   "Unknown producer was turned into a reaped CompletedProcess")
