@@ -1262,8 +1262,8 @@ The original caller/key, digest, unit, absence, declaration, hook kind,
 version and payload are matched before any state or terminal answer.
 
 The persistence/integrity prerequisite of the split's first part is
-implemented in `crates/barge/src/operation.rs`, with no caller connected and
-no effect behind it:
+implemented in `crates/barge/src/operation.rs`. The checked effect paths
+described above are in progress; no Oxide caller has been connected:
 
 - **Formats, bound by this implementation:** records are `barge.operation/1`,
   the epoch document is `barge.journal/1`, the external identity binding is

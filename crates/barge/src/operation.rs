@@ -3970,6 +3970,100 @@ mod tests {
     }
 
     #[test]
+    fn caller_projects_exact_pairs_and_refuses_unknown_payloads_from_complete_view() {
+        // This deliberately small caller owns its payload format. The store
+        // merely returns opaque records; an actual caller must enforce its own
+        // domain-specific binding and unknown-version policy.
+        fn conflict(records: &[OperationRecord], checkout: &str, root: &str) -> Option<bool> {
+            for record in records {
+                let spec = record.finalize.as_ref()?;
+                if record.caller.as_deref() != Some("synthetic")
+                    || spec.kind != "synthetic.settle"
+                    || spec.version != "1"
+                {
+                    return None;
+                }
+                let value: serde_json::Value = serde_json::from_str(&spec.payload).ok()?;
+                let observed_checkout = value.get("checkout")?.as_str()?;
+                let observed_root = value.get("root")?.as_str()?;
+                if observed_root != record.unit.name {
+                    return None;
+                }
+                if observed_checkout == checkout && observed_root == root {
+                    return Some(true);
+                }
+            }
+            Some(false)
+        }
+
+        let (_dir, state, uuid) = fixture("operation-synthetic-projection");
+        init(&state);
+        let mut first = delegated_request(&uuid);
+        first.caller = Some("synthetic".to_owned());
+        first.finalize = Some(FinalizeSpec {
+            kind: "synthetic.settle".to_owned(),
+            version: "1".to_owned(),
+            payload: format!(
+                r#"{{"checkout":"checkout-a","root":"{}"}}"#,
+                first.unit.name
+            ),
+        });
+        let root = first.unit.name.clone();
+        begin(&platform(), &state, first.clone());
+        let mut locks = LockSet::new(state.clone());
+        let view = consult_operations(&platform(), &platform(), &state, &mut locks, INTENT_ROWS)
+            .expect("complete view")
+            .expect("initialized");
+        let records: Vec<_> = view.nonterminal().cloned().collect();
+        assert_eq!(conflict(&records, "checkout-a", &root), Some(true));
+        assert_eq!(conflict(&records, "checkout-b", &root), Some(false));
+        assert_eq!(
+            conflict(&records, "checkout-a", "another-root"),
+            Some(false)
+        );
+        assert!(
+            !records.is_empty(),
+            "compaction refuses any pending operation"
+        );
+
+        let (_other_dir, other_state, _) = fixture("operation-malformed-projection");
+        init(&other_state);
+        let mut malformed = first.clone();
+        malformed.key = Some("malformed".to_owned());
+        malformed.request_digest = Some("c".repeat(64));
+        malformed.unit.name = format!("{:032x}", 8);
+        malformed.unit.inode += 2;
+        malformed.finalize.as_mut().expect("hook").payload = "{".to_owned();
+        begin(&platform(), &other_state, malformed);
+        let mut locks = LockSet::new(other_state.clone());
+        let view = consult_operations(
+            &platform(),
+            &platform(),
+            &other_state,
+            &mut locks,
+            INTENT_ROWS,
+        )
+        .expect("complete view")
+        .expect("initialized");
+        let records: Vec<_> = view.nonterminal().cloned().collect();
+        assert_eq!(conflict(&records, "checkout-b", "another-root"), None);
+
+        let mut unknown = first;
+        unknown.key = Some("unknown".to_owned());
+        unknown.request_digest = Some("b".repeat(64));
+        unknown.unit.name = format!("{:032x}", 9);
+        unknown.unit.inode += 1;
+        unknown.finalize.as_mut().expect("hook").version = "2".to_owned();
+        begin(&platform(), &state, unknown);
+        let mut locks = LockSet::new(state.clone());
+        let view = consult_operations(&platform(), &platform(), &state, &mut locks, INTENT_ROWS)
+            .expect("complete view")
+            .expect("initialized");
+        let records: Vec<_> = view.nonterminal().cloned().collect();
+        assert_eq!(conflict(&records, "checkout-b", "another-root"), None);
+    }
+
+    #[test]
     fn checked_dispatch_reenters_without_a_lock_and_preserves_other_conflicts() {
         struct Hook<'a> {
             state: &'a StatePaths,
@@ -4062,6 +4156,28 @@ mod tests {
         };
         stale.record.generation += 1;
         assert!(consult_settlement(&platform(), &platform(), &state, &stale).is_err());
+        let mut forged = FinalizationContext {
+            identity: context.identity.clone(),
+            record: context.record.clone(),
+        };
+        forged
+            .record
+            .finalize
+            .as_mut()
+            .expect("handler")
+            .payload
+            .push(' ');
+        assert!(consult_settlement(&platform(), &platform(), &state, &forged).is_err());
+        let (_foreign_dir, foreign_state, _) = fixture("operation-foreign-settlement");
+        init(&foreign_state);
+        assert!(consult_settlement(&platform(), &platform(), &foreign_state, &context).is_err());
+        {
+            let mut holder = LockSet::new(state.clone());
+            let _lock = holder.lock_operations().expect("exclusive journal custody");
+            let error = consult_settlement(&platform(), &platform(), &state, &context)
+                .expect_err("a guarded settlement must not wait on a busy journal");
+            assert_eq!(error.kind(), ErrorKind::Locked);
+        }
         let completed = finalize_operation(
             &platform(),
             &platform(),
