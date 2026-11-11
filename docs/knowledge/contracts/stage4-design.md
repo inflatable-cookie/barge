@@ -1238,22 +1238,32 @@ acquiring or waiting for any Barge lock. `LockSet` order is registry → volume
 | Barge-alone replay | Barge shared → exclusive volume lock; takes no Oxide lock |
 | drain | Barge shared observation read → dispatch with zero locks → Barge locks for the ack; the handler inside holds guard(admission) only |
 
-**Every shared registry writer is covered by the handoff.** The rows are
-keyed `(checkout_id, root)` — `complete_intent` filters exactly that pair
-(`prune.rs:7385`) and `recheck` selects rows the same way
-(`prune_barge.rs:354`) — so a writer that could touch this group's rows acts
-for this checkout, and every such command serializes on the clean barrier
-or the binding lock the prune already holds across begin, re-affirmation and
-effect: `adopt` waits on the clean barrier, `bind_for_command` and `reserve`
-wait on the binding, a second prune takes both. A writer for another checkout
-writes rows keyed to its own `(checkout_id, root)` and cannot create or
-change a row in this group; it can only advance the registry revision, which
-the re-affirmation observes (unrelated advance → the guarded eligibility
-re-runs; a reference to this root → pre-effect cancellation). The handler's
-in-guard fresh re-verification at each write catches anything that changed
-regardless of writer. The consult-to-publication race a paused writer could
-create is therefore closed by the same serialization the writer must already
-pass through, not by the consult alone.
+**Every shared registry writer consults the journal inside its own guarded
+publication (named decision; PROPOSED).** A writer-scope proof alone cannot
+close the handoff: `recheck` itself rejects another checkout's live reference
+to the same root (`prune_barge.rs:388`–`:392`, "another checkout references
+this root"), so cross-checkout live rows referencing this root path can
+exist, and per-checkout locks (`begin_clean`, `store.rs:3575`; `lock_binding`,
+`:3439`) do not serialize writers of different checkouts with the prune. The
+closing rule: **every registry publication consults the journal, fail-fast,
+inside the publication guard it already holds** — the guarded write refuses
+if a pending operation record binds any `(checkout_id, root)` among the rows
+or live root references it is about to write. The consult read uses a
+non-blocking shared observation mode (`try-shared`, PROPOSED): if the lock
+cannot be taken immediately the consult answers `Unknown` and the writer
+refuses publication — a try-lock never waits, so no Oxide admission lock ever
+waits on a Barge lock, preserving the no-admission-wait rule exactly. The
+publication sites are enumerated: `adopt`, `bind_for_command`, `reserve`,
+the local prune's intent publication, the settlement revisions, and
+compaction; each adds one fail-fast consult (a read, not a write — priced in
+the accounting). With this, the handoff closes for every writer: a writer
+that consulted before the prune's begin and publishes after it still
+consults inside its own guard, where the now-existing pending record refuses
+it; a writer that published first is seen by the prune's re-affirmation
+(unrelated advance → eligibility re-runs; a reference to this root →
+pre-effect cancellation to the retained `cancelled` phase); and the
+handler's in-guard fresh re-verification at each settlement write catches
+anything that changed regardless of writer.
 
 Rules, proven by the table: (R1) every cross-lock direction is caller → Barge;
 (R2) no Oxide admission lock is ever held while acquiring or waiting for any
@@ -1284,6 +1294,13 @@ acknowledged, never settled (stage 1 design, "Durable custody of captured
 objects"). **No numbered record is ever removed**: cancellation, like
 settlement, is a retained terminal transition, so an authorized cancellation
 can never masquerade as a lost record (the gapless rule below stays exact).
+This is a stated PROPOSED change to stage 1's shipped rule — "A rolled-back
+`intent` phase is the one record removed" — which exists to keep the shipped
+journal clean; the successor major retains the record instead because the
+gapless inventory requires numbered records to persist. Stage 1's shipped
+behavior is unchanged until implementation briefs adopt this, and the owning
+design carries both statements without contradiction by marking this one
+PROPOSED.
 The consult excludes conflicting work for non-terminal phases only
 (`intent`/`renamed`/`marker_last`/`removed`/`deleted`); `cancelled` and
 `complete` bind nothing, and a fresh attempt uses a fresh caller key. Each
@@ -1320,11 +1337,12 @@ guard**. It calls `begin` (no Oxide lock held), then re-takes the guard for a
 bounded **re-affirmation**: the live revision equals the record's → proceed;
 it advanced → the full guarded eligibility re-runs — still eligible → the
 record's bound revision updates under Barge locks and the effect runs; the
-root became referenced or selected → pre-effect cancellation (the one
-removal) and refusal. Every registry writer holds the same guard, so any
-interleave between verdict and effect is observed at the re-affirmation;
-changes after it are excluded by the pending record and the in-lock consults,
-as today's pending intent and `pruning` flag exclude them. Effects are
+root became referenced or selected → pre-effect cancellation (the retained
+`cancelled` transition) and refusal. Every registry writer holds the same
+guard, so any interleave between verdict and the re-affirmation is observed
+there; changes after it are excluded by the pending record and the
+writer-side in-guard consults every publication performs, as today's pending
+intent and `pruning` flag exclude them. Effects are
 strictly ordered after the record's durable publication, so a world without a
 record is the pre-effect world: nothing happened, no exclusion owed, a fresh
 prune may begin again under a new key. A begin whose publish cannot confirm
@@ -1444,16 +1462,24 @@ makes an over-full journal `Unknown`, never a prune.
 
 ### The finalization transaction
 
-The payload carries: original identity and preview, grant generation, caller
-key, checkout id and receipt path, group rows as `{member, generation, nonce,
-root_ino, marker_digest}` (at most six; larger groups refuse at begin and are
-not covered), the fixed `terminal_ms`, and the begin-bound registry revision.
-Those are `recheck`'s own comparison facts (`prune_barge.rs:336`: per-row
-flags, nonce, generation, inode, marker, checkout, receipt — and rejection of
-another live root reference), so the handler reproduces the shipped
-verification exactly. Every write happens inside guard(admission) with a
-completely fresh registry and receipt read; nothing observed outside the
-guard authorizes a write:
+The payload carries: original identity and preview (including `root_kind`
+and `volume_uuid`), grant generation, caller key, checkout id and path,
+receipt path, group rows as `{member, generation, nonce, root_ino,
+marker_digest}` (at most six; larger groups refuse at begin and are not
+covered), the receipt's digest at begin (`prior_receipt_sha`), the fixed
+`terminal_ms`, and the begin-bound registry revision. The handler's guarded
+verification reproduces `recheck`'s own comparison set (`prune_barge.rs:358`–
+`:392`) exactly, with one justified exclusion: per-row `selected`, `pending`,
+`reservation`, `cancelling` and `pruning` flags, `nonce`, `generation`,
+`root_ino`, `marker_digest`, and the row's `checkout` and `receipt` paths
+compared to the record's identity — while `root_dev` is the one excluded
+fact, because it is the remount observation this design never binds (the
+shipped `replay_unit` rule), and a handler that compared it would refuse
+every resume after a remount. `recheck`'s cross-checkout scan is reproduced
+too: any **live row of another checkout referencing this root** refuses and
+stays owed (`prune_barge.rs:388`–`:392`). Every write happens inside
+guard(admission) with a completely fresh registry and receipt read; nothing
+observed outside the guard authorizes a write:
 
 1. Guard; read the registry completely, fresh; unknown stays owed.
 2. **Verify the complete group as an exact set**: the rows matching
@@ -1467,13 +1493,21 @@ guard authorizes a write:
    authorizes a whole-group transition. **All absent** → settlement only if
    this operation's settlement entry is present (step 5); otherwise anomalous
    → `Unknown`, stay owed — absent rows alone never prove this handler
-   removed them. Rows of a recreated root at the same path carry a different
+   removed them, and the bound revision refines the diagnosis only: a fresh
+   revision equal to the begin-bound one means the group never existed after
+   begin (anomalous); a greater revision means a concurrent actor may have
+   removed them; both stay owed. Rows of a recreated root at the same path carry a different
    nonce and make the set inexact: `Unknown`, never matched, marked or
    removed.
-3. **Receipt, read-only, under the same guard**: if the receipt is pruning or
-   its current selection places this root → refuse, stay owed (the covered
-   begin required it not to place the root; "a released root is history in its
-   receipt", `prune.rs:7527`). Otherwise the released-root receipt step is a
+3. **Receipt, read-only, under the same guard**, mirroring `recheck`'s
+   preimage rule: hash the live receipt; if it differs from the payload's
+   `prior_receipt_sha`, the receipt changed since begin — refuse and stay
+   owed, exactly `recheck`'s "the original receipt changed before Barge
+   settled" (`prune_barge.rs:393`–`:396`); if the receipt is pruning or its
+   current selection places this root → refuse, stay owed (the covered begin
+   required it not to place the root; "a released root is history in its
+   receipt", `prune.rs:7527`) — the handler never rewrites a receipt a
+   current selection owns. Otherwise the released-root receipt step is a
    no-op — the handler deliberately does not reuse `publish_terminal_receipt`,
    whose commitment lives in the intent this design removes.
 4. **Terminal marking revision** (guard held): clear
@@ -1515,7 +1549,7 @@ because the settlement fact cannot lag the removal it authorizes.
 | capture rename → `removed` not yet durable | record at `marker_last`, the leaf's capture recorded; the recorded private name gone reads `Unknown` | pending, exactly as shipped; never acknowledged |
 | Barge's unlink done, `removed` durable | positive evidence in the record | the next drain dispatches; the handler settles; ack recorded |
 | pre-effect cancellation decided | record transitions to `cancelled`, retained | non-binding; a fresh attempt uses a fresh key; the gapless inventory is unchanged |
-| rows removed, settlement entry durable, ack lost | re-dispatch: absent members + settlement entry → ack |
+| rows removed, settlement entry durable, ack lost | registry settled, record still owed | re-dispatch: absent members + settlement entry → ack |
 | handler unregistered / version mismatch | owed, intelligibly named | pending with caller, key, kind, version; never guessed, never executed unloaded |
 | sequence gap / binding or epoch broken | `Unknown`, never "no operation" | delegated refusal until operator resolution |
 | volume absent | pending; the consult refuses | attach; nothing inferred |
@@ -1559,9 +1593,11 @@ integrity inventory. **Coordination writes per covered operation**
 = **nine**; after — six Barge records (`intent`, `renamed`, `marker_last`,
 `removed`, `deleted`, `complete`), the handler's marking revision, the
 removal revision **with its atomic settlement entry**, and the begin's
-watermark advance = **nine**. Writes are flat: the watermark advance and the
-settlement entry are the priced machinery of proven loss detection and a safe
-repeated ack, and they replace nothing. Retention is the other counted cost:
+watermark advance = **nine**. Writes are flat on the clean path: the
+watermark advance and the settlement entry are the priced machinery of
+proven loss detection and a safe repeated ack, and they replace nothing; the
+re-affirmation's revision update is one **conditional** write, taken only on
+the advanced-revision path, counted here. Retention is the other counted cost:
 numbered records are never removed, so `cancelled` records accumulate like
 settled ones, and the registry's `settled` set is bounded — a full cap
 refuses, never evicts. **Phase states:** eleven across two stores (six Oxide,
@@ -1588,7 +1624,8 @@ shaping counterexample: a journal cannot detect the loss of an individual
 record from its content alone, nor the recreation of its directory from a
 document stored inside itself — so the reset carries a watermark, a gapless
 read rule, and an identity binding outside the journal. That inventory is
-genuinely added machinery, priced above (+1 write, two static documents, one
+genuinely added machinery, priced above (+1 write on the advanced-revision
+path, two static documents, one
 operator command, one re-affirmation pass); what it buys is loss and
 recreation detection the shipped design does not have, and the removal of the
 sidecar store, routes, schema-3 validation, the lookup pair, the same-call
