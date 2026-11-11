@@ -22,12 +22,14 @@ release and outputs proofs:
   parses exactly one inner receipt from it, and returns the actual guard
   exit. It creates no fixture, stage root or receipt.
 - **Inner (guarded).** The inner validates that it really is the guard's run:
-  the scratch and evidence directories the supervisor supplied exist, are
-  canonical, sit inside the designated barge scratch on the verified private
-  Stash volume, are owned by this account and free of group/other write
+  the scratch and evidence directories the supervisor supplied are lstat'ed
+  on their raw paths (a symlink is refused, never resolved), must be
+  canonical directories owned by this account and free of group/other write
   bits — the guard creates them 0755, and the guard's owned root must be
-  private 0700 — and the wall
-  deadline the outer minted is present and well formed. It then creates its
+  private 0700 — must sit inside the designated barge scratch on the
+  verified private Stash volume, and the evidence must live inside the same
+  guard-owned root; the wall deadline the outer minted must be present and
+  well formed. It then creates its
   fixture and stage roots inside the owned scratch, stages the `proof-journal`
   feature build of HEAD through the managed Oxide build, mints the
   source-bound manifest and requires it to equal the pre-stage identity
@@ -367,22 +369,34 @@ class InnerEffects:
             """What the host says about the guard-supplied directories, in the
             reference helper's shape: the scratch and evidence facts, the owned
             root that parents them, the verified scratch parent, the scratch
-            volume's UUID, and this account's uid. Read-only."""
+            volume's UUID, and this account's uid. Read-only.
+
+            The facts are taken from the RAW environment paths — one lstat per
+            path, never following the leaf — with the real resolution recorded
+            beside each. A symlinked path keeps its own `islink` fact and its
+            target as `realpath`, so the containment check sees the alias
+            instead of silently adopting the target."""
             scratch_real = os.path.realpath(scratch)
             evidence_real = os.path.realpath(evidence)
             route = base.scratch_route_facts(scratch_real, base.SCRATCH_VOLUME_MOUNT)
             owned_root = os.path.dirname(scratch_real)
 
-            def directory_facts(path):
-                exists = os.path.exists(path)
-                info = os.lstat(path) if exists else None
+            def directory_facts(raw_path):
+                islink = os.path.islink(raw_path)
+                exists = os.path.exists(raw_path)
+                info = None
+                try:
+                    info = os.lstat(raw_path)
+                except OSError:
+                    pass
                 return {
-                    "path": path, "realpath": os.path.realpath(path),
+                    "path": raw_path,
+                    "realpath": os.path.realpath(raw_path),
                     "present": exists,
-                    "isdir": os.path.isdir(path) and not os.path.islink(path),
-                    "islink": os.path.islink(path),
-                    "uid": info.st_uid if info else None,
-                    "mode": info.st_mode & 0o777 if info else None,
+                    "isdir": os.path.isdir(raw_path) and not islink,
+                    "islink": islink,
+                    "uid": info.st_uid if info is not None else None,
+                    "mode": info.st_mode & 0o777 if info is not None else None,
                 }
 
             facts = {
@@ -390,8 +404,8 @@ class InnerEffects:
                 "volume_uuid": route.get("volume_uuid"),
                 "path": scratch,
                 "root_parent": os.path.realpath(DESIGNATED_SCRATCH),
-                "scratch_facts": directory_facts(scratch_real),
-                "evidence_facts": directory_facts(evidence_real),
+                "scratch_facts": directory_facts(scratch),
+                "evidence_facts": directory_facts(evidence),
                 "root_facts": directory_facts(owned_root),
             }
             return facts
@@ -590,6 +604,15 @@ def guard_containment_problems(facts):
         if owned_root and scratch_real \
                 and os.path.normpath(evidence_path) == os.path.normpath(scratch_real):
             problems.append("the evidence directory aliases the scratch directory")
+        # The evidence must live inside the monitored owned root — by
+        # resolution, so an escaping alias is caught even when its raw path
+        # names a point inside the root.
+        evidence_real = evidence.get("realpath") or ""
+        if owned_root and evidence_real:
+            if evidence_real != owned_root \
+                    and not evidence_real.startswith(owned_root + os.sep):
+                problems.append(f"the evidence directory {evidence.get('path')!r} "
+                                f"is outside the guard's owned root {owned_root!r}")
     if facts.get("volume_uuid") != ROUTE_UUID:
         problems.append(
             f"the scratch volume is {facts.get('volume_uuid')}, "
@@ -1008,10 +1031,13 @@ class ControlHarness:
         self.scratch_mode = 0o755
         self.scratch_canonical = True
         self.scratch_present = True
+        self.scratch_islink = False
+        self.scratch_real_target = None
         self.evidence_mode = 0o755
         self.evidence_owner_uid = os.getuid()
         self.evidence_canonical = True
         self.evidence_present = True
+        self.evidence_real_target = None
         self.root_mode = 0o700
         self.root_owner_uid = os.getuid()
         self.root_canonical = True
@@ -1083,18 +1109,22 @@ class ControlHarness:
 
     def guard_facts(self, scratch, evidence):
         """The scripted answers for the guard-supplied layout, in the
-        reference shape: the scratch and evidence facts (0755 by default, as
-        the pinned supervisor creates them), the owned root that parents the
-        scratch (0700 by default), the verified scratch parent, and the
-        scratch volume's UUID."""
+        reference shape: the raw env paths with their real resolutions kept
+        separate (a scripted symlink keeps `islink` and its target), the
+        scratch and evidence facts (0755 by default, as the pinned supervisor
+        creates them), the owned root that parents the scratch (0700 by
+        default), the verified scratch parent, and the scratch volume's
+        UUID."""
         guard_root = os.path.dirname(self.guard_scratch)
         owned_root = os.path.dirname(scratch)
 
-        def directory_facts(path, mode, owner, canonical, present):
+        def directory_facts(path, mode, owner, canonical, present,
+                            islink=False, real_target=None):
             return {"path": path,
-                    "realpath": path if canonical else path + ".elsewhere",
-                    "present": present, "isdir": present, "islink": False,
-                    "uid": owner, "mode": mode}
+                    "realpath": real_target or
+                               (path if canonical else path + ".elsewhere"),
+                    "present": present, "isdir": present and not islink,
+                    "islink": islink, "uid": owner, "mode": mode}
 
         return {
             "uid": os.getuid(),
@@ -1104,12 +1134,16 @@ class ControlHarness:
             "scratch_facts": directory_facts(scratch, self.scratch_mode,
                                              self.scratch_owner_uid,
                                              self.scratch_canonical,
-                                             self.scratch_present),
+                                             self.scratch_present,
+                                             self.scratch_islink,
+                                             self.scratch_real_target),
             "evidence_facts": directory_facts(evidence, self.evidence_mode,
                                               self.evidence_owner_uid,
                                               self.evidence_canonical,
-                                              self.evidence_present),
-            "root_facts": directory_facts(owned_root, self.root_mode,
+                                              self.evidence_present,
+                                              False,
+                                              self.evidence_real_target),
+            "root_facts": directory_facts(guard_root, self.root_mode,
                                           self.root_owner_uid,
                                           self.root_canonical,
                                           self.root_present),
@@ -1305,6 +1339,30 @@ def composition_controls():
     inner = harness.inner_receipt or {}
     expect(any("owned root" in refusal for refusal in inner.get("refused", [])),
            "the owned-root refusal was not named")
+
+    # A symlinked scratch path is refused by its own raw-path fact, even
+    # though its target sits on the verified Stash volume: the reference
+    # helper refuses the alias before anything else.
+    harness = control_harness()
+    harness.scratch_islink = True
+    harness.scratch_real_target = (DESIGNATED_SCRATCH
+                                   + "/journal-guard/other-scratch")
+    exit_code = outer_half("counted", harness.outer_effects())
+    expect(exit_code != 0, "a symlinked scratch did not fail the run")
+    inner = harness.inner_receipt or {}
+    expect(any("symlink" in refusal for refusal in inner.get("refused", [])),
+           "the symlinked scratch was not refused as a symlink")
+
+    # Evidence outside the guard's owned root refuses, even though the scratch
+    # itself is the verified layout.
+    harness = control_harness()
+    harness.evidence_real_target = "/elsewhere/evidence"
+    exit_code = outer_half("counted", harness.outer_effects())
+    expect(exit_code != 0, "evidence outside the owned root did not fail the run")
+    inner = harness.inner_receipt or {}
+    expect(any("outside the guard's owned root" in refusal
+               for refusal in inner.get("refused", [])),
+           "the outside evidence was not refused by containment")
 
     # A foreign-owned owned root refuses too.
     harness = control_harness()
@@ -1551,6 +1609,20 @@ def composition_controls():
            "the stage spawn failure was not recorded as a bounded stage fault")
     expect("receipt_path" in inner,
            "the stage spawn failure published no bounded receipt")
+
+    # A symlinked scratch keeps its own raw-path fact and is refused as an
+    # alias even when its target sits on the verified volume — the exact
+    # reproduction from the re-review, run through the harness facts seam.
+    harness = control_harness()
+    harness.scratch_islink = True
+    harness.scratch_real_target = (DESIGNATED_SCRATCH
+                                   + "/journal-guard/other-scratch")
+    facts = harness.guard_facts(harness.guard_scratch, harness.guard_evidence)
+    symlink_problems = guard_containment_problems(facts)
+    expect(any("symlink" in problem for problem in symlink_problems),
+           "the scripted symlink fact did not refuse the alias")
+    if not any("symlink" in problem for problem in symlink_problems):
+        problems.extend(symlink_problems)
 
     # Report failure: an unwritable receipt unqualifies the inner.
     harness = control_harness()
