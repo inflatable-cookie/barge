@@ -210,14 +210,20 @@ FORBIDDEN_TOKENS = ["-" + "force", "p" + "kill", "kill" + "all"]
 # journal-only proof carries or an explicit n/a.
 PREMISES = (
     ("private HOME, CARGO_HOME and BARGE_STATE_DIR",
-     "the inner runner exports a private home, cargo home and state directory "
-     "under the guard's owned root and passes them to every case child"),
+     "n/a for the store surface, implemented as absence: the journal reads no "
+     "account facts, so the case environment binds no HOME/CARGO_HOME and no "
+     "BARGE_STATE_DIR — it binds BARGE_PROOF_CASE_DIR and scrubs temporaries "
+     "under the owned root (case_environment); the staged build is the "
+     "ordinary managed Oxide build in the real account, which compiles no "
+     "fixture code"),
     ("private account resolution; complete before and after real-state digest",
-     "n/a for the store surface: the journal never reads account facts; the "
-     "driver resolves its state directory from BARGE_STATE_DIR alone"),
+     "n/a: the driver resolves its fixture state directory from "
+     "BARGE_PROOF_CASE_DIR through StatePaths::resolve's explicit override, "
+     "never from the account, and no real-state digest is claimed"),
     ("TMPDIR, TMP and TEMP inside the owned root; inherited injection removed",
-     "the inner runner overrides all three to directories under the owned root "
-     "and clears inherited interposers"),
+     "the inner's case environment overrides all three to the case directory "
+     "under the owned run root, after base.stage_environment's scrub of "
+     "inherited OXIDE, XDG, BARGE and Rust-flag variables"),
     ("explicit fixture volume and area declarations; no real UUID",
      "n/a for images: the journal binds the synthetic fixture UUID a6ac3ed7 "
      "and never verifies a real volume"),
@@ -305,15 +311,43 @@ class Contract:
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(text)
 
+        def route_facts(path):
+            facts = base.scratch_route_facts(
+                os.path.realpath(path), base.SCRATCH_VOLUME_MOUNT)
+            designated = os.path.realpath(DESIGNATED_SCRATCH)
+            real = facts.get("realpath", "")
+            facts["within_designated"] = (
+                real == designated or real.startswith(designated + os.sep))
+            return facts
+
         return Contract(environment, run_child,
                         lambda: base.sha256_file(base.supervisor_path()),
-                        lambda: base.scratch_route_facts(),
+                        route_facts,
                         git, sha256_file, read_file,
                         time.monotonic, make_directory, write_file)
 
 
 def supervisor_path():
     return base.supervisor_path()
+
+
+def verified_scratch_root(contract):
+    """The guard's own scratch root, verified against the pinned Stash route.
+
+    Returns the canonical directory the supervisor must adopt and the inner
+    must build in, or a Fault. The guard's OXIDE_TASK_SCRATCH_ROOT is the
+    genuine Effigy/Nucleus admission hook; it is accepted only when it really
+    resolves onto the verified private Stash volume inside the designated
+    barge scratch — never on faith, never by naming another root.
+    """
+    root = contract.env.get("OXIDE_TASK_SCRATCH_ROOT")
+    if not root:
+        raise Fault("guard", "OXIDE_TASK_SCRATCH_ROOT is absent; no verified scratch")
+    facts = contract.route_facts(root)
+    problems = route_problems(facts)
+    if problems:
+        raise Fault("route", "; ".join(problems))
+    return facts["realpath"]
 
 
 def source_identity(contract):
@@ -331,15 +365,15 @@ def source_identity(contract):
     }
 
 
-def stage_driver(contract, deadline):
-    """Stage the proof build through the managed Oxide build and select the
+def stage_driver(contract, run_root):
+    """Stage the proof build through the managed Oxide build — inside the
+    guard, with the build temporaries under the run root — and select the
     driver's own artifact. The stage command's artifact lines name the
     example target, its feature and the executable; anything else is a
     refusal."""
-    environment = base.stage_environment(dict(contract.env), None)
-    environment["TMPDIR"] = environment.get("TMPDIR") or contract.env.get("TMPDIR", "/tmp")
-    if contract.monotonic() >= deadline:
-        raise Fault("deadline", "the stage did not start inside the budget")
+    environment = base.stage_environment(dict(contract.env),
+                                         os.path.join(run_root, "stage-tmp"))
+    os.makedirs(environment["TMPDIR"], exist_ok=True)
     try:
         result = contract.run_child(STAGE_COMMAND, environment, 240)
     except subprocess.TimeoutExpired as error:
@@ -368,27 +402,25 @@ def stage_driver(contract, deadline):
     return {"binary": binary, "binary_sha256": binary_sha256}
 
 
-def source_drift_problems(contract, identity):
-    """The staged source must be the manifest's source: a changed driver or
-    store between staging and the launch is drift, and drift never qualifies."""
+def manifest_complete(manifest):
+    """Why an inner receipt's manifest is not a complete source binding."""
     problems = []
-    checks = (
-        ("driver_source_sha256", DRIVER_SOURCE),
-        ("store_source_sha256", STORE_SOURCE),
-        ("cargo_lock_sha256", CARGO_LOCK),
-        ("toolchain_sha256", TOOLCHAIN_FILE),
-    )
-    for field, path in checks:
-        if contract.sha256_file(path) != identity[field]:
-            problems.append(f"{os.path.basename(path)} changed after the stage")
-    if contract.git(["rev-parse", "HEAD"]) != identity["head"]:
-        problems.append("HEAD changed after the stage")
+    required = ("head", "tree", "cargo_lock_sha256", "toolchain_sha256",
+                "driver_source_sha256", "store_source_sha256", "binary_sha256")
+    for field in required:
+        value = manifest.get(field)
+        if not isinstance(value, str) or len(value) < 32:
+            problems.append(f"the manifest's {field} is missing or not a digest")
+    if manifest.get("features") != [PROOF_FEATURE]:
+        problems.append("the manifest does not carry exactly the proof feature")
     return problems
 
 
 def case_environment(inner_env, case_dir):
     """The case child's environment: the stage scrub, then the fixture
-    bindings applied after it, so the scrub cannot drop a binding."""
+    bindings applied after it, so the scrub cannot drop a binding. The
+    journal surface reads no account facts, so no HOME is exported — the
+    temporaries and the case directory are the bindings that exist."""
     scrubbed = base.stage_environment(dict(inner_env), case_dir)
     scrubbed.update({
         "BARGE_PROOF_CASE_DIR": case_dir,
@@ -399,38 +431,43 @@ def case_environment(inner_env, case_dir):
     return scrubbed
 
 
-def inner_command(mode, binary, binary_sha256, run_root):
-    """The guarded inner argv: this script's inner runner, bound to the
-    staged binary, the manifest's digest of it, and this run's owned root."""
+def inner_command(mode, run_root):
+    """The guarded inner argv: this script's inner runner, bound to the mode
+    and this run's verified owned root. The inner stages and binds the
+    source itself, inside the guard."""
     return [
         "python3", SCRIPT_PATH, "--inner", mode,
-        "--binary", binary,
-        "--binary-sha256", binary_sha256,
         "--run-root", run_root,
     ]
 
 
-def supervisor_command(inner_argv):
+def supervisor_command(inner_argv, root_parent):
     """The unchanged qualified supervisor wrapping the inner argv: the one
-    guarded child a native run spawns."""
+    guarded child a native run spawns, adopting exactly the verified root
+    the inner builds in."""
     return [
         sys.executable, base.supervisor_path(),
         "--limit", str(LIMIT_SECONDS),
         "--scratch-budget-mib", str(SCRATCH_BUDGET_MIB),
-        "--root-parent", DESIGNATED_SCRATCH,
+        "--root-parent", root_parent,
         "--", *inner_argv,
     ]
 
 
 def route_problems(facts):
-    """Why the designated scratch route is not the verified private Stash."""
+    """Why the scratch root is not the verified private Stash route."""
     problems = []
     if not facts.get("present"):
-        problems.append(f"the designated scratch {facts.get('path')} is absent")
+        problems.append(f"the scratch root {facts.get('path')} is absent")
     if facts.get("volume_uuid") != ROUTE_UUID:
         problems.append(
-            f"the designated scratch's volume is {facts.get('volume_uuid')}, "
+            f"the scratch root's volume is {facts.get('volume_uuid')}, "
             f"not the verified private Stash {ROUTE_UUID}"
+        )
+    if facts.get("within_designated") is not True:
+        problems.append(
+            f"the scratch root {facts.get('path')} is not inside the designated "
+            f"barge scratch {DESIGNATED_SCRATCH}"
         )
     return problems
 
@@ -450,22 +487,30 @@ def inner_deadline(env, monotonic):
     return monotonic() + LIMIT_SECONDS
 
 
-def run_cases_inner(mode, binary, binary_sha256, run_root, exec_case, monotonic,
-                    make_directory, env):
-    """The inner composition: the twelve fixed case groups, each one direct
-    driver child in its own fresh fixture directory under the owned run root,
-    counted fail-fast or diagnostic keep-going, and one inner receipt.
+def run_cases_inner(mode, run_root, env, deadline, make_directory, stage_fn,
+                    case_fn, identity_fn):
+    """The inner composition: stage the proof build inside the guard, mint
+    the source-bound manifest here, and run the twelve fixed case groups,
+    each one direct driver child in its own fresh fixture directory under
+    the owned run root — counted fail-fast or diagnostic keep-going — and
+    return one inner receipt.
 
     This is the function the `--inner` runner calls with real child
-    execution, and the effect-free controls call with only the case executor
-    faked — the composition itself is never a fake.
+    execution, and the effect-free controls call with only the stage and
+    case executors and the source identity faked — the composition itself,
+    including the in-guard stage and the manifest mint, is never a fake.
     """
-    deadline = inner_deadline(env, monotonic)
+    stage = stage_fn(env, run_root)
+    manifest = identity_fn()
+    manifest["binary_sha256"] = stage["binary_sha256"]
+    incomplete = manifest_complete(manifest)
+    if incomplete:
+        raise Fault("manifest", "; ".join(incomplete))
     cases = []
     passed = set()
     fault = None
     for case in CASES:
-        if deadline - monotonic() <= 0:
+        if deadline <= 0:
             cases.append({"case": case["id"], "status": "unexecuted",
                           "detail": "the guarded budget expired before this case"})
             continue
@@ -474,14 +519,14 @@ def run_cases_inner(mode, binary, binary_sha256, run_root, exec_case, monotonic,
                           "kind": "latched",
                           "detail": "a counted run latched an earlier fault"})
             continue
-        if fault and deadline - monotonic() <= WORK_STOP_SECONDS:
+        if fault and deadline <= WORK_STOP_SECONDS:
             cases.append({"case": case["id"], "status": "unexecuted",
                           "detail": "inside the work-stop margin"})
             continue
         case_dir = make_directory(run_root, f"case-{case['id']}-")
         try:
-            command = [binary, case["id"]]
-            result = exec_case(command, case_environment(env, case_dir), 60)
+            command = [stage["binary"], case["id"]]
+            result = case_fn(command, case_environment(env, case_dir), 60)
             verdicts = []
             for line in result.stdout.splitlines():
                 try:
@@ -527,7 +572,7 @@ def run_cases_inner(mode, binary, binary_sha256, run_root, exec_case, monotonic,
         "schema": SCHEMA,
         "stage": "inner",
         "mode": mode,
-        "binary_sha256": binary_sha256,
+        "manifest": manifest,
         "run_root": run_root,
         "qualified_inner": bool(clean),
         "passed": sorted(passed),
@@ -535,27 +580,89 @@ def run_cases_inner(mode, binary, binary_sha256, run_root, exec_case, monotonic,
     }
 
 
+def real_stage_fn(env, run_root):
+    """The real in-guard stage: the managed Oxide build under the stage
+    scrub, the artifact selected, its bytes digested."""
+    environment = base.stage_environment(dict(env), os.path.join(run_root, "stage-tmp"))
+    os.makedirs(environment["TMPDIR"], exist_ok=True)
+    result = subprocess.run(STAGE_COMMAND, env=environment, capture_output=True,
+                            text=True, timeout=240)
+    if result.returncode != 0:
+        raise Fault("stage",
+                    f"the stage build exited {result.returncode}: {result.stderr[-400:]}")
+    selected = None
+    for line in result.stdout.splitlines():
+        try:
+            document = json.loads(line)
+        except ValueError:
+            continue
+        target = document.get("target") or {}
+        if (document.get("reason") == "compiler-artifact"
+                and "example" in (target.get("kind") or [])
+                and target.get("name") == DRIVER_NAME
+                and document.get("executable")):
+            selected = document
+    if selected is None:
+        raise Fault("stage", "the stage build produced no journal_proof artifact")
+    if selected.get("features") != [PROOF_FEATURE]:
+        raise Fault("stage", "the staged artifact does not carry exactly the proof feature")
+    binary = selected["executable"]
+    digest = hashlib.sha256()
+    with open(binary, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return {"binary": binary, "binary_sha256": digest.hexdigest()}
+
+
+def real_identity_fn():
+    """The real source binding, read from this checkout."""
+    def identity():
+        def git(arguments):
+            result = subprocess.run(["git", *arguments], cwd=REPO_ROOT,
+                                    capture_output=True, text=True, timeout=60)
+            if result.returncode != 0:
+                raise Fault("source",
+                            f"git {' '.join(arguments)} failed: {result.stderr[-200:]}")
+            return result.stdout.strip()
+
+        def sha256_file(path):
+            digest = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        return source_identity(types.SimpleNamespace(
+            git=git, sha256_file=sha256_file))
+    return identity
+
+
 def run_inner(arguments):
     """The guarded inner runner: invoked by the supervisor as the one guarded
-    child, it stages nothing and verifies nothing about the host — it runs
-    the fixed cases through the staged binary and prints one inner receipt.
-    The outer composes the final receipt from it; the supervisor owns the
-    group closure."""
-    if not arguments.binary or not arguments.run_root:
+    child, it inherits the supervisor's budget hook, stages inside the guard,
+    mints the source-bound manifest here, runs the fixed cases, and prints
+    one inner receipt. The outer composes the final receipt from it; the
+    supervisor owns the group closure."""
+    if not arguments.run_root:
         print(json.dumps({"schema": SCHEMA, "stage": "inner", "mode": arguments.inner,
                           "qualified_inner": False, "cases": [],
-                          "detail": "the inner argv carries no staged binary or run root"}),
+                          "detail": "the inner argv carries no owned run root"}),
               flush=True)
         return 1
-    receipt = run_cases_inner(
-        arguments.inner, arguments.binary, arguments.binary_sha256 or "",
-        arguments.run_root,
-        lambda command, env, timeout: subprocess.run(
-            command, env=env, capture_output=True, text=True, timeout=timeout),
-        time.monotonic,
-        lambda parent, prefix: tempfile.mkdtemp(prefix=prefix, dir=parent),
-        dict(os.environ),
-    )
+    try:
+        receipt = run_cases_inner(
+            arguments.inner, arguments.run_root, dict(os.environ),
+            inner_deadline(dict(os.environ), time.monotonic),
+            lambda parent, prefix: tempfile.mkdtemp(prefix=prefix, dir=parent),
+            real_stage_fn,
+            lambda command, env, timeout: subprocess.run(
+                command, env=env, capture_output=True, text=True, timeout=timeout),
+            real_identity_fn(),
+        )
+    except Fault as error:
+        receipt = {"schema": SCHEMA, "stage": "inner", "mode": arguments.inner,
+                   "qualified_inner": False, "cases": [],
+                   "fault": {"kind": error.kind, "detail": error.detail}}
     print(json.dumps(receipt), flush=True)
     if arguments.inner == "counted" and receipt["qualified_inner"]:
         return 0
@@ -563,11 +670,14 @@ def run_inner(arguments):
 
 
 def run_native(mode, contract):
-    """The actual native entry: verify, stage, bind, launch the unchanged
-    qualified supervisor around the inner runner, and compose the receipt
-    from the guarded child's own inner outcome. Never qualified on any
-    fault, drift, unverified supervisor or route, a bad or missing child
-    reply, duplicate or unknown cases, or an expired budget."""
+    """The actual native entry: verify the guard hooks, the pinned
+    supervisor and the verified Stash route of the guard's own scratch, bind
+    the run root there, and launch the one guarded child — the unchanged
+    qualified supervisor around the inner runner, which stages inside the
+    guard, mints the manifest, and runs the fixed cases. The outer composes
+    and publishes the receipt from that guarded outcome; never qualified on
+    any fault, an unverified boundary, or an inner receipt that is not
+    exactly the fixed map."""
     receipt = {
         "schema": SCHEMA,
         "stage": "outer",
@@ -578,9 +688,9 @@ def run_native(mode, contract):
         "route_uuid": ROUTE_UUID,
         "route_verified": False,
         "guard_environment": False,
+        "verified_scratch_root": None,
         "guard_closure": "separate fact owned by the supervisor; this receipt "
                          "records the inner native outcome only",
-        "head": None,
         "manifest": None,
         "inner": None,
         "cases": [],
@@ -616,26 +726,16 @@ def run_native(mode, contract):
                     f"the supervisor's bytes are {found}, not the pinned {base.SUPERVISOR_SHA256}")
     receipt["supervisor_verified"] = True
 
-    route_faults = route_problems(contract.route_facts())
-    if route_faults:
-        raise Fault("route", "; ".join(route_faults))
+    # The guard's own scratch root is the verified Stash route: this is the
+    # directory the supervisor adopts and the inner builds in.
+    scratch_root = verified_scratch_root(contract)
     receipt["route_verified"] = True
+    receipt["verified_scratch_root"] = scratch_root
 
-    run_root = contract.make_directory(contract.env["OXIDE_TASK_SCRATCH_ROOT"],
-                                       RUN_ROOT_PREFIX)
+    run_root = contract.make_directory(scratch_root, RUN_ROOT_PREFIX)
 
-    stage = stage_driver(contract, contract.monotonic() + LIMIT_SECONDS)
-    identity = source_identity(contract)
-    identity["binary_sha256"] = stage["binary_sha256"]
-    receipt["manifest"] = identity
-    receipt["head"] = identity["head"]
-
-    drift = source_drift_problems(contract, identity)
-    if drift:
-        raise Fault("drift", "; ".join(drift))
-
-    inner_argv = inner_command(mode, stage["binary"], stage["binary_sha256"], run_root)
-    guarded_command = supervisor_command(inner_argv)
+    inner_argv = inner_command(mode, run_root)
+    guarded_command = supervisor_command(inner_argv, scratch_root)
     try:
         guarded = contract.run_child(guarded_command, dict(contract.env),
                                      LIMIT_SECONDS + 60)
@@ -643,7 +743,8 @@ def run_native(mode, contract):
         raise Fault("reap",
                     "the guarded supervisor child did not finish inside its wall") from None
 
-    # The guarded child's own inner outcome, parsed exactly once.
+    # The guarded child's own inner outcome, parsed exactly once. The inner
+    # staged inside the guard and minted the manifest; the outer binds it.
     inner = None
     for line in guarded.stdout.splitlines():
         try:
@@ -660,18 +761,26 @@ def run_native(mode, contract):
                     f"the guarded child printed no inner receipt (exit {guarded.returncode}); "
                     f"stdout tail: {guarded.stdout[-300:]}")
     receipt["inner"] = inner
+    receipt["manifest"] = inner.get("manifest")
     receipt["cases"] = inner.get("cases", [])
 
-    # Honesty: the inner receipt must name every fixed case exactly once, no
-    # unknown case, and carry this run's own staged binary digest.
-    seen = [case.get("case") for case in receipt["cases"]]
-    expected = [case["id"] for case in CASES]
-    if sorted(seen) != sorted(expected):
-        raise Fault("child",
-                    f"the inner receipt's cases {seen} are not exactly the fixed map {expected}")
-    if inner.get("binary_sha256") != stage["binary_sha256"]:
-        raise Fault("child",
-                    "the inner receipt does not carry this run's staged binary digest")
+    # Honesty. A faulted inner receipt is a legitimate recorded outcome: the
+    # outer composes it as the failure it is, never qualified. An inner that
+    # claims cases or qualification must name every fixed case exactly once
+    # and carry the complete manifest it minted inside the guard.
+    if inner.get("fault") and not inner.get("cases"):
+        receipt["fault"] = inner["fault"]
+    else:
+        seen = [case.get("case") for case in receipt["cases"]]
+        expected = [case["id"] for case in CASES]
+        if sorted(seen) != sorted(expected):
+            raise Fault("child",
+                        f"the inner receipt's cases {seen} are not exactly the fixed map {expected}")
+        if not receipt["manifest"]:
+            raise Fault("child", "the inner receipt carries no manifest")
+        incomplete = manifest_complete(receipt["manifest"])
+        if incomplete:
+            raise Fault("child", "; ".join(incomplete))
 
     receipt["qualified"] = bool(
         mode == "counted"
@@ -683,34 +792,32 @@ def run_native(mode, contract):
     return receipt, path
 
 
-def run_inner_main(arguments):
-    """Dispatch the guarded inner runner (kept beside run_native for the argv
-    guard to execute)."""
-    return run_inner(arguments)
-
-
 # ---------- effect-free controls through the actual entry ----------
 
 class FakeContract:
     """The external seams, scripted. Only executors, time, identity and
     storage are fakes; the composition they drive is the actual entry — the
     supervisor child is "executed" by really running the inner composition
-    with the case executor faked at the driver-child boundary."""
+    (in-guard stage, manifest mint, case loop) with the stage and driver
+    children faked at the executor boundary."""
 
     def __init__(self):
-        self.env = {"OXIDE_TASK_SCRATCH_ROOT": "/guard/scratch",
+        self.env = {"OXIDE_TASK_SCRATCH_ROOT": "/Volumes/Stash/scratch/barge/journal-guard",
                     "OXIDE_PROOF_EVIDENCE": "/guard/evidence",
                     "HOME": "/guard/home", "TMPDIR": "/guard/tmp"}
         self.written = {}
         self.directories = []
+        self.sequence = []
         self.clock = None
         self.supervisor_digest_value = base.SUPERVISOR_SHA256
-        self.route = {"present": True, "path": DESIGNATED_SCRATCH,
-                      "volume_uuid": ROUTE_UUID}
-        self.stage_result = self._stage_ok()
-        self.supervisor_child = None
-        self.case_results = {}
+        self.route = {"present": True,
+                      "path": "/Volumes/Stash/scratch/barge/journal-guard",
+                      "realpath": "/Volumes/Stash/scratch/barge/journal-guard",
+                      "volume_uuid": ROUTE_UUID,
+                      "within_designated": True}
         self.inner_mode = None
+        self.case_results = {}
+        self.stage_result = self._stage_ok()
         self.source_digests = {}
         self.head = "0" * 40
         self.fail_report_write = False
@@ -722,8 +829,10 @@ class FakeContract:
     def supervisor_digest(self):
         return self.supervisor_digest_value
 
-    def route_facts(self):
-        return dict(self.route)
+    def route_facts(self, path):
+        facts = dict(self.route)
+        facts["path"] = path
+        return facts
 
     def monotonic(self):
         if self.clock:
@@ -731,10 +840,7 @@ class FakeContract:
         return 0.0
 
     @staticmethod
-    def _ok():
-        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    def _stage_ok(self):
+    def _stage_ok():
         line = ('{"reason":"compiler-artifact","target":{"kind":["example"],'
                 '"crate_types":["bin"],"name":"' + DRIVER_NAME + '","edition":"2021"},'
                 '"features":["' + PROOF_FEATURE + '"],"executable":"/stage/'
@@ -742,15 +848,13 @@ class FakeContract:
         return types.SimpleNamespace(returncode=0, stdout=line + "\n", stderr="")
 
     def run_child(self, command, env, timeout):
-        if command[:2] == ["oxide", "build"]:
-            if self.fail_stage:
-                return types.SimpleNamespace(returncode=101, stdout="", stderr="staging refused")
-            return self.stage_result
         if len(command) > 2 and "bounded-test.py" in command[1]:
             # The guarded supervisor child. The seams faked here are the
-            # kernel's time and the driver child only: the inner composition
-            # really runs, from the argv the outer actually built.
+            # kernel's time and the stage/driver children only: the inner
+            # composition really runs — including the in-guard stage and the
+            # manifest mint — from the argv the outer actually built.
             self.last_guarded_command = command
+            self.sequence.append("guarded")
             inner_argv = command[command.index("--") + 1:]
             parsed = argument_parser().parse_args(inner_argv[2:])
             self.inner_mode = parsed.inner
@@ -758,29 +862,42 @@ class FakeContract:
                 return types.SimpleNamespace(returncode=1, stdout="", stderr="supervisor refused")
             if self.reap_fails:
                 raise subprocess.TimeoutExpired(command, timeout)
-            receipt = run_cases_inner(
-                parsed.inner, parsed.binary, parsed.binary_sha256, parsed.run_root,
-                self.execute_case, lambda: 0.0,
-                lambda parent, prefix: f"{parent}/{prefix}{len(self.directories)}",
-                self.env,
-            )
+
+            def stage_fn(stage_env, run_root):
+                self.sequence.append("stage")
+                if self.fail_stage:
+                    raise Fault("stage", "the injected stage refusal")
+                return {"binary": "/stage/" + DRIVER_NAME,
+                        "binary_sha256": self.source_digests.get(
+                            "/stage/" + DRIVER_NAME, "f" * 64)}
+
+            def case_fn(case_command, case_env, timeout):
+                case = case_command[-1]
+                scripted = self.case_results.get(case)
+                if scripted is not None:
+                    return scripted
+                return types.SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"case": case, "status": "passed",
+                                       "detail": "fake pass", "injections": []}) + "\n",
+                    stderr="")
+
+            try:
+                receipt = run_cases_inner(
+                    parsed.inner, parsed.run_root, env,
+                    inner_deadline(env, lambda: 0.0),
+                    lambda parent, prefix: f"{parent}/{prefix}{len(self.directories)}",
+                    stage_fn, case_fn,
+                    lambda: source_identity(self),
+                )
+            except Fault as error:
+                receipt = {"schema": SCHEMA, "stage": "inner", "mode": parsed.inner,
+                           "qualified_inner": False, "cases": [],
+                           "fault": {"kind": error.kind, "detail": error.detail}}
             clean = parsed.inner == "counted" and receipt["qualified_inner"]
             return types.SimpleNamespace(returncode=0 if clean else 1,
                                          stdout=json.dumps(receipt) + "\n", stderr="")
         return self._ok()
-
-    def execute_case(self, command, env, timeout):
-        """The faked driver child: the only external seam the controls
-        substitute, at the same signature the real inner uses."""
-        case = command[-1]
-        scripted = self.case_results.get(case)
-        if scripted is not None:
-            return scripted
-        return types.SimpleNamespace(
-            returncode=0,
-            stdout=json.dumps({"case": case, "status": "passed",
-                               "detail": "fake pass", "injections": []}) + "\n",
-            stderr="")
 
     def git(self, arguments):
         return self.head
@@ -815,11 +932,11 @@ def control_contract():
 
 
 def composition_controls():
-    """Call the actual `run_native` entry: launch, stage, the guarded
-    supervisor child (really running the inner composition with the driver
-    children faked), verdict parsing, report publication and receipt
-    composition — with only the external executors, clock, identity and
-    storage faked."""
+    """Call the actual `run_native` entry: guard verification, the verified
+    scratch route, the one guarded supervisor child (really running the
+    inner composition — in-guard stage, manifest mint, case loop — with only
+    the stage and driver children faked), verdict parsing, report
+    publication and receipt composition."""
     problems = []
 
     def expect(condition, message):
@@ -827,31 +944,42 @@ def composition_controls():
             problems.append(message)
 
     # Clean counted pass: the outer spawns the unchanged qualified supervisor
-    # around the inner runner, every case passes, the receipt qualifies.
+    # around the inner runner, the stage and manifest are minted inside the
+    # guarded child (after the launch, never before it), and the receipt
+    # qualifies.
     contract = control_contract()
     receipt, path = run_native("counted", contract)
     expect(receipt["qualified"] is True, "a clean counted pass did not qualify")
     expect(path.endswith(RECEIPT_NAME), "the receipt is not at the evidence path")
     expect(any(key.endswith(RECEIPT_NAME) for key in contract.written),
            "the receipt was not published")
-    expect(any(directory.startswith("/guard/scratch/journal-proof-")
-               for directory in contract.directories),
-           "the run root is not inside the guard's owned scratch")
+    expect(contract.sequence[:2] == ["guarded", "stage"],
+           "the stage did not run inside the guarded child, after the launch")
+    expect(any(directory.startswith(
+        "/Volumes/Stash/scratch/barge/journal-guard/journal-proof-")
+        for directory in contract.directories),
+        "the run root is not inside the verified guard scratch")
     expect(len([c for c in receipt["cases"] if c["status"] == "passed"]) == len(CASES),
            "the clean pass did not pass every case")
-    # The launch shape: the guarded command is the unchanged qualified
-    # supervisor wrapping this script's inner argv, and the inner really ran.
     guarded = contract.last_guarded_command
     expect(guarded is not None, "run_native never spawned the guarded supervisor child")
     expect(guarded and "bounded-test.py" in guarded[1],
            "the guarded child is not the pinned supervisor")
-    expect(guarded and guarded[guarded.index("--") + 1:][:2] == ["python3", SCRIPT_PATH],
+    inner_tail = guarded[guarded.index("--") + 1:]
+    expect(inner_tail[:2] == ["python3", SCRIPT_PATH],
            "the guarded child does not wrap this script's inner runner")
-    expect(guarded and "--limit" in guarded and str(LIMIT_SECONDS) in guarded,
+    expect("--limit" in guarded and str(LIMIT_SECONDS) in guarded,
            "the guarded child does not carry the supervisor's limits")
-    expect(guarded and DESIGNATED_SCRATCH in guarded,
-           "the guarded child does not name the verified scratch parent")
+    expect("/Volumes/Stash/scratch/barge/journal-guard" in guarded,
+           "the guarded child does not adopt the verified scratch root as its parent")
+    expect("--binary" not in inner_tail,
+           "the inner argv carries a staged binary the outer cannot have minted")
     expect(contract.inner_mode == "counted", "the inner did not run the counted mode")
+    manifest = receipt.get("manifest") or {}
+    expect(manifest.get("features") == [PROOF_FEATURE]
+           and len(manifest.get("binary_sha256", "")) >= 32
+           and len(manifest.get("head", "")) >= 32,
+           "the outer receipt does not bind the inner's in-guard manifest")
     expect(receipt["inner"] is not None and receipt["inner"]["qualified_inner"] is True,
            "the outer receipt does not embed the inner's own outcome")
 
@@ -876,10 +1004,9 @@ def composition_controls():
     except Fault as error:
         expect(error.kind == "guard", "a missing guard faulted with the wrong kind")
 
-    # Route mismatch: the scratch's volume is not the verified Stash.
+    # Route mismatch: the guard's scratch is not the verified Stash volume.
     contract = control_contract()
-    contract.route = {"present": True, "path": DESIGNATED_SCRATCH,
-                      "volume_uuid": "00000000-0000-0000-0000-000000000000"}
+    contract.route["volume_uuid"] = "00000000-0000-0000-0000-000000000000"
     try:
         run_native("counted", contract)
         problems.append("a route mismatch did not fault")
@@ -888,48 +1015,17 @@ def composition_controls():
     expect(not contract.last_guarded_command,
            "a route mismatch still launched a guarded child")
 
-    # Stage refusal: the build fails, and no guarded child runs.
+    # Route escape: the guard's scratch resolves outside the designated barge
+    # scratch. Refused before the launch.
     contract = control_contract()
-    contract.fail_stage = True
+    contract.route["within_designated"] = False
     try:
         run_native("counted", contract)
-        problems.append("a refused stage did not fault")
+        problems.append("a route escape did not fault")
     except Fault as error:
-        expect(error.kind == "stage", "a stage refusal faulted with the wrong kind")
-    expect(not contract.last_guarded_command, "a refused stage still launched the guard")
-
-    # Wrong artifact: the stage output names another target, and the selector
-    # refuses it.
-    contract = control_contract()
-    wrong = ('{"reason":"compiler-artifact","target":{"kind":["bin"],'
-             '"crate_types":["bin"],"name":"barge","edition":"2021"},'
-             '"features":["' + PROOF_FEATURE + '"],"executable":"/stage/barge"}')
-    contract.stage_result = types.SimpleNamespace(returncode=0, stdout=wrong + "\n", stderr="")
-    try:
-        run_native("counted", contract)
-        problems.append("a wrong staged artifact did not fault")
-    except Fault as error:
-        expect(error.kind == "stage", "a wrong artifact faulted with the wrong kind")
-
-    # Source drift: the store digest changes after the manifest mints it, and
-    # the entry refuses before launching the guarded child.
-    contract = control_contract()
-    store_calls = {"count": 0}
-    original_sha = contract.sha256_file
-
-    def drifting_sha(path):
-        if path == STORE_SOURCE:
-            store_calls["count"] += 1
-            if store_calls["count"] > 1:
-                return "changed" * 8
-        return original_sha(path)
-    contract.sha256_file = drifting_sha
-    try:
-        receipt, _ = run_native("counted", contract)
-        expect(receipt["qualified"] is False, "drift produced a qualified receipt")
-    except Fault as error:
-        expect(error.kind == "drift", "a drift faulted with the wrong kind")
-    expect(not contract.last_guarded_command, "drift still launched the guarded child")
+        expect(error.kind == "route", "a route escape faulted with the wrong kind")
+    expect(not contract.last_guarded_command,
+           "a route escape still launched a guarded child")
 
     # Case fault: a failing case fails the inner, latches the counted run,
     # and the outer composes an unqualified receipt embedding the outcome.
@@ -944,6 +1040,8 @@ def composition_controls():
     expect(statuses["J1"] == "failed", "the failing case was not recorded")
     expect(statuses["J12"] == "skipped", "a latched counted run did not skip the rest")
     expect(receipt["qualified"] is False, "a latched run produced a qualified receipt")
+    expect(contract.sequence[:2] == ["guarded", "stage"],
+           "the faulting run did not stage inside the guarded child")
 
     # Bad child reply: no verdict for the case fails the inner honestly.
     contract = control_contract()
@@ -969,6 +1067,17 @@ def composition_controls():
     receipt, _ = run_native("counted", contract)
     expect(receipt["qualified"] is False, "an unknown-case verdict produced a qualified receipt")
 
+    # Stage refusal inside the guard: the inner faults, the outer composes an
+    # unqualified receipt from the guarded outcome.
+    contract = control_contract()
+    contract.fail_stage = True
+    receipt, _ = run_native("counted", contract)
+    expect(receipt["qualified"] is False, "a stage refusal produced a qualified receipt")
+    expect(receipt.get("fault", {}).get("kind") == "stage",
+           "the stage refusal was not recorded as the guarded fault")
+    expect(contract.sequence[:2] == ["guarded", "stage"],
+           "the stage refusal did not happen inside the guarded child")
+
     # Reap: a guarded child that never finishes faults as a reap failure, and
     # nothing qualifies.
     contract = control_contract()
@@ -991,7 +1100,6 @@ def composition_controls():
     # Deadline inside the inner: the guarded budget expired, every case is
     # recorded unexecuted, and the receipt never qualifies.
     contract = control_contract()
-    contract.clock = [0.0] * 6
     contract.env["OXIDE_PROOF_DEADLINE_NS"] = "0"
     receipt, _ = run_native("counted", contract)
     expect(len(receipt["cases"]) == len(CASES),
@@ -999,6 +1107,8 @@ def composition_controls():
     expect(all(c["status"] == "unexecuted" for c in receipt["cases"]),
            "an expired budget did not record the unexecuted cases")
     expect(receipt["qualified"] is False, "an expired budget produced a qualified receipt")
+    expect(contract.sequence[:2] == ["guarded", "stage"],
+           "the expired-budget run did not stage inside the guarded child")
 
     # Diagnostic: keep-going records every case and always qualifies false.
     contract = control_contract()
@@ -1118,15 +1228,21 @@ def supervisor_problems():
 def route_readiness_problems():
     """Why this host cannot verify the designated scratch route right now."""
     facts = base.scratch_route_facts()
+    designated = os.path.realpath(DESIGNATED_SCRATCH)
+    real = facts.get("realpath", "")
+    facts["within_designated"] = (
+        real == designated or real.startswith(designated + os.sep))
     return route_problems(facts)
 
 
 def argv_shape_problems():
     """The outer guarded command must end in an inner argv this script's own
-    parser accepts, binding mode, staged binary, digest and run root."""
+    parser accepts, binding the mode and the verified owned run root, and
+    must let the supervisor adopt that same verified root."""
     problems = []
-    command = supervisor_command(inner_command("counted", "/stage/" + DRIVER_NAME,
-                                               "a" * 64, "/guard/scratch/run"))
+    command = supervisor_command(
+        inner_command("counted", "/Volumes/Stash/scratch/barge/journal-guard/run"),
+        "/Volumes/Stash/scratch/barge/journal-guard")
     tail = command[command.index("--") + 1:]
     if tail[0] != "python3" or tail[1] != SCRIPT_PATH:
         problems.append("the guarded command does not run this script's inner runner")
@@ -1135,12 +1251,13 @@ def argv_shape_problems():
     except SystemExit:
         problems.append("the guarded inner argv does not parse")
         return problems
-    if parsed.inner != "counted" or not parsed.binary or not parsed.run_root:
-        problems.append("the guarded inner argv does not bind mode, binary and run root")
+    if parsed.inner != "counted" or not parsed.run_root:
+        problems.append("the guarded inner argv does not bind the mode and run root")
     if "--limit" not in command or str(LIMIT_SECONDS) not in command:
         problems.append("the guarded command does not carry the supervisor's limits")
-    if DESIGNATED_SCRATCH not in command:
-        problems.append("the guarded command does not name the verified scratch parent")
+    parent_index = command.index("--root-parent")
+    if command[parent_index + 1] != "/Volumes/Stash/scratch/barge/journal-guard":
+        problems.append("the supervisor does not adopt the verified scratch root")
     return problems
 
 
@@ -1206,8 +1323,6 @@ def argument_parser():
     parser.add_argument("--plan", action="store_true")
     parser.add_argument("mode", nargs="?", choices=["counted", "diagnostic"])
     parser.add_argument("--inner", nargs="?", const="counted", default=None)
-    parser.add_argument("--binary")
-    parser.add_argument("--binary-sha256")
     parser.add_argument("--run-root")
     return parser
 

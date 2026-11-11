@@ -7,13 +7,16 @@
 //! `required-features`, so no ordinary build compiles it.
 //!
 //! Each case group builds its own fixture inside the directory the caller
-//! names (`BARGE_PROOF_CASE_DIR`): a private state directory under it, the
-//! operation journal initialized through the actual
-//! [`barge::operation::init_operation_journal`], and every later step through
-//! the actual store, lock and publication code — [`begin_operation`],
-//! [`read_operations`], [`consult_operations`], [`advance_operation`],
-//! [`inspect_operation_journal`] — on fresh private filesystem fixtures. The
-//! unit bindings are synthetic; no real volume is ever touched.
+//! names (`BARGE_PROOF_CASE_DIR`, one fresh directory per case under the
+//! guard's owned run root): the state directory is resolved explicitly from
+//! that case directory through [`StatePaths::resolve`]'s override — never
+//! from the account — and the operation journal is initialized and driven
+//! through the actual store, lock and publication code
+//! ([`begin_operation`], [`read_operations`], [`consult_operations`],
+//! [`advance_operation`], [`inspect_operation_journal`]) on those fresh
+//! private filesystem fixtures. The unit bindings are synthetic; no real
+//! volume is ever touched. No HOME is exported or read: the journal surface
+//! reads no account facts.
 //!
 //! Publication and watermark failures are injected through the feature-gated
 //! endpoints ([`fail_next_document_publish`], [`fail_next_watermark_publish`]),
