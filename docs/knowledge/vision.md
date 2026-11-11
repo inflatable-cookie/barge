@@ -82,3 +82,12 @@ Tom selected source-only bounded shared descriptor-listing design in decision
 scan totals. The [writer-custody design](contracts/stage1-design.md#bounded-shared-descriptor-listing-design-only-2026-11-10)
 requires independent exact-head review; runtime caps remain unchanged.
 Implementation, capacity changes and native/live activation need new scoped authority.
+
+Tom asked for simpler shared recovery on 2026-11-10 (decision
+`1d4a7aee-a8e6-4a75-96f0-b142c4176db2` v2): the delegated-deletion machinery
+must shrink in both products, and a later consumer must not rebuild the
+recovery protocol. The proposed answer — one Barge-owned operation journal
+with typed durable caller hooks — is recorded design-only in the
+[stage 4 design](contracts/stage4-design.md#one-operation-journal-for-delegated-recovery-proposed-2026-11-10);
+design review authorizes neither implementation, migration, native execution
+nor live adoption.

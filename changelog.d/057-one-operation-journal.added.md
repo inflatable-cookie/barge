@@ -1,0 +1,1 @@
+Add the proposed one-operation-journal recovery design (stage 4): one Barge-owned durable authority with typed durable caller hooks, with the old-to-new removal map for both products; current behavior is unchanged.

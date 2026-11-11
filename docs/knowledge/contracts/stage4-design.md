@@ -1164,6 +1164,271 @@ Barge051/052/053 evidence retains its accepted limits and is not integrated
 credit. Production account lookup, deployment, live adoption and integrated
 proof remain unresolved; O2/O3 and production parent-reader conversion stay held.
 
+## One operation journal for delegated recovery (proposed, 2026-11-10)
+
+**Status: proposed design, source-only.** Tom asked on 2026-11-10 (decision
+`1d4a7aee-a8e6-4a75-96f0-b142c4176db2` v2) for delegated-deletion recovery
+that is dependable and simpler in *both* products, because the machinery will
+recur with every new integration. This is Barge's owning answer, proposing the
+successor to the two adapter sections above; everything below is PROPOSED and
+changes no shipped behavior until implementation briefs land reviewed code.
+Oxide's owning contract is not edited from here; its needed reconciliation text
+is quoted at the end.
+
+One delegated deletion is coordinated today by five durable facts across two
+products: Oxide's `prune-intent/1` journal, the registry's schema-3
+`deletion_routes`, the immutable `prune-delegation/1` sidecars, the
+`oxide.outputs/4` fence with its paired-pool upgrade, and Barge's
+`barge.intent/2` with its caller fields — joined by a four-state lookup, an
+absence-only lookup, a first-call-only `Locked` rule and a twelve-row crash
+table. Ordinary domain state (Oxide's registry rows and receipts, which say
+what exists and what is selected) is entangled with a second, independent
+recovery authority, and a second consumer would rebuild all of it.
+
+### Ownership boundary (the candidate)
+
+Barge's operation journal becomes the ONE durable authority for a delegated
+operation: whether it is in progress, what it binds, whether its caller still
+owes a finalization, and whether conflicting work may enter. Ordinary domain
+state stays put: Oxide's registry and receipts keep describing what exists and
+what is selected, stay reconstructible from Oxide's own settlement writes, and
+never decide recovery.
+
+    caller (eligibility, in-process)              Barge
+    ----------------------------------           --------------------------------------
+    begin(request) ------------------------>      re-proof, then ONE operation record
+    holds the checkout barrier                    intent > renamed > marker_last
+                                                  > removed > deleted > complete
+    drain(hooks) <--- dispatch, no Barge locks    owed finalize --ack--> complete
+
+The record is written once, under the existing `LockSet` order — registry,
+volume, root, intent write (`state.rs:19`, `:1246`) — binds the original
+identity, request digest, grant generation and the caller's typed finalize
+hook (kind, version, bounded payload), and is the only place recovery
+decisions come from. There is no index, no sidecar, no cache: every consult
+reads this one journal, and a read that cannot complete is unknown, never "no
+operation" (`read_intents`, `contract.rs:50`). The hook acknowledgement is a
+field transition inside the same record, not a third ledger.
+
+### Phases and transitions (PROPOSED)
+
+| Phase | Meaning | Written by |
+| --- | --- | --- |
+| `intent` | begin published; no effect yet; finalize owed | begin, after the full re-proof |
+| `renamed` → `marker_last` → `removed` | today's effect phases, unchanged (`state.rs:1398`) | the effect, under the exclusive volume lock |
+| `deleted` | effect terminal; finalize still owed | the effect |
+| `complete` | hook acknowledged; the record is settled | drain, after the ack |
+| (record removed) | pre-effect cancellation only: `intent` phase, root present, re-proof failed | begin or resume |
+
+Removing a pre-effect record stays today's only removal (stage 1 design, "A
+settled intent is kept"); a post-effect record is never removed, so a terminal
+deletion cannot lose an unfinished finalization — the owed hook travels in the
+record from begin, before any effect exists.
+
+### Begin: the no-gap ordering
+
+`operation::begin` (PROPOSED) merges what `execute` does today in steps 2–8
+(`oxide_outputs.rs:591`) into one call: stored declaration and area grant
+re-read, volume record, exact unit construction and validation, marker
+re-proof and checkout absence — all before the record is published, all under
+the existing lock order. The caller computes the request digest exactly as
+`DelegatedRequest::digest` does today (`oxide_outputs.rs:124`); preview, grant
+generation and original identity travel inside the typed payload, so no
+refreshed grant or current root substitutes for original authority.
+
+**Custody ordering.** Oxide holds its admission locks only during eligibility
+and releases them before begin (admission never waits on a Barge lock), and
+holds the process-held checkout barrier across begin and the whole call, as
+the live-writer fence. Oxide's publication lock re-enters only inside the
+handler's settlement, where no Barge lock is held. No caller durable state
+precedes begin: a crash before publication leaves nothing anywhere (the
+barrier dies with the process), so today's "intent/route not positively
+published" and same-call `Locked` rollback boundaries do not exist, and a
+`Locked` begin is a plain retry.
+
+**Named ownership decision (PROPOSED).** The adapter's re-read of Oxide's
+registry (`lookup_oxide_intent`) leaves the covered path. Eligibility stays
+Oxide's, exercised in-process immediately before begin; Barge's durable
+cross-checks stay exactly what they are — stored grant, unit custody,
+absence, binding — and the record, not a second journal, is thereafter the
+proof that this operation exists. A forged claim still cannot delete anything
+Barge cannot re-prove, and a settled key answers idempotently.
+
+### Conflicting entry points (all consult conservatively)
+
+Every conflicting Oxide entry point refuses unless one bounded journal read
+completes and shows no conflicting pending record: adopt and bind
+(`outputs.rs:2300`, `:4486`), reserve and resume paths (`outputs.rs:6237`,
+`:6330` — today `unsettled_for`, `prune.rs:1158`), a second prune of the same
+root, and `resolve-intent`. Truncated, unreadable or over-cap journals refuse;
+unknown is never "no operation". The consult matches on the bound root
+identity and the caller operation key, derives no second registry and keeps no
+derived state.
+
+### The hook contract (PROPOSED)
+
+```rust
+pub struct BeginRequest<'a> {
+    pub caller: &'a str,             // namespace, e.g. "oxide.outputs"
+    pub key: &'a str,                // the caller's own operation key
+    pub finalize: FinalizeSpec<'a>,  // hook kind, version, bounded payload
+    pub unit: DeletionUnit,          // the exact binding; today's type
+    pub request_digest: &'a str,     // the original request's digest
+}
+pub enum Begun { Began, Already(OperationState) }
+pub trait FinalizeHook: Sync {
+    fn kind(&self) -> &str;  fn version(&self) -> &str;
+    fn finalize(&self, op: &FinalizeOp) -> Result<FinalizeAck>;
+}
+pub fn begin(...) -> Result<Begun>;  // idempotent per (caller, key)
+pub fn drain(paths, hooks: &[&dyn FinalizeHook], bounds) -> DrainReport;
+```
+
+Authorization, eligibility and domain bookkeeping stay caller-owned; Barge owns
+the destructive phases, replay and operation progress. Barge persists the
+operation's type, version and bounded payload — never closures or function
+pointers — and validates only shape and bounds, never interpreting the
+payload, so generic mechanics stay free of consumer policy. There is no plugin
+loader, daemon, workflow platform or callback-registry service: the handler is
+linked code registered in-process, and one fixed dispatch API is enough.
+Dispatch runs outside every Barge lock — Barge reads the owed record,
+releases, calls the handler registered for that (kind, version), re-takes the
+locks and records `complete` — and the rules are absolute: no Barge lock
+inside a hook, no caller lock inside a Barge lock, no Barge → caller → Barge
+cycle. Double dispatch is safe because handlers are idempotent by contract and
+the ack is idempotent; begin refuses a request whose digest matches a record
+with an owed finalize, so an operation cannot nest inside its own settlement.
+The payload cap sits inside the existing 4 KiB record cap (`contract.rs:47`;
+the number is an implementation constant — the today-sidecar material measures
+well under a kilobyte), and begin refuses oversize before any durable step, so
+there is no partial begin. Settled `complete` records are kept like settled
+intents today (stage 1 design, "A settled intent is kept"); the 4 096-row read
+bound (`contract.rs:50`) makes an over-full journal refuse as unknown, never
+prune.
+
+### Crash and concurrency traces
+
+| Window | Fact after the crash | Next actor, and why it is safe |
+| --- | --- | --- |
+| before begin published | nothing anywhere | a later prune re-runs eligibility; no exclusion was published |
+| begin published, no effect | record at `intent` | any Barge replay re-proves and resumes the effect; conflicting work refuses at the consult |
+| quarantine rename, partial unlink | today's replay windows, unchanged | replay from the record's identity (stage 1 design, whole-unit deletion) |
+| effect terminal, before ack | `deleted`, finalize owed | the next drain dispatches; the handler settles; the ack is recorded |
+| caller settled, before ack recorded | registry terminal, record still owed | drain calls the idempotent handler again; it sees its own terminal state and acks |
+| handler unregistered / version mismatch | owed, intelligibly named | pending with caller, key, kind and version; never guessed, never executes unloaded code, never adds deletion authority |
+| volume absent / journal unreadable | pending; the consult refuses | attach or repair; nothing is inferred |
+
+Concurrency: two begins on one key — the second reads the first's record and
+resumes or reports it. Begin versus adopt — the consult refuses adopt while a
+pending record binds the checkout. Drain versus begin — the ack write re-reads
+the record and does nothing if it is already `complete`.
+
+### Who triggers recovery
+
+**Oxide running:** its admission consults and drains its namespace, its prune
+path begins or resumes its operations, its handler settles. **Barge alone**
+(CLI, `maintain` host job): generic replay resumes the effects of any pending
+record — including another caller's — and reports owed finalizations by
+namespace; it dispatches nothing and settles nothing. **A later process or
+third tool:** the same; a hook is data until its owning caller's code is
+linked and registered in that process.
+
+The PROPOSED replay change is narrow: today only the adapter may resume this
+family (`delete.rs:385`); under one journal the effects of any pending record
+are Barge-owned replay, while hook dispatch and settlement stay handler-only.
+A generic delete that is not a record's replay still refuses a delegated unit
+(`delete.rs:452`, `:516`) — this is the operation architecture, not a waiver
+of the existing safe deleter.
+
+### OLD → NEW removal map
+
+Sources: Barge at this repository's HEAD; Oxide read-only at PR 263 head
+`39211b4e1cef4abf9ea07f2ef1a4814ce6b0d3a0`.
+
+| Today | Proposed | Verdict |
+| --- | --- | --- |
+| Oxide schema-3 `deletion_routes`, and Barge's route reader (`DeletionRoute`, `reference.rs:525`; `OXIDE_REGISTRY_V3`, `:70`) | routing recorded once in the record | removed, both sides |
+| `prune-delegation/1` sidecars; Oxide `RequestStore` (225 lines) and `prune_request.rs` (334 lines, `Ready`/`Unavailable`) | the record's typed payload, persisted by Barge at begin | removed; the `Unavailable` variant and its absence-only lookup (`lookup_absence`, `oxide_outputs/absence.rs`) go with it — Barge unavailable means begin never happened, so Oxide skips the root with no durable state |
+| Oxide's covered-path `prune-intent/1`, the four-state `lookup` (`oxide_outputs.rs:338`), the same-call `Locked` rule and the reply correlation (`prune_barge.rs:154`–`:336`, `:593`) | one idempotent begin/state/drain answer | removed from the covered path; Oxide keeps its journal for local roots |
+| `unsettled_for` exclusion (`prune.rs:1158`) scanning Oxide intents | one bounded consult of Barge pending records | simplified; same call count, one authority |
+| paired-pool `/4` upgrade orchestration (`store.rs:2702`–`:2865`) and schema-3 validation | one-time adoption fence only | reduced; per-operation upgrade machinery removed |
+| Barge caller fields and `validate_caller` (`state.rs:1622`–`:1629`, `:1794`), `CallerCorrelation` (`state.rs:1654`), `check_binding`'s fourteen-way comparison (`oxide_outputs.rs:440`) | generic caller block; the record is the binding | generalized; consumer rules leave generic code |
+| `Outcome`'s six kinds and `BargeLookup`'s four states (`oxide_outputs.rs:223`–`:337`) | `Begun` / `OperationState` / `DrainReport` | replaced |
+
+Retained, with the caller's kept duties stated honestly: Barge's whole safe
+deleter and replay windows (`delete.rs`), the `oxide_outputs` marker family
+and area grant (`unit.rs:141`, `:326`), settled records and the row and byte
+caps, the fence and old-reader refusal, Oxide's registry/receipt history as
+domain state, and Oxide's local prune path with its own journal; on the
+caller's side, eligibility, the whole-group receipt settlement ordering inside
+its handler, the checkout barrier, the positive checkout-absence re-proof at
+begin and every replay, live and unknown-writer refusal, grant revocation (a
+revoked grant never resumes), whole-root group semantics, no local-delete
+fallback for delegated roots, and the exact root/volume/request binding.
+
+Counts. Durable artifacts per delegated operation: five → one (plus the static
+adoption fence). Durable writes: about ten → six. Crash boundaries in the
+owning table: twelve → seven. Caller obligations: publish sidecar, intent and
+route; first-versus-resumed `Locked` discrimination; four-state lookup;
+absence-only lookup; recovery dispatch; dual resolve prechecks; compaction and
+upgrade orchestration → eligibility, one begin, one idempotent handler, one
+consult. A second caller does not rebuild the protocol: a hypothetical Effigy
+scratch delegation declares its area grant, calls begin with caller
+`"effigy.scratch"` and hook `"conclude-run/1"` carrying its run ids, and
+registers one handler that concludes those run roots; exclusion and recovery
+come from the same journal and the same drain.
+
+### Counterexample considered
+
+The strongest case against: exclusion migrates from Oxide's journal to
+Barge's, so Oxide admission gains a dependency on Barge's state directory. But
+exclusion already required Barge-side facts at rollback and resolve today, and
+the consult is one read whose bounded refusal already exists — nothing is
+relocated that was not already joined; the two journals become one. If review
+finds the begin-authorization decision (dropping the registry re-read)
+unsound, the precise fallback is the shipped two-journal execution unchanged;
+there is no middle state to drift into.
+
+### Compatibility and staged delivery
+
+Barge051–055 stay historical; PR 56's shared scanner stays an orthogonal
+preserved candidate; Oxide PR 263 stays unmerged and preserved — if it merges,
+its machinery is this map's OLD column, and the scoped caller work then
+removes it. No live schema-3/fence-4 migration is assumed; none has shipped.
+An older Barge refuses a successor record major as unknown state (strict
+schema validation, unchanged); an older Oxide refuses at the adoption fence;
+new format numbers are set by implementation briefs, not guessed here. Pending
+two-journal operations drain under the shipped protocol before any successor
+format activates — the no-unfinished-predecessor rule, applied once.
+Implementation splits into: (1) Barge prerequisites — the operation record
+major, begin/state/drain, the narrow replay extension and regressions per
+crash window; (2) Oxide caller work — the begin call, the handler (today's
+`settle_deleted` ordering, `prune_barge.rs:479`), the consult, and the
+removals in the map; (3) bounded validation — crash-injection fixtures per
+window, concurrency traces, oversize, unregistered-handler, mismatch and
+refusal cases. Named risks: the journal now gates Oxide admission (truncation
+conservatively blocks; refuse-safe), payload-cap refusals and retention
+growth. No native apparatus is authored or activated by this design.
+
+### Owning-contract reconciliation text for Oxide (not edited here)
+
+> In `barge-adoption.md`, the sections "Persistence amendment for independent
+> review (oxide#304)" and "Recovery, retention and crash boundaries" are
+> superseded for the covered class by Barge's stage 4 design, "One operation
+> journal for delegated recovery": the caller keeps eligibility, the checkout
+> barrier and one idempotent finalize handler, and drops route publication, the
+> request sidecar, the covered-path intent journal, the absence-only query, the
+> same-call rule and the per-operation upgrade; `unsettled_for` consults
+> Barge's pending records. The adoption-time fence and old-reader refusal keep
+> their meanings.
+
+**Acceptance recommendation:** adopt the one-journal candidate as the target
+architecture for delegated recovery, delivered through the implementation
+split above under separate briefs and review. It is a net reduction, not a
+relocation: the second journal, the sidecar store, routes, the lookup pair and
+the same-call rule are removed, while the hook adds one trait and one field
+transition inside a record that already exists.
+
 ## Failure, race and cancellation matrix
 
 Every row is a rule the implementation must carry a test for. "Keeps" means the
