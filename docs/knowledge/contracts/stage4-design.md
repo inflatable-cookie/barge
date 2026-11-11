@@ -1342,10 +1342,12 @@ substitutes for original authority.
 without holding admission across a Barge wait: the caller takes the binding
 lock and guard(admission), computes the verdict with its own rules — the
 complete-group verification `journal_intent_with_route` performs under that
-guard (`prune.rs:7118`: complete registry, per-row flags clear, identity
-matching) plus the receipt committed and not placing the root and unknown-free
-pool custody — records the observed registry revision, and **releases the
-guard**. It calls `begin` (no Oxide lock held), then re-takes the guard for a
+guard (`prune.rs:7118`: complete registry, expected revision, per-row flags
+clear, identity matching), the per-row identity and flag facts and the
+cross-checkout live-reference scan `prune_barge::recheck` performs
+(`prune_barge.rs:358`–`:392`), the receipt committed and not placing the
+root, and unknown-free pool custody — records the observed registry revision,
+and **releases the guard**. The re-affirmation re-runs exactly this verdict. It calls `begin` (no Oxide lock held), then re-takes the guard for a
 bounded **re-affirmation**: the live revision equals the record's → proceed;
 it advanced → the full guarded eligibility re-runs — still eligible → the
 record's bound revision updates under Barge locks and the effect runs; the
@@ -1720,10 +1722,11 @@ same drain — no routes, no sidecars, no lookup pair, no Oxide protocol
 rebuilt.
 
 **Acceptance recommendation (decisive).** With the cross-checkout handoff
-proven by writer scope and serialization, cancellation made a retained
-transition, settlement atomic with the removal, and the coordination priced,
-the reset protocol is deliverable and this task's acceptance recommendation is
-**adopt it** as the target architecture for delegated recovery, through the
+closed by the writer-side fail-fast consults under every publication's own
+guard, cancellation made a retained transition, settlement atomic with the
+removal, and the coordination priced, the reset protocol is deliverable and
+this task's acceptance recommendation is **adopt it** as the target
+architecture for delegated recovery, through the
 implementation split above under separate briefs and review. The negative
 exit stays real, not rhetorical: if the retained review finds a concrete
 counterexample — an unresolved crash or concurrency window, or an integrity
