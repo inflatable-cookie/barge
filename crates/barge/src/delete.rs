@@ -2038,6 +2038,13 @@ fn replay_locked_operation(
             ));
         }
     }
+    // Restore only the modes bound to verified recorded captures before any
+    // marker or identity refusal can leave those directories widened.
+    if let Some(reason) =
+        restore_recorded_modes(dirs, &parent, handle.as_ref(), &intent, volume.device)?
+    {
+        return Ok(OperationReplay::Pending(reason));
+    }
     if record
         .owned_plan
         .as_ref()
@@ -2048,11 +2055,6 @@ fn replay_locked_operation(
         {
             return Ok(OperationReplay::Pending(reason));
         }
-    }
-    if let Some(reason) =
-        restore_recorded_modes(dirs, &parent, handle.as_ref(), &intent, volume.device)?
-    {
-        return Ok(OperationReplay::Pending(reason));
     }
     if let Err(reason) = custody::unit_holds_clear(state_paths, observer, &unit, bounds.custody) {
         return Ok(OperationReplay::Pending(reason));
@@ -8380,6 +8382,113 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn owned_replay_restores_recorded_mode_before_identity_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::operation::{self, OperationPhase};
+        let prepared = prepared("owned-replay-mode-before-identity");
+        plant_unit_contents(&prepared);
+        std::fs::set_permissions(prepared.unit_path(), std::fs::Permissions::from_mode(0o500))
+            .expect("the original unit is read-only");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+        let evidence = evidence_for(&prepared);
+        let reprove = |_: &crate::registry::VolumeRecord| Ok(None);
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks).expect("initialize");
+        let begun = super::begin_owned_from_checked_plan(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &prepared.unit,
+            &declared,
+            &evidence,
+            true,
+            false,
+            &reprove,
+            prepared.bounds(),
+        )
+        .expect("checked owned begin");
+        let view =
+            operation::read_operations(&dirs, &observer, state, crate::contract::INTENT_ROWS)
+                .expect("journal reads")
+                .expect("initialized");
+        dirs.failing_listing_after_mode();
+        let stopped = super::execute_bound_operation(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &view.identity,
+            begun.record(),
+            Some(&reprove),
+            prepared.bounds(),
+        )
+        .expect("the interrupted walk reports its outcome");
+        assert_eq!(stopped.outcome, DeleteOutcome::Pending, "{stopped:?}");
+        let leaf = stopped.quarantine;
+        assert_eq!(mode_of(&leaf), 0o500, "the abort guard restored the mode");
+        let before =
+            operation::read_operations(&dirs, &observer, state, crate::contract::INTENT_ROWS)
+                .expect("journal reads")
+                .expect("initialized")
+                .records
+                .remove(0);
+        assert_eq!(before.phase, OperationPhase::Renamed);
+        assert!(before.owned_plan.as_ref().expect("plan").requires_identity);
+        assert!(before
+            .captures
+            .iter()
+            .any(|capture| capture.mode == Some(0o040500)));
+
+        // Model a stop after the recorded chmod, and invalidate the original
+        // marker before replay. The recorded inode still identifies the leaf.
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o700))
+            .expect("the interrupted leaf is widened");
+        let marker_path = leaf.join(ROOT_MARKER_FILE);
+        let mut marker: crate::area::RootMarker =
+            serde_json::from_slice(&std::fs::read(&marker_path).expect("the marker reads"))
+                .expect("the marker decodes");
+        marker.created_ms = marker.created_ms.saturating_add(1);
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&marker).expect("encode marker"),
+        )
+        .expect("the changed marker is written");
+
+        let rows = super::drain_checked_operations(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &[],
+            prepared.bounds(),
+        )
+        .expect("drain");
+        assert!(
+            matches!(&rows[0].outcome, super::OperationDrainOutcome::Pending(reason)
+            if reason.contains("marker is not the recorded bytes")),
+            "{rows:?}"
+        );
+        assert_eq!(
+            mode_of(&leaf),
+            0o500,
+            "identity refusal restores the recorded mode"
+        );
+        assert!(leaf.join("payload.txt").is_file(), "nothing was unlinked");
+        let after =
+            operation::read_operations(&dirs, &observer, state, crate::contract::INTENT_ROWS)
+                .expect("journal reads")
+                .expect("initialized")
+                .records
+                .remove(0);
+        assert_eq!(after, before, "the pending operation is not advanced");
     }
 
     #[test]

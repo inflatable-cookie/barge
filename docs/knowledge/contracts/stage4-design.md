@@ -1208,6 +1208,8 @@ the successor journal without publishing a legacy intent. Checked delegated
 begin, execution and post-capture replay now use that walk. Intent-phase
 recovery requires the caller's fresh guarded reaffirmation; a missing capture
 without the recorded `removed` phase remains pending.
+Post-capture replay restores verified recorded modes before a marker or
+identity refusal, so a pending captured directory is not left widened.
 Exact delegated state lookup refuses changed request or handler bindings even
 for terminal records. The in-progress cancellation entry retains a cancelled
 record only after taking journal, volume and unit custody and verifying the
