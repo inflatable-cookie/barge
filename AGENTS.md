@@ -212,9 +212,14 @@ guarded exception. Each selector covers what it names:
   fresh private per-run fixture directory under the run's own TMPDIR, with
   the real 0755/0700 guard layout materialized inside that fixture; the
   module's designated scratch points into the fixture for the duration of
-  each control, a write-audit control rejects any write outside the run's
-  temporary areas, and no entry is ever created in the shared designated
-  scratch root.
+  each control, every harness fixture is closed deterministically (never by
+  the garbage collector), and a write-audit control judges only the audited
+  call's own capture window — collection is flushed before and suspended
+  inside the window, the window's fixture stays alive through it, and any
+  write outside the audited composition's own fixture (or any fd-relative
+  event that cannot be attributed to a location) refuses — so no entry is
+  ever created in the shared designated scratch root, and forced-GC runs
+  return the same verdict the ordinary run does.
 - `effigy journal:native` and `effigy journal:native:diagnostic` — the
   operation journal's one bounded native, journal-only, on fresh private
   filesystem fixtures inside the guard's owned scratch under the same

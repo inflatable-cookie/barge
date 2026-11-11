@@ -62,6 +62,7 @@ owner-activated diagnostic.
 
 import argparse
 import contextlib
+import gc
 import hashlib
 import importlib.util
 import json
@@ -1339,9 +1340,14 @@ def run_outer(harness, mode="counted"):
     is installed as the process's external world for the call, so
     `OuterEffects.from_environment()` and the guard child's
     `InnerEffects.from_environment()` are both the production factories and
-    only the leaf external queries are scripted."""
-    with harness.real_factory():
-        return outer_half(mode, OuterEffects.from_environment())
+    only the leaf external queries are scripted. The harness is owned here:
+    its fixture is closed deterministically when the run returns, never
+    left to the garbage collector."""
+    try:
+        with harness.real_factory():
+            return outer_half(mode, OuterEffects.from_environment())
+    finally:
+        harness.cleanup()
 
 
 def all_cases_unexecuted(receipt):
@@ -1796,148 +1802,154 @@ def composition_controls():
     harness = control_harness()
     harness.env[base.WALL_DEADLINE_ENV] = str(
         harness.monotonic_ns_value + 10_000 * 10 ** 9)
-    with harness.real_factory():
-        effects = InnerEffects.from_environment()
-        run_root = os.path.join(harness.fixture_root, "stage-run")
-        os.makedirs(run_root)
-        staged = os.path.join(run_root, "pool", DRIVER_NAME)
-        os.makedirs(os.path.dirname(staged))
-        with open(staged, "wb") as handle:
-            handle.write(b"\xcf\xfa\xed\xfe journal-proof binary-as-data"
-                         b" (hashed, never executed)")
-        with open(staged, "rb") as handle:
-            fixture_digest = hashlib.sha256(handle.read()).hexdigest()
-        harness.stage_output = (json.dumps({
-            "reason": "compiler-artifact",
-            "target": {"kind": ["example"], "crate_types": ["bin"],
-                       "name": DRIVER_NAME, "edition": "2021"},
-            "features": [PROOF_FEATURE],
-            "executable": staged}) + "\n")
-        receipt = run_cases_inner("counted", run_root, effects,
-                                  int(harness.env[base.WALL_DEADLINE_ENV]))
-        expect(receipt.get("qualified_inner") is True,
-               "the real-factory composition did not qualify")
-        expect(len(receipt.get("cases", [])) == len(CASES)
-               and all(c.get("status") == "passed" for c in receipt["cases"]),
-               "the real-factory composition did not pass all twelve groups")
-        expect((receipt.get("manifest") or {}).get("binary_sha256")
-               == fixture_digest,
-               "the manifest does not carry the real staged binary's digest")
-        expect(all(receipt.get("pre_stage_identity", {}).get(key)
-                   == (receipt.get("manifest") or {}).get(key)
-                   for key in ("store_source_sha256", "driver_source_sha256")),
-               "the pre-stage and post-stage identities disagree on a clean run")
-        build = harness.build_calls[0]
-        expect(build["command"] == STAGE_COMMAND,
-               "the real adapter did not run the exact managed build command")
-        expect(build["env"].get("RUSTUP_TOOLCHAIN") == TOOLCHAIN_CHANNEL
-               and build["env"].get("CARGO_NET_OFFLINE") == "true"
-               and build["env"].get("TMPDIR")
-               == os.path.join(run_root, "stage-tmp"),
-               "the real adapter did not apply the stage env scrub")
-        expect(build["timeout"] == STAGE_BASE_TIMEOUT,
-               "the stage timeout was not the remaining-capped base")
-        expect(harness.sequence[0] == "stage",
-               "the stage did not precede the case children in the sequence")
-        expect(harness.stage_timeouts == [STAGE_BASE_TIMEOUT],
-               "the stage child ran with a wrong timeout")
-        expect(harness.case_timeouts == [CASE_BASE_TIMEOUT] * len(CASES),
-               "the case children did not run at the remaining-capped base")
-        expect(harness.digest_calls.count(staged) == 2,
-               "the staged binary was not hashed at stage time and re-hashed "
-               "before the first case")
+    try:
+        with harness.real_factory():
+            effects = InnerEffects.from_environment()
+            run_root = os.path.join(harness.fixture_root, "stage-run")
+            os.makedirs(run_root)
+            staged = os.path.join(run_root, "pool", DRIVER_NAME)
+            os.makedirs(os.path.dirname(staged))
+            with open(staged, "wb") as handle:
+                handle.write(b"\xcf\xfa\xed\xfe journal-proof binary-as-data"
+                             b" (hashed, never executed)")
+            with open(staged, "rb") as handle:
+                fixture_digest = hashlib.sha256(handle.read()).hexdigest()
+            harness.stage_output = (json.dumps({
+                "reason": "compiler-artifact",
+                "target": {"kind": ["example"], "crate_types": ["bin"],
+                           "name": DRIVER_NAME, "edition": "2021"},
+                "features": [PROOF_FEATURE],
+                "executable": staged}) + "\n")
+            receipt = run_cases_inner("counted", run_root, effects,
+                                      int(harness.env[base.WALL_DEADLINE_ENV]))
+            expect(receipt.get("qualified_inner") is True,
+                   "the real-factory composition did not qualify")
+            expect(len(receipt.get("cases", [])) == len(CASES)
+                   and all(c.get("status") == "passed" for c in receipt["cases"]),
+                   "the real-factory composition did not pass all twelve groups")
+            expect((receipt.get("manifest") or {}).get("binary_sha256")
+                   == fixture_digest,
+                   "the manifest does not carry the real staged binary's digest")
+            expect(all(receipt.get("pre_stage_identity", {}).get(key)
+                       == (receipt.get("manifest") or {}).get(key)
+                       for key in ("store_source_sha256", "driver_source_sha256")),
+                   "the pre-stage and post-stage identities disagree on a clean run")
+            build = harness.build_calls[0]
+            expect(build["command"] == STAGE_COMMAND,
+                   "the real adapter did not run the exact managed build command")
+            expect(build["env"].get("RUSTUP_TOOLCHAIN") == TOOLCHAIN_CHANNEL
+                   and build["env"].get("CARGO_NET_OFFLINE") == "true"
+                   and build["env"].get("TMPDIR")
+                   == os.path.join(run_root, "stage-tmp"),
+                   "the real adapter did not apply the stage env scrub")
+            expect(build["timeout"] == STAGE_BASE_TIMEOUT,
+                   "the stage timeout was not the remaining-capped base")
+            expect(harness.sequence[0] == "stage",
+                   "the stage did not precede the case children in the sequence")
+            expect(harness.stage_timeouts == [STAGE_BASE_TIMEOUT],
+                   "the stage child ran with a wrong timeout")
+            expect(harness.case_timeouts == [CASE_BASE_TIMEOUT] * len(CASES),
+                   "the case children did not run at the remaining-capped base")
+            expect(harness.digest_calls.count(staged) == 2,
+                   "the staged binary was not hashed at stage time and re-hashed "
+                   "before the first case")
 
-        # The retired keyword/return contract must fail against the real
-        # factory: no `run_stage_child` executor with the old `(env=,
-        # run_root=, timeout=)` stage-record shape can resolve, and a
-        # CompletedProcess can never stand in for the stage record.
-        try:
-            effects.run_stage_child(env=effects.env, run_root="ignored",
-                                    timeout=STAGE_BASE_TIMEOUT)
-            expect(False, "the retired stage executor keyword contract still resolved")
-        except AttributeError:
-            expect(True, "")
+            # The retired keyword/return contract must fail against the real
+            # factory: no `run_stage_child` executor with the old `(env=,
+            # run_root=, timeout=)` stage-record shape can resolve, and a
+            # CompletedProcess can never stand in for the stage record.
+            try:
+                effects.run_stage_child(env=effects.env, run_root="ignored",
+                                        timeout=STAGE_BASE_TIMEOUT)
+                expect(False, "the retired stage executor keyword contract still resolved")
+            except AttributeError:
+                expect(True, "")
 
-        # The factory's seam wiring, behaviorally: identity produces the
-        # source-binding shape, the digest hashes real bytes, directory
-        # creation lands under its parent, and the process seam receives
-        # (command, env, timeout) positionally. A mis-wired factory —
-        # swapped identity/digest positions, a reordered constructor — fails
-        # here instead of crashing a real receipt-less inner.
-        identity = effects.identity_fn()
-        expect(isinstance(identity, dict)
-               and {"head", "tree", "store_source_sha256",
-                    "driver_source_sha256"} <= set(identity),
-               "the factory's identity seam does not produce the source binding")
-        probe_path = os.path.join(harness.fixture_root, "wiring-probe")
-        with open(probe_path, "wb") as handle:
-            handle.write(b"wiring probe bytes")
-        expect(effects.digest_fn(probe_path)
-               == hashlib.sha256(b"wiring probe bytes").hexdigest(),
-               "the factory's digest seam does not hash real bytes")
-        wiring_parent = os.path.join(harness.fixture_root, "wiring-parent")
-        os.makedirs(wiring_parent, exist_ok=True)
-        made_directory = effects.make_directory(wiring_parent, "wiring-child-")
-        expect(os.path.isdir(made_directory)
-               and made_directory.startswith(wiring_parent + os.sep),
-               "the factory's directory seam does not create under its parent")
-        effects.run_process(["oxide", "build"], {"WIRING": "1"}, 5.0)
-        wiring_call = harness.build_calls[-1]
-        expect(wiring_call["command"] == ["oxide", "build"]
-               and wiring_call["env"] == {"WIRING": "1"}
-               and wiring_call["timeout"] == 5.0,
-               "the factory's process seam is not (command, env, timeout)")
+            # The factory's seam wiring, behaviorally: identity produces the
+            # source-binding shape, the digest hashes real bytes, directory
+            # creation lands under its parent, and the process seam receives
+            # (command, env, timeout) positionally. A mis-wired factory —
+            # swapped identity/digest positions, a reordered constructor —
+            # fails here instead of crashing a real receipt-less inner.
+            identity = effects.identity_fn()
+            expect(isinstance(identity, dict)
+                   and {"head", "tree", "store_source_sha256",
+                        "driver_source_sha256"} <= set(identity),
+                   "the factory's identity seam does not produce the source binding")
+            probe_path = os.path.join(harness.fixture_root, "wiring-probe")
+            with open(probe_path, "wb") as handle:
+                handle.write(b"wiring probe bytes")
+            expect(effects.digest_fn(probe_path)
+                   == hashlib.sha256(b"wiring probe bytes").hexdigest(),
+                   "the factory's digest seam does not hash real bytes")
+            wiring_parent = os.path.join(harness.fixture_root, "wiring-parent")
+            os.makedirs(wiring_parent, exist_ok=True)
+            made_directory = effects.make_directory(wiring_parent, "wiring-child-")
+            expect(os.path.isdir(made_directory)
+                   and made_directory.startswith(wiring_parent + os.sep),
+                   "the factory's directory seam does not create under its parent")
+            effects.run_process(["oxide", "build"], {"WIRING": "1"}, 5.0)
+            wiring_call = harness.build_calls[-1]
+            expect(wiring_call["command"] == ["oxide", "build"]
+                   and wiring_call["env"] == {"WIRING": "1"}
+                   and wiring_call["timeout"] == 5.0,
+                   "the factory's process seam is not (command, env, timeout)")
+    finally:
+        harness.cleanup()
 
     # The real stage adapter's failure matrix through the same real factory:
     # nonzero build, timeout, spawn OSError, and wrong/missing/duplicate/
     # unfeatured artifacts all fault the adapter as bounded stage faults.
     harness = control_harness()
-    with harness.real_factory():
-        effects_stage = InnerEffects.from_environment()
-        fault_root = os.path.join(harness.fixture_root, "adapter-faults")
-        os.makedirs(fault_root, exist_ok=True)
+    try:
+        with harness.real_factory():
+            effects_stage = InnerEffects.from_environment()
+            fault_root = os.path.join(harness.fixture_root, "adapter-faults")
+            os.makedirs(fault_root, exist_ok=True)
 
-        def stage_fault(expected_detail):
-            try:
-                effects_stage.stage(env=effects_stage.env, run_root=fault_root,
-                                    timeout=min(STAGE_BASE_TIMEOUT, 90.0))
-                expect(False, expected_detail + " did not fault the real adapter")
-            except Fault as error:
-                expect(error.kind == "stage",
-                       expected_detail + " was not a bounded stage fault")
+            def stage_fault(expected_detail):
+                try:
+                    effects_stage.stage(env=effects_stage.env, run_root=fault_root,
+                                        timeout=min(STAGE_BASE_TIMEOUT, 90.0))
+                    expect(False, expected_detail + " did not fault the real adapter")
+                except Fault as error:
+                    expect(error.kind == "stage",
+                           expected_detail + " was not a bounded stage fault")
 
-        def artifact_line(**overrides):
-            document = {"reason": "compiler-artifact",
-                        "target": {"kind": ["example"], "crate_types": ["bin"],
-                                   "name": DRIVER_NAME, "edition": "2021"},
-                        "features": [PROOF_FEATURE],
-                        "executable": "/stage/" + DRIVER_NAME}
-            document.update(overrides)
-            return json.dumps(document) + "\n"
+            def artifact_line(**overrides):
+                document = {"reason": "compiler-artifact",
+                            "target": {"kind": ["example"], "crate_types": ["bin"],
+                                       "name": DRIVER_NAME, "edition": "2021"},
+                            "features": [PROOF_FEATURE],
+                            "executable": "/stage/" + DRIVER_NAME}
+                document.update(overrides)
+                return json.dumps(document) + "\n"
 
-        harness.build_returncode = 101
-        stage_fault("a failed stage build")
-        harness.build_returncode = 0
+            harness.build_returncode = 101
+            stage_fault("a failed stage build")
+            harness.build_returncode = 0
 
-        harness.stage_raise = subprocess.TimeoutExpired(STAGE_COMMAND, 90.0)
-        stage_fault("a stage build timeout")
-        harness.stage_raise = OSError("the adapter spawn refusal")
-        stage_fault("a stage spawn OSError")
-        harness.stage_raise = None
+            harness.stage_raise = subprocess.TimeoutExpired(STAGE_COMMAND, 90.0)
+            stage_fault("a stage build timeout")
+            harness.stage_raise = OSError("the adapter spawn refusal")
+            stage_fault("a stage spawn OSError")
+            harness.stage_raise = None
 
-        for label, output in (
-                ("a missing journal_proof artifact", ""),
-                ("a bin-kind artifact (wrong target kind)",
-                 artifact_line(target={"kind": ["bin"], "name": DRIVER_NAME,
-                                       "crate_types": ["bin"],
-                                       "edition": "2021"})),
-                ("duplicate journal_proof artifacts",
-                 artifact_line() + artifact_line()),
-                ("an artifact without the proof feature",
-                 artifact_line(features=["default"]))):
-            harness.stage_output = output
-            stage_fault(label)
-        harness.stage_output = artifact_line()
+            for label, output in (
+                    ("a missing journal_proof artifact", ""),
+                    ("a bin-kind artifact (wrong target kind)",
+                     artifact_line(target={"kind": ["bin"], "name": DRIVER_NAME,
+                                           "crate_types": ["bin"],
+                                           "edition": "2021"})),
+                    ("duplicate journal_proof artifacts",
+                     artifact_line() + artifact_line()),
+                    ("an artifact without the proof feature",
+                     artifact_line(features=["default"]))):
+                harness.stage_output = output
+                stage_fault(label)
+            harness.stage_output = artifact_line()
+    finally:
+        harness.cleanup()
 
     # An unexpected adapter exception (outside Fault/TimeoutExpired/OSError)
     # must still land as a bounded first/secondary infrastructure fault with
@@ -1968,11 +1980,20 @@ def composition_controls():
 
     # Fixture isolation under the platform's write audit: one full counted
     # composition through the real factories writes only inside this run's
-    # own fixture and temporary areas — the shared designated scratch root
+    # own fixture — the shared designated scratch root (and everything else)
     # sees nothing, which is exactly the regression the audit-hook
-    # reproduction caught at the previous head.
+    # reproduction caught two heads ago.
+    #
+    # The capture is scoped so only writes made by the audited call are
+    # judged: garbage-collected fixture teardown from other controls is
+    # neither in the window nor misclassified. Pending collections are
+    # flushed before the window, collection is suspended for the window
+    # (restored after), the audited call's own harness fixture stays alive
+    # for the whole capture, and the harness is closed deterministically
+    # outside the window — never by GC. Teardown events carry fd-relative
+    # names that cannot be attributed to a location; such an event inside
+    # the window is refused as unattributable rather than blanket-ignored.
     harness = control_harness()
-    shared_designated = harness.saved_designated
     write_events = []
 
     def write_audit(event, args):
@@ -1992,30 +2013,32 @@ def composition_controls():
                     write_events.append((event, value))
 
     sys.addaudithook(write_audit)
-    window_start = len(write_events)
-    exit_code, _ignored_receipt = run_outer(harness)
-    window = write_events[window_start:]
+    gc_was_enabled = gc.isenabled()
+    gc.collect()
+    gc.disable()
+    try:
+        with harness.real_factory():
+            window_start = len(write_events)
+            exit_code, _ignored_receipt = outer_half("counted",
+                                                     OuterEffects.from_environment())
+            window = write_events[window_start:]
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+    harness.cleanup()
     expect(exit_code == 0, "the audited clean run did not pass")
-    outside_roots = (harness.fixture_root + os.sep,
-                     tempfile.gettempdir() + os.sep,
-                     os.devnull)
+    allowed_roots = (harness.fixture_root + os.sep,)
     stray = [entry for entry in window
-             if not any(entry[1].startswith(root) for root in outside_roots)
-             and entry[1] != os.devnull]
+             if os.path.isabs(entry[1])
+             and not any(entry[1].startswith(root) or entry[1] == os.devnull
+                         for root in allowed_roots)]
     expect(not stray,
-           f"the effect-free selector wrote outside its private fixture: "
-           f"{stray[:4]}")
-    # This run's own temporary area lives under the shared designated root,
-    # so the shared-root regression is specifically an entry under the shared
-    # root but outside this run's temporary area — the direct shared-root
-    # layout the previous head created (journal-guard/... directly in the
-    # shared root).
-    shared_writes = [entry for entry in window
-                     if entry[1].startswith(shared_designated + os.sep)
-                     and not entry[1].startswith(tempfile.gettempdir() + os.sep)]
-    expect(not shared_writes,
-           "the effect-free selector created entries in the shared "
-           "designated scratch root")
+           f"the audited composition wrote outside its own private fixture "
+           f"(the shared designated scratch root included): {stray[:4]}")
+    unattributable = [entry for entry in window if not os.path.isabs(entry[1])]
+    expect(not unattributable,
+           f"the audited window recorded fd-relative writes that cannot be "
+           f"attributed to a location: {unattributable[:4]}")
 
     # The real reader: the containment checks must hold against the REAL
     # InnerEffects.guard_facts — where the symlink regression sat — on a tiny
@@ -2371,8 +2394,9 @@ def main(argv):
               "child process; the only storage is a set of fresh private "
               "per-run fixture directories under this run's own TMPDIR — "
               "one per harness, with each harness's real guard layout "
-              "materialized inside its own fixture — and no entry is ever "
-              "created in the shared designated scratch root)")
+              "materialized inside its own fixture and closed "
+              "deterministically — and no entry is ever created in the "
+              "shared designated scratch root)")
         return 0
     if arguments.plan:
         print(json.dumps(plan_document(), indent=2))

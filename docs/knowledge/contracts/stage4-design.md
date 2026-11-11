@@ -1287,9 +1287,13 @@ no effect behind it:
   hashed but never executed. Each control harness owns one fresh private
   per-run fixture directory under the run's own TMPDIR, with the real guard
   layout materialized inside that fixture and the module's designated
-  scratch pointed into it for the control's duration; a write-audit control
-  rejects any write outside the run's temporary areas, and no entry is ever
-  created in the shared designated scratch root. The
+  scratch pointed into it for the control's duration; harness fixtures are
+  closed deterministically, and a write-audit control judges only the
+  audited call's capture window (collection flushed before, suspended
+  inside), refusing any write outside the audited composition's own fixture
+  and any unattributable fd-relative event — so no entry is ever created in
+  the shared designated scratch root and forced-GC runs keep test and plan
+  outcomes equal. The
   driver is the `journal_proof` example behind the proof-only `proof-journal`
   feature; `effigy journal:native:test` and `journal:native:plan` are
   effect-free, and `journal:native` / `journal:native:diagnostic` are HELD
