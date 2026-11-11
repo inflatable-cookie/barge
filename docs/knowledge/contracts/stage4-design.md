@@ -1274,11 +1274,22 @@ no effect behind it:
   mismatch the first actual diagnostic occurrence died on at `a279031`, spent
   failed and preserved) lands as a bounded infrastructure fault whose receipt,
   all-unexecuted rows and available pre-stage binding still publish — never
-  an unhandled crash without a receipt. The composition controls instantiate
-  the real `InnerEffects` factory and drive the actual inner composition with
-  only the external subprocess/Git/clock/storage seams faked: the fake runner
-  supplies raw Cargo artifact JSON, never a preconstructed stage record, and
-  the fixture binary is real data that is hashed but never executed. The
+  an unhandled crash without a receipt; the pre-stage source-identity
+  capture is bounded the same way, so an unreadable identity (a refusing or
+  failing git query) lands as a bounded source fault with no manifest and no
+  fabricated binding. The composition controls instantiate the REAL
+  `OuterEffects.from_environment()` / `InnerEffects.from_environment()`
+  factories and drive the actual inner composition with only the external
+  process, Git, clock, route and storage queries scripted at named
+  module-level query points — no factory is replaced, no stage record is
+  faked, and the fake runner supplies raw Cargo artifact JSON, never a
+  preconstructed stage record, over a fixture binary that is real data
+  hashed but never executed. Each control harness owns one fresh private
+  per-run fixture directory under the run's own TMPDIR, with the real guard
+  layout materialized inside that fixture and the module's designated
+  scratch pointed into it for the control's duration; a write-audit control
+  rejects any write outside the run's temporary areas, and no entry is ever
+  created in the shared designated scratch root. The
   driver is the `journal_proof` example behind the proof-only `proof-journal`
   feature; `effigy journal:native:test` and `journal:native:plan` are
   effect-free, and `journal:native` / `journal:native:diagnostic` are HELD

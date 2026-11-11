@@ -61,11 +61,13 @@ owner-activated diagnostic.
 """
 
 import argparse
+import contextlib
 import hashlib
 import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -276,6 +278,74 @@ class Fault(Exception):
         self.detail = detail
 
 
+# ---------- the external queries ----------
+# One real implementation per external query, named at module level. The
+# from_environment factories close over exactly these names, so the controls
+# never replace a factory: they instantiate the REAL
+# `OuterEffects.from_environment()` / `InnerEffects.from_environment()` and
+# script only these leaf query points (process, Git, clock, route, storage).
+# Anything else — env scrub, artifact parsing, digests, containment, the
+# whole composition — runs as it runs in production.
+
+def external_environment():
+    return dict(os.environ)
+
+
+def external_clock_ns():
+    return time.monotonic_ns()
+
+
+def external_run_process(command, env, timeout):
+    return subprocess.run(command, env=env, capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def external_run_guarded(command, env):
+    return subprocess.run(command, env=env, capture_output=True, text=True)
+
+
+def external_supervisor_digest():
+    digest = hashlib.sha256()
+    with open(base.supervisor_path(), "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def external_route_facts():
+    return base.scratch_route_facts()
+
+
+def external_effective_uid():
+    return os.getuid()
+
+
+def external_git(arguments):
+    result = subprocess.run(["git", *arguments], cwd=REPO_ROOT,
+                            capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise Fault("source",
+                    f"git {' '.join(arguments)} failed: {result.stderr[-200:]}")
+    return result.stdout.strip()
+
+
+def external_sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def external_make_directory(parent, prefix):
+    return tempfile.mkdtemp(prefix=prefix, dir=parent)
+
+
+def external_write_file(path, text):
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
 class OuterEffects:
     """The unguarded entry's external seams: this process's environment, the
     clock (the same monotonic_ns domain the inner reads), the one guarded
@@ -293,19 +363,9 @@ class OuterEffects:
     def from_environment():
         environment = dict(os.environ)
 
-        def run_guarded(command, env):
-            return subprocess.run(command, env=env, capture_output=True,
-                                  text=True)
-
-        def supervisor_digest():
-            digest = hashlib.sha256()
-            with open(base.supervisor_path(), "rb") as handle:
-                for chunk in iter(lambda: handle.read(1 << 20), b""):
-                    digest.update(chunk)
-            return digest.hexdigest()
-
-        return OuterEffects(environment, time.monotonic_ns, run_guarded,
-                            supervisor_digest, base.scratch_route_facts)
+        return OuterEffects(external_environment(), external_clock_ns,
+                            external_run_guarded, external_supervisor_digest,
+                            external_route_facts)
 
 
 class InnerEffects:
@@ -349,39 +409,19 @@ class InnerEffects:
 
     @staticmethod
     def from_environment():
-        environment = dict(os.environ)
+        environment = external_environment()
 
         def run_process(command, env, timeout):
-            return subprocess.run(command, env=env, capture_output=True,
-                                  text=True, timeout=timeout)
+            return external_run_process(command, env, timeout)
 
         def make_directory(parent, prefix):
-            return tempfile.mkdtemp(prefix=prefix, dir=parent)
+            return external_make_directory(parent, prefix)
 
         def identity_fn():
-            def git(arguments):
-                result = subprocess.run(["git", *arguments], cwd=REPO_ROOT,
-                                        capture_output=True, text=True, timeout=60)
-                if result.returncode != 0:
-                    raise Fault("source",
-                                f"git {' '.join(arguments)} failed: {result.stderr[-200:]}")
-                return result.stdout.strip()
-
-            def sha256_file(path):
-                digest = hashlib.sha256()
-                with open(path, "rb") as handle:
-                    for chunk in iter(lambda: handle.read(1 << 20), b""):
-                        digest.update(chunk)
-                return digest.hexdigest()
-
-            return source_identity(git, sha256_file)
+            return source_identity(external_git, external_sha256_file)
 
         def digest_fn(path):
-            digest = hashlib.sha256()
-            with open(path, "rb") as handle:
-                for chunk in iter(lambda: handle.read(1 << 20), b""):
-                    digest.update(chunk)
-            return digest.hexdigest()
+            return external_sha256_file(path)
 
         def guard_facts(scratch, evidence):
             """What the host says about the guard-supplied directories, in the
@@ -418,7 +458,7 @@ class InnerEffects:
                 }
 
             facts = {
-                "uid": os.getuid(),
+                "uid": external_effective_uid(),
                 "volume_uuid": route.get("volume_uuid"),
                 "path": scratch,
                 "root_parent": os.path.realpath(DESIGNATED_SCRATCH),
@@ -429,10 +469,9 @@ class InnerEffects:
             return facts
 
         def write_file(path, text):
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(text)
+            external_write_file(path, text)
 
-        return InnerEffects(environment, time.monotonic_ns, make_directory,
+        return InnerEffects(environment, external_clock_ns, make_directory,
                             run_process, identity_fn, digest_fn,
                             guard_facts, write_file)
 
@@ -729,38 +768,51 @@ def run_cases_inner(mode, run_root, effects, deadline_ns):
     fault = None
     stage_record = None
     manifest = None
+    pre_stage = None
+    stage_blocked_detail = None
     # The pre-stage identity is captured BEFORE the stage in every path: the
     # manifest minted after the build must equal it, so a checkout change
-    # during the build is drift and refuses.
-    pre_stage = effects.identity_fn()
+    # during the build is drift and refuses. The capture itself is bounded:
+    # a source seam failure (the real git query refusing, or any other
+    # error) lands as a bounded source fault with its receipt — it never
+    # escapes this composition without evidence.
+    try:
+        pre_stage = effects.identity_fn()
+    except Fault as error:
+        fault = error
+    except Exception as error:  # noqa: BLE001 - bounded by contract
+        fault = Fault("source",
+                      f"the pre-stage source identity could not be read: "
+                      f"{type(error).__name__}: {error}")
 
-    remaining = remaining_seconds(effects, deadline_ns)
-    stage_blocked_detail = None
-    if not spawn_allowed(remaining):
-        stage_blocked_detail = "no guarded wall left to stage inside the closure margin"
-    else:
-        try:
-            stage_record = effects.stage(env=effects.env, run_root=run_root,
-                                         timeout=child_timeout(remaining, STAGE_BASE_TIMEOUT))
-            manifest = effects.identity_fn()
-            drifts = identity_drift(pre_stage, manifest)
-            if drifts:
-                raise Fault("drift",
-                            f"the checkout changed during the in-guard stage: "
-                            f"{', '.join(drifts)}")
-            manifest["binary_sha256"] = stage_record["binary_sha256"]
-            incomplete = manifest_complete(manifest)
-            if incomplete:
-                raise Fault("manifest", "; ".join(incomplete))
-            # The staged pool binary is re-hashed before the first case: a
-            # replaced binary is drift, never the manifest's evidence.
-            if effects.digest_fn(stage_record["binary"]) != stage_record["binary_sha256"]:
-                raise Fault("drift", "the staged binary changed after the stage")
-        except Fault as error:
-            fault = error
-        except Exception as error:  # noqa: BLE001 - bounded by contract
-            fault = Fault("stage",
-                          f"the stage adapter failed unexpectedly: {error!r}")
+    if fault is None:
+        remaining = remaining_seconds(effects, deadline_ns)
+        stage_blocked_detail = None
+        if not spawn_allowed(remaining):
+            stage_blocked_detail = "no guarded wall left to stage inside the closure margin"
+        else:
+            try:
+                stage_record = effects.stage(env=effects.env, run_root=run_root,
+                                             timeout=child_timeout(remaining, STAGE_BASE_TIMEOUT))
+                manifest = effects.identity_fn()
+                drifts = identity_drift(pre_stage, manifest)
+                if drifts:
+                    raise Fault("drift",
+                                f"the checkout changed during the in-guard stage: "
+                                f"{', '.join(drifts)}")
+                manifest["binary_sha256"] = stage_record["binary_sha256"]
+                incomplete = manifest_complete(manifest)
+                if incomplete:
+                    raise Fault("manifest", "; ".join(incomplete))
+                # The staged pool binary is re-hashed before the first case: a
+                # replaced binary is drift, never the manifest's evidence.
+                if effects.digest_fn(stage_record["binary"]) != stage_record["binary_sha256"]:
+                    raise Fault("drift", "the staged binary changed after the stage")
+            except Fault as error:
+                fault = error
+            except Exception as error:  # noqa: BLE001 - bounded by contract
+                fault = Fault("stage",
+                              f"the stage adapter failed unexpectedly: {error!r}")
 
     if fault is None:
         for case in CASES:
@@ -844,7 +896,7 @@ def run_cases_inner(mode, run_root, effects, deadline_ns):
         "schema": SCHEMA,
         "stage": "inner",
         "mode": mode,
-        "pre_stage_identity": dict(pre_stage),
+        "pre_stage_identity": dict(pre_stage) if isinstance(pre_stage, dict) else None,
         "manifest": manifest,
         "run_root": run_root,
         "qualified_inner": bool(clean),
@@ -1027,16 +1079,25 @@ def run_inner(arguments):
 # ---------- effect-free controls through the actual entries ----------
 
 class ControlHarness:
-    """The faked external seams for the actual `outer_half` and
+    """The scripted external world for the actual `outer_half` and
     `inner_half`.
 
     O1: the harness's outer environment carries no guard-created variables,
     so `outer_half` must run exactly as the genuine Effigy entry would. Its
     one guarded launch is "executed" by really running the actual
-    `inner_half` with an `InnerEffects` whose environment carries the
-    guard-supplied scratch, evidence and wall deadline, and whose stage and
-    case children, clock, storage, identity and digest are scripted at the
-    executor boundary. No other seam is faked."""
+    `inner_half` — through the REAL `InnerEffects.from_environment()`
+    factory over the guard-constructed child environment — with only the
+    leaf external queries scripted: the subprocess runner (raw Cargo artifact
+    JSON and raw case verdicts), Git, the clock, the supervisor/route
+    queries, directory creation and receipt publication. No factory is ever
+    replaced and no stage record is ever faked.
+
+    Every harness owns one fresh private per-run fixture directory under
+    this run's own TMPDIR; while its `real_factory()` context is held, the
+    module's DESIGNATED_SCRATCH points at that fixture's designated path, so
+    the real guard layout — and everything the real stage adapter and the
+    run root create — stays inside the harness's own fixture. The shared
+    designated scratch root is never touched."""
 
     def __init__(self):
         self.env = {"HOME": "/home", "TMPDIR": "/tmp", "PATH": "/bin"}
@@ -1048,30 +1109,12 @@ class ControlHarness:
         self.monotonic_ns_value = 1_000_000_000_000
         self.clock = None
         self.supervisor_digest_value = base.SUPERVISOR_SHA256
-        self.route = {"path": DESIGNATED_SCRATCH, "realpath": DESIGNATED_SCRATCH,
-                      "volume_uuid": ROUTE_UUID, "owner_uid": os.getuid(),
-                      "uid": os.getuid(), "mode": 0o700, "present": True}
-        self.guard_scratch = DESIGNATED_SCRATCH + "/journal-guard/scratch"
-        self.guard_evidence = DESIGNATED_SCRATCH + "/journal-guard/evidence"
+        self.route_volume_uuid = ROUTE_UUID
         self.supply_guard_env = True
         self.strip_wall_deadline = False
         self.wall_deadline_override = None
-        self.scratch_volume_uuid = ROUTE_UUID
-        self.scratch_owner_uid = os.getuid()
-        self.scratch_mode = 0o755
-        self.scratch_canonical = True
-        self.scratch_present = True
-        self.scratch_islink = False
-        self.scratch_real_target = None
-        self.evidence_mode = 0o755
-        self.evidence_owner_uid = os.getuid()
-        self.evidence_canonical = True
-        self.evidence_present = True
-        self.evidence_real_target = None
-        self.root_mode = 0o700
-        self.root_owner_uid = os.getuid()
-        self.root_canonical = True
-        self.root_present = True
+        self.scratch_override = None
+        self.evidence_override = None
         self.stage_fault = None
         self.stage_raise = None
         self.build_returncode = 0
@@ -1094,38 +1137,68 @@ class ControlHarness:
         self.last_guarded_command = None
         self.last_guarded_env = None
         self.guarded_launches = 0
-        self.identity_calls = 0
+        self.used_designated = None
+        self.git_calls = 0
         self.inner_receipt = None
+        # One fresh private per-run fixture under this run's own TMPDIR, with
+        # the real guard layout materialized inside it exactly as the pinned
+        # supervisor creates it: 0755 scratch and evidence over a 0700 owned
+        # owned root, owned by this account. The REAL reader reads it.
+        self._tmp = tempfile.TemporaryDirectory(prefix="journal-control-")
+        self.fixture_root = os.path.realpath(self._tmp.name)
+        self.saved_designated = DESIGNATED_SCRATCH
+        self.fixture_designated = os.path.join(self.fixture_root, "designated")
+        self.fixture_guard_root = os.path.join(self.fixture_designated,
+                                               "journal-guard")
+        self.fixture_scratch = os.path.join(self.fixture_guard_root, "scratch")
+        self.fixture_evidence = os.path.join(self.fixture_guard_root, "evidence")
+        os.makedirs(self.fixture_scratch)
+        os.makedirs(self.fixture_evidence)
+        os.chmod(self.fixture_guard_root, 0o700)
 
-    # OuterEffects seams
-    def outer_effects(self):
-        return OuterEffects(dict(self.env), self.monotonic_ns, self.run_guarded,
-                            self.supervisor_digest, self.route_facts)
+    def cleanup(self):
+        self._tmp.cleanup()
 
+    # The scripted external queries (the only fakes)
     def supervisor_digest(self):
         return self.supervisor_digest_value
 
     def route_facts(self):
-        return dict(self.route)
+        designated = DESIGNATED_SCRATCH
+        return {"path": designated, "realpath": designated,
+                "volume_uuid": self.route_volume_uuid,
+                "owner_uid": os.getuid(), "uid": os.getuid(),
+                "mode": 0o700, "present": True}
 
     def run_guarded(self, command, env):
+        """The scripted guard boundary: the guard constructs the child's
+        environment (scratch, evidence, wall deadline) and launches; the
+        child process then really runs `inner_half` over the REAL
+        `InnerEffects.from_environment()` factory built from that
+        environment."""
         self.last_guarded_command = list(command)
         self.last_guarded_env = dict(env)
         self.writes_before_launch = len(self.written)
         self.directories_before_launch = len(self.directories)
         self.sequence.append("guarded")
+        self.used_designated = DESIGNATED_SCRATCH
         self.guarded_launches += 1
         inner_mode = command[command.index("--") + 1:][-1]
         inner_env = dict(env)
         if self.supply_guard_env:
-            inner_env["OXIDE_TASK_SCRATCH_ROOT"] = self.guard_scratch
-            inner_env["OXIDE_PROOF_EVIDENCE"] = self.guard_evidence
+            layout = self.guard_layout()
+            inner_env["OXIDE_TASK_SCRATCH_ROOT"] = layout["scratch"]
+            inner_env["OXIDE_PROOF_EVIDENCE"] = layout["evidence"]
         if self.strip_wall_deadline:
             inner_env.pop(base.WALL_DEADLINE_ENV, None)
         elif self.wall_deadline_override is not None:
             inner_env[base.WALL_DEADLINE_ENV] = self.wall_deadline_override
-        effects = self.inner_effects(inner_env)
-        receipt = inner_half(inner_mode, effects)
+        saved_env = self.env
+        self.env = inner_env
+        try:
+            receipt = inner_half(inner_mode, InnerEffects.from_environment())
+        finally:
+            self.env = saved_env
         self.inner_receipt = receipt
         clean = (inner_mode == "counted" and receipt.get("qualified_inner")
                  and not receipt.get("refused") and not receipt.get("fault"))
@@ -1134,53 +1207,15 @@ class ControlHarness:
         return types.SimpleNamespace(returncode=exit_code,
                                      stdout=json.dumps(receipt) + "\n", stderr="")
 
-    # InnerEffects seams
-    def inner_effects(self, env):
-        return InnerEffects(env, self.monotonic_ns, self.make_directory,
-                            self.run_process, self.identity_fn, self.digest_fn,
-                            self.guard_facts, self.write_file)
-
-    def guard_facts(self, scratch, evidence):
-        """The scripted answers for the guard-supplied layout, in the
-        reference shape: the raw env paths with their real resolutions kept
-        separate (a scripted symlink keeps `islink` and its target), the
-        scratch and evidence facts (0755 by default, as the pinned supervisor
-        creates them), the owned root that parents the scratch (0700 by
-        default), the verified scratch parent, and the scratch volume's
-        UUID."""
-        guard_root = os.path.dirname(self.guard_scratch)
-        owned_root = os.path.dirname(scratch)
-
-        def directory_facts(path, mode, owner, canonical, present,
-                            islink=False, real_target=None):
-            return {"path": path,
-                    "realpath": real_target or
-                               (path if canonical else path + ".elsewhere"),
-                    "present": present, "isdir": present and not islink,
-                    "islink": islink, "uid": owner, "mode": mode}
-
-        return {
-            "uid": os.getuid(),
-            "volume_uuid": self.scratch_volume_uuid,
-            "path": scratch,
-            "root_parent": DESIGNATED_SCRATCH,
-            "scratch_facts": directory_facts(scratch, self.scratch_mode,
-                                             self.scratch_owner_uid,
-                                             self.scratch_canonical,
-                                             self.scratch_present,
-                                             self.scratch_islink,
-                                             self.scratch_real_target),
-            "evidence_facts": directory_facts(evidence, self.evidence_mode,
-                                              self.evidence_owner_uid,
-                                              self.evidence_canonical,
-                                              self.evidence_present,
-                                              False,
-                                              self.evidence_real_target),
-            "root_facts": directory_facts(guard_root, self.root_mode,
-                                          self.root_owner_uid,
-                                          self.root_canonical,
-                                          self.root_present),
-        }
+    def guard_layout(self):
+        """The guard-supplied bindings for this run: inside this harness's
+        own fixture unless a control overrides a path to exercise a real
+        containment refusal."""
+        scratch = self.scratch_override or \
+            (DESIGNATED_SCRATCH + "/journal-guard/scratch")
+        evidence = self.evidence_override or \
+            (DESIGNATED_SCRATCH + "/journal-guard/evidence")
+        return {"scratch": scratch, "evidence": evidence}
 
     def monotonic_ns(self):
         if self.clock and len(self.clock) > 1:
@@ -1190,11 +1225,17 @@ class ControlHarness:
         return self.monotonic_ns_value
 
     def make_directory(self, parent, prefix):
+        """The scripted storage query: a real directory under the given
+        parent, recorded; a control's custody knob can point a case
+        directory outside the run root, virtually, to exercise the
+        containment refusal without a stray write."""
         if prefix.startswith("case-") and self.case_directory_parent:
-            parent = self.case_directory_parent
-        elif self.make_directory_parent:
+            path = f"{self.case_directory_parent}/{prefix}{len(self.directories)}"
+            self.directories.append(path)
+            return path
+        if self.make_directory_parent:
             parent = self.make_directory_parent
-        path = f"{parent}/{prefix}{len(self.directories)}"
+        path = tempfile.mkdtemp(prefix=prefix, dir=parent)
         self.directories.append(path)
         return path
 
@@ -1226,17 +1267,23 @@ class ControlHarness:
                                "detail": "fake pass", "injections": []}) + "\n",
             stderr="")
 
-    def identity_fn(self):
-        self.identity_calls += 1
-        identity = source_identity(self.git, self.sha256_file)
-        if self.identity_drift_after_capture and self.identity_calls >= 2:
-            identity["store_source_sha256"] = "changed" * 8
-        return identity
+    def git(self, arguments):
+        self.git_calls += 1
+        return self.head
 
-    def digest_fn(self, path):
+    def sha256_file(self, path):
+        """The scripted digest query: real files (binary-as-data) are hashed
+        for real, source files carry scripted digests, and the control knobs
+        — replaced binary at the re-hash, identity drift after the pre-stage
+        capture — fire only at their named moments."""
         self.digest_calls.append(path)
+        if (self.identity_drift_after_capture
+                and path == STORE_SOURCE and self.git_calls >= 4):
+            # The second identity capture (git calls 3 and 4 are the manifest
+            # mint's rev-parses) observes a changed store source. This knob
+            # precedes real-file hashing: it scripts the drift semantically.
+            return "changed" * 8
         if os.path.isfile(path):
-            # A real fixture file (binary-as-data) is hashed for real.
             with open(path, "rb") as handle:
                 return hashlib.sha256(handle.read()).hexdigest()
         if path == "/stage/" + DRIVER_NAME:
@@ -1253,24 +1300,66 @@ class ControlHarness:
             raise OSError("the injected report failure")
         self.written[path] = text
 
-    def git(self, arguments):
-        return self.head
+    @contextlib.contextmanager
+    def real_factory(self):
+        """Install this harness as the process's external world for the
+        enclosed block and point the module's designated scratch at this
+        harness's own private fixture. The `from_environment` factories stay
+        real; only these leaf external queries are scripted."""
+        saved = {}
 
-    def sha256_file(self, path):
-        if path == "/stage/" + DRIVER_NAME and self.replaced_binary_digest:
-            return "staged" * 8
-        return self.source_digests.get(path, "a" * 64)
+        def install(name, value):
+            saved[name] = globals()[name]
+            globals()[name] = value
+
+        install("external_environment", lambda: dict(self.env))
+        install("external_clock_ns", self.monotonic_ns)
+        install("external_run_process", self.run_process)
+        install("external_run_guarded", self.run_guarded)
+        install("external_supervisor_digest", self.supervisor_digest)
+        install("external_route_facts", self.route_facts)
+        install("external_git", self.git)
+        install("external_sha256_file", self.sha256_file)
+        install("external_make_directory", self.make_directory)
+        install("external_write_file", self.write_file)
+        install("DESIGNATED_SCRATCH", self.fixture_designated)
+        try:
+            yield self
+        finally:
+            for name, value in saved.items():
+                globals()[name] = value
 
 
 def control_harness():
     return ControlHarness()
 
 
+def run_outer(harness, mode="counted"):
+    """Drive the REAL unguarded outer over the REAL factories: the harness
+    is installed as the process's external world for the call, so
+    `OuterEffects.from_environment()` and the guard child's
+    `InnerEffects.from_environment()` are both the production factories and
+    only the leaf external queries are scripted."""
+    with harness.real_factory():
+        return outer_half(mode, OuterEffects.from_environment())
+
+
+def all_cases_unexecuted(receipt):
+    """Whether a faulted receipt accounts for every fixed group as honestly
+    unexecuted (never vacuously: the row count is checked too)."""
+    cases = (receipt or {}).get("cases") or []
+    return (len(cases) == len(CASES)
+            and all(case.get("status") == "unexecuted" for case in cases))
+
+
 def composition_controls():
-    """Drive the actual `outer_half` and `inner_half` entries: the unguarded
-    launch with no guard env, the guard-supplied inner bindings, the fresh
-    remaining-time behavior, and the failure paths — with only the external
-    executors, clock, identity, digest and storage faked."""
+    """Drive the actual `outer_half` and `inner_half` entries through the
+    REAL `from_environment` factories: the unguarded launch with no guard
+    env, the guard-supplied inner bindings, the fresh remaining-time
+    behavior, and the failure paths — with only the external process, Git,
+    clock, route and storage queries scripted. Every fixture is a fresh
+    private per-run directory under this run's own TMPDIR; the shared
+    designated scratch root is never created in, written, or removed."""
     problems = []
 
     def expect(condition, message):
@@ -1279,9 +1368,11 @@ def composition_controls():
 
     # O1, normal unguarded entry: no guard-created env keys, one guarded
     # launch, zero fixture/stage/receipt writes before it, genuine hooks
-    # preserved, and the inner really ran inside the guarded child.
+    # preserved, and the inner really ran inside the guarded child over the
+    # real inner factory. The run's designated scratch is this harness's own
+    # private fixture — provably not the shared root.
     harness = control_harness()
-    receipt_exit, outer_receipt = outer_half("counted", harness.outer_effects())
+    receipt_exit, outer_receipt = run_outer(harness)
     expect(isinstance(receipt_exit, int) and receipt_exit == 0,
            "a clean counted pass did not exit zero")
     expect(outer_receipt.get("qualified") is True,
@@ -1302,10 +1393,14 @@ def composition_controls():
            harness.sequence[2:] == [f"case:{case['id']}" for case in CASES],
            "the inner ordering is not stage then J1..J12")
     expect(len(harness.written) == 1 and
-           list(harness.written)[0].startswith(harness.guard_evidence),
+           list(harness.written)[0].startswith(harness.fixture_evidence),
            "the receipt was not published into the guard's evidence directory")
     expect("--binary" not in harness.last_guarded_command,
            "the inner argv carries a staged binary the outer cannot have minted")
+    expect(harness.used_designated == harness.fixture_designated
+           and harness.used_designated != harness.saved_designated,
+           "the run's guard layout did not live inside the harness's own "
+           "private fixture")
 
     # Guard argv contract: the unchanged qualified supervisor, its limits, the
     # verified root parent, and the parseable inner tail.
@@ -1315,8 +1410,8 @@ def composition_controls():
     expect("--limit" in command and str(LIMIT_SECONDS) in command,
            "the guarded child does not carry the supervisor's limits")
     expect("--root-parent" in command and
-           command[command.index("--root-parent") + 1] == DESIGNATED_SCRATCH,
-           "the guarded child does not adopt the designated Stash scratch")
+           command[command.index("--root-parent") + 1] == harness.used_designated,
+           "the guarded child does not adopt the run's designated scratch")
     tail = command[command.index("--") + 1:]
     expect(tail[:2] == ["python3", SCRIPT_PATH], "the inner tail is not this script")
     try:
@@ -1328,86 +1423,61 @@ def composition_controls():
     # Supervisor pin mismatch: refusal, no launch.
     harness = control_harness()
     harness.supervisor_digest_value = "b" * 64
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code == 125, "a supervisor pin mismatch did not refuse with 125")
     expect(harness.guarded_launches == 0, "a pin mismatch still launched the guard")
 
     # Route mismatch: the designated scratch's volume is not the verified Stash.
     harness = control_harness()
-    harness.route["volume_uuid"] = "00000000-0000-0000-0000-000000000000"
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    harness.route_volume_uuid = "0" * 8 + ROUTE_UUID[8:]
+    exit_code, receipt = run_outer(harness)
     expect(exit_code == 125, "a route mismatch did not refuse with 125")
     expect(harness.guarded_launches == 0, "a route mismatch still launched the guard")
 
-    # Inner binding refusals: the guard-supplied bindings are stale, foreign
-    # or missing, and the inner refuses each before any fixture effect.
-    refusal_cases = [
-        ("foreign volume", {"scratch_volume_uuid": "1" * 8 + ROUTE_UUID[8:]}),
-        ("foreign owner", {"scratch_owner_uid": os.getuid() + 1}),
-        ("group-writable mode", {"scratch_mode": 0o775}),
-        ("non-canonical", {"scratch_canonical": False}),
-        ("absent scratch", {"scratch_present": False}),
-    ]
-    for name, override in refusal_cases:
-        harness = control_harness()
-        for key, value in override.items():
-            setattr(harness, key, value)
-        harness.case_results = {"J1": types.SimpleNamespace(
-            returncode=0,
-            stdout=json.dumps({"case": "J1", "status": "passed", "detail": "x"}) + "\n",
-            stderr="")}
-        exit_code, receipt = outer_half("counted", harness.outer_effects())
-        expect(isinstance(exit_code, int) and exit_code != 0,
-               f"the inner binding refusal ({name}) did not fail the run")
-        inner = harness.inner_receipt or {}
-        expect(inner.get("qualified_inner") is not True,
-               f"the inner binding refusal ({name}) still qualified the inner")
-        expect(harness.sequence.count("stage") == 0,
-               f"the inner binding refusal ({name}) still staged")
-
-    # The actual guard layout passes: 0755 scratch and evidence over a 0700
-    # owned root is exactly what the pinned supervisor creates, and the
-    # ownership comparison — never the read bits — is the boundary.
+    # Inner binding refusals through the REAL reader over the REAL fixture:
+    # each variation materializes the exact real layout the pinned supervisor
+    # would refuse, and the inner refuses before any stage or case effect.
     harness = control_harness()
-    harness.scratch_mode = 0o755
-    harness.evidence_mode = 0o755
-    harness.root_mode = 0o700
-    layout_exit, _layout_receipt = outer_half("counted", harness.outer_effects())
-    expect(isinstance(layout_exit, int) and layout_exit == 0,
-           "the actual guard layout (0755/0700) did not qualify")
+    shutil.rmtree(harness.fixture_scratch)
+    exit_code, _ignored_receipt = run_outer(harness)
+    expect(isinstance(exit_code, int) and exit_code != 0,
+           "an absent scratch did not fail the run")
     inner = harness.inner_receipt or {}
-    expect(inner.get("qualified_inner") is True,
-           "the actual guard layout did not qualify the inner")
+    expect(inner.get("qualified_inner") is not True,
+           "an absent scratch still qualified the inner")
+    expect(harness.sequence.count("stage") == 0, "an absent scratch still staged")
 
-    # The owned root must be private 0700: 0755 there refuses, as the
-    # reference helper requires for the monitored root alone.
     harness = control_harness()
-    harness.root_mode = 0o755
-    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
-    expect(exit_code != 0, "a non-private owned root did not fail the run")
-    inner = harness.inner_receipt or {}
-    expect(any("owned root" in refusal for refusal in inner.get("refused", [])),
-           "the owned-root refusal was not named")
+    os.chmod(harness.fixture_scratch, 0o775)
+    exit_code, _ignored_receipt = run_outer(harness)
+    expect(isinstance(exit_code, int) and exit_code != 0,
+           "a group-writable scratch did not fail the run")
+    expect(harness.sequence.count("stage") == 0, "a group-writable scratch still staged")
 
-    # A symlinked scratch path is refused by its own raw-path fact, even
-    # though its target sits on the verified Stash volume: the reference
-    # helper refuses the alias before anything else.
     harness = control_harness()
-    harness.scratch_islink = True
-    harness.scratch_real_target = (DESIGNATED_SCRATCH
-                                   + "/journal-guard/other-scratch")
-    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
+    alias = os.path.join(harness.fixture_guard_root, "scratch-alias")
+    os.symlink(harness.fixture_scratch, alias)
+    harness.scratch_override = alias
+    exit_code, _ignored_receipt = run_outer(harness)
     expect(isinstance(exit_code, int) and exit_code != 0,
            "a symlinked scratch did not fail the run")
     inner = harness.inner_receipt or {}
     expect(any("symlink" in refusal for refusal in inner.get("refused", [])),
            "the symlinked scratch was not refused as a symlink")
 
-    # Evidence outside the guard's owned root refuses, even though the scratch
-    # itself is the verified layout.
     harness = control_harness()
-    harness.evidence_real_target = "/elsewhere/evidence"
-    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
+    os.chmod(harness.fixture_guard_root, 0o755)
+    exit_code, _ignored_receipt = run_outer(harness)
+    expect(exit_code != 0, "a non-private owned root did not fail the run")
+    inner = harness.inner_receipt or {}
+    expect(any("owned root" in refusal for refusal in inner.get("refused", [])),
+           "the owned-root refusal was not named")
+
+    harness = control_harness()
+    elsewhere = os.path.join(harness.fixture_root, "elsewhere-evidence")
+    os.makedirs(elsewhere)
+    harness.evidence_override = elsewhere
+    exit_code, _ignored_receipt = run_outer(harness)
     expect(isinstance(exit_code, int) and exit_code != 0,
            "evidence outside the owned root did not fail the run")
     inner = harness.inner_receipt or {}
@@ -1415,33 +1485,62 @@ def composition_controls():
                for refusal in inner.get("refused", [])),
            "the outside evidence was not refused by containment")
 
-    # A foreign-owned owned root refuses too.
     harness = control_harness()
-    harness.root_owner_uid = os.getuid() + 1
-    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
-    expect(exit_code != 0, "a foreign owned root did not fail the run")
-
-    # The owned root must be a direct child of the verified scratch parent.
-    harness = control_harness()
-    harness.guard_scratch = "/Volumes/Stash/scratch/barge/nested/deeper/scratch"
-    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
+    nested = os.path.join(harness.fixture_designated, "nested", "deeper",
+                          "scratch")
+    os.makedirs(nested)
+    harness.scratch_override = nested
+    exit_code, _ignored_receipt = run_outer(harness)
     expect(exit_code != 0, "an off-parent owned root did not fail the run")
 
-    # Missing guard-supplied scratch or evidence: not the guard's run.
-    for name, strip in (("scratch", "OXIDE_TASK_SCRATCH_ROOT"),
-                        ("evidence", "OXIDE_PROOF_EVIDENCE")):
-        harness = control_harness()
-        harness.supply_guard_env = False
-        exit_code, receipt = outer_half("counted", harness.outer_effects())
-        expect(exit_code != 0, f"missing guard {name} did not fail the run")
-        inner = harness.inner_receipt or {}
-        expect(inner.get("qualified_inner") is not True,
-               f"missing guard {name} still qualified the inner")
+    # A foreign scratch volume, through the REAL reader: only the volume
+    # query's mount is pointed elsewhere (the external kernel/route query),
+    # and the reader's fact then refuses the foreign uuid.
+    harness = control_harness()
+    saved_mount = base.SCRATCH_VOLUME_MOUNT
+    base.SCRATCH_VOLUME_MOUNT = "/Volumes/elsewhere"
+    try:
+        exit_code, _ignored_receipt = run_outer(harness)
+    finally:
+        base.SCRATCH_VOLUME_MOUNT = saved_mount
+    expect(isinstance(exit_code, int) and exit_code != 0,
+           "a foreign scratch volume did not fail the run")
+
+    # Foreign ownership cannot be materialized under this account, so the
+    # pure containment check is driven directly over the reference fact
+    # shape for the two uid variations (the real reader's uid fidelity is
+    # the real-reader control's, over real files).
+    def reference_facts():
+        def directory_facts(path, mode, uid, islink=False):
+            return {"path": path, "realpath": path, "present": True,
+                    "isdir": not islink, "islink": islink, "uid": uid,
+                    "mode": mode}
+        return {
+            "uid": os.getuid(),
+            "volume_uuid": ROUTE_UUID,
+            "path": "guarded/scratch",
+            "root_parent": "guarded",
+            "scratch_facts": directory_facts("guarded/scratch", 0o755, os.getuid()),
+            "evidence_facts": directory_facts("guarded/evidence", 0o755, os.getuid()),
+            "root_facts": directory_facts("guarded", 0o700, os.getuid()),
+        }
+
+    foreign_uid = os.getuid() + 1
+    for name, mutate in (
+            ("foreign scratch owner",
+             lambda facts: facts["scratch_facts"].update(uid=foreign_uid)),
+            ("foreign owned-root owner",
+             lambda facts: facts["root_facts"].update(uid=foreign_uid))):
+        facts = reference_facts()
+        mutate(facts)
+        uid_problems = guard_containment_problems(facts)
+        expect(uid_problems,
+               f"the containment check missed the {name}")
 
     # Wall deadline handoff: missing, malformed, stale, huge-but-expired.
     harness = control_harness()
     harness.strip_wall_deadline = True
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "a missing wall deadline did not fail the run")
     inner = harness.inner_receipt or {}
     expect(any("WALL_DEADLINE" in refusal for refusal in inner.get("refused", [])),
@@ -1449,40 +1548,25 @@ def composition_controls():
 
     harness = control_harness()
     harness.wall_deadline_override = "not-a-number"
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "a malformed wall deadline did not fail the run")
 
     harness = control_harness()
     harness.wall_deadline_override = str(10 ** 18)
     harness.monotonic_ns_value = 2 * 10 ** 18
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "a numerically huge expired wall did not fail the run")
     inner = harness.inner_receipt or {}
-    expect(all(c.get("status") == "unexecuted" for c in inner.get("cases", [])),
+    expect(all_cases_unexecuted(inner),
            "an expired wall did not record every case unexecuted")
 
     harness = control_harness()
     harness.wall_deadline_override = str(harness.monotonic_ns_value - 1)
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "a stale wall deadline did not fail the run")
     inner = harness.inner_receipt or {}
-    expect(all(c.get("status") == "unexecuted" for c in inner.get("cases", [])),
+    expect(all_cases_unexecuted(inner),
            "a stale wall deadline did not record every case unexecuted")
-
-    # Fresh remaining time: the clock advances during the stage so the cases
-    # start past their cutoff, and the executor timeouts are capped by the
-    # remaining wall minus the closure margin.
-    harness = control_harness()
-    harness.wall_deadline_override = str(harness.monotonic_ns_value + 100 * 10 ** 9)
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
-    expect(harness.stage_timeouts and harness.stage_timeouts[0] == 70.0,
-           f"the stage timeout was not min(240, remaining - margin): "
-           f"{harness.stage_timeouts}")
-    expect(harness.case_timeouts and
-           all(timeout == 60.0 for timeout in harness.case_timeouts),
-           f"the case timeouts were not min(60, remaining - margin): "
-           f"{harness.case_timeouts}")
-    expect(receipt_exit if False else True, "")
 
     # Clock advancing during the stage: the cases start past the closure
     # margin and are recorded unexecuted, honestly.
@@ -1496,10 +1580,10 @@ def composition_controls():
             harness.monotonic_ns_value = harness.monotonic_ns_value + 200 * 10 ** 9
         return result
     harness.run_process = stage_advancing_clock
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "a stage that consumed the wall did not fail the run")
     inner = harness.inner_receipt or {}
-    expect(all(c.get("status") == "unexecuted" for c in inner.get("cases", [])),
+    expect(all_cases_unexecuted(inner),
            "a consumed wall did not record every case unexecuted")
 
     # Clock advancing between cases: case J6 latches nothing (clean so far),
@@ -1514,7 +1598,7 @@ def composition_controls():
             harness.monotonic_ns_value = harness.monotonic_ns_value + 200 * 10 ** 9
         return result
     harness.run_process = case_advancing_clock
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "a consumed mid-run wall did not fail the counted run")
     inner = harness.inner_receipt or {}
     statuses = {c.get("case"): c.get("status") for c in inner.get("cases", [])}
@@ -1533,7 +1617,7 @@ def composition_controls():
             harness.monotonic_ns_value = harness.monotonic_ns_value + 5 * 10 ** 9
         return result
     harness.run_process = case_consuming_clock
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     inner = harness.inner_receipt or {}
     statuses = {c.get("case"): c.get("status") for c in inner.get("cases", [])}
     expect(statuses.get("J1") == "passed", "J1 should have run inside the margin")
@@ -1544,7 +1628,7 @@ def composition_controls():
     # manifest mint, and the entry faults as drift before any case passes.
     harness = control_harness()
     harness.identity_drift_after_capture = True
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "an identity drift did not fail the run")
     inner = harness.inner_receipt or {}
     expect(inner.get("fault", {}).get("kind") == "drift",
@@ -1559,7 +1643,7 @@ def composition_controls():
     # manifest's digest, and the entry faults as drift.
     harness = control_harness()
     harness.replaced_binary_digest = "c" * 64
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "a replaced staged binary did not fail the run")
     inner = harness.inner_receipt or {}
     expect(inner.get("fault", {}).get("kind") == "drift",
@@ -1569,7 +1653,7 @@ def composition_controls():
     # root is a custody fault, and the run never qualifies.
     harness = control_harness()
     harness.case_directory_parent = "/elsewhere"
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "an escaped case directory did not fail the run")
     inner = harness.inner_receipt or {}
     expect(any(c.get("kind") == "custody" for c in inner.get("cases", [])),
@@ -1578,7 +1662,7 @@ def composition_controls():
     # Stage refusal inside the guard: bounded failure evidence, never qualified.
     harness = control_harness()
     harness.stage_fault = ("stage", "the injected stage refusal")
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "a stage refusal did not fail the run")
     inner = harness.inner_receipt or {}
     expect(inner.get("fault", {}).get("kind") == "stage",
@@ -1591,7 +1675,7 @@ def composition_controls():
     # the inner outcome alone never qualifies.
     harness = control_harness()
     harness.guard_exit_override = 1
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "a nonzero guarded exit produced a nonzero-qualified run")
     inner = harness.inner_receipt or {}
     expect(inner.get("qualified_inner") is True,
@@ -1605,7 +1689,7 @@ def composition_controls():
         stdout=json.dumps({"case": "J1", "status": "failed",
                            "detail": "injected: refused"}) + "\n",
         stderr="")}
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "a failing case did not fail the counted run")
     inner = harness.inner_receipt or {}
     statuses = {c.get("case"): c.get("status") for c in inner.get("cases", [])}
@@ -1616,20 +1700,20 @@ def composition_controls():
     harness = control_harness()
     harness.case_results = {"J1": types.SimpleNamespace(returncode=0, stdout="{}\n",
                                                         stderr="")}
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "a bad child reply did not fail the run")
     harness = control_harness()
     duplicate = json.dumps({"case": "J1", "status": "passed", "detail": "x"})
     harness.case_results = {"J1": types.SimpleNamespace(
         returncode=0, stdout=duplicate + "\n" + duplicate, stderr="")}
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "a duplicate verdict did not fail the run")
     harness = control_harness()
     harness.case_results = {"J1": types.SimpleNamespace(
         returncode=0,
         stdout=json.dumps({"case": "J99", "status": "passed", "detail": "x"}) + "\n",
         stderr="")}
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "an unknown-case verdict did not fail the run")
 
     # Stage executor exceptions: a remaining-capped stage timeout and a
@@ -1643,15 +1727,15 @@ def composition_controls():
             raise subprocess.TimeoutExpired(command, timeout)
         return runner_through_stage(command, env, timeout)
     harness.run_process = stage_timeout_expired
-    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
+    exit_code, _ignored_receipt = run_outer(harness)
     expect(exit_code != 0, "a stage timeout did not fail the run")
     inner = harness.inner_receipt or {}
     expect(inner.get("fault", {}).get("kind") == "stage",
            "the stage timeout was not recorded as a bounded stage fault")
     expect("receipt_path" in inner,
            "the stage timeout published no bounded receipt")
-    expect(not any(c.get("status") == "passed" for c in inner.get("cases", [])),
-           "a stage-timeout run still passed cases")
+    expect(all_cases_unexecuted(inner),
+           "a stage-timeout run did not record every case unexecuted")
 
     harness = control_harness()
     runner_through_spawn = harness.run_process
@@ -1661,36 +1745,66 @@ def composition_controls():
             raise OSError("the injected stage spawn failure")
         return runner_through_spawn(command, env, timeout)
     harness.run_process = stage_spawn_oserror
-    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
+    exit_code, _ignored_receipt = run_outer(harness)
     expect(exit_code != 0, "a stage spawn failure did not fail the run")
     inner = harness.inner_receipt or {}
     expect(inner.get("fault", {}).get("kind") == "stage",
            "the stage spawn failure was not recorded as a bounded stage fault")
     expect("receipt_path" in inner,
            "the stage spawn failure published no bounded receipt")
+    expect(all_cases_unexecuted(inner),
+           "a stage-spawn-failure run did not record every case unexecuted")
 
-    # The REAL factory and the REAL stage adapter, end to end: a real
-    # InnerEffects (never a harness stage override) whose only faked seams
-    # are the external queries — the subprocess runner (supplying raw Cargo
-    # artifact JSON, never a preconstructed stage record), Git, the clock and
-    # the storage — driving the actual inner composition. The stage artifact
-    # names a fresh private fixture binary-as-data that is hashed but never
-    # executed, so the real artifact parser, feature validation, digest and
-    # re-hash all run for real.
+    # Pre-stage source failures are bounded too: a Fault and an OSError from
+    # the identity seam (the real git query refusing or failing) land as a
+    # bounded source fault whose receipt still publishes, with all twelve
+    # groups unexecuted, no manifest, and no fabricated pre-stage binding.
+    for name, injected in (
+            ("git fault", Fault("source", "git rev-parse HEAD failed: injected")),
+            ("git oserror", OSError("the injected git spawn failure"))):
+        harness = control_harness()
+
+        def failing_git(arguments, _error=injected):
+            raise _error
+        harness.git = failing_git
+        exit_code, _ignored_receipt = run_outer(harness)
+        expect(exit_code != 0,
+               f"a pre-stage source failure ({name}) did not fail the run")
+        inner = harness.inner_receipt or {}
+        fault = inner.get("fault") or {}
+        expect(fault.get("kind") == "source",
+               f"the pre-stage source failure ({name}) was not a bounded source fault")
+        expect("receipt_path" in inner,
+               f"the pre-stage source failure ({name}) published no bounded receipt")
+        expect(all_cases_unexecuted(inner),
+               f"the pre-stage source failure ({name}) did not record every "
+               f"case unexecuted")
+        expect(inner.get("manifest") is None,
+               f"the pre-stage source failure ({name}) fabricated a manifest")
+        expect(inner.get("pre_stage_identity") is None,
+               f"the pre-stage source failure ({name}) fabricated a pre-stage binding")
+
+    # The REAL factory and the REAL stage adapter, end to end: the real
+    # `InnerEffects.from_environment()` factory (never a harness-built
+    # effects object) drives the actual inner composition, with only the
+    # external subprocess runner (supplying raw Cargo artifact JSON, never a
+    # preconstructed stage record), Git, the clock and the storage scripted.
+    # The stage artifact names a fresh private fixture binary-as-data inside
+    # this harness's own fixture that is hashed but never executed, so the
+    # real artifact parser, feature validation, digest and re-hash all run
+    # for real — and every write lands inside the fixture.
     harness = control_harness()
     harness.env[base.WALL_DEADLINE_ENV] = str(
         harness.monotonic_ns_value + 10_000 * 10 ** 9)
-    effects = harness.inner_effects(dict(harness.env))
-    binary = None
-    try:
-        fixture = tempfile.TemporaryDirectory(prefix="journal-stage-fixture-")
-        run_root = os.path.realpath(fixture.name)
+    with harness.real_factory():
+        effects = InnerEffects.from_environment()
+        run_root = os.path.join(harness.fixture_root, "stage-run")
+        os.makedirs(run_root)
         staged = os.path.join(run_root, "pool", DRIVER_NAME)
         os.makedirs(os.path.dirname(staged))
         with open(staged, "wb") as handle:
             handle.write(b"\xcf\xfa\xed\xfe journal-proof binary-as-data"
                          b" (hashed, never executed)")
-        binary = staged
         with open(staged, "rb") as handle:
             fixture_digest = hashlib.sha256(handle.read()).hexdigest()
         harness.stage_output = (json.dumps({
@@ -1709,9 +1823,7 @@ def composition_controls():
         expect((receipt.get("manifest") or {}).get("binary_sha256")
                == fixture_digest,
                "the manifest does not carry the real staged binary's digest")
-        expect(receipt.get("pre_stage_identity")
-               == receipt.get("manifest") or
-               all(receipt.get("pre_stage_identity", {}).get(key)
+        expect(all(receipt.get("pre_stage_identity", {}).get(key)
                    == (receipt.get("manifest") or {}).get(key)
                    for key in ("store_source_sha256", "driver_source_sha256")),
                "the pre-stage and post-stage identities disagree on a clean run")
@@ -1725,45 +1837,70 @@ def composition_controls():
                "the real adapter did not apply the stage env scrub")
         expect(build["timeout"] == STAGE_BASE_TIMEOUT,
                "the stage timeout was not the remaining-capped base")
-        expect(harness.sequence[:2] == ["stage", "guarded"] or
-               harness.sequence[0] == "stage",
+        expect(harness.sequence[0] == "stage",
                "the stage did not precede the case children in the sequence")
-        stage_child_timeouts = harness.stage_timeouts
-        expect(stage_child_timeouts == [STAGE_BASE_TIMEOUT],
+        expect(harness.stage_timeouts == [STAGE_BASE_TIMEOUT],
                "the stage child ran with a wrong timeout")
-        expect(harness.case_timeouts
-               == [CASE_BASE_TIMEOUT] * len(CASES),
+        expect(harness.case_timeouts == [CASE_BASE_TIMEOUT] * len(CASES),
                "the case children did not run at the remaining-capped base")
         expect(harness.digest_calls.count(staged) == 2,
                "the staged binary was not hashed at stage time and re-hashed "
                "before the first case")
-    finally:
-        if binary and os.path.exists(binary):
-            os.unlink(binary)
+
+        # The retired keyword/return contract must fail against the real
+        # factory: no `run_stage_child` executor with the old `(env=,
+        # run_root=, timeout=)` stage-record shape can resolve, and a
+        # CompletedProcess can never stand in for the stage record.
         try:
-            fixture.cleanup()
-        except UnboundLocalError:
-            pass
+            effects.run_stage_child(env=effects.env, run_root="ignored",
+                                    timeout=STAGE_BASE_TIMEOUT)
+            expect(False, "the retired stage executor keyword contract still resolved")
+        except AttributeError:
+            expect(True, "")
 
-    # The retired keyword/return contract must fail against the real
-    # factory: no `run_stage_child` executor with the old `(env=, run_root=,
-    # timeout=)` stage-record shape can resolve, and a CompletedProcess can
-    # never stand in for the stage record.
-    try:
-        effects.run_stage_child(env=effects.env, run_root="ignored",
-                                timeout=STAGE_BASE_TIMEOUT)
-        expect(False, "the retired stage executor keyword contract still resolved")
-    except AttributeError:
-        expect(True, "")
+        # The factory's seam wiring, behaviorally: identity produces the
+        # source-binding shape, the digest hashes real bytes, directory
+        # creation lands under its parent, and the process seam receives
+        # (command, env, timeout) positionally. A mis-wired factory —
+        # swapped identity/digest positions, a reordered constructor — fails
+        # here instead of crashing a real receipt-less inner.
+        identity = effects.identity_fn()
+        expect(isinstance(identity, dict)
+               and {"head", "tree", "store_source_sha256",
+                    "driver_source_sha256"} <= set(identity),
+               "the factory's identity seam does not produce the source binding")
+        probe_path = os.path.join(harness.fixture_root, "wiring-probe")
+        with open(probe_path, "wb") as handle:
+            handle.write(b"wiring probe bytes")
+        expect(effects.digest_fn(probe_path)
+               == hashlib.sha256(b"wiring probe bytes").hexdigest(),
+               "the factory's digest seam does not hash real bytes")
+        wiring_parent = os.path.join(harness.fixture_root, "wiring-parent")
+        os.makedirs(wiring_parent, exist_ok=True)
+        made_directory = effects.make_directory(wiring_parent, "wiring-child-")
+        expect(os.path.isdir(made_directory)
+               and made_directory.startswith(wiring_parent + os.sep),
+               "the factory's directory seam does not create under its parent")
+        effects.run_process(["oxide", "build"], {"WIRING": "1"}, 5.0)
+        wiring_call = harness.build_calls[-1]
+        expect(wiring_call["command"] == ["oxide", "build"]
+               and wiring_call["env"] == {"WIRING": "1"}
+               and wiring_call["timeout"] == 5.0,
+               "the factory's process seam is not (command, env, timeout)")
 
-    adapter_stage_timeout = min(STAGE_BASE_TIMEOUT, 90.0)
-    effects_stage = harness.inner_effects(dict(harness.env))
-    with tempfile.TemporaryDirectory(prefix="journal-adapter-faults-") as fault_root:
-        def stage_fault(expected_detail, prepare):
-            prepare()
+    # The real stage adapter's failure matrix through the same real factory:
+    # nonzero build, timeout, spawn OSError, and wrong/missing/duplicate/
+    # unfeatured artifacts all fault the adapter as bounded stage faults.
+    harness = control_harness()
+    with harness.real_factory():
+        effects_stage = InnerEffects.from_environment()
+        fault_root = os.path.join(harness.fixture_root, "adapter-faults")
+        os.makedirs(fault_root, exist_ok=True)
+
+        def stage_fault(expected_detail):
             try:
                 effects_stage.stage(env=effects_stage.env, run_root=fault_root,
-                                    timeout=adapter_stage_timeout)
+                                    timeout=min(STAGE_BASE_TIMEOUT, 90.0))
                 expect(False, expected_detail + " did not fault the real adapter")
             except Fault as error:
                 expect(error.kind == "stage",
@@ -1779,14 +1916,13 @@ def composition_controls():
             return json.dumps(document) + "\n"
 
         harness.build_returncode = 101
-        stage_fault("a failed stage build",
-                    lambda: None)
+        stage_fault("a failed stage build")
         harness.build_returncode = 0
 
         harness.stage_raise = subprocess.TimeoutExpired(STAGE_COMMAND, 90.0)
-        stage_fault("a stage build timeout", lambda: None)
+        stage_fault("a stage build timeout")
         harness.stage_raise = OSError("the adapter spawn refusal")
-        stage_fault("a stage spawn OSError", lambda: None)
+        stage_fault("a stage spawn OSError")
         harness.stage_raise = None
 
         for label, output in (
@@ -1800,7 +1936,7 @@ def composition_controls():
                 ("an artifact without the proof feature",
                  artifact_line(features=["default"]))):
             harness.stage_output = output
-            stage_fault(label, lambda: None)
+            stage_fault(label)
         harness.stage_output = artifact_line()
 
     # An unexpected adapter exception (outside Fault/TimeoutExpired/OSError)
@@ -1816,33 +1952,70 @@ def composition_controls():
                 "run_stage_child() got an unexpected keyword argument 'run_root'")
         return runner_through_type_error(command, env, timeout)
     harness.run_process = stage_type_error
-    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
+    exit_code, _ignored_receipt = run_outer(harness)
     expect(exit_code != 0, "an unexpected adapter exception did not fail the run")
     inner = harness.inner_receipt or {}
     expect(inner.get("fault", {}).get("kind") == "stage",
            "the unexpected adapter exception was not a bounded stage fault")
     expect("receipt_path" in inner,
            "the unexpected adapter exception published no bounded receipt")
-    expect(all(c.get("status") == "unexecuted" for c in inner.get("cases", [])),
+    expect(all_cases_unexecuted(inner),
            "an adapter-exception run still executed case groups")
     expect(bool(inner.get("pre_stage_identity")),
            "the adapter-exception receipt carries no pre-stage binding")
     expect(not (inner.get("manifest") or {}).get("binary_sha256"),
            "a failed stage still fabricated a manifest binary digest")
 
-    # A symlinked scratch keeps its own raw-path fact and is refused as an
-    # alias even when its target sits on the verified volume — the exact
-    # reproduction from the re-review, run through the harness facts seam.
+    # Fixture isolation under the platform's write audit: one full counted
+    # composition through the real factories writes only inside this run's
+    # own fixture and temporary areas — the shared designated scratch root
+    # sees nothing, which is exactly the regression the audit-hook
+    # reproduction caught at the previous head.
     harness = control_harness()
-    harness.scratch_islink = True
-    harness.scratch_real_target = (DESIGNATED_SCRATCH
-                                   + "/journal-guard/other-scratch")
-    facts = harness.guard_facts(harness.guard_scratch, harness.guard_evidence)
-    symlink_problems = guard_containment_problems(facts)
-    expect(any("symlink" in problem for problem in symlink_problems),
-           "the scripted symlink fact did not refuse the alias")
-    if not any("symlink" in problem for problem in symlink_problems):
-        problems.extend(symlink_problems)
+    shared_designated = harness.saved_designated
+    write_events = []
+
+    def write_audit(event, args):
+        if event == "os.mkdir":
+            write_events.append(("os.mkdir", args[0]))
+        elif event == "open":
+            path, _mode, flags = args
+            if isinstance(path, str) and (
+                    flags & os.O_WRONLY or flags & os.O_RDWR
+                    or flags & os.O_CREAT or flags & os.O_APPEND
+                    or flags & os.O_TRUNC):
+                write_events.append(("open", path))
+        elif event in ("os.rename", "os.replace", "shutil.copyfile",
+                       "os.remove", "os.rmdir", "os.truncate"):
+            for value in args:
+                if isinstance(value, str):
+                    write_events.append((event, value))
+
+    sys.addaudithook(write_audit)
+    window_start = len(write_events)
+    exit_code, _ignored_receipt = run_outer(harness)
+    window = write_events[window_start:]
+    expect(exit_code == 0, "the audited clean run did not pass")
+    outside_roots = (harness.fixture_root + os.sep,
+                     tempfile.gettempdir() + os.sep,
+                     os.devnull)
+    stray = [entry for entry in window
+             if not any(entry[1].startswith(root) for root in outside_roots)
+             and entry[1] != os.devnull]
+    expect(not stray,
+           f"the effect-free selector wrote outside its private fixture: "
+           f"{stray[:4]}")
+    # This run's own temporary area lives under the shared designated root,
+    # so the shared-root regression is specifically an entry under the shared
+    # root but outside this run's temporary area — the direct shared-root
+    # layout the previous head created (journal-guard/... directly in the
+    # shared root).
+    shared_writes = [entry for entry in window
+                     if entry[1].startswith(shared_designated + os.sep)
+                     and not entry[1].startswith(tempfile.gettempdir() + os.sep)]
+    expect(not shared_writes,
+           "the effect-free selector created entries in the shared "
+           "designated scratch root")
 
     # The real reader: the containment checks must hold against the REAL
     # InnerEffects.guard_facts — where the symlink regression sat — on a tiny
@@ -1932,7 +2105,7 @@ def composition_controls():
     # Report failure: an unwritable receipt unqualifies the inner.
     harness = control_harness()
     harness.fail_report_write = True
-    exit_code, receipt = outer_half("counted", harness.outer_effects())
+    exit_code, receipt = run_outer(harness)
     expect(exit_code != 0, "a report failure did not fail the run")
     inner = harness.inner_receipt or {}
     expect(inner.get("qualified_inner") is not True,
@@ -1945,7 +2118,7 @@ def composition_controls():
         stdout=json.dumps({"case": "J3", "status": "failed",
                            "detail": "injected: refused"}) + "\n",
         stderr="")}
-    exit_code, receipt = outer_half("diagnostic", harness.outer_effects())
+    exit_code, receipt = run_outer(harness, "diagnostic")
     expect(exit_code != 0, "the diagnostic did not stay nonzero")
     inner = harness.inner_receipt or {}
     expect(len([c for c in inner.get("cases", [])
@@ -1955,9 +2128,9 @@ def composition_controls():
     # Retained evidence after simulated scratch cleanup: the receipt lives in
     # the guard's evidence directory, not the scratch that cleanup removes.
     harness = control_harness()
-    outer_half("counted", harness.outer_effects())
+    run_outer(harness)
     receipt_paths = list(harness.written)
-    expect(receipt_paths and all(path.startswith(harness.guard_evidence)
+    expect(receipt_paths and all(path.startswith(harness.fixture_evidence)
                                  for path in receipt_paths),
            "the receipt is not inside the guard's evidence directory")
     harness.directories.clear()  # simulated guard scratch cleanup
@@ -1965,7 +2138,6 @@ def composition_controls():
            "the retained evidence did not survive the simulated scratch cleanup")
 
     return problems
-
 
 def case_table_problems():
     """Every group names a real driver method and real carried regressions."""
@@ -2194,9 +2366,13 @@ def main(argv):
             return 1
         print(f"journal-proof apparatus: OK ({len(CASES)} case groups, "
               f"{sum(len(c['carried_by']) for c in CASES)} named regressions, "
-              "entry composition controls passed, no image, no guarded "
-              "launch, no child process; the only storage is one fresh "
-              "private per-run fixture directory)")
+              "entry composition controls passed through the real "
+              "from_environment factories, no image, no guarded launch, no "
+              "child process; the only storage is a set of fresh private "
+              "per-run fixture directories under this run's own TMPDIR — "
+              "one per harness, with each harness's real guard layout "
+              "materialized inside its own fixture — and no entry is ever "
+              "created in the shared designated scratch root)")
         return 0
     if arguments.plan:
         print(json.dumps(plan_document(), indent=2))

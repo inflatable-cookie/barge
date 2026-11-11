@@ -201,14 +201,20 @@ guarded exception. Each selector covers what it names:
   twelve-group case table checked against its named regressions in
   `crates/barge/src/operation.rs`, the `proof-journal` feature's declarations,
   the verified Stash route, the nine premises with dispositions, the held
-  bounds, and composition controls that drive the actual `outer_half` and
-  `inner_half` entries — launch, guarded supervisor child, case driver,
-  verdict parsing, report publication and receipt composition — with only the
-  external executors, clock, identity, digest and route query faked. No image,
-  no guarded launch and no child process; the real-reader containment suite
-  creates and removes one fresh private per-run fixture directory under the
-  task TMPDIR (the module's designated scratch points there for the
-  duration), and no shared-root entry is ever created.
+  bounds, and composition controls that instantiate the REAL
+  `OuterEffects.from_environment()` / `InnerEffects.from_environment()`
+  factories and drive the actual `outer_half` and `inner_half` entries —
+  launch, guarded supervisor child, case driver, verdict parsing, report
+  publication and receipt composition — with only the external process, Git,
+  clock, route and storage queries scripted at named module-level query
+  points; no factory is replaced and no stage record is faked. No image, no
+  guarded launch and no child process. Storage: each control harness owns one
+  fresh private per-run fixture directory under the run's own TMPDIR, with
+  the real 0755/0700 guard layout materialized inside that fixture; the
+  module's designated scratch points into the fixture for the duration of
+  each control, a write-audit control rejects any write outside the run's
+  temporary areas, and no entry is ever created in the shared designated
+  scratch root.
 - `effigy journal:native` and `effigy journal:native:diagnostic` — the
   operation journal's one bounded native, journal-only, on fresh private
   filesystem fixtures inside the guard's owned scratch under the same
