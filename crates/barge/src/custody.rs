@@ -983,7 +983,7 @@ fn decide(
 /// A grant revoked, or a unit moved outside the scope it was declared for,
 /// between the plan and the effect keeps the unit rather than being trusted
 /// from the plan.
-fn grant_still_recorded(
+pub(crate) fn grant_still_recorded(
     state_paths: &StatePaths,
     record: &registry::VolumeRecord,
     unit: &DeletionUnit,

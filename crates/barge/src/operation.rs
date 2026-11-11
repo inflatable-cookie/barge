@@ -259,6 +259,37 @@ pub struct FinalizeSpec {
     pub payload: String,
 }
 
+/// The original Barge declaration and grant that authorized the request.
+/// The generation is a floor, not an instruction to adopt a current grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclarationAuthority {
+    /// Declaration namespace.
+    pub namespace: String,
+    /// Declaration area name.
+    pub area: String,
+    /// Generation observed by the original caller.
+    pub generation: u64,
+    /// Exact grant kind and reference bound to this unit.
+    pub grant: UnitGrant,
+}
+
+impl DeclarationAuthority {
+    /// Validate the binding without reading or interpreting caller payloads.
+    pub fn validate(&self, unit: &OperationUnit) -> Result<()> {
+        crate::area::validate_name("namespace", &self.namespace)?;
+        crate::area::validate_name("area", &self.area)?;
+        self.grant.validate()?;
+        if self.generation == 0 || self.grant != unit.grant {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                "the declaration authority is not bound to the unit and a nonzero generation",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl FinalizeSpec {
     /// Validate shape and bounds only; the payload is never interpreted.
     pub fn validate(&self) -> Result<()> {
@@ -560,6 +591,10 @@ pub struct OperationRecord {
     /// ancestor bind future fresh proofs; it is never itself permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub absence: Option<crate::evidence::AbsenceEvidence>,
+    /// Original typed declaration authority. Older records omit it and are
+    /// never implicitly upgraded from a current declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<DeclarationAuthority>,
     /// Whether the hook is owed, acknowledged, or released by cancellation.
     pub finalize_status: FinalizeStatus,
     /// The exact unit the operation binds.
@@ -653,6 +688,9 @@ impl OperationRecord {
             .with_detail("sequence", self.sequence.into()));
         }
         self.unit.validate(self.sequence)?;
+        if let Some(declaration) = &self.declaration {
+            declaration.validate(&self.unit)?;
+        }
         if let Some(absence) = &self.absence {
             absence.validate()?;
             if absence.verdict != "absent" {
@@ -831,6 +869,9 @@ pub struct BeginRequest {
     /// The original consumer-path absence observation, when required by the
     /// delegated route. Replay must re-establish it from its bound ancestor.
     pub absence: Option<crate::evidence::AbsenceEvidence>,
+    /// Original declaration and grant authority, when a checked effect will
+    /// be requested. A missing binding cannot authorize a delegated effect.
+    pub declaration: Option<DeclarationAuthority>,
     /// The exact unit binding, without its sequence-derived capture name yet.
     pub unit: OperationUnit,
 }
@@ -851,6 +892,7 @@ impl BeginRequest {
             request_digest: Some(request_digest.into()),
             finalize: Some(finalize),
             absence: None,
+            declaration: None,
             unit,
         }
     }
@@ -864,6 +906,7 @@ impl BeginRequest {
             request_digest: None,
             finalize: None,
             absence: None,
+            declaration: None,
             unit,
         }
     }
@@ -918,6 +961,9 @@ impl BeginRequest {
                 "a begin request derives the private capture name from the allocated sequence; it never accepts one"
                     .to_owned(),
             ));
+        }
+        if let Some(declaration) = &self.declaration {
+            declaration.validate(&self.unit)?;
         }
         if let Some(absence) = &self.absence {
             absence.validate()?;
@@ -1938,6 +1984,7 @@ pub fn begin_operation(
         request_digest: request.request_digest.clone(),
         finalize: request.finalize.clone(),
         absence: request.absence.clone(),
+        declaration: request.declaration.clone(),
         finalize_status: FinalizeStatus::Owed,
         unit,
         phase: OperationPhase::Intent,
@@ -1959,7 +2006,7 @@ pub fn begin_operation(
 /// Whether an existing record and a begin request present the same operation:
 /// the exact original request digest, unit binding, and hook kind, version and
 /// payload.
-fn same_request(existing: &OperationRecord, request: &BeginRequest) -> bool {
+pub(crate) fn same_request(existing: &OperationRecord, request: &BeginRequest) -> bool {
     let Some((_, _, digest, finalize)) = existing.delegation() else {
         return false;
     };
@@ -1972,6 +2019,7 @@ fn same_request(existing: &OperationRecord, request: &BeginRequest) -> bool {
     digest == request_digest
         && finalize == request_finalize
         && existing.absence == request.absence
+        && existing.declaration == request.declaration
         && existing.unit.same_binding(&request.unit)
 }
 
@@ -2370,7 +2418,7 @@ pub fn finalize_operation(
             Error::new(
                 error.kind(),
                 format!(
-                    "caller `{caller}` key `{key}` handler `{}` version `{}` remains owed: {error}",
+            "caller `{caller}` key `{key}` handler `{}` version `{}` did not confirm finalization: {error}",
                     spec.kind, spec.version
                 ),
             )
@@ -2416,6 +2464,57 @@ pub fn finalize_operation(
         current,
         OperationPhase::Complete,
     )
+}
+
+/// One bounded finalization attempt from a complete journal observation.
+#[derive(Debug)]
+pub struct FinalizationAttempt {
+    /// The original caller namespace.
+    pub caller: String,
+    /// The caller's original operation key.
+    pub key: String,
+    /// The persisted handler kind.
+    pub kind: String,
+    /// The persisted handler version.
+    pub version: String,
+    /// The exact acknowledgement or the reason this attempt remains unresolved.
+    pub result: Result<OperationRecord>,
+}
+
+/// Attempt each observed deleted, owed delegated operation once. The initial
+/// read must be complete; an unreadable, uninitialized or busy journal fails
+/// the entire call instead of returning an empty or partial census. Each hook
+/// runs through [`finalize_operation`] with no lock spanning dispatch.
+pub fn drain_finalizations(
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    state: &StatePaths,
+    hooks: &[&dyn FinalizeHook],
+) -> Result<Vec<FinalizationAttempt>> {
+    let mut locks = LockSet::new(state.clone());
+    let view = consult_operations(dirs, observer, state, &mut locks, INTENT_ROWS)?
+        .ok_or_else(uninitialized_error)?;
+    let mut attempts = Vec::new();
+    for record in view.records.into_iter().filter(|record| {
+        record.resume == ResumePolicy::Caller
+            && record.phase == OperationPhase::Deleted
+            && record.finalization_owed()
+    }) {
+        let (caller, key, _, spec) = record.delegation().ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "a deleted operation has incomplete delegation",
+            )
+        })?;
+        attempts.push(FinalizationAttempt {
+            caller: caller.to_owned(),
+            key: key.to_owned(),
+            kind: spec.kind.clone(),
+            version: spec.version.clone(),
+            result: finalize_operation(dirs, observer, state, caller, key, hooks),
+        });
+    }
+    Ok(attempts)
 }
 
 /// One record the diagnostic could read, summarized.
@@ -2818,11 +2917,12 @@ mod tests {
 
     use super::{
         advance_operation, begin_operation, checked_operation_state, consult_operations,
-        consult_settlement, epoch_path, finalize_operation, init_operation_journal,
-        inspect_operation_journal, read_operations, record_operation_captures, record_path,
-        BeginRequest, Begun, FinalizationContext, FinalizeHook, FinalizeSpec, FinalizeStatus,
-        JournalEpoch, JournalFinding, JournalIdentity, OperationPhase, OperationRecord,
-        OperationUnit, ResumePolicy, SettlementConsult, EPOCH_FILE_NAME,
+        consult_settlement, drain_finalizations, epoch_path, finalize_operation,
+        init_operation_journal, inspect_operation_journal, read_operations,
+        record_operation_captures, record_path, BeginRequest, Begun, FinalizationContext,
+        FinalizeHook, FinalizeSpec, FinalizeStatus, JournalEpoch, JournalFinding, JournalIdentity,
+        OperationPhase, OperationRecord, OperationUnit, ResumePolicy, SettlementConsult,
+        EPOCH_FILE_NAME,
     };
     use crate::contract::{
         INTENT_ROWS, JOURNAL_EPOCH_SCHEMA, JOURNAL_IDENTITY_SCHEMA, OPERATION_PAYLOAD_CAP_BYTES,
@@ -3813,6 +3913,130 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_dispatches_acknowledge_the_same_exact_operation() {
+        struct Hook<'a> {
+            state: &'a StatePaths,
+            both_entered: &'a std::sync::Barrier,
+            both_consulted: &'a std::sync::Barrier,
+        }
+        impl FinalizeHook for Hook<'_> {
+            fn kind(&self) -> &str {
+                "oxide.settle-outputs"
+            }
+            fn version(&self) -> &str {
+                "1"
+            }
+            fn finalize(
+                &self,
+                context: &FinalizationContext,
+                _: &OperationRecord,
+            ) -> crate::error::Result<()> {
+                self.both_entered.wait();
+                let answer = consult_settlement(&platform(), &platform(), self.state, context)?;
+                assert!(matches!(answer, SettlementConsult::Owed(_)));
+                self.both_consulted.wait();
+                Ok(())
+            }
+        }
+        let (_dir, state, uuid) = fixture("operation-concurrent-hooks");
+        init(&state);
+        let mut record = begin(&platform(), &state, delegated_request(&uuid))
+            .record()
+            .clone();
+        let mut locks = LockSet::new(state.clone());
+        let write = write_token(&mut locks, &uuid);
+        for phase in [
+            OperationPhase::Renamed,
+            OperationPhase::MarkerLast,
+            OperationPhase::Removed,
+            OperationPhase::Deleted,
+        ] {
+            record = advance_operation(&write, &platform(), &platform(), &state, &record, phase)
+                .expect("phase");
+        }
+        let both_entered = std::sync::Barrier::new(2);
+        let both_consulted = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let invoke = || {
+                let hook = Hook {
+                    state: &state,
+                    both_entered: &both_entered,
+                    both_consulted: &both_consulted,
+                };
+                finalize_operation(
+                    &platform(),
+                    &platform(),
+                    &state,
+                    "oxide.outputs",
+                    "prune-run-1",
+                    &[&hook],
+                )
+            };
+            let first = scope.spawn(invoke);
+            let second = scope.spawn(invoke);
+            assert_eq!(
+                first
+                    .join()
+                    .expect("first thread")
+                    .expect("first ack")
+                    .phase,
+                OperationPhase::Complete
+            );
+            assert_eq!(
+                second
+                    .join()
+                    .expect("second thread")
+                    .expect("second ack")
+                    .phase,
+                OperationPhase::Complete
+            );
+        });
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
+            .expect("read")
+            .expect("initialized");
+        assert_eq!(view.records[0].generation, record.generation + 1);
+    }
+
+    #[test]
+    fn drain_reports_missing_handlers_without_losing_the_owed_record() {
+        let (_dir, state, uuid) = fixture("operation-drain-missing");
+        init(&state);
+        let mut record = begin(&platform(), &state, delegated_request(&uuid))
+            .record()
+            .clone();
+        let mut locks = LockSet::new(state.clone());
+        let write = write_token(&mut locks, &uuid);
+        for phase in [
+            OperationPhase::Renamed,
+            OperationPhase::MarkerLast,
+            OperationPhase::Removed,
+            OperationPhase::Deleted,
+        ] {
+            record = advance_operation(&write, &platform(), &platform(), &state, &record, phase)
+                .expect("phase");
+        }
+        let attempts =
+            drain_finalizations(&platform(), &platform(), &state, &[]).expect("complete census");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].caller, "oxide.outputs");
+        assert_eq!(attempts[0].key, "prune-run-1");
+        assert_eq!(attempts[0].kind, "oxide.settle-outputs");
+        assert_eq!(attempts[0].version, "1");
+        assert_eq!(
+            attempts[0]
+                .result
+                .as_ref()
+                .expect_err("unregistered handler")
+                .kind(),
+            ErrorKind::RefusedBoundary
+        );
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
+            .expect("read")
+            .expect("initialized");
+        assert_eq!(view.records[0], record);
+    }
+
+    #[test]
     fn capture_evidence_publishes_before_its_unlink_and_stays_bounded() {
         let (_dir, state, uuid) = fixture("operation-captures");
         let mut locks = LockSet::new(state.clone());
@@ -4607,6 +4831,7 @@ mod tests {
             request_digest: Some(digest.to_owned()),
             finalize: Some(finalize()),
             absence: None,
+            declaration: None,
             finalize_status: FinalizeStatus::Owed,
             unit: bound,
             phase: OperationPhase::Intent,
@@ -4631,6 +4856,7 @@ mod tests {
             request_digest: None,
             finalize: None,
             absence: None,
+            declaration: None,
             finalize_status: FinalizeStatus::Owed,
             unit: bound,
             phase: OperationPhase::Intent,
@@ -4655,6 +4881,7 @@ mod tests {
             request_digest: Some(DIGEST.to_owned()),
             finalize: Some(finalize()),
             absence: None,
+            declaration: None,
             finalize_status: FinalizeStatus::Released,
             unit,
             phase: OperationPhase::Cancelled,

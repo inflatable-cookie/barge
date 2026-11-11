@@ -1205,6 +1205,20 @@ existing encoding; an older strict reader refuses a record containing the new
 field. The existing capture walk can write its captures and phase transitions
 to the successor journal without publishing a legacy intent, but checked
 admission and successor replay are not connected yet.
+Exact delegated state lookup refuses changed request or handler bindings even
+for terminal records. The in-progress cancellation entry retains a cancelled
+record only after taking journal, volume and unit custody and verifying the
+original unit and absent capture; an `intent` phase alone is insufficient.
+Finalization drain attempts each observed deleted, owed handler at most once
+per call and reports each outcome. None of these pieces yet authorizes an
+effect or replaces the existing covered caller.
+
+The original declaration authority is a typed namespace, area, generation and
+grant binding in the same record, separate from the opaque caller payload.
+Its generation is a floor: a newer declaration is acceptable only while the
+same grant and location still cover the unit. A missing binding never acquires
+authority from the current declaration. Records without the added field retain
+their prior encoding; strict older readers refuse records that include it.
 
 The persistence/integrity prerequisite of the split's first part is
 implemented in `crates/barge/src/operation.rs`, with no caller connected and
