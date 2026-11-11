@@ -77,11 +77,15 @@ owns scope and naming. Moving live data, changing host settings and deleting
 existing data each need explicit operator approval until a placement kind is
 qualified.
 
-Tom selected source-only bounded shared descriptor-listing design in decision
-`9e68c8ce-ac61-4190-a31c-b45f99fd6ecd` v2 (2026-11-10), within the existing
-scan totals. The [writer-custody design](contracts/stage1-design.md#bounded-shared-descriptor-listing-design-only-2026-11-10)
-requires independent exact-head review; runtime caps remain unchanged.
-Implementation, capacity changes and native/live activation need new scoped authority.
+Tom selected bounded shared descriptor-listing design in decision
+`9e68c8ce-ac61-4190-a31c-b45f99fd6ecd` v2, then “Implement reviewed listing
+on fixtures” in decision `13834566-5b7f-44be-a655-6444a4eeaa32` v2
+(2026-11-10). The [writer-custody contract](contracts/stage1-design.md#bounded-shared-descriptor-listing-2026-11-10)
+keeps the 4096-process, 65,536-returned-row and 10 s ceilings. The approved
+scope covers implementation, ordinary checks and native readiness, with
+independent exact-head review. Diagnostic, author and distinct reviewer native
+occurrences each require separate planner activation before merge. No
+installation, live adoption, capacity increase or retained-image cleanup follows.
 
 Tom asked for simpler shared recovery on 2026-11-10 (decision
 `1d4a7aee-a8e6-4a75-96f0-b142c4176db2` v2): the delegated-deletion machinery

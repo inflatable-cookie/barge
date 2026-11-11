@@ -97,7 +97,8 @@ pub const CAPABILITY: &str = "cooperative_holds_plus_same_uid_descriptor_observa
 /// How many same-uid processes one scan may observe before it is bounded.
 pub const SCAN_PROCESSES: usize = 4096;
 
-/// How many descriptors one scan may observe before it is bounded.
+/// How many returned listing rows one scan may spend before it is bounded.
+/// Discarded full prefixes and repeated listings spend the same allowance.
 pub const SCAN_DESCRIPTORS: usize = 65_536;
 
 /// How long one descriptor scan may take before it is bounded.
@@ -197,7 +198,9 @@ pub struct CustodyBounds {
     pub holds: usize,
     /// How many same-uid processes the scan may observe.
     pub processes: usize,
-    /// How many descriptors the scan may observe.
+    /// The scan's returned-listing-row work allowance, including discarded full
+    /// prefixes and repeated listings. Observed-descriptor evidence keeps its
+    /// final-listing meaning.
     pub descriptors: usize,
     /// How long the scan may take.
     pub timeout: Duration,
@@ -1363,6 +1366,7 @@ pub fn capability_report() -> CustodyReport {
         establishes: vec![
             "every recorded hold for the deletion unit is released or positively stale; Barge holds are keyed by a Barge root id, so a unit Barge never created has none to read".to_owned(),
             "a bounded scan of this account's open descriptors is complete and finds none at or under the unit".to_owned(),
+            "that scan shares one original deadline and at most 4096 same-uid processes, 65536 returned listing rows and 10 s across initial listings, bounded buffer growth and relistings; discarded prefixes, repeated rows and non-vnodes spend the same private work allowance, while observed-descriptor counts keep their final-listing meaning, so work exhaustion can refuse earlier; accepted listings bracket PID, start and effective uid, and full, malformed, ambiguous or expired answers never prove completion".to_owned(),
             "that scan classifies each process by the effective uid the kernel's own process table reports, before it inspects any descriptor, and reports how many processes of another effective uid it classified".to_owned(),
             "that scan excludes the calling barge process's own descriptors, by its pid and the start identity read once and verified, and no other process: another barge process, its child or its parent is observed like any other same-uid writer".to_owned(),
             "that scan re-observes a same-uid process whose descriptor listing the kernel answers EPERM for, by re-reading the kernel's pid, start identity and effective uid and listing again at most three times inside a 250 ms settle window, with both that window and the scan's own deadline rechecked after every backoff, and settles it only on a positive fact: a later listing, a process the kernel reports gone, a changed start identity re-evaluated as the different process it now names, or a changed effective uid counted as the named blind spot; the same identity still answering EPERM is unknown and refuses, and elapsed time is never taken as proof".to_owned(),
@@ -1398,8 +1402,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        capability_report, take_custody, CustodyBounds, CustodyEvidence, CustodyVerdict,
-        PendingIntent, CAPABILITY,
+        capability_report, take_custody, CustodyBounds, CustodyVerdict, PendingIntent, CAPABILITY,
     };
     use crate::area::RootKind;
     use crate::error::{Error, ErrorKind, Result};
@@ -2860,49 +2863,32 @@ mod tests {
     }
 
     #[test]
-    fn a_process_this_account_may_not_read_is_reclassified_foreign_by_its_identity() {
+    fn a_foreign_process_misclassified_as_same_uid_refuses_before_listing() {
         let holder = real_holder("custody-real-descriptors-unreadable");
         holder.payload();
-        // A pid whose descriptors the kernel will not show this account, claimed
-        // by the table as this account's own. The listing answers `EPERM`, and
-        // the re-observation reads the pid's kernel identity, which reports
-        // another account: it is the named blind spot, counted and reported,
-        // rather than an unreadable same-uid process (barge#012, ruling
-        // bcaa83d8). Nothing about it is inspected.
-        //
-        // A real process can exit between the table read and the re-observation;
-        // it then resolves as positively gone, which is a true answer about it but
-        // not the fact under test, so the next live candidate is tried. Candidates
-        // are ordered so a long-lived process (`launchd`, then a `login`) comes
-        // first, and the proof holds only when a live foreign process really was
-        // reclassified.
+        // The initial table deliberately lies about a real foreign process's
+        // uid. The mandatory pre-listing identity bracket must refuse before
+        // any descriptor read; an invalid classification cannot borrow EPERM's
+        // positive reclassification policy. The separate owned-child EPERM/uid
+        // control below still proves that policy's affirmative foreign result.
         let candidates = foreign_identity_candidates();
         assert!(
             !candidates.is_empty(),
             "this host reports processes of other effective uids"
         );
-        let (pid, evidence) = reclassified_foreign_evidence(&holder, &candidates)
-            .unwrap_or_else(|| {
+        let (_, verdict) =
+            misclassified_foreign_refusal(&holder, &candidates).unwrap_or_else(|| {
                 panic!(
-                    "no live process of another effective uid was re-observed as foreign: {candidates:?}"
+                    "no live foreign process reached the initial identity refusal: {candidates:?}"
                 )
             });
-        assert_eq!(evidence.foreign_uid_processes, 1);
-        assert_eq!(evidence.retry.retried_unreadable, 1);
-        let retried = evidence.retry.retried.first().expect("the retried pid");
-        assert_eq!(
-            retried.pid, pid,
-            "the counted process is the re-observed one"
-        );
-        assert_eq!(retried.resolution, RetryResolution::Foreign);
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        assert_eq!(verdict.retry().retried_unreadable, 0);
+        assert!(verdict.into_evidence().is_err(), "unknown refuses");
     }
 
     #[test]
     fn a_candidate_that_exits_before_the_observation_is_passed_over() {
-        // A real process that is gone by the time the observation runs: its stated
-        // row is claimed as this account's own and the kernel reports it gone, so
-        // it proves nothing about reclassification. The proof must move on to a
-        // live candidate rather than report a false zero.
         let holder = real_holder("custody-real-candidate-gone");
         holder.payload();
         let mut child = std::process::Command::new("/bin/sleep")
@@ -2921,9 +2907,25 @@ mod tests {
             effective_uid: Some(platform().effective_uid().expect("the account uid")),
             start,
         };
+        // Positive gone precedes the descriptor read, so even a queued EPERM
+        // must remain unconsumed and there is no retry or foreign evidence.
+        let observer = TableObserver::stated(
+            vec![self_identity(), gone],
+            vec![StatedListing {
+                pid,
+                errnos: vec![EPERM],
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+        let evidence = verdict.evidence().expect("the evidence");
+        assert_eq!(evidence.processes, 0);
+        assert_eq!(evidence.foreign_uid_processes, 0);
+        assert_eq!(evidence.retry.retried_unreadable, 0);
         assert!(
-            reclassified_foreign_evidence(&holder, std::slice::from_ref(&gone)).is_none(),
-            "the exited candidate alone proves nothing"
+            misclassified_foreign_refusal(&holder, std::slice::from_ref(&gone)).is_none(),
+            "the exited candidate supplies neither a foreign fact nor a refusal"
         );
         let live = foreign_identity_candidates();
         assert!(
@@ -2932,45 +2934,59 @@ mod tests {
         );
         let mut candidates = vec![gone];
         candidates.extend(live);
-        let (_, evidence) = reclassified_foreign_evidence(&holder, &candidates)
-            .expect("a live foreign candidate is re-observed as foreign");
-        assert_eq!(evidence.foreign_uid_processes, 1);
-        assert_eq!(
-            evidence
-                .retry
-                .retried
-                .first()
-                .expect("the retried pid")
-                .resolution,
-            RetryResolution::Foreign
+        let (_, verdict) = misclassified_foreign_refusal(&holder, &candidates)
+            .expect("the next live misclassified process conservatively refuses");
+        assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+        assert_eq!(verdict.retry().retried_unreadable, 0);
+        assert!(
+            verdict.into_evidence().is_err(),
+            "no false foreign Safe result"
         );
     }
 
-    /// Run the reclassification observation over the candidates in order, and
-    /// return the first evidence that counted exactly one re-observed foreign
-    /// process, with the pid that produced it.
-    ///
-    /// A candidate the kernel reports positively gone is skipped: it is a true
-    /// answer about that process, but not the fact the real-process proof needs.
-    fn reclassified_foreign_evidence(
+    /// A positive gone candidate is not a foreign fact. The first live candidate
+    /// whose stated same-uid classification contradicts the kernel must refuse
+    /// before listing, both at the actual adapter and at the custody caller.
+    fn misclassified_foreign_refusal(
         holder: &Holder,
         candidates: &[ProcessIdentity],
-    ) -> Option<(u32, CustodyEvidence)> {
+    ) -> Option<(u32, CustodyVerdict)> {
         let uid = platform().effective_uid().expect("the account uid");
+        let root = holder.unit.path_in(&holder.area);
+        let request = DescriptorScanRequest {
+            root: &root,
+            root_device: holder.unit.device,
+            root_inode: holder.unit.inode,
+            max_processes: 8,
+            max_descriptors: 64,
+            timeout: Duration::from_secs(5),
+            self_exclusion: None,
+        };
         for foreign in candidates {
-            let observer = TableObserver::new(vec![
-                self_identity(),
-                ProcessIdentity {
-                    pid: foreign.pid,
-                    effective_uid: Some(uid),
-                    start: foreign.start,
-                },
-            ]);
-            let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
-            if let Some(evidence) = verdict.evidence() {
-                if evidence.foreign_uid_processes == 1 {
-                    return Some((foreign.pid, evidence.clone()));
-                }
+            let classified = ProcessIdentity {
+                pid: foreign.pid,
+                effective_uid: Some(uid),
+                start: foreign.start,
+            };
+            let fault = StatedListing {
+                pid: foreign.pid,
+                errnos: vec![EPERM],
+                ..StatedListing::default()
+            };
+            let mut faults = vec![fault.clone()];
+            let answer = platform()
+                .scan_open_descriptors_with(&request, &[classified], &[], &mut faults)
+                .expect("the conservative scan answer");
+            assert_eq!(faults[0].list_calls, 0, "{answer:?}");
+            assert_eq!(faults[0].errnos, vec![EPERM], "no listing was attempted");
+            if let DescriptorScan::Unreadable { reason, retry } = answer {
+                assert!(reason.contains("changed before the read"), "{reason}");
+                assert_eq!(retry.retried_unreadable, 0);
+                let observer =
+                    TableObserver::stated(vec![self_identity(), classified], vec![fault]);
+                let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+                assert_eq!(verdict.name(), "unknown", "{:?}", verdict.reason());
+                return Some((foreign.pid, verdict));
             }
         }
         None
@@ -3124,11 +3140,9 @@ mod tests {
     }
 
     #[test]
-    fn an_eperm_for_a_process_the_kernel_reports_gone_is_resolved_as_gone() {
-        let holder = real_holder("custody-012-gone");
+    fn a_process_already_gone_before_listing_needs_no_eperm_retry() {
+        let holder = real_holder("custody-012-gone-before-read");
         holder.payload();
-        // A pid no process has: the kernel's own table reports no such process,
-        // which is a positive fact, and a gone process holds no descriptors.
         let absent = ProcessIdentity {
             pid: 4_242_420,
             effective_uid: Some(platform().effective_uid().expect("the account uid")),
@@ -3145,18 +3159,45 @@ mod tests {
         let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
         assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
         let evidence = verdict.evidence().expect("the evidence");
+        assert_eq!(evidence.processes, 0);
+        assert_eq!(evidence.retry.retried_unreadable, 0);
+        assert!(evidence.retry.retried.is_empty());
+    }
+
+    #[test]
+    fn an_eperm_followed_by_positive_gone_reobservation_is_resolved_as_gone() {
+        let holder = real_holder("custody-012-gone-after-eperm");
+        holder.payload();
+        let child = Child::idle();
+        let identity = child.identity();
+        // The initial identity is real and valid. Only after the actual listing
+        // seam answers EPERM does the existing identity seam state positive
+        // gone, which exercises the settlement rather than skipping its read.
+        let observer = TableObserver::stated(
+            vec![self_identity(), identity],
+            vec![StatedListing {
+                pid: identity.pid,
+                errnos: vec![EPERM],
+                gone_after: Some(0),
+                ..StatedListing::default()
+            }],
+        );
+        let verdict = holder.take_with(&[], &observer, CustodyBounds::default());
+        assert_eq!(verdict.name(), "safe", "{:?}", verdict.reason());
+        let evidence = verdict.evidence().expect("the evidence");
         assert_eq!(evidence.retry.retried_unreadable, 1);
         let record = evidence
             .retry
             .retried
             .first()
             .expect("the retried pid is recorded");
-        assert_eq!(record.pid, absent.pid);
+        assert_eq!(record.pid, identity.pid);
+        assert_eq!(record.start, identity.start);
         assert_eq!(record.errnos, vec![EPERM]);
         assert_eq!(record.resolution, RetryResolution::Gone);
         assert!(
             record.command.is_none(),
-            "the kernel never reported the process, so no command was read: {:?}",
+            "positive gone ended the first re-observation: {:?}",
             record.command
         );
     }

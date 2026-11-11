@@ -30,6 +30,9 @@ libc = "=0.2.190"
 [features]
 proof-synthetic-account = []
 proof-journal = []
+# The targeted shared-listing kernel proof. No ordinary build enables its
+# single-PID endpoint or its driver; it does not replace the custody scan.
+proof-descriptor-listing = []
 
 [lints]
 workspace = true
@@ -50,6 +53,10 @@ required-features = ["proof-synthetic-account"]
 [[example]]
 name = "journal_proof"
 required-features = ["proof-journal"]
+
+[[example]]
+name = "descriptor_listing_proof"
+required-features = ["proof-descriptor-listing"]
 
 # The F6-O2 B-S1 capture harness (docs/knowledge/contracts/o2-tape.md): a
 # standalone executable whose argv contract is

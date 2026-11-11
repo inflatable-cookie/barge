@@ -727,11 +727,16 @@ pub struct DescriptorScanRequest<'a> {
     pub root_device: DeviceId,
     /// The root's inode.
     pub root_inode: u64,
-    /// How many processes this account may be observed through.
+    /// How many same-uid processes may be observed, capped at 4096. Foreign
+    /// processes and the verified self-exclusion keep their existing meanings.
     pub max_processes: usize,
-    /// How many descriptors may be observed in total.
+    /// The total returned-listing-row work allowance, capped at 65,536. Every
+    /// row spends it, including non-vnodes, discarded full prefixes and repeated
+    /// listings. Public observed-descriptor counts still count only evaluated
+    /// final-listing rows, so private work exhaustion can refuse earlier.
     pub max_descriptors: usize,
-    /// How long the scan may take before it must answer "bounded".
+    /// How long the scan may take before it must answer "bounded", capped at
+    /// 10 s. Listing growth and all retries share the original deadline.
     pub timeout: Duration,
     /// The calling process to exclude, or `None` to exclude nothing. Custody
     /// always names itself: the descriptors it holds for its own walk and its
@@ -1011,7 +1016,9 @@ pub enum DescriptorScan {
     Complete {
         /// How many same-uid processes were observed.
         processes: usize,
-        /// How many descriptors were observed.
+        /// How many final-listing rows were evaluated, including non-vnodes.
+        /// Discarded full prefixes and relist rows spend private work but are
+        /// not added to this observed count.
         descriptors: usize,
         /// How many processes the table classified as another effective uid.
         /// They were classified, not inspected: this is the named blind spot,
@@ -1037,7 +1044,8 @@ pub enum DescriptorScan {
     Bounded {
         /// How many same-uid processes were observed before the bound.
         processes: usize,
-        /// How many descriptors were observed before the bound.
+        /// How many final-listing rows were evaluated before the bound. This
+        /// count excludes discarded prefixes and repeated listing work.
         descriptors: usize,
         /// Which bound stopped the scan.
         bound: &'static str,
