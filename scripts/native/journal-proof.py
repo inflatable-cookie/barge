@@ -313,27 +313,45 @@ class InnerEffects:
     clock, directory creation, the stage and case child executors, the source
     identity and digests, route facts, and receipt publication."""
 
-    def __init__(self, env, monotonic_ns, make_directory, run_stage_child,
-                 run_case_child, identity_fn, digest_fn, guard_facts, write_file):
+    def __init__(self, env, monotonic_ns, make_directory, run_process,
+                 identity_fn, digest_fn, guard_facts, write_file):
         self.env = env
         self.monotonic_ns = monotonic_ns
         self.make_directory = make_directory
-        self.run_stage_child = run_stage_child
-        self.run_case_child = run_case_child
+        self.run_process = run_process
         self.identity_fn = identity_fn
         self.digest_fn = digest_fn
         self.guard_facts = guard_facts
         self.write_file = write_file
 
+    def stage(self, env, run_root, timeout):
+        """The real stage adapter: the managed Oxide build under the stage
+        scrub, bounded by the caller's remaining-time timeout, returning the
+        higher-level stage record (selected artifact path + binary digest) —
+        never a raw CompletedProcess. The low-level subprocess runner is the
+        external seam; this method owns the env scrub, the artifact selection
+        and the digest, and bounds every external failure mode (nonzero
+        build, timeout, spawn OSError, wrong/duplicate/missing artifact) as
+        a Fault so the composition never handles raw process errors."""
+        try:
+            environment = base.stage_environment(dict(env),
+                                                 os.path.join(run_root, "stage-tmp"))
+            os.makedirs(environment["TMPDIR"], exist_ok=True)
+            result = self.run_process(STAGE_COMMAND, environment, timeout)
+            return build_stage_record(result, self.digest_fn)
+        except Fault:
+            raise
+        except subprocess.TimeoutExpired:
+            raise Fault("stage",
+                        f"the stage build timed out after {timeout:g}s")
+        except OSError as error:
+            raise Fault("stage", f"the stage build could not start: {error}")
+
     @staticmethod
     def from_environment():
         environment = dict(os.environ)
 
-        def run_stage_child(command, env, timeout):
-            return subprocess.run(command, env=env, capture_output=True,
-                                  text=True, timeout=timeout)
-
-        def run_case_child(command, env, timeout):
+        def run_process(command, env, timeout):
             return subprocess.run(command, env=env, capture_output=True,
                                   text=True, timeout=timeout)
 
@@ -415,8 +433,8 @@ class InnerEffects:
                 handle.write(text)
 
         return InnerEffects(environment, time.monotonic_ns, make_directory,
-                            run_stage_child, run_case_child, identity_fn,
-                            digest_fn, guard_facts, write_file)
+                            run_process, identity_fn, digest_fn,
+                            guard_facts, write_file)
 
 
 def supervisor_path():
@@ -621,6 +639,39 @@ def guard_containment_problems(facts):
     return problems
 
 
+def build_stage_record(result, digest_fn):
+    """The real artifact parser and hasher for one managed build result.
+
+    Selects exactly one `journal_proof` example artifact carrying exactly the
+    proof feature, and returns the higher-level stage record: the staged
+    binary path and its SHA-256. Never a raw CompletedProcess."""
+    if result.returncode != 0:
+        raise Fault("stage",
+                    f"the stage build exited {result.returncode}: {result.stderr[-400:]}")
+    matches = []
+    for line in result.stdout.splitlines():
+        try:
+            document = json.loads(line)
+        except ValueError:
+            continue
+        target = document.get("target") or {}
+        if (document.get("reason") == "compiler-artifact"
+                and "example" in (target.get("kind") or [])
+                and target.get("name") == DRIVER_NAME
+                and document.get("executable")):
+            matches.append(document)
+    if not matches:
+        raise Fault("stage", "the stage build produced no journal_proof artifact")
+    if len(matches) > 1:
+        raise Fault("stage",
+                    f"the stage build produced {len(matches)} journal_proof artifacts")
+    selected = matches[0]
+    if selected.get("features") != [PROOF_FEATURE]:
+        raise Fault("stage", "the staged artifact does not carry exactly the proof feature")
+    binary = selected["executable"]
+    return {"binary": binary, "binary_sha256": digest_fn(binary)}
+
+
 def wall_deadline_ns(effects):
     """The absolute monotonic wall deadline the outer minted, in ns.
 
@@ -668,10 +719,10 @@ def run_cases_inner(mode, run_root, effects, deadline_ns):
     one inner receipt for publication into the guard's evidence directory.
 
     This is the function the `--inner` runner calls with real child
-    execution, and the effect-free controls call with only the stage and case
-    executors, the source identity, the digest, the clock and the storage
-    faked — the composition itself, including the in-guard stage, the
-    manifest mint and the drift comparison, is never a fake.
+    execution, and the effect-free controls call with only the external
+    subprocess/Git/clock/storage seams faked — the composition itself,
+    including the real stage adapter, the manifest mint and the drift
+    comparison, is never a fake.
     """
     cases = []
     passed = set()
@@ -689,9 +740,8 @@ def run_cases_inner(mode, run_root, effects, deadline_ns):
         stage_blocked_detail = "no guarded wall left to stage inside the closure margin"
     else:
         try:
-            stage_record = effects.run_stage_child(
-                env=effects.env, run_root=run_root,
-                timeout=child_timeout(remaining, STAGE_BASE_TIMEOUT))
+            stage_record = effects.stage(env=effects.env, run_root=run_root,
+                                         timeout=child_timeout(remaining, STAGE_BASE_TIMEOUT))
             manifest = effects.identity_fn()
             drifts = identity_drift(pre_stage, manifest)
             if drifts:
@@ -708,11 +758,9 @@ def run_cases_inner(mode, run_root, effects, deadline_ns):
                 raise Fault("drift", "the staged binary changed after the stage")
         except Fault as error:
             fault = error
-        except subprocess.TimeoutExpired:
+        except Exception as error:  # noqa: BLE001 - bounded by contract
             fault = Fault("stage",
-                          "the guard's wall expired while staging the proof build")
-        except OSError as error:
-            fault = Fault("stage", f"the stage build could not start: {error}")
+                          f"the stage adapter failed unexpectedly: {error!r}")
 
     if fault is None:
         for case in CASES:
@@ -734,7 +782,7 @@ def run_cases_inner(mode, run_root, effects, deadline_ns):
                 continue
             try:
                 command = [stage_record["binary"], case["id"]]
-                result = effects.run_case_child(
+                result = effects.run_process(
                     command, case_environment(effects.env, case_dir),
                     child_timeout(remaining, CASE_BASE_TIMEOUT))
                 verdicts = []
@@ -964,40 +1012,6 @@ def outer_half(mode, effects):
     return exit_code, receipt
 
 
-def real_stage_child(env, run_root, timeout):
-    """The real in-guard stage: the managed Oxide build under the stage
-    scrub, bounded by the caller's remaining-time timeout."""
-    environment = base.stage_environment(dict(env), os.path.join(run_root, "stage-tmp"))
-    os.makedirs(environment["TMPDIR"], exist_ok=True)
-    result = subprocess.run(STAGE_COMMAND, env=environment, capture_output=True,
-                            text=True, timeout=timeout)
-    if result.returncode != 0:
-        raise Fault("stage",
-                    f"the stage build exited {result.returncode}: {result.stderr[-400:]}")
-    selected = None
-    for line in result.stdout.splitlines():
-        try:
-            document = json.loads(line)
-        except ValueError:
-            continue
-        target = document.get("target") or {}
-        if (document.get("reason") == "compiler-artifact"
-                and "example" in (target.get("kind") or [])
-                and target.get("name") == DRIVER_NAME
-                and document.get("executable")):
-            selected = document
-    if selected is None:
-        raise Fault("stage", "the stage build produced no journal_proof artifact")
-    if selected.get("features") != [PROOF_FEATURE]:
-        raise Fault("stage", "the staged artifact does not carry exactly the proof feature")
-    binary = selected["executable"]
-    digest = hashlib.sha256()
-    with open(binary, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    return {"binary": binary, "binary_sha256": digest.hexdigest()}
-
-
 def run_inner(arguments):
     """The guarded inner runner: validate the guard-supplied run, compose the
     cases, publish the receipt into the guard's evidence, and exit zero only
@@ -1059,6 +1073,10 @@ class ControlHarness:
         self.root_canonical = True
         self.root_present = True
         self.stage_fault = None
+        self.stage_raise = None
+        self.build_returncode = 0
+        self.build_calls = []
+        self.digest_calls = []
         self.case_results = {}
         self.identity_drift_after_capture = False
         self.replaced_binary_digest = None
@@ -1119,9 +1137,8 @@ class ControlHarness:
     # InnerEffects seams
     def inner_effects(self, env):
         return InnerEffects(env, self.monotonic_ns, self.make_directory,
-                            self.run_stage_child, self.run_case_child,
-                            self.identity_fn, self.digest_fn, self.guard_facts,
-                            self.write_file)
+                            self.run_process, self.identity_fn, self.digest_fn,
+                            self.guard_facts, self.write_file)
 
     def guard_facts(self, scratch, evidence):
         """The scripted answers for the guard-supplied layout, in the
@@ -1181,14 +1198,22 @@ class ControlHarness:
         self.directories.append(path)
         return path
 
-    def run_stage_child(self, env, run_root, timeout):
-        self.sequence.append("stage")
-        self.stage_timeouts.append(timeout)
-        if self.stage_fault:
-            raise Fault(self.stage_fault[0], self.stage_fault[1])
-        return {"binary": "/stage/" + DRIVER_NAME, "binary_sha256": "f" * 64}
-
-    def run_case_child(self, command, env, timeout):
+    def run_process(self, command, env, timeout):
+        """The low-level subprocess seam: every real child (the stage build
+        and each driver case) arrives here as `(command, env, timeout)` and
+        leaves as a CompletedProcess-shaped namespace. The fake supplies raw
+        Cargo artifact JSON and raw case verdicts — never a stage record."""
+        if command[:2] == ["oxide", "build"]:
+            self.sequence.append("stage")
+            self.stage_timeouts.append(timeout)
+            self.build_calls.append({"command": list(command), "env": dict(env),
+                                     "timeout": timeout})
+            if self.stage_raise is not None:
+                raise self.stage_raise
+            if self.stage_fault:
+                raise Fault(self.stage_fault[0], self.stage_fault[1])
+            return types.SimpleNamespace(returncode=self.build_returncode,
+                                         stdout=self.stage_output, stderr="")
         case = command[-1]
         self.sequence.append(f"case:{case}")
         self.case_timeouts.append(timeout)
@@ -1209,10 +1234,18 @@ class ControlHarness:
         return identity
 
     def digest_fn(self, path):
+        self.digest_calls.append(path)
+        if os.path.isfile(path):
+            # A real fixture file (binary-as-data) is hashed for real.
+            with open(path, "rb") as handle:
+                return hashlib.sha256(handle.read()).hexdigest()
         if path == "/stage/" + DRIVER_NAME:
-            # The staged binary's digest: the stage default unless the
-            # replaced-binary control scripts a different re-hash answer.
-            return self.replaced_binary_digest or "f" * 64
+            if (self.replaced_binary_digest is not None
+                    and self.digest_calls.count(path) >= 2):
+                # Only the pre-first-case re-hash observes the replacement:
+                # the stage-time digest stays the original binary's.
+                return self.replaced_binary_digest
+            return "f" * 64
         return self.source_digests.get(path, "a" * 64)
 
     def write_file(self, path, text):
@@ -1455,13 +1488,14 @@ def composition_controls():
     # margin and are recorded unexecuted, honestly.
     harness = control_harness()
     harness.wall_deadline_override = str(harness.monotonic_ns_value + 100 * 10 ** 9)
-    original_stage = harness.run_stage_child
+    original_stage = harness.run_process
 
-    def stage_advancing_clock(env, run_root, timeout):
-        result = original_stage(env, run_root, timeout)
-        harness.monotonic_ns_value = harness.monotonic_ns_value + 200 * 10 ** 9
+    def stage_advancing_clock(command, env, timeout):
+        result = original_stage(command, env, timeout)
+        if command[:2] == ["oxide", "build"]:
+            harness.monotonic_ns_value = harness.monotonic_ns_value + 200 * 10 ** 9
         return result
-    harness.run_stage_child = stage_advancing_clock
+    harness.run_process = stage_advancing_clock
     exit_code, receipt = outer_half("counted", harness.outer_effects())
     expect(exit_code != 0, "a stage that consumed the wall did not fail the run")
     inner = harness.inner_receipt or {}
@@ -1472,14 +1506,14 @@ def composition_controls():
     # but once the clock crosses the cutoff the later cases are unexecuted.
     harness = control_harness()
     harness.wall_deadline_override = str(harness.monotonic_ns_value + 100 * 10 ** 9)
-    original_case = harness.run_case_child
+    original_case = harness.run_process
 
     def case_advancing_clock(command, env, timeout):
         result = original_case(command, env, timeout)
         if command[-1] == "J5":
             harness.monotonic_ns_value = harness.monotonic_ns_value + 200 * 10 ** 9
         return result
-    harness.run_case_child = case_advancing_clock
+    harness.run_process = case_advancing_clock
     exit_code, receipt = outer_half("counted", harness.outer_effects())
     expect(exit_code != 0, "a consumed mid-run wall did not fail the counted run")
     inner = harness.inner_receipt or {}
@@ -1491,13 +1525,14 @@ def composition_controls():
     # Cutoff just before a case: J1 passes, then the cutoff lands before J2.
     harness = control_harness()
     harness.wall_deadline_override = str(harness.monotonic_ns_value + 31 * 10 ** 9)
-    original_case = harness.run_case_child
+    original_case = harness.run_process
 
     def case_consuming_clock(command, env, timeout):
         result = original_case(command, env, timeout)
-        harness.monotonic_ns_value = harness.monotonic_ns_value + 5 * 10 ** 9
+        if command[:2] != ["oxide", "build"]:
+            harness.monotonic_ns_value = harness.monotonic_ns_value + 5 * 10 ** 9
         return result
-    harness.run_case_child = case_consuming_clock
+    harness.run_process = case_consuming_clock
     exit_code, receipt = outer_half("counted", harness.outer_effects())
     inner = harness.inner_receipt or {}
     statuses = {c.get("case"): c.get("status") for c in inner.get("cases", [])}
@@ -1601,10 +1636,13 @@ def composition_controls():
     # failed stage spawn both become bounded stage faults — the inner
     # publishes its receipt and never crashes without evidence.
     harness = control_harness()
+    runner_through_stage = harness.run_process
 
-    def stage_timeout_expired(env, run_root, timeout):
-        raise subprocess.TimeoutExpired(["oxide", "build"], timeout)
-    harness.run_stage_child = stage_timeout_expired
+    def stage_timeout_expired(command, env, timeout):
+        if command[:2] == ["oxide", "build"]:
+            raise subprocess.TimeoutExpired(command, timeout)
+        return runner_through_stage(command, env, timeout)
+    harness.run_process = stage_timeout_expired
     exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
     expect(exit_code != 0, "a stage timeout did not fail the run")
     inner = harness.inner_receipt or {}
@@ -1616,10 +1654,13 @@ def composition_controls():
            "a stage-timeout run still passed cases")
 
     harness = control_harness()
+    runner_through_spawn = harness.run_process
 
-    def stage_spawn_oserror(env, run_root, timeout):
-        raise OSError("the injected stage spawn failure")
-    harness.run_stage_child = stage_spawn_oserror
+    def stage_spawn_oserror(command, env, timeout):
+        if command[:2] == ["oxide", "build"]:
+            raise OSError("the injected stage spawn failure")
+        return runner_through_spawn(command, env, timeout)
+    harness.run_process = stage_spawn_oserror
     exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
     expect(exit_code != 0, "a stage spawn failure did not fail the run")
     inner = harness.inner_receipt or {}
@@ -1627,6 +1668,167 @@ def composition_controls():
            "the stage spawn failure was not recorded as a bounded stage fault")
     expect("receipt_path" in inner,
            "the stage spawn failure published no bounded receipt")
+
+    # The REAL factory and the REAL stage adapter, end to end: a real
+    # InnerEffects (never a harness stage override) whose only faked seams
+    # are the external queries — the subprocess runner (supplying raw Cargo
+    # artifact JSON, never a preconstructed stage record), Git, the clock and
+    # the storage — driving the actual inner composition. The stage artifact
+    # names a fresh private fixture binary-as-data that is hashed but never
+    # executed, so the real artifact parser, feature validation, digest and
+    # re-hash all run for real.
+    harness = control_harness()
+    harness.env[base.WALL_DEADLINE_ENV] = str(
+        harness.monotonic_ns_value + 10_000 * 10 ** 9)
+    effects = harness.inner_effects(dict(harness.env))
+    binary = None
+    try:
+        fixture = tempfile.TemporaryDirectory(prefix="journal-stage-fixture-")
+        run_root = os.path.realpath(fixture.name)
+        staged = os.path.join(run_root, "pool", DRIVER_NAME)
+        os.makedirs(os.path.dirname(staged))
+        with open(staged, "wb") as handle:
+            handle.write(b"\xcf\xfa\xed\xfe journal-proof binary-as-data"
+                         b" (hashed, never executed)")
+        binary = staged
+        with open(staged, "rb") as handle:
+            fixture_digest = hashlib.sha256(handle.read()).hexdigest()
+        harness.stage_output = (json.dumps({
+            "reason": "compiler-artifact",
+            "target": {"kind": ["example"], "crate_types": ["bin"],
+                       "name": DRIVER_NAME, "edition": "2021"},
+            "features": [PROOF_FEATURE],
+            "executable": staged}) + "\n")
+        receipt = run_cases_inner("counted", run_root, effects,
+                                  int(harness.env[base.WALL_DEADLINE_ENV]))
+        expect(receipt.get("qualified_inner") is True,
+               "the real-factory composition did not qualify")
+        expect(len(receipt.get("cases", [])) == len(CASES)
+               and all(c.get("status") == "passed" for c in receipt["cases"]),
+               "the real-factory composition did not pass all twelve groups")
+        expect((receipt.get("manifest") or {}).get("binary_sha256")
+               == fixture_digest,
+               "the manifest does not carry the real staged binary's digest")
+        expect(receipt.get("pre_stage_identity")
+               == receipt.get("manifest") or
+               all(receipt.get("pre_stage_identity", {}).get(key)
+                   == (receipt.get("manifest") or {}).get(key)
+                   for key in ("store_source_sha256", "driver_source_sha256")),
+               "the pre-stage and post-stage identities disagree on a clean run")
+        build = harness.build_calls[0]
+        expect(build["command"] == STAGE_COMMAND,
+               "the real adapter did not run the exact managed build command")
+        expect(build["env"].get("RUSTUP_TOOLCHAIN") == TOOLCHAIN_CHANNEL
+               and build["env"].get("CARGO_NET_OFFLINE") == "true"
+               and build["env"].get("TMPDIR")
+               == os.path.join(run_root, "stage-tmp"),
+               "the real adapter did not apply the stage env scrub")
+        expect(build["timeout"] == STAGE_BASE_TIMEOUT,
+               "the stage timeout was not the remaining-capped base")
+        expect(harness.sequence[:2] == ["stage", "guarded"] or
+               harness.sequence[0] == "stage",
+               "the stage did not precede the case children in the sequence")
+        stage_child_timeouts = harness.stage_timeouts
+        expect(stage_child_timeouts == [STAGE_BASE_TIMEOUT],
+               "the stage child ran with a wrong timeout")
+        expect(harness.case_timeouts
+               == [CASE_BASE_TIMEOUT] * len(CASES),
+               "the case children did not run at the remaining-capped base")
+        expect(harness.digest_calls.count(staged) == 2,
+               "the staged binary was not hashed at stage time and re-hashed "
+               "before the first case")
+    finally:
+        if binary and os.path.exists(binary):
+            os.unlink(binary)
+        try:
+            fixture.cleanup()
+        except UnboundLocalError:
+            pass
+
+    # The retired keyword/return contract must fail against the real
+    # factory: no `run_stage_child` executor with the old `(env=, run_root=,
+    # timeout=)` stage-record shape can resolve, and a CompletedProcess can
+    # never stand in for the stage record.
+    try:
+        effects.run_stage_child(env=effects.env, run_root="ignored",
+                                timeout=STAGE_BASE_TIMEOUT)
+        expect(False, "the retired stage executor keyword contract still resolved")
+    except AttributeError:
+        expect(True, "")
+
+    adapter_stage_timeout = min(STAGE_BASE_TIMEOUT, 90.0)
+    effects_stage = harness.inner_effects(dict(harness.env))
+    with tempfile.TemporaryDirectory(prefix="journal-adapter-faults-") as fault_root:
+        def stage_fault(expected_detail, prepare):
+            prepare()
+            try:
+                effects_stage.stage(env=effects_stage.env, run_root=fault_root,
+                                    timeout=adapter_stage_timeout)
+                expect(False, expected_detail + " did not fault the real adapter")
+            except Fault as error:
+                expect(error.kind == "stage",
+                       expected_detail + " was not a bounded stage fault")
+
+        def artifact_line(**overrides):
+            document = {"reason": "compiler-artifact",
+                        "target": {"kind": ["example"], "crate_types": ["bin"],
+                                   "name": DRIVER_NAME, "edition": "2021"},
+                        "features": [PROOF_FEATURE],
+                        "executable": "/stage/" + DRIVER_NAME}
+            document.update(overrides)
+            return json.dumps(document) + "\n"
+
+        harness.build_returncode = 101
+        stage_fault("a failed stage build",
+                    lambda: None)
+        harness.build_returncode = 0
+
+        harness.stage_raise = subprocess.TimeoutExpired(STAGE_COMMAND, 90.0)
+        stage_fault("a stage build timeout", lambda: None)
+        harness.stage_raise = OSError("the adapter spawn refusal")
+        stage_fault("a stage spawn OSError", lambda: None)
+        harness.stage_raise = None
+
+        for label, output in (
+                ("a missing journal_proof artifact", ""),
+                ("a bin-kind artifact (wrong target kind)",
+                 artifact_line(target={"kind": ["bin"], "name": DRIVER_NAME,
+                                       "crate_types": ["bin"],
+                                       "edition": "2021"})),
+                ("duplicate journal_proof artifacts",
+                 artifact_line() + artifact_line()),
+                ("an artifact without the proof feature",
+                 artifact_line(features=["default"]))):
+            harness.stage_output = output
+            stage_fault(label, lambda: None)
+        harness.stage_output = artifact_line()
+
+    # An unexpected adapter exception (outside Fault/TimeoutExpired/OSError)
+    # must still land as a bounded first/secondary infrastructure fault with
+    # all twelve groups unexecuted and the available pre-stage binding —
+    # never an unhandled TypeError with no receipt and no fabricated manifest.
+    harness = control_harness()
+    runner_through_type_error = harness.run_process
+
+    def stage_type_error(command, env, timeout):
+        if command[:2] == ["oxide", "build"]:
+            raise TypeError(
+                "run_stage_child() got an unexpected keyword argument 'run_root'")
+        return runner_through_type_error(command, env, timeout)
+    harness.run_process = stage_type_error
+    exit_code, _ignored_receipt = outer_half("counted", harness.outer_effects())
+    expect(exit_code != 0, "an unexpected adapter exception did not fail the run")
+    inner = harness.inner_receipt or {}
+    expect(inner.get("fault", {}).get("kind") == "stage",
+           "the unexpected adapter exception was not a bounded stage fault")
+    expect("receipt_path" in inner,
+           "the unexpected adapter exception published no bounded receipt")
+    expect(all(c.get("status") == "unexecuted" for c in inner.get("cases", [])),
+           "an adapter-exception run still executed case groups")
+    expect(bool(inner.get("pre_stage_identity")),
+           "the adapter-exception receipt carries no pre-stage binding")
+    expect(not (inner.get("manifest") or {}).get("binary_sha256"),
+           "a failed stage still fabricated a manifest binary digest")
 
     # A symlinked scratch keeps its own raw-path fact and is refused as an
     # alias even when its target sits on the verified volume — the exact
