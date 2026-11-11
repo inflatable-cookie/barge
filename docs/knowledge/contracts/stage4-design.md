@@ -1263,14 +1263,28 @@ no effect behind it:
 - **Proof readiness:** the focused native apparatus is authored and
   effect-free — `scripts/native/journal-proof.py` declares twelve journal-only
   case groups, each carried by named regressions the self-check proves against
-  `crates/barge/src/operation.rs`, the composition controls exercise
-  entry→case→report→receipt through fake external effects, and the plan
-  prints the case map, the nine premises with their dispositions and the held
-  bounds (300 s wall, 512 MiB, no image; fit unmeasured). The driver is the
-  `journal_proof` example behind the proof-only `proof-journal` feature;
-  `effigy journal:native:test` and `journal:native:plan` are effect-free, and
-  `journal:native` / `journal:native:diagnostic` are HELD owner activations
-  that declare nothing.
+  `crates/barge/src/operation.rs`, and the plan prints the case map, the nine
+  premises with their dispositions and the held bounds (300 s wall, 512 MiB,
+  no image; fit unmeasured). The inner stages through one real bounded stage
+  adapter — the managed Oxide build under the stage scrub, selection of
+  exactly one `journal_proof` artifact carrying exactly the proof feature,
+  and the staged binary's SHA-256 — and bounds every external failure mode
+  (nonzero build, timeout, spawn OSError, wrong/duplicate/missing artifact)
+  as a stage fault; anything else an adapter can raise (the executor-contract
+  mismatch the first actual diagnostic occurrence died on at `a279031`, spent
+  failed and preserved) lands as a bounded infrastructure fault whose receipt,
+  all-unexecuted rows and available pre-stage binding still publish — never
+  an unhandled crash without a receipt. The composition controls instantiate
+  the real `InnerEffects` factory and drive the actual inner composition with
+  only the external subprocess/Git/clock/storage seams faked: the fake runner
+  supplies raw Cargo artifact JSON, never a preconstructed stage record, and
+  the fixture binary is real data that is hashed but never executed. The
+  driver is the `journal_proof` example behind the proof-only `proof-journal`
+  feature; `effigy journal:native:test` and `journal:native:plan` are
+  effect-free, and `journal:native` / `journal:native:diagnostic` are HELD
+  owner activations that declare nothing. The apparatus sits on the qualified
+  listing stage (056, merged into this branch from main), whose qualified
+  supervisor and single-guard split it shares.
 
 Today one delegated deletion is coordinated by five durable facts across two
 products — Oxide's `prune-intent/1` journal, the registry's schema-3
