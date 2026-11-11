@@ -365,43 +365,6 @@ def source_identity(contract):
     }
 
 
-def stage_driver(contract, run_root):
-    """Stage the proof build through the managed Oxide build — inside the
-    guard, with the build temporaries under the run root — and select the
-    driver's own artifact. The stage command's artifact lines name the
-    example target, its feature and the executable; anything else is a
-    refusal."""
-    environment = base.stage_environment(dict(contract.env),
-                                         os.path.join(run_root, "stage-tmp"))
-    os.makedirs(environment["TMPDIR"], exist_ok=True)
-    try:
-        result = contract.run_child(STAGE_COMMAND, environment, 240)
-    except subprocess.TimeoutExpired as error:
-        raise Fault("stage", f"the stage build did not finish: {error}") from None
-    if result.returncode != 0:
-        raise Fault("stage",
-                    f"the stage build exited {result.returncode}: {result.stderr[-400:]}")
-    selected = None
-    for line in result.stdout.splitlines():
-        try:
-            document = json.loads(line)
-        except ValueError:
-            continue
-        target = document.get("target") or {}
-        if (document.get("reason") == "compiler-artifact"
-                and "example" in (target.get("kind") or [])
-                and target.get("name") == DRIVER_NAME
-                and document.get("executable")):
-            selected = document
-    if selected is None:
-        raise Fault("stage", "the stage build produced no journal_proof artifact")
-    if selected.get("features") != [PROOF_FEATURE]:
-        raise Fault("stage", "the staged artifact does not carry exactly the proof feature")
-    binary = selected["executable"]
-    binary_sha256 = contract.sha256_file(binary)
-    return {"binary": binary, "binary_sha256": binary_sha256}
-
-
 def manifest_complete(manifest):
     """Why an inner receipt's manifest is not a complete source binding."""
     problems = []
@@ -469,6 +432,12 @@ def route_problems(facts):
             f"the scratch root {facts.get('path')} is not inside the designated "
             f"barge scratch {DESIGNATED_SCRATCH}"
         )
+    if facts.get("owner_uid") is not None and facts.get("uid") is not None \
+            and facts.get("owner_uid") != facts.get("uid"):
+        problems.append("the scratch root is not owned by this account")
+    mode = facts.get("mode")
+    if isinstance(mode, int) and mode & 0o077:
+        problems.append(f"the scratch root mode {mode!r} is not owner-only")
     return problems
 
 
@@ -487,22 +456,45 @@ def inner_deadline(env, monotonic):
     return monotonic() + LIMIT_SECONDS
 
 
+SOURCE_IDENTITY_FIELDS = ("head", "tree", "cargo_lock_sha256", "toolchain_sha256",
+                          "driver_source_sha256", "store_source_sha256")
+
+
+def identity_drift(first, second):
+    """The source fields two identities must agree on, and where they do not."""
+    drifts = [field for field in SOURCE_IDENTITY_FIELDS
+              if first.get(field) != second.get(field)]
+    return drifts
+
+
 def run_cases_inner(mode, run_root, env, deadline, make_directory, stage_fn,
-                    case_fn, identity_fn):
-    """The inner composition: stage the proof build inside the guard, mint
-    the source-bound manifest here, and run the twelve fixed case groups,
-    each one direct driver child in its own fresh fixture directory under
-    the owned run root — counted fail-fast or diagnostic keep-going — and
-    return one inner receipt.
+                    case_fn, identity_fn, digest_fn):
+    """The inner composition: capture the pre-stage identity, stage the proof
+    build inside the guard, mint the source-bound manifest here and require
+    it to equal the pre-stage identity (drift refuses), re-hash the staged
+    binary before the first case, and run the twelve fixed case groups, each
+    one direct driver child in its own fresh fixture directory under the
+    owned run root — counted fail-fast or diagnostic keep-going — and return
+    one inner receipt.
 
     This is the function the `--inner` runner calls with real child
     execution, and the effect-free controls call with only the stage and
-    case executors and the source identity faked — the composition itself,
-    including the in-guard stage and the manifest mint, is never a fake.
+    case executors, the source identity and the digest faked — the
+    composition itself, including the in-guard stage, the manifest mint and
+    the drift comparison, is never a fake.
     """
+    pre_stage = identity_fn()
     stage = stage_fn(env, run_root)
     manifest = identity_fn()
+    drifts = identity_drift(pre_stage, manifest)
+    if drifts:
+        raise Fault("drift",
+                    f"the checkout changed during the in-guard stage: {', '.join(drifts)}")
     manifest["binary_sha256"] = stage["binary_sha256"]
+    # The staged pool binary is re-hashed before the first case: a replaced
+    # binary is drift, never the manifest's evidence.
+    if digest_fn(stage["binary"]) != stage["binary_sha256"]:
+        raise Fault("drift", "the staged binary changed after the stage")
     incomplete = manifest_complete(manifest)
     if incomplete:
         raise Fault("manifest", "; ".join(incomplete))
@@ -510,18 +502,15 @@ def run_cases_inner(mode, run_root, env, deadline, make_directory, stage_fn,
     passed = set()
     fault = None
     for case in CASES:
-        if deadline <= 0:
+        remaining = deadline - 0
+        if deadline <= 0 or deadline <= WORK_STOP_SECONDS:
             cases.append({"case": case["id"], "status": "unexecuted",
-                          "detail": "the guarded budget expired before this case"})
+                          "detail": "inside the work-stop margin or past the budget"})
             continue
         if fault and mode == "counted":
             cases.append({"case": case["id"], "status": "skipped",
                           "kind": "latched",
                           "detail": "a counted run latched an earlier fault"})
-            continue
-        if fault and deadline <= WORK_STOP_SECONDS:
-            cases.append({"case": case["id"], "status": "unexecuted",
-                          "detail": "inside the work-stop margin"})
             continue
         case_dir = make_directory(run_root, f"case-{case['id']}-")
         try:
@@ -572,6 +561,7 @@ def run_cases_inner(mode, run_root, env, deadline, make_directory, stage_fn,
         "schema": SCHEMA,
         "stage": "inner",
         "mode": mode,
+        "pre_stage_identity": pre_stage,
         "manifest": manifest,
         "run_root": run_root,
         "qualified_inner": bool(clean),
@@ -649,6 +639,13 @@ def run_inner(arguments):
                           "detail": "the inner argv carries no owned run root"}),
               flush=True)
         return 1
+    def real_digest_fn(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
     try:
         receipt = run_cases_inner(
             arguments.inner, arguments.run_root, dict(os.environ),
@@ -658,6 +655,7 @@ def run_inner(arguments):
             lambda command, env, timeout: subprocess.run(
                 command, env=env, capture_output=True, text=True, timeout=timeout),
             real_identity_fn(),
+            real_digest_fn,
         )
     except Fault as error:
         receipt = {"schema": SCHEMA, "stage": "inner", "mode": arguments.inner,
@@ -825,6 +823,10 @@ class FakeContract:
         self.fail_supervisor_child = False
         self.reap_fails = False
         self.last_guarded_command = None
+        self.identity_calls = 0
+        self.drift_after_identity = False
+        self.staged_binary_digest_after_stage = None
+        self.supervisor_child_exit = None
 
     def supervisor_digest(self):
         return self.supervisor_digest_value
@@ -888,14 +890,17 @@ class FakeContract:
                     inner_deadline(env, lambda: 0.0),
                     lambda parent, prefix: f"{parent}/{prefix}{len(self.directories)}",
                     stage_fn, case_fn,
-                    lambda: source_identity(self),
+                    self.identity_fn, self.digest_fn,
                 )
             except Fault as error:
                 receipt = {"schema": SCHEMA, "stage": "inner", "mode": parsed.inner,
                            "qualified_inner": False, "cases": [],
                            "fault": {"kind": error.kind, "detail": error.detail}}
             clean = parsed.inner == "counted" and receipt["qualified_inner"]
-            return types.SimpleNamespace(returncode=0 if clean else 1,
+            exit_code = self.supervisor_child_exit
+            if exit_code is None:
+                exit_code = 0 if clean else 1
+            return types.SimpleNamespace(returncode=exit_code,
                                          stdout=json.dumps(receipt) + "\n", stderr="")
         return self._ok()
 
@@ -903,7 +908,23 @@ class FakeContract:
         return self.head
 
     def sha256_file(self, path):
+        if path == "/stage/" + DRIVER_NAME:
+            # The staged binary's digest: the stage default unless the
+            # replaced-binary control scripts a different re-hash answer.
+            return self.staged_binary_digest_after_stage or "f" * 64
         return self.source_digests.get(path, "a" * 64)
+
+    def identity_fn(self):
+        """The faked source binding; scripted to drift after the first call
+        so the drift comparison really executes against changed digests."""
+        self.identity_calls += 1
+        identity = source_identity(self)
+        if self.drift_after_identity and self.identity_calls > 1:
+            identity["store_source_sha256"] = "changed" * 8
+        return identity
+
+    def digest_fn(self, path):
+        return self.sha256_file(path)
 
     def read_file(self, path):
         return self.source_digests.get(path, "")
@@ -1122,6 +1143,48 @@ def composition_controls():
            "the diagnostic did not record every case")
     expect(receipt["qualified"] is False, "a diagnostic receipt claimed qualified")
 
+    # Manifest/source drift: the store digest changes between the pre-stage
+    # capture and the manifest mint, and the entry faults as drift before any
+    # case runs.
+    contract = control_contract()
+    contract.drift_after_identity = True
+    try:
+        receipt, _ = run_native("counted", contract)
+        expect(receipt["qualified"] is False, "drift produced a qualified receipt")
+        expect(receipt.get("fault", {}).get("kind") == "drift",
+               "the identity drift was not recorded as the guarded fault")
+        expect(not any(c["status"] == "passed" for c in receipt["cases"]),
+               "a drifted run still passed cases")
+    except Fault as error:
+        expect(error.kind == "drift", "an identity drift faulted with the wrong kind")
+
+    # Replaced staged binary: the re-hash before the first case disagrees
+    # with the manifest's digest, and the entry faults as drift.
+    contract = control_contract()
+    contract.staged_binary_digest_after_stage = "c" * 64
+    try:
+        receipt, _ = run_native("counted", contract)
+        expect(receipt["qualified"] is False, "a replaced binary produced a qualified receipt")
+        expect(receipt.get("fault", {}).get("kind") == "drift",
+               "the replaced binary was not recorded as drift")
+        expect(not receipt["cases"] or
+               all(c["status"] != "passed" for c in receipt["cases"]),
+               "a replaced binary still let cases pass")
+    except Fault as error:
+        expect(error.kind == "drift", "a replaced binary faulted with the wrong kind")
+
+    # Guard not closed: the inner receipt is clean, but the guarded child
+    # exits nonzero - the supervisor latched a custody fault - and the outer
+    # composes the honest unqualified receipt. Qualification never rests on
+    # the inner outcome alone.
+    contract = control_contract()
+    contract.supervisor_child_exit = 1
+    receipt, _ = run_native("counted", contract)
+    expect(receipt["qualified"] is False,
+           "a nonzero guarded exit with a clean inner receipt produced a qualified receipt")
+    expect(receipt["inner"] is not None and receipt["inner"]["qualified_inner"] is True,
+           "the clean inner outcome was not preserved in the receipt")
+
     # Report failure: an unwritable receipt faults and never qualifies.
     contract = control_contract()
     contract.fail_report_write = True
@@ -1167,13 +1230,18 @@ def source_text():
 
 
 def rust_test_names():
-    """The regression names this proof carries, read from the real source."""
+    """The regression names this proof carries, read from the real source:
+    only functions annotated `#[test]` count."""
     names = set()
+    previous = ""
     with open(STORE_SOURCE, "r", encoding="utf-8") as handle:
         for line in handle:
             stripped = line.strip()
-            if stripped.startswith("fn ") and "(" in stripped:
+            if stripped.startswith("fn ") and "(" in stripped \
+                    and "#[test]" in previous:
                 names.add(stripped[3:].split("(")[0].strip())
+            if stripped:
+                previous = stripped
     return names
 
 
