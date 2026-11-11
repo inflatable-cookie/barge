@@ -190,7 +190,7 @@ guarded exception. Each selector covers what it names:
   external executors, without a build, holder or kernel proof.
 - `effigy listing:native` and `effigy listing:native:diagnostic` — one targeted
   owned-child kernel proof, no image, under the same qualified supervisor
-  (300 s / 512 MiB, 30 s work stop). Each occurrence stages its own fresh
+  (600 s / 512 MiB, 30 s work stop; production scans remain 10 s). Each occurrence stages its own fresh
   source-bound proof-feature driver inside the guard through ordinary Oxide.
   HELD for separate owner activation: diagnostic, counted author and distinct
   reviewer runs. Targeted listing evidence grants no whole-host custody or

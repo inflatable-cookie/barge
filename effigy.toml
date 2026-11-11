@@ -174,7 +174,8 @@ run = "python3 scripts/native/oxide-outputs-proof.py diagnostic"
 
 # HELD: each diagnostic/author/reviewer occurrence needs separate activation.
 # No image, no host census, no limit changes; one owned child's actual kernel
-# listing under the qualified 300 s / 512 MiB guard, staged inside that guard.
+# listing under the qualified 600 s / 512 MiB guard, staged inside that guard.
+# This prospective proof wall never changes the 10 s production scan deadline.
 [tasks."listing:native"]
 admission = "heavy"
 run = "python3 scripts/native/descriptor-listing-proof.py counted"

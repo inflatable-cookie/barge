@@ -1164,7 +1164,7 @@ overflow/allocation failure; EPERM/gone/unreadable; PID/UID/churn/deadline races
 initial/retry/relist aggregate exhaustion and custody/cache refusal. Preserve
 existing dead/blind-spot controls. The
 [targeted kernel proof](descriptor-listing-proof.md) prepares one owned child holding 4097–8191 total descriptors under the qualified supervisor
-(proposed 300 s/512 MiB, owned Stash scratch), with a below-threshold control,
+(prospective 600 s/512 MiB, owned Stash scratch; historical 300 s failures remain failed), with a below-threshold control,
 complete positive listing outside the target, held-writer refusal inside it
 and exhausted-budget refusal,
 PID/start/UID brackets, actual returned counts, child reap and resource closure.

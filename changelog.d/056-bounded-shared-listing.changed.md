@@ -1,1 +1,1 @@
-Grow shared descriptor listings within the original scan budgets, with checked identity and answers, conservative refusal, and exact descriptor-set readiness for separately activated targeted kernel qualification.
+Grow shared descriptor listings within the original scan budgets, with conservative identity/refusal checks and exact descriptor-set proof readiness; retain bounded staging logs and producer custody through failures under a prospective, separately activated 600-second proof window.

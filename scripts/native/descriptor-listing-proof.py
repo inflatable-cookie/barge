@@ -3,7 +3,7 @@
 
 The test/plan modes do not stage or run a native. Each counted or diagnostic
 occurrence is separately owner-activated. One qualified supervisor owns the
-300 s / 512 MiB envelope. No image, host census, limit change or installation
+600 s / 512 MiB envelope. No image, host census, limit change or installation
 is used. Ordinary compilation uses Oxide's managed output pool.
 """
 
@@ -45,9 +45,11 @@ SCHEMA = "barge.descriptor-listing.native/1"
 FEATURE = "proof-descriptor-listing"
 DRIVER = "descriptor_listing_proof"
 RECEIPT = "descriptor-listing-proof-receipt.json"
-LIMIT_SECONDS = 300
+LIMIT_SECONDS = 600
 SCRATCH_MIB = 512
 WORK_STOP_SECONDS = 30
+CASE_RESERVE_SECONDS = 65
+BUILD_LOG_BYTES = 1_048_576
 LARGE_OPENS = 5000
 SMALL_OPENS = 32
 # Standard streams plus a generous fixed implementation margin. This is only
@@ -140,7 +142,8 @@ def stage_deadline(deadline_ns):
     return local_start + (deadline_ns - captured_raw)
 
 
-def source_binding(repo=REPO_ROOT, runner=subprocess.run):
+def source_binding(repo=REPO_ROOT, runner=None):
+    runner = runner or subprocess.run
     def git(*args):
         result = runner(["git", "-C", repo, *args], capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
@@ -159,21 +162,57 @@ def source_binding(repo=REPO_ROOT, runner=subprocess.run):
     }
 
 
-def stage_driver(parent, owned, deadline_ns, runner=None, binding=source_binding):
-    before = binding()
-    manifest, resources = base.stage_proof_binary(
-        parent, owned, deadline_ns=stage_deadline(deadline_ns), runner=runner
-    )
-    after = binding()
-    if before != after or manifest["head"] != before["head"]:
-        raise base.Infrastructure("source", "the source binding changed while staging")
-    manifest["source_binding"] = before
-    manifest["bytes"] = os.path.getsize(manifest["path"])
-    with open(os.path.join(os.path.dirname(manifest["path"]), base.STAGE_MANIFEST),
-              "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, indent=1)
-        handle.write("\n")
-    return manifest, resources
+def stage_driver(parent, owned, deadline_ns, attempt=None, binding=source_binding):
+    """Keep the accepted stage/manifest producer; adapt only its external executor.
+
+    Partial provenance lives in the caller's receipt even if no binary exists.
+    Producer reap never stands for compiler-descendant or group closure.
+    """
+    attempt = {} if attempt is None else attempt
+    attempt.update(schema="barge.listing.stage-attempt/1", status="started",
+                   source_before=None, source_after=None, manifest=None, producer=None,
+                   build_command=BUILD_COMMAND, toolchain=base.TOOLCHAIN_CHANNEL,
+                   feature=FEATURE, deadline_raw_ns=deadline_ns)
+    started = raw_now()
+    executor = None
+    try:
+        remaining_seconds(deadline_ns)
+        problems = base.stage_parent_problems(parent, owned)
+        if problems:
+            raise base.Infrastructure("stage", "; ".join(problems))
+        before = binding()
+        attempt["source_before"] = before
+        logs = tempfile.mkdtemp(prefix="listing-stage-logs-", dir=parent)
+        executor = StageExecutor(logs, deadline_ns, attempt)
+        manifest, resources = base.stage_proof_binary(
+            parent, owned, deadline_ns=stage_deadline(deadline_ns), runner=executor.run
+        )
+        attempt["manifest"] = manifest
+        after = binding()
+        attempt["source_after"] = after
+        problems = base.staged_build_problems(manifest["path"], before["head"], parent)
+        if (before != after or manifest["head"] != before["head"]
+                or manifest["features"] != [FEATURE] or manifest["toolchain"] != before["toolchain"]
+                or manifest["offline"] is not True or problems):
+            raise base.Infrastructure("source", "stage source/artifact/manifest binding is invalid")
+        remaining_seconds(deadline_ns)
+        manifest["source_binding"] = before
+        manifest["bytes"] = os.path.getsize(manifest["path"])
+        with open(os.path.join(os.path.dirname(manifest["path"]), base.STAGE_MANIFEST),
+                  "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=1)
+            handle.write("\n")
+        remaining_seconds(deadline_ns)
+        attempt["status"] = "complete"
+        return manifest, resources
+    except Exception as error:
+        attempt["status"] = "failed"
+        attempt["error"] = f"{type(error).__name__}: {error}"[:1024]
+        raise
+    finally:
+        attempt["elapsed_seconds"] = (raw_now() - started) / 1e9
+        attempt["producer"] = None if executor is None else executor.record
+        attempt["group_closure"] = "Unknown here; qualified supervisor's separate receipt is authoritative"
 
 
 def driver_environment(inherited, root):
@@ -216,6 +255,95 @@ class DirectChildren(space_images.Images):
         self.closure_deadline_ns = work_deadline_ns if closure_deadline_ns is None else closure_deadline_ns
         self.children = set()
         self.unknown = False
+
+
+class ProducerSet(set):
+    """Observe the actual child added by Images.run, before it can be reaped."""
+    def __init__(self, record):
+        super().__init__()
+        self.record = record
+        self.producer = None
+
+    def add(self, child):
+        super().add(child)
+        self.producer = child
+        self.record.update(started=True, pid=child.pid, started_raw_ns=raw_now())
+        try:
+            parent_group, parent_session = os.getpgrp(), os.getsid(0)
+            group, session = os.getpgid(child.pid), os.getsid(child.pid)
+            self.record.update(group=group, session=session,
+                               parent_group=parent_group, parent_session=parent_session)
+            if group != parent_group or session != parent_session:
+                raise OSError("producer is outside the inherited qualified group/session")
+        except OSError as error:
+            raise space_images.CustodyUnknown(f"producer scope is Unknown: {error}") from error
+        self.record["scope"] = "same inherited group/session; descendant closure requires guard census"
+
+
+class StageExecutor:
+    """Adapt Images.run to the stage helper's runner interface, without spawning a new scope."""
+    def __init__(self, logs, deadline_ns, attempt):
+        self.logs = logs
+        self.deadline_ns = deadline_ns
+        self.attempt = attempt
+        self.record = {"started": False, "pid": None, "returncode": None,
+                       "reaped": None, "scope": "Unknown", "custody_known": False,
+                       "stdout": None, "stderr": None}
+
+    def save_output(self, name, output, complete):
+        available = output is not None
+        if output is None:
+            output = b""
+        if not isinstance(output, bytes):
+            raise base.Infrastructure("stage", "producer output is not bytes")
+        path = os.path.join(self.logs, name + ".log")
+        with open(path, "xb") as handle:
+            handle.write(output[:BUILD_LOG_BYTES])
+        self.record[name] = {"path": path, "bytes": min(len(output), BUILD_LOG_BYTES),
+                             "sha256": base.sha256_file(path), "captured_bytes": len(output),
+                             "omitted_bytes": max(0, len(output) - BUILD_LOG_BYTES),
+                             "available": available, "complete": complete and available}
+
+    def run(self, command, **kwargs):
+        if command != BUILD_COMMAND or kwargs["cwd"] != REPO_ROOT:
+            raise base.Infrastructure("stage", "unexpected stage producer command or working directory")
+        children = DirectChildren(REPO_ROOT, kwargs["env"], self.deadline_ns)
+        children.children = ProducerSet(self.record)
+        output = error_output = None
+        complete = False
+        try:
+            code, output, error_output = children.run(command, kwargs["timeout"])
+            child = children.children.producer
+            self.record.update(returncode=child.returncode, reaped=child.returncode is not None,
+                               ended_raw_ns=raw_now())
+            if child.returncode is None or code != child.returncode:
+                children.unknown = True
+                raise space_images.CustodyUnknown("producer status/reap is Unknown")
+            complete = True
+            remaining_seconds(self.deadline_ns)
+        except Exception as error:
+            # Images.run deliberately leaves a timed-out child tracked and
+            # unsignalled. Preserve its actual partial pipe output, not a
+            # fabricated successful CompletedProcess or implied group reap.
+            cause = error.__cause__
+            if isinstance(cause, subprocess.TimeoutExpired):
+                output, error_output = cause.output, cause.stderr
+                self.record["timed_out"] = True
+            if children.children or isinstance(error, space_images.CustodyUnknown):
+                children.unknown = True
+            self.record["error"] = f"{type(error).__name__}: {error}"[:1024]
+            raise
+        finally:
+            self.record["unreaped_pids"] = [child.pid for child in children.children]
+            self.record["custody_known"] = (complete and not children.unknown and not children.children)
+            self.save_output("stdout", output, complete)
+            self.save_output("stderr", error_output, complete)
+        if any(self.record[name]["omitted_bytes"] for name in ("stdout", "stderr")):
+            raise base.Infrastructure("stage", "producer output exceeded retained log bounds; artifact refused")
+        # This adapts argv/stdout/status only. Custody evidence remains the
+        # separately recorded actual Popen/communicate facts above.
+        return subprocess.CompletedProcess(command, code, output.decode("utf-8", "strict"),
+                                           error_output.decode("utf-8", "strict"))
 
 
 def own_limit():
@@ -557,12 +685,25 @@ def inspect(children, binary, case, holder, root):
     return report
 
 
-def publish(path, receipt):
+def publish(path, receipt, deadline_ns=None):
     # Failure to record is an execution failure. No successful diagnostic can
     # be reported without its own bounded receipt.
     with open(path, "x", encoding="utf-8") as handle:
         json.dump(receipt, handle, indent=1)
         handle.write("\n")
+        handle.flush()
+        if deadline_ns is not None:
+            try:
+                remaining_seconds(deadline_ns)
+            except base.Infrastructure:
+                receipt["qualified"] = False
+                receipt["first_fault"] = receipt["first_fault"] or "publication"
+                receipt["infrastructure"] = "receipt publication exceeded the original work stop"
+                handle.seek(0)
+                handle.truncate()
+                json.dump(receipt, handle, indent=1)
+                handle.write("\n")
+                raise
 
 
 def guarded_run(mode, scratch, evidence, deadline_ns, route):
@@ -573,12 +714,15 @@ def guarded_run(mode, scratch, evidence, deadline_ns, route):
     holder = None
     holder_log = None
     started = raw_now()
+    work_deadline = deadline_ns - WORK_STOP_SECONDS * 1_000_000_000
     try:
         if not receipt["readiness"]["execution_ready"]:
             raise base.Infrastructure("rlimit", receipt["readiness"]["missing_prerequisite"])
-        work_deadline = deadline_ns - WORK_STOP_SECONDS * 1_000_000_000
         remaining_seconds(work_deadline)
-        stage, stage_resources = stage_driver(scratch, {"scratch": scratch}, work_deadline)
+        receipt["stage_attempt"] = {}
+        stage_stop = work_deadline - CASE_RESERVE_SECONDS * 1_000_000_000
+        stage, stage_resources = stage_driver(scratch, {"scratch": scratch}, stage_stop,
+                                             attempt=receipt["stage_attempt"])
         receipt["stage"] = stage
         receipt["resources"]["stage"] = stage_resources
         root = tempfile.mkdtemp(prefix="listing-proof-", dir=scratch)
@@ -632,13 +776,18 @@ def guarded_run(mode, scratch, evidence, deadline_ns, route):
             if case["id"] not in recorded:
                 receipt["cases"].append({"id": case["id"], "status": "unexecuted",
                                          "reason": "infrastructure, identity, deadline or child custody fault stopped work"})
-        receipt["closure"] = {"children_reaped": children is None or not children.children,
-                              "custody_known": children is None or (not children.unknown and not children.children),
+        producer = receipt.get("stage_attempt", {}).get("producer")
+        receipt["closure"] = {"children_reaped": None if children is None else not children.children,
+                              "custody_known": bool(children is not None and not children.unknown
+                                                    and not children.children and producer
+                                                    and producer["custody_known"]),
+                              "stage_producer": producer,
+                              "holders_started": children is not None,
                               "group_closure": "the supervisor's separate receipt is authoritative"}
         receipt["resources"].update({"elapsed_seconds": (raw_now() - started) / 1e9,
                                     "wall_seconds": LIMIT_SECONDS, "scratch_budget_mib": SCRATCH_MIB,
                                     "work_stop_seconds": WORK_STOP_SECONDS,
-                                    "peak_opened_holder_descriptors": LARGE_OPENS,
+                                    "planned_maximum_holder_payload_descriptors": LARGE_OPENS,
                                     "image_count": 0})
     all_passed = len(receipt["cases"]) == len(CASES) and all(
         case["status"] == "passed" for case in receipt["cases"]
@@ -647,7 +796,18 @@ def guarded_run(mode, scratch, evidence, deadline_ns, route):
                             and receipt["closure"]["children_reaped"]
                             and receipt["closure"]["custody_known"])
     receipt_path = os.path.join(evidence, RECEIPT)
-    publish(receipt_path, receipt)
+    try:
+        remaining_seconds(work_deadline)
+    except base.Infrastructure as error:
+        receipt["qualified"] = False
+        receipt["first_fault"] = receipt["first_fault"] or "publication"
+        receipt["infrastructure"] = str(error)
+    try:
+        publish(receipt_path, receipt, work_deadline)
+    except Exception as error:
+        print(json.dumps({"schema": SCHEMA, "qualified": False, "receipt_path": receipt_path,
+                          "publication_error": f"{type(error).__name__}: {error}"[:1024]}))
+        return 1
     print(json.dumps({"schema": SCHEMA, "qualified": receipt["qualified"],
                       "receipt_path": receipt_path, "cases": receipt["cases"],
                       "closure": receipt["closure"], "first_fault": receipt["first_fault"]}))
@@ -726,24 +886,29 @@ def premise_dispositions():
 
 
 def plan_document():
-    return {"schema": SCHEMA, "activated": False, "readiness": own_limit(),
+    limits = own_limit()
+    readiness = dict(limits, limit_ready=limits["execution_ready"], execution_ready=False,
+                     missing_prerequisite=(limits["missing_prerequisite"] or
+                         "fresh source-bound executable/manifest not minted; requires a separately activated in-guard stage"))
+    return {"schema": SCHEMA, "activated": False, "readiness": readiness,
             "supervisor_sha256": base.SUPERVISOR_SHA256,
             "scratch": {"path": base.DESIGNATED_SCRATCH, "uuid": base.SCRATCH_VOLUME_UUID},
             "bounds": {"wall_seconds": LIMIT_SECONDS, "scratch_mib": SCRATCH_MIB,
                        "work_stop_seconds": WORK_STOP_SECONDS, "images": 0,
                        "holder_opens": [SMALL_OPENS, LARGE_OPENS], "concurrent_holders": 1,
                        "holder_normalization_close_attempts": 2 * (MAX_SUPPORTED_SOFT_FDS - 3),
-                       "holder_readiness_seconds": 5,
+                       "holder_readiness_seconds": 5, "case_reserve_seconds": CASE_RESERVE_SECONDS,
+                       "retained_build_log_bytes_each": BUILD_LOG_BYTES,
                        "inspections": 4, "total_listing_work_ceiling": 4 * 65536},
             "finite_phase_plan": [
-                "0-210 s proposed: fresh locked/offline source-bound stage through ordinary Oxide, including waits; no fit promise",
-                "210-255 s proposed: two sequential holders, four fixed kernel observations, each endpoint <=10 s and one report <=64 KiB",
-                "255-270 s proposed: ordinary holder EOF/exit/reap and bounded receipt; no work after original deadline minus30s",
-                "270-300 s reserved: qualified supervisor's own child/group closure; separate receipt required",
+                "0-505 s proposed: fresh locked/offline source-bound stage through ordinary Oxide, including waits; no fit promise",
+                "505-555 s proposed: two sequential holders, four fixed kernel observations, each endpoint <=10 s and one report <=64 KiB",
+                "555-570 s proposed: ordinary holder EOF/exit/reap and bounded receipt; no work after original deadline minus30s",
+                "570-600 s reserved: qualified supervisor's own child/group closure; separate receipt required",
             ],
-            "resource_plan": {"fixture_bytes": "one small payload, two holder logs/readiness files, private empty homes; <1 MiB planned",
+            "resource_plan": {"fixture_bytes": "two retained build logs <=1 MiB each plus small payload, two holder logs/readiness files and private empty homes; <3 MiB planned",
                               "staged_binary": "one fresh binary+manifest inside guard scratch; actual bytes recorded; no assumed build/RSS fit",
-                              "compiler_storage": "ordinary Oxide pool placement, outside the guard's fixture scratch accounting; compiler temp files use guard scratch",
+                              "compiler_storage": "ordinary Oxide pool placement outside fixture scratch; inherited direct producer group/session must bind, descendant group closure requires guard census; existing communicate capture is not an RSS bound",
                               "fds": "one fresh holder at a time; finite existing soft limit5064..1048576; two holders perform at most2,097,146 own nonstandard close attempts after startup, then declare actual32/5000 payload fd numbers and positive0/1/2stream facts; exact kernel set must match",
                               "normalization_fit": "fixture setup, not product scan budget; each holder retains the existing5s readiness window; timing/fit unmeasured, no experiment or fit promise"},
             "cases": CASES, "premises": premise_dispositions(), "limitation": LIMITATION,
@@ -1061,6 +1226,279 @@ def holder_controls(check, problems):
     holder_receiver_controls(valid_record, check, problems)
     return valid_record
 
+def stage_controls(check, problems):
+    """Actual stage/manifest/child helper; fake only external Git/Popen/clock/file reads."""
+    parent = tempfile.mkdtemp(prefix="listing-stage-controls-", dir=os.environ["TMPDIR"])
+    artifact = os.path.join(parent, "synthetic-artifact")
+    Path(artifact).write_bytes(b"inert stage control, never executed\n")
+    for fault in (None, "timeout", "nonzero", "wrong_artifact", "wrong_features", "duplicate_artifact",
+                  "source_drift", "bad_manifest", "unreaped", "foreign_scope", "spawn",
+                  "overflow", "late", "no_time"):
+        root = tempfile.mkdtemp(prefix="case-", dir=parent)
+        clock = [100_000_000_000]
+        drift = [False]
+        def fake_git(command, **kwargs):
+            check(command[:3] == ["git", "-C", REPO_ROOT], "stage invoked an unexpected external command")
+            answer = {("rev-parse", "HEAD"): ("c" if drift[0] else "a") * 40,
+                      ("rev-parse", "HEAD^{tree}"): "b" * 40,
+                      ("status", "--porcelain"): ""}[tuple(command[3:])]
+            return subprocess.CompletedProcess(command, 0, answer + "\n", "")
+        row = {"reason": "compiler-artifact", "target": {"name": DRIVER, "kind": ["example"]},
+               "features": [FEATURE], "executable": artifact}
+        if fault == "wrong_artifact":
+            row["target"]["name"] = "barge"
+        if fault == "wrong_features":
+            row["features"] = []
+        output = json.dumps(row).encode()
+        if fault == "duplicate_artifact":
+            output += b"\n" + output
+        if fault == "overflow":
+            output += b" " * BUILD_LOG_BYTES
+        class Child:
+            pid = 42
+            returncode = None
+            def communicate(self, timeout):
+                check(0 < timeout <= 20, "stage child escaped original remaining deadline")
+                if fault == "timeout":
+                    raise subprocess.TimeoutExpired("oxide", timeout, output=b"partial stdout", stderr=b"partial stderr")
+                self.returncode = None if fault == "unreaped" else (7 if fault == "nonzero" else 0)
+                drift[0] = fault == "source_drift"
+                if fault == "late":
+                    clock[0] = 121_000_000_000
+                return output, b"build stderr"
+        child = Child()
+        def spawn(command, **kwargs):
+            check(command == BUILD_COMMAND and kwargs["cwd"] == REPO_ROOT
+                  and kwargs["env"]["RUSTUP_AUTO_INSTALL"] == "0"
+                  and kwargs["env"]["CARGO_NET_OFFLINE"] == "true"
+                  and kwargs["env"]["TMPDIR"] == kwargs["env"]["TMP"] == kwargs["env"]["TEMP"],
+                  "actual stage command/environment changed")
+            check(not kwargs.get("start_new_session") and "preexec_fn" not in kwargs,
+                  "stage producer escaped inherited supervision scope")
+            if fault == "spawn":
+                raise OSError("synthetic producer start failure")
+            return child
+        original_open = open
+        def files(path, mode="r", *args, **kwargs):
+            if fault == "bad_manifest" and str(path).endswith(base.STAGE_MANIFEST) and mode == "r":
+                return __import__("io").StringIO("{malformed manifest")
+            return original_open(path, mode, *args, **kwargs)
+        attempt = {}
+        failure = None
+        with mock.patch.object(subprocess, "run", side_effect=fake_git), \
+                mock.patch.object(subprocess, "Popen", side_effect=spawn) as popen, \
+                mock.patch.object(os, "getpgrp", return_value=5), \
+                mock.patch.object(os, "getpgid", return_value=6 if fault == "foreign_scope" else 5), \
+                mock.patch.object(os, "getsid", return_value=5), \
+                mock.patch.object(time, "clock_gettime_ns", side_effect=lambda *_: clock[0]), \
+                mock.patch("builtins.open", side_effect=files):
+            try:
+                manifest, resources = stage_driver(root, {"fixture": root},
+                    100_000_000_000 if fault == "no_time" else 120_000_000_000, attempt)
+            except (base.Infrastructure, space_images.CustodyUnknown, OSError) as error:
+                failure = error
+        if fault is None:
+            check(failure is None and attempt["status"] == "complete"
+                  and manifest["sha256"] == base.sha256_file(artifact)
+                  and manifest["source_binding"] == attempt["source_before"] == attempt["source_after"]
+                  and resources["seconds"] >= 0, "actual stage/manifest success composition failed")
+        else:
+            check(failure is not None and attempt["status"] == "failed", f"stage accepted injected {fault}")
+        producer = attempt["producer"]
+        if fault == "no_time":
+            check(popen.call_count == 0 and producer is None, "exhausted stage budget spawned a producer")
+            continue
+        check(attempt["source_before"]["toolchain"] == "1.97.1"
+              and len(attempt["source_before"]["lock_sha256"]) == 64,
+              "failed stage lost partial tool/source/lock provenance")
+        check(producer is not None and producer["custody_known"] is
+              (fault not in ("timeout", "unreaped", "foreign_scope", "spawn")),
+              f"stage producer custody was fabricated or erased for {fault}")
+        if fault in ("timeout", "foreign_scope", "unreaped"):
+            check(producer["unreaped_pids"] == ([42] if fault != "unreaped" else [])
+                  and producer["returncode"] is None and producer["reaped"] is not True,
+                  "Unknown producer was turned into a reaped CompletedProcess")
+        for name in ("stdout", "stderr"):
+            log = producer[name]
+            check(log is not None and log["bytes"] <= BUILD_LOG_BYTES
+                  and base.sha256_file(log["path"]) == log["sha256"], "bounded build output was lost")
+        if fault == "timeout":
+            check(Path(producer["stdout"]["path"]).read_bytes() == b"partial stdout"
+                  and Path(producer["stderr"]["path"]).read_bytes() == b"partial stderr"
+                  and producer["stdout"]["complete"] is False, "timeout discarded actual partial build output")
+        if fault == "overflow":
+            check(producer["stdout"]["omitted_bytes"] > 0, "output overflow was silently truncated to an accepted artifact")
+    return parent
+
+
+def guarded_controls(check, problems):
+    """Actual entry body/stage/holder/report flow with external producers and kernel reports faked."""
+    parent = tempfile.mkdtemp(prefix="listing-flow-controls-", dir=os.environ["TMPDIR"])
+    artifact = os.path.join(parent, "synthetic-artifact")
+    Path(artifact).write_bytes(b"inert driver, never executed\n")
+    for fault in (None, "oracle", "timeout", "nonzero", "unknown", "publication", "late_publication", "time_budget"):
+        root = tempfile.mkdtemp(prefix="case-", dir=parent)
+        clock = [100_000_000_000]
+        holders = {}
+        observations = []
+        class Child:
+            returncode = None
+            pid = 42
+            stdin = None
+            def communicate(self, timeout):
+                self.returncode = 0
+                if self.command == BUILD_COMMAND:
+                    if fault == "timeout":
+                        self.returncode = None
+                        raise subprocess.TimeoutExpired("oxide", timeout, output=b"stage partial", stderr=b"wait")
+                    if fault == "nonzero":
+                        self.returncode = 9
+                    row = {"reason": "compiler-artifact", "target": {"name": DRIVER, "kind": ["example"]},
+                           "features": [FEATURE], "executable": artifact}
+                    return json.dumps(row).encode(), b"stage stderr"
+                record = holders[int(self.command[2])]
+                identity = {"pid": record["pid"], "start": 12, "effective_uid": record["uid"]}
+                rows = int(self.command[4]); count = record["opened"] + 3
+                bounded = rows == 4096
+                inside = self.command[3].endswith("/inside")
+                fds = holder_declarations(record)
+                attempts = [(4096, 4096)] if bounded else ([(4096, count)] if count < 4096 else [(4096, 4096), (8192, count)])
+                report = {"identity": identity, "outcome": "bounded" if bounded else "complete",
+                          "reason": "descriptor work" if bounded else None, "final_count": 0 if bounded else count,
+                          "capacity": 0 if bounded else attempts[-1][0], "returned_row_work": sum(n for _, n in attempts),
+                          "limit_ms": 10000, "open_count": record["opened"] if inside else 0,
+                          "matching_fd_numbers": record["payload_fds"] if inside else [],
+                          "fd_numbers": None if bounded else fds, "fd_type_counts": None if bounded else [[1, count]],
+                          "custody": "unknown" if bounded else ("unsafe" if inside else "safe_sample"),
+                          "attempts": [{"capacity": cap, "rows": n, "identity_before": identity, "identity_after": identity}
+                                       for cap, n in attempts]}
+                if fault == "oracle" and len(observations) == 0:
+                    report["capacity"] = 4097
+                if fault == "unknown":
+                    report["outcome"] = "unreadable"
+                observations.append(report)
+                return json.dumps(report).encode(), b""
+            def poll(self):
+                return self.returncode
+            def wait(self, timeout):
+                check(self.stdin.close.called, "holder was waited without ordinary EOF")
+                self.returncode = 0
+                return 0
+        def spawn(command, **kwargs):
+            child = Child(); child.command = command
+            if "--holder" in command:
+                count, path, ready = command[-3:];count = int(count)
+                child.pid = 42 if count == SMALL_OPENS else 43
+                child.stdin = types.SimpleNamespace(close=mock.Mock())
+                log = os.fstat(kwargs["stdout"].fileno())
+                stream = {"kind": "regular", "device": log.st_dev, "inode": log.st_ino, "uid": log.st_uid}
+                record = {"schema": HOLDER_SCHEMA, "pid": child.pid, "uid": os.geteuid(), "opened": count,
+                          "payload_fds": list(range(3, count + 3)), "soft_limit": REQUIRED_SOFT_FDS,
+                          "baseline_closed": True,
+                          "standard_fds": [dict(stream, fd=0, kind="fifo", inode=1),
+                                           dict(stream, fd=1), dict(stream, fd=2)],
+                          "payload_identity": {"device": log.st_dev, "inode": log.st_ino + 1, "uid": log.st_uid}}
+                holders[child.pid] = record
+                kwargs["stdout"].write((json.dumps(record) + "\n").encode());kwargs["stdout"].flush()
+                Path(ready).write_bytes(b"")
+            return child
+        def git(command, **kwargs):
+            value = {("rev-parse", "HEAD"): "a" * 40, ("rev-parse", "HEAD^{tree}"): "b" * 40,
+                     ("status", "--porcelain"): ""}[tuple(command[3:])]
+            return subprocess.CompletedProcess(command, 0, value + "\n", "")
+        original_open = open
+        class LateFile:
+            def __init__(self, handle): self.handle = handle
+            def __enter__(self): return self
+            def __exit__(self, *args): return self.handle.__exit__(*args)
+            def __getattr__(self, name): return getattr(self.handle, name)
+            def flush(self):
+                self.handle.flush();clock[0] = 671_000_000_000
+        def files(path, mode="r", *args, **kwargs):
+            if str(path) == os.path.join(root, RECEIPT):
+                if fault == "publication": raise OSError("synthetic receipt write failure")
+                handle = original_open(path, mode, *args, **kwargs)
+                return LateFile(handle) if fault == "late_publication" else handle
+            return original_open(path, mode, *args, **kwargs)
+        with mock.patch.object(subprocess, "Popen", side_effect=spawn), \
+                mock.patch.object(subprocess, "run", side_effect=git), \
+                mock.patch.object(os, "getpgrp", return_value=5), \
+                mock.patch.object(os, "getpgid", return_value=5), \
+                mock.patch.object(os, "getsid", return_value=5), \
+                mock.patch.object(resource, "getrlimit", return_value=(REQUIRED_SOFT_FDS, REQUIRED_SOFT_FDS)), \
+                mock.patch.object(time, "clock_gettime_ns", side_effect=lambda *_: clock[0]), \
+                mock.patch("builtins.open", side_effect=files), \
+                contextlib.redirect_stdout(__import__("io").StringIO()):
+            code = guarded_run("diagnostic", root, root,
+                               130_000_000_000 if fault == "time_budget" else 700_000_000_000, {})
+        if fault == "publication":
+            check(code == 1, "failed report publication was accepted")
+            continue
+        receipt = json.loads(Path(root, RECEIPT).read_text())
+        if fault == "time_budget":
+            check(code == 1 and "stage_attempt" not in receipt and not holders and not observations
+                  and receipt["closure"]["custody_known"] is False,
+                  "original exhausted work margin started a stage or fabricated custody")
+            continue
+        check(receipt["stage_attempt"]["source_before"]["feature"] == FEATURE
+              and receipt["stage_attempt"]["deadline_raw_ns"] == 605_000_000_000,
+              "actual guarded stage lost source/feature or original deadline-minus-reserves binding")
+        if fault in ("timeout", "nonzero"):
+            check(code == 1 and all(row["status"] == "unexecuted" for row in receipt["cases"])
+                  and not holders and receipt["closure"]["custody_known"] is False
+                  and receipt["closure"]["children_reaped"] is None,
+                  "stage failure fabricated fixture/producer custody or lost omitted cases")
+        elif fault == "unknown":
+            check(code == 1 and len(observations) == 1
+                  and all(row["status"] == "unexecuted" for row in receipt["cases"]),
+                  "Unknown observation continued as an oracle fault")
+        else:
+            expected = "failed" if fault == "oracle" else "passed"
+            check(receipt["cases"][0]["status"] == expected and len(receipt["cases"]) == len(observations) == 4
+                  and all(row["status"] == "passed" for row in receipt["cases"][1:]),
+                  "actual guarded fixed-case composition or diagnostic keep-going drifted")
+            check(receipt["closure"]["custody_known"] is True
+                  and len(receipt["holders"]) == 2 and all(h["reaped"] for h in receipt["holders"]),
+                  "actual ordinary holder EOF/reap or stage producer facts were lost")
+            check(code == (0 if fault is None else 1) and receipt["qualified"] is False,
+                  "failed/late diagnostic was qualified or returned a successful result")
+        if fault == "late_publication":
+            check(receipt["infrastructure"] == "receipt publication exceeded the original work stop",
+                  "late last report did not retain its original-deadline failure")
+
+
+def outer_controls(check):
+    """Real outer entry and guard argv, with external disk/metadata/guard executor faked."""
+    calls = []
+    def execute(command, **kwargs):
+        if command == [base.DISKUTIL, "info", "-plist", base.SCRATCH_VOLUME_MOUNT]:
+            return subprocess.CompletedProcess(command, 0,
+                base.plistlib.dumps({"VolumeUUID": base.SCRATCH_VOLUME_UUID}), b"")
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 125)
+    original_lstat = os.lstat
+    def metadata(path, *args, **kwargs):
+        if path == base.DESIGNATED_SCRATCH:
+            return types.SimpleNamespace(st_uid=os.getuid(), st_mode=stat.S_IFDIR | 0o700)
+        return original_lstat(path, *args, **kwargs)
+    with mock.patch.object(subprocess, "run", side_effect=execute), \
+            mock.patch.object(os, "lstat", side_effect=metadata), \
+            mock.patch.object(os.path, "realpath", side_effect=lambda path: path), \
+            mock.patch.dict(os.environ, {"NUCLEUS_CONTROL": "genuine", "EFFIGY_CONTROL": "genuine",
+                                         "OXIDE_PROOF_DEADLINE_NS": "stale"}):
+        check(main(["diagnostic"]) == 125, "outer entry replaced actual guard refusal status")
+    check(len(calls) == 1, "outer entry retried or bypassed its one guard command")
+    command, kwargs = calls[0]
+    check(command == supervisor_command(base.supervisor_path(), "diagnostic")
+          and command[command.index("--limit") + 1] == "600"
+          and command[command.index("--scratch-budget-mib") + 1] == "512",
+          "prospective fixed guard tuple drifted")
+    check(kwargs["env"]["NUCLEUS_CONTROL"] == kwargs["env"]["EFFIGY_CONTROL"] == "genuine"
+          and "OXIDE_PROOF_DEADLINE_NS" not in kwargs["env"]
+          and json.loads(kwargs["env"][base.ROUTE_ENV])["volume_uuid"] == base.SCRATCH_VOLUME_UUID,
+          "outer entry altered genuine admission context or reused a stale deadline")
+
+
 def self_check():
     """Tiny synthetic files/fake external executors drive the actual apparatus."""
     problems = []
@@ -1068,6 +1506,7 @@ def self_check():
         if not condition:
             problems.append(description)
     small_holder = holder_controls(check, problems)
+    outer_controls(check)
     check(base.SUPERVISOR_SHA256 == "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b", "supervisor pin drift")
     problems += base.installed_supervisor_problems()
     env = driver_environment({"HOME": "/original", "PATH": "/bin", "OXIDE_POOL": "host",
@@ -1078,6 +1517,13 @@ def self_check():
     check(all(name not in env for name in ("OXIDE_POOL", "OXIDE_TEST_FAULT", "XDG_STATE_HOME", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")), "driver environment leaked host controls")
     check(env["NUCLEUS_TICKET"] == "genuine" and env["TMPDIR"] == env["TMP"] == env["TEMP"], "admission or temporary environment drift")
     check(len(premise_dispositions()) == 9, "nine-premise map drift")
+    with mock.patch.object(resource, "getrlimit", return_value=(REQUIRED_SOFT_FDS, REQUIRED_SOFT_FDS)):
+        planned = plan_document()
+    check(planned["bounds"]["wall_seconds"] == 600 and planned["bounds"]["work_stop_seconds"] == 30
+          and planned["readiness"]["limit_ready"] is True
+          and planned["readiness"]["execution_ready"] is False
+          and "executable/manifest" in planned["readiness"]["missing_prerequisite"],
+          "effect-free plan hid the missing fresh executable or reset proof/scanner bounds")
     for mode in ("counted", "diagnostic"):
         command = supervisor_command("/supervisor", mode)
         check(command[-2:] == ["--inner", mode] and "--root-parent" in command, "native command bypassed guarded entry")
@@ -1088,7 +1534,7 @@ def self_check():
     with mock.patch.object(time, "monotonic_ns", return_value=4_000_000_000), \
             mock.patch.object(time, "clock_gettime_ns", return_value=100_000_000_000):
         check(stage_deadline(105_000_000_001) == 9_000_000_001, "stage mixed clocks or rounded its integer remaining duration")
-        for deadline in (99_000_000_000, 401_000_000_000, None, True):
+        for deadline in (99_000_000_000, 701_000_000_000, None, True):
             try:
                 remaining_seconds(deadline)
             except base.Infrastructure:
@@ -1271,47 +1717,7 @@ def self_check():
                   "late endpoint result lost the original deadline or actual child reap")
         else:
             problems.append("late last-case endpoint result was accepted")
-    # Actual stage helper: tiny synthetic artifact, fake build executor,
-    # actual allocation/copy/hash/manifest and bound/environment checks.
-    parent = tempfile.mkdtemp(prefix="listing-apparatus-", dir=os.environ["TMPDIR"])
-    artifact = os.path.join(parent, "synthetic-driver")
-    Path(artifact).write_bytes(b"not executable; stage control only\n")
-    Path(parent, "Cargo.lock").write_text("synthetic lock\n", encoding="utf-8")
-    Path(parent, "rust-toolchain.toml").write_text('[toolchain]\nchannel="1.97.1"\n', encoding="utf-8")
-    def fake_git(command, **kwargs):
-        answer = {("rev-parse", "HEAD"): "a" * 40,
-                  ("rev-parse", "HEAD^{tree}"): "b" * 40,
-                  ("status", "--porcelain"): ""}[tuple(command[3:])]
-        return subprocess.CompletedProcess(command, 0, answer + "\n", "")
-    bind = source_binding(parent, fake_git)
-    check(bind["lock_sha256"] == base.sha256_file(os.path.join(parent, "Cargo.lock"))
-          and bind["toolchain_sha256"] == base.sha256_file(os.path.join(parent, "rust-toolchain.toml")),
-          "source binding lost actual lock/toolchain bytes")
-    def dirty_git(command, **kwargs):
-        if command[3:] == ["status", "--porcelain"]:
-            return subprocess.CompletedProcess(command, 0, " M Cargo.lock\n", "")
-        return fake_git(command, **kwargs)
-    try:
-        source_binding(parent, dirty_git)
-    except base.Infrastructure:
-        pass
-    else:
-        problems.append("dirty source binding accepted")
-    calls = []
-    def fake_build(command, **kwargs):
-        calls.append((command, kwargs))
-        check(command == BUILD_COMMAND and kwargs["env"]["RUSTUP_AUTO_INSTALL"] == "0", "stage command/environment drift")
-        check(0 < kwargs["timeout"] <= 20, "stage timeout escaped original wall")
-        row = {"reason": "compiler-artifact", "target": {"name": DRIVER, "kind": ["example"]},
-               "features": [FEATURE], "executable": artifact}
-        return subprocess.CompletedProcess(command, 0, json.dumps(row), "")
-    with mock.patch.object(base, "git_head", return_value="a" * 40):
-        manifest, _ = stage_driver(parent, {"fixture": parent}, raw_now() + 20_000_000_000,
-                                   runner=fake_build, binding=lambda: source_binding(parent, fake_git))
-    check(len(calls) == 1 and manifest["sha256"] == base.sha256_file(artifact)
-          and manifest["source_binding"] == bind and manifest["features"] == [FEATURE], "stage manifest lost source/bytes/features")
-    check(artifact_from_build(json.dumps({"reason": "compiler-artifact", "target": {"name": "barge", "kind": ["bin"]},
-                                          "features": [FEATURE], "executable": artifact})) is None, "wrong production endpoint artifact accepted")
+    parent = stage_controls(check, problems)
     # Actual bounded publication and error path; no report-writing mock.
     receipt_path = os.path.join(parent, "receipt.json")
     publish(receipt_path, {"qualified": False, "cases": [{"id": "L1", "status": "failed"}]})
@@ -1332,7 +1738,10 @@ def self_check():
     check(code == 1 and refused["qualified"] is False and refused["first_fault"] == "infrastructure"
           and all(row["status"] == "unexecuted" for row in refused["cases"])
           and [row["id"] for row in refused["cases"]] == [case["id"] for case in CASES]
-          and refused["closure"]["children_reaped"], "guarded preflight failure lost its errors/omissions/closure")
+          and refused["closure"]["children_reaped"] is None
+          and refused["closure"]["custody_known"] is False,
+          "guarded preflight failure lost its errors/omissions/Unknown custody")
+    guarded_controls(check, problems)
     return problems
 
 

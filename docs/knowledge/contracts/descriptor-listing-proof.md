@@ -12,16 +12,27 @@ production account lookup, installation, adoption or lifetime closure.
 `effigy listing:native:test` runs tiny-file controls with fake external
 executors. `effigy listing:native:plan` reads only this caller's own
 `RLIMIT_NOFILE` and prints the fixed plan. Neither starts a native or stages a
-binary. The native and diagnostic selectors remain **held for separate owner
+binary. Its `limit_ready` reads the caller's own limit; `execution_ready:false`
+explicitly names the missing fresh executable/manifest that must be minted in a
+separately activated guard. It neither inspects nor adopts an existing binary.
+The native and diagnostic selectors remain **held for separate owner
 activation**. Declarations and ordinary covering are no activation.
 `effigy rust:compile:listing:proof` checks the driver with only its proof
 feature. `effigy rust:test:listing:proof` drives the actual endpoint's guard,
 lossless inventory and encoded-size controls, without a process read.
 
+The owner's 2026-11-11 proof-fit ruling under Tom's decision
+`13834566-5b7f-44be-a655-6444a4eeaa32` v2 selects a fixed **600 s** wall for
+future, separately activated changed-head listing sessions. The earlier 300 s
+attempt exhausted its 270 s work window in staging before any case; the cause
+of that delay is not established. This source-only preparation grants no new
+execution. The production scanner's 10 s / 4096-process / 65,536-row ceilings,
+64 KiB endpoint and four-attempt bounds stay unchanged.
+
 Each future occurrence verifies the qualified supervisor's exact SHA-256
 `fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b` and Stash
 UUID `8A660440-C919-45C6-A3F1-3365B9BD2006`, then enters that guard at
-300 s / 512 MiB under `/Volumes/Stash/scratch/barge`. No image is used.
+600 s / 512 MiB under `/Volumes/Stash/scratch/barge`. No image is used.
 Source must be a clean exact Git head. The accepted release staging helper
 builds a fresh `descriptor_listing_proof` example inside this guarded
 occurrence through locked/offline Oxide, with pinned toolchain `1.97.1` and
@@ -84,13 +95,16 @@ Two holders attempt at most 2,097,146 baseline closes in total. Each keeps the
 existing five-second readiness window; setup fit is unmeasured and no timing
 experiment is part of this source correction.
 
-The finite proposal reserves 0–210 s for fresh staging including waits,
-210–255 s for two sequential holders and four inspections, 255–270 s for
-holder closure and receipt, and 30 s for the guard's group closure. All phases
+The finite proposal reserves 0–505 s for fresh staging including waits,
+505–555 s for two sequential holders and four inspections, 555–570 s for
+holder closure and receipt, and 570–600 s for the guard's group closure.
+The stage stop is the original deadline minus the 30 s work margin and a
+65 s case/report reserve; it is not a fresh timeout. Expired time refuses,
+without a floor, reset or retry. All phases
 spend the original guard deadline; these ranges are estimates, not measured
 fit. No work starts after deadline minus 30 s. Each inspection is at most
-10 s, its report at most 64 KiB. The fixture plans less than 1 MiB plus the
-one staged binary/manifest, whose actual size is recorded. Compiler outputs
+10 s, its report at most 64 KiB. The fixture plans less than 3 MiB including two retained build logs of at most
+1 MiB each, plus the one staged binary/manifest, whose actual size is recorded. Compiler outputs
 retain ordinary Oxide pool placement; compiler temporaries use guard scratch.
 The 512 MiB guard budget is monitored scratch, not a hard RSS claim.
 
@@ -115,26 +129,65 @@ The executable `premise_dispositions()` publishes the same map:
 `DirectChildren` supplies only the receiver fields required by the existing
 `space_images.Images.run`: its actual `CLOCK_UPTIME_RAW` clock, direct-child
 tracking, communication, reap and timeout/unknown handling are reused without
-image construction. Staging reuses `release-proof.py`'s allocation, copying,
+image construction. `StageExecutor` adapts that same helper to the staging
+runner interface. Its set receiver records the actual Popen child before
+communication, positively checks the direct producer's inherited process group
+and session, and records returned status and direct-child reap. Unreadable or
+foreign scope and an unreaped producer are Unknown and stop. It creates no
+session, supervisor, signal/retry or descendant census. A CompletedProcess is
+only the stage helper's argv/output adapter; it is never group-closure evidence.
+
+Staging reuses `release-proof.py`'s allocation, copying,
 manifest, environment and bounds through its declared command, feature and
 artifact receiver globals. The receiver's monotonic staging deadline is
 derived conservatively from remaining raw-uptime duration; unlike-clock
 stamps are never subtracted or passed to it. The endpoint receives relative
-remaining milliseconds, never a cross-process timestamp.
+remaining milliseconds, never a cross-process timestamp. Holder readiness
+keeps its five-second bound within the remaining original work allowance.
+
+Before staging, the receipt owns a partial `stage_attempt`: actual source
+head/tree/lock/toolchain/script binding, declared command/feature, original
+stage stop and elapsed raw-uptime duration. Success adds and verifies the
+fresh binary/manifest; failure leaves unavailable fields explicitly missing.
+The accepted build environment stays pinned to 1.97.1, locked/offline with no
+auto-install, preserving genuine Nucleus/Effigy context and ordinary Oxide
+compiler placement. Partial metadata is no successful compiler or binary claim.
+
+`StageExecutor` retains separate exclusive stdout/stderr logs on both success
+and failure, each capped at 1 MiB with exact retained bytes/hash, available
+captured bytes, omitted bytes and complete/partial status. Overflow refuses the
+artifact; no truncated stdout establishes success. On timeout the imported
+helper leaves the child tracked and unsignalled; actual TimeoutExpired partial
+output is retained, and producer status/reap remains Unknown. Failed start or
+missing capture records unavailable output, not an invented empty stream.
+The existing pipe `communicate` capture is not a memory/RSS bound. Compiler
+outputs remain outside monitored fixture scratch. The separately qualified
+guard's joined, certain deciding/final census is required for descendant/group
+closure; direct-producer reap alone never supplies it.
 
 The effect-free test drives the actual unguarded-entry refusal, staging helper
 with tiny artifact/fake compiler output, flag/temporary environment, actual
 imported child helper including its timeout custody, endpoint argv/report
 adapter, exact descriptor-set/type-count and identity/work oracles, holder
-normalization/refusal branches and receipt publication failures. It runs no
-kernel proof, child holder or build.
+normalization/refusal branches and receipt publication failures. It also drives
+the actual entry/stage/holder/oracle/receipt composition through external
+Popen/Git/clock/file boundaries: success, timeout with partial provenance,
+nonzero build, invalid artifact/features/manifest, source drift, foreign scope,
+unreaped producer, bounded-output overflow, exhausted time, late result,
+known oracle keep-going, Unknown custody and late/failed report. It runs no
+kernel proof, real holder, build or timing experiment.
 
 ## Receipts and remaining gates
 
 The script writes `descriptor-listing-proof-receipt.json` in the current
 guard's evidence directory. It records source/stage bindings, each actual
 case/report/error or omission, holders' ordinary EOF closure/reap, resources
-and targeted child closure. The supervisor's separate receipt owns group
+and targeted child closure. If setup never constructed a holder receiver,
+`children_reaped:null` and `custody_known:false` preserve that omission; no
+`children=None` default can certify producer custody. Producer status/logs and
+the separate guard closure remain distinct. Publication checks the original
+work stop; late output is explicitly failed and report-write failure returns
+nonzero without a retry or qualification claim. The supervisor's separate receipt owns group
 closure and measured resource/timeout conclusions. Both are required.
 
 A diagnostic is always uncounted and `qualified:false`. It continues only
@@ -152,6 +205,19 @@ explain that observation nor qualify it retroactively. Separately, that run's
 UNCLOSED group outcome lacked a completed, joined census. Fixture correction
 does not discharge that process-custody obligation. The failed receipt,
 unknowns, original bounds and retained resources remain historical.
+
+The corrected exact-set source `bb8aa7258e874631263683c42c160981cf7df2b5`
+then timed out in staging after 269.710778166 s. All L1–L4 were unexecuted:
+no source-bound staged binary/manifest, descriptor sets, identities or work
+observations were published. The old receipt's planned peak constant and
+vacuous child flags give no observed holder or compiler-group credit. Its
+guard also remained UNCLOSED without a completed joined census. Both retained
+roots (`na85ok9x`, `ye5za15u`) stay untouched. The qualified supervisor's later
+single-window observation in Oxide306 did not reproduce the stall; it neither
+explains these historical failures nor fixes or qualifies this consumer.
+Census-thread attribution remains Unknown and the candidate is unpromoted.
+The additional reviewer observation outside that task's one allowance confers
+no authorized credit. No new session or cleanup follows from either packet.
 
 This source correction runs no staging, holder or native occurrence and
 supplies no new kernel or closure credit. Independent exact-head
