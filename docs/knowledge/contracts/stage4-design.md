@@ -1236,21 +1236,24 @@ no effect behind it:
   inherited from its parent.
 - **Actual API for the next dependent slice (059, the checked
   coordinator):** the public store surface is
-  `init_operation_journal(dirs, state, locks)`,
-  `read_operations(dirs, state, max) -> Result<Option<JournalView>>`,
-  `begin_operation(dirs, state, locks, BeginRequest) -> Result<Begun>`,
-  `consult_operations(dirs, state, locks, max)` (the fail-fast observation),
-  and `inspect_operation_journal(dirs, state, max)` (the read-only
-  diagnostic); `JournalView` carries the epoch, identity, records and
+  `init_operation_journal(dirs, observer, state, locks)`,
+  `read_operations(dirs, observer, state, max) -> Result<Option<JournalView>>`,
+  `begin_operation(dirs, observer, state, locks, BeginRequest) -> Result<Begun>`,
+  `consult_operations(dirs, observer, state, locks, max)` (the fail-fast
+  observation), and `inspect_operation_journal(dirs, observer, state, max)`
+  (the read-only diagnostic), where `observer: &dyn ProcessObserver` is the
+  trusted effective-uid seam the ownership comparison reads;
+  `JournalView` carries the epoch, identity, records and
   `tail_sequence`; `Begun` is `Began | Already`. The phase and capture
-  writers (`advance_operation`, `record_operation_captures`,
-  `record_operation_foreign_capture`) are crate-private and
-  capability-checked by the intent-write token; the `proof-journal` feature
-  exposes a thin, documented delegation surface for the staged proof driver
-  alone, together with the labelled publication-failure endpoints. Stated
-  detection limits carry over verbatim: a consistent historical restoration
-  is indistinguishable from the journal's own past, and the journal's
-  guarantees bind its own writes, not the storage beneath them.
+  writers (`advance_operation(write, dirs, observer, state, record, …)`,
+  `record_operation_captures(…)`, `record_operation_foreign_capture(…)`) are
+  crate-private and capability-checked by the intent-write token; the
+  `proof-journal` feature exposes a thin, documented delegation surface for
+  the staged proof driver alone, together with the labelled
+  publication-failure endpoints. Stated detection limits carry over
+  verbatim: a consistent historical restoration is indistinguishable from
+  the journal's own past, and the journal's guarantees bind its own writes,
+  not the storage beneath them.
 - **Still absent, by scope:** the checked coordinator (caller-authenticated
   resume, drain dispatch, the guarded re-affirmation), the Oxide caller and
   its six writer-side consults, the operator gap-resolution command (the
