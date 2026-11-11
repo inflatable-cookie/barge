@@ -20,8 +20,16 @@ libc = "=0.2.190"
 # "F6-R1 landed surface"). No ordinary build enables it. Under this feature alone,
 # Oxide's state and cache directories, which feed the reference set, come from one
 # validated private account home. Every other fact and rule is unchanged.
+#
+# The proof-only operation journal driver (scripts/native/journal-proof.py): under
+# this feature alone the journal's labelled publication-failure injection
+# endpoints exist (`operation::fail_next_document_publish`,
+# `fail_next_watermark_publish`), so the staged proof build can stop the actual
+# store exactly at a crash window and label the injection in its evidence. No
+# ordinary build enables it; every other fact and rule is unchanged.
 [features]
 proof-synthetic-account = []
+proof-journal = []
 # The targeted shared-listing kernel proof. No ordinary build enables its
 # single-PID endpoint or its driver; it does not replace the custody scan.
 proof-descriptor-listing = []
@@ -36,6 +44,15 @@ workspace = true
 [[example]]
 name = "oxide_outputs_proof"
 required-features = ["proof-synthetic-account"]
+
+# The operation journal's proof-only driver (scripts/native/journal-proof.py):
+# one case group per invocation, through the actual journal store, lock and
+# publication code on fresh private filesystem fixtures. `required-features`
+# keeps it out of every ordinary build, including --all-targets without the
+# feature; only the staged proof build compiles it.
+[[example]]
+name = "journal_proof"
+required-features = ["proof-journal"]
 
 [[example]]
 name = "descriptor_listing_proof"

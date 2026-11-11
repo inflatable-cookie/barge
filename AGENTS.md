@@ -196,6 +196,42 @@ guarded exception. Each selector covers what it names:
   reviewer runs. Targeted listing evidence grants no whole-host custody or
   consumer qualification. See the [proof contract](docs/knowledge/contracts/descriptor-listing-proof.md).
 
+- `effigy journal:native:test` and `effigy journal:native:plan` — the
+  operation journal's proof apparatus, effect-free: the pinned supervisor, the
+  twelve-group case table checked against its named regressions in
+  `crates/barge/src/operation.rs`, the `proof-journal` feature's declarations,
+  the verified Stash route, the nine premises with dispositions, the held
+  bounds, and composition controls that instantiate the REAL
+  `OuterEffects.from_environment()` / `InnerEffects.from_environment()`
+  factories and drive the actual `outer_half` and `inner_half` entries —
+  launch, guarded supervisor child, case driver, verdict parsing, report
+  publication and receipt composition — with only the external process, Git,
+  clock, route and storage queries scripted at named module-level query
+  points; no factory is replaced and no stage record is faked. No image, no
+  guarded launch and no child process. Storage: each control harness owns one
+  fresh private per-run fixture directory under the run's own TMPDIR, with
+  the real 0755/0700 guard layout materialized inside that fixture; the
+  module's designated scratch points into the fixture for the duration of
+  each control, every harness fixture is closed deterministically (never by
+  the garbage collector), and a write-audit control judges only the audited
+  call's own capture window — collection is flushed before and suspended
+  inside the window, the window's fixture stays alive through it, and any
+  write outside the audited composition's own fixture (or any fd-relative
+  event that cannot be attributed to a location) refuses — so no entry is
+  ever created in the shared designated scratch root, and forced-GC runs
+  return the same verdict the ordinary run does.
+- `effigy journal:native` and `effigy journal:native:diagnostic` — the
+  operation journal's one bounded native, journal-only, on fresh private
+  filesystem fixtures inside the guard's owned scratch under the same
+  qualified supervisor. Each run verifies the supervisor's bytes and the
+  verified Stash scratch UUID, stages the proof-journal build of HEAD with a
+  source-bound manifest (head, tree, lock, toolchain, feature, source and
+  binary digests), and runs the twelve case groups as direct children of the
+  inner runner. Counted fail-fast preserves skipped/unexecuted states;
+  diagnostic keeps going within custody and budget and is always
+  `qualified: false` and nonzero. HELD for owner activation on the same terms
+  as the release and outputs proofs.
+
 RustQuality strict is active for the Rust source, manifests, tests and their
 documentation: `docs/knowledge/contracts/language-quality-activation.json` opts
 in, `rust-quality-profile.json` declares the strict profile and its MSRV

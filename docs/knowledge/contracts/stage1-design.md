@@ -246,8 +246,13 @@ state/
   cache-undo-<kind>.json        barge.cache-undo/1 (pending undo captures)
   holds/<root-id>/<holder>.json barge.hold/1
   intents/<intent-id>.json      barge.intent/2   (barge.intent/1 still read)
+  operations/journal.json       barge.journal/1  (single-authority journal epoch;
+                                  stage 4, "One operation journal")
+  operations/<sequence>.json    barge.operation/1 (numbered records, retained)
+  journal-identity.json         barge.journal.identity/1 (creation id and time,
+                                  outside the journal directory)
   locks/                        registry.lock, volume-<uuid>.lock, root-<id>.lock,
-                                unit-<key>.lock
+                                unit-<key>.lock, operations.lock
   journal/                      bounded append-only prune/delete observations
 ```
 
@@ -259,7 +264,11 @@ mutating command refuse, and is never rebuilt from markers.
 
 Lock order is fixed and documented so two processes cannot deadlock: registry
 lock → volume lock → root lock (a Barge root id, or a unit's own derived key) →
-intent write. The registry lock is never held across a deletion or a volume walk;
+intent write. The operation journal has its own registry-rank lock file
+(`locks/operations.lock`), taken alone: journal allocation and identity
+initialization serialize under it, a writer's fail-fast consult takes it shared
+with one immediate try-acquire, and no path holds it and the registry lock
+together. The registry lock is never held across a deletion or a volume walk;
 a long delete holds the volume and unit locks and re-reads the registry state it
 needs before publishing its intent. A unit whose name is a Barge root id takes
 that root's lock, which is the lock a hold on it takes too; any other unit takes
@@ -2214,7 +2223,12 @@ Choices S5 made where this design left the mechanic to the slice:
 - **A settled intent is kept.** `deleted` is the settlement; the record stays in
   `state/intents/` as the journal's own account of what happened, and replay
   treats it as non-pending work. A rolled-back `intent` phase is the one record
-  removed, because nothing happened.
+  removed, because nothing happened. This rule is the shipped `barge.intent/2`
+  journal's and stays exactly as it is; the successor single-authority journal
+  (stage 4, "One operation journal for delegated recovery", implemented in
+  `state/operations/`) retains **every** numbered record — `cancelled` and
+  settled `complete` included — because its gapless sequence inventory requires
+  numbered records to persist, and a removed one would read as proven loss.
 - **Replay proofs.** An intent is resolved only from its recorded identity, and
   the windows are conservative. A replay may resume a deletion at `renamed` only
   when the quarantine leaf is at its **visible** `.barge-prune-<intent-id>` name

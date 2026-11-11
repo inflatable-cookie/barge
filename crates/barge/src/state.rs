@@ -191,6 +191,36 @@ impl StatePaths {
         self.root.join("journal")
     }
 
+    /// The single-authority operation journal directory: the epoch document
+    /// and the numbered `barge.operation/1` records.
+    ///
+    /// It is a separate directory from `intents/`, so the shipped
+    /// `barge.intent/2` journal and the successor journal never mix and every
+    /// shipped reader of `intents/` is unchanged (stage 4 design, "One
+    /// operation journal for delegated recovery", compatibility note).
+    pub fn operations_dir(&self) -> PathBuf {
+        self.root.join("operations")
+    }
+
+    /// The operation journal's external identity binding: a static document
+    /// at the state level, outside the journal directory, carrying the same
+    /// creation id and creation time as the epoch. A recreated journal
+    /// directory cannot carry the id this file expects, which is how recreation
+    /// is detected.
+    pub fn journal_identity_path(&self) -> PathBuf {
+        self.root.join("journal-identity.json")
+    }
+
+    /// The operation journal's own lock file.
+    ///
+    /// It is a registry-rank state lock over its own file: journal allocation
+    /// and identity initialization serialize under it, and a writer's fail-fast
+    /// consult takes it shared with one immediate try-acquire. No path holds it
+    /// and the registry lock together, so the same-rank files never deadlock.
+    pub fn operations_lock_path(&self) -> PathBuf {
+        self.locks_dir().join("operations.lock")
+    }
+
     /// The registry lock file, first in the fixed order.
     pub fn registry_lock_path(&self) -> PathBuf {
         self.locks_dir().join("registry.lock")
@@ -270,6 +300,7 @@ impl StatePaths {
             self.activity_dir(),
             self.intents_dir(),
             self.journal_dir(),
+            self.operations_dir(),
             self.locks_dir(),
         ] {
             ensure_directory(&directory)?;
@@ -1094,6 +1125,50 @@ impl StateLock {
         }))
     }
 
+    /// Try to take a shared lock once, on a lock file that already exists.
+    ///
+    /// It is the fail-fast observation mode the writers' journal consults use:
+    /// an absent lock file is `Ok(None)` (nothing has ever locked here), a lock
+    /// another live owner holds is a [`ErrorKind::Locked`] refusal rather than
+    /// a wait, and an acquired lock is held until the returned value drops.
+    /// A consult that is refused answers `Unknown` and the writer refuses its
+    /// publication; admission is never made to wait on the journal.
+    pub fn try_shared_if_present(path: &Path, rank: LockRank) -> Result<Option<Self>> {
+        let file = match OpenOptions::new().read(true).open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == IoErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(lock_open_error(path, &error)),
+        };
+        match file.try_lock_shared() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(Error::new(
+                    ErrorKind::Locked,
+                    format!(
+                        "{} is locked by another live owner; the observation gives up instead of waiting",
+                        path.display()
+                    ),
+                )
+                .with_detail("path", path.display().to_string().into())
+                .with_detail("mode", "shared".into()));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(Error::new(
+                    ErrorKind::Io,
+                    format!("cannot lock {}: {error}", path.display()),
+                )
+                .with_detail("path", path.display().to_string().into())
+                .with_detail("os_error", error.to_string().into()));
+            }
+        }
+        Ok(Some(Self {
+            path: path.to_path_buf(),
+            rank,
+            mode: LockMode::Shared,
+            file,
+        }))
+    }
+
     /// The lock file this lock is held on.
     pub fn path(&self) -> &Path {
         &self.path
@@ -1338,6 +1413,36 @@ impl LockSet {
     pub fn observe_root(&mut self, root_id: &str) -> Result<Option<StateLock>> {
         let path = self.state.root_lock_path(root_id)?;
         self.acquire_shared(LockRank::Root, &path)
+    }
+
+    /// Take the operation journal's lock: a registry-rank exclusive lock over
+    /// its own file, first in the fixed order.
+    ///
+    /// Every journal allocation, identity initialization and watermark
+    /// recovery holds it while it publishes. It is a separate file from the
+    /// registry's, and no path holds both, so the same-rank files never
+    /// deadlock; the `check` below still refuses any caller that has already
+    /// acquired a higher rank through this set.
+    pub fn lock_operations(&mut self) -> Result<StateLock> {
+        let path = self.state.operations_lock_path();
+        self.acquire_exclusive(LockRank::Registry, &path)
+    }
+
+    /// Try to observe the operation journal shared, once, without waiting.
+    ///
+    /// It is the writers' fail-fast consult observation: `Ok(None)` when no
+    /// journal writer has ever locked (the journal may still be unbound, which
+    /// the read decides), `Ok(Some(lock))` while the shared lock is held, and
+    /// [`ErrorKind::Locked`] when another live owner holds the journal, which
+    /// the consult answers as `Unknown` and a refusal. Admission never waits.
+    pub fn try_observe_operations(&mut self) -> Result<Option<StateLock>> {
+        let path = self.state.operations_lock_path();
+        self.check(LockRank::Registry)?;
+        let lock = StateLock::try_shared_if_present(&path, LockRank::Registry)?;
+        if lock.is_some() {
+            self.highest = Some(LockRank::Registry);
+        }
+        Ok(lock)
     }
 
     /// Enter the intent-write step: the last rank, ordered after the root lock.
