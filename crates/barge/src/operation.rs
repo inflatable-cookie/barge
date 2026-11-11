@@ -1186,6 +1186,55 @@ fn list_record_entries(
     Ok(names)
 }
 
+/// Whether the journal directory holds any record-named entry, for the
+/// empty-journal probes.
+///
+/// The question these probes answer is "is there anything to account for",
+/// never "how much", so the listing stops at the first record-named entry and
+/// never reports a row bound: a journal that is supposed to be genuinely empty
+/// but holds anything else is unknown state, and the caller refuses it as one.
+fn has_record_entry(state: &StatePaths) -> Result<bool> {
+    let directory = state.operations_dir();
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!("cannot read the operation journal: {error}"),
+            )
+            .with_detail("path", directory.display().to_string().into()));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            Error::new(
+                ErrorKind::UnknownState,
+                format!("cannot read the operation journal: {error}"),
+            )
+            .with_detail("path", directory.display().to_string().into())
+        })?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "the operation journal holds `{}`, which is not a name this build reads",
+                    name.to_string_lossy()
+                ),
+            )
+            .with_detail("path", directory.display().to_string().into())
+        })?;
+        if matches!(
+            classify_name(name),
+            NameClass::Record(_) | NameClass::Invalid
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Read every numbered record strictly, bounded, in sequence order.
 ///
 /// A record that vanished between the listing and the read is a breakage,
@@ -1318,15 +1367,12 @@ pub(crate) fn read_operations_with_deadline(
             // Never initialized. The journal directory must hold nothing: a
             // record without a complete pair is exactly the state the binding
             // exists to detect, never a clean empty journal.
-            if state.operations_dir().is_dir() {
-                let entries = list_record_entries(state, 0, deadline)?;
-                if !entries.is_empty() {
-                    return Err(Error::new(
-                        ErrorKind::UnknownState,
-                        "the operation journal holds records but no identity binding or epoch; it is never bound after the fact"
-                            .to_owned(),
-                    ));
-                }
+            if state.operations_dir().is_dir() && has_record_entry(state)? {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "the operation journal holds records but no identity binding or epoch; it is never bound after the fact"
+                        .to_owned(),
+                ));
             }
             return Ok(None);
         }
@@ -1460,8 +1506,7 @@ pub fn init_operation_journal(
                 .with_detail("creation_id", epoch.creation_id.into())
                 .with_detail("watermark", epoch.watermark.into()));
             }
-            let entries = list_record_entries(state, 0, deadline)?;
-            if !entries.is_empty() {
+            if has_record_entry(state)? {
                 return Err(Error::new(
                     ErrorKind::UnknownState,
                     "the operation journal holds records its missing identity binding never bound; initialization never finishes a journal that is not genuinely empty"
@@ -1479,8 +1524,7 @@ pub fn init_operation_journal(
             )
         }
         (None, None) => {
-            let entries = list_record_entries(state, 0, deadline)?;
-            if !entries.is_empty() {
+            if has_record_entry(state)? {
                 return Err(Error::new(
                     ErrorKind::UnknownState,
                     "the operation journal holds records but no identity binding or epoch; it is never bound after the fact"
@@ -1546,6 +1590,9 @@ fn publish_operation(
 ///   mismatched request.
 /// - A different `(caller, key)` whose request digest matches a record with an
 ///   owed finalize refuses: one request binds one operation while it is owed.
+/// - A unit a non-terminal record binds is spoken for: a Barge-owned begin is
+///   idempotent on the exact unit binding, and any other begin for that unit
+///   refuses, whatever resume policy presents it.
 /// - An uninitialized journal refuses; it is never initialized implicitly.
 ///
 /// A record whose publication fails reports the failure: the allocation is
@@ -1626,6 +1673,30 @@ pub fn begin_operation(
             }
         }
     }
+    // One unit carries at most one non-terminal operation. A Barge-owned
+    // begin is idempotent on the exact unit binding - the unit is its own
+    // operation key - and any other begin for a unit a pending record binds
+    // refuses, whoever resumes it: two pending operations must never point at
+    // one unit. A terminal record binds nothing, so a fresh attempt after a
+    // cancellation may begin again.
+    if let Some(existing) = view
+        .records
+        .iter()
+        .find(|record| record.binds_conflict() && record.unit.same_binding(&request.unit))
+    {
+        if request.resume == ResumePolicy::Barge && existing.resume == ResumePolicy::Barge {
+            return Ok(Begun::Already(existing.clone()));
+        }
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "the unit `{}` is already bound to the pending operation at sequence {}; a second operation never begins for it",
+                existing.unit.name, existing.sequence
+            ),
+        )
+        .with_detail("sequence", existing.sequence.into())
+        .with_detail("phase", existing.phase.as_str().into()));
+    }
     let sequence = watermark.checked_add(1).ok_or_else(|| {
         Error::new(
             ErrorKind::ResourceBound,
@@ -1682,20 +1753,31 @@ fn same_request(existing: &OperationRecord, request: &BeginRequest) -> bool {
         && existing.unit.same_binding(&request.unit)
 }
 
-/// Advance one operation to a later phase, publishing the new generation
-/// durably before any effect. Capability-checked: the caller holds the
-/// intent-write step, so the write is ordered after every unit or root lock.
+/// Advance one operation to the next phase, publishing the new generation
+/// durably before the effect it authorizes. Crate-private and
+/// capability-checked: only this crate's checked coordinator calls it, the
+/// [`IntentWrite`] token orders the write after every unit or root lock, and
+/// the caller's own unit lock serializes concurrent writers of one record.
 ///
 /// The transitions are exactly:
 ///
-/// - forward on the ladder `intent` → `renamed` → `marker_last` → `removed` →
-///   `deleted`, in one or more steps, never backward;
+/// - one step forward on the ladder `intent` → `renamed` → `marker_last` →
+///   `removed` → `deleted`, never backward and never skipping: every
+///   intermediate phase is its own durable evidence (`intent` before the
+///   quarantine rename, `renamed` before the first unlink, `marker_last`
+///   before the leaf's removal, `removed` only after Barge's own final
+///   unlink), so no publish can stand in for the evidence it skips;
 /// - `deleted` → `complete`, the hook's acknowledgement;
 /// - `intent` → `cancelled`, the pre-effect cancellation, retained.
 ///
 /// A terminal record never advances again; nothing rewinds; a `renamed` or
 /// later record is never cancelled, because the effect has already begun.
-pub fn advance_operation(
+/// The checked coordinator of the next slice is this function's in-crate
+/// caller; today the crate's own regressions drive it, so a production build
+/// that names no caller yet must not fail the unused-code lint on the
+/// contract's own evidence chain.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn advance_operation(
     write: &IntentWrite,
     state: &StatePaths,
     record: &OperationRecord,
@@ -1705,7 +1787,7 @@ pub fn advance_operation(
         (OperationPhase::Deleted, OperationPhase::Complete) => true,
         (OperationPhase::Intent, OperationPhase::Cancelled) => true,
         (from, to) => match (from.ladder_position(), to.ladder_position()) {
-            (Some(from), Some(to)) => to > from,
+            (Some(from), Some(to)) => to == from + 1,
             _ => false,
         },
     };
@@ -1736,8 +1818,9 @@ pub fn advance_operation(
 
 /// Record the captures this operation has verified and may still unlink,
 /// published before each unlink, exactly as the shipped evidence chain does.
-/// Capability-checked.
-pub fn record_operation_captures(
+/// Crate-private and capability-checked like [`advance_operation`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn record_operation_captures(
     write: &IntentWrite,
     state: &StatePaths,
     record: &OperationRecord,
@@ -1760,8 +1843,9 @@ pub fn record_operation_captures(
 
 /// Record one capture whose verification failed, published before its
 /// put-back, so a failed capture is never relabelled as ordinary content.
-/// Capability-checked.
-pub fn record_operation_foreign_capture(
+/// Crate-private and capability-checked like [`advance_operation`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn record_operation_foreign_capture(
     write: &IntentWrite,
     state: &StatePaths,
     record: &OperationRecord,
@@ -2426,6 +2510,102 @@ mod tests {
     }
 
     #[test]
+    fn a_barge_owned_begin_is_idempotent_on_unit_identity() {
+        let (_dir, state, uuid) = fixture("operation-barge-idempotent");
+        init(&state);
+        let begun = begin(&state, BeginRequest::barge_owned(unit(&uuid, 7)));
+        let first = begun.record().clone();
+        // The same unit binds the same operation, whoever re-presents it.
+        let again = begin(&state, BeginRequest::barge_owned(unit(&uuid, 7)));
+        let Begun::Already(existing) = again else {
+            panic!("a barge-owned repeat binds the existing operation");
+        };
+        assert_eq!(existing.sequence, first.sequence);
+        let view = read_operations(&state, INTENT_ROWS)
+            .expect("the journal reads")
+            .expect("initialized");
+        assert_eq!(view.records.len(), 1, "no second pending record");
+
+        // The unit is spoken for: a delegated begin for the same unit refuses.
+        let mut same_unit = delegated_request(&uuid);
+        same_unit.unit.inode = 7;
+        let error = begin_refused(&state, same_unit);
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+    }
+
+    #[test]
+    fn a_unit_a_pending_operation_binds_is_spoken_for() {
+        let (_dir, state, uuid) = fixture("operation-unit-bound");
+        init(&state);
+        begin(&state, delegated_request(&uuid));
+        // A delegated begin with a different key but the same unit refuses.
+        let mut second = delegated_request(&uuid);
+        second.key = Some("prune-run-2".to_owned());
+        second.request_digest = Some("6".repeat(64));
+        let error = begin_refused(&state, second);
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        // A barge-owned begin for the same unit refuses too.
+        let error = begin_refused(&state, BeginRequest::barge_owned(unit(&uuid, 4_242)));
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+
+        // A different unit begins freely.
+        let mut third = delegated_request(&uuid);
+        third.key = Some("prune-run-2".to_owned());
+        third.request_digest = Some("6".repeat(64));
+        third.unit.inode = 4_243;
+        let begun = begin(&state, third);
+        assert_eq!(begun.record().sequence, 2);
+    }
+
+    #[test]
+    fn a_cancelled_unit_may_begin_again_but_a_pending_one_never() {
+        let (_dir, state, uuid) = fixture("operation-cancelled-unit");
+        init(&state);
+        let begun = begin(&state, delegated_request(&uuid));
+        let record = begun.record().clone();
+        let mut write_locks = LockSet::new(state.clone());
+        let write = write_token(&mut write_locks, &uuid);
+        advance_operation(&write, &state, &record, OperationPhase::Cancelled)
+            .expect("the pre-effect cancellation retains the record");
+        // A terminal record binds nothing: the same unit may begin again.
+        let mut fresh = delegated_request(&uuid);
+        fresh.key = Some("prune-run-2".to_owned());
+        fresh.request_digest = Some("6".repeat(64));
+        let begun = begin(&state, fresh);
+        assert_eq!(
+            begun.record().sequence,
+            2,
+            "a cancelled unit frees the binding"
+        );
+    }
+
+    #[test]
+    fn records_without_a_complete_authority_pair_refuse_as_unknown_not_resource_bound() {
+        // Records exist, no pair at all: the unbound read refuses as unknown.
+        let (_dir, state, uuid) = fixture("operation-records-no-pair");
+        write_fixture_record(&state, &cancelled_record(&uuid, 1), 1);
+        let error =
+            read_operations(&state, INTENT_ROWS).expect_err("records without a pair are unknown");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        // Initialization refuses the same way, never with a row bound.
+        let mut locks = LockSet::new(state.clone());
+        let error = init_operation_journal(&platform(), &state, &mut locks)
+            .expect_err("initialization never binds over records");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+
+        // An epoch that accounts for nothing but records that exist: the same
+        // refusal, still unknown, still not a row bound.
+        let (_dir2, state2, uuid2) = fixture("operation-epoch-zero-records");
+        let epoch = JournalEpoch::new("fedcba98".repeat(4), now_ms());
+        publish_epoch_fixture(&state2, &epoch);
+        write_fixture_record(&state2, &cancelled_record(&uuid2, 1), 1);
+        let mut locks2 = LockSet::new(state2.clone());
+        let error = init_operation_journal(&platform(), &state2, &mut locks2)
+            .expect_err("an epoch-only journal with records never finishes");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+    }
+
+    #[test]
     fn the_same_request_answers_already_and_any_mismatch_refuses() {
         let (_dir, state, uuid) = fixture("operation-idempotency");
         init(&state);
@@ -2526,11 +2706,13 @@ mod tests {
         assert_eq!(view.nonterminal().count(), 1, "the tail binds, too");
 
         // The next allocation reconciles the tail first, then allocates. The
-        // second request is a different request: the first digest is still
-        // owed, and one owed request binds one operation under any key.
+        // second request is a genuinely different operation - its own unit
+        // and its own request digest, because the first digest is still owed
+        // and one pending operation binds one unit.
         let mut second = delegated_request(&uuid);
         second.key = Some("prune-run-2".to_owned());
         second.request_digest = Some("6".repeat(64));
+        second.unit.inode = 4_243;
         let begun = begin(&state, second);
         assert_eq!(begun.record().sequence, 2);
         let view = read_operations(&state, INTENT_ROWS)
@@ -2548,6 +2730,7 @@ mod tests {
         let mut second = delegated_request(&uuid);
         second.key = Some("prune-run-2".to_owned());
         second.request_digest = Some("6".repeat(64));
+        second.unit.inode = 4_243;
         begin(&state, second);
         // The first record disappears: the gap proves its loss.
         std::fs::remove_file(record_path(&state, 1)).expect("the fixture drops a record");
@@ -2717,6 +2900,15 @@ mod tests {
             .expect_err("the ladder never rewinds");
         assert_eq!(error.kind(), ErrorKind::Usage);
 
+        // Skipping is refused: every phase is its own durable evidence, and a
+        // publish that skipped one would stand in for the evidence it skipped.
+        let error = advance_operation(&write, &state, &record, OperationPhase::MarkerLast)
+            .expect_err("the ladder never skips marker_last");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        let error = advance_operation(&write, &state, &record, OperationPhase::Deleted)
+            .expect_err("the ladder never skips to deleted without a durable removed");
+        assert_eq!(error.kind(), ErrorKind::Usage);
+
         // Skipping forward is one publication per step, with the generation
         // increasing.
         for phase in [
@@ -2809,8 +3001,9 @@ mod tests {
             verdict: CaptureVerdict::Observed,
             mode: Some(0o100_644),
         };
-        let next = record_operation_captures(&write, &state, &record, std::slice::from_ref(&capture))
-            .expect("the capture chain publishes");
+        let next =
+            record_operation_captures(&write, &state, &record, std::slice::from_ref(&capture))
+                .expect("the capture chain publishes");
         assert_eq!(next.generation, record.generation + 1);
         assert_eq!(next.phase, record.phase);
         let view = read_operations(&state, INTENT_ROWS)

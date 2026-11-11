@@ -23,6 +23,17 @@ design](contracts/stage1-design.md).
   root is the Barge-marked directory case; S4's delegated and claimed scratch
   units are the others. Nothing else is ever deleted, and a unit is only ever
   deleted whole.
+- **Operation journal.** For a delegated deletion, the one durable authority
+  for the operation: numbered `barge.operation/1` records under
+  `state/operations/` bind the exact unit, the caller's key and original
+  request, the resume policy, the typed durable hook and the owed or settled
+  finalization, in one gapless sequence with an epoch watermark and an
+  external identity binding, so a lost record is a proven gap, a recreated
+  journal is detected, and a retained `cancelled` or settled record is never
+  mistaken for one ([stage 4
+  design](contracts/stage4-design.md#one-operation-journal-for-delegated-recovery)).
+  The shipped `barge.intent/2` journal keeps its own meaning beside it until
+  an explicit supported transition.
 - **Scratch area.** A per-project tree under the volume's `scratch/<project>`,
   with marked run roots and expiry.
 - **Writer custody.** Before any move, swap or delete, Barge proves that no

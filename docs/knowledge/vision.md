@@ -86,8 +86,13 @@ Implementation, capacity changes and native/live activation need new scoped auth
 Tom asked for simpler shared recovery on 2026-11-10 (decision
 `1d4a7aee-a8e6-4a75-96f0-b142c4176db2` v2): the delegated-deletion machinery
 must shrink in both products, and a later consumer must not rebuild the
-recovery protocol. The proposed answer — one Barge-owned operation journal
-with typed durable caller hooks — is recorded design-only in the
-[stage 4 design](contracts/stage4-design.md#one-operation-journal-for-delegated-recovery-proposed-2026-11-10);
-design review authorizes neither implementation, migration, native execution
-nor live adoption.
+recovery protocol. Tom then selected implementation of the reviewed
+single-authority design — one Barge-owned operation journal with typed
+durable caller hooks — on disposable fixtures on 2026-11-11 (decision
+`1735df31-7cc1-4748-9f8a-0767ee6259ff` v2), in bounded reviewed slices
+([stage 4 design](contracts/stage4-design.md#one-operation-journal-for-delegated-recovery)).
+The first slice, the journal/integrity store, is implemented (barge#058);
+the checked coordinator, the Oxide caller and the old join's removal are
+later slices. No slice connects a caller or changes shipped behavior until
+its own reviewed code lands, and live migration/adoption, native execution
+and host change remain separately gated.

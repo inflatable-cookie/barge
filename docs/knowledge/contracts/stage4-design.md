@@ -1164,21 +1164,24 @@ Barge051/052/053 evidence retains its accepted limits and is not integrated
 credit. Production account lookup, deployment, live adoption and integrated
 proof remain unresolved; O2/O3 and production parent-reader conversion stay held.
 
-## One operation journal for delegated recovery (proposed, 2026-11-10)
+## One operation journal for delegated recovery
 
-**Status: proposed design, source-only; architectural reset after three
-non-converging exact-head reviews (planner ruling, brief v2); first slice
-implemented (barge#058, 2026-11-11).** Tom asked on 2026-11-10 (decision
-`1d4a7aee-a8e6-4a75-96f0-b142c4176db2` v2) for delegated-deletion recovery
-that is dependable and simpler in *both* products, and selected implementation
-on disposable fixtures on 2026-11-11 (decision
-`1735df31-7cc1-4748-9f8a-0767ee6259ff` v2, recorded in Oxide's vision). This
-section supersedes its own prior revisions and states one coherent protocol.
-Everything below is design until its slice lands reviewed code; the journal
-integrity/persistence store of the first slice is now implemented as described
-under **Implementation status**. The checked begin/deletion/replay/hook
-coordinator, the actual Oxide caller and the old join's removal are still
-PROPOSED, and no shipped behavior of the two-journal protocol has changed.
+**Status: reviewed, selected, and shipping in bounded slices; the
+journal/integrity store is implemented (barge#058, 2026-11-11), and the
+checked coordinator, Oxide caller and old join's removal are still design.**
+Tom asked on 2026-11-10 (decision `1d4a7aee-a8e6-4a75-96f0-b142c4176db2` v2)
+for delegated-deletion recovery that is dependable and simpler in *both*
+products. The section is the architectural reset after three non-converging
+exact-head reviews (planner ruling, brief v2), superseding its own prior
+revisions with one coherent protocol. The reviewed design (design 057,
+reviewed at `b2b30584a0392d3c5ad5087a0429027dc747e323`, published at
+`adc352792eaa6348d76ab31afc2bebceeefd6ca0`, final independent review
+`6785003512`, all ten subjects pass) was selected for implementation on
+disposable fixtures by Tom on 2026-11-11 (decision
+`1735df31-7cc1-4748-9f8a-0767ee6259ff` v2, recorded in Oxide's vision). The
+store slice described under **Implementation status** is shipped source; every
+other slice below is design until its own brief lands reviewed code, and
+nothing here authorizes migration, adoption, native execution or live change.
 Oxide's owning contract is not edited from here; its needed reconciliation
 text is quoted at the end. Sources: Barge at this repository's HEAD; Oxide
 read-only at PR 263 head `39211b4e1cef4abf9ea07f2ef1a4814ce6b0d3a0`.
@@ -1298,7 +1301,8 @@ prune's intent publication, the settlement revisions) consult with the
 `(checkout_id, root)` pairs they are about to write or reference live;
 whole-image writers (`compaction`) consult for **any** non-terminal
 delegated record. The consult read uses a non-blocking shared observation
-mode (`try-shared`, PROPOSED): if the lock cannot be taken immediately the
+mode (`try-shared`, implemented as the store's observation; the writer-side
+consult sites are still design): if the lock cannot be taken immediately the
 consult answers `Unknown` and the writer refuses publication — a try-acquire
 never blocks, so admission is never made to **wait** on a Barge lock. The
 publication sites are enumerated: `adopt`, `bind_for_command`, `reserve`,
@@ -1350,13 +1354,13 @@ acknowledged, never settled (stage 1 design, "Durable custody of captured
 objects"). **No numbered record is ever removed**: cancellation, like
 settlement, is a retained terminal transition, so an authorized cancellation
 can never masquerade as a lost record (the gapless rule below stays exact).
-This is a stated PROPOSED change to stage 1's shipped rule — "A rolled-back
-`intent` phase is the one record removed" — which exists to keep the shipped
-journal clean; the successor major retains the record instead because the
-gapless inventory requires numbered records to persist. Stage 1's shipped
-behavior is unchanged until implementation briefs adopt this, and the owning
-design carries both statements without contradiction by marking this one
-PROPOSED.
+The successor major's retention rule deliberately differs from stage 1's
+shipped rule — "A rolled-back `intent` phase is the one record removed" —
+which exists to keep the shipped journal clean: the implemented successor
+major retains the record instead, because the gapless inventory requires
+numbered records to persist. Stage 1's shipped `barge.intent/2` journal keeps
+its own rule unchanged, and the two journals never mix (see the
+implementation status above).
 The consult excludes conflicting work for non-terminal phases only
 (`intent`/`renamed`/`marker_last`/`removed`/`deleted`); `cancelled` and
 `complete` bind nothing, and a fresh attempt uses a fresh caller key. Each
