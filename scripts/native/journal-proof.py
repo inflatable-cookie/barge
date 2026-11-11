@@ -1065,16 +1065,37 @@ def outer_half(mode, effects):
     return exit_code, receipt
 
 
+RECEIPT_LINE_BOUND = 65536
+
+
+def bounded_receipt_line(receipt):
+    """One bounded compact JSON line carrying the inner receipt: the guarded
+    child's stdout handoff to the unguarded outer. A document that exceeds
+    the bound falls back to a small honest refusal rather than an unparseable
+    or unbounded line."""
+    line = json.dumps(receipt, separators=(",", ":"))
+    if len(line) <= RECEIPT_LINE_BOUND:
+        return line
+    bounded = {"schema": SCHEMA, "stage": "inner",
+               "mode": receipt.get("mode"), "qualified_inner": False,
+               "fault": {"kind": "receipt",
+                         "detail": "the inner receipt exceeded the bounded "
+                                   "stdout line"}}
+    return json.dumps(bounded, separators=(",", ":"))
+
+
 def run_inner(arguments):
     """The guarded inner runner: validate the guard-supplied run, compose the
-    cases, publish the receipt into the guard's evidence, and exit zero only
-    for a clean counted pass."""
+    cases, publish the receipt into the guard's evidence, and hand ONE
+    bounded JSON receipt line back through stdout — on success and on fault
+    alike, so the unguarded outer can parse what actually happened. Exit
+    zero only for a clean counted pass."""
     effects = InnerEffects.from_environment()
     receipt = inner_half(arguments.inner, effects)
-    if arguments.inner == "counted" and receipt.get("qualified_inner") \
-            and not receipt.get("refused") and not receipt.get("fault"):
-        return 0
-    return 1
+    line = bounded_receipt_line(receipt)
+    clean = (arguments.inner == "counted" and receipt.get("qualified_inner")
+             and not receipt.get("refused") and not receipt.get("fault"))
+    return (0 if clean else 1), line
 
 
 # ---------- effect-free controls through the actual entries ----------
@@ -2134,6 +2155,80 @@ def composition_controls():
     expect(inner.get("qualified_inner") is not True,
            "a failed receipt write still qualified the inner")
 
+    # The guarded runner's stdout handoff: the real `run_inner` entry (the
+    # exact function `--inner` invokes) returns one bounded JSON receipt line
+    # beside its exit code — on a clean counted pass, on a guarded fault,
+    # on a publication failure and in diagnostic mode — because the
+    # unguarded outer parses exactly this channel.
+    def handoff_harness():
+        harness = control_harness()
+        harness.env.update({
+            "OXIDE_TASK_SCRATCH_ROOT": harness.fixture_scratch,
+            "OXIDE_PROOF_EVIDENCE": harness.fixture_evidence,
+            base.WALL_DEADLINE_ENV: str(harness.monotonic_ns_value + 300 * 10 ** 9),
+        })
+        return harness
+
+    harness = handoff_harness()
+    try:
+        with harness.real_factory():
+            code, line = run_inner(argument_parser().parse_args(["--inner", "counted"]))
+        expect(code == 0, "a clean counted inner did not exit zero")
+        expect("\n" not in line, "the receipt handoff is not one line")
+        document = json.loads(line)
+        expect(document.get("qualified_inner") is True,
+               "the handed-off receipt does not qualify the clean pass")
+        expect(document.get("stage") == "inner"
+               and len(document.get("cases", [])) == len(CASES),
+               "the handed-off receipt does not carry the twelve groups")
+        expect(len(line) <= RECEIPT_LINE_BOUND, "the receipt line is not bounded")
+        oversized = {"cases": [{"detail": "x" * (RECEIPT_LINE_BOUND + 1)}]}
+        fallback = bounded_receipt_line(oversized)
+        expect("\n" not in fallback and "bounded" in fallback,
+               "the oversized receipt did not fall back to the bounded line")
+    finally:
+        harness.cleanup()
+
+    harness = handoff_harness()
+    harness.stage_fault = ("stage", "the injected handoff fault")
+    try:
+        with harness.real_factory():
+            code, line = run_inner(argument_parser().parse_args(["--inner", "counted"]))
+        expect(code == 1, "a faulted inner did not exit nonzero")
+        document = json.loads(line)
+        expect(document.get("fault", {}).get("kind") == "stage",
+               "the faulted handoff does not carry the guarded fault")
+        expect(all_cases_unexecuted(document),
+               "the faulted handoff did not record every group unexecuted")
+    finally:
+        harness.cleanup()
+
+    harness = handoff_harness()
+    harness.fail_report_write = True
+    try:
+        with harness.real_factory():
+            code, line = run_inner(argument_parser().parse_args(["--inner", "counted"]))
+        expect(code == 1, "a publication failure did not exit nonzero")
+        document = json.loads(line)
+        expect(bool(document.get("receipt_write_fault")),
+               "the publication failure is not recorded in the handed-off receipt")
+        expect(document.get("qualified_inner") is not True,
+               "a publication failure still qualified the inner")
+    finally:
+        harness.cleanup()
+
+    harness = handoff_harness()
+    try:
+        with harness.real_factory():
+            code, line = run_inner(argument_parser().parse_args(["--inner", "diagnostic"]))
+        expect(code == 1, "the diagnostic inner did not stay nonzero")
+        document = json.loads(line)
+        expect(document.get("mode") == "diagnostic"
+               and len(document.get("cases", [])) == len(CASES),
+               "the diagnostic handoff does not carry its mode and groups")
+    finally:
+        harness.cleanup()
+
     # Diagnostic: keep-going records every case and never qualifies.
     harness = control_harness()
     harness.case_results = {"J3": types.SimpleNamespace(
@@ -2402,7 +2497,9 @@ def main(argv):
         print(json.dumps(plan_document(), indent=2))
         return 0
     if arguments.inner is not None:
-        return run_inner(arguments)
+        code, line = run_inner(arguments)
+        print(line)
+        return code
     if arguments.mode in ("counted", "diagnostic"):
         # The owner-activated entry: the unguarded outer half verifies the
         # pins and launches the one guarded child, returning the actual guard

@@ -343,9 +343,16 @@ fn write_full_pair(f: &Fixture, watermark: u64) -> Result<(), String> {
 
 fn init_and_binding(_injections: &mut Vec<&'static str>) -> Result<String, String> {
     let f = fixture("j1")?;
-    let mut locks = LockSet::new(f.state.clone());
+    // Each init call takes its own fresh lock set: the lock order is
+    // per-acquisition, and a set that already holds the registry lock is
+    // spent (the store refuses re-acquisition as a lock-order violation).
     step!(
-        init_operation_journal(&f.dirs, &f.dirs, &f.state, &mut locks),
+        init_operation_journal(
+            &f.dirs,
+            &f.dirs,
+            &f.state,
+            &mut LockSet::new(f.state.clone())
+        ),
         "init"
     );
     let view = read(&f)?;
@@ -358,7 +365,12 @@ fn init_and_binding(_injections: &mut Vec<&'static str>) -> Result<String, Strin
         "the pair carries one creation id",
     )?;
     step!(
-        init_operation_journal(&f.dirs, &f.dirs, &f.state, &mut locks),
+        init_operation_journal(
+            &f.dirs,
+            &f.dirs,
+            &f.state,
+            &mut LockSet::new(f.state.clone())
+        ),
         "re-init"
     );
     let again = read(&f)?;
@@ -448,7 +460,10 @@ fn full_capacity_retry(injections: &mut Vec<&'static str>) -> Result<String, Str
     )?;
     // A genuinely new allocation refuses, and writes nothing.
     let view_before = read(&f)?;
-    let fresh = delegated_request(&f.uuid, "prune-run-fresh", 8_001);
+    // A genuinely new allocation with its own distinct valid digest: a
+    // digest shared with any existing row is a different question.
+    let mut fresh = delegated_request(&f.uuid, "prune-run-fresh", 8_001);
+    fresh.request_digest = Some("9".repeat(64));
     let error = begin_result(&f, fresh)?
         .err()
         .ok_or("a full journal must refuse")?;
@@ -783,7 +798,7 @@ fn capture_evidence(injections: &mut Vec<&'static str>) -> Result<String, String
     let record = begun.record().clone();
     let write = write_token(&f)?;
     let capture = CaptureRecord {
-        private: format!("{}{}", "barge-del-", "c".repeat(32)),
+        private: format!("{QUARANTINE_PREFIX}{}", "c".repeat(32)),
         original: "child.txt".to_owned(),
         device: record.unit.device,
         inode: 77,
