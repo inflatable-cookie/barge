@@ -122,6 +122,14 @@ alias = "barge"
 # no scratch and no child process.
 "outputs:native:test" = "python3 scripts/native/oxide-outputs-proof.py --self-check"
 "outputs:native:plan" = "python3 scripts/native/oxide-outputs-proof.py --plan"
+# The operation journal's proof apparatus (scripts/native/journal-proof.py),
+# effect-free: the pinned supervisor, the twelve-group case table checked
+# against its named regressions in crates/barge/src/operation.rs, the
+# proof-journal feature's declarations, the journal-only fixture route, the
+# composition controls through fake external effects, and the held bounds. No
+# image, no scratch and no child process.
+"journal:native:test" = "python3 scripts/native/journal-proof.py --self-check"
+"journal:native:plan" = "python3 scripts/native/journal-proof.py --plan"
 # Builds the proof-feature binary of HEAD through Oxide, copies and hashes it into an
 # exclusive directory under the designated Stash scratch, and writes its manifest. It
 # runs no proof and touches no image. It is an explicit staging record only: a native
@@ -164,6 +172,25 @@ run = "python3 scripts/native/oxide-outputs-proof.py counted"
 [tasks."outputs:native:diagnostic"]
 admission = "heavy"
 run = "python3 scripts/native/oxide-outputs-proof.py diagnostic"
+
+# The operation journal's focused native proof (stage 4, "One operation journal
+# for delegated recovery"): the twelve journal-only case groups of
+# scripts/native/journal-proof.py through the proof-journal feature build of
+# HEAD, under the same qualified shared supervisor, on fresh private filesystem
+# fixtures in the guard's own scratch — no image, no real volume, no output-root
+# unlink, and every injected publication failure labelled.
+#
+# HELD for owner activation: these declarations activate nothing, and no native
+# receipt exists yet. The planner separately activates one uncounted diagnostic,
+# then one counted author pass, then a distinct retained-reviewer pass, each at
+# an exact reviewed head. A missing receipt is a missing proof.
+[tasks."journal:native"]
+admission = "heavy"
+run = "python3 scripts/native/journal-proof.py counted"
+
+[tasks."journal:native:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/native/journal-proof.py diagnostic"
 
 [test.suites.rust]
 # The library and CLI suites. The budgets are the test route's timeout and

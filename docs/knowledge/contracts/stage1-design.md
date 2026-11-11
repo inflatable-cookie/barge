@@ -264,7 +264,11 @@ mutating command refuse, and is never rebuilt from markers.
 
 Lock order is fixed and documented so two processes cannot deadlock: registry
 lock → volume lock → root lock (a Barge root id, or a unit's own derived key) →
-intent write. The registry lock is never held across a deletion or a volume walk;
+intent write. The operation journal has its own registry-rank lock file
+(`locks/operations.lock`), taken alone: journal allocation and identity
+initialization serialize under it, a writer's fail-fast consult takes it shared
+with one immediate try-acquire, and no path holds it and the registry lock
+together. The registry lock is never held across a deletion or a volume walk;
 a long delete holds the volume and unit locks and re-reads the registry state it
 needs before publishing its intent. A unit whose name is a Barge root id takes
 that root's lock, which is the lock a hold on it takes too; any other unit takes

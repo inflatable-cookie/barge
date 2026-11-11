@@ -1209,20 +1209,60 @@ no effect behind it:
   synced; re-init finishes only an unbound genuinely empty journal); the
   fail-closed gapless read with the typed refusal classes; crash-consistent
   allocation with one recoverable verified tail; begin idempotency per
-  `(caller, key)` with the exact digest/unit/hook matching and the
-  owed-digest refusal; the phase ladder with the retained `cancelled` and
-  settled `complete` terminals; capture and foreign-capture evidence fields
-  with the shipped bounds; the fail-fast try-shared consult observation over
-  the journal's own registry-rank lock (`state/locks/operations.lock`, never
-  held with the registry lock); and the read-only custody diagnostic that
-  reports findings and never repairs. Private no-follow owner/type checks
-  guard every state document the journal reads.
+  `(caller, key)` with the exact digest/unit/hook matching, the owed-digest
+  refusal and the one-pending-operation-per-unit binding (a Barge-owned begin
+  is idempotent on the exact unit); **idempotency and conflicts answered
+  before the capacity refusal**, so a full journal never prevents the retry of
+  an operation that already exists and only a genuinely new allocation
+  refuses, without a write; the phase ladder with adjacent-only steps, the
+  retained `cancelled` and settled `complete` terminals; capture and
+  foreign-capture evidence fields with the shipped bounds; the fail-fast
+  try-shared consult observation over the journal's own registry-rank lock
+  (`state/locks/operations.lock`, never held with the registry lock); and the
+  read-only custody diagnostic that reports findings and never repairs.
+  **Directory custody:** every journal access opens the state directory and
+  the journal directory through `DirOps`' descriptor-relative,
+  never-following primitives (`openat` `O_NOFOLLOW`/`O_DIRECTORY`), verifies
+  real-directory kind and the private permission set through the handles, and
+  lists, reads and publishes every document through the handle it verified —
+  so a replaced or linked directory is refused, no publication lands in a
+  substitute, and leaf checks never stand in for parent custody. The owner
+  boundary is the private permission set (state directory `0700`, documents
+  `0600`); anything wider is refused, never repaired.
+- **Actual API for the next dependent slice (059, the checked
+  coordinator):** the public store surface is
+  `init_operation_journal(dirs, state, locks)`,
+  `read_operations(dirs, state, max) -> Result<Option<JournalView>>`,
+  `begin_operation(dirs, state, locks, BeginRequest) -> Result<Begun>`,
+  `consult_operations(dirs, state, locks, max)` (the fail-fast observation),
+  and `inspect_operation_journal(dirs, state, max)` (the read-only
+  diagnostic); `JournalView` carries the epoch, identity, records and
+  `tail_sequence`; `Begun` is `Began | Already`. The phase and capture
+  writers (`advance_operation`, `record_operation_captures`,
+  `record_operation_foreign_capture`) are crate-private and
+  capability-checked by the intent-write token; the `proof-journal` feature
+  exposes a thin, documented delegation surface for the staged proof driver
+  alone, together with the labelled publication-failure endpoints. Stated
+  detection limits carry over verbatim: a consistent historical restoration
+  is indistinguishable from the journal's own past, and the journal's
+  guarantees bind its own writes, not the storage beneath them.
 - **Still absent, by scope:** the checked coordinator (caller-authenticated
   resume, drain dispatch, the guarded re-affirmation), the Oxide caller and
   its six writer-side consults, the operator gap-resolution command (the
   diagnostic reports; resolution stays blocked for an operator ruling), any
   CLI verb, and any live migration. Existing delete/replay paths do not read
   the operation journal.
+- **Proof readiness:** the focused native apparatus is authored and
+  effect-free — `scripts/native/journal-proof.py` declares twelve journal-only
+  case groups, each carried by named regressions the self-check proves against
+  `crates/barge/src/operation.rs`, the composition controls exercise
+  entry→case→report→receipt through fake external effects, and the plan
+  prints the case map, the nine premises with their dispositions and the held
+  bounds (300 s wall, 512 MiB, no image; fit unmeasured). The driver is the
+  `journal_proof` example behind the proof-only `proof-journal` feature;
+  `effigy journal:native:test` and `journal:native:plan` are effect-free, and
+  `journal:native` / `journal:native:diagnostic` are HELD owner activations
+  that declare nothing.
 
 Today one delegated deletion is coordinated by five durable facts across two
 products — Oxide's `prune-intent/1` journal, the registry's schema-3
