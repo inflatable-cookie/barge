@@ -2,9 +2,11 @@
 //! output volume. These are fake volume observations over actual descriptors;
 //! mounted native qualification remains a separate proof.
 use super::*;
+use crate::delete::DeleteBounds;
 use crate::os::{
     AbsenceVolume, DirHandle, MountPoint, MountRoot, VolumeFacts, VolumeIdentity, VolumeLocator,
 };
+use crate::testkit::Faults;
 use std::cell::Cell;
 use std::path::Path;
 
@@ -140,6 +142,191 @@ fn proof(fixture: &Fixture, facts: &CheckoutFacts) -> crate::evidence::AbsenceEv
     .unwrap();
     assert_eq!(proof.verdict(), "absent");
     serde_json::from_value(serde_json::to_value(proof).unwrap()).unwrap()
+}
+
+#[test]
+fn successor_begin_and_effect_reprove_the_original_checkout_and_grant() {
+    use crate::delete::{
+        begin_checked_delegated, execute_checked_delegated, OperationReaffirmation,
+    };
+    use crate::operation::{
+        self, BeginRequest, DeclarationAuthority, FinalizeSpec, OperationRecord, OperationUnit,
+    };
+    struct Reaffirm;
+    impl OperationReaffirmation for Reaffirm {
+        fn reaffirm(&self, _: &OperationRecord) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+    for withdraw in [false, true] {
+        let (fixture, facts) = mounted("successor-checkout-authority");
+        let mut root = fixture.root("root-one");
+        // Update only the owned marker; the new route needs no Oxide intent,
+        // sidecar, or route publication.
+        let marker_path = root.path.join(crate::reference::OXIDE_MARKER_FILE);
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+        marker["checkout_volume_uuid"] = json!(CHECKOUT_UUID);
+        let bytes = serde_json::to_vec(&marker).unwrap();
+        root.marker_digest = sha256_hex(&bytes);
+        std::fs::write(marker_path, bytes).unwrap();
+        let state = &fixture.volume.state;
+        let declared = area::show(state, AREA_NAMESPACE, AREA_NAME)
+            .unwrap()
+            .unwrap();
+        let grant = UnitGrant::delegation(MarkerFamily::OxideOutputs);
+        let mut request = BeginRequest::delegated(
+            "oxide.outputs",
+            "new-key",
+            "a".repeat(64),
+            FinalizeSpec {
+                kind: "oxide.settle-outputs".to_owned(),
+                version: "1".to_owned(),
+                payload: "{}".to_owned(),
+            },
+            OperationUnit {
+                volume_uuid: fixture.volume.uuid.clone(),
+                mount_hint: fixture.volume.root.clone(),
+                root_dir: fixture.volume.record.root_dir.clone(),
+                folder: declared.folder.clone(),
+                parent: String::new(),
+                name: root.path.file_name().unwrap().to_str().unwrap().to_owned(),
+                kind: UnitKind::Directory,
+                device: root.device,
+                inode: root.inode,
+                marker: Some(UnitMarker::new(
+                    MarkerFamily::OxideOutputs,
+                    root.marker_digest.clone(),
+                )),
+                root_id: None,
+                capture_name: None,
+                grant: grant.clone(),
+            },
+        );
+        request.absence = Some(proof(&fixture, &facts));
+        request.declaration = Some(DeclarationAuthority {
+            namespace: AREA_NAMESPACE.to_owned(),
+            area: AREA_NAME.to_owned(),
+            generation: declared.generation,
+            grant,
+        });
+        let dirs = Faults::new();
+        let observer = fixture.volume.observer();
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks).unwrap();
+        begin_checked_delegated(
+            state,
+            &dirs,
+            &facts,
+            &observer,
+            request.clone(),
+            DeleteBounds::default(),
+        )
+        .expect("checked begin");
+        if withdraw {
+            fixture.withdraw_grant();
+        }
+        let result = execute_checked_delegated(
+            state,
+            &dirs,
+            &facts,
+            &observer,
+            &request,
+            &Reaffirm,
+            DeleteBounds::default(),
+        );
+        if withdraw {
+            assert!(result.is_err(), "withdrawn authority refuses");
+            assert!(root.path.exists());
+        } else {
+            assert_eq!(
+                result.expect("checked execution").outcome,
+                crate::delete::DeleteOutcome::Deleted
+            );
+        }
+        assert!(state::read_intents(state, crate::contract::INTENT_ROWS)
+            .unwrap()
+            .records
+            .is_empty());
+    }
+}
+
+#[test]
+fn successor_checkout_binding_accepts_the_same_volume_at_a_new_mount() {
+    use crate::operation::{self, BeginRequest, DeclarationAuthority, FinalizeSpec, OperationUnit};
+    let (fixture, mut facts) = mounted("successor-checkout-remount");
+    let mut root = fixture.root("root-one");
+    let marker_path = root.path.join(crate::reference::OXIDE_MARKER_FILE);
+    let mut marker: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+    marker["checkout_volume_uuid"] = json!(CHECKOUT_UUID);
+    let bytes = serde_json::to_vec(&marker).unwrap();
+    root.marker_digest = sha256_hex(&bytes);
+    std::fs::write(marker_path, bytes).unwrap();
+    let new_mount = fixture.volume.dir.path().join("checkout-volume-moved");
+    std::fs::rename(&facts.checkout.root, &new_mount).unwrap();
+    facts.checkout.root = new_mount;
+    let absence = super::super::prove_checkout_absent(
+        &platform(),
+        &facts,
+        &fixture.checkout,
+        Some(&facts.checkout.uuid),
+    )
+    .unwrap();
+    let state = &fixture.volume.state;
+    let declared = area::show(state, AREA_NAMESPACE, AREA_NAME)
+        .unwrap()
+        .unwrap();
+    let grant = UnitGrant::delegation(MarkerFamily::OxideOutputs);
+    let mut request = BeginRequest::delegated(
+        "oxide.outputs",
+        "remount-key",
+        "a".repeat(64),
+        FinalizeSpec {
+            kind: "oxide.settle-outputs".to_owned(),
+            version: "1".to_owned(),
+            payload: "{}".to_owned(),
+        },
+        OperationUnit {
+            volume_uuid: fixture.volume.uuid.clone(),
+            mount_hint: fixture.volume.root.clone(),
+            root_dir: fixture.volume.record.root_dir.clone(),
+            folder: declared.folder.clone(),
+            parent: String::new(),
+            name: root.path.file_name().unwrap().to_str().unwrap().to_owned(),
+            kind: UnitKind::Directory,
+            device: root.device,
+            inode: root.inode,
+            marker: Some(UnitMarker::new(
+                MarkerFamily::OxideOutputs,
+                root.marker_digest.clone(),
+            )),
+            root_id: None,
+            capture_name: None,
+            grant: grant.clone(),
+        },
+    );
+    request.absence = Some(absence);
+    request.declaration = Some(DeclarationAuthority {
+        namespace: AREA_NAMESPACE.to_owned(),
+        area: AREA_NAME.to_owned(),
+        generation: declared.generation,
+        grant,
+    });
+    let dirs = Faults::new();
+    let observer = fixture.volume.observer();
+    let mut locks = LockSet::new(state.clone());
+    operation::init_operation_journal(&dirs, &observer, state, &mut locks).unwrap();
+    crate::delete::begin_checked_delegated(
+        state,
+        &dirs,
+        &facts,
+        &observer,
+        request,
+        DeleteBounds::default(),
+    )
+    .expect("same checkout volume after remount");
+    assert!(root.path.exists());
 }
 
 #[test]

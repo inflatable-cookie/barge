@@ -1865,7 +1865,30 @@ pub fn begin_operation(
     request: BeginRequest,
 ) -> Result<Begun> {
     request.validate()?;
-    let _lock = locks.lock_operations()?;
+    let lock = locks.lock_operations()?;
+    begin_operation_locked(dirs, observer, state, locks, &lock, request)
+}
+
+/// Allocate while the caller holds the operation lock and any later-ranked
+/// volume and unit locks. Only the checked in-crate coordinator calls this.
+pub(crate) fn begin_operation_locked(
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    state: &StatePaths,
+    locks: &mut LockSet,
+    journal_lock: &crate::state::StateLock,
+    request: BeginRequest,
+) -> Result<Begun> {
+    request.validate()?;
+    if journal_lock.rank() != crate::state::LockRank::Registry
+        || journal_lock.mode() != crate::state::LockMode::Exclusive
+        || journal_lock.path() != state.operations_lock_path()
+    {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "operation allocation requires its exclusive journal lock",
+        ));
+    }
     let deadline = Deadline::after(READ_DEADLINE);
     let root = open_journal_root(dirs, observer, state)?;
     let Some(view) = read_operations_with_deadline(dirs, observer, state, INTENT_ROWS, deadline)?

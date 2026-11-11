@@ -1167,8 +1167,9 @@ proof remain unresolved; O2/O3 and production parent-reader conversion stay held
 ## One operation journal for delegated recovery
 
 **Status: reviewed, selected, and shipping in bounded slices; the
-journal/integrity store is implemented (barge#058, 2026-11-11), and the
-checked coordinator, Oxide caller and old join's removal are still design.**
+journal/integrity store is implemented (barge#058, 2026-11-11), the
+checked coordinator is in progress, and the Oxide caller and old join's
+removal are still design.**
 Tom asked on 2026-11-10 (decision `1d4a7aee-a8e6-4a75-96f0-b142c4176db2` v2)
 for delegated-deletion recovery that is dependable and simpler in *both*
 products. The section is the architectural reset after three non-converging
@@ -1195,23 +1196,26 @@ settlement consult to exempt only that exact deleted, owed operation. The
 consult returns every other pending record; the caller interprets its own
 payloads, refuses unknown relevant kinds or malformed bindings, and checks its
 own guarded domain state. A concurrently acknowledged exact operation is a
-read-only outcome, not permission for another publication. This seam alone does
-not connect deletion or qualify a caller.
+read-only outcome, not permission for another publication. No caller is yet
+integrated or qualified.
 
 The in-progress successor record can also retain the original validated
 consumer-path absence observation. It is part of exact request binding and is
 evidence to re-prove, never permission by itself. Records without it retain the
 existing encoding; an older strict reader refuses a record containing the new
-field. The existing capture walk can write its captures and phase transitions
-to the successor journal without publishing a legacy intent, but checked
-admission and successor replay are not connected yet.
+field. The existing capture walk writes its captures and phase transitions to
+the successor journal without publishing a legacy intent. Checked delegated
+begin, execution and post-capture replay now use that walk. Intent-phase
+recovery requires the caller's fresh guarded reaffirmation; a missing capture
+without the recorded `removed` phase remains pending.
 Exact delegated state lookup refuses changed request or handler bindings even
 for terminal records. The in-progress cancellation entry retains a cancelled
 record only after taking journal, volume and unit custody and verifying the
 original unit and absent capture; an `intent` phase alone is insufficient.
 Finalization drain attempts each observed deleted, owed handler at most once
-per call and reports each outcome. None of these pieces yet authorizes an
-effect or replaces the existing covered caller.
+per call and reports each outcome. These APIs do not replace the existing
+covered caller; source, ordinary validation and native readiness remain in
+progress.
 
 The original declaration authority is a typed namespace, area, generation and
 grant binding in the same record, separate from the opaque caller payload.
@@ -1219,6 +1223,29 @@ Its generation is a floor: a newer declaration is acceptable only while the
 same grant and location still cover the unit. A missing binding never acquires
 authority from the current declaration. Records without the added field retain
 their prior encoding; strict older readers refuse records that include it.
+
+For the staged compatibility period, a successor begin or replay refuses an
+overlapping pending legacy intent. A legacy delete or replay consults the
+successor journal without waiting while it holds volume custody and refuses a
+busy, unknown or overlapping successor record. No old record is converted or
+discarded. Barge-owned successor replay is not yet connected: drain reports it
+pending rather than manufacturing a request binding.
+
+The in-progress caller surface is `begin_checked_delegated` with an original
+`BeginRequest`, `checked_operation_state` for an exact bound observation,
+`execute_checked_delegated` with a linked `OperationReaffirmation`,
+`cancel_delegated_operation`, and `drain_checked_operations`. The caller holds
+its binding barrier across begin, guarded reaffirmation and execution, owns
+the domain verdict and projects its own opaque hook payload when consulting
+the complete journal. Reaffirmation runs without a Barge lock and must repeat
+the full guarded verdict; Barge re-reads the exact journal identity and record
+after it returns. A busy, missing or invalid journal refuses; absence is never
+an empty partial result. `FinalizeHook` receives an unconstructible
+`FinalizationContext`, and `consult_settlement` exempts only the exact
+deleted, owed record while returning all other pending operations. Hooks must
+make their own guarded settlement idempotent, including a lost acknowledgment.
+The original caller/key, digest, unit, absence, declaration, hook kind,
+version and payload are matched before any state or terminal answer.
 
 The persistence/integrity prerequisite of the split's first part is
 implemented in `crates/barge/src/operation.rs`, with no caller connected and
@@ -1286,12 +1313,11 @@ no effect behind it:
   verbatim: a consistent historical restoration is indistinguishable from
   the journal's own past, and the journal's guarantees bind its own writes,
   not the storage beneath them.
-- **Still absent, by scope:** the checked coordinator (caller-authenticated
-  resume, drain dispatch, the guarded re-affirmation), the Oxide caller and
-  its six writer-side consults, the operator gap-resolution command (the
-  diagnostic reports; resolution stays blocked for an operator ruling), any
-  CLI verb, and any live migration. Existing delete/replay paths do not read
-  the operation journal.
+- **Still absent, by scope:** the Oxide caller and its six writer-side
+  consults, the operator gap-resolution command (the diagnostic reports;
+  resolution stays blocked for an operator ruling), any CLI verb, and live
+  migration. The checked coordinator is in progress as described above; legacy
+  delete and replay now refuse overlapping successor work.
 - **Proof readiness:** the focused native apparatus is authored and
   effect-free — `scripts/native/journal-proof.py` declares twelve journal-only
   case groups, each carried by named regressions the self-check proves against
