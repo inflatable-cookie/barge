@@ -1188,6 +1188,16 @@ read-only at PR 263 head `39211b4e1cef4abf9ea07f2ef1a4814ce6b0d3a0`.
 
 ### Implementation status: the journal/integrity store (barge#058)
 
+The checked coordinator remains in progress. Its finalization seam dispatches
+linked handlers with no Barge lock held, then re-reads and compares the exact
+record before acknowledgement. A handler's opaque context permits a fail-fast
+settlement consult to exempt only that exact deleted, owed operation. The
+consult returns every other pending record; the caller interprets its own
+payloads, refuses unknown relevant kinds or malformed bindings, and checks its
+own guarded domain state. A concurrently acknowledged exact operation is a
+read-only outcome, not permission for another publication. This seam alone does
+not connect deletion or qualify a caller.
+
 The persistence/integrity prerequisite of the split's first part is
 implemented in `crates/barge/src/operation.rs`, with no caller connected and
 no effect behind it:

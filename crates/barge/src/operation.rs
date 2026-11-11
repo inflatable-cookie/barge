@@ -6,9 +6,9 @@
 //! design, "One operation journal for delegated recovery"
 //! (`docs/knowledge/contracts/stage4-design.md`): Barge's journal is the one
 //! durable authority for an operation's progress, binding and owed caller
-//! finalization. The checked begin/deletion/replay/hook coordinator is a later
-//! slice; nothing here connects a caller, runs an effect, or manufactures
-//! successful deletion from absence. Every numbered record is retained —
+//! finalization. The linked finalization seam is present; checked deletion and
+//! replay remain a later slice. Nothing here connects a caller, runs an effect,
+//! or manufactures successful deletion from absence. Every numbered record is retained —
 //! `cancelled` and settled `complete` records included — so the sequence stays
 //! gapless and a proven loss is a detectable gap, never silence.
 //!
@@ -2157,6 +2157,205 @@ pub fn consult_operations(
     read_operations(dirs, observer, state, max)
 }
 
+/// A linked caller handler. Implementations must make settlement idempotent:
+/// another dispatch may run concurrently or after a lost acknowledgement.
+pub trait FinalizeHook {
+    /// The persisted handler kind this implementation accepts.
+    fn kind(&self) -> &str;
+    /// The persisted handler version this implementation accepts.
+    fn version(&self) -> &str;
+    /// Settle the caller's domain state, using guarded rechecks of its own.
+    /// No Barge lock is held during this call.
+    fn finalize(&self, context: &FinalizationContext, record: &OperationRecord) -> Result<()>;
+}
+
+/// Authority for one checked hook invocation. Only Barge can construct it.
+/// It is bound to the journal identity and the exact deleted, owed record.
+#[derive(Debug)]
+pub struct FinalizationContext {
+    identity: JournalIdentity,
+    record: OperationRecord,
+}
+
+/// Result of a fail-fast settlement consult inside a caller's publication guard.
+#[derive(Debug)]
+pub enum SettlementConsult {
+    /// The exact operation is still owed. These are *all* other pending
+    /// records; the caller must interpret its own supported payloads and refuse
+    /// if it cannot exclude a conflict.
+    Owed(Vec<OperationRecord>),
+    /// This exact operation has already been acknowledged. This is read-only;
+    /// it does not authorize another domain publication.
+    AlreadyComplete,
+}
+
+fn is_acknowledged_record(original: &OperationRecord, current: &OperationRecord) -> bool {
+    let mut expected = original.clone();
+    expected.phase = OperationPhase::Complete;
+    expected.finalize_status = FinalizeStatus::Acknowledged;
+    let Some(generation) = original.generation.checked_add(1) else {
+        return false;
+    };
+    expected.generation = generation;
+    expected.phase_ms = current.phase_ms;
+    current.phase_ms >= original.phase_ms && *current == expected
+}
+
+/// Re-read the complete journal immediately without waiting for its lock.
+/// Only the exact operation that minted `context` is exempted; an identity,
+/// generation, phase or binding mismatch refuses instead of granting authority.
+pub fn consult_settlement(
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    state: &StatePaths,
+    context: &FinalizationContext,
+) -> Result<SettlementConsult> {
+    let mut locks = LockSet::new(state.clone());
+    let view = consult_operations(dirs, observer, state, &mut locks, INTENT_ROWS)?
+        .ok_or_else(uninitialized_error)?;
+    if view.identity != context.identity {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the settlement journal identity changed",
+        ));
+    }
+    let current = view
+        .records
+        .iter()
+        .find(|record| record.sequence == context.record.sequence)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the settlement operation is missing",
+            )
+        })?;
+    if is_acknowledged_record(&context.record, current) {
+        return Ok(SettlementConsult::AlreadyComplete);
+    }
+    if *current != context.record {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the settlement operation changed",
+        ));
+    }
+    Ok(SettlementConsult::Owed(
+        view.records
+            .into_iter()
+            .filter(|record| record.is_pending() && record.sequence != context.record.sequence)
+            .collect(),
+    ))
+}
+
+/// Dispatch one deleted, owed operation to its linked handler and record its
+/// acknowledgement. No journal lock is held while the handler runs. A failed
+/// or absent handler leaves the obligation owed.
+pub fn finalize_operation(
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    state: &StatePaths,
+    caller: &str,
+    key: &str,
+    hooks: &[&dyn FinalizeHook],
+) -> Result<OperationRecord> {
+    let mut locks = LockSet::new(state.clone());
+    let view = consult_operations(dirs, observer, state, &mut locks, INTENT_ROWS)?
+        .ok_or_else(uninitialized_error)?;
+    let record = view
+        .find_operation(caller, key)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the operation to finalize was not found",
+            )
+        })?
+        .clone();
+    if record.phase != OperationPhase::Deleted || !record.finalization_owed() {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            "the operation is not deleted and owed",
+        ));
+    }
+    let spec = record
+        .finalize
+        .as_ref()
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the operation has no finalize handler",
+            )
+        })?
+        .clone();
+    let matching: Vec<_> = hooks
+        .iter()
+        .filter(|hook| hook.kind() == spec.kind && hook.version() == spec.version)
+        .collect();
+    if matching.len() != 1 {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!(
+                "caller `{caller}` key `{key}` needs exactly one handler for `{}` version `{}`",
+                spec.kind, spec.version
+            ),
+        ));
+    }
+    let context = FinalizationContext {
+        identity: view.identity,
+        record,
+    };
+    matching[0]
+        .finalize(&context, &context.record)
+        .map_err(|error| {
+            Error::new(
+                error.kind(),
+                format!(
+                    "caller `{caller}` key `{key}` handler `{}` version `{}` remains owed: {error}",
+                    spec.kind, spec.version
+                ),
+            )
+        })?;
+
+    // Re-enter with a fresh lock set: the handler may itself have consulted
+    // the journal under the caller's guard, but no lock spans that call.
+    let mut locks = LockSet::new(state.clone());
+    let _lock = locks.lock_operations()?;
+    let view =
+        read_operations(dirs, observer, state, INTENT_ROWS)?.ok_or_else(uninitialized_error)?;
+    if view.identity != context.identity {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the finalization journal identity changed",
+        ));
+    }
+    let current = view
+        .records
+        .iter()
+        .find(|record| record.sequence == context.record.sequence)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownState,
+                "the finalization operation is missing",
+            )
+        })?;
+    if is_acknowledged_record(&context.record, current) {
+        return Ok(current.clone());
+    }
+    if *current != context.record {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "the finalization operation changed",
+        ));
+    }
+    let write = locks.begin_intent_write()?;
+    advance_operation(
+        &write,
+        dirs,
+        observer,
+        state,
+        current,
+        OperationPhase::Complete,
+    )
+}
+
 /// One record the diagnostic could read, summarized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticRecord {
@@ -2556,10 +2755,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        advance_operation, begin_operation, consult_operations, epoch_path, init_operation_journal,
-        inspect_operation_journal, read_operations, record_operation_captures, record_path,
-        BeginRequest, Begun, FinalizeSpec, FinalizeStatus, JournalEpoch, JournalFinding,
-        JournalIdentity, OperationPhase, OperationRecord, OperationUnit, ResumePolicy,
+        advance_operation, begin_operation, consult_operations, consult_settlement, epoch_path,
+        finalize_operation, init_operation_journal, inspect_operation_journal, read_operations,
+        record_operation_captures, record_path, BeginRequest, Begun, FinalizationContext,
+        FinalizeHook, FinalizeSpec, FinalizeStatus, JournalEpoch, JournalFinding, JournalIdentity,
+        OperationPhase, OperationRecord, OperationUnit, ResumePolicy, SettlementConsult,
         EPOCH_FILE_NAME,
     };
     use crate::contract::{
@@ -3374,6 +3574,115 @@ mod tests {
         )
         .expect_err("a terminal record is frozen");
         assert_eq!(error.kind(), ErrorKind::Usage);
+    }
+
+    #[test]
+    fn checked_dispatch_reenters_without_a_lock_and_preserves_other_conflicts() {
+        struct Hook<'a> {
+            state: &'a StatePaths,
+            fail: std::cell::Cell<bool>,
+        }
+        impl FinalizeHook for Hook<'_> {
+            fn kind(&self) -> &str {
+                "oxide.settle-outputs"
+            }
+            fn version(&self) -> &str {
+                "1"
+            }
+            fn finalize(
+                &self,
+                context: &FinalizationContext,
+                _: &OperationRecord,
+            ) -> crate::error::Result<()> {
+                let consult = consult_settlement(&platform(), &platform(), self.state, context)?;
+                let SettlementConsult::Owed(other) = consult else {
+                    panic!("the first dispatch is still owed");
+                };
+                assert_eq!(other.len(), 1, "another operation remains visible");
+                if self.fail.replace(false) {
+                    return Err(Error::new(ErrorKind::Io, "lost reply"));
+                }
+                Ok(())
+            }
+        }
+
+        let (_dir, state, uuid) = fixture("operation-hook");
+        init(&state);
+        let mut record = begin(&platform(), &state, delegated_request(&uuid))
+            .record()
+            .clone();
+        let mut other = delegated_request(&uuid);
+        other.key = Some("other".to_owned());
+        other.request_digest = Some("b".repeat(64));
+        other.unit.inode += 1;
+        other.unit.name = format!("{:032x}", 9);
+        begin(&platform(), &state, other);
+        let mut locks = LockSet::new(state.clone());
+        let write = write_token(&mut locks, &uuid);
+        for phase in [
+            OperationPhase::Renamed,
+            OperationPhase::MarkerLast,
+            OperationPhase::Removed,
+            OperationPhase::Deleted,
+        ] {
+            record = advance_operation(&write, &platform(), &platform(), &state, &record, phase)
+                .expect("phase");
+        }
+        let hook = Hook {
+            state: &state,
+            fail: std::cell::Cell::new(true),
+        };
+        let error = finalize_operation(
+            &platform(),
+            &platform(),
+            &state,
+            "oxide.outputs",
+            "prune-run-1",
+            &[],
+        )
+        .expect_err("missing handler refuses");
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
+        finalize_operation(
+            &platform(),
+            &platform(),
+            &state,
+            "oxide.outputs",
+            "prune-run-1",
+            &[&hook],
+        )
+        .expect_err("lost reply leaves the operation owed");
+        let view = read_operations(&platform(), &platform(), &state, INTENT_ROWS)
+            .expect("read")
+            .expect("initialized");
+        assert_eq!(
+            view.find_operation("oxide.outputs", "prune-run-1")
+                .expect("record"),
+            &record
+        );
+        let context = FinalizationContext {
+            identity: view.identity.clone(),
+            record: record.clone(),
+        };
+        let mut stale = FinalizationContext {
+            identity: view.identity,
+            record: record.clone(),
+        };
+        stale.record.generation += 1;
+        assert!(consult_settlement(&platform(), &platform(), &state, &stale).is_err());
+        let completed = finalize_operation(
+            &platform(),
+            &platform(),
+            &state,
+            "oxide.outputs",
+            "prune-run-1",
+            &[&hook],
+        )
+        .expect("retry settles");
+        assert_eq!(completed.phase, OperationPhase::Complete);
+        assert!(matches!(
+            consult_settlement(&platform(), &platform(), &state, &context).expect("consult"),
+            SettlementConsult::AlreadyComplete
+        ));
     }
 
     #[test]
