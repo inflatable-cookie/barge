@@ -30,6 +30,10 @@ enables it, and under it alone Oxide's reference directories come from a validat
 synthetic account home ([stage 4 design](docs/knowledge/contracts/stage4-design.md),
 "Proof build").
 
+The library's `proof-descriptor-listing` feature is also proof-only. Its targeted
+owned-child endpoint and example are absent from ordinary builds; it does not
+replace the real, unfiltered consumer scan.
+
 ## Validate
 
 Ordinary Rust selectors run through `oxide`; the `oxide:begin` block below lists
@@ -55,7 +59,7 @@ guarded exception. Each selector covers what it names:
   capture tape ([o2-tape](docs/knowledge/contracts/o2-tape.md)) compiles away, since a
   production build names none of it.
 - `effigy rust:format` — `oxide fmt --all -- --check`; run it when formatted
-  Rust changed.
+  Rust changed. `rust:format:apply` applies that formatting.
 - `effigy rust:lint` — clippy at the RustQuality strict profile. Every finding
   is repaired or recorded as a concrete deviation in
   `docs/knowledge/contracts/rust-quality-deviations.json`.
@@ -64,6 +68,10 @@ guarded exception. Each selector covers what it names:
   waits. Expiry still forces closure; historical 300 s timeouts remain failures.
   For fixture-bound runs, set `BARGE_TEST_SCRATCH_ROOT` and `TMPDIR`/`TMP`/`TEMP`
   to the same fresh Stash scratch directory; compiler output stays in Oxide's pool.
+- `effigy rust:test:listing` — focused actual shared-helper and macOS adapter
+  controls; `rust:compile:listing:proof` checks the driver with only its proof
+  feature. `rust:test:listing:proof` exercises the endpoint's fixture/argument
+  refusals and lossless bounded reporting without a process read or native proof.
 - `effigy os:volumes:probe` — the read-only OS-layer diagnostic:
   `BARGE_OS_PROBE_PATH` names one directory on a volume, whose facts are read
   and then verified against that identity; nothing is written. Evidence, not a
@@ -176,6 +184,17 @@ guarded exception. Each selector covers what it names:
   and does not establish the production account lookup, a live drive, or any
   adoption. HELD for owner activation on the same terms as the release proof's
   natives.
+- `effigy listing:native:test` and `effigy listing:native:plan` — effect-free
+  controls and the fixed targeted shared-listing plan. The plan reads only the
+  caller's own descriptor limit; controls use tiny synthetic files and fake
+  external executors, without a build, holder or kernel proof.
+- `effigy listing:native` and `effigy listing:native:diagnostic` — one targeted
+  owned-child kernel proof, no image, under the same qualified supervisor
+  (600 s / 512 MiB, 30 s work stop; production scans remain 10 s). Each occurrence stages its own fresh
+  source-bound proof-feature driver inside the guard through ordinary Oxide.
+  HELD for separate owner activation: diagnostic, counted author and distinct
+  reviewer runs. Targeted listing evidence grants no whole-host custody or
+  consumer qualification. See the [proof contract](docs/knowledge/contracts/descriptor-listing-proof.md).
 
 RustQuality strict is active for the Rust source, manifests, tests and their
 documentation: `docs/knowledge/contracts/language-quality-activation.json` opts

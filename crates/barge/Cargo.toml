@@ -22,6 +22,9 @@ libc = "=0.2.190"
 # validated private account home. Every other fact and rule is unchanged.
 [features]
 proof-synthetic-account = []
+# The targeted shared-listing kernel proof. No ordinary build enables its
+# single-PID endpoint or its driver; it does not replace the custody scan.
+proof-descriptor-listing = []
 
 [lints]
 workspace = true
@@ -33,6 +36,10 @@ workspace = true
 [[example]]
 name = "oxide_outputs_proof"
 required-features = ["proof-synthetic-account"]
+
+[[example]]
+name = "descriptor_listing_proof"
+required-features = ["proof-descriptor-listing"]
 
 # The F6-O2 B-S1 capture harness (docs/knowledge/contracts/o2-tape.md): a
 # standalone executable whose argv contract is

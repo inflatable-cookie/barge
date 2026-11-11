@@ -15,6 +15,8 @@ mod space;
 pub use absence::{prove_absence, AbsenceProof, AbsenceVolume, AncestorExpected};
 
 #[cfg(target_os = "macos")]
+mod descriptor_listing;
+#[cfg(target_os = "macos")]
 mod macos;
 
 // The proof-only synthetic account: compiled only under its feature, which no

@@ -1053,17 +1053,27 @@ mid-write without a hold is a consumer Barge cannot see, which is exactly the
 limit above and the reason adoption is explicit and holds are the documented
 protocol.
 
-### Bounded shared descriptor listing (design only, 2026-11-10)
+### Bounded shared descriptor listing (2026-11-10)
 
 Tom selected “Design bounded shared listing” in decision
-`9e68c8ce-ac61-4190-a31c-b45f99fd6ecd` v2. This is source-only design and
-independent exact-head review. Runtime remains unchanged: 4096 entries per
-listing, 4096 processes, 65,536 descriptors and 10 s. Implementation and native
-activation need new scoped briefs.
+`9e68c8ce-ac61-4190-a31c-b45f99fd6ecd` v2, then “Implement reviewed listing
+on fixtures” in decision `13834566-5b7f-44be-a655-6444a4eeaa32` v2. The
+implementation shares one private listing helper across custody callers,
+within the existing 4096-process, 65,536-returned-row and 10 s ceilings.
+The scope covers ordinary verification and native readiness. Each diagnostic,
+counted author and distinct retained-reviewer kernel occurrence needs separate
+planner activation; final exact-head judgment and the merge hold remain binding.
+Installation, live adoption, capacity increases and retained-image cleanup stay held.
 
-**Source binding.** Barge published
+**Source binding.** The reviewed design is [PR 55](https://github.com/inflatable-cookie/barge/pull/55),
+reviewed `bc2bb069c25ac5246a31d42e40019969b501c4ce` and published
+`c9095f7ef1ccd04ad1e1f822ba52356921f15c85`, identical tree
+`006383169e7af034d3a975d96236caf241fe58f9`, with independent
+[review 6778829040](https://github.com/inflatable-cookie/barge/pull/55#issuecomment-6778829040).
+It is docs-only over published runtime
 `63163686d212e6e5a900d6cc2ddfcce65b475890`, tree
-`8a3b368e7883be862fe8319bb34e9f987e38731b`; anchors below use that source.
+`8a3b368e7883be862fe8319bb34e9f987e38731b`; historical anchors below use
+that runtime source and supply no prior implementation or execution credit.
 Authenticated Oxide [PR 263 source](https://github.com/inflatable-cookie/oxide/blob/39211b4e1cef4abf9ea07f2ef1a4814ce6b0d3a0/docs/knowledge/contracts/barge-adoption.md#connected-caller-and-recovery-source-oxide304)
 (`39211b4e1cef4abf9ea07f2ef1a4814ce6b0d3a0`, adoption-contract blob
 `6ddce39d26ff69b915570d0a10f205947b564d2a`) and actual retained
@@ -1075,7 +1085,7 @@ unexecuted. This identifies no process, leak/load, transient cause or defect.
 Seven spent failures, no-launch refusal, original limits/charges/unknowns and
 four retained images stand; no proof credit transfers.
 
-| Shared call chain (macos.rs line anchors below) | Present behavior → proposed budget route |
+| Shared call chain (historical macos.rs line anchors below) | Shared budget route |
 | --- | --- |
 | `scan_open_descriptors` 958 → `scan_processes` 1015 → `scan_table` 1040 → `settle_descriptors` 1450 → `list_descriptors` 2134 | Kernel table first; one original `scan_table` start/deadline (currently after table/account reads), 4096-process admission and one mutable descriptor-work budget. Never reset them. |
 | `settle_descriptors` initial and EPERM loop 1483–1639 | Same helper on every attempt; preserve 250 ms window and 25/75/100 ms backoffs. Growth shares that window. |
@@ -1084,25 +1094,28 @@ four retained images stand; no proof credit transfers.
 | Test entry points 987/1005; `StatedListing` 2288; `dead_handle_candidates` 2961 → listing 2974 | Injected errnos must enter the same checked adapter. Candidate search gets one bounded context (512 candidates, at most 65,536 work rows/10 s), accepts only complete listings and remains test discovery, never custody. |
 | `custody::decide` 861–940; `cache.rs` 2755–2812; `diagnostic.rs` 89–161 | Complete-empty alone can support custody/cache replacement; Bounded/Unreadable refuse. Census remains diagnostic infrastructure on refusal, never Safe. |
 
-**Minimum private delta.** Add `ScanBudget { deadline, remaining }`;
+**Private implementation.** One `ScanBudget` owns the deadline and remaining
+returned-row allowance.
 `list_descriptors(classified: ProcessIdentity, budget: &mut ScanBudget,
 local_deadline: Option<Instant>, faults: &mut [StatedListing])` returns
-explicit complete, bounded,
-gone or unreadable. Thread it through `settle_descriptors`, `observe_descriptor`,
-`settle_pair` and `settle_dead_handle`. `SettledListing::Listed` must carry the
-verified identity used by subsequent per-fd/platform checks: today EPERM can
-update `start` locally while `scan_table` still uses the original identity.
-Carry bound reasons through `SettledListing`/`Observed`, replacing both
-4096-length sentinels. Public `ProcessObserver`, `DescriptorScanRequest` and
-`DescriptorScan` shapes need no change.
+explicit complete, bounded, gone or unreadable answers. The budget is threaded
+through `settle_descriptors`, `observe_descriptor`,
+`settle_pair` and `settle_dead_handle`. `SettledListing::Listed` carries the
+verified identity used by subsequent per-fd/platform checks, including a
+same-uid replacement positively re-evaluated during EPERM settlement.
+Explicit bound reasons travel through `SettledListing`/`Observed`; a full
+listing is never a length sentinel for completion. Public `ProcessObserver`,
+`DescriptorScanRequest` and `DescriptorScan` shapes stay unchanged.
 
 **Accounting and growth.** Remaining means unspent returned listing rows,
-including non-vnodes, repeats across attempts, discarded full prefixes and relists; never
-refund them or charge final per-fd iteration twice. Today only final iteration
-is counted. Keep its public `descriptors` count; document the stricter private
-work limit in request/capability text. Clamp requested budgets/time to the existing totals (smaller requests stay
-smaller); use checked deadline construction. Keep process-count semantics and
-refuse before another same-uid listing once its process allowance is exhausted.
+including non-vnodes, repeats across attempts, discarded full prefixes and
+relists; none are refunded or charged again during final per-fd iteration.
+The public `descriptors` count still means final-listing rows evaluated, not
+private listing work. Stricter work accounting can therefore refuse earlier.
+Requested budgets/time are clamped to the existing totals (smaller requests
+stay smaller), with checked deadline construction. Process-count semantics
+stay unchanged; another same-uid listing is refused once its process allowance
+is exhausted.
 Zero remaining refuses before a listing, even for a potentially empty process.
 Start at `min(4096, remaining)`; after a full response charge it, discard it,
 and request `min(checked_double(previous), remaining)` only if strictly larger.
@@ -1126,7 +1139,7 @@ after allocation, reads and final identity, and before Complete, including
 empty/last-process paths. Retain existing window/scan refusal precedence.
 Blocking kernel calls are not preempted by these checks; runtime fit is unknown.
 
-| Allocation/answer obligation | Proposed deciding rule |
+| Allocation/answer obligation | Deciding rule |
 | --- | --- |
 | Capacity, PID and bytes | Checked multiplication by `size_of::<proc_fdinfo>()`; positive PID and exact checked PID/byte conversions to `c_int`, no saturation/substitution. Fallible `try_reserve_exact`, then initialize only reserved entries; allocation/conversion/overflow failure is Unreadable. |
 | Return value and errno | Clear errno, capture immediately. Negative always Unreadable except explicit ESRCH/EPERM handling; negative without errno never means empty. Zero + clear errno is empty only after identity/deadline checks; ESRCH is gone; EPERM uses only the existing listing-settlement policy (relist EPERM remains unreadable); ENOENT/other errno refuses. Positive + nonzero errno is ambiguous and refuses. |
@@ -1137,29 +1150,32 @@ Blocking kernel calls are not preempted by these checks; runtime fit is unknown.
 release, replay and delegated outputs wherever they use custody. Keep holds,
 self-exclusion, blind-spot/dead-handle rules, grants, unknown/refusal and every
 [stage 4 adapter/recovery boundary](stage4-design.md#the-oxide-outputs-adapter-barge-is-the-covered-classs-only-deleter-2026-11-09).
-Keep describe/evidence schemas and observed counts; update capability prose.
+Describe/evidence schemas and observed counts stay unchanged; capability prose
+names the stricter private work accounting.
 Tape records each actual attempt and its bound without raising tape caps;
 overflow remains insufficient. Test seams compile away; adapt vnode-index injections to sorted rows. Comparison stays deferred.
 Stronger lifetime/atomicity guarantees or wider totals require an explicit ruling.
 
-**Validation proposal, not activation.** First source-review shared paths and
-fallible allocation/identity/accounting. Then ordinary regressions inject raw
+**Verification and qualification gates.** Source review covers shared paths and
+fallible allocation/identity/accounting. Ordinary regressions inject raw
 kernel returns, allocation/clock/identity through the actual production helper:
 small, full→grown, exact-full/zero budget; partial/malformed/negative/empty,
 overflow/allocation failure; EPERM/gone/unreadable; PID/UID/churn/deadline races;
 initial/retry/relist aggregate exhaustion and custody/cache refusal. Preserve
-existing dead/blind-spot controls. Separately review native readiness for one
-owned child holding 4097–8191 total descriptors under the qualified supervisor
-(proposed 300 s/512 MiB, owned Stash scratch), with a below-threshold control,
+existing dead/blind-spot controls. The
+[targeted kernel proof](descriptor-listing-proof.md) prepares one owned child holding 4097–8191 total descriptors under the qualified supervisor
+(prospective 600 s/512 MiB, owned Stash scratch; historical 300 s failures remain failed), with a below-threshold control,
 complete positive listing outside the target, held-writer refusal inside it
 and exhausted-budget refusal,
 PID/start/UID brackets, actual returned counts, child reap and resource closure.
 If existing fixture limits cannot support it, readiness refuses: no assumed
 RLIMIT, limit raising or simulated kernel credit. Targeted kernel listing
-credit is distinct from whole-host custody completion and integrated fit. Future custody/deletion work
-remains Elevated: source review, separately activated uncounted diagnostic,
-counted author and distinct reviewer proof; no 600 s fit promise. This design
-runs only `effigy docs:check`.
+credit is distinct from whole-host custody completion and integrated fit.
+Future custody/deletion work remains Elevated: source review, separately activated uncounted diagnostic,
+counted author and distinct reviewer proof; no 600 s fit promise. Ordinary
+covering and effect-free readiness establish neither targeted kernel
+qualification nor whole-host custody, integrated fit, Oxide304 qualification,
+production-account equivalence or deployment readiness.
 
 Source anchors: [macos.rs](../../../crates/barge/src/os/macos.rs),
 [custody.rs](../../../crates/barge/src/custody.rs),
@@ -1783,8 +1799,13 @@ Choices S5 made where this design left the mechanic to the slice:
   or the table is refused as unknown. A table that fills its bound is `Bounded`;
   an unreadable table, an unreadable effective uid, an unreadable same-uid
   descriptor, or an entry or time bound that is reached makes the verdict
-  `Unknown`. The concrete bounds are 4096 processes, 65 536 descriptors and 10 s
-  per scan; a root carries at most its 64 holds. `lsof` is never read.
+  `Unknown`. The concrete ceilings are 4096 processes, 65 536 returned listing rows
+  and 10 s per scan; smaller caller bounds stay smaller. Full prefixes and
+  relistings spend those rows too, so work exhaustion can precede the public
+  observed-descriptor count. Filled per-process buffers grow only within the
+  original shared allowance and deadline, with identity brackets and checked
+  answers as [specified above](#bounded-shared-descriptor-listing-2026-11-10).
+  A root carries at most its 64 holds. `lsof` is never read.
 - **The calling process excludes itself, and nothing else** (corrected here after
   S6's spent diagnostic). Custody opens the area folder and the root for its own
   walk and its own checks, so the first implementation's scan always found its
