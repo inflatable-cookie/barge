@@ -1167,15 +1167,59 @@ proof remain unresolved; O2/O3 and production parent-reader conversion stay held
 ## One operation journal for delegated recovery (proposed, 2026-11-10)
 
 **Status: proposed design, source-only; architectural reset after three
-non-converging exact-head reviews (planner ruling, brief v2).** Tom asked on
-2026-11-10 (decision `1d4a7aee-a8e6-4a75-96f0-b142c4176db2` v2) for
-delegated-deletion recovery that is dependable and simpler in *both* products.
-This section supersedes its own prior revisions and states one coherent
-protocol; everything below is PROPOSED and changes no shipped behavior until
-implementation briefs land reviewed code. Oxide's owning contract is not
-edited from here; its needed reconciliation text is quoted at the end.
-Sources: Barge at this repository's HEAD; Oxide read-only at PR 263 head
-`39211b4e1cef4abf9ea07f2ef1a4814ce6b0d3a0`.
+non-converging exact-head reviews (planner ruling, brief v2); first slice
+implemented (barge#058, 2026-11-11).** Tom asked on 2026-11-10 (decision
+`1d4a7aee-a8e6-4a75-96f0-b142c4176db2` v2) for delegated-deletion recovery
+that is dependable and simpler in *both* products, and selected implementation
+on disposable fixtures on 2026-11-11 (decision
+`1735df31-7cc1-4748-9f8a-0767ee6259ff` v2, recorded in Oxide's vision). This
+section supersedes its own prior revisions and states one coherent protocol.
+Everything below is design until its slice lands reviewed code; the journal
+integrity/persistence store of the first slice is now implemented as described
+under **Implementation status**. The checked begin/deletion/replay/hook
+coordinator, the actual Oxide caller and the old join's removal are still
+PROPOSED, and no shipped behavior of the two-journal protocol has changed.
+Oxide's owning contract is not edited from here; its needed reconciliation
+text is quoted at the end. Sources: Barge at this repository's HEAD; Oxide
+read-only at PR 263 head `39211b4e1cef4abf9ea07f2ef1a4814ce6b0d3a0`.
+
+### Implementation status: the journal/integrity store (barge#058)
+
+The persistence/integrity prerequisite of the split's first part is
+implemented in `crates/barge/src/operation.rs`, with no caller connected and
+no effect behind it:
+
+- **Formats, bound by this implementation:** records are `barge.operation/1`,
+  the epoch document is `barge.journal/1`, the external identity binding is
+  `barge.journal.identity/1`. The finalize payload budget is 2 560 bytes
+  inside the 4 KiB record cap.
+- **Locations, a deliberate compatibility choice:** the numbered records and
+  the epoch document live in `state/operations/`, and the binding lives at
+  `<state>/journal-identity.json`. The design text below names the journal
+  directory `state/intents/`; the implementation keeps the shipped
+  `barge.intent/2` journal exactly where it is and gives the successor journal
+  its own directory, so the two journals never mix, every shipped reader of
+  `state/intents/` is byte-for-byte unchanged, and no old-format state is
+  silently upgraded. The explicit transition that moves or renames them
+  remains later scope.
+- **Implemented:** explicit initialization (epoch first, binding second, each
+  synced; re-init finishes only an unbound genuinely empty journal); the
+  fail-closed gapless read with the typed refusal classes; crash-consistent
+  allocation with one recoverable verified tail; begin idempotency per
+  `(caller, key)` with the exact digest/unit/hook matching and the
+  owed-digest refusal; the phase ladder with the retained `cancelled` and
+  settled `complete` terminals; capture and foreign-capture evidence fields
+  with the shipped bounds; the fail-fast try-shared consult observation over
+  the journal's own registry-rank lock (`state/locks/operations.lock`, never
+  held with the registry lock); and the read-only custody diagnostic that
+  reports findings and never repairs. Private no-follow owner/type checks
+  guard every state document the journal reads.
+- **Still absent, by scope:** the checked coordinator (caller-authenticated
+  resume, drain dispatch, the guarded re-affirmation), the Oxide caller and
+  its six writer-side consults, the operator gap-resolution command (the
+  diagnostic reports; resolution stays blocked for an operator ruling), any
+  CLI verb, and any live migration. Existing delete/replay paths do not read
+  the operation journal.
 
 Today one delegated deletion is coordinated by five durable facts across two
 products — Oxide's `prune-intent/1` journal, the registry's schema-3
@@ -1368,12 +1412,14 @@ machinery exists.
 
 ### Journal integrity and custody
 
-The journal (`state/intents/`) gains an integrity inventory of three pieces,
+The successor journal (implemented in `state/operations/`; the shipped
+`state/intents/` journal is unchanged beside it until an explicit supported
+transition) gains an integrity inventory of three pieces,
 counted as machinery in the accounting:
 
-1. **Epoch document** `barge.journal/1` (PROPOSED) inside the journal
-   directory: the journal's creation id and its `sequence` watermark. Every
-   journal write publishes whole documents by exclusive rename + directory
+1. **Epoch document** `barge.journal/1` (implemented as `journal.json` inside
+   the successor journal directory `state/operations/`): the journal's creation
+   id and its `sequence` watermark. Every journal write publishes whole documents by exclusive rename + directory
    sync (`state.rs:787`). **Allocation is crash-consistent**: begin reads the
    watermark `w`, publishes the record numbered `w+1`, then advances the
    watermark to `w+1`. A read accepts sequences `1..=w` exactly once
@@ -1384,7 +1430,8 @@ counted as machinery in the accounting:
    or more unwatermarked records, or any sequence above `w+1`, is broken
    allocation: `Unknown`, refused, never renumbered.
 2. **Identity binding**, a static document at the account-state level but
-   **outside** the journal directory (`<state>/journal-identity`, PROPOSED):
+   **outside** the journal directory (implemented as
+   `<state>/journal-identity.json`, schema `barge.journal.identity/1`):
    the same creation id and creation time. It is written only by explicit
    state initialization — epoch first, binding second, each synced; the pair
    is complete only when both exist with the same id. An empty, unbound
@@ -1663,7 +1710,11 @@ then removes it. No live schema-3/fence-4 migration is assumed; none has
 shipped. An older Barge refuses a successor record major as unknown state;
 an older Oxide refuses at the adoption fence; the identity binding is a new
 unnamed state file that shipped readers never read; new format numbers are
-set by implementation briefs, not guessed here. Pending two-journal
+set by implementation briefs, not guessed here. The first implementation
+brief (barge#058) set them: records `barge.operation/1`, epoch document
+`barge.journal/1`, identity binding `barge.journal.identity/1`, journal
+directory `state/operations/`, binding file `<state>/journal-identity.json`,
+journal lock `state/locks/operations.lock`. Pending two-journal
 operations drain under the shipped protocol before any successor format
 activates — the no-unfinished-predecessor rule, applied once. Implementation
 splits into: (1) Barge prerequisites — the operation record major (`resume`
@@ -1686,7 +1737,11 @@ risks: the journal gates Oxide admission (loss conservatively blocks;
 refuse-safe); publications refuse while the journal is momentarily locked or
 conflicting (refuse-safe; retried); payload-budget refusals; retention
 growth; the operator-resolution dependency for proven gaps. No native
-apparatus is authored or activated by this design.
+apparatus is authored or activated by this design. Split (1) is partially
+implemented (barge#058: the record major, integrity documents, gapless
+reads, begin/idempotency, transitions, consult observation and the read-only
+diagnostic; the coordinator's begin/state/drain verbs and the operator
+resolution command are the next slice).
 
 ### Owning-contract reconciliation text for Oxide (not edited here)
 

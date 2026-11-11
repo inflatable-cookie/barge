@@ -140,6 +140,27 @@ pub const ACTIVITY_SCHEMA: &str = "barge.activity/1";
 pub const INTENT_SCHEMA: &str = "barge.intent/2";
 /// The previous intent major, still read as a Barge-marked directory unit.
 pub const INTENT_SCHEMA_V1: &str = "barge.intent/1";
+/// One numbered operation journal record's format: the single-authority
+/// successor record major of stage 4's reviewed design, "One operation journal
+/// for delegated recovery".
+///
+/// The shipped `barge.intent/2` journal keeps its own meaning until an explicit
+/// supported transition; the numbered records live in their own journal
+/// directory and the two formats are never mixed.
+pub const OPERATION_SCHEMA: &str = "barge.operation/1";
+/// The operation journal's epoch document: the journal's creation id and its
+/// `sequence` watermark, published inside the journal directory.
+pub const JOURNAL_EPOCH_SCHEMA: &str = "barge.journal/1";
+/// The operation journal's external identity binding: the same creation id
+/// and creation time as the epoch, at the account-state level outside the
+/// journal directory, so a recreated journal directory is detected.
+pub const JOURNAL_IDENTITY_SCHEMA: &str = "barge.journal.identity/1";
+/// The largest delegated finalize payload one operation record carries.
+///
+/// It is inside [`INTENT_CAP_BYTES`] by design: the 4 KiB record cap also
+/// carries the phase, binding and capture fields, and an over-large payload
+/// refuses at begin before any durable step.
+pub const OPERATION_PAYLOAD_CAP_BYTES: usize = 2560;
 
 /// Every format version Barge speaks, as `describe` reports them. A format's
 /// major changes only when its document changes incompatibly; the previous
@@ -168,6 +189,10 @@ pub struct FormatVersions {
     pub activity: String,
     /// `barge.intent/<major>`.
     pub intent: String,
+    /// `barge.operation/<major>`: the single-authority operation journal's
+    /// numbered record major.
+    #[serde(default)]
+    pub operation: String,
     /// `barge.space/<major>`.
     #[serde(default)]
     pub space: String,
@@ -208,6 +233,7 @@ impl FormatVersions {
             hold: HOLD_SCHEMA.to_owned(),
             activity: ACTIVITY_SCHEMA.to_owned(),
             intent: INTENT_SCHEMA.to_owned(),
+            operation: OPERATION_SCHEMA.to_owned(),
             space: crate::space::SPACE_SCHEMA.to_owned(),
             space_guard: crate::space::SPACE_GUARD_SCHEMA.to_owned(),
             space_prune: crate::space::SPACE_PRUNE_SCHEMA.to_owned(),
@@ -414,6 +440,7 @@ mod tests {
         assert_eq!(formats.hold, "barge.hold/1");
         assert_eq!(formats.activity, "barge.activity/1");
         assert_eq!(formats.intent, "barge.intent/2");
+        assert_eq!(formats.operation, "barge.operation/1");
         assert_eq!(formats.space, "barge.space/1");
         assert_eq!(formats.space_prune, "barge.space.prune/1");
         assert_eq!(formats.space_prune_plan, "barge.space.prune.plan/1");

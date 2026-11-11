@@ -246,8 +246,13 @@ state/
   cache-undo-<kind>.json        barge.cache-undo/1 (pending undo captures)
   holds/<root-id>/<holder>.json barge.hold/1
   intents/<intent-id>.json      barge.intent/2   (barge.intent/1 still read)
+  operations/journal.json       barge.journal/1  (single-authority journal epoch;
+                                  stage 4, "One operation journal")
+  operations/<sequence>.json    barge.operation/1 (numbered records, retained)
+  journal-identity.json         barge.journal.identity/1 (creation id and time,
+                                  outside the journal directory)
   locks/                        registry.lock, volume-<uuid>.lock, root-<id>.lock,
-                                unit-<key>.lock
+                                unit-<key>.lock, operations.lock
   journal/                      bounded append-only prune/delete observations
 ```
 
@@ -2193,7 +2198,12 @@ Choices S5 made where this design left the mechanic to the slice:
 - **A settled intent is kept.** `deleted` is the settlement; the record stays in
   `state/intents/` as the journal's own account of what happened, and replay
   treats it as non-pending work. A rolled-back `intent` phase is the one record
-  removed, because nothing happened.
+  removed, because nothing happened. This rule is the shipped `barge.intent/2`
+  journal's and stays exactly as it is; the successor single-authority journal
+  (stage 4, "One operation journal for delegated recovery", implemented in
+  `state/operations/`) retains **every** numbered record — `cancelled` and
+  settled `complete` included — because its gapless sequence inventory requires
+  numbered records to persist, and a removed one would read as proven loss.
 - **Replay proofs.** An intent is resolved only from its recorded identity, and
   the windows are conservative. A replay may resume a deletion at `renamed` only
   when the quarantine leaf is at its **visible** `.barge-prune-<intent-id>` name

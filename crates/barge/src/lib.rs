@@ -44,6 +44,7 @@ pub mod error;
 pub mod evidence;
 pub mod identity;
 pub mod inspect;
+pub mod operation;
 pub mod os;
 pub mod oxide_outputs;
 pub mod pool_custody;
