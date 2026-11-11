@@ -1686,9 +1686,37 @@ def composition_controls():
             expect(any("outside the guard's owned root" in problem
                        for problem in outside_problems),
                    "the real reader accepted evidence outside the owned root")
+
+            # A symlinked evidence leaf refuses on its own raw-path fact.
+            evidence_link = os.path.join(fixture, "evidence-alias")
+            os.symlink(evidence, evidence_link)
+            linked_evidence = real_effects.guard_facts(scratch, evidence_link)
+            evidence_symlink_problems = guard_containment_problems(linked_evidence)
+            expect(any("symlink" in problem
+                       for problem in evidence_symlink_problems),
+                   "the real reader accepted a symlinked evidence leaf")
+
+            # A symlinked owned-root parent — an alias route to the very same
+            # layout — refuses on the raw-path alias facts: the scratch path
+            # resolves elsewhere and the parent itself is a symlink.
+            parent_alias = os.path.join(DESIGNATED_SCRATCH,
+                                        "journal-facts-parent-alias")
+            os.symlink(fixture, parent_alias)
+            via_alias = os.path.join(parent_alias, "scratch")
+            alias_facts = real_effects.guard_facts(via_alias, evidence)
+            alias_problems = guard_containment_problems(alias_facts)
+            expect(any("alias or a symlink" in problem
+                       or "is a symlink" in problem
+                       for problem in alias_problems),
+                   "the real reader accepted a parent-alias route")
         finally:
             base.scratch_route_facts = saved_route_query
     finally:
+        for leftover in (parent_alias, evidence_link):
+            try:
+                os.remove(leftover)
+            except OSError:
+                pass
         _shutil.rmtree(fixture, ignore_errors=True)
         _shutil.rmtree(outside, ignore_errors=True)
 
