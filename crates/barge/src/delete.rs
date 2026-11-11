@@ -114,6 +114,9 @@ use crate::unit::{self, DeletionUnit, MarkerFamily, UnitKind};
 #[cfg(any(test, feature = "proof-journal"))]
 thread_local! {
     static FAIL_AFTER_OPERATION_UNLINK: Cell<bool> = const { Cell::new(false) };
+    static FAIL_AFTER_OPERATION_CAPTURE: Cell<bool> = const { Cell::new(false) };
+    static STOP_AFTER_OPERATION_RENAMED: Cell<bool> = const { Cell::new(false) };
+    static STOP_AFTER_OPERATION_REMOVED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Inject a publication failure immediately after the successor walk's own
@@ -121,6 +124,24 @@ thread_local! {
 #[cfg(any(test, feature = "proof-journal"))]
 pub fn fail_after_operation_unlink() {
     FAIL_AFTER_OPERATION_UNLINK.with(|armed| armed.set(true));
+}
+
+/// Inject refusal to publish the captured phase after the real rename.
+#[cfg(any(test, feature = "proof-journal"))]
+pub fn fail_after_operation_capture() {
+    FAIL_AFTER_OPERATION_CAPTURE.with(|armed| armed.set(true));
+}
+
+/// Stop after the captured phase is durable, before the first unlink.
+#[cfg(any(test, feature = "proof-journal"))]
+pub fn stop_after_operation_renamed() {
+    STOP_AFTER_OPERATION_RENAMED.with(|armed| armed.set(true));
+}
+
+/// Stop after Barge's unlink is durably recorded, before deleted publication.
+#[cfg(any(test, feature = "proof-journal"))]
+pub fn stop_after_operation_removed() {
+    STOP_AFTER_OPERATION_REMOVED.with(|armed| armed.set(true));
 }
 
 /// How deep a whole-root delete walks (design, "Bounded resources").
@@ -1587,6 +1608,14 @@ pub(crate) fn execute_bound_operation(
             Some(evidence),
         ));
     }
+    #[cfg(any(test, feature = "proof-journal"))]
+    FAIL_AFTER_OPERATION_CAPTURE.with(|armed| {
+        if armed.replace(false) {
+            crate::operation::fail_next_document_publish(std::io::Error::other(
+                "injected post-capture publication failure",
+            ));
+        }
+    });
     let renamed = match journal.advance(IntentPhase::Renamed) {
         Ok(record) => record,
         Err(error) => {
@@ -1599,6 +1628,16 @@ pub(crate) fn execute_bound_operation(
             ))
         }
     };
+    #[cfg(any(test, feature = "proof-journal"))]
+    if STOP_AFTER_OPERATION_RENAMED.with(|armed| armed.replace(false)) {
+        return Ok(pending_report(
+            &renamed,
+            quarantine,
+            Counts::default(),
+            "injected stop after durable capture".to_owned(),
+            Some(evidence),
+        ));
+    }
     let mut report = finish_deletion(
         &journal,
         dirs,
@@ -3407,6 +3446,18 @@ fn finish_deletion(
                 None,
             )
         }
+    }
+    #[cfg(any(test, feature = "proof-journal"))]
+    if matches!(&journal.backend, CaptureBackend::Operation { .. })
+        && STOP_AFTER_OPERATION_REMOVED.with(|armed| armed.replace(false))
+    {
+        return pending_report(
+            &current,
+            quarantine,
+            counts,
+            "injected stop after durable removal".to_owned(),
+            None,
+        );
     }
     if expired(bounds.deadline) {
         return pending_report(
@@ -7429,6 +7480,165 @@ mod tests {
                 .phase,
             OperationPhase::Intent
         );
+    }
+
+    #[test]
+    fn phase_faults_preserve_caller_intent_and_enable_post_capture_replay() {
+        use crate::operation::{self, DeclarationAuthority, OperationPhase, OperationRecord};
+        struct Reaffirm;
+        impl super::OperationReaffirmation for Reaffirm {
+            fn reaffirm(&self, _: &OperationRecord) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+        for intent_window in [true, false] {
+            let prepared = prepared("operation-phase-fault");
+            prepared.payload("payload", b"fixture");
+            let dirs = Faults::new();
+            let observer = prepared.fixture.observer();
+            let state = &prepared.fixture.state;
+            let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+            let mut request = operation_request(&prepared);
+            request.declaration = Some(DeclarationAuthority {
+                namespace: declared.namespace,
+                area: declared.area,
+                generation: declared.generation,
+                grant: prepared.unit.grant.clone(),
+            });
+            let mut locks = LockSet::new(state.clone());
+            operation::init_operation_journal(&dirs, &observer, state, &mut locks)
+                .expect("initialize");
+            super::begin_checked_delegated(
+                state,
+                &dirs,
+                &prepared.fixture.facts(),
+                &observer,
+                request.clone(),
+                prepared.bounds(),
+            )
+            .expect("begin");
+            if intent_window {
+                super::fail_after_operation_capture();
+            } else {
+                super::stop_after_operation_renamed();
+            }
+            let stopped = super::execute_checked_delegated(
+                state,
+                &dirs,
+                &prepared.fixture.facts(),
+                &observer,
+                &request,
+                &Reaffirm,
+                prepared.bounds(),
+            )
+            .expect("stop");
+            assert_eq!(stopped.outcome, DeleteOutcome::Pending);
+            let current = operation::checked_operation_state(&dirs, &observer, state, &request)
+                .expect("read")
+                .expect("record");
+            assert_eq!(
+                current.phase,
+                if intent_window {
+                    OperationPhase::Intent
+                } else {
+                    OperationPhase::Renamed
+                }
+            );
+            let replay = super::replay_checked_operation(
+                state,
+                &dirs,
+                &prepared.fixture.facts(),
+                &observer,
+                &request,
+                prepared.bounds(),
+            );
+            if intent_window {
+                assert!(replay.is_err());
+                let report = super::execute_checked_delegated(
+                    state,
+                    &dirs,
+                    &prepared.fixture.facts(),
+                    &observer,
+                    &request,
+                    &Reaffirm,
+                    prepared.bounds(),
+                )
+                .expect("reauthorize");
+                assert_eq!(report.outcome, DeleteOutcome::Deleted);
+            } else {
+                assert!(
+                    matches!(replay.expect("replay"), super::OperationReplay::Walked(report)
+                    if report.outcome == DeleteOutcome::Deleted)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recorded_removal_after_real_unlink_can_settle_on_replay() {
+        use crate::operation::{self, DeclarationAuthority, OperationPhase, OperationRecord};
+        struct Reaffirm;
+        impl super::OperationReaffirmation for Reaffirm {
+            fn reaffirm(&self, _: &OperationRecord) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+        let prepared = prepared("operation-positive-removed");
+        prepared.payload("payload", b"fixture");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let declared = crate::area::declare(state, &prepared.declaration, 1).expect("declare");
+        let mut request = operation_request(&prepared);
+        request.declaration = Some(DeclarationAuthority {
+            namespace: declared.namespace,
+            area: declared.area,
+            generation: declared.generation,
+            grant: prepared.unit.grant.clone(),
+        });
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks).expect("initialize");
+        super::begin_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            request.clone(),
+            prepared.bounds(),
+        )
+        .expect("begin");
+        super::stop_after_operation_removed();
+        let stopped = super::execute_checked_delegated(
+            state,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &request,
+            &Reaffirm,
+            prepared.bounds(),
+        )
+        .expect("stop");
+        assert_eq!(stopped.outcome, DeleteOutcome::Pending);
+        assert!(!prepared.unit_path().exists());
+        assert_eq!(
+            operation::checked_operation_state(&dirs, &observer, state, &request)
+                .expect("read")
+                .expect("record")
+                .phase,
+            OperationPhase::Removed
+        );
+        assert!(matches!(
+            super::replay_checked_operation(
+                state,
+                &dirs,
+                &prepared.fixture.facts(),
+                &observer,
+                &request,
+                prepared.bounds()
+            )
+            .expect("replay"),
+            super::OperationReplay::Deleted
+        ));
     }
 
     #[test]
