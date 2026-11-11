@@ -831,9 +831,9 @@ fn delete_unit_locked(
     }
     intent = state::advance_intent(&write, state_paths, &intent, IntentPhase::Renamed)?;
 
+    let journal = CaptureJournal::new(&write, state_paths, &intent);
     let mut report = finish_deletion(
-        &write,
-        state_paths,
+        &journal,
         dirs,
         facts,
         observer,
@@ -999,8 +999,7 @@ fn renamed_leaf_mismatch(
 /// Delete one quarantined unit whole, from the phase the intent reached.
 #[allow(clippy::too_many_arguments)]
 fn finish_deletion(
-    write: &IntentWrite,
-    state_paths: &StatePaths,
+    journal: &CaptureJournal<'_>,
     dirs: &dyn DirOps,
     facts: &dyn VolumeFacts,
     observer: &dyn ProcessObserver,
@@ -1170,7 +1169,6 @@ fn finish_deletion(
         }
     }
 
-    let journal = CaptureJournal::new(write, state_paths, &current);
     // The leaf's own mode: a directory whose owner cannot write into it cannot
     // have its contents removed. Its mode is published before the change and a
     // guard puts it back on every abort, and a replay restores it first.
@@ -1243,7 +1241,7 @@ fn finish_deletion(
         volume.device,
         volume.mount.clone(),
         bounds,
-        &journal,
+        journal,
         base_chain,
         intent
             .unit
@@ -1330,15 +1328,9 @@ fn finish_deletion(
         // A file unit has no contents and no marker: its own identity, checked
         // against the record above, is the whole unit, so the phase moves
         // straight to `marker_last` and the captured leaf is removed next.
-        match state::advance_intent(
-            write,
-            state_paths,
-            &journal.intent(),
-            IntentPhase::MarkerLast,
-        ) {
+        match journal.advance(IntentPhase::MarkerLast) {
             Ok(next) => {
                 current = next;
-                journal.advanced(current.clone());
             }
             Err(error) => {
                 return pending_report(
@@ -1392,10 +1384,9 @@ fn finish_deletion(
             None,
         );
     }
-    match state::advance_intent(write, state_paths, &journal.intent(), IntentPhase::Removed) {
+    match journal.advance(IntentPhase::Removed) {
         Ok(removed) => {
-            current = removed.clone();
-            journal.advanced(removed);
+            current = removed;
         }
         Err(error) => {
             return pending_report(
@@ -1416,7 +1407,7 @@ fn finish_deletion(
             None,
         );
     }
-    match state::advance_intent(write, state_paths, &current, IntentPhase::Deleted) {
+    match journal.advance(IntentPhase::Deleted) {
         Ok(settled) => DeleteReport {
             volume_uuid: settled.volume_uuid.to_string(),
             unit_name: settled.unit.name.clone(),
@@ -1575,6 +1566,16 @@ struct CaptureJournal<'a> {
     write: &'a IntentWrite,
     state_paths: &'a StatePaths,
     intent: RefCell<IntentRecord>,
+    backend: CaptureBackend<'a>,
+}
+
+enum CaptureBackend<'a> {
+    Legacy,
+    Operation {
+        dirs: &'a dyn DirOps,
+        observer: &'a dyn ProcessObserver,
+        record: RefCell<crate::operation::OperationRecord>,
+    },
 }
 
 impl<'a> CaptureJournal<'a> {
@@ -1588,7 +1589,95 @@ impl<'a> CaptureJournal<'a> {
             write,
             state_paths,
             intent: RefCell::new(intent.clone()),
+            backend: CaptureBackend::Legacy,
         }
+    }
+
+    /// Bind the existing walk to the successor's one durable operation. The
+    /// intent is an in-memory view for the existing identity and walk code; it
+    /// is never published to the legacy journal.
+    #[allow(dead_code)]
+    fn for_operation(
+        write: &'a IntentWrite,
+        state_paths: &'a StatePaths,
+        dirs: &'a dyn DirOps,
+        observer: &'a dyn ProcessObserver,
+        record: &crate::operation::OperationRecord,
+    ) -> Result<Self> {
+        record.validate()?;
+        let phase = match record.phase {
+            crate::operation::OperationPhase::Intent => IntentPhase::Intent,
+            crate::operation::OperationPhase::Renamed => IntentPhase::Renamed,
+            crate::operation::OperationPhase::MarkerLast => IntentPhase::MarkerLast,
+            crate::operation::OperationPhase::Removed => IntentPhase::Removed,
+            crate::operation::OperationPhase::Deleted => IntentPhase::Deleted,
+            crate::operation::OperationPhase::Complete
+            | crate::operation::OperationPhase::Cancelled => {
+                return Err(Error::new(
+                    ErrorKind::RefusedBoundary,
+                    "a terminal operation cannot enter the deletion walk",
+                ));
+            }
+        };
+        let plan_digest = record.request_digest.clone().ok_or_else(|| {
+            Error::new(
+                ErrorKind::RefusedBoundary,
+                "the operation has no original delegated request",
+            )
+        })?;
+        let intent = IntentRecord {
+            schema: crate::contract::INTENT_SCHEMA.to_owned(),
+            intent_id: record.sequence.to_string(),
+            volume_uuid: record.unit.volume_uuid.clone(),
+            mount_hint: record.unit.mount_hint.clone(),
+            root_dir: record.unit.root_dir.clone(),
+            folder: record.unit.folder.clone(),
+            unit: IntentUnit {
+                parent: record.unit.parent.clone(),
+                name: record.unit.name.clone(),
+                kind: record.unit.kind,
+                device: record.unit.device,
+                inode: record.unit.inode,
+                marker: record.unit.marker.clone(),
+                root_id: record.unit.root_id.clone(),
+                capture_name: record.unit.capture_name.clone().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::UnknownState,
+                        "the operation capture name is missing",
+                    )
+                })?,
+                grant: record.unit.grant.clone(),
+            },
+            plan_digest,
+            phase,
+            generation: record.generation,
+            recorded_ms: record.recorded_ms,
+            phase_ms: record.phase_ms,
+            captures: record.captures.clone(),
+            foreign_captures: record.foreign_captures.clone(),
+            identity: None,
+            absence: record.absence.clone(),
+            caller_intent_id: None,
+            caller_request_digest: None,
+        };
+        Ok(Self {
+            write,
+            state_paths,
+            intent: RefCell::new(intent),
+            backend: CaptureBackend::Operation {
+                dirs,
+                observer,
+                record: RefCell::new(record.clone()),
+            },
+        })
+    }
+
+    fn update_operation(&self, next: &crate::operation::OperationRecord) {
+        let mut intent = self.intent.borrow_mut();
+        intent.generation = next.generation;
+        intent.phase_ms = next.phase_ms;
+        intent.captures.clone_from(&next.captures);
+        intent.foreign_captures.clone_from(&next.foreign_captures);
     }
 
     /// Publish one capture whose verification failed, before its put-back.
@@ -1596,6 +1685,24 @@ impl<'a> CaptureJournal<'a> {
     /// A later record of the same capture replaces the earlier one, so the
     /// put-back answer is added rather than duplicated.
     fn record_foreign(&self, foreign: ForeignCapture) -> Result<()> {
+        if let CaptureBackend::Operation {
+            dirs,
+            observer,
+            record,
+        } = &self.backend
+        {
+            let next = crate::operation::record_operation_foreign_capture(
+                self.write,
+                *dirs,
+                *observer,
+                self.state_paths,
+                &record.borrow(),
+                &foreign,
+            )?;
+            self.update_operation(&next);
+            *record.borrow_mut() = next;
+            return Ok(());
+        }
         let next = {
             let current = self.intent.borrow();
             state::record_foreign_capture(self.write, self.state_paths, &current, &foreign)?
@@ -1610,6 +1717,24 @@ impl<'a> CaptureJournal<'a> {
     /// unlinked only while the intent records its capture and verification, with
     /// the mode Barge is about to change, so a replay re-verifies the same object.
     fn record_captures(&self, captures: &[CaptureRecord]) -> Result<()> {
+        if let CaptureBackend::Operation {
+            dirs,
+            observer,
+            record,
+        } = &self.backend
+        {
+            let next = crate::operation::record_operation_captures(
+                self.write,
+                *dirs,
+                *observer,
+                self.state_paths,
+                &record.borrow(),
+                captures,
+            )?;
+            self.update_operation(&next);
+            *record.borrow_mut() = next;
+            return Ok(());
+        }
         let next = {
             let current = self.intent.borrow();
             state::record_captures(self.write, self.state_paths, &current, captures)?
@@ -1623,10 +1748,38 @@ impl<'a> CaptureJournal<'a> {
         self.intent.borrow().clone()
     }
 
-    /// Take a phase the caller published through the journal's own token, so a
-    /// later report from the journal names the phase that is actually durable.
-    fn advanced(&self, intent: IntentRecord) {
-        *self.intent.borrow_mut() = intent;
+    /// Publish the next phase in the journal that owns this walk.
+    fn advance(&self, phase: IntentPhase) -> Result<IntentRecord> {
+        if let CaptureBackend::Operation {
+            dirs,
+            observer,
+            record,
+        } = &self.backend
+        {
+            let target = match phase {
+                IntentPhase::Intent => crate::operation::OperationPhase::Intent,
+                IntentPhase::Renamed => crate::operation::OperationPhase::Renamed,
+                IntentPhase::MarkerLast => crate::operation::OperationPhase::MarkerLast,
+                IntentPhase::Removed => crate::operation::OperationPhase::Removed,
+                IntentPhase::Deleted => crate::operation::OperationPhase::Deleted,
+            };
+            let next = crate::operation::advance_operation(
+                self.write,
+                *dirs,
+                *observer,
+                self.state_paths,
+                &record.borrow(),
+                target,
+            )?;
+            self.update_operation(&next);
+            *record.borrow_mut() = next;
+            self.intent.borrow_mut().phase = phase;
+            return Ok(self.intent());
+        }
+        let next =
+            state::advance_intent(self.write, self.state_paths, &self.intent.borrow(), phase)?;
+        *self.intent.borrow_mut() = next.clone();
+        Ok(next)
     }
 }
 
@@ -3857,9 +4010,9 @@ fn replay_one(
                 }
                 let renamed =
                     state::advance_intent(&write, state_paths, intent, IntentPhase::Renamed)?;
+                let journal = CaptureJournal::new(&write, state_paths, &renamed);
                 let report = finish_deletion(
-                    &write,
-                    state_paths,
+                    &journal,
                     dirs,
                     volumes,
                     observer,
@@ -3900,9 +4053,9 @@ fn replay_one(
                 return Ok(ReplayOutcome::Pending(reason));
             }
             if leaf_matches && marker_matches(&marker_digest, intent) {
+                let journal = CaptureJournal::new(&write, state_paths, intent);
                 let report = finish_deletion(
-                    &write,
-                    state_paths,
+                    &journal,
                     dirs,
                     volumes,
                     observer,
@@ -4856,6 +5009,96 @@ mod tests {
             &state::IntentEvidence::none(),
             prepared.unit.device.get(),
         )
+    }
+
+    #[test]
+    fn operation_journal_owns_the_actual_capture_walk() {
+        use crate::operation::{self, BeginRequest, FinalizeSpec, OperationPhase, OperationUnit};
+
+        let prepared = prepared("operation-capture-walk");
+        prepared.payload("payload", b"fixture");
+        let dirs = Faults::new();
+        let observer = prepared.fixture.observer();
+        let state = &prepared.fixture.state;
+        let unit = &prepared.unit;
+        let mut locks = LockSet::new(state.clone());
+        operation::init_operation_journal(&dirs, &observer, state, &mut locks)
+            .expect("initialize successor journal");
+        let request = BeginRequest::delegated(
+            "test.caller",
+            "key",
+            PLAN,
+            FinalizeSpec {
+                kind: "test.finalize".to_owned(),
+                version: "1".to_owned(),
+                payload: String::new(),
+            },
+            OperationUnit {
+                volume_uuid: unit.volume_uuid.clone(),
+                mount_hint: prepared.fixture.root.clone(),
+                root_dir: unit.root_dir.clone(),
+                folder: unit.folder.clone(),
+                parent: unit.parent.clone(),
+                name: unit.name.clone(),
+                kind: unit.kind,
+                device: unit.device.get(),
+                inode: unit.inode,
+                marker: unit.marker.clone(),
+                root_id: unit.root_id.clone(),
+                capture_name: None,
+                grant: unit.grant.clone(),
+            },
+        );
+        let mut locks = LockSet::new(state.clone());
+        let begun = operation::begin_operation(&dirs, &observer, state, &mut locks, request)
+            .expect("begin");
+        let record = begun.record().clone();
+        let capture = record.unit.capture_name.as_ref().expect("capture name");
+        std::fs::rename(prepared.unit_path(), prepared.parent_path().join(capture))
+            .expect("fixture capture");
+        let mut locks = LockSet::new(state.clone());
+        let _journal_lock = locks.lock_operations().expect("journal lock");
+        let _volume = locks.lock_volume(&unit.volume_uuid).expect("volume lock");
+        let _unit = super::lock_deletion_unit(&mut locks, unit).expect("unit lock");
+        let write = locks.begin_intent_write().expect("write token");
+        let renamed = operation::advance_operation(
+            &write,
+            &dirs,
+            &observer,
+            state,
+            &record,
+            OperationPhase::Renamed,
+        )
+        .expect("renamed");
+        let journal =
+            super::CaptureJournal::for_operation(&write, state, &dirs, &observer, &renamed)
+                .expect("operation walk");
+        let parent = dirs.open_path(&prepared.parent_path()).expect("parent");
+        let volume = super::WalkVolume {
+            mount: prepared.fixture.root.clone(),
+            device: unit.device,
+        };
+        let report = super::finish_deletion(
+            &journal,
+            &dirs,
+            &prepared.fixture.facts(),
+            &observer,
+            &journal.intent(),
+            &prepared.parent_path(),
+            &parent,
+            prepared.bounds(),
+            &volume,
+        );
+        assert_eq!(report.outcome, DeleteOutcome::Deleted, "{report:?}");
+        let view =
+            operation::read_operations(&dirs, &observer, state, crate::contract::INTENT_ROWS)
+                .expect("read")
+                .expect("initialized");
+        assert_eq!(view.records[0].phase, OperationPhase::Deleted);
+        assert!(state::read_intents(state, crate::contract::INTENT_ROWS)
+            .expect("legacy read")
+            .records
+            .is_empty());
     }
 
     /// Publish one intent that records a device other than the live one and the

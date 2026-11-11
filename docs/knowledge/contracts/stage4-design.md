@@ -1198,6 +1198,14 @@ own guarded domain state. A concurrently acknowledged exact operation is a
 read-only outcome, not permission for another publication. This seam alone does
 not connect deletion or qualify a caller.
 
+The in-progress successor record can also retain the original validated
+consumer-path absence observation. It is part of exact request binding and is
+evidence to re-prove, never permission by itself. Records without it retain the
+existing encoding; an older strict reader refuses a record containing the new
+field. The existing capture walk can write its captures and phase transitions
+to the successor journal without publishing a legacy intent, but checked
+admission and successor replay are not connected yet.
+
 The persistence/integrity prerequisite of the split's first part is
 implemented in `crates/barge/src/operation.rs`, with no caller connected and
 no effect behind it:

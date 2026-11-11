@@ -556,6 +556,10 @@ pub struct OperationRecord {
     /// The typed durable hook the caller owes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finalize: Option<FinalizeSpec>,
+    /// The original consumer-path absence observation. Its anchor and
+    /// ancestor bind future fresh proofs; it is never itself permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absence: Option<crate::evidence::AbsenceEvidence>,
     /// Whether the hook is owed, acknowledged, or released by cancellation.
     pub finalize_status: FinalizeStatus,
     /// The exact unit the operation binds.
@@ -649,6 +653,15 @@ impl OperationRecord {
             .with_detail("sequence", self.sequence.into()));
         }
         self.unit.validate(self.sequence)?;
+        if let Some(absence) = &self.absence {
+            absence.validate()?;
+            if absence.verdict != "absent" {
+                return Err(Error::new(
+                    ErrorKind::UnknownState,
+                    "the recorded consumer path was not proved absent",
+                ));
+            }
+        }
         // The delegation fields stand or fall together, and their shapes are
         // checked even on the `resume: barge` form, which must carry none.
         match (
@@ -815,6 +828,9 @@ pub struct BeginRequest {
     pub request_digest: Option<String>,
     /// The typed durable hook, when the caller resumes.
     pub finalize: Option<FinalizeSpec>,
+    /// The original consumer-path absence observation, when required by the
+    /// delegated route. Replay must re-establish it from its bound ancestor.
+    pub absence: Option<crate::evidence::AbsenceEvidence>,
     /// The exact unit binding, without its sequence-derived capture name yet.
     pub unit: OperationUnit,
 }
@@ -834,6 +850,7 @@ impl BeginRequest {
             key: Some(key.into()),
             request_digest: Some(request_digest.into()),
             finalize: Some(finalize),
+            absence: None,
             unit,
         }
     }
@@ -846,6 +863,7 @@ impl BeginRequest {
             key: None,
             request_digest: None,
             finalize: None,
+            absence: None,
             unit,
         }
     }
@@ -900,6 +918,15 @@ impl BeginRequest {
                 "a begin request derives the private capture name from the allocated sequence; it never accepts one"
                     .to_owned(),
             ));
+        }
+        if let Some(absence) = &self.absence {
+            absence.validate()?;
+            if absence.verdict != "absent" {
+                return Err(Error::new(
+                    ErrorKind::RefusedBoundary,
+                    "the consumer path is not proved absent",
+                ));
+            }
         }
         self.unit.validate_binding()
     }
@@ -1910,6 +1937,7 @@ pub fn begin_operation(
         key: request.key.clone(),
         request_digest: request.request_digest.clone(),
         finalize: request.finalize.clone(),
+        absence: request.absence.clone(),
         finalize_status: FinalizeStatus::Owed,
         unit,
         phase: OperationPhase::Intent,
@@ -1943,7 +1971,41 @@ fn same_request(existing: &OperationRecord, request: &BeginRequest) -> bool {
     };
     digest == request_digest
         && finalize == request_finalize
+        && existing.absence == request.absence
         && existing.unit.same_binding(&request.unit)
+}
+
+/// Read the state of the exact delegated request, including retained terminal
+/// records. The caller must supply its original binding: a reused caller/key
+/// never turns a different request into an answer about the older operation.
+/// A busy or incomplete journal is an error, not an empty result.
+pub fn checked_operation_state(
+    dirs: &dyn DirOps,
+    observer: &dyn ProcessObserver,
+    state: &StatePaths,
+    request: &BeginRequest,
+) -> Result<Option<OperationRecord>> {
+    request.validate()?;
+    let (Some(caller), Some(key)) = (request.caller.as_deref(), request.key.as_deref()) else {
+        return Err(Error::new(
+            ErrorKind::Usage,
+            "an operation state lookup requires a delegated request",
+        ));
+    };
+    let mut locks = LockSet::new(state.clone());
+    let view = consult_operations(dirs, observer, state, &mut locks, INTENT_ROWS)?
+        .ok_or_else(uninitialized_error)?;
+    let Some(record) = view.find_operation(caller, key) else {
+        return Ok(None);
+    };
+    if !same_request(record, request) {
+        return Err(Error::new(
+            ErrorKind::RefusedBoundary,
+            format!("caller `{caller}` key `{key}` binds a different request, unit or handler"),
+        )
+        .with_detail("sequence", record.sequence.into()));
+    }
+    Ok(Some(record.clone()))
 }
 
 /// Advance one operation to the next phase, publishing the new generation
@@ -2755,12 +2817,12 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        advance_operation, begin_operation, consult_operations, consult_settlement, epoch_path,
-        finalize_operation, init_operation_journal, inspect_operation_journal, read_operations,
-        record_operation_captures, record_path, BeginRequest, Begun, FinalizationContext,
-        FinalizeHook, FinalizeSpec, FinalizeStatus, JournalEpoch, JournalFinding, JournalIdentity,
-        OperationPhase, OperationRecord, OperationUnit, ResumePolicy, SettlementConsult,
-        EPOCH_FILE_NAME,
+        advance_operation, begin_operation, checked_operation_state, consult_operations,
+        consult_settlement, epoch_path, finalize_operation, init_operation_journal,
+        inspect_operation_journal, read_operations, record_operation_captures, record_path,
+        BeginRequest, Begun, FinalizationContext, FinalizeHook, FinalizeSpec, FinalizeStatus,
+        JournalEpoch, JournalFinding, JournalIdentity, OperationPhase, OperationRecord,
+        OperationUnit, ResumePolicy, SettlementConsult, EPOCH_FILE_NAME,
     };
     use crate::contract::{
         INTENT_ROWS, JOURNAL_EPOCH_SCHEMA, JOURNAL_IDENTITY_SCHEMA, OPERATION_PAYLOAD_CAP_BYTES,
@@ -3574,6 +3636,71 @@ mod tests {
         )
         .expect_err("a terminal record is frozen");
         assert_eq!(error.kind(), ErrorKind::Usage);
+    }
+
+    #[test]
+    fn checked_state_rejects_a_changed_request_even_after_completion() {
+        let (_dir, state, uuid) = fixture("operation-checked-state");
+        init(&state);
+        let mut request = delegated_request(&uuid);
+        request.absence = Some(crate::evidence::AbsenceEvidence {
+            schema: crate::evidence::ABSENCE_SCHEMA.to_owned(),
+            path: PathBuf::from("/fixture/checkout"),
+            verdict: "absent".to_owned(),
+            anchor: crate::evidence::AbsenceAnchor {
+                kind: "root".to_owned(),
+                path: PathBuf::from("/"),
+            },
+            ancestor: Some(crate::evidence::AbsenceAncestor {
+                path: PathBuf::from("/fixture"),
+                inode: 42,
+                device: 7,
+                volume: crate::evidence::AbsenceVolumeRow {
+                    kind: "boot_data".to_owned(),
+                    volume_uuid: UUID.to_owned(),
+                    file_system: "apfs".to_owned(),
+                },
+            }),
+            leaf: Some(crate::evidence::AbsenceLeaf {
+                name: "checkout".to_owned(),
+                result: "enoent".to_owned(),
+            }),
+            components_walked: 2,
+            proved_ms: 7,
+            reason: None,
+        });
+        let mut record = begin(&platform(), &state, request.clone()).record().clone();
+        let mut locks = LockSet::new(state.clone());
+        let write = write_token(&mut locks, &uuid);
+        for phase in [
+            OperationPhase::Renamed,
+            OperationPhase::MarkerLast,
+            OperationPhase::Removed,
+            OperationPhase::Deleted,
+            OperationPhase::Complete,
+        ] {
+            record = advance_operation(&write, &platform(), &platform(), &state, &record, phase)
+                .expect("the phase advances");
+        }
+        let found = checked_operation_state(&platform(), &platform(), &state, &request)
+            .expect("the journal reads")
+            .expect("the operation remains recorded");
+        assert_eq!(found, record);
+        let mut changed_absence = request.clone();
+        changed_absence.absence.as_mut().expect("absence").proved_ms += 1;
+        assert!(
+            checked_operation_state(&platform(), &platform(), &state, &changed_absence).is_err()
+        );
+        let mut changed = request;
+        changed
+            .finalize
+            .as_mut()
+            .expect("handler")
+            .payload
+            .push(' ');
+        let error = checked_operation_state(&platform(), &platform(), &state, &changed)
+            .expect_err("a terminal answer still requires the exact binding");
+        assert_eq!(error.kind(), ErrorKind::RefusedBoundary);
     }
 
     #[test]
@@ -4479,6 +4606,7 @@ mod tests {
             key: Some(key.to_owned()),
             request_digest: Some(digest.to_owned()),
             finalize: Some(finalize()),
+            absence: None,
             finalize_status: FinalizeStatus::Owed,
             unit: bound,
             phase: OperationPhase::Intent,
@@ -4502,6 +4630,7 @@ mod tests {
             key: None,
             request_digest: None,
             finalize: None,
+            absence: None,
             finalize_status: FinalizeStatus::Owed,
             unit: bound,
             phase: OperationPhase::Intent,
@@ -4525,6 +4654,7 @@ mod tests {
             key: Some(format!("prune-run-{sequence}")),
             request_digest: Some(DIGEST.to_owned()),
             finalize: Some(finalize()),
+            absence: None,
             finalize_status: FinalizeStatus::Released,
             unit,
             phase: OperationPhase::Cancelled,

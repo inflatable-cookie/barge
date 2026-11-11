@@ -47,6 +47,8 @@ alias = "barge"
 # Individually bounded target runs support exact-head covering evidence.
 "rust:test:prewarm" = "oxide test --admission-budget 300s --execution-budget 600s --workspace --all-targets --locked --no-run"
 "rust:test:lib" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib"
+"rust:test:operation-walk" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib operation_journal_owns_the_actual_capture_walk"
+"rust:test:operation-state" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib checked_state_rejects_a_changed_request_even_after_completion"
 "rust:test:listing" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --lib listing"
 "rust:compile:listing:proof" = "oxide check --locked -p barge --features proof-descriptor-listing --example descriptor_listing_proof"
 "rust:test:listing:proof" = "oxide test --admission-budget 300s --execution-budget 600s --locked -p barge --features proof-descriptor-listing --lib listing_proof_tests"
