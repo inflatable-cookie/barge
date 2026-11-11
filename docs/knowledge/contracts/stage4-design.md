@@ -1199,7 +1199,7 @@ contract.
 | A recreated/destroyed journal | `read_intents`' empty-on-absent default reads it as no operations | registry-level identity binding plus epoch: recreation is `Unknown`, no auto-recreation |
 | Crash-consistency | atomic images + syncs on both sides | unchanged rule, every journal write |
 | A historical whole-state restoration | invisible | equally invisible — a stated model limit, not a waiver (below) |
-| Exclusion atomicity | caller intent published under publication custody before the Barge call | guarded verdict → begin → guarded re-affirmation by revision; same custody rule |
+| Exclusion atomicity | caller intent published under publication custody before the Barge call | guarded verdict → begin → guarded re-affirmation by revision, plus fail-fast writer-side consults inside every registry publication's guard |
 | Settlement | `complete_intent` + `settle_receipt` under the caller's intent | the handler mirrors the same two revisions and released-receipt branch, with the settlement entry atomic in the removal image, without the intent |
 | Crash windows | twelve-row table across four stores | ten windows in one store (traced below) |
 
@@ -1248,11 +1248,15 @@ exist, and per-checkout locks (`begin_clean`, `store.rs:3575`; `lock_binding`,
 closing rule: **every registry publication consults the journal, fail-fast,
 inside the publication guard it already holds** — the guarded write refuses
 if a pending operation record binds any `(checkout_id, root)` among the rows
-or live root references it is about to write. The consult read uses a
-non-blocking shared observation mode (`try-shared`, PROPOSED): if the lock
-cannot be taken immediately the consult answers `Unknown` and the writer
-refuses publication — a try-lock never waits, so no Oxide admission lock ever
-waits on a Barge lock, preserving the no-admission-wait rule exactly. The
+or live root references it is about to write. The consult key is exact per
+site: row-scoped writers (`adopt`, `bind_for_command`, `reserve`, the local
+prune's intent publication, the settlement revisions) consult with the
+`(checkout_id, root)` pairs they are about to write or reference live;
+whole-image writers (`compaction`) consult for **any** non-terminal
+delegated record. The consult read uses a non-blocking shared observation
+mode (`try-shared`, PROPOSED): if the lock cannot be taken immediately the
+consult answers `Unknown` and the writer refuses publication — a try-acquire
+never blocks, so admission is never made to **wait** on a Barge lock. The
 publication sites are enumerated: `adopt`, `bind_for_command`, `reserve`,
 the local prune's intent publication, the settlement revisions, and
 compaction; each adds one fail-fast consult (a read, not a write — priced in
@@ -1265,12 +1269,20 @@ pre-effect cancellation to the retained `cancelled` phase); and the
 handler's in-guard fresh re-verification at each settlement write catches
 anything that changed regardless of writer.
 
-Rules, proven by the table: (R1) every cross-lock direction is caller → Barge;
-(R2) no Oxide admission lock is ever held while acquiring or waiting for any
-Barge lock — the joint no-admission-wait rule is preserved verbatim, and the
-re-affirmation is what makes that possible (begin runs with no Oxide lock
-held; the guard re-enters only after `begin` has returned); (R3) Barge never
-takes an Oxide lock; (R4) the handler runs with zero Barge locks — no Barge →
+Rules, proven by the table: (R1) every cross-lock direction is caller →
+Barge; (R2) **no Oxide admission lock is ever held while blocking-waiting for
+any Barge lock** — the joint no-admission-wait rule's availability guarantee
+is preserved verbatim, and the re-affirmation is what makes that possible
+(begin runs with no Oxide lock held; the guard re-enters only after `begin`
+has returned); (R2b, PROPOSED refinement of R2's letter) the writer-side
+consults are the single permitted exception to the word "acquiring": a
+`try-shared` acquisition attempt under admission gives up rather than waits,
+so admission is never delayed by Barge — its worst case is a refused
+publication while the journal is momentarily locked, retried by the writer's
+ordinary retry. The begin and re-affirmation handoffs satisfy R2 in its
+strict original form — no Barge lock is touched while admission is held —
+and R2b applies only to the consults; (R3) Barge never takes an Oxide lock;
+(R4) the handler runs with zero Barge locks — no Barge →
 caller → Barge cycle exists. Re-entry: the guard is per-thread reentrant
 (`store.rs:6558`), so the handler's settlement inside an Oxide command that
 already holds the guard nests safely; a hook that consults Barge does so with
@@ -1607,15 +1619,20 @@ states → seven in one store (`intent`, `renamed`, `marker_last`, `removed`,
 **Caller obligations:** sidecar/intent/route publication, first-vs-resumed
 `Locked` discrimination, four-state lookup, absence-only lookup, recovery
 dispatch, dual resolve prechecks, compaction and upgrade orchestration
-(seven) → guarded verdict, begin, re-affirmation, one idempotent handler, one
-in-lock consult (**five**). **Recovery boundaries:** the amendment's twelve →
-ten traced windows in one store. **Added machinery, named:** the sequence
-watermark, the identity binding, the gapless read rule, the operator
-gap-resolution command, the re-affirmation pass, the handler's atomic
-settlement entry — each replaces a larger removed piece except the watermark
-advance and the settlement entry, which are priced above. The net reduction
-survives on authorities, artifacts, states, obligations and removed machinery;
-it does not survive on write count.
+(seven) → guarded verdict, begin, re-affirmation, one idempotent handler,
+one in-lock consult (**five**). **Recovery boundaries:** the amendment's
+twelve → ten traced windows in one store. **Added machinery, named:** the
+sequence watermark, the identity binding, the gapless read rule, the
+operator gap-resolution command, the re-affirmation pass, the handler's
+atomic settlement entry, and the **six writer-side fail-fast consults** (one
+per enumerated publication site — reads, not writes) with their refusal path:
+a publication that cannot take the try-shared lock immediately, or that sees
+a conflicting pending record, refuses and is retried by the writer's ordinary
+retry — the availability cost of the consult, priced here. Each named piece
+replaces a larger removed piece except the watermark advance and the
+settlement entry, which are priced above. The net reduction survives on
+authorities, artifacts, states, obligations and removed machinery; it does
+not survive on write count.
 
 ### The counterexample, and the exit
 
@@ -1650,18 +1667,23 @@ activates — the no-unfinished-predecessor rule, applied once. Implementation
 splits into: (1) Barge prerequisites — the operation record major (`resume`
 policy, sequence, payload budget, shipped evidence phases); the epoch and
 identity-binding documents with the gapless read rule and the bounded
-operator resolution command; begin/state/drain with the fail-closed rules;
-the narrow post-capture replay extension; regressions per trace; (2) Oxide
-caller work — the guarded verdict, begin and re-affirmation under the
-binding, the in-lock consults at the four sites, the handler (mirroring
-`complete_intent`, `settle_receipt` and its atomic settlement entry), and the removals in
-the map; (3) bounded validation — crash-injection fixtures per window
-including sequence-gap loss, binding destruction, uncertain publication,
+operator resolution command; begin/state/drain with the fail-closed rules
+and the `try-shared` observation mode the consults use; the narrow
+post-capture replay extension; regressions per trace; (2) Oxide caller work
+— the guarded verdict, begin and re-affirmation under the binding, the
+writer-side fail-fast consults at all six publication sites (`adopt`,
+`bind_for_command`, `reserve`, the local prune's intent publication, the
+settlement revisions, compaction), the handler (mirroring `complete_intent`,
+`settle_receipt` and its atomic settlement entry), and the removals in the
+map; (3) bounded validation — crash-injection fixtures per window including
+sequence-gap loss, binding destruction, uncertain publication,
 historical-restoration refusal behaviour, the interleaving traces both
-directions, concurrency traces, oversize, unregistered-handler, mismatch and
-refusal cases. Named risks: the journal gates Oxide admission (loss
-conservatively blocks; refuse-safe), payload-budget refusals, retention
-growth, and the operator-resolution dependency for proven gaps. No native
+directions, concurrency traces, consult refusals under a momentarily locked
+journal, oversize, unregistered-handler, mismatch and refusal cases. Named
+risks: the journal gates Oxide admission (loss conservatively blocks;
+refuse-safe); publications refuse while the journal is momentarily locked or
+conflicting (refuse-safe; retried); payload-budget refusals; retention
+growth; the operator-resolution dependency for proven gaps. No native
 apparatus is authored or activated by this design.
 
 ### Owning-contract reconciliation text for Oxide (not edited here)
@@ -1675,11 +1697,15 @@ apparatus is authored or activated by this design.
 > serialization and guarded verbs, the whole-group recheck before an
 > `intent`-phase effect, and one idempotent finalize handler mirroring
 > `complete_intent` and `settle_receipt`'s released-root branch with the
-> atomic settlement entry as its settlement fact; it moves its exclusion consults inside
-> the binding section, and drops route publication, the request sidecar, the
-> covered-path intent journal, the absence-only query, the same-call rule and
-> the per-operation upgrade. `publication_guard` is the internal pool's
-> admission lock and is never held while waiting for a Barge lock. The
+> atomic settlement entry as its settlement fact; it moves its exclusion
+> consults inside every registry publication's own guard (a fail-fast,
+> non-blocking journal read at each publication site, refusing while a
+> pending operation binds what it writes), and drops route publication, the
+> request sidecar, the covered-path intent journal, the absence-only query,
+> the same-call rule and the per-operation upgrade. `publication_guard` is
+> the internal pool's admission lock; it is never held while blocking-waiting
+> for a Barge lock — the only Barge touch under admission is the
+> publications' fail-fast consult, which gives up rather than waits. The
 > adoption-time fence and old-reader refusal keep their meanings.
 
 **A second caller does not rebuild the protocol.** A hypothetical Effigy
