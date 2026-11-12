@@ -2239,7 +2239,10 @@ What the reference readers read, and where. Barge's own: every placement record
 plan is built under (current when its policy never releases a root), and the
 root's hold records, which the caller reads under the root's own lock (a live or
 undecidable hold is current; a positively stale one is not). Oxide's, read in place and never written: the outputs registry
-`oxide.outputs.registry/3` and its `/2` and `/1` predecessors, every checkout receipt
+`oxide.outputs.registry/1`–`/4`, each version in its own exact field set (`/3`
+requires its `deletion_routes`; `/4` requires its retained `settled` set through
+[the shared settlement rule](#the-coordinated-registry-settlement-set-2026-11-12)),
+every checkout receipt
 (`oxide.outputs.transition/1`, `/2` and `/3`, each read for its own selection
 site), and one root marker `oxide.outputs.root/2` (a `/1` marker is unknown,
 because its field set predates the nonce and the checkout volume). A registry
@@ -2757,7 +2760,7 @@ authority, and neither borrows the other's census. R11's remount must verify the
 backing, the same volume UUID and the same recorded relative path before its replay
 binds them, and R12 begins only after that remount and its digest-bound registration
 succeed. The final closure is the script's own; the guard's cleanup is authorized
-separately by the guard's own custody scan, so a counted pass correlates all twelve
+separately by the guard's own custody scan, so a counted pass correlates all fifteen
 case rows, this whole-backing clearance and the supervisor's own receipt, and a
 missing or unclear half is a missing proof.
 
@@ -2765,7 +2768,7 @@ It creates one owned 64 MiB sparse APFS image inside that run root and registers
 as the only volume. Its environment binds `HOME`, `BARGE_ACCOUNT_HOME` and
 `BARGE_STATE_DIR` inside the owned scratch, and it checks that each path resolves
 there. Each case's receipt records the reference control its previews chose, and a
-control outside the owned scratch faults the case. Each of its twelve cases declares
+control outside the owned scratch faults the case. Each of its fifteen cases declares
 its own area, so one case's roots never reach another case's plan:
 
 | Case | Claim | Counterfactual of |
@@ -2782,6 +2785,9 @@ its own area, so one case's roots never reach another case's plan:
 | R10 | a consumer path that reappears between plan and run keeps the root | the release-by-reference case |
 | R11 | a pending intent is written before the rename; after an ordinary detach and reattach, a later run settles it by UUID and the root releases after | the intent and remount |
 | R12 | a run releases only the rows its presented plan carries | the plan's scope |
+| R13 | a valid coordinated `/4` registry keeps its live Oxide reference's root and releases an unrelated eligible root past a settlement naming that root's exact path | R1, the coordinated format |
+| R14 | a coordinated `/4` registry without its settlement set refuses the whole batch (`unknown_state`) and changes nothing | R13, the settlement set |
+| R15 | the census reads the same coordinated `/4` document as reported facts; its malformed twin stays unknown | the census observation on R13's document |
 
 R11 retains the original identity record, marker, inode and fixture content through
 replay. It binds the recorded relative path to the reattached mount only after the
@@ -2881,7 +2887,7 @@ are proposed for the implementation slices.
 | The gate | each of the six conditions alone blocks a delete | six counterfactuals, one per condition, each proving the root survives with its reason; plus one proving all six together authorize it |
 | References | receipts, registry flags and Barge's own records decide "current" | an incomplete reference set keeps the whole batch; a selected, reserved, pruning or cancelling row keeps its root |
 | Plan and intent | canonical plan, digest, evidence on every row | a changed digest, a changed marker digest, a changed identity and a reappeared consumer path each stop the affected row only; a replay after a device change settles from the recorded identity |
-| Oxide census | strict bounded reading of `oxide.outputs.registry/3`, `/2` and `/1` | a version-1 row, an incomplete registry, a duplicated UUID and a row whose volume is away each report the honest verdict; nothing is written and no row becomes authoritative |
+| Oxide census | strict bounded reading of `oxide.outputs.registry/4`, `/2` and `/1` | a version-1 row, an incomplete registry, a coordinated registry without its settlement set, a duplicated UUID and a row whose volume is away each report the honest verdict; nothing is written and no row becomes authoritative |
 | Caches and scratch | the identity rule reaches every root kind | a `scratch_run` root concluded under generation 2 verifies; an adopted `held-root` with `origin: adopted_existing` verifies; a `cache_root` with a changed inode is kept |
 
 The regression test the carried finding needs is a named pair: a fixture root

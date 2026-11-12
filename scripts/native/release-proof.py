@@ -2190,7 +2190,7 @@ class Proof:
                           "wall_seconds": round(time.time() - self.started, 3)},
             "closure": self.closure,
             "qualification_inputs": {
-                "case_rows": "every R1-R12 row passed in this mode",
+                "case_rows": f"every case row (R1-R{len(CASES)}) passed in this mode",
                 "image_whole_backing_clearance": (self.closure or {}).get("closed"),
                 "guard_receipt": {
                     "required": True,
