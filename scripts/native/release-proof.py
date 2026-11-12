@@ -1755,62 +1755,73 @@ def guest_binding_controls():
             result = entry("diagnostic", "/owned/invocation", "0" * 64)
             if result != 125 or make_directory.called:
                 problems.append("a guest entry did not refuse changed instruction bytes before effects")
-    # Drive the real inner entry with low-level observations scripted, changing
-    # only the outer tree. No guard, build, writer, or case oracle is replaced.
-    scratch = record["scratch"] + "/oxide-proof.example/scratch"
-    evidence = record["scratch"] + "/oxide-proof.example/evidence"
-    outer_observed = dict(paired, tree="0" * 40)
-    env = {"HOME": GUEST_HOME, "OXIDE_TASK_SCRATCH_ROOT": scratch,
-           "OXIDE_PROOF_EVIDENCE": evidence, "TMPDIR": scratch,
-           "BARGE_PROOF_SUPERVISOR": record["supervisor_path"],
-           WALL_DEADLINE_ENV: str(200 * 10 ** 9), "OXIDE_PROOF_DEADLINE_NS": str(200 * 10 ** 9),
-           ROUTE_ENV: json.dumps({"instruction_sha256": digest, "mode": "diagnostic", "observed": outer_observed})}
-    file_info = mock.Mock(st_mode=0o100600, st_uid=GUEST_UID)
-    directory_info = mock.Mock(st_mode=0o40700, st_uid=GUEST_UID, st_gid=GUEST_GID, st_dev=17, st_ino=3)
-    parent_info = mock.Mock(st_mode=0o40777, st_uid=0, st_gid=0, st_dev=17, st_ino=2)
-    path_parts = record["scratch"].split(os.sep)[1:]
-    path_infos = [directory_info] * len(path_parts)
-    path_infos[-2] = parent_info
-    def local_process(argv, **kwargs):
-        if argv[0] == DISKUTIL:
-            return mock.Mock(returncode=0, stdout=plistlib.dumps({"VolumeUUID": GUEST_VOLUME_UUID}), stderr=b"")
-        if argv[0] == "/bin/ps":
-            return mock.Mock(returncode=0, stdout="/usr/bin/python3 " + record["supervisor_path"], stderr="")
-        if argv[0] == record["cargo_path"]:
-            return mock.Mock(returncode=0, stdout="cargo 1.97.1 (test)", stderr="")
-        if argv[0] == record["rustc_path"]:
-            return mock.Mock(returncode=0, stdout="rustc 1.97.1 (test)\nhost: aarch64-apple-darwin", stderr="")
-        return host_command(argv, **kwargs)
-    def local_hash(path):
-        if path == record["input_manifest"]:
-            return record["inputs_sha256"]
-        if path == record["supervisor_path"]:
-            return SUPERVISOR_SHA256
-        return record["lock_sha256"] if path.endswith("Cargo.lock") else "f" * 64
-    def local_realpath(path):
-        return record["python_path"] if path == sys.executable else path
-    output = io.StringIO()
-    patches = (mock.patch.dict(os.environ, env, clear=True), mock.patch("os.open", return_value=42),
-               mock.patch("os.close"), mock.patch("os.getuid", return_value=GUEST_UID),
-               mock.patch("os.geteuid", return_value=GUEST_UID), mock.patch("os.getegid", return_value=GUEST_GID),
-               mock.patch("os.getpid", return_value=123), mock.patch("os.getsid", return_value=123),
-               mock.patch("os.getpgid", return_value=123), mock.patch("os.getppid", return_value=100),
-               mock.patch("os.fstat", side_effect=[file_info, *path_infos, directory_info]),
-               mock.patch("os.fdopen", return_value=io.BytesIO(raw)), mock.patch("os.lstat", return_value=directory_info),
-               mock.patch("os.path.isdir", return_value=True), mock.patch("os.path.islink", return_value=False),
-               mock.patch("os.path.realpath", side_effect=local_realpath),
-               mock.patch("os.fstatvfs", return_value=mock.Mock(f_bavail=21 * 1024 ** 3, f_frsize=1)),
-               mock.patch("subprocess.run", side_effect=local_process),
-               mock.patch(__name__ + ".sha256_file", side_effect=local_hash),
-               mock.patch(__name__ + ".guest_clock_ns", return_value=1),
-               mock.patch(__name__ + ".REPO_ROOT", record["source_path"]), contextlib.redirect_stdout(output))
-    with contextlib.ExitStack() as stack:
-        for patcher in patches:
-            stack.enter_context(patcher)
-        make_directory = stack.enter_context(mock.patch("os.mkdir"))
-        result = guest_inner_half("diagnostic", record["instruction_guest_path"], digest)
-    if result != 125 or make_directory.called or "tree changed between outer and inner" not in output.getvalue():
-        problems.append("real guest inner entry did not refuse changed outer source before effects")
+    # Synthetic checker inputs exercise the same gate as guest_inner_half. The
+    # instrumented boundary does not create a guard, stage a build or run cases.
+    carried = {"instruction_sha256": digest, "mode": "diagnostic", "observed": paired}
+    guard_facts = {"evidence_isdir": True, "scratch_isdir": True,
+                   "tmpdir_inside_scratch": True, "containment_problems": [],
+                   "supervisor_problems": [], "deadline_ns": 1, "route": carried}
+    def exercise_gate(inner, outer=carried, facts=guard_facts):
+        effects = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = guest_inner_gate(record, inner, outer, record["instruction_guest_path"],
+                                      digest, "diagnostic", facts, [], lambda: effects.append("stage"))
+        return result, effects
+    _result, effects = exercise_gate(paired)
+    if effects != ["stage"]:
+        problems.append("synthetic valid facts did not reach the instrumented boundary")
+    for key in ("uid", "gid", "home", "mount", "volume_uuid", "scratch", "head", "tree",
+                "lock_sha256", "guard_sha256", "toolchain", "target", "features", "inputs_sha256",
+                "cargo_path", "cargo_sha256", "rustc_path", "rustc_sha256", "python_path",
+                "python_sha256", "canonical", "nofollow", "owner_only", "same_volume", "reserve", "route_identity"):
+        result, effects = exercise_gate(dict(paired, **{key: None}))
+        if result != 125 or effects:
+            problems.append(f"guest inner gate accepted changed or absent {key} before effects")
+    for key in ("head", "tree", "lock_sha256", "guard_sha256", "uid", "volume_uuid", "scratch", "route_identity"):
+        mismatched = dict(carried, observed=dict(paired, **{key: None}))
+        result, effects = exercise_gate(paired, outer=mismatched)
+        if result != 125 or effects:
+            problems.append(f"guest inner gate accepted outer/inner {key} disagreement")
+    for changed in ({"evidence_isdir": False}, {"scratch_isdir": False},
+                    {"tmpdir_inside_scratch": False}, {"containment_problems": ["bad parent"]},
+                    {"supervisor_problems": ["guard changed"]}, {"deadline_ns": None}):
+        result, effects = exercise_gate(paired, facts=dict(guard_facts, **changed))
+        if result != 125 or effects:
+            problems.append("guest inner gate accepted an invalid guard observation")
+    for key in ("uid", "gid", "home", "head", "tree", "lock_sha256", "guard_sha256",
+                "toolchain", "target", "inputs_sha256", "cargo_sha256", "rustc_sha256", "scratch"):
+        effects = []
+        refused, _leaf = guest_outer_gate(record, dict(paired, **{key: None}),
+                                           record["instruction_guest_path"], "diagnostic", [],
+                                           lambda: effects.append("leaf"))
+        if not refused or effects:
+            problems.append(f"guest outer gate accepted changed or absent {key} before effects")
+    parent_good = mock.Mock(st_mode=0o40777, st_uid=0, st_gid=0, st_dev=17)
+    leaf_good = mock.Mock(st_mode=0o40700, st_uid=GUEST_UID, st_gid=GUEST_GID, st_dev=17)
+    def create_control(parent=parent_good, mount=parent_good, uid=GUEST_UID, uuid=GUEST_VOLUME_UUID, real=GUEST_PARENT):
+        parts = GUEST_PARENT.split(os.sep)[1:]
+        infos = [parent_good] * len(parts)
+        infos[parts.index("Data")] = mount
+        infos[-1] = parent
+        with mock.patch("os.open", return_value=42), mock.patch("os.close"), \
+                mock.patch("os.fstat", side_effect=[*infos, parent, leaf_good]), \
+                mock.patch("os.geteuid", return_value=uid), mock.patch("os.getegid", return_value=GUEST_GID), \
+                mock.patch.dict(os.environ, {"HOME": GUEST_HOME}), \
+                mock.patch("os.fstatvfs", return_value=mock.Mock(f_bavail=21 * 1024 ** 3, f_frsize=1)), \
+                mock.patch("os.path.realpath", return_value=real), \
+                mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stdout=plistlib.dumps({"VolumeUUID": uuid}))), \
+                mock.patch("os.mkdir") as mkdir:
+            try:
+                guest_create_leaf(record)
+                return False, mkdir.called
+            except (OSError, ValueError):
+                return True, mkdir.called
+    for params in ({"uid": 1}, {"uuid": "wrong"}, {"real": "/alias"},
+                   {"parent": mock.Mock(st_mode=0o40777, st_uid=1, st_gid=0, st_dev=17)},
+                   {"mount": mock.Mock(st_mode=0o40755, st_uid=0, st_gid=0, st_dev=18)}):
+        refused, wrote = create_control(**params)
+        if not refused or wrote:
+            problems.append("guest leaf creation accepted invalid account, parent, route or volume before effects")
     if read_instruction(raw, digest) != record:
         problems.append("guest instruction did not preserve its actual decoded fields")
     for name, data, expected, uid, mode in (
@@ -1840,7 +1851,7 @@ def guest_binding_controls():
                 mock.patch("os.geteuid", return_value=GUEST_UID), mock.patch("os.getegid", return_value=GUEST_GID), \
                 mock.patch.dict(os.environ, {"HOME": GUEST_HOME}), \
                 mock.patch("os.fstatvfs", return_value=mock.Mock(f_bavail=free, f_frsize=1)), \
-                mock.patch(__name__ + ".volume_uuid", return_value=uuid):
+                mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stdout=plistlib.dumps({"VolumeUUID": uuid}))):
             return guest_route_facts(path)
     route = observe_route()
     if any(route[key] is not True for key in ("canonical", "nofollow", "owner_only", "same_volume", "reserve")):
@@ -4151,6 +4162,22 @@ def inner_half(mode, receipt_path):
                        {"owned root": owned_root, "evidence directory": evidence})
 
 
+def guest_inner_gate(record, observed, carried, instruction_path, instruction_digest, mode, facts, extra, effect):
+    """The shared refusal boundary; synthetic controls never execute a native effect."""
+    problems = list(extra) + guest_binding_problems(record, observed)
+    if instruction_path != record.get("instruction_guest_path"):
+        problems.append("the guest instruction path differs from the invocation")
+    if (not isinstance(carried, dict) or carried.get("instruction_sha256") != instruction_digest
+            or carried.get("mode") != mode or record.get("mode") != mode):
+        problems.append("the guest outer instruction or mode does not match")
+    problems += guest_recheck_problems(carried.get("observed") if isinstance(carried, dict) else None, observed)
+    refusals = guard_refusals(facts, problems)
+    if refusals:
+        print(json.dumps({"schema": SCHEMA, "ok": False, "refused": "; ".join(refusals)}))
+        return 125
+    return effect()
+
+
 def guest_inner_half(mode, instruction_path, instruction_digest):
     """Recheck guest facts inside the genuine guard before staging or fixture effects."""
     try:
@@ -4160,13 +4187,7 @@ def guest_inner_half(mode, instruction_path, instruction_digest):
         return 125
     observed = guest_local_observation(record)
     carried = carried_route()
-    route_problems = guest_binding_problems(record, observed)
-    if instruction_path != record.get("instruction_guest_path"):
-        route_problems.append("the guest instruction path differs from the invocation")
-    if (not isinstance(carried, dict) or carried.get("instruction_sha256") != instruction_digest
-            or carried.get("mode") != mode or record.get("mode") != mode):
-        route_problems.append("the guest outer instruction or mode does not match")
-    route_problems += guest_recheck_problems(carried.get("observed") if isinstance(carried, dict) else None, observed)
+    route_problems = []
     if supervisor_path() != record.get("supervisor_path"):
         route_problems.append("the guest guard path differs from the instruction")
     try:
@@ -4201,20 +4222,29 @@ def guest_inner_half(mode, instruction_path, instruction_digest):
              "containment_problems": guard_containment_problems(containment),
              "supervisor_problems": installed_supervisor_problems(), "route": carried,
              "deadline_ns": deadline}
-    refusals = guard_refusals(facts, route_problems)
-    if refusals:
-        print(json.dumps({"schema": SCHEMA, "ok": False, "refused": "; ".join(refusals)}))
-        return 125
-    receipt = os.path.join(evidence, PROOF_RECEIPT)
-    carried = dict(carried)
-    carried["guest_correlation"] = {key: record[key] for key in
-                                    ("nonce", "head", "tree", "lock_sha256", "guard_sha256", "inputs_sha256")}
-    owned = {"owned root": guard_owned_root(scratch), "evidence directory": evidence}
-    stage = lambda parent, roots, deadline_ns: guest_stage_proof_binary(
-        parent, roots, deadline_ns, record, observed, lambda: guest_local_observation(record))
-    verify = lambda binary, head, root: guest_staged_build_problems(binary, head, root, record)
-    return guarded_run(mode, receipt, carried, deadline, scratch, owned, stage=stage, verify=verify,
-                       head=record["head"])
+    def effect():
+        receipt = os.path.join(evidence, PROOF_RECEIPT)
+        route = dict(carried)
+        route["guest_correlation"] = {key: record[key] for key in
+                                      ("nonce", "head", "tree", "lock_sha256", "guard_sha256", "inputs_sha256")}
+        owned = {"owned root": guard_owned_root(scratch), "evidence directory": evidence}
+        stage = lambda parent, roots, deadline_ns: guest_stage_proof_binary(
+            parent, roots, deadline_ns, record, observed, lambda: guest_local_observation(record))
+        verify = lambda binary, head, root: guest_staged_build_problems(binary, head, root, record)
+        return guarded_run(mode, receipt, route, deadline, scratch, owned, stage=stage, verify=verify,
+                           head=record["head"])
+    return guest_inner_gate(record, observed, carried, instruction_path, instruction_digest,
+                            mode, facts, route_problems, effect)
+
+
+def guest_outer_gate(record, observed, instruction_path, mode, extra, effect):
+    """Validate the guest's pre-leaf facts before its first owned effect."""
+    problems = guest_binding_problems(record, observed, check_route=False) + list(extra)
+    if instruction_path != record.get("instruction_guest_path"):
+        problems.append("the guest instruction path differs from the invocation")
+    if record.get("mode") != mode:
+        problems.append("the guest mode differs from the instruction")
+    return (problems, None) if problems else ([], effect())
 
 
 def guest_outer_half(mode, instruction_path, instruction_digest):
@@ -4223,15 +4253,11 @@ def guest_outer_half(mode, instruction_path, instruction_digest):
     try:
         record = guest_instruction(instruction_path, instruction_digest)
         observed = guest_local_observation(record)
-        problems = guest_binding_problems(record, observed, check_route=False)
-        if instruction_path != record.get("instruction_guest_path"):
-            problems.append("the guest instruction path differs from the invocation")
-        if record.get("mode") != mode:
-            problems.append("the guest mode differs from the instruction")
-        problems += guest_offline_inputs_problems(record, deadline)
+        offline = guest_offline_inputs_problems(record, deadline)
+        problems, leaf = guest_outer_gate(record, observed, instruction_path, mode, offline,
+                                          lambda: guest_create_leaf(record))
         if problems:
             raise ValueError("; ".join(problems))
-        leaf = guest_create_leaf(record)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         print(json.dumps({"schema": SCHEMA, "ok": False, "refused": f"guest outer: {error}"}))
         return 125
