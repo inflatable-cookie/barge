@@ -1204,10 +1204,12 @@ def host_vm_problems(document):
 
 def host_guest_argv(record, instruction_digest):
     """The host transport's exact argv; a digest placeholder avoids self-reference."""
-    return ["prlctl", "exec", GUEST_VM_UUID, "--current-user", record["python_path"],
-            os.path.join(record["source_path"], "scripts/native/release-proof.py"),
-            "--guest-outer", record["mode"], "--guest-instruction", record["instruction_guest_path"],
-            "--guest-digest", instruction_digest]
+    guest = [record["python_path"], os.path.join(record["source_path"], "scripts/native/release-proof.py"),
+             "--guest-outer", record["mode"], "--guest-instruction", record["instruction_guest_path"],
+             "--guest-digest", instruction_digest]
+    script = shlex.join(["sudo", "-n", "-H", "-u", "inflatable-tester", "--",
+                         "/bin/sh", "-c", shlex.join(guest)])
+    return ["prlctl", "exec", GUEST_VM_UUID, shlex.join(["/bin/sh", "-c", script])]
 
 
 def host_guest_preflight(instruction_path, instruction_digest, role, run, activation):
@@ -1578,6 +1580,16 @@ def guest_binding_controls():
     input_bytes = json.dumps({"roots": {record["cargo_home"]: {}, record["toolchain_root"]: {}}}).encode()
     record["inputs_sha256"] = hashlib.sha256(input_bytes).hexdigest()
     template = host_guest_argv(record, "<instruction-digest>")
+    transport = host_guest_argv(record, "f" * 64)
+    outer = shlex.split(transport[3])
+    inner = shlex.split(outer[2]) if outer[:2] == ["/bin/sh", "-c"] and len(outer) == 3 else []
+    guest_argv = shlex.split(inner[8]) if len(inner) == 9 else []
+    if (transport[:3] != ["prlctl", "exec", GUEST_VM_UUID]
+            or inner[:8] != ["sudo", "-n", "-H", "-u", "inflatable-tester", "--", "/bin/sh", "-c"]
+            or guest_argv != [record["python_path"], os.path.join(record["source_path"], "scripts/native/release-proof.py"),
+                              "--guest-outer", record["mode"], "--guest-instruction", record["instruction_guest_path"],
+                              "--guest-digest", "f" * 64]):
+        problems.append("guest transport did not serialize the selected existing-user command")
     record["command_sha256"] = hashlib.sha256(json.dumps(template, separators=(",", ":")).encode()).hexdigest()
     observed = dict(record, canonical=True, nofollow=True, owner_only=True, same_volume=True, reserve=True,
                     route_identity={"mount": [17, 1], "parent": [17, 2], "leaf": [17, 3]})

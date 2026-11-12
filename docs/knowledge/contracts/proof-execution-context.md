@@ -186,6 +186,11 @@ Nucleus role. A nonce correlates evidence but establishes neither admission nor
 closure. This is a cooperative trusted-host workflow, not a defense against a
 malicious host, guest or root user. Complete transport, applicable admission,
 private Data scratch and actual runtime fit still require separate evidence.
+The host command uses the serialized default-exec route and credential-free
+`sudo -n -H -u inflatable-tester`; the guest still checks its own UID and HOME.
+The original host deadline cannot be established in the guest by passing a
+remaining duration across an unbounded transport delay. A timing binding remains
+required before guest execution; a host timeout does not establish guest closure.
 
 The guest must actually run the same hash-pinned Oxide qualified supervisor
 `fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b`
