@@ -1790,21 +1790,24 @@ def guest_binding_controls():
     def local_realpath(path):
         return record["python_path"] if path == sys.executable else path
     output = io.StringIO()
-    with mock.patch.dict(os.environ, env, clear=True), mock.patch("os.open", return_value=42), \
-            mock.patch("os.close"), mock.patch("os.getuid", return_value=GUEST_UID), \
-            mock.patch("os.geteuid", return_value=GUEST_UID), mock.patch("os.getegid", return_value=GUEST_GID), \
-            mock.patch("os.getpid", return_value=123), mock.patch("os.getsid", return_value=123), \
-            mock.patch("os.getpgid", return_value=123), mock.patch("os.getppid", return_value=100), \
-            mock.patch("os.fstat", side_effect=[file_info, *path_infos, directory_info]), \
-            mock.patch("os.fdopen", return_value=io.BytesIO(raw)), mock.patch("os.lstat", return_value=directory_info), \
-            mock.patch("os.path.isdir", return_value=True), mock.patch("os.path.islink", return_value=False), \
-            mock.patch("os.path.realpath", side_effect=local_realpath), \
-            mock.patch("os.fstatvfs", return_value=mock.Mock(f_bavail=21 * 1024 ** 3, f_frsize=1)), \
-            mock.patch("subprocess.run", side_effect=local_process), \
-            mock.patch(__name__ + ".sha256_file", side_effect=local_hash), \
-            mock.patch(__name__ + ".guest_clock_ns", return_value=1), \
-            mock.patch(__name__ + ".REPO_ROOT", record["source_path"]), \
-            mock.patch("os.mkdir") as make_directory, contextlib.redirect_stdout(output):
+    patches = (mock.patch.dict(os.environ, env, clear=True), mock.patch("os.open", return_value=42),
+               mock.patch("os.close"), mock.patch("os.getuid", return_value=GUEST_UID),
+               mock.patch("os.geteuid", return_value=GUEST_UID), mock.patch("os.getegid", return_value=GUEST_GID),
+               mock.patch("os.getpid", return_value=123), mock.patch("os.getsid", return_value=123),
+               mock.patch("os.getpgid", return_value=123), mock.patch("os.getppid", return_value=100),
+               mock.patch("os.fstat", side_effect=[file_info, *path_infos, directory_info]),
+               mock.patch("os.fdopen", return_value=io.BytesIO(raw)), mock.patch("os.lstat", return_value=directory_info),
+               mock.patch("os.path.isdir", return_value=True), mock.patch("os.path.islink", return_value=False),
+               mock.patch("os.path.realpath", side_effect=local_realpath),
+               mock.patch("os.fstatvfs", return_value=mock.Mock(f_bavail=21 * 1024 ** 3, f_frsize=1)),
+               mock.patch("subprocess.run", side_effect=local_process),
+               mock.patch(__name__ + ".sha256_file", side_effect=local_hash),
+               mock.patch(__name__ + ".guest_clock_ns", return_value=1),
+               mock.patch(__name__ + ".REPO_ROOT", record["source_path"]), contextlib.redirect_stdout(output))
+    with contextlib.ExitStack() as stack:
+        for patcher in patches:
+            stack.enter_context(patcher)
+        make_directory = stack.enter_context(mock.patch("os.mkdir"))
         result = guest_inner_half("diagnostic", record["instruction_guest_path"], digest)
     if result != 125 or make_directory.called or "tree changed between outer and inner" not in output.getvalue():
         problems.append("real guest inner entry did not refuse changed outer source before effects")
