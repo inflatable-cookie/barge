@@ -680,6 +680,9 @@ def guest_stage_environment(base, tmpdir, target_dir):
             or target_dir != os.path.join(tmpdir, "cargo-target")):
         raise ValueError("the guest target directory is not inside this guard's scratch")
     environment = stage_environment(base, tmpdir)
+    for name in ("RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC",
+                 "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"):
+        environment.pop(name, None)
     environment["CARGO_TARGET_DIR"] = target_dir
     return environment
 
@@ -1084,7 +1087,8 @@ def guest_binding_problems(record, observed):
         "task", "role", "run", "activation", "mode", "vm_uuid", "uid", "gid",
         "home", "mount", "volume_uuid", "scratch", "head", "tree", "lock_sha256",
         "guard_sha256", "toolchain", "target", "features", "command_sha256",
-        "inputs_sha256", "nonce",
+        "inputs_sha256", "nonce", "cargo_path", "cargo_sha256", "rustc_path", "rustc_sha256",
+        "input_manifest", "supervisor_path", "source_path",
     }
     if set(record) != required:
         return ["guest invocation binding has missing or unexpected fields"]
@@ -1106,20 +1110,33 @@ def guest_binding_problems(record, observed):
         if not isinstance(record[key], str) or not re.fullmatch(r"[A-Za-z0-9-]{16,128}", record[key]):
             problems.append(f"guest invocation {key} is malformed")
     for key, length in (("head", 40), ("tree", 40), ("lock_sha256", 64),
-                        ("command_sha256", 64), ("inputs_sha256", 64)):
+                        ("command_sha256", 64), ("inputs_sha256", 64), ("cargo_sha256", 64),
+                        ("rustc_sha256", 64)):
         if not isinstance(record[key], str) or not re.fullmatch(rf"[0-9a-f]{{{length}}}", record[key]):
             problems.append(f"guest invocation {key} is malformed")
     scratch = record["scratch"]
     if not isinstance(scratch, str) or os.path.dirname(scratch) != GUEST_PARENT or \
             not re.fullmatch(r"barge-proof-[A-Za-z0-9_-]{8,80}", os.path.basename(scratch)):
         problems.append("guest scratch is not a named private leaf of the Data parent")
+    for key in ("cargo_path", "rustc_path", "input_manifest", "supervisor_path", "source_path"):
+        path = record[key]
+        if not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path:
+            problems.append(f"guest {key} is not absolute and canonical")
     for key in ("uid", "gid", "home", "mount", "volume_uuid", "scratch", "head", "tree",
-                "lock_sha256", "guard_sha256", "toolchain", "target", "features", "inputs_sha256"):
+                "lock_sha256", "guard_sha256", "toolchain", "target", "features", "inputs_sha256",
+                "cargo_path", "cargo_sha256", "rustc_path", "rustc_sha256", "input_manifest",
+                "supervisor_path", "source_path"):
         if observed.get(key) != record[key]:
             problems.append(f"guest observation {key} differs from the invocation")
     for key in ("canonical", "nofollow", "owner_only", "same_volume", "reserve"):
         if observed.get(key) is not True:
             problems.append(f"guest route {key} is not established")
+    identities = observed.get("route_identity")
+    if (not isinstance(identities, dict) or set(identities) != {"mount", "parent", "leaf"}
+            or any(not isinstance(identities[key], list) or len(identities[key]) != 2
+                   or any(type(value) is not int or value < 0 for value in identities[key])
+                   for key in ("mount", "parent", "leaf"))):
+        problems.append("guest route device and inode identities are incomplete")
     return problems
 
 
@@ -1143,9 +1160,67 @@ def guest_recheck_problems(outer, inner):
         return ["guest outer or inner observation is missing"]
     keys = ("uid", "gid", "home", "mount", "volume_uuid", "scratch", "head", "tree",
             "lock_sha256", "guard_sha256", "toolchain", "target", "features", "inputs_sha256",
-            "route_identity")
+            "route_identity", "cargo_path", "cargo_sha256", "rustc_path", "rustc_sha256",
+            "input_manifest", "supervisor_path", "source_path")
     return [f"guest {key} changed between outer and inner" for key in keys
             if outer.get(key) is None or outer.get(key) != inner.get(key)]
+
+
+def guest_local_observation(record):
+    """Re-read guest-observable facts; this cannot observe host VM or role authority."""
+    if not isinstance(record, dict):
+        return {}
+    facts = guest_route_facts(record.get("scratch"))
+    for key in ("source_path", "supervisor_path", "input_manifest", "cargo_path", "rustc_path"):
+        facts[key] = None
+    try:
+        for key in ("source_path", "supervisor_path", "input_manifest", "cargo_path", "rustc_path"):
+            path = record[key]
+            if (not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path
+                    or os.path.realpath(path) != path):
+                return facts
+            facts[key] = path
+        if facts["source_path"] != REPO_ROOT:
+            return facts
+        def command(argv):
+            result = subprocess.run(argv, cwd=REPO_ROOT, capture_output=True, text=True,
+                                    timeout=INFO_TIMEOUT_SECONDS)
+            if result.returncode:
+                raise ValueError("local identity command refused")
+            return result.stdout.strip()
+        head = command(["git", "-C", REPO_ROOT, "rev-parse", "HEAD"])
+        tree = command(["git", "-C", REPO_ROOT, "rev-parse", "HEAD^{tree}"])
+        status = command(["git", "-C", REPO_ROOT, "status", "--porcelain", "--untracked-files=all"])
+        if status:
+            return facts
+        rustc = command([facts["rustc_path"], "--version", "--verbose"])
+        cargo = command([facts["cargo_path"], "--version"])
+        if not cargo.startswith("cargo 1.97.1 ") or not rustc.startswith("rustc 1.97.1 "):
+            return facts
+        host = next((line.removeprefix("host: ") for line in rustc.splitlines() if line.startswith("host: ")), None)
+        facts.update(head=head, tree=tree, lock_sha256=sha256_file(os.path.join(REPO_ROOT, "Cargo.lock")),
+                     guard_sha256=sha256_file(facts["supervisor_path"]),
+                     cargo_sha256=sha256_file(facts["cargo_path"]),
+                     rustc_sha256=sha256_file(facts["rustc_path"]),
+                     inputs_sha256=sha256_file(facts["input_manifest"]),
+                     toolchain="1.97.1", target=host, features=[PROOF_FEATURE])
+    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+        return facts
+    return facts
+
+
+def guest_artifact_problems(artifact, target_dir, before, after):
+    """Check a fresh guest Cargo artifact and both source observations before copying."""
+    problems = guest_recheck_problems(before, after)
+    if not isinstance(artifact, dict) or artifact.get("features") != [PROOF_FEATURE]:
+        return problems + ["guest Cargo did not report the single proof-feature artifact"]
+    path = artifact.get("executable")
+    if (not isinstance(path, str) or not os.path.isabs(path)
+            or os.path.normpath(path) != path or not isinstance(target_dir, str)
+            or not os.path.isabs(target_dir) or os.path.normpath(target_dir) != target_dir
+            or not path.startswith(target_dir + os.sep)):
+        problems.append("guest Cargo artifact is outside this occurrence's target directory")
+    return problems
 
 
 def guest_binding_controls():
@@ -1170,8 +1245,13 @@ def guest_binding_controls():
               "tree": "b" * 40, "lock_sha256": "c" * 64, "guard_sha256": SUPERVISOR_SHA256,
               "toolchain": "1.97.1", "target": "aarch64-apple-darwin",
               "features": [PROOF_FEATURE], "command_sha256": "d" * 64,
-              "inputs_sha256": "e" * 64, "nonce": "n" * 16}
-    observed = dict(record, canonical=True, nofollow=True, owner_only=True, same_volume=True, reserve=True)
+              "inputs_sha256": "e" * 64, "nonce": "n" * 16,
+              "cargo_path": "/guest/toolchain/bin/cargo", "cargo_sha256": "f" * 64,
+              "rustc_path": "/guest/toolchain/bin/rustc", "rustc_sha256": "f" * 64,
+              "input_manifest": "/guest/inputs.json", "supervisor_path": "/guest/bounded-test.py",
+              "source_path": "/guest/source"}
+    observed = dict(record, canonical=True, nofollow=True, owner_only=True, same_volume=True, reserve=True,
+                    route_identity={"mount": [17, 1], "parent": [17, 2], "leaf": [17, 3]})
     if guest_binding_problems(record, observed):
         problems.append("valid guest comparison was refused")
     for field in ("uid", "gid", "volume_uuid", "head", "tree", "lock_sha256", "guard_sha256",
@@ -1201,6 +1281,49 @@ def guest_binding_controls():
                 "guard_sha256", "toolchain", "target", "features", "inputs_sha256", "route_identity"):
         if not guest_recheck_problems(paired, dict(paired, **{key: None})):
             problems.append(f"guest recheck accepted changed {key}")
+    artifact = {"executable": "/guard/scratch/cargo-target/debug/barge", "features": [PROOF_FEATURE]}
+    if guest_artifact_problems(artifact, "/guard/scratch/cargo-target", paired, paired):
+        problems.append("the fresh guest artifact was refused")
+    for bad in (None, dict(artifact, executable="/elsewhere/barge"), dict(artifact, features=[])):
+        if not guest_artifact_problems(bad, "/guard/scratch/cargo-target", paired, paired):
+            problems.append("a foreign or wrong-feature guest artifact was accepted")
+    if not guest_artifact_problems(artifact, "/guard/scratch/cargo-target", paired,
+                                   dict(paired, tree="0" * 40)):
+        problems.append("the guest artifact accepted changed source after building")
+    output = json.dumps({"reason": "compiler-artifact", "target": {"name": "barge", "kind": ["bin"]},
+                         "executable": artifact["executable"], "features": [PROOF_FEATURE]})
+    build = mock.Mock(returncode=0, stdout=output, stderr="")
+    def stage_control(after, response=build):
+        with mock.patch("os.mkdir"), mock.patch("os.chmod"), mock.patch("shutil.copyfile"), \
+                mock.patch("tempfile.mkdtemp", return_value="/guard/scratch/staged"), \
+                mock.patch("builtins.open", mock.mock_open()), \
+                mock.patch("os.path.realpath", side_effect=lambda path: path), \
+                mock.patch(__name__ + ".sha256_file", return_value="f" * 64), \
+                mock.patch("time.monotonic_ns", return_value=1):
+            return guest_stage_proof_binary("/guard/scratch", {"guard": "/guard"}, 10 ** 12,
+                                            record, paired, lambda: after,
+                                            runner=lambda *args, **kwargs: response)
+    try:
+        staged, _ = stage_control(paired)
+        if (staged.get("tree") != record["tree"] or staged.get("build_command") !=
+                [record["cargo_path"], *GUEST_BUILD_COMMAND[1:]]):
+            problems.append("guest stage did not retain its source and command bindings")
+        with mock.patch("builtins.open", mock.mock_open(read_data=json.dumps(staged))), \
+                mock.patch(__name__ + ".sha256_file", return_value="f" * 64):
+            if guest_staged_build_problems(staged["path"], record["head"], "/guard/scratch", record):
+                problems.append("guest stage could not authenticate its bound staged bytes")
+            if not guest_staged_build_problems(staged["path"], record["head"], "/guard/scratch",
+                                               dict(record, tree="0" * 40)):
+                problems.append("guest stage accepted a changed bound tree")
+    except Infrastructure as error:
+        problems.append(f"guest stage refused its scripted artifact: {error.detail}")
+    for after, response in ((dict(paired, tree="0" * 40), build),
+                            (paired, mock.Mock(returncode=1, stdout="", stderr="offline inputs missing"))):
+        try:
+            stage_control(after, response)
+            problems.append("guest stage accepted changed source or failed offline build")
+        except Infrastructure:
+            pass
     raw = json.dumps(record).encode()
     digest = hashlib.sha256(raw).hexdigest()
     def read_instruction(data, expected, *, uid=123, mode=0o100600):
@@ -1222,8 +1345,8 @@ def guest_binding_controls():
             problems.append(f"guest instruction accepted {name}")
         except (OSError, ValueError):
             pass
-    directory = mock.Mock(st_mode=0o40700, st_uid=GUEST_UID, st_gid=GUEST_GID, st_dev=17)
-    parent = mock.Mock(st_mode=0o40777, st_uid=0, st_gid=0, st_dev=17)
+    directory = mock.Mock(st_mode=0o40700, st_uid=GUEST_UID, st_gid=GUEST_GID, st_dev=17, st_ino=3)
+    parent = mock.Mock(st_mode=0o40777, st_uid=0, st_gid=0, st_dev=17, st_ino=2)
     def observe_route(*, leaf=directory, mount=directory, parent_info=parent, real=None,
                       free=21 * 1024 ** 3, uuid=GUEST_VOLUME_UUID, open_error=None):
         path = record["scratch"]
@@ -1244,9 +1367,9 @@ def guest_binding_controls():
     if any(route[key] is not True for key in ("canonical", "nofollow", "owner_only", "same_volume", "reserve")):
         problems.append("guest route observations did not retain valid local facts")
     for changed in (observe_route(open_error=OSError("no-follow refusal")),
-                    observe_route(leaf=mock.Mock(st_mode=0o40755, st_uid=GUEST_UID, st_gid=GUEST_GID, st_dev=17)),
-                    observe_route(parent_info=mock.Mock(st_mode=0o40777, st_uid=1, st_gid=0, st_dev=17)),
-                    observe_route(mount=mock.Mock(st_mode=0o40755, st_dev=18)), observe_route(real="/other"),
+                    observe_route(leaf=mock.Mock(st_mode=0o40755, st_uid=GUEST_UID, st_gid=GUEST_GID, st_dev=17, st_ino=3)),
+                    observe_route(parent_info=mock.Mock(st_mode=0o40777, st_uid=1, st_gid=0, st_dev=17, st_ino=2)),
+                    observe_route(mount=mock.Mock(st_mode=0o40755, st_dev=18, st_ino=1)), observe_route(real="/other"),
                     observe_route(free=0), observe_route(uuid="other")):
         observed_route = dict(observed, **changed)
         if not guest_binding_problems(record, observed_route):
@@ -1510,6 +1633,93 @@ def stage_proof_binary(parent, owned, deadline_ns=None, runner=None):
                       "bound_seconds": None if remaining is None else round(remaining, 3),
                       "environment": {key: environment[key] for key in
                                       ("RUSTUP_TOOLCHAIN", "RUSTUP_AUTO_INSTALL", "CARGO_NET_OFFLINE")}}
+
+
+def guest_stage_proof_binary(parent, owned, deadline_ns, record, before, observe, runner=None):
+    """Stage the guest's fresh Cargo artifact within the existing guard's owned root.
+
+    The caller must have established the genuine guard and supplied independently
+    observed facts; this routine cannot establish host activation or admission.
+    """
+    problems = stage_parent_problems(parent, owned) + guest_binding_problems(record, before)
+    if problems:
+        raise Infrastructure("stage", "; ".join(problems))
+    if not isinstance(deadline_ns, int) or deadline_ns <= time.monotonic_ns():
+        raise Infrastructure("stage", "no guard wall is left for the guest build")
+    cargo = record["cargo_path"]
+    try:
+        if (os.path.realpath(cargo) != cargo or sha256_file(cargo) != record["cargo_sha256"]
+                or os.path.realpath(record["rustc_path"]) != record["rustc_path"]
+                or sha256_file(record["rustc_path"]) != record["rustc_sha256"]):
+            raise Infrastructure("stage", "guest tool paths or bytes differ from the invocation")
+    except OSError as error:
+        raise Infrastructure("stage", f"guest Cargo is unreadable: {error}") from None
+    target_dir = os.path.join(parent, "cargo-target")
+    environment = guest_stage_environment(dict(os.environ), parent, target_dir)
+    environment["RUSTC"] = record["rustc_path"]
+    problems = stage_environment_problems(environment)
+    if problems:
+        raise Infrastructure("stage", "; ".join(problems))
+    try:
+        os.mkdir(target_dir, 0o700)
+        remaining = (deadline_ns - time.monotonic_ns()) / 1e9
+        if remaining <= 0:
+            raise Infrastructure("stage", "the guard wall expired before the guest build")
+        build = (runner or subprocess.run)([cargo, *GUEST_BUILD_COMMAND[1:]], cwd=REPO_ROOT, env=environment,
+                                          capture_output=True, text=True, timeout=remaining)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Infrastructure("stage", f"guest Cargo could not complete: {error}") from None
+    if build.returncode != 0:
+        raise Infrastructure("stage", f"guest Cargo exited {build.returncode}: {build.stderr[-400:]}")
+    artifact = executable_from_build(build.stdout)
+    after = observe()
+    problems = guest_binding_problems(record, after) + guest_artifact_problems(artifact, target_dir, before, after)
+    if time.monotonic_ns() >= deadline_ns:
+        problems.append("the guard wall expired before guest artifact staging")
+    if problems:
+        raise Infrastructure("stage", "; ".join(problems))
+    source = artifact["executable"]
+    if os.path.realpath(source) != source:
+        raise Infrastructure("stage", "guest Cargo artifact resolves through a link or alias")
+    directory = tempfile.mkdtemp(prefix=STAGE_PREFIX, dir=parent)
+    staged = os.path.join(directory, "barge")
+    shutil.copyfile(source, staged)
+    os.chmod(staged, 0o755)
+    manifest = {"schema": STAGE_SCHEMA, "head": record["head"], "tree": record["tree"],
+                "lock_sha256": record["lock_sha256"], "inputs_sha256": record["inputs_sha256"],
+                "guard_sha256": record["guard_sha256"], "features": artifact["features"],
+                "build_command": [cargo, *GUEST_BUILD_COMMAND[1:]], "cargo_sha256": record["cargo_sha256"],
+                "rustc_sha256": record["rustc_sha256"],
+                "toolchain": TOOLCHAIN_CHANNEL,
+                "offline": True, "source": source, "path": staged, "sha256": sha256_file(staged)}
+    with open(os.path.join(directory, STAGE_MANIFEST), "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=1)
+        handle.write("\n")
+    return manifest, {"bound_seconds": round(remaining, 3), "context": "guest"}
+
+
+def guest_staged_build_problems(binary, head, root, record):
+    """Authenticate a staged copy and its guest source binding before proof effects."""
+    problems = staged_build_problems(binary, head, root)
+    try:
+        with open(os.path.join(os.path.dirname(binary), STAGE_MANIFEST), encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return problems + ["the guest stage manifest is unavailable"]
+    for key in ("head", "tree", "lock_sha256", "inputs_sha256", "guard_sha256", "cargo_sha256", "rustc_sha256"):
+        if not isinstance(record, dict) or not record.get(key) or manifest.get(key) != record[key]:
+            problems.append(f"the guest stage {key} does not match the invocation")
+    if (not isinstance(record, dict) or manifest.get("build_command") !=
+            [record.get("cargo_path"), *GUEST_BUILD_COMMAND[1:]] or manifest.get("offline") is not True):
+        problems.append("the guest stage does not name its locked offline Cargo command")
+    if manifest.get("toolchain") != TOOLCHAIN_CHANNEL:
+        problems.append("the guest stage does not name the pinned toolchain")
+    source = manifest.get("source")
+    target_dir = os.path.join(root, "cargo-target")
+    if (not isinstance(source, str) or os.path.normpath(source) != source
+            or not source.startswith(target_dir + os.sep)):
+        problems.append("the guest stage does not name an artifact in its owned target directory")
+    return problems
 
 
 def rebound_path(old_mount, new_mount, old_path, identity, uuid):
@@ -5313,6 +5523,24 @@ def plan_document():
             "closure": "ordinary child success and reap plus whole-backing attachment absence plus an absent mount path",
         },
         "limitation": LIMITATION,
+        "guest_readiness": {
+            "status": "held: guest route, admission and complete receipt transport are not established",
+            "authority": "the retained host participant's activation and authenticated report; guest correlation is not authority",
+            "admission": "evaluate a supported mechanism first; the interim heavy-inline route requires all published conditions and an explicit not-host-admitted disclosure",
+            "route": "private uid 501 leaf on the pinned Data volume; outer and inner observations must agree before effects",
+            "premises": {
+                "private_home_rustup": "guest toolchain and offline inputs must be source-bound; fixture children retain private homes",
+                "account_home": "synthetic fixture account remains confined to the owned run root",
+                "environment": "scrub hooks and flags; pin the offline guest build and guarded target",
+                "adoption": "no checkout build in a fixture; use only explicit synthetic roots",
+                "cargo_argv": "one locked offline Cargo build in verified guest context; host remains Oxide",
+                "owned_image": "one own image; ordinary detach and whole-backing absence remain required",
+                "compiler_flags": "remove inherited compiler flags and guard hooks from the stage environment",
+                "temporary_storage": "fresh build and staged binary stay inside the guest guard's budgeted root",
+                "mktemp": "exclusive directories have explicit verified owned parents",
+            },
+            "closure": "guest image closure and separately completed joined guest group closure are required; host transport exit proves neither",
+        },
         "premise_dispositions": {
             "private_home_rustup": "every fixture child gets a private HOME/CARGO_HOME and the fixture state; the staged proof-feature compile is the ordinary managed Oxide build and therefore keeps the real account's HOME, CARGO_HOME and rustup home, writes nothing into the fixture, and is pinned to RUSTUP_TOOLCHAIN 1.97.1 with auto-install disabled and the committed lock; no fixture builds",
             "account_home": "fixture_environment binds HOME and BARGE_ACCOUNT_HOME; setup sets OXIDE_TEST_HOME_FROM_ENV for children",

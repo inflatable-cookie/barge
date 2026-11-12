@@ -138,8 +138,13 @@ host-controlled work and guest execution, with the actual admission mechanism
 and its limitations recorded; do not transfer a host allowance as guest proof.
 The existing interim disclosure, if applicable, remains explicit: “Effigy heavy
 admission unavailable (f6b3b50 retired host-run client; Queue #381 pending); not
-host-admitted”, alongside a fresh scheduler headroom receipt. Neither a host
-Nucleus report nor command transport supplies guest admission or guard custody.
+host-admitted”, alongside a fresh scheduler headroom receipt. Use it only after
+the current Barge and VM applicability and every published condition are
+established, including a continuous 20 GiB reserve watchdog, raw qualified
+receipts, unchanged unknown and closure handling, and its stated end condition.
+Neither a host Nucleus report nor command transport supplies guest admission or
+guard custody. Missing guest evidence is not a finding that a mechanism is
+unsupported; it stops the occurrence until the particular fact is established.
 
 ## Guest storage and proof route
 
@@ -209,19 +214,18 @@ establishes the other's closure.
 
 ## Readiness and later authorizations
 
-1. **Read-only preparation now:** review this correction, actual source entries,
-   installed public CLI help and the recorded host metadata. No guest survey or
-   backing inspection is authorized. Owner reads the final design before any
-   subsequent activation.
+1. **Source preparation now:** the scoped 061 guest Cargo apparatus amendment
+   and effect-free covering checks are authorized. No guest survey or backing
+   inspection is authorized. Source readiness requires independent exact-head review.
 2. **Later, separately authorize VM start and guest inspection:** establish the
    existing guest identity, OS/build, command and evidence return channels,
    admission and resource headroom, APFS mount/UUID and required tool availability.
    A failed or missing fact remains unresolved; do not invent a credential or
    change GuestTools.
-3. **Later, separately authorize any necessary setup/install and source change:**
+3. **Later, separately authorize any necessary setup/install:**
    use the existing guest identity; bind and review the fresh guest scratch route,
    exact source and premise differences, toolchain, Oxide and supervisor bytes.
-   No setup, installation or source amendment follows from this document.
+   No setup or installation follows from this document.
 4. **Later, separately activate each exact-head occurrence:** adequate uncounted
    diagnostic first, counted author and distinct retained reviewer after that,
    each with its own prospectively authorized scope and image closure where
@@ -233,5 +237,5 @@ The three open barge#061 images, seven oxide#304 images and all other unclosed
 obligations remain untouched. Both failed author counts remain failed and spent;
 the latest R6 process cause and partial effect extent remain unknown. No old
 root, backing, PID or device path is inspected, reused, repaired or cleaned.
-All 061/304 runtime, source, provisioning and merge gates remain held; 304 still
+All 061/304 runtime, provisioning and merge gates remain held; 304 still
 requires actual qualified 061 publication and its own integrated gates.
