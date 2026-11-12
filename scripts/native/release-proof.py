@@ -2011,11 +2011,11 @@ class Proof:
         if failed is not None:
             raise Fault("R13", failure_detail(
                 failed, run_report_summary(run_doc["data"], unrelated["root_id"], observations)))
-        if os.path.lexists(protected["path"]):
+        if not os.path.lexists(protected["path"]):
             raise Fault("R13", failure_detail(
-                "protected_present",
+                "protected_absent",
                 run_report_summary(run_doc["data"], protected["root_id"],
-                                   {"protected_present": True})))
+                                   {"protected_present": False})))
         return {"protected": protected["root_id"], "unrelated": unrelated["root_id"],
                 "released": 1, "settlement_named": unrelated["path"]}
 
@@ -3050,6 +3050,111 @@ def plan_controls():
     return problems
 
 
+def r13_case_controls():
+    """Drive the real R13 body on fake external query seams. Pure.
+
+    The control enters the actual case method, not a copied predicate: its plan
+    subject is the unrelated root expected eligible, the real run presents the
+    planned digest, the published settlement names the unrelated root's exact
+    path, and both survival observations are actual filesystem queries the
+    control fakes per scenario. The correct outcome (unrelated removed, its live
+    referenced neighbour still present) passes; a missing protected root fails
+    the survival requirement and a surviving unrelated root fails the release
+    oracle. No CLI, filesystem, image or child is touched.
+    """
+    problems = []
+    protected = {"root_id": "protected", "path": "/guard/root/c13/protected"}
+    unrelated = {"root_id": "unrelated", "path": "/guard/root/c13/unrelated"}
+    planned = ({"data": {"plan_digest": "d" * 64}},
+               {"eligible": True, "blocked_by": None}, "/guard/root/R13-plan.json")
+    kept = {"eligible": False, "blocked_by": "references"}
+    run_report = {"released_count": 1, "kept_count": 0, "stopped": False,
+                  "replay_pending": 0,
+                  "rows": [{"root_id": "unrelated", "outcome": "released"}]}
+
+    def lexists_for(protected_present, unrelated_present):
+        def check(path):
+            if path == protected["path"]:
+                return protected_present
+            if path == unrelated["path"]:
+                return unrelated_present
+            raise AssertionError(f"an unexpected path observation: {path}")
+        return check
+
+    def build():
+        proof = Proof.__new__(Proof)
+        proof.home = "/guard/home"
+        calls = []
+        roots = iter([protected, unrelated])
+        proof.fresh_area = lambda *args, **kwargs: calls.append("fresh_area") or "c13"
+        proof.new_root = lambda area, aged=True: calls.append(("new_root", area, aged)) or next(roots)
+        proof.oxide_row = lambda root, checkout, **kwargs: \
+            calls.append(("oxide_row", root["root_id"])) or {"row": root["root_id"]}
+        proof.settlement = lambda path: {"root": path}
+        proof.coordinated_registry = lambda rows, settled, **kwargs: \
+            calls.append(("coordinated_registry", rows[0]["row"], settled[0]["root"]))
+        proof.row_for = lambda document, root: calls.append(("row_for", root["root_id"])) or kept
+
+        def planned_run(case, area, root, **kwargs):
+            calls.append(("plan_and_run", case, root["root_id"], kwargs.get("expect_eligible")))
+            return planned
+
+        proof.plan_and_run = planned_run
+
+        def real_run(plan_file, digest, expect=0):
+            calls.append(("real", plan_file, digest, expect))
+            return 0, {"data": run_report}
+
+        proof.real = real_run
+        return proof, calls
+
+    # The correct outcome: the unrelated root is removed, the live referenced
+    # neighbour survives, and every seam saw its real argument.
+    proof, calls = build()
+    try:
+        with mock.patch("os.path.lexists", lexists_for(True, False)):
+            evidence = proof.case_coordinated_registry_releases_unrelated_and_keeps_live_reference()
+    except Fault as error:
+        problems.append(f"the real R13 body refused its correct outcome: "
+                        f"{error.check}: {error.detail[:FAILURE_TEXT_CHARS]}")
+    else:
+        failed = first_failed_predicate([
+            ("plan_subject", lambda: ("plan_and_run", "R13", "unrelated", True) not in calls),
+            ("row_for_protected", lambda: ("row_for", "protected") not in calls),
+            ("run_digest",
+             lambda: ("real", "/guard/root/R13-plan.json", "d" * 64, 0) not in calls),
+            ("published_document",
+             lambda: ("coordinated_registry", "protected", unrelated["path"]) not in calls),
+            ("released", lambda: evidence.get("released") != 1),
+        ])
+        if failed is not None:
+            problems.append(f"the real R13 body failed its correct outcome at {failed}: "
+                            f"{calls}, {evidence}")
+
+    # A missing protected root fails the survival requirement, at the real method.
+    proof, calls = build()
+    try:
+        with mock.patch("os.path.lexists", lexists_for(False, False)):
+            proof.case_coordinated_registry_releases_unrelated_and_keeps_live_reference()
+        problems.append("a missing protected root passed R13")
+    except Fault as error:
+        if error.check != "R13" or "protected_absent" not in error.detail:
+            problems.append(f"an absent protected root failed as {error.check}: "
+                            f"{error.detail[:FAILURE_TEXT_CHARS]}")
+
+    # A surviving unrelated root fails the release oracle's own polarity.
+    proof, calls = build()
+    try:
+        with mock.patch("os.path.lexists", lexists_for(True, True)):
+            proof.case_coordinated_registry_releases_unrelated_and_keeps_live_reference()
+        problems.append("a still-present unrelated root passed R13")
+    except Fault as error:
+        if error.check != "R13" or "path_present" not in error.detail:
+            problems.append(f"a surviving unrelated root failed as {error.check}: "
+                            f"{error.detail[:FAILURE_TEXT_CHARS]}")
+    return problems
+
+
 def containment_facts(**overrides):
     """The pinned guard's real monitored layout as canned facts, plus overrides. Pure.
 
@@ -3256,6 +3361,7 @@ def pure_self_check():
     problems += closure_controls()
     problems += containment_controls()
     problems += plan_controls()
+    problems += r13_case_controls()
     problems += failure_report_controls()
     problems += guarded_controls()
     # Exercise the same path and rollback helpers used by R11, without a filesystem.
