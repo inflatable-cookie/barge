@@ -5454,6 +5454,231 @@ mod tests {
     }
 
     #[test]
+    fn a_coordinated_registry_releases_an_unrelated_root_and_keeps_its_live_reference() {
+        // Oxide's coordinated registry (/4): its live selection keeps its own
+        // root while an unrelated eligible root releases, and the retained
+        // settlement naming that unrelated root's exact path is a terminal
+        // fact that keeps nothing. Settlements are never references.
+        let fixture = Fixture::new("release-coordinated-live");
+        let protected = fixture.root();
+        let unrelated = fixture.root();
+        let live_row = serde_json::json!({
+            "checkout_id": "c".repeat(64),
+            "checkout": fixture.account.home.join("checkout").display().to_string(),
+            "receipt": fixture.account.home.join("receipt.json").display().to_string(),
+            "member": "target",
+            "root": protected.path.display().to_string(),
+            "root_kind": "external",
+            "recipe": "target-debug-v1",
+            "generation": 1,
+            "selected": true,
+            "pending": false,
+        });
+        let settlement = serde_json::json!({
+            "caller": "oxide.outputs",
+            "key": "a".repeat(32),
+            "checkout_id": "c".repeat(64),
+            "root": unrelated.path.display().to_string(),
+            "nonce": "b".repeat(32),
+            "outcome": "deleted",
+            "terminal_ms": 1,
+            "request_sha256": "d".repeat(64),
+        });
+        let document = serde_json::json!({
+            "version": reference::OXIDE_REGISTRY_V4,
+            "schema": 4,
+            "revision": 2,
+            "complete": true,
+            "created_by": "oxide",
+            "rows": [live_row],
+            "settled": [settlement],
+        });
+        let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
+        std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
+        std::fs::write(
+            outputs.join(reference::OXIDE_REGISTRY_FILE),
+            serde_json::to_vec(&document).expect("the registry encodes"),
+        )
+        .expect("the registry is written");
+
+        let report = fixture.plan();
+        let kept = row(&report, &protected);
+        assert!(!kept.eligible, "{kept:?}");
+        assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+        assert!(kept.references.iter().any(|reference| {
+            reference.source == reference::OXIDE_REGISTRY && reference.current
+        }));
+        let released = row(&report, &unrelated);
+        assert!(released.eligible, "{released:?}");
+
+        let (bytes, digest) = presented(&report);
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let run = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &digest,
+        )
+        .expect("the run is reported");
+        assert_eq!(run.released_count, 1, "{run:?}");
+        assert_eq!(run.kept_count, 0, "{run:?}");
+        assert_eq!(run.rows.len(), 1, "only the eligible root is run: {run:?}");
+        assert!(
+            std::fs::metadata(&unrelated.path).is_err(),
+            "the unrelated root is released past its terminal settlement"
+        );
+        assert!(
+            std::fs::metadata(&protected.path).is_ok(),
+            "the live reference keeps its root"
+        );
+    }
+
+    #[test]
+    fn a_malformed_coordinated_registry_refuses_the_whole_batch_and_changes_nothing() {
+        // A coordinated registry that omits its settlement set is not a
+        // readable document: the plan keeps the whole batch it covers, and a
+        // presented plan cannot run either. Nothing is released and no intent
+        // is written.
+        let fixture = Fixture::new("release-coordinated-malformed");
+        let first = fixture.root();
+        let second = fixture.root();
+        let document = serde_json::json!({
+            "version": reference::OXIDE_REGISTRY_V4,
+            "schema": 4,
+            "revision": 2,
+            "complete": true,
+            "created_by": "oxide",
+            "rows": [],
+        });
+        let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
+        std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
+        std::fs::write(
+            outputs.join(reference::OXIDE_REGISTRY_FILE),
+            serde_json::to_vec(&document).expect("the registry encodes"),
+        )
+        .expect("the registry is written");
+
+        let report = fixture.plan();
+        for root in [&first, &second] {
+            let kept = row(&report, root);
+            assert!(!kept.eligible, "{kept:?}");
+            assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+            assert!(!kept.references_complete, "the batch is kept, not one root");
+        }
+        assert_eq!(report.plan.eligible_count, 0);
+        assert!(!report.oxide.complete);
+        assert!(
+            report.needs_human(),
+            "an unreadable coordinated set exits 3"
+        );
+
+        let (bytes, digest) = presented(&report);
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let error = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &digest,
+        )
+        .expect_err("a malformed coordinated registry keeps the whole batch");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(std::fs::metadata(&first.path).is_ok());
+        assert!(std::fs::metadata(&second.path).is_ok());
+        assert!(intent_records(&fixture).is_empty());
+    }
+
+    #[test]
+    fn the_coordinated_census_reads_the_release_fixture_and_a_malformed_one_stays_unknown() {
+        // The census reads the same coordinated document the release gate
+        // reads, through its own entry point, and reports its document facts;
+        // the malformed twin is unknown state to both readers, because both
+        // validate through the one shared settlement rule.
+        let fixture = Fixture::new("census-coordinated-fixture");
+        let protected = fixture.root();
+        let live_row = serde_json::json!({
+            "checkout_id": "c".repeat(64),
+            "checkout": fixture.account.home.join("checkout").display().to_string(),
+            "receipt": fixture.account.home.join("receipt.json").display().to_string(),
+            "member": "target",
+            "root": protected.path.display().to_string(),
+            "root_kind": "external",
+            "recipe": "target-debug-v1",
+            "generation": 1,
+            "selected": true,
+            "pending": false,
+        });
+        let settlement = serde_json::json!({
+            "caller": "oxide.outputs",
+            "key": "a".repeat(32),
+            "checkout_id": "c".repeat(64),
+            "root": "/Volumes/Builds/gone",
+            "nonce": "b".repeat(32),
+            "outcome": "deleted",
+            "terminal_ms": 1,
+            "request_sha256": "d".repeat(64),
+        });
+        let document = serde_json::json!({
+            "version": reference::OXIDE_REGISTRY_V4,
+            "schema": 4,
+            "revision": 2,
+            "complete": true,
+            "created_by": "oxide",
+            "rows": [live_row],
+            "settled": [settlement],
+        });
+        let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
+        std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
+        let registry_path = outputs.join(reference::OXIDE_REGISTRY_FILE);
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec(&document).expect("the registry encodes"),
+        )
+        .expect("the registry is written");
+        let observation = crate::census::read_registry(
+            &registry_path,
+            Deadline::after(crate::census::OXIDE_CENSUS_DEADLINE),
+        );
+        let observed = observation
+            .observed()
+            .expect("a coordinated registry is reported, not unknown");
+        assert_eq!(observed.value().version(), reference::OXIDE_REGISTRY_V4);
+        assert_eq!(observed.value().schema(), 4);
+        assert_eq!(observed.value().rows().len(), 1);
+        assert!(observed.value().rows()[0].selected());
+
+        // The same format without its settlement set is unknown state to the
+        // census too, with the same reason the release gate refuses it.
+        let mut malformed = document.clone();
+        malformed
+            .as_object_mut()
+            .expect("the registry is an object")
+            .remove("settled");
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec(&malformed).expect("the registry encodes"),
+        )
+        .expect("the registry is written");
+        let observation = crate::census::read_registry(
+            &registry_path,
+            Deadline::after(crate::census::OXIDE_CENSUS_DEADLINE),
+        );
+        assert_eq!(
+            observation.state(),
+            crate::inspect::ObservationState::UnknownState
+        );
+        let detail = observation
+            .detail()
+            .expect("an unknown observation says why");
+        assert!(detail.contains("settlement set"), "{detail}");
+    }
+
+    #[test]
     fn a_release_by_reference_policy_releases_a_root_without_an_age_gate() {
         let fixture = Fixture::new("release-by-reference");
         let mut declaration = fixture.declaration.clone();

@@ -47,6 +47,7 @@ pub mod inspect;
 pub mod operation;
 pub mod os;
 pub mod oxide_outputs;
+pub(crate) mod oxide_settlement;
 pub mod pool_custody;
 pub mod prune;
 pub mod reference;

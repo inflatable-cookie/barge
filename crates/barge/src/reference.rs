@@ -10,8 +10,10 @@
 //!   is current, and a hold that is live or undecidable is current. A stale hold
 //!   is not: custody has already classified it as positively gone.
 //! - **Oxide's own records, read strictly in place** (Q-004): the outputs
-//!   registry `oxide.outputs.registry/2` (and its `/1` predecessor), the
-//!   checkout receipts `oxide.outputs.transition/1..3`, and one root marker
+//!   registry `oxide.outputs.registry/1`–`/4`, each in exactly the field set
+//!   its version defines (`/3` requires its `deletion_routes`; `/4` requires
+//!   its retained `settled` set and carries no routes), the checkout receipts
+//!   `oxide.outputs.transition/1..3`, and one root marker
 //!   `oxide.outputs.root/2` (`/1` is read as unknown). Nothing is written,
 //!   nothing is adopted and no Oxide fact becomes authoritative. A row that is
 //!   selected, pending, reserved, pruning or cancelling is current; Oxide's own
@@ -68,6 +70,10 @@ pub const OXIDE_WRITER_CUSTODY: &str = "oxide_writer_custody";
 
 /// Oxide's explicit deletion-route registry.
 pub const OXIDE_REGISTRY_V3: &str = "oxide.outputs.registry/3";
+/// Oxide's coordinated single-authority registry. Its `settled` array is the
+/// retained terminal record of delegated deletions, read and validated through
+/// [`crate::oxide_settlement`], and its `deletion_routes` member is gone.
+pub const OXIDE_REGISTRY_V4: &str = "oxide.outputs.registry/4";
 /// The historical outputs registry without deletion routes.
 pub const OXIDE_REGISTRY_V2: &str = "oxide.outputs.registry/2";
 /// Oxide's predecessor outputs registry, read as its own field set.
@@ -83,7 +89,7 @@ pub const OXIDE_INTENT_V1: &str = "oxide.outputs.prune-intent/1";
 pub const MAX_TEXT_BYTES: usize = 1024;
 
 /// Whether a value is one of Oxide's 128-bit lowercase hex ids.
-fn is_hex32(value: &str) -> bool {
+pub(crate) fn is_hex32(value: &str) -> bool {
     value.len() == 32
         && value
             .bytes()
@@ -91,7 +97,7 @@ fn is_hex32(value: &str) -> bool {
 }
 
 /// Whether a value is one of Oxide's 256-bit lowercase hex digests.
-fn is_hex64(value: &str) -> bool {
+pub(crate) fn is_hex64(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -105,7 +111,7 @@ fn is_hex64(value: &str) -> bool {
 /// component is never the component chain of a root Barge walks, so accepting one
 /// would let a snapshot look complete while a root it names looks unreferenced: the
 /// document is divergent instead.
-fn is_safe_absolute(path: &Path) -> bool {
+pub(crate) fn is_safe_absolute(path: &Path) -> bool {
     path.is_absolute()
         && path.components().all(|component| {
             !matches!(
@@ -1322,6 +1328,14 @@ struct RawRegistry {
     #[serde(default)]
     #[allow(dead_code)]
     cancelled_overflow: Vec<String>,
+    /// The coordinated registry's retained settlement facts, read and
+    /// validated through the one shared rule both readers use. Required
+    /// present on `/4`, refused on every predecessor.
+    #[serde(
+        default,
+        deserialize_with = "crate::oxide_settlement::read_settlements"
+    )]
+    settled: Option<Vec<crate::oxide_settlement::RawSettlement>>,
 }
 
 /// An explicitly present route array must be an array, including when empty.
@@ -1517,7 +1531,14 @@ struct RawRow {
 fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
     let raw: RawRegistry = serde_json::from_slice(bytes)
         .map_err(|error| format!("the registry is not the field set Oxide writes: {error}"))?;
-    if ![OXIDE_REGISTRY_V1, OXIDE_REGISTRY_V2, OXIDE_REGISTRY_V3].contains(&raw.version.as_str()) {
+    if ![
+        OXIDE_REGISTRY_V1,
+        OXIDE_REGISTRY_V2,
+        OXIDE_REGISTRY_V3,
+        OXIDE_REGISTRY_V4,
+    ]
+    .contains(&raw.version.as_str())
+    {
         return Err(format!(
             "`{}` is not a version this build reads",
             raw.version
@@ -1528,6 +1549,14 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
     if raw.version == OXIDE_REGISTRY_V2 && raw.schema != 0 && raw.schema != 2 {
         return Err(format!(
             "a `{OXIDE_REGISTRY_V2}` registry states format {}",
+            raw.schema
+        ));
+    }
+    // Oxide's own validate: a coordinated registry is only ever the exact
+    // version/schema pair, and it always writes the numeric schema.
+    if raw.version == OXIDE_REGISTRY_V4 && raw.schema != 4 {
+        return Err(format!(
+            "a `{OXIDE_REGISTRY_V4}` registry must state numeric schema 4, not {}",
             raw.schema
         ));
     }
@@ -1566,7 +1595,25 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
             }
         }
     } else if raw.deletion_routes.is_some() {
+        if raw.version == OXIDE_REGISTRY_V4 {
+            return Err("the coordinated registry cannot carry deletion_routes".to_owned());
+        }
         return Err("a historical registry cannot carry deletion_routes".to_owned());
+    }
+    // The coordinated registry's settlement set: required present and
+    // validated on `/4`, refused on every predecessor. The entries are
+    // retained terminal facts, never references: they are validated here and
+    // dropped, because the registry's current rows and intents still decide
+    // everything a reference depends on.
+    match (raw.version == OXIDE_REGISTRY_V4, raw.settled) {
+        (true, Some(entries)) => crate::oxide_settlement::validate_settlement_set(&entries)?,
+        (true, None) => {
+            return Err("a coordinated registry omits its settlement set".to_owned());
+        }
+        (false, Some(_)) => {
+            return Err("a predecessor registry cannot carry settlement facts".to_owned());
+        }
+        (false, None) => {}
     }
     if raw.rows.len() > REGISTRY_ROWS {
         return Err(format!(
@@ -2843,6 +2890,234 @@ mod tests {
             };
             assert_eq!(intents[0].deletion_route, None);
         }
+    }
+
+    /// A coordinated-registry document exactly as Oxide writes it after
+    /// adopting single authority (Oxide at 8346df5e): the exact version/schema
+    /// pair, no `deletion_routes`, and a present `settled` array whose entries
+    /// are exactly Oxide's `Settlement` field set in its serialization order.
+    fn coordinated_registry() -> serde_json::Value {
+        serde_json::json!({
+            "version": OXIDE_REGISTRY_V4, "schema": 4, "revision": 2,
+            "complete": true, "created_by": "oxide", "rows": [],
+            "settled": [],
+        })
+    }
+
+    /// One settlement entry, exactly Oxide's serialized `Settlement` field set:
+    /// the caller, a 32-hex key, a 64-hex checkout id, an absolute root, a
+    /// present 32-hex nonce, the `deleted` outcome, a positive terminal time
+    /// and a 64-hex request digest.
+    fn settlement_entry(root: &str) -> serde_json::Value {
+        serde_json::json!({
+            "caller": "oxide.outputs",
+            "key": "a".repeat(32),
+            "checkout_id": "c".repeat(64),
+            "root": root,
+            "nonce": "b".repeat(32),
+            "outcome": "deleted",
+            "terminal_ms": 1,
+            "request_sha256": "d".repeat(64),
+        })
+    }
+
+    #[test]
+    fn a_coordinated_registry_requires_its_present_settlement_set() {
+        // The adopted empty set is Oxide's own upgrade shape: present, empty,
+        // and never inferred.
+        let read = parse_registry(&serde_json::to_vec(&coordinated_registry()).expect("encodes"));
+        assert!(matches!(
+            read,
+            Ok(OxideRegistry::Read { complete: true, .. })
+        ));
+
+        // A settlement entry with every field exactly right reads.
+        let mut with_entry = coordinated_registry();
+        with_entry["settled"] = serde_json::json!([settlement_entry("/Volumes/Builds/gone")]);
+        assert!(matches!(
+            parse_registry(&serde_json::to_vec(&with_entry).expect("encodes")),
+            Ok(OxideRegistry::Read { .. })
+        ));
+
+        // Absent, null, and not-an-array are all refusals: neither ever reads
+        // as an empty set or as absence of the member.
+        let mut absent = coordinated_registry();
+        absent.as_object_mut().expect("object").remove("settled");
+        assert!(parse_registry(&serde_json::to_vec(&absent).expect("encodes")).is_err());
+        let mut null = coordinated_registry();
+        null["settled"] = serde_json::Value::Null;
+        assert!(parse_registry(&serde_json::to_vec(&null).expect("encodes")).is_err());
+        let mut string = coordinated_registry();
+        string["settled"] = serde_json::json!("gone");
+        assert!(parse_registry(&serde_json::to_vec(&string).expect("encodes")).is_err());
+    }
+
+    #[test]
+    fn a_settlement_matrix_refuses_every_unusable_entry() {
+        let valid = settlement_entry("/Volumes/Builds/gone");
+        let mut cases = Vec::new();
+        for (field, value) in [
+            ("caller", serde_json::json!("oxide.other")),
+            ("caller", serde_json::json!("")),
+            ("key", serde_json::json!("A".repeat(32))),
+            ("key", serde_json::json!("a".repeat(31))),
+            ("key", serde_json::json!("g".repeat(32))),
+            ("key", serde_json::json!("")),
+            ("checkout_id", serde_json::json!("c".repeat(63))),
+            ("checkout_id", serde_json::json!("C".repeat(64))),
+            ("root", serde_json::json!("gone")),
+            ("root", serde_json::json!("/Volumes/Builds/../Builds/gone")),
+            ("nonce", serde_json::Value::Null),
+            ("nonce", serde_json::json!("b".repeat(31))),
+            ("nonce", serde_json::json!("B".repeat(32))),
+            ("outcome", serde_json::json!("removed")),
+            ("outcome", serde_json::json!("")),
+            ("terminal_ms", serde_json::json!(0)),
+            ("request_sha256", serde_json::json!("d".repeat(63))),
+            ("request_sha256", serde_json::json!("D".repeat(64))),
+            ("invented", serde_json::json!(true)),
+        ] {
+            let mut changed = valid.clone();
+            changed[field] = value;
+            cases.push(changed);
+        }
+        // A missing nonce member is not a present one: it reads as absent and
+        // an absent nonce is refused.
+        let mut without_nonce = valid.clone();
+        without_nonce
+            .as_object_mut()
+            .expect("object")
+            .remove("nonce");
+        cases.push(without_nonce);
+        // The same settlement twice is a repeat.
+        cases.push(serde_json::json!([valid.clone(), valid.clone()]));
+        // The same key under the one caller twice is a repeat too.
+        let mut other_root = valid.clone();
+        other_root["root"] = serde_json::json!("/Volumes/Builds/also-gone");
+        cases.push(serde_json::json!([valid, other_root]));
+        for settled in cases {
+            let mut document = coordinated_registry();
+            document["settled"] = serde_json::json!([settled]);
+            assert!(
+                parse_registry(&serde_json::to_vec(&document).expect("encodes")).is_err(),
+                "the settlement must be refused: {document}"
+            );
+        }
+
+        // The retained set shares Oxide's 256-entry cap: 256 entries read,
+        // 257 refuse.
+        for count in [256, 257] {
+            let entries: Vec<serde_json::Value> = (0..count)
+                .map(|index| {
+                    let mut entry = settlement_entry("/Volumes/Builds/gone");
+                    entry["key"] = serde_json::json!(format!("{index:032x}"));
+                    entry
+                })
+                .collect();
+            let mut document = coordinated_registry();
+            document["settled"] = serde_json::Value::Array(entries);
+            assert_eq!(
+                parse_registry(&serde_json::to_vec(&document).expect("encodes")).is_ok(),
+                count == 256,
+                "the settlement cap binds at {count} entries"
+            );
+        }
+    }
+
+    #[test]
+    fn settlement_facts_belong_only_to_the_coordinated_format() {
+        // Every predecessor refuses the member: a settled array must never
+        // retroactively attach to a format that never wrote one.
+        for (version, schema) in [
+            (OXIDE_REGISTRY_V1, serde_json::json!(1)),
+            (OXIDE_REGISTRY_V2, serde_json::json!(2)),
+            (OXIDE_REGISTRY_V3, serde_json::json!(3)),
+        ] {
+            let mut predecessor = coordinated_registry();
+            predecessor["version"] = serde_json::json!(version);
+            predecessor["schema"] = schema;
+            assert!(
+                parse_registry(&serde_json::to_vec(&predecessor).expect("encodes")).is_err(),
+                "{version} must refuse settled"
+            );
+        }
+
+        // The coordinated format refuses the predecessor's routes, with or
+        // without its own settlement set.
+        for settled in [serde_json::Value::Null, serde_json::json!([])] {
+            let mut routed = coordinated_registry();
+            routed["deletion_routes"] =
+                serde_json::json!([{"intent_id": "1".repeat(32), "deleter": "local"}]);
+            if settled.is_null() {
+                routed.as_object_mut().expect("object").remove("settled");
+            }
+            assert!(parse_registry(&serde_json::to_vec(&routed).expect("encodes")).is_err());
+        }
+
+        // The version/schema pair is exact: no other numeric format states the
+        // coordinated version, and the schema is always written.
+        for schema in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(1),
+            serde_json::json!(2),
+            serde_json::json!(3),
+            serde_json::json!(5),
+        ] {
+            let mut document = coordinated_registry();
+            if schema.is_null() {
+                document.as_object_mut().expect("object").remove("schema");
+            } else {
+                document["schema"] = schema.clone();
+            }
+            assert!(
+                parse_registry(&serde_json::to_vec(&document).expect("encodes")).is_err(),
+                "schema {schema} must refuse the coordinated version"
+            );
+        }
+    }
+
+    #[test]
+    fn a_settlement_is_a_terminal_fact_that_never_names_a_root() {
+        // A settlement whose root path is the only record of a root: the
+        // registry reads with no rows and no intents. The terminal fact alone
+        // contributes nothing a reference depends on.
+        let mut alone = coordinated_registry();
+        alone["settled"] = serde_json::json!([settlement_entry("/Volumes/Builds/gone")]);
+        let Ok(OxideRegistry::Read { rows, intents, .. }) =
+            parse_registry(&serde_json::to_vec(&alone).expect("encodes"))
+        else {
+            panic!("the terminal fact alone reads")
+        };
+        assert!(rows.is_empty() && intents.is_empty());
+
+        // A settled history row and a settlement naming the same path
+        // coexist: the row is present and not live, and the settlement adds
+        // nothing. A settlement never turns a row's path into a reference.
+        let mut both = coordinated_registry();
+        both["rows"] = serde_json::json!([
+            {
+                "checkout_id": "c".repeat(64),
+                "checkout": "/Users/fixture/Dev/example",
+                "receipt": "/pool/receipt.json",
+                "member": "target",
+                "root": "/Volumes/Builds/gone",
+                "root_kind": "external",
+                "recipe": "target-debug-v1",
+                "generation": 1,
+                "selected": false,
+                "pending": false,
+            }
+        ]);
+        both["settled"] = serde_json::json!([settlement_entry("/Volumes/Builds/gone")]);
+        let Ok(OxideRegistry::Read { rows, intents, .. }) =
+            parse_registry(&serde_json::to_vec(&both).expect("encodes"))
+        else {
+            panic!("the row and the terminal fact coexist")
+        };
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].live(), "a settled row stays settled: {rows:?}");
+        assert!(intents.is_empty());
     }
 
     #[test]
