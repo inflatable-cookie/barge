@@ -679,9 +679,10 @@ Rules that keep the handover safe:
 - While Oxide prunes, **Barge deletes no Oxide root.** The primitive is
   implemented and proven against Barge-owned roots first; Oxide's adoption is
   its own slice with its own brief (stage 1 S8, `F6` below).
-- Barge never writes an Oxide marker, receipt, registry row, tombstone, control
-  state or ledger. It reads `oxide.outputs.root/2` markers,
-  `oxide.outputs.registry/2` rows, the receipts and each pool's `state.json` and
+- Barge never writes an Oxide marker, receipt, registry row, settlement,
+  tombstone, control state or ledger. It reads `oxide.outputs.root/2` markers,
+  `oxide.outputs.registry/1`–`/4` rows and settlement sets (each version in its
+  own exact field set), the receipts and each pool's `state.json` and
   `ledger.json` strictly, bounded and in place, and reports them. It takes no
   Oxide lock and creates no file.
 - Where Oxide's own rule is stricter than Barge's — the complete-receipt
@@ -706,8 +707,13 @@ single root. `barge inspect` already reads Oxide's state in place and reports
 observations; stage 4 adds one bounded, read-only observation:
 
 ```text
-<internal pool>/outputs/registry.json   oxide.outputs.registry/3 (and /2, /1)
+<internal pool>/outputs/registry.json   oxide.outputs.registry/4 (and /2, /1)
 ```
+
+The census reads `/1` and `/2` as always, and the coordinated `/4` with its
+required `settled` set through the same shared strict reading the release gate
+uses ([barge#060](#the-coordinated-registry-settlement-set-2026-11-12)). The
+delegated `/3` stays a version this reader does not read, as it always was.
 
 with, per row: the recorded root path, `volume_uuid`, `nonce`, `generation`,
 `root_dev`, `root_ino`, `marker_digest`, the selection flags, and — where the
@@ -1121,6 +1127,60 @@ credited by source controls. The existing 128 MiB image, 300 s / 512 MiB guard,
 30 s work stop, supervisor pin, pre-backing custody and detach/reap/whole-backing
 closure gates remain. Production account lookup, O2/O3, parent-reader conversion,
 installation, real grants/registration, migration and live adoption remain held.
+
+### The coordinated registry settlement set (2026-11-12)
+
+Oxide's approved single-authority implementation (oxide#304, read-only source
+at `8346df5e97046b4cd05f352d7cea120823134bdb`, tree
+`46067fe353302b730f7abcdb18890564fe1875a0`) adopted the coordinated registry
+`oxide.outputs.registry/4` and its completed diagnostic actually published one:
+its generic-release fixture then failed because Barge059's readers refused the
+then-unknown `settled` member, keeping the whole batch (the packet at
+`/Volumes/Stash/scratch/oxide/a1512f41/replacement-diagnostic.n1976_od`, packet
+SHA-256 `2a2f68826f8997f7ebc1ed5a13c3e44f68ce33d909bfe1573c68faec088d7502`, is
+the retained FAILED/INADEQUATE evidence; it is a refusal, never a
+qualification). Barge#060 is the bounded compatibility correction: both of
+Barge's registry readers read `/4` strictly, additively, without changing any
+historical disposition.
+
+The exact `/4` wire and rules, derived from Oxide's own `Registry::validate` at
+that source and mirrored in `crates/barge/src/oxide_settlement.rs`, the one
+shared crate-private reader both consumers use:
+
+- The version/schema pair is exact: `oxide.outputs.registry/4` requires numeric
+  schema 4, which Oxide always writes.
+- `settled` is required present and must be an array (the adopted empty set is
+  normal); absent, explicit `null` or a non-array is a refusal, never an empty
+  set. `deletion_routes` is refused on `/4` as on `/1` and `/2`.
+- Each settlement entry is exactly the field set
+  `caller,key,checkout_id,root,nonce,outcome,terminal_ms,request_sha256`, with
+  caller `oxide.outputs`, a lowercase 32-hex key, a lowercase 64-hex checkout
+  id, an absolute usable root (Barge's established recorded-root rule, which
+  also refuses `.` and `..` components), a present lowercase 32-hex nonce, the
+  one `deleted` outcome, a positive `terminal_ms`, a lowercase 64-hex request
+  digest, unique `(caller, key)`, and Oxide's own 256-entry cap. Anything else
+  makes the whole document Unknown.
+- Every predecessor (`/1`, `/2`, `/3`) refuses `settled`; the census's existing
+  disposition on `/3` is unchanged (it still does not read that version).
+- A settlement is a retained TERMINAL domain fact. It is validated and then
+  dropped: it is never a live root reference, never deletion authority and
+  never a second progress journal. The registry's current rows and intents
+  still decide everything a reference depends on, even where a settlement
+  names the same path, and an invalid settlement set keeps the whole affected
+  release batch as Unknown.
+
+The correction is covered by fixture regressions on both readers and by the
+composed release gate, and the existing release proof's case table gains R13
+(valid `/4`: an unrelated root releases past a settlement naming its exact path
+while a live reference keeps its root), R14 (malformed `/4`: whole-batch
+refusal, no effects) and R15 (the census reports the same `/4` document; its
+malformed twin stays unknown), each carried by a named regression. Those are
+readiness cases only: any actual native run remains separately owner-activated
+diagnostic, counted author and distinct retained-reviewer occurrences at an
+accepted exact head, on the unchanged qualified supervisor and image bounds.
+This correction establishes neither Oxide304's adoption, the production
+account lookup, nor any live-drive behavior, and the synthetic-versus-native
+evidence limit of the retained diagnostic stands.
 
 ### Delegated checkout absence bound to its volume (2026-11-10)
 
