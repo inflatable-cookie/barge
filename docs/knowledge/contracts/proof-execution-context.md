@@ -212,6 +212,34 @@ exception, broadened ceiling or automatic retry. The supervisor's session-scoped
 census is separate from the product's same-uid whole-guest scan; neither
 establishes the other's closure.
 
+For the 061 guest apparatus amendment the nine premise dispositions are:
+
+1. **Private HOME and rustup:** fixture children use private HOME and CARGO_HOME;
+   they do not build or install a toolchain. The guest build binds the official
+   toolchain, committed lock and complete offline inputs; the ordinary host
+   route retains its existing rustup handling.
+2. **Account home:** fixture children use the synthetic account home inside
+   the guard's owned scratch.
+3. **Environment:** inherited hooks and compiler flags are scrubbed; source,
+   tool and route identities are independently rechecked inside the guard.
+4. **Adoption:** the proof creates synthetic roots explicitly; no fixture builds
+   or live adoption are implied.
+5. **Cargo external argv:** these cases invoke no fake Cargo external
+   subcommand. The separately staged guest build uses pinned locked, offline
+   Cargo; ordinary host builds continue through Oxide.
+6. **Owned image:** the one fresh image needs ordinary detach, reap and
+   whole-backing absence; uncertain custody stays retained.
+7. **Compiler flags:** inherited Rust flags and wrappers cannot alter the build;
+   tool and input identities remain part of the bound source evidence.
+8. **Temporary storage:** guest build output and staged binary stay inside the
+   existing guard's monitored 512 MiB root and 300 s occurrence.
+9. **macOS mktemp:** Python's `mkdtemp` receives an explicit owned parent;
+   the Data leaf and stage directories are exclusive and verified.
+
+These are requirements of the amendment, not observations of a guest run.
+Current admission, byte-preserving transfer, the guard's actual guest closure
+and each runtime occurrence remain separately evidenced and activated.
+
 ## Readiness and later authorizations
 
 1. **Source preparation now:** the scoped 061 guest Cargo apparatus amendment

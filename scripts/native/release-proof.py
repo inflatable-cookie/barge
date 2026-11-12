@@ -70,6 +70,7 @@ import os
 import plistlib
 import pwd
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1077,21 +1078,17 @@ def guest_instruction(path, expected_sha256):
         os.close(fd)
 
 
-def guest_binding_problems(record, observed, *, check_route=True):
-    """Check scoped instruction data against separately attributed observations.
-
-    This comparison is not authentication, admission, or closure.  The host
-    participant owns the record and independently verifies the registered VM;
-    the guest cannot observe the host's Nucleus role or Parallels registration.
-    """
-    if not isinstance(record, dict) or not isinstance(observed, dict):
-        return ["guest invocation binding or observations are missing"]
+def guest_record_problems(record):
+    """Validate the owner's scoped instruction data without asserting authority."""
+    if not isinstance(record, dict):
+        return ["guest invocation binding is missing"]
     required = {
         "task", "role", "run", "activation", "mode", "vm_uuid", "uid", "gid",
         "home", "mount", "volume_uuid", "scratch", "head", "tree", "lock_sha256",
         "guard_sha256", "toolchain", "target", "features", "command_sha256",
         "inputs_sha256", "nonce", "cargo_path", "cargo_sha256", "rustc_path", "rustc_sha256",
         "input_manifest", "supervisor_path", "source_path", "cargo_home", "toolchain_root",
+        "instruction_guest_path", "python_path", "python_sha256",
     }
     if set(record) != required:
         return ["guest invocation binding has missing or unexpected fields"]
@@ -1114,7 +1111,7 @@ def guest_binding_problems(record, observed, *, check_route=True):
             problems.append(f"guest invocation {key} is malformed")
     for key, length in (("head", 40), ("tree", 40), ("lock_sha256", 64),
                         ("command_sha256", 64), ("inputs_sha256", 64), ("cargo_sha256", 64),
-                        ("rustc_sha256", 64)):
+                        ("rustc_sha256", 64), ("python_sha256", 64)):
         if not isinstance(record[key], str) or not re.fullmatch(rf"[0-9a-f]{{{length}}}", record[key]):
             problems.append(f"guest invocation {key} is malformed")
     scratch = record["scratch"]
@@ -1122,7 +1119,7 @@ def guest_binding_problems(record, observed, *, check_route=True):
             not re.fullmatch(r"barge-proof-[A-Za-z0-9_-]{8,80}", os.path.basename(scratch)):
         problems.append("guest scratch is not a named private leaf of the Data parent")
     for key in ("cargo_path", "rustc_path", "input_manifest", "supervisor_path", "source_path",
-                "cargo_home", "toolchain_root"):
+                "cargo_home", "toolchain_root", "instruction_guest_path", "python_path"):
         path = record[key]
         if not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path:
             problems.append(f"guest {key} is not absolute and canonical")
@@ -1131,10 +1128,18 @@ def guest_binding_problems(record, observed, *, check_route=True):
             not isinstance(record[key], str) or not record[key].startswith(toolchain_root + os.sep)
             for key in ("cargo_path", "rustc_path")):
         problems.append("guest tools are outside the bound toolchain root")
+    return problems
+
+
+def guest_binding_problems(record, observed, *, check_route=True):
+    """Compare guest-observable facts without claiming host authority or admission."""
+    problems = guest_record_problems(record)
+    if problems or not isinstance(observed, dict):
+        return problems or ["guest observations are missing"]
     for key in ("uid", "gid", "home", "mount", "volume_uuid", "scratch", "head", "tree",
                 "lock_sha256", "guard_sha256", "toolchain", "target", "features", "inputs_sha256",
                 "cargo_path", "cargo_sha256", "rustc_path", "rustc_sha256", "input_manifest",
-                "supervisor_path", "source_path", "cargo_home", "toolchain_root"):
+                "supervisor_path", "source_path", "cargo_home", "toolchain_root", "python_path", "python_sha256"):
         if not check_route and key == "volume_uuid":
             continue
         if observed.get(key) != record[key]:
@@ -1166,6 +1171,145 @@ def guest_receipt_problems(record, receipt, actual_digest, expected_digest):
     return problems
 
 
+def host_vm_problems(document):
+    """Validate a fresh Parallels JSON inventory, not guest self-attestation."""
+    if not isinstance(document, list):
+        return ["registered VM metadata is not a complete inventory"]
+    matches = []
+    for row in document:
+        if not isinstance(row, dict) or not isinstance(row.get("ID"), str):
+            return ["registered VM metadata contains a malformed row"]
+        vm_id = row["ID"]
+        if not re.fullmatch(r"(?:[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}|\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\})", vm_id):
+            return ["registered VM metadata contains a malformed UUID"]
+        if vm_id.removeprefix("{").removesuffix("}").lower() == GUEST_VM_UUID:
+            matches.append(row)
+    if len(matches) != 1 or matches[0].get("State") != "running":
+        return ["the registered target VM is missing, duplicated or not running"]
+    return []
+
+
+def host_guest_argv(record, instruction_digest):
+    """The host transport's exact argv; a digest placeholder avoids self-reference."""
+    return ["prlctl", "exec", GUEST_VM_UUID, "--current-user", record["python_path"],
+            os.path.join(record["source_path"], "scripts/native/release-proof.py"),
+            "--guest-outer", record["mode"], "--guest-instruction", record["instruction_guest_path"],
+            "--guest-digest", instruction_digest]
+
+
+def host_guest_preflight(instruction_path, instruction_digest, role, run, activation):
+    """Bind the retained host participant's record to current source and VM metadata.
+
+    The authenticated Nucleus report, not this comparison, establishes the
+    participant and activation. No guest fact or admission is inferred here.
+    """
+    try:
+        record = guest_instruction(instruction_path, instruction_digest)
+        problems = guest_record_problems(record)
+        for key, expected in (("role", role), ("run", run), ("activation", activation)):
+            if record.get(key) != expected:
+                problems.append(f"host participant {key} differs from the instruction")
+        if not problems:
+            template = host_guest_argv(record, "<instruction-digest>")
+            digest = hashlib.sha256(json.dumps(template, separators=(",", ":")).encode()).hexdigest()
+            if digest != record["command_sha256"]:
+                problems.append("the fixed guest command differs from the instruction")
+            if any(not re.fullmatch(r"/[A-Za-z0-9_./-]+", record[key])
+                   for key in ("python_path", "source_path", "instruction_guest_path")):
+                problems.append("guest transport paths need an independently verified lossless argument route")
+        def git(*args):
+            result = subprocess.run(["git", "-C", REPO_ROOT, *args], capture_output=True,
+                                    text=True, timeout=INFO_TIMEOUT_SECONDS)
+            if result.returncode:
+                raise ValueError("host source identity is unreadable")
+            return result.stdout.strip()
+        if (git("rev-parse", "HEAD") != record.get("head")
+                or git("rev-parse", "HEAD^{tree}") != record.get("tree")
+                or git("status", "--porcelain", "--untracked-files=all")
+                or sha256_file(os.path.join(REPO_ROOT, "Cargo.lock")) != record.get("lock_sha256")):
+            problems.append("host source, tree, lock or checkout differs from the instruction")
+        problems += installed_supervisor_problems()
+        if problems:
+            return record, problems, None
+        metadata_argv = ["prlctl", "list", "-a", "-i", "--json"]
+        metadata = subprocess.run(metadata_argv, capture_output=True, timeout=INFO_TIMEOUT_SECONDS)
+        if metadata.returncode or len(metadata.stdout) > 1024 * 1024 or len(metadata.stderr) > 1024 * 1024:
+            problems.append("fresh registered VM metadata was unsuccessful or exceeded its bound")
+        else:
+            def unique(pairs):
+                value = {}
+                for key, item in pairs:
+                    if key in value:
+                        raise ValueError("duplicate VM metadata key")
+                    value[key] = item
+                return value
+            problems += host_vm_problems(json.loads(metadata.stdout, object_pairs_hook=unique))
+        return record, problems, command_record(metadata_argv, metadata)
+    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
+        return None, [f"host guest preflight unavailable: {error}"], None
+
+
+def host_guest_launch(instruction_path, instruction_digest, role, run, activation, stdout, stderr):
+    """Launch through the retained host participant after separate admission readiness.
+
+    The caller owns bounded stream files and must independently establish host
+    and guest admission and a complete receipt channel before calling. The
+    returned transport status is not proof of guest group or image closure.
+    """
+    record, problems, metadata = host_guest_preflight(instruction_path, instruction_digest, role, run, activation)
+    if problems:
+        return {"ok": False, "refused": problems, "vm_metadata": metadata}
+    argv = host_guest_argv(record, instruction_digest)
+    started = time.time()
+    try:
+        result = subprocess.run(argv, stdout=stdout, stderr=stderr, timeout=LIMIT_SECONDS)
+        return {"ok": result.returncode == 0, "argv": argv, "exit": result.returncode,
+                "reaped": True, "elapsed_seconds": round(time.time() - started, 3),
+                "vm_metadata": metadata, "guest_closure": "not established by transport"}
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"ok": False, "argv": argv, "exit": None,
+                "reaped": isinstance(error, subprocess.TimeoutExpired),
+                "elapsed_seconds": round(time.time() - started, 3), "problem": str(error),
+                "vm_metadata": metadata, "guest_closure": "unknown; preserve guest resources"}
+
+
+def host_guest_receipt(record, path, expected_digest):
+    """Read a separately transferred full receipt; stdout is never the receipt channel."""
+    if not isinstance(expected_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        return None, ["the independently supplied receipt digest is absent"]
+    if not getattr(os, "O_NOFOLLOW", 0):
+        return None, ["no-follow receipt reads are unavailable"]
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            before = os.fstat(fd)
+            if (not __import__("stat").S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                    or before.st_mode & 0o077):
+                return None, ["the transferred receipt is not a private owned regular file"]
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                raw = stream.read(16 * 1024 * 1024 + 1)
+            after = os.fstat(fd)
+        finally:
+            os.close(fd)
+        if (len(raw) > 16 * 1024 * 1024 or before.st_size != len(raw)
+                or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) !=
+                   (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
+            return None, ["the transferred receipt was incomplete, oversized or changed during reading"]
+        def unique(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("duplicate receipt key")
+                value[key] = item
+            return value
+        receipt = json.loads(raw, object_pairs_hook=unique)
+        actual = hashlib.sha256(raw).hexdigest()
+        problems = guest_receipt_problems(record, receipt, actual, expected_digest)
+        return ({"receipt": receipt, "bytes": len(raw), "sha256": actual} if not problems else None), problems
+    except (OSError, ValueError, TypeError) as error:
+        return None, [f"the transferred receipt is unreadable: {error}"]
+
+
 def guest_recheck_problems(outer, inner):
     """Compare independently observed local identities, never host authority."""
     if not isinstance(outer, dict) or not isinstance(inner, dict):
@@ -1173,7 +1317,7 @@ def guest_recheck_problems(outer, inner):
     keys = ("uid", "gid", "home", "mount", "volume_uuid", "scratch", "head", "tree",
             "lock_sha256", "guard_sha256", "toolchain", "target", "features", "inputs_sha256",
             "route_identity", "cargo_path", "cargo_sha256", "rustc_path", "rustc_sha256",
-            "input_manifest", "supervisor_path", "source_path", "cargo_home", "toolchain_root")
+            "input_manifest", "supervisor_path", "source_path", "cargo_home", "toolchain_root", "python_path", "python_sha256")
     return [f"guest {key} changed between outer and inner" for key in keys
             if outer.get(key) is None or outer.get(key) != inner.get(key)]
 
@@ -1257,17 +1401,17 @@ def guest_local_observation(record):
         return {}
     facts = guest_route_facts(record.get("scratch"))
     for key in ("source_path", "supervisor_path", "input_manifest", "cargo_path", "rustc_path",
-                "cargo_home", "toolchain_root"):
+                "cargo_home", "toolchain_root", "python_path"):
         facts[key] = None
     try:
         for key in ("source_path", "supervisor_path", "input_manifest", "cargo_path", "rustc_path",
-                    "cargo_home", "toolchain_root"):
+                    "cargo_home", "toolchain_root", "python_path"):
             path = record[key]
             if (not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path
                     or os.path.realpath(path) != path):
                 return facts
             facts[key] = path
-        if facts["source_path"] != REPO_ROOT:
+        if facts["source_path"] != REPO_ROOT or os.path.realpath(sys.executable) != facts["python_path"]:
             return facts
         def command(argv):
             result = subprocess.run(argv, cwd=REPO_ROOT, capture_output=True, text=True,
@@ -1289,6 +1433,7 @@ def guest_local_observation(record):
                      guard_sha256=sha256_file(facts["supervisor_path"]),
                      cargo_sha256=sha256_file(facts["cargo_path"]),
                      rustc_sha256=sha256_file(facts["rustc_path"]),
+                     python_sha256=sha256_file(facts["python_path"]),
                      inputs_sha256=sha256_file(facts["input_manifest"]),
                      toolchain="1.97.1", target=host, features=[PROOF_FEATURE])
     except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
@@ -1364,6 +1509,16 @@ def guest_artifact_problems(artifact, target_dir, before, after):
 def guest_binding_controls():
     """Exercise the data comparisons; these do not exercise the live guest route."""
     problems = []
+    for argv in (["--guest-outer", "counted"],
+                 ["counted", "--guest-outer", "counted", "--guest-instruction", "/guest/record", "--guest-digest", "f" * 64],
+                 ["--guest-inner", "counted", "--guest-outer", "counted", "--guest-instruction", "/guest/record", "--guest-digest", "f" * 64],
+                 ["--guest-instruction", "/guest/record", "--guest-digest", "f" * 64]):
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                main(argv)
+                problems.append("a missing or mixed guest context was accepted")
+            except SystemExit:
+                pass
     if BUILD_COMMAND[0] != "oxide" or GUEST_BUILD_COMMAND != ["cargo", *BUILD_COMMAND[1:]]:
         problems.append("host and guest build commands are not the pinned separate routes")
     environment = guest_stage_environment({"CARGO_TARGET_DIR": "/foreign", "RUSTFLAGS": "bad"},
@@ -1388,9 +1543,12 @@ def guest_binding_controls():
               "rustc_path": "/guest/toolchain/bin/rustc", "rustc_sha256": "f" * 64,
               "input_manifest": "/guest/inputs.json", "supervisor_path": "/guest/bounded-test.py",
               "source_path": "/guest/source", "cargo_home": "/guest/cargo-home",
-              "toolchain_root": "/guest/toolchain"}
+              "toolchain_root": "/guest/toolchain", "instruction_guest_path": "/guest/invocation.json",
+              "python_path": "/guest/python3", "python_sha256": "f" * 64}
     input_bytes = json.dumps({"roots": {record["cargo_home"]: {}, record["toolchain_root"]: {}}}).encode()
     record["inputs_sha256"] = hashlib.sha256(input_bytes).hexdigest()
+    template = host_guest_argv(record, "<instruction-digest>")
+    record["command_sha256"] = hashlib.sha256(json.dumps(template, separators=(",", ":")).encode()).hexdigest()
     observed = dict(record, canonical=True, nofollow=True, owner_only=True, same_volume=True, reserve=True,
                     route_identity={"mount": [17, 1], "parent": [17, 2], "leaf": [17, 3]})
     if guest_binding_problems(record, observed):
@@ -1415,6 +1573,28 @@ def guest_binding_controls():
         problems.append("guest receipt comparison accepted a different nonce")
     if not guest_receipt_problems(record, receipt, "f" * 64, "0" * 64):
         problems.append("guest receipt comparison accepted different bytes")
+    receipt_bytes = json.dumps(receipt).encode()
+    receipt_hash = hashlib.sha256(receipt_bytes).hexdigest()
+    receipt_info = mock.Mock(st_mode=0o100600, st_uid=123, st_size=len(receipt_bytes),
+                             st_dev=1, st_ino=2, st_mtime_ns=3)
+    with mock.patch("os.open", return_value=42), mock.patch("os.close"), \
+            mock.patch("os.getuid", return_value=123), mock.patch("os.fstat", return_value=receipt_info), \
+            mock.patch("os.fdopen", return_value=io.BytesIO(receipt_bytes)):
+        copied, refused = host_guest_receipt(record, "/owned/receipt", receipt_hash)
+        if refused or copied is None or copied["sha256"] != receipt_hash:
+            problems.append("complete transferred receipt failed its actual byte comparison")
+    with mock.patch("os.open", return_value=42), mock.patch("os.close"), \
+            mock.patch("os.getuid", return_value=123), mock.patch("os.fstat", return_value=receipt_info), \
+            mock.patch("os.fdopen", return_value=io.BytesIO(receipt_bytes)):
+        copied, refused = host_guest_receipt(record, "/owned/receipt", "0" * 64)
+        if not refused or copied is not None:
+            problems.append("different transferred receipt bytes were accepted")
+    if host_vm_problems([{"ID": "{" + GUEST_VM_UUID + "}", "State": "running"}]):
+        problems.append("the pinned registered VM inventory was refused")
+    for inventory in (None, [], [{"ID": GUEST_VM_UUID, "State": "stopped"}],
+                      [{"ID": GUEST_VM_UUID, "State": "running"}] * 2, [{}]):
+        if not host_vm_problems(inventory):
+            problems.append("an incomplete or mismatched host VM inventory was accepted")
     paired = dict(observed, route_identity={"mount": [17, 1], "parent": [17, 2], "leaf": [17, 3]})
     if guest_recheck_problems(paired, dict(paired)):
         problems.append("matching guest observations did not compare equal")
@@ -1478,6 +1658,36 @@ def guest_binding_controls():
         pass
     raw = json.dumps(record).encode()
     digest = hashlib.sha256(raw).hexdigest()
+    def host_command(argv, **kwargs):
+        if argv[0] == "prlctl":
+            return mock.Mock(returncode=0, stdout=json.dumps([{"ID": GUEST_VM_UUID, "State": "running"}]).encode(), stderr=b"")
+        if argv[-1] == "HEAD":
+            output = record["head"]
+        elif argv[-1] == "HEAD^{tree}":
+            output = record["tree"]
+        else:
+            output = ""
+        return mock.Mock(returncode=0, stdout=output, stderr="")
+    def host_hash(path):
+        return record["lock_sha256"] if path.endswith("Cargo.lock") else SUPERVISOR_SHA256
+    with mock.patch("os.open", return_value=42), mock.patch("os.close"), \
+            mock.patch("os.getuid", return_value=123), \
+            mock.patch("os.fstat", return_value=mock.Mock(st_uid=123, st_mode=0o100600)), \
+            mock.patch("os.fdopen", return_value=io.BytesIO(raw)), \
+            mock.patch("subprocess.run", side_effect=host_command), \
+            mock.patch(__name__ + ".sha256_file", side_effect=host_hash):
+        bound, refused, _metadata = host_guest_preflight("/owned/record", digest, "author", record["run"], record["activation"])
+        if refused or bound != record:
+            problems.append("host preflight refused the scripted current source and registered VM")
+    with mock.patch("os.open", return_value=42), mock.patch("os.close"), \
+            mock.patch("os.getuid", return_value=123), \
+            mock.patch("os.fstat", return_value=mock.Mock(st_uid=123, st_mode=0o100600)), \
+            mock.patch("os.fdopen", return_value=io.BytesIO(raw)), \
+            mock.patch("subprocess.run", side_effect=host_command) as host_calls, \
+            mock.patch(__name__ + ".sha256_file", side_effect=host_hash):
+        _bound, refused, _metadata = host_guest_preflight("/owned/record", digest, "reviewer", record["run"], record["activation"])
+        if not refused or any(call.args[0][0] == "prlctl" for call in host_calls.call_args_list):
+            problems.append("host preflight accepted a different participant role")
     def read_instruction(data, expected, *, uid=123, mode=0o100600):
         with mock.patch("os.open", return_value=42), mock.patch("os.close"), \
                 mock.patch("os.getuid", return_value=123), \
@@ -3834,6 +4044,8 @@ def guest_inner_half(mode, instruction_path, instruction_digest):
     observed = guest_local_observation(record)
     carried = carried_route()
     route_problems = guest_binding_problems(record, observed)
+    if instruction_path != record.get("instruction_guest_path"):
+        route_problems.append("the guest instruction path differs from the invocation")
     if (not isinstance(carried, dict) or carried.get("instruction_sha256") != instruction_digest
             or carried.get("mode") != mode or record.get("mode") != mode):
         route_problems.append("the guest outer instruction or mode does not match")
@@ -3845,6 +4057,14 @@ def guest_inner_half(mode, instruction_path, instruction_digest):
             route_problems.append("the guest child is not the guard's session leader")
     except OSError:
         route_problems.append("the guest child session identity is unreadable")
+    try:
+        parent = subprocess.run(["/bin/ps", "-p", str(os.getppid()), "-o", "command="],
+                                capture_output=True, text=True, timeout=INFO_TIMEOUT_SECONDS)
+        argv = shlex.split(parent.stdout.strip()) if parent.returncode == 0 else []
+        if len(argv) < 2 or argv[1] != record.get("supervisor_path"):
+            route_problems.append("the guest child's parent is not the selected guard command")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        route_problems.append("the guest guard parent observation is unavailable")
     evidence = os.environ.get("OXIDE_PROOF_EVIDENCE")
     scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
     tmpdir = os.environ.get("TMPDIR", "")
@@ -3887,13 +4107,15 @@ def guest_outer_half(mode, instruction_path, instruction_digest):
         record = guest_instruction(instruction_path, instruction_digest)
         observed = guest_local_observation(record)
         problems = guest_binding_problems(record, observed, check_route=False)
+        if instruction_path != record.get("instruction_guest_path"):
+            problems.append("the guest instruction path differs from the invocation")
         if record.get("mode") != mode:
             problems.append("the guest mode differs from the instruction")
         problems += guest_offline_inputs_problems(record, deadline)
         if problems:
             raise ValueError("; ".join(problems))
         leaf = guest_create_leaf(record)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         print(json.dumps({"schema": SCHEMA, "ok": False, "refused": f"guest outer: {error}"}))
         return 125
     try:
@@ -5851,12 +6073,26 @@ def argument_parser():
     parser.add_argument("--plan", action="store_true")
     parser.add_argument("--inner", choices=["counted", "diagnostic"])
     parser.add_argument("--receipt")
+    parser.add_argument("--guest-outer", choices=["counted", "diagnostic"])
+    parser.add_argument("--guest-inner", choices=["counted", "diagnostic"])
+    parser.add_argument("--guest-instruction")
+    parser.add_argument("--guest-digest")
     return parser
 
 
 def main(argv):
     parser = argument_parser()
     args = parser.parse_args(argv)
+    guest_arguments = (args.guest_outer, args.guest_inner, args.guest_instruction, args.guest_digest)
+    if any(value is not None for value in guest_arguments):
+        if ((args.guest_outer is None) == (args.guest_inner is None)
+                or not args.guest_instruction or not args.guest_digest
+                or args.mode is not None or args.inner is not None or args.receipt is not None
+                or args.self_check or args.plan):
+            parser.error("select exactly one guest entry with its instruction and digest, and no host mode")
+        if args.guest_outer:
+            return guest_outer_half(args.guest_outer, args.guest_instruction, args.guest_digest)
+        return guest_inner_half(args.guest_inner, args.guest_instruction, args.guest_digest)
     if args.self_check:
         problems = self_check()
         for problem in problems:
