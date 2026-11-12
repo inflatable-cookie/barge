@@ -100,3 +100,9 @@ the checked coordinator, the Oxide caller and the old join's removal are
 later slices. No slice connects a caller or changes shipped behavior until
 its own reviewed code lands, and live migration/adoption, native execution
 and host change remain separately gated.
+
+Tom reaffirmed on 2026-11-12 that the existing Parallels macOS VM is the
+selected preparation context for Barge proofs and no new host account is wanted
+(decision `49861fc2` v3). The [proof execution context](contracts/proof-execution-context.md)
+records the guest identity, storage and evidence boundaries; it authorizes no
+VM action or proof.
