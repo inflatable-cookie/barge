@@ -18,7 +18,7 @@ What it does, in one sentence: after the unchanged qualified supervisor's bytes 
 this host's Stash scratch route are verified, and under that supervisor (pinned below,
 executed with the same interpreter), it creates one private run root inside the
 guard's owned scratch, attaches one owned APFS sparse image of 64 MiB with ownership
-enabled, registers that image as the only volume, and runs twelve release cases
+enabled, registers that image as the only volume, and runs fifteen release cases
 through the staged `barge` CLI against a private HOME, a private state directory and a
 synthetic account home (BARGE_ACCOUNT_HOME, equal to HOME). Each case declares its own
 area, so one case's roots never reach another case's plan.
@@ -119,6 +119,10 @@ OXIDE_RELATIVE_REGISTRY = os.path.join(
     "Library", "Caches", "oxide", "build-pool", "oxide-managed", "outputs", "registry.json"
 )
 OXIDE_REGISTRY_VERSION = "oxide.outputs.registry/2"
+# Oxide's coordinated single-authority registry: the /4 documents Barge's
+# generic release and census readers must read strictly (settled required,
+# deletion_routes gone).
+OXIDE_COORDINATED_REGISTRY_VERSION = "oxide.outputs.registry/4"
 VOLUME_UUID_KEY = "VolumeUUID"
 HOLDER = "release-native-holder"
 PROOF_RECEIPT = "release-proof-receipt.json"
@@ -233,6 +237,15 @@ CASES = [
     {"id": "R12", "method": "case_named_run_refuses_a_root_it_was_not_given",
      "claim": "a run releases only the rows its presented plan carries; a root added after the plan is never released by it",
      "carried_by": "a_release_run_deletes_one_root_the_presented_plan_allows_and_replaying_it_releases_nothing"},
+    {"id": "R13", "method": "case_coordinated_registry_releases_unrelated_and_keeps_live_reference",
+     "claim": "a valid coordinated /4 registry keeps its live Oxide reference's root and releases an unrelated eligible root past a settlement naming that root's exact path",
+     "carried_by": "a_coordinated_registry_releases_an_unrelated_root_and_keeps_its_live_reference"},
+    {"id": "R14", "method": "case_malformed_coordinated_registry_refuses_the_batch",
+     "claim": "a coordinated /4 registry without its settlement set refuses the whole batch and changes nothing",
+     "carried_by": "a_malformed_coordinated_registry_refuses_the_whole_batch_and_changes_nothing"},
+    {"id": "R15", "method": "case_coordinated_census_reports_the_registry",
+     "claim": "the census reads the same coordinated /4 document as reported document facts, and its malformed twin stays unknown",
+     "carried_by": "the_coordinated_census_reads_the_release_fixture_and_a_malformed_one_stays_unknown"},
 ]
 
 # The byte-level oracle for the identity record: its path inside the state directory.
@@ -1498,6 +1511,40 @@ class Proof:
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(document, handle)
 
+    def coordinated_registry(self, rows, settled, complete=True, path=None):
+        """Publish one coordinated (/4) output-registry document.
+
+        The default path is the release reader's resolution under the private
+        HOME; `path` publishes the identical document where another reader —
+        the census — resolves the registry, so one fixture can serve both.
+        """
+        path = path or os.path.join(self.home, OXIDE_RELATIVE_REGISTRY)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        document = {
+            "version": OXIDE_COORDINATED_REGISTRY_VERSION,
+            "schema": 4,
+            "revision": 2,
+            "complete": complete,
+            "created_by": "oxide",
+            "rows": rows,
+            "settled": settled,
+        }
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+
+    def settlement(self, root):
+        """One settlement entry, exactly Oxide's serialized `Settlement` field set."""
+        return {
+            "caller": "oxide.outputs",
+            "key": "a" * 32,
+            "checkout_id": OXIDE_CHECKOUT_ID,
+            "root": root,
+            "nonce": "b" * 32,
+            "outcome": "deleted",
+            "terminal_ms": 1,
+            "request_sha256": "d" * 64,
+        }
+
     def oxide_row(self, root, checkout, pending=False, selected=False, on_volume=False):
         """One registry row. `on_volume` names the synthetic volume the checkout lives on.
 
@@ -1935,6 +1982,134 @@ class Proof:
         if not os.path.lexists(late["path"]):
             raise Fault("R12", "a root the presented plan did not carry was released")
         return {"given": given["root_id"], "not_given_kept": late["root_id"], "released": 1}
+
+    def case_coordinated_registry_releases_unrelated_and_keeps_live_reference(self):
+        area = self.fresh_area("c13", f"oldest-idle:{AREA_AGE_SECONDS}")
+        protected = self.new_root(area, aged=True)
+        unrelated = self.new_root(area, aged=True)
+        checkout = os.path.join(self.home, "checkouts", "coordinated")
+        self.coordinated_registry(
+            [self.oxide_row(protected, checkout, selected=True)],
+            [self.settlement(unrelated["path"])],
+        )
+        preview, unrelated_row, plan_file = self.plan_and_run(
+            "R13", area, unrelated, expect_eligible=True)
+        kept = self.row_for(preview, protected)
+        failed = first_failed_predicate([
+            ("protected_eligible", lambda: kept["eligible"]),
+            ("protected_blocked_by", lambda: kept["blocked_by"] != "references"),
+            ("unrelated_eligible", lambda: not unrelated_row["eligible"]),
+        ])
+        if failed is not None:
+            raise Fault("R13", failure_detail(failed, failure_summary({
+                "protected": {"eligible": kept["eligible"], "blocked_by": kept.get("blocked_by")},
+                "unrelated": {"eligible": unrelated_row["eligible"],
+                              "blocked_by": unrelated_row.get("blocked_by")}})))
+        _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
+        failed, observations = root_released_failure(
+            run_doc["data"], unrelated["root_id"], lambda: os.path.lexists(unrelated["path"]))
+        if failed is not None:
+            raise Fault("R13", failure_detail(
+                failed, run_report_summary(run_doc["data"], unrelated["root_id"], observations)))
+        if os.path.lexists(protected["path"]):
+            raise Fault("R13", failure_detail(
+                "protected_present",
+                run_report_summary(run_doc["data"], protected["root_id"],
+                                   {"protected_present": True})))
+        return {"protected": protected["root_id"], "unrelated": unrelated["root_id"],
+                "released": 1, "settlement_named": unrelated["path"]}
+
+    def case_malformed_coordinated_registry_refuses_the_batch(self):
+        area = self.fresh_area("c14", f"oldest-idle:{AREA_AGE_SECONDS}")
+        first = self.new_root(area, aged=True)
+        second = self.new_root(area, aged=True)
+        # The exact malformed shape: the coordinated version without its
+        # settlement set, as no /4-aware writer ever publishes it.
+        path = os.path.join(self.home, OXIDE_RELATIVE_REGISTRY)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        document = {
+            "version": OXIDE_COORDINATED_REGISTRY_VERSION,
+            "schema": 4,
+            "revision": 2,
+            "complete": True,
+            "created_by": "oxide",
+            "rows": [],
+        }
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+        self.current_area = area
+        plan_file = self.plan_path("R14")
+        # An unreadable coordinated set is a plan that needs a human: exit 3,
+        # every row kept, and a presented run refuses without effects.
+        _code, preview = self.preview(area, plan_file, expect=3)
+        for root in (first, second):
+            row = self.row_for(preview, root)
+            if row["eligible"]:
+                raise Fault("R14", failure_detail("eligible", failure_summary({
+                    "root": root["root_id"], "blocked_by": row.get("blocked_by")})))
+        if preview["data"]["oxide"]["complete"]:
+            raise Fault("R14", "a malformed coordinated registry reads as complete")
+        refusal = self.refused(plan_file, preview["data"]["plan_digest"], area)
+        if refusal["kind"] != "unknown_state":
+            raise Fault("R14", f"the batch was refused as {refusal}, expected unknown_state")
+        for root in (first, second):
+            if not os.path.lexists(root["path"]):
+                raise Fault("R14", failure_detail("path_present", failure_summary({
+                    "root": root["root_id"], "path_present": False})))
+        return {"roots_kept": 2, "refusal": refusal, "counterfactual_of": "R13",
+                "flipped_condition": "settlement set present"}
+
+    def case_coordinated_census_reports_the_registry(self):
+        area = self.fresh_area("c15", f"oldest-idle:{AREA_AGE_SECONDS}")
+        root = self.new_root(area, aged=True)
+        checkout = os.path.join(self.home, "checkouts", "coordinated")
+        settled = [self.settlement(os.path.join(self.mount, "gone"))]
+        # The census resolves the registry from the internal pool list itself,
+        # so the same coordinated document is published where the census reads
+        # it: the default pool's own outputs folder.
+        census_path = os.path.join(
+            self.home, "Library", "Caches", "oxide", "build-pool", "outputs", "registry.json")
+        self.coordinated_registry(
+            [self.oxide_row(root, checkout, selected=True)], settled, path=census_path)
+        _code, inspect_doc = self.barge("inspect", expect=0)
+        census = inspect_doc["data"]["oxide_census"]
+        document = census.get("document") or {}
+        failed = first_failed_predicate([
+            ("census_state", lambda: census.get("state") != "reported"),
+            ("census_version",
+             lambda: document.get("version") != OXIDE_COORDINATED_REGISTRY_VERSION),
+            ("census_schema", lambda: document.get("schema") != 4),
+            ("census_rows", lambda: (census.get("rows") or {}).get("count") != 1),
+        ])
+        if failed is not None:
+            raise Fault("R15", failure_detail(failed, failure_summary({
+                "state": census.get("state"), "document": document,
+                "rows": (census.get("rows") or {}).get("count"),
+                "path": census.get("path")})))
+        # The malformed twin: the same format without its settlement set stays
+        # unknown, never an empty registry.
+        with open(census_path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "version": OXIDE_COORDINATED_REGISTRY_VERSION,
+                "schema": 4,
+                "revision": 2,
+                "complete": True,
+                "created_by": "oxide",
+                "rows": [],
+            }, handle)
+        _code, inspect_doc = self.barge("inspect", expect=0)
+        census = inspect_doc["data"]["oxide_census"]
+        detail = census.get("detail") or ""
+        failed = first_failed_predicate([
+            ("census_state", lambda: census.get("state") != "unknown_state"),
+            ("census_reason", lambda: "settlement set" not in detail),
+        ])
+        if failed is not None:
+            raise Fault("R15", failure_detail(failed, failure_summary({
+                "state": census.get("state"),
+                "detail": bounded_text(detail, FAILURE_TEXT_CHARS)})))
+        return {"census_version": OXIDE_COORDINATED_REGISTRY_VERSION, "rows": 1,
+                "malformed_state": "unknown_state"}
 
     # -- the run ----------------------------------------------------------
 
@@ -3113,10 +3288,15 @@ def pure_self_check():
         setattr(fake, case["method"], lambda: {})
     def fail_remount():
         raise Fault("R11", "synthetic failed oracle")
-    setattr(fake, CASES[-2]["method"], fail_remount)
-    setattr(fake, CASES[-1]["method"], lambda: problems.append("R12 ran after failed R11"))
+    by_id = {case["id"]: case for case in CASES}
+    setattr(fake, by_id["R11"]["method"], fail_remount)
+    setattr(fake, by_id["R12"]["method"],
+            lambda: problems.append("R12 ran after failed R11"))
     fake.run_cases()
-    if fake.results[-1]["status"] != "skipped":
+    results = {result["case"]: result for result in fake.results}
+    if results["R11"]["status"] != "failed":
+        problems.append("the synthetic R11 fault did not fail R11")
+    if results["R12"]["status"] != "skipped":
         problems.append("failed R11 did not skip R12")
     # Drive the real R12 body: its failed registration gate must precede all ordinary work.
     stale = Proof("unused", "unused", True, {})
