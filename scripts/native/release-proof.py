@@ -2082,6 +2082,9 @@ def guest_continuation_controls(record, observed, digest):
         def __init__(self, binary, receipt_path, diagnostic, build, evidence=None, route=None):
             order.append("proof")
             self.receipt_path, self.route = receipt_path, route
+            if (binary != manifest["path"] or receipt_path != os.path.join(evidence, PROOF_RECEIPT)
+                    or diagnostic is not True or build != manifest or evidence != "/synthetic/owned/evidence"):
+                raise ValueError("guest proof received mismatched continuation arguments")
             self.build, self.attached, self.mount = build, False, None
             self.results, self.first_fault, self.infrastructure = [], None, None
             self.real_state, self.isolation, self.unknown_custody = None, None, False
@@ -2090,7 +2093,8 @@ def guest_continuation_controls(record, observed, digest):
             raise Infrastructure("synthetic", "no native effect")
         def receipt_document(self, _cancelled):
             return {"schema": SCHEMA, "all_cases_passed": False, "first_fault": self.first_fault,
-                    "closure": self.closure, "cases": self.results, "qualified": False}
+                    "closure": self.closure, "cases": self.results, "qualified": False,
+                    "build": self.build, "route": self.route}
         def write_receipt(self, receipt):
             order.append("receipt")
             receipts.append(receipt)
@@ -2115,7 +2119,9 @@ def guest_continuation_controls(record, observed, digest):
     correlation = {key: record[key] for key in ("nonce", "head", "tree", "lock_sha256", "guard_sha256", "inputs_sha256")}
     if (result != EXIT_INFRASTRUCTURE or order != ["stage", "verify", "proof", "receipt"]
             or len(receipts) != 1 or any(receipts[0].get(key) != value for key, value in correlation.items())
-            or receipts[0].get("receipt_path") != os.path.join(evidence, PROOF_RECEIPT)):
+            or receipts[0].get("receipt_path") != os.path.join(evidence, PROOF_RECEIPT)
+            or receipts[0].get("build") != dict(manifest, stage={"synthetic": True})
+            or receipts[0].get("route", {}).get("guest_correlation") != correlation):
         problems.append("guest continuation lost stage/verify/proof order or published receipt correlation")
     for rejected in ("stage", "missing", "verify"):
         order.clear(); receipts.clear()
