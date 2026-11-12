@@ -962,6 +962,73 @@ def closure_document(purpose, exit_code, reaped, rows, mount_absent):
     return document
 
 
+def guest_route_facts(path):
+    """Observe the guest's private leaf; the host VM identity is not observable here."""
+    result = {"scratch": path, "uid": os.geteuid(), "gid": os.getegid(),
+              "home": os.environ.get("HOME"), "mount": GUEST_MOUNT,
+              "volume_uuid": None, "canonical": False, "nofollow": False,
+              "owner_only": False, "same_volume": False, "reserve": False}
+    if not isinstance(path, str) or os.path.dirname(path) != GUEST_PARENT or not re.fullmatch(
+            r"barge-proof-[A-Za-z0-9_-]{8,80}", os.path.basename(path)):
+        return result
+    try:
+        # Every component is examined rather than trusting realpath alone.
+        parts = path.split(os.sep)[1:]
+        current = os.sep
+        for part in parts:
+            current = os.path.join(current, part)
+            info = os.lstat(current)
+            if __import__("stat").S_ISLNK(info.st_mode) or not __import__("stat").S_ISDIR(info.st_mode):
+                return result
+        mount_info = os.stat(GUEST_MOUNT)
+        leaf_info = os.lstat(path)
+        result["canonical"] = os.path.realpath(path) == path
+        result["nofollow"] = True
+        result["owner_only"] = leaf_info.st_uid == GUEST_UID and (leaf_info.st_mode & 0o777) == 0o700
+        result["same_volume"] = leaf_info.st_dev == mount_info.st_dev
+        result["volume_uuid"] = volume_uuid(GUEST_MOUNT)
+        space = os.statvfs(path)
+        result["reserve"] = space.f_bavail * space.f_frsize >= 20 * 1024 ** 3
+    except OSError:
+        pass
+    return result
+
+
+def guest_instruction(path, expected_sha256):
+    """Read an owner's bounded instruction record without following its final link.
+
+    This checks bytes and local ownership only.  Neither this document nor its
+    digest is an admission or an authenticated statement by the guest.
+    """
+    if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise ValueError("guest instruction digest is absent or malformed")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if not getattr(os, "O_NOFOLLOW", 0):
+        raise ValueError("no-follow instruction reads are unavailable")
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not __import__("stat").S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError("guest instruction must be a private owned regular file")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(16385)
+        if len(raw) > 16384 or hashlib.sha256(raw).hexdigest() != expected_sha256:
+            raise ValueError("guest instruction size or digest does not match")
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate guest instruction key")
+                result[key] = value
+            return result
+        result = json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=unique)
+        if not isinstance(result, dict):
+            raise ValueError("guest instruction is not an object")
+        return result
+    finally:
+        os.close(fd)
+
+
 def guest_binding_problems(record, observed):
     """Check scoped instruction data against separately attributed observations.
 
@@ -1058,6 +1125,47 @@ def guest_binding_controls():
         problems.append("guest receipt comparison accepted a different nonce")
     if not guest_receipt_problems(record, receipt, "f" * 64, "0" * 64):
         problems.append("guest receipt comparison accepted different bytes")
+    raw = json.dumps(record).encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    def read_instruction(data, expected, *, uid=123, mode=0o100600):
+        with mock.patch("os.open", return_value=42), mock.patch("os.close"), \
+                mock.patch("os.getuid", return_value=123), \
+                mock.patch("os.fstat", return_value=mock.Mock(st_uid=uid, st_mode=mode)), \
+                mock.patch("os.fdopen", return_value=io.BytesIO(data)):
+            return guest_instruction("/owned/invocation", expected)
+    if read_instruction(raw, digest) != record:
+        problems.append("guest instruction did not preserve its actual decoded fields")
+    for name, data, expected, uid, mode in (
+            ("digest", raw, "0" * 64, 123, 0o100600),
+            ("foreign owner", raw, digest, 124, 0o100600),
+            ("public mode", raw, digest, 123, 0o100644),
+            ("oversized", b"x" * 16385, hashlib.sha256(b"x" * 16385).hexdigest(), 123, 0o100600),
+            ("duplicate", b'{"a":1,"a":2}', hashlib.sha256(b'{"a":1,"a":2}').hexdigest(), 123, 0o100600)):
+        try:
+            read_instruction(data, expected, uid=uid, mode=mode)
+            problems.append(f"guest instruction accepted {name}")
+        except (OSError, ValueError):
+            pass
+    directory = mock.Mock(st_mode=0o40700, st_uid=GUEST_UID, st_dev=17)
+    def observe_route(*, leaf=directory, mount=directory, real=None, free=21 * 1024 ** 3, uuid=GUEST_VOLUME_UUID):
+        path = record["scratch"]
+        with mock.patch("os.lstat", return_value=leaf), mock.patch("os.stat", return_value=mount), \
+                mock.patch("os.path.realpath", return_value=path if real is None else real), \
+                mock.patch("os.geteuid", return_value=GUEST_UID), mock.patch("os.getegid", return_value=GUEST_GID), \
+                mock.patch.dict(os.environ, {"HOME": GUEST_HOME}), \
+                mock.patch("os.statvfs", return_value=mock.Mock(f_bavail=free, f_frsize=1)), \
+                mock.patch(__name__ + ".volume_uuid", return_value=uuid):
+            return guest_route_facts(path)
+    route = observe_route()
+    if any(route[key] is not True for key in ("canonical", "nofollow", "owner_only", "same_volume", "reserve")):
+        problems.append("guest route observations did not retain valid local facts")
+    for changed in (observe_route(leaf=mock.Mock(st_mode=0o120777, st_uid=GUEST_UID, st_dev=17)),
+                    observe_route(leaf=mock.Mock(st_mode=0o40755, st_uid=GUEST_UID, st_dev=17)),
+                    observe_route(mount=mock.Mock(st_dev=18)), observe_route(real="/other"),
+                    observe_route(free=0), observe_route(uuid="other")):
+        observed_route = dict(observed, **changed)
+        if not guest_binding_problems(record, observed_route):
+            problems.append("guest comparison accepted a changed actual route observation")
     return problems
 
 
