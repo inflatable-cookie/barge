@@ -10,6 +10,7 @@ Barge moves heavy, rebuildable developer data (build output, caches, scratch, VM
 - [Stage 3 design: registration, space policy, reserve pruning and the floor](knowledge/contracts/stage3-space-policy.md)
 - [Builds real-drive qualification procedure](knowledge/contracts/t9-real-drive-qualification.md)
 - [Stage 4 design: owned-root identity across remounts and absence proofs for pruning](knowledge/contracts/stage4-design.md)
+- [Controlled proof execution context](knowledge/contracts/proof-execution-context.md)
 - [F6-O2 B-S1 capture tape and release-plan harness](knowledge/contracts/o2-tape.md)
 - [Open decisions](knowledge/questions.md)
 - [Knowledge map](knowledge/README.md)
