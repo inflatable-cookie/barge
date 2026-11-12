@@ -682,7 +682,8 @@ def guest_stage_environment(base, tmpdir, target_dir):
         raise ValueError("the guest target directory is not inside this guard's scratch")
     environment = stage_environment(base, tmpdir)
     for name in tuple(environment):
-        if name.startswith("CARGO_") and name != "CARGO_NET_OFFLINE":
+        if ((name.startswith("CARGO_") and name != "CARGO_NET_OFFLINE")
+                or (name.startswith("RUST") and name not in ("RUSTUP_TOOLCHAIN", "RUSTUP_AUTO_INSTALL"))):
             environment.pop(name)
     for name in ("RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC",
                  "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"):
@@ -1168,6 +1169,18 @@ def guest_receipt_problems(record, receipt, actual_digest, expected_digest):
     for key in ("nonce", "head", "tree", "lock_sha256", "guard_sha256", "inputs_sha256"):
         if not record.get(key) or receipt.get(key) != record[key]:
             problems.append(f"guest receipt {key} does not match the invocation")
+    build = receipt.get("build")
+    if not isinstance(build, dict):
+        problems.append("guest receipt has no staged build binding")
+    else:
+        for key in ("head", "tree", "lock_sha256", "guard_sha256", "inputs_sha256", "cargo_sha256", "rustc_sha256"):
+            if build.get(key) != record.get(key):
+                problems.append(f"guest receipt build {key} differs from the invocation")
+        if (build.get("features") != [PROOF_FEATURE] or build.get("toolchain") != TOOLCHAIN_CHANNEL
+                or build.get("build_command") != [record.get("cargo_path"), *GUEST_BUILD_COMMAND[1:]]
+                or build.get("offline") is not True or not isinstance(build.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", build["sha256"])):
+            problems.append("guest receipt build command, features, toolchain or binary digest is incomplete")
     return problems
 
 
@@ -1219,7 +1232,8 @@ def host_guest_preflight(instruction_path, instruction_digest, role, run, activa
                 problems.append("guest transport paths need an independently verified lossless argument route")
         def git(*args):
             result = subprocess.run(["git", "-C", REPO_ROOT, *args], capture_output=True,
-                                    text=True, timeout=INFO_TIMEOUT_SECONDS)
+                                    text=True, timeout=INFO_TIMEOUT_SECONDS,
+                                    env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))
             if result.returncode:
                 raise ValueError("host source identity is unreadable")
             return result.stdout.strip()
@@ -1256,6 +1270,18 @@ def host_guest_launch(instruction_path, instruction_digest, role, run, activatio
     and guest admission and a complete receipt channel before calling. The
     returned transport status is not proof of guest group or image closure.
     """
+    try:
+        identities = []
+        for stream in (stdout, stderr):
+            info = os.fstat(stream.fileno())
+            if (not __import__("stat").S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077 or info.st_size != 0 or info.st_nlink != 1):
+                return {"ok": False, "refused": ["host stream is not an empty private owned file"]}
+            identities.append((info.st_dev, info.st_ino))
+        if identities[0] == identities[1]:
+            return {"ok": False, "refused": ["host streams identify the same file"]}
+    except (OSError, ValueError, AttributeError):
+        return {"ok": False, "refused": ["host stream descriptors are unavailable"]}
     record, problems, metadata = host_guest_preflight(instruction_path, instruction_digest, role, run, activation)
     if problems:
         return {"ok": False, "refused": problems, "vm_metadata": metadata}
@@ -1263,9 +1289,10 @@ def host_guest_launch(instruction_path, instruction_digest, role, run, activatio
     started = time.time()
     try:
         result = subprocess.run(argv, stdout=stdout, stderr=stderr, timeout=LIMIT_SECONDS)
-        return {"ok": result.returncode == 0, "argv": argv, "exit": result.returncode,
+        return {"ok": False, "transport_ok": result.returncode == 0, "argv": argv, "exit": result.returncode,
                 "reaped": True, "elapsed_seconds": round(time.time() - started, 3),
-                "vm_metadata": metadata, "guest_closure": "not established by transport"}
+                "vm_metadata": metadata, "receipt": "not yet independently transferred",
+                "guest_closure": "not established by transport"}
     except (OSError, subprocess.TimeoutExpired) as error:
         return {"ok": False, "argv": argv, "exit": None,
                 "reaped": isinstance(error, subprocess.TimeoutExpired),
@@ -1415,7 +1442,8 @@ def guest_local_observation(record):
             return facts
         def command(argv):
             result = subprocess.run(argv, cwd=REPO_ROOT, capture_output=True, text=True,
-                                    timeout=INFO_TIMEOUT_SECONDS)
+                                    timeout=INFO_TIMEOUT_SECONDS,
+                                    env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))
             if result.returncode:
                 raise ValueError("local identity command refused")
             return result.stdout.strip()
@@ -1510,8 +1538,10 @@ def guest_binding_controls():
     """Exercise the data comparisons; these do not exercise the live guest route."""
     problems = []
     for argv in (["--guest-outer", "counted"],
+                 ["--guest-host", "--guest-instruction", "/guest/record", "--guest-digest", "f" * 64],
                  ["counted", "--guest-outer", "counted", "--guest-instruction", "/guest/record", "--guest-digest", "f" * 64],
                  ["--guest-inner", "counted", "--guest-outer", "counted", "--guest-instruction", "/guest/record", "--guest-digest", "f" * 64],
+                 ["--guest-inner", "counted", "--host-role", "author", "--guest-instruction", "/guest/record", "--guest-digest", "f" * 64],
                  ["--guest-instruction", "/guest/record", "--guest-digest", "f" * 64]):
         with contextlib.redirect_stderr(io.StringIO()):
             try:
@@ -1567,6 +1597,9 @@ def guest_binding_controls():
         if not guest_binding_problems(reduced, observed):
             problems.append(f"guest comparison accepted missing {field}")
     receipt = {key: record[key] for key in ("nonce", "head", "tree", "lock_sha256", "guard_sha256", "inputs_sha256")}
+    receipt["build"] = {key: record[key] for key in ("head", "tree", "lock_sha256", "guard_sha256", "inputs_sha256", "cargo_sha256", "rustc_sha256")}
+    receipt["build"].update(features=[PROOF_FEATURE], toolchain=TOOLCHAIN_CHANNEL, offline=True,
+                            build_command=[record["cargo_path"], *GUEST_BUILD_COMMAND[1:]], sha256="f" * 64)
     if guest_receipt_problems(record, receipt, "f" * 64, "f" * 64):
         problems.append("matching guest receipt comparison was refused")
     if not guest_receipt_problems(record, dict(receipt, nonce="other"), "f" * 64, "f" * 64):
@@ -1660,6 +1693,8 @@ def guest_binding_controls():
     digest = hashlib.sha256(raw).hexdigest()
     def host_command(argv, **kwargs):
         if argv[0] == "prlctl":
+            if argv[1] == "exec":
+                return mock.Mock(returncode=0, stdout=b"", stderr=b"")
             return mock.Mock(returncode=0, stdout=json.dumps([{"ID": GUEST_VM_UUID, "State": "running"}]).encode(), stderr=b"")
         if argv[-1] == "HEAD":
             output = record["head"]
@@ -1688,12 +1723,91 @@ def guest_binding_controls():
         _bound, refused, _metadata = host_guest_preflight("/owned/record", digest, "reviewer", record["run"], record["activation"])
         if not refused or any(call.args[0][0] == "prlctl" for call in host_calls.call_args_list):
             problems.append("host preflight accepted a different participant role")
+    stream_a = mock.Mock(fileno=lambda: 10)
+    stream_b = mock.Mock(fileno=lambda: 11)
+    info_a = mock.Mock(st_mode=0o100600, st_uid=123, st_size=0, st_nlink=1, st_dev=1, st_ino=10)
+    info_b = mock.Mock(st_mode=0o100600, st_uid=123, st_size=0, st_nlink=1, st_dev=1, st_ino=11)
+    with mock.patch("os.open", return_value=42), mock.patch("os.close"), \
+            mock.patch("os.getuid", return_value=123), \
+            mock.patch("os.fstat", side_effect=[info_a, info_b, mock.Mock(st_uid=123, st_mode=0o100600)]), \
+            mock.patch("os.fdopen", return_value=io.BytesIO(raw)), \
+            mock.patch("subprocess.run", side_effect=host_command) as host_calls, \
+            mock.patch(__name__ + ".sha256_file", side_effect=host_hash):
+        launched = host_guest_launch("/owned/record", digest, "author", record["run"], record["activation"], stream_a, stream_b)
+        commands = [call.args[0] for call in host_calls.call_args_list if call.args[0][0] == "prlctl"]
+        if (launched.get("ok") is not False or launched.get("transport_ok") is not True
+                or not commands or commands[-1] != host_guest_argv(record, digest)):
+            problems.append("host launcher did not preserve actual argv or kept transport unqualified")
     def read_instruction(data, expected, *, uid=123, mode=0o100600):
         with mock.patch("os.open", return_value=42), mock.patch("os.close"), \
                 mock.patch("os.getuid", return_value=123), \
                 mock.patch("os.fstat", return_value=mock.Mock(st_uid=uid, st_mode=mode)), \
                 mock.patch("os.fdopen", return_value=io.BytesIO(data)):
             return guest_instruction("/owned/invocation", expected)
+    for entry in (guest_outer_half, guest_inner_half):
+        with mock.patch("os.open", return_value=42), mock.patch("os.close"), \
+                mock.patch("os.getuid", return_value=123), \
+                mock.patch("os.fstat", return_value=mock.Mock(st_uid=123, st_mode=0o100600)), \
+                mock.patch("os.fdopen", return_value=io.BytesIO(raw)), \
+                mock.patch("os.mkdir") as make_directory, \
+                mock.patch(__name__ + ".guest_clock_ns", return_value=1), \
+                contextlib.redirect_stdout(io.StringIO()):
+            result = entry("diagnostic", "/owned/invocation", "0" * 64)
+            if result != 125 or make_directory.called:
+                problems.append("a guest entry did not refuse changed instruction bytes before effects")
+    # Drive the real inner entry with low-level observations scripted, changing
+    # only the outer tree. No guard, build, writer, or case oracle is replaced.
+    scratch = record["scratch"] + "/oxide-proof.example/scratch"
+    evidence = record["scratch"] + "/oxide-proof.example/evidence"
+    outer_observed = dict(paired, tree="0" * 40)
+    env = {"HOME": GUEST_HOME, "OXIDE_TASK_SCRATCH_ROOT": scratch,
+           "OXIDE_PROOF_EVIDENCE": evidence, "TMPDIR": scratch,
+           "BARGE_PROOF_SUPERVISOR": record["supervisor_path"],
+           WALL_DEADLINE_ENV: str(200 * 10 ** 9), "OXIDE_PROOF_DEADLINE_NS": str(200 * 10 ** 9),
+           ROUTE_ENV: json.dumps({"instruction_sha256": digest, "mode": "diagnostic", "observed": outer_observed})}
+    file_info = mock.Mock(st_mode=0o100600, st_uid=GUEST_UID)
+    directory_info = mock.Mock(st_mode=0o40700, st_uid=GUEST_UID, st_gid=GUEST_GID, st_dev=17, st_ino=3)
+    parent_info = mock.Mock(st_mode=0o40777, st_uid=0, st_gid=0, st_dev=17, st_ino=2)
+    path_parts = record["scratch"].split(os.sep)[1:]
+    path_infos = [directory_info] * len(path_parts)
+    path_infos[-2] = parent_info
+    def local_process(argv, **kwargs):
+        if argv[0] == DISKUTIL:
+            return mock.Mock(returncode=0, stdout=plistlib.dumps({"VolumeUUID": GUEST_VOLUME_UUID}), stderr=b"")
+        if argv[0] == "/bin/ps":
+            return mock.Mock(returncode=0, stdout="/usr/bin/python3 " + record["supervisor_path"], stderr="")
+        if argv[0] == record["cargo_path"]:
+            return mock.Mock(returncode=0, stdout="cargo 1.97.1 (test)", stderr="")
+        if argv[0] == record["rustc_path"]:
+            return mock.Mock(returncode=0, stdout="rustc 1.97.1 (test)\nhost: aarch64-apple-darwin", stderr="")
+        return host_command(argv, **kwargs)
+    def local_hash(path):
+        if path == record["input_manifest"]:
+            return record["inputs_sha256"]
+        if path == record["supervisor_path"]:
+            return SUPERVISOR_SHA256
+        return record["lock_sha256"] if path.endswith("Cargo.lock") else "f" * 64
+    def local_realpath(path):
+        return record["python_path"] if path == sys.executable else path
+    output = io.StringIO()
+    with mock.patch.dict(os.environ, env, clear=True), mock.patch("os.open", return_value=42), \
+            mock.patch("os.close"), mock.patch("os.getuid", return_value=GUEST_UID), \
+            mock.patch("os.geteuid", return_value=GUEST_UID), mock.patch("os.getegid", return_value=GUEST_GID), \
+            mock.patch("os.getpid", return_value=123), mock.patch("os.getsid", return_value=123), \
+            mock.patch("os.getpgid", return_value=123), mock.patch("os.getppid", return_value=100), \
+            mock.patch("os.fstat", side_effect=[file_info, *path_infos, directory_info]), \
+            mock.patch("os.fdopen", return_value=io.BytesIO(raw)), mock.patch("os.lstat", return_value=directory_info), \
+            mock.patch("os.path.isdir", return_value=True), mock.patch("os.path.islink", return_value=False), \
+            mock.patch("os.path.realpath", side_effect=local_realpath), \
+            mock.patch("os.fstatvfs", return_value=mock.Mock(f_bavail=21 * 1024 ** 3, f_frsize=1)), \
+            mock.patch("subprocess.run", side_effect=local_process), \
+            mock.patch(__name__ + ".sha256_file", side_effect=local_hash), \
+            mock.patch(__name__ + ".guest_clock_ns", return_value=1), \
+            mock.patch(__name__ + ".REPO_ROOT", record["source_path"]), \
+            mock.patch("os.mkdir") as make_directory, contextlib.redirect_stdout(output):
+        result = guest_inner_half("diagnostic", record["instruction_guest_path"], digest)
+    if result != 125 or make_directory.called or "tree changed between outer and inner" not in output.getvalue():
+        problems.append("real guest inner entry did not refuse changed outer source before effects")
     if read_instruction(raw, digest) != record:
         problems.append("guest instruction did not preserve its actual decoded fields")
     for name, data, expected, uid, mode in (
@@ -6013,6 +6127,8 @@ def plan_document():
             "status": "held: guest route, admission and complete receipt transport are not established",
             "authority": "the retained host participant's activation and authenticated report; guest correlation is not authority",
             "admission": "evaluate a supported mechanism first; the interim heavy-inline route requires all published conditions and an explicit not-host-admitted disclosure",
+            "command": GUEST_BUILD_COMMAND,
+            "binding": "owner record pins the host guest-command template with the instruction-digest placeholder; the host records the complete actual argv and independently compares a transferred receipt",
             "route": "private uid 501 leaf on the pinned Data volume; outer and inner observations must agree before effects",
             "premises": {
                 "private_home_rustup": "guest toolchain and offline inputs must be source-bound; fixture children retain private homes",
@@ -6075,21 +6191,44 @@ def argument_parser():
     parser.add_argument("--receipt")
     parser.add_argument("--guest-outer", choices=["counted", "diagnostic"])
     parser.add_argument("--guest-inner", choices=["counted", "diagnostic"])
+    parser.add_argument("--guest-host", action="store_true")
     parser.add_argument("--guest-instruction")
     parser.add_argument("--guest-digest")
+    parser.add_argument("--host-role", choices=["author", "reviewer"])
+    parser.add_argument("--host-run")
+    parser.add_argument("--host-activation")
+    parser.add_argument("--host-stdout-fd", type=int)
+    parser.add_argument("--host-stderr-fd", type=int)
     return parser
 
 
 def main(argv):
     parser = argument_parser()
     args = parser.parse_args(argv)
-    guest_arguments = (args.guest_outer, args.guest_inner, args.guest_instruction, args.guest_digest)
-    if any(value is not None for value in guest_arguments):
-        if ((args.guest_outer is None) == (args.guest_inner is None)
+    host_fields = (args.host_role, args.host_run, args.host_activation, args.host_stdout_fd, args.host_stderr_fd)
+    guest_arguments = (args.guest_outer, args.guest_inner, args.guest_instruction, args.guest_digest, *host_fields)
+    if args.guest_host or any(value is not None for value in guest_arguments):
+        if (sum((args.guest_host, args.guest_outer is not None, args.guest_inner is not None)) != 1
                 or not args.guest_instruction or not args.guest_digest
                 or args.mode is not None or args.inner is not None or args.receipt is not None
                 or args.self_check or args.plan):
             parser.error("select exactly one guest entry with its instruction and digest, and no host mode")
+        if args.guest_host:
+            if (any(value is None for value in host_fields) or args.host_stdout_fd < 3 or args.host_stderr_fd < 3
+                    or args.host_stdout_fd == args.host_stderr_fd):
+                parser.error("guest host launch requires role, run, activation and distinct owned stream descriptors")
+            try:
+                with os.fdopen(args.host_stdout_fd, "wb", closefd=False) as stdout, \
+                        os.fdopen(args.host_stderr_fd, "wb", closefd=False) as stderr:
+                    result = host_guest_launch(args.guest_instruction, args.guest_digest, args.host_role,
+                                               args.host_run, args.host_activation, stdout, stderr)
+                print(json.dumps(result))
+                return 0 if result.get("ok") else 125
+            except (OSError, ValueError) as error:
+                print(json.dumps({"schema": SCHEMA, "ok": False, "refused": f"host stream: {error}"}))
+                return 125
+        if any(value is not None for value in host_fields):
+            parser.error("host participant arguments cannot be passed to a guest entry")
         if args.guest_outer:
             return guest_outer_half(args.guest_outer, args.guest_instruction, args.guest_digest)
         return guest_inner_half(args.guest_inner, args.guest_instruction, args.guest_digest)
