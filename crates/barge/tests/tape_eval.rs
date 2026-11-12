@@ -112,6 +112,8 @@ mod operation;
 mod os;
 #[path = "../src/oxide_outputs.rs"]
 mod oxide_outputs;
+#[path = "../src/oxide_settlement.rs"]
+mod oxide_settlement;
 #[path = "../src/pool_custody.rs"]
 mod pool_custody;
 #[path = "../src/prune.rs"]

@@ -5,8 +5,9 @@
 //! `barge inspect` already reads Oxide's state in place and reports
 //! observations. This module adds the one bounded, read-only observation the
 //! finding needs: Oxide's output registry
-//! (`<internal pool>/outputs/registry.json`, `oxide.outputs.registry/2` and `/1`)
-//! is read strictly, and every row is reported with the facts Oxide recorded
+//! (`<internal pool>/outputs/registry.json`, `oxide.outputs.registry/1` and
+//! `/2`, and the coordinated `/4` with its required `settled` set) is read
+//! strictly, and every row is reported with the facts Oxide recorded
 //! and — where the recorded volume is present and verifiable — Barge's own
 //! identity verdict for that root, from the same descriptor walk a root
 //! verification takes (stage 4 design, "Verifying a root").
@@ -388,6 +389,7 @@ fn parse_registry(path: &Path, bytes: &[u8]) -> Result<Observed<OxideRegistry>> 
     let schema = match (raw.version.as_str(), raw.schema) {
         ("oxide.outputs.registry/2", 2) => 2,
         ("oxide.outputs.registry/1", 1) => 1,
+        ("oxide.outputs.registry/4", 4) => 4,
         (version, schema) => {
             return Err(divergence(
                 path,
@@ -435,6 +437,31 @@ fn parse_registry(path: &Path, bytes: &[u8]) -> Result<Observed<OxideRegistry>> 
             ),
         ));
     }
+    // The coordinated registry's settlement set: required present and
+    // validated on `/4`, refused on every predecessor this reader reads. The
+    // entries are retained terminal facts, never references: they are
+    // validated here and dropped, through the one shared rule the release
+    // reader uses, so both readers cannot disagree about which `/4`
+    // documents are valid.
+    match (schema == 4, raw.settled) {
+        (true, Some(entries)) => {
+            crate::oxide_settlement::validate_settlement_set(&entries)
+                .map_err(|message| divergence(path, message))?;
+        }
+        (true, None) => {
+            return Err(divergence(
+                path,
+                "the coordinated output registry omits its settlement set".to_owned(),
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(divergence(
+                path,
+                "a predecessor output registry cannot carry settlement facts".to_owned(),
+            ));
+        }
+        (false, None) => {}
+    }
     let rows = raw.rows.into_iter().map(OxideRegistryRow::from).collect();
     Ok(Observed::new(
         OXIDE_REGISTRY_SOURCE,
@@ -475,6 +502,14 @@ struct RawRegistry {
     #[allow(dead_code)]
     #[serde(default)]
     cancelled_overflow: Vec<serde_json::Value>,
+    /// The coordinated registry's retained settlement facts. Required present
+    /// on `/4` and validated there; refused on `/1` and `/2`. An explicit
+    /// `null` is refused by the shared reader, never read as an empty set.
+    #[serde(
+        default,
+        deserialize_with = "crate::oxide_settlement::read_settlements"
+    )]
+    settled: Option<Vec<crate::oxide_settlement::RawSettlement>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2540,6 +2575,195 @@ mod tests {
             read_registry(&over, Deadline::after(std::time::Duration::from_secs(5))).state(),
             ObservationState::UnknownState
         );
+    }
+
+    /// One settlement entry, exactly Oxide's serialized `Settlement` field set
+    /// (Oxide at 8346df5e), shared with the release reader's tests through the
+    /// same validation rule.
+    fn settlement_entry(root: &str) -> serde_json::Value {
+        serde_json::json!({
+            "caller": "oxide.outputs",
+            "key": "a".repeat(32),
+            "checkout_id": "c".repeat(64),
+            "root": root,
+            "nonce": "b".repeat(32),
+            "outcome": "deleted",
+            "terminal_ms": 1,
+            "request_sha256": "d".repeat(64),
+        })
+    }
+
+    #[test]
+    fn a_coordinated_registry_is_reported_with_its_document_facts_and_rows() {
+        let fixture = TempDir::new("census-coordinated");
+        let document = serde_json::json!({
+            "version": "oxide.outputs.registry/4",
+            "schema": 4,
+            "revision": 9,
+            "complete": true,
+            "created_by": "fixture-transaction",
+            "rows": [
+                {
+                    "checkout_id": CHECKOUT_ID,
+                    "checkout": CHECKOUT,
+                    "receipt": RECEIPT,
+                    "member": "target",
+                    "root": "/Volumes/Builds/oxide-outputs/root",
+                    "root_kind": "external",
+                    "recipe": "target-debug",
+                    "generation": 1,
+                    "selected": true,
+                    "pending": false,
+                }
+            ],
+            "settled": [settlement_entry("/Volumes/Builds/oxide-outputs/gone")],
+        });
+        let path = fixture.write(
+            "registry.json",
+            &serde_json::to_vec(&document).expect("the fixture encodes"),
+        );
+        let observation = read_registry(&path, Deadline::after(std::time::Duration::from_secs(5)));
+        let observed = observation
+            .observed()
+            .expect("a coordinated registry is reported, not unknown");
+        assert_eq!(observed.value().version(), "oxide.outputs.registry/4");
+        assert_eq!(observed.value().schema(), 4);
+        assert_eq!(observed.value().rows().len(), 1);
+        assert!(observed.value().rows()[0].selected());
+
+        // The adopted empty settlement set is Oxide's own upgrade shape.
+        let mut adopted = document.clone();
+        adopted["settled"] = serde_json::json!([]);
+        let path = fixture.write(
+            "adopted.json",
+            &serde_json::to_vec(&adopted).expect("the fixture encodes"),
+        );
+        let observation = read_registry(&path, Deadline::after(std::time::Duration::from_secs(5)));
+        assert!(observation.observed().is_some(), "{observation:?}");
+    }
+
+    #[test]
+    fn a_coordinated_registry_that_omits_or_malforms_its_settlement_set_is_unknown_state() {
+        let fixture = TempDir::new("census-coordinated-divergent");
+        let base = serde_json::json!({
+            "version": "oxide.outputs.registry/4",
+            "schema": 4,
+            "revision": 9,
+            "complete": true,
+            "created_by": "fixture-transaction",
+            "rows": [],
+            "settled": [],
+        });
+        let mut cases: Vec<(&str, serde_json::Value)> = Vec::new();
+        let mut absent = base.clone();
+        absent.as_object_mut().expect("object").remove("settled");
+        cases.push(("absent-settled", absent));
+        let mut null = base.clone();
+        null["settled"] = serde_json::Value::Null;
+        cases.push(("null-settled", null));
+        let mut entry = base.clone();
+        entry["settled"] = serde_json::json!([{
+            "caller": "oxide.other",
+            "key": "a".repeat(32),
+            "checkout_id": "c".repeat(64),
+            "root": "/Volumes/Builds/gone",
+            "nonce": "b".repeat(32),
+            "outcome": "deleted",
+            "terminal_ms": 1,
+            "request_sha256": "d".repeat(64),
+        }]);
+        cases.push(("wrong-caller", entry));
+        let mut entry = base.clone();
+        entry["settled"] = serde_json::json!([{
+            "caller": "oxide.outputs",
+            "key": "a".repeat(32),
+            "checkout_id": "c".repeat(64),
+            "root": "gone",
+            "nonce": "b".repeat(32),
+            "outcome": "deleted",
+            "terminal_ms": 1,
+            "request_sha256": "d".repeat(64),
+        }]);
+        cases.push(("relative-root", entry));
+        let mut entry = base.clone();
+        entry["settled"] = serde_json::json!([{
+            "caller": "oxide.outputs",
+            "key": "a".repeat(32),
+            "outcome": "deleted",
+            "terminal_ms": 1,
+            "request_sha256": "d".repeat(64),
+        }]);
+        cases.push(("missing-members", entry));
+        let mut repeated = base.clone();
+        repeated["settled"] = serde_json::json!([settlement_entry("/g"), settlement_entry("/h")]);
+        cases.push(("repeated-key", repeated));
+        let mut routes = base.clone();
+        routes["deletion_routes"] =
+            serde_json::json!([{"intent_id": "1".repeat(32), "deleter": "local"}]);
+        cases.push(("routes", routes));
+        let mut schema = base.clone();
+        schema["schema"] = serde_json::json!(3);
+        cases.push(("schema-pair", schema));
+        for (name, document) in cases {
+            let path = fixture.write(
+                &format!("{name}.json"),
+                &serde_json::to_vec(&document).expect("the fixture encodes"),
+            );
+            let observation =
+                read_registry(&path, Deadline::after(std::time::Duration::from_secs(5)));
+            assert_eq!(
+                observation.state(),
+                ObservationState::UnknownState,
+                "{name} must be unknown state: {observation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn settlement_facts_and_the_delegated_format_keep_their_dispositions() {
+        let fixture = TempDir::new("census-settled-dispositions");
+        // A predecessor that carries the coordinated member is divergent.
+        let mut predecessor = serde_json::json!({
+            "version": "oxide.outputs.registry/2",
+            "schema": 2,
+            "revision": 1,
+            "complete": true,
+            "created_by": "t",
+            "rows": [],
+        });
+        predecessor["settled"] = serde_json::json!([]);
+        let path = fixture.write(
+            "settled-on-two.json",
+            &serde_json::to_vec(&predecessor).expect("the fixture encodes"),
+        );
+        assert_eq!(
+            read_registry(&path, Deadline::after(std::time::Duration::from_secs(5))).state(),
+            ObservationState::UnknownState
+        );
+        // The census's existing disposition is unchanged: the delegated
+        // format stays a version this reader does not read.
+        let delegated = serde_json::json!({
+            "version": "oxide.outputs.registry/3",
+            "schema": 3,
+            "revision": 1,
+            "complete": true,
+            "created_by": "t",
+            "rows": [],
+            "deletion_routes": [{"intent_id": "1".repeat(32), "deleter": "local"}],
+        });
+        let path = fixture.write(
+            "delegated.json",
+            &serde_json::to_vec(&delegated).expect("the fixture encodes"),
+        );
+        let observation = read_registry(&path, Deadline::after(std::time::Duration::from_secs(5)));
+        assert_eq!(observation.state(), ObservationState::UnknownState);
+        // The refusal names the document, not a version Barge could read: the
+        // census never gained the delegated field set, and this correction
+        // does not add it.
+        let detail = observation
+            .detail()
+            .expect("an unknown observation says why");
+        assert!(detail.contains("not the field set"), "{detail}");
     }
 
     #[test]
