@@ -680,6 +680,9 @@ def guest_stage_environment(base, tmpdir, target_dir):
             or target_dir != os.path.join(tmpdir, "cargo-target")):
         raise ValueError("the guest target directory is not inside this guard's scratch")
     environment = stage_environment(base, tmpdir)
+    for name in tuple(environment):
+        if name.startswith("CARGO_") and name != "CARGO_NET_OFFLINE":
+            environment.pop(name)
     for name in ("RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC",
                  "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"):
         environment.pop(name, None)
@@ -1074,7 +1077,7 @@ def guest_instruction(path, expected_sha256):
         os.close(fd)
 
 
-def guest_binding_problems(record, observed):
+def guest_binding_problems(record, observed, *, check_route=True):
     """Check scoped instruction data against separately attributed observations.
 
     This comparison is not authentication, admission, or closure.  The host
@@ -1088,7 +1091,7 @@ def guest_binding_problems(record, observed):
         "home", "mount", "volume_uuid", "scratch", "head", "tree", "lock_sha256",
         "guard_sha256", "toolchain", "target", "features", "command_sha256",
         "inputs_sha256", "nonce", "cargo_path", "cargo_sha256", "rustc_path", "rustc_sha256",
-        "input_manifest", "supervisor_path", "source_path",
+        "input_manifest", "supervisor_path", "source_path", "cargo_home", "toolchain_root",
     }
     if set(record) != required:
         return ["guest invocation binding has missing or unexpected fields"]
@@ -1118,25 +1121,34 @@ def guest_binding_problems(record, observed):
     if not isinstance(scratch, str) or os.path.dirname(scratch) != GUEST_PARENT or \
             not re.fullmatch(r"barge-proof-[A-Za-z0-9_-]{8,80}", os.path.basename(scratch)):
         problems.append("guest scratch is not a named private leaf of the Data parent")
-    for key in ("cargo_path", "rustc_path", "input_manifest", "supervisor_path", "source_path"):
+    for key in ("cargo_path", "rustc_path", "input_manifest", "supervisor_path", "source_path",
+                "cargo_home", "toolchain_root"):
         path = record[key]
         if not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path:
             problems.append(f"guest {key} is not absolute and canonical")
+    toolchain_root = record["toolchain_root"]
+    if not isinstance(toolchain_root, str) or any(
+            not isinstance(record[key], str) or not record[key].startswith(toolchain_root + os.sep)
+            for key in ("cargo_path", "rustc_path")):
+        problems.append("guest tools are outside the bound toolchain root")
     for key in ("uid", "gid", "home", "mount", "volume_uuid", "scratch", "head", "tree",
                 "lock_sha256", "guard_sha256", "toolchain", "target", "features", "inputs_sha256",
                 "cargo_path", "cargo_sha256", "rustc_path", "rustc_sha256", "input_manifest",
-                "supervisor_path", "source_path"):
+                "supervisor_path", "source_path", "cargo_home", "toolchain_root"):
+        if not check_route and key == "volume_uuid":
+            continue
         if observed.get(key) != record[key]:
             problems.append(f"guest observation {key} differs from the invocation")
-    for key in ("canonical", "nofollow", "owner_only", "same_volume", "reserve"):
-        if observed.get(key) is not True:
-            problems.append(f"guest route {key} is not established")
-    identities = observed.get("route_identity")
-    if (not isinstance(identities, dict) or set(identities) != {"mount", "parent", "leaf"}
-            or any(not isinstance(identities[key], list) or len(identities[key]) != 2
-                   or any(type(value) is not int or value < 0 for value in identities[key])
-                   for key in ("mount", "parent", "leaf"))):
-        problems.append("guest route device and inode identities are incomplete")
+    if check_route:
+        for key in ("canonical", "nofollow", "owner_only", "same_volume", "reserve"):
+            if observed.get(key) is not True:
+                problems.append(f"guest route {key} is not established")
+        identities = observed.get("route_identity")
+        if (not isinstance(identities, dict) or set(identities) != {"mount", "parent", "leaf"}
+                or any(not isinstance(identities[key], list) or len(identities[key]) != 2
+                       or any(type(value) is not int or value < 0 for value in identities[key])
+                       for key in ("mount", "parent", "leaf"))):
+            problems.append("guest route device and inode identities are incomplete")
     return problems
 
 
@@ -1161,9 +1173,82 @@ def guest_recheck_problems(outer, inner):
     keys = ("uid", "gid", "home", "mount", "volume_uuid", "scratch", "head", "tree",
             "lock_sha256", "guard_sha256", "toolchain", "target", "features", "inputs_sha256",
             "route_identity", "cargo_path", "cargo_sha256", "rustc_path", "rustc_sha256",
-            "input_manifest", "supervisor_path", "source_path")
+            "input_manifest", "supervisor_path", "source_path", "cargo_home", "toolchain_root")
     return [f"guest {key} changed between outer and inner" for key in keys
             if outer.get(key) is None or outer.get(key) != inner.get(key)]
+
+
+def guest_clock_ns():
+    """Use the qualified guard's clock; no guest wall-clock conversion."""
+    return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+
+
+def guest_offline_inputs_problems(record, deadline_ns):
+    """Compare all files in the two declared offline roots with the owner's manifest.
+
+    The manifest is scoped evidence, not a guest credential. Symlinks and any
+    missing, extra, unreadable or changed file refuse the staged build.
+    """
+    try:
+        with open(record["input_manifest"], "rb") as handle:
+            raw = handle.read(16 * 1024 * 1024 + 1)
+        if len(raw) > 16 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != record["inputs_sha256"]:
+            return ["guest offline input manifest bytes differ or exceed the bound"]
+        def unique(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("duplicate manifest key")
+                value[key] = item
+            return value
+        manifest = json.loads(raw, object_pairs_hook=unique)
+        roots = (record["cargo_home"], record["toolchain_root"])
+        if (not isinstance(manifest, dict) or set(manifest) != {"roots"}
+                or not isinstance(manifest["roots"], dict) or set(manifest["roots"]) != set(roots)
+                or len(set(roots)) != 2):
+            return ["guest offline input roots do not match the invocation"]
+        if not getattr(os, "O_NOFOLLOW", 0) or not hasattr(os, "fwalk"):
+            return ["guest offline input no-follow traversal is unavailable"]
+        for root in roots:
+            if os.path.realpath(root) != root or not os.path.isdir(root):
+                return ["guest offline input root is not a canonical directory"]
+            expected = manifest["roots"][root]
+            if not isinstance(expected, dict) or len(expected) > 100000:
+                return ["guest offline input inventory is malformed or too large"]
+            actual = {}
+            def fail_walk(error):
+                raise error
+            for directory, subdirs, files, directory_fd in os.fwalk(root, follow_symlinks=False, onerror=fail_walk):
+                if guest_clock_ns() >= deadline_ns:
+                    return ["guest offline input verification exceeded the guard deadline"]
+                for name in subdirs:
+                    if not __import__("stat").S_ISDIR(os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_mode):
+                        return ["guest offline input directory is a link or special file"]
+                for name in files:
+                    relative = os.path.relpath(os.path.join(directory, name), root)
+                    if len(actual) >= 100000:
+                        return ["guest offline input inventory exceeds the file bound"]
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                    try:
+                        info = os.fstat(fd)
+                        if not __import__("stat").S_ISREG(info.st_mode):
+                            return ["guest offline input is not a regular file"]
+                        digest = hashlib.sha256()
+                        while True:
+                            if guest_clock_ns() >= deadline_ns:
+                                return ["guest offline input verification exceeded the guard deadline"]
+                            data = os.read(fd, 1024 * 1024)
+                            if not data:
+                                break
+                            digest.update(data)
+                        actual[relative] = digest.hexdigest()
+                    finally:
+                        os.close(fd)
+            if actual != expected:
+                return ["guest offline input files do not match the complete manifest"]
+    except (OSError, ValueError, TypeError, KeyError):
+        return ["guest offline input evidence is unreadable or malformed"]
+    return []
 
 
 def guest_local_observation(record):
@@ -1171,10 +1256,12 @@ def guest_local_observation(record):
     if not isinstance(record, dict):
         return {}
     facts = guest_route_facts(record.get("scratch"))
-    for key in ("source_path", "supervisor_path", "input_manifest", "cargo_path", "rustc_path"):
+    for key in ("source_path", "supervisor_path", "input_manifest", "cargo_path", "rustc_path",
+                "cargo_home", "toolchain_root"):
         facts[key] = None
     try:
-        for key in ("source_path", "supervisor_path", "input_manifest", "cargo_path", "rustc_path"):
+        for key in ("source_path", "supervisor_path", "input_manifest", "cargo_path", "rustc_path",
+                    "cargo_home", "toolchain_root"):
             path = record[key]
             if (not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path
                     or os.path.realpath(path) != path):
@@ -1207,6 +1294,57 @@ def guest_local_observation(record):
     except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
         return facts
     return facts
+
+
+def guest_create_leaf(record):
+    """Create one exclusive leaf relative to verified Data directory descriptors."""
+    path = record.get("scratch") if isinstance(record, dict) else None
+    if (not isinstance(path, str) or os.path.dirname(path) != GUEST_PARENT
+            or not re.fullmatch(r"barge-proof-[A-Za-z0-9_-]{8,80}", os.path.basename(path))):
+        raise ValueError("guest leaf name is not authorized")
+    if os.geteuid() != GUEST_UID or os.getegid() != GUEST_GID or os.environ.get("HOME") != GUEST_HOME:
+        raise ValueError("guest account does not match")
+    if not getattr(os, "O_DIRECTORY", 0) or not getattr(os, "O_NOFOLLOW", 0):
+        raise ValueError("guest directory no-follow operations are unavailable")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptors = []
+    leaf = None
+    try:
+        fd = os.open(os.sep, flags)
+        descriptors.append(fd)
+        current = ""
+        mount_info = None
+        for part in GUEST_PARENT.split(os.sep)[1:]:
+            fd = os.open(part, flags, dir_fd=fd)
+            descriptors.append(fd)
+            info = os.fstat(fd)
+            if not __import__("stat").S_ISDIR(info.st_mode):
+                raise ValueError("guest parent component is not a directory")
+            current += os.sep + part
+            if current == GUEST_MOUNT:
+                mount_info = info
+        parent_info = os.fstat(fd)
+        space = os.fstatvfs(fd)
+        if (mount_info is None or parent_info.st_dev != mount_info.st_dev or parent_info.st_uid != 0
+                or parent_info.st_gid != 0 or (parent_info.st_mode & 0o777) != 0o777
+                or os.path.realpath(GUEST_PARENT) != GUEST_PARENT
+                or volume_uuid(GUEST_MOUNT) != GUEST_VOLUME_UUID
+                or space.f_bavail * space.f_frsize < 20 * 1024 ** 3):
+            raise ValueError("guest Data parent, volume or reserve is not established")
+        os.mkdir(os.path.basename(path), 0o700, dir_fd=fd)
+        leaf = os.open(os.path.basename(path), flags, dir_fd=fd)
+        info = os.fstat(leaf)
+        if (info.st_uid != GUEST_UID or info.st_gid != GUEST_GID or (info.st_mode & 0o777) != 0o700
+                or info.st_dev != mount_info.st_dev):
+            raise ValueError("new guest leaf ownership, mode or volume does not match")
+        result = leaf
+        leaf = None
+        return result
+    finally:
+        if leaf is not None:
+            os.close(leaf)
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def guest_artifact_problems(artifact, target_dir, before, after):
@@ -1249,7 +1387,10 @@ def guest_binding_controls():
               "cargo_path": "/guest/toolchain/bin/cargo", "cargo_sha256": "f" * 64,
               "rustc_path": "/guest/toolchain/bin/rustc", "rustc_sha256": "f" * 64,
               "input_manifest": "/guest/inputs.json", "supervisor_path": "/guest/bounded-test.py",
-              "source_path": "/guest/source"}
+              "source_path": "/guest/source", "cargo_home": "/guest/cargo-home",
+              "toolchain_root": "/guest/toolchain"}
+    input_bytes = json.dumps({"roots": {record["cargo_home"]: {}, record["toolchain_root"]: {}}}).encode()
+    record["inputs_sha256"] = hashlib.sha256(input_bytes).hexdigest()
     observed = dict(record, canonical=True, nofollow=True, owner_only=True, same_volume=True, reserve=True,
                     route_identity={"mount": [17, 1], "parent": [17, 2], "leaf": [17, 3]})
     if guest_binding_problems(record, observed):
@@ -1293,13 +1434,19 @@ def guest_binding_controls():
     output = json.dumps({"reason": "compiler-artifact", "target": {"name": "barge", "kind": ["bin"]},
                          "executable": artifact["executable"], "features": [PROOF_FEATURE]})
     build = mock.Mock(returncode=0, stdout=output, stderr="")
-    def stage_control(after, response=build):
+    def stage_control(after, response=build, manifest_bytes=input_bytes):
+        writer = mock.mock_open()
+        def open_file(path, mode="r", *args, **kwargs):
+            return io.BytesIO(manifest_bytes) if path == record["input_manifest"] and mode == "rb" else writer(path, mode, *args, **kwargs)
+        def walk(root, **kwargs):
+            return iter([(root, [], [], 42)])
         with mock.patch("os.mkdir"), mock.patch("os.chmod"), mock.patch("shutil.copyfile"), \
                 mock.patch("tempfile.mkdtemp", return_value="/guard/scratch/staged"), \
-                mock.patch("builtins.open", mock.mock_open()), \
+                mock.patch("builtins.open", side_effect=open_file), mock.patch("os.fwalk", side_effect=walk), \
+                mock.patch("os.path.isdir", return_value=True), \
                 mock.patch("os.path.realpath", side_effect=lambda path: path), \
                 mock.patch(__name__ + ".sha256_file", return_value="f" * 64), \
-                mock.patch("time.monotonic_ns", return_value=1):
+                mock.patch(__name__ + ".guest_clock_ns", return_value=1):
             return guest_stage_proof_binary("/guard/scratch", {"guard": "/guard"}, 10 ** 12,
                                             record, paired, lambda: after,
                                             runner=lambda *args, **kwargs: response)
@@ -1324,6 +1471,11 @@ def guest_binding_controls():
             problems.append("guest stage accepted changed source or failed offline build")
         except Infrastructure:
             pass
+    try:
+        stage_control(paired, manifest_bytes=b"changed")
+        problems.append("guest stage accepted changed offline input manifest bytes")
+    except Infrastructure:
+        pass
     raw = json.dumps(record).encode()
     digest = hashlib.sha256(raw).hexdigest()
     def read_instruction(data, expected, *, uid=123, mode=0o100600):
@@ -1644,8 +1796,11 @@ def guest_stage_proof_binary(parent, owned, deadline_ns, record, before, observe
     problems = stage_parent_problems(parent, owned) + guest_binding_problems(record, before)
     if problems:
         raise Infrastructure("stage", "; ".join(problems))
-    if not isinstance(deadline_ns, int) or deadline_ns <= time.monotonic_ns():
+    if not isinstance(deadline_ns, int) or deadline_ns <= guest_clock_ns():
         raise Infrastructure("stage", "no guard wall is left for the guest build")
+    problems = guest_offline_inputs_problems(record, deadline_ns)
+    if problems:
+        raise Infrastructure("stage", "; ".join(problems))
     cargo = record["cargo_path"]
     try:
         if (os.path.realpath(cargo) != cargo or sha256_file(cargo) != record["cargo_sha256"]
@@ -1657,12 +1812,13 @@ def guest_stage_proof_binary(parent, owned, deadline_ns, record, before, observe
     target_dir = os.path.join(parent, "cargo-target")
     environment = guest_stage_environment(dict(os.environ), parent, target_dir)
     environment["RUSTC"] = record["rustc_path"]
+    environment["CARGO_HOME"] = record["cargo_home"]
     problems = stage_environment_problems(environment)
     if problems:
         raise Infrastructure("stage", "; ".join(problems))
     try:
         os.mkdir(target_dir, 0o700)
-        remaining = (deadline_ns - time.monotonic_ns()) / 1e9
+        remaining = (deadline_ns - guest_clock_ns()) / 1e9
         if remaining <= 0:
             raise Infrastructure("stage", "the guard wall expired before the guest build")
         build = (runner or subprocess.run)([cargo, *GUEST_BUILD_COMMAND[1:]], cwd=REPO_ROOT, env=environment,
@@ -1674,7 +1830,8 @@ def guest_stage_proof_binary(parent, owned, deadline_ns, record, before, observe
     artifact = executable_from_build(build.stdout)
     after = observe()
     problems = guest_binding_problems(record, after) + guest_artifact_problems(artifact, target_dir, before, after)
-    if time.monotonic_ns() >= deadline_ns:
+    problems += guest_offline_inputs_problems(record, deadline_ns)
+    if guest_clock_ns() >= deadline_ns:
         problems.append("the guard wall expired before guest artifact staging")
     if problems:
         raise Infrastructure("stage", "; ".join(problems))
@@ -3386,7 +3543,7 @@ def guard_owned_root(scratch):
     return parent if parent not in ("", os.sep) else None
 
 
-def guard_containment_facts(scratch_env=None, evidence_env=None):
+def guard_containment_facts(scratch_env=None, evidence_env=None, root_parent=DESIGNATED_SCRATCH):
     """What the host says about the guard's monitored layout. Read-only.
 
     One `lstat` and one real resolution per path; nothing is created. `scratch_env`
@@ -3395,7 +3552,7 @@ def guard_containment_facts(scratch_env=None, evidence_env=None):
     scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "") if scratch_env is None else scratch_env
     evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "") if evidence_env is None else evidence_env
     facts = {"scratch": scratch, "evidence": evidence,
-             "root_parent": os.path.realpath(DESIGNATED_SCRATCH),
+             "root_parent": os.path.realpath(root_parent),
              "uid": os.getuid(), "scratch_facts": None, "evidence_facts": None,
              "root_facts": None}
     for key, path in (("scratch_facts", scratch), ("evidence_facts", evidence),
@@ -3475,7 +3632,7 @@ def guard_containment_problems(facts):
     return problems
 
 
-def guard_refusals(facts):
+def guard_refusals(facts, route_problems=None):
     """Why this process is not the pinned supervisor's guarded child. Pure.
 
     `facts` carries what the process observed: whether the evidence directory and the
@@ -3492,7 +3649,7 @@ def guard_refusals(facts):
     if facts.get("tmpdir_inside_scratch") is not True:
         refusals.append("TMPDIR is not inside the guard's owned scratch")
     refusals += list(facts.get("supervisor_problems") or [])
-    refusals += route_refusals(facts.get("route"))
+    refusals += route_refusals(facts.get("route")) if route_problems is None else route_problems
     if facts.get("deadline_ns") is None:
         refusals.append(f"{WALL_DEADLINE_ENV} does not name the guard's wall deadline")
     refusals += [f"guard containment: {problem}" for problem in facts.get("containment_problems") or []]
@@ -3597,6 +3754,10 @@ def run_proof(mode, build, stage_record, receipt_path, route):
     proof.real_state["unchanged"] = premise_failure is None
 
     receipt = proof.receipt_document(cancelled)
+    if isinstance(route, dict) and isinstance(route.get("guest_correlation"), dict):
+        # Correlation is evidence for the retained host participant, not a
+        # guest assertion of VM identity, admission or group closure.
+        receipt.update(route["guest_correlation"])
     receipt["real_state"] = proof.real_state
     receipt["premise_failure"] = premise_failure
     qualified = (
@@ -3661,6 +3822,109 @@ def inner_half(mode, receipt_path):
     owned_root = guard_owned_root(scratch)
     return guarded_run(mode, receipt_path, facts["route"], facts["deadline_ns"], scratch,
                        {"owned root": owned_root, "evidence directory": evidence})
+
+
+def guest_inner_half(mode, instruction_path, instruction_digest):
+    """Recheck guest facts inside the genuine guard before staging or fixture effects."""
+    try:
+        record = guest_instruction(instruction_path, instruction_digest)
+    except (OSError, ValueError) as error:
+        print(json.dumps({"schema": SCHEMA, "ok": False, "refused": f"guest instruction: {error}"}))
+        return 125
+    observed = guest_local_observation(record)
+    carried = carried_route()
+    route_problems = guest_binding_problems(record, observed)
+    if (not isinstance(carried, dict) or carried.get("instruction_sha256") != instruction_digest
+            or carried.get("mode") != mode or record.get("mode") != mode):
+        route_problems.append("the guest outer instruction or mode does not match")
+    route_problems += guest_recheck_problems(carried.get("observed") if isinstance(carried, dict) else None, observed)
+    if supervisor_path() != record.get("supervisor_path"):
+        route_problems.append("the guest guard path differs from the instruction")
+    try:
+        if os.getsid(0) != os.getpid() or os.getpgid(0) != os.getpid():
+            route_problems.append("the guest child is not the guard's session leader")
+    except OSError:
+        route_problems.append("the guest child session identity is unreadable")
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE")
+    scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
+    tmpdir = os.environ.get("TMPDIR", "")
+    containment = guard_containment_facts(scratch, evidence or "", record.get("scratch", ""))
+    deadline = wall_deadline()
+    if deadline is None or not guest_clock_ns() < deadline <= guest_clock_ns() + LIMIT_SECONDS * 10 ** 9:
+        route_problems.append("the guest guard deadline is absent, expired or exceeds the occurrence")
+    try:
+        guard_deadline = int(os.environ.get("OXIDE_PROOF_DEADLINE_NS", ""))
+        if deadline is None or guard_deadline < deadline or guard_deadline - deadline > 2 * 10 ** 9:
+            route_problems.append("the guest guard and outer deadlines do not describe the same bounded occurrence")
+    except ValueError:
+        route_problems.append("the guest guard's own deadline is unreadable")
+    facts = {"evidence_isdir": bool(evidence) and os.path.isdir(evidence),
+             "scratch_isdir": bool(scratch) and os.path.isdir(scratch),
+             "tmpdir_inside_scratch": inside_owned(tmpdir, scratch),
+             "containment_problems": guard_containment_problems(containment),
+             "supervisor_problems": installed_supervisor_problems(), "route": carried,
+             "deadline_ns": deadline}
+    refusals = guard_refusals(facts, route_problems)
+    if refusals:
+        print(json.dumps({"schema": SCHEMA, "ok": False, "refused": "; ".join(refusals)}))
+        return 125
+    receipt = os.path.join(evidence, PROOF_RECEIPT)
+    carried = dict(carried)
+    carried["guest_correlation"] = {key: record[key] for key in
+                                    ("nonce", "head", "tree", "lock_sha256", "guard_sha256", "inputs_sha256")}
+    owned = {"owned root": guard_owned_root(scratch), "evidence directory": evidence}
+    stage = lambda parent, roots, deadline_ns: guest_stage_proof_binary(
+        parent, roots, deadline_ns, record, observed, lambda: guest_local_observation(record))
+    verify = lambda binary, head, root: guest_staged_build_problems(binary, head, root, record)
+    return guarded_run(mode, receipt, carried, deadline, scratch, owned, stage=stage, verify=verify,
+                       head=record["head"])
+
+
+def guest_outer_half(mode, instruction_path, instruction_digest):
+    """Validate guest-local facts, create the private leaf and launch the same guard."""
+    deadline = guest_clock_ns() + (LIMIT_SECONDS - 2) * 10 ** 9
+    try:
+        record = guest_instruction(instruction_path, instruction_digest)
+        observed = guest_local_observation(record)
+        problems = guest_binding_problems(record, observed, check_route=False)
+        if record.get("mode") != mode:
+            problems.append("the guest mode differs from the instruction")
+        problems += guest_offline_inputs_problems(record, deadline)
+        if problems:
+            raise ValueError("; ".join(problems))
+        leaf = guest_create_leaf(record)
+    except (OSError, ValueError) as error:
+        print(json.dumps({"schema": SCHEMA, "ok": False, "refused": f"guest outer: {error}"}))
+        return 125
+    try:
+        observed = guest_local_observation(record)
+        problems = guest_binding_problems(record, observed)
+        opened = os.fstat(leaf)
+        if (observed.get("route_identity") or {}).get("leaf") != [opened.st_dev, opened.st_ino]:
+            problems.append("the verified guest leaf is not the opened leaf")
+        remaining = (deadline - guest_clock_ns()) / 1e9
+        if remaining <= 32:
+            problems.append("insufficient guest wall remains for the guard and stop margin")
+        if problems:
+            print(json.dumps({"schema": SCHEMA, "ok": False, "refused": "; ".join(problems)}))
+            return 125
+        env = dict(os.environ)
+        for key in ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_EVIDENCE", "DYLD_INSERT_LIBRARIES", ROUTE_ENV):
+            env.pop(key, None)
+        env[ROUTE_ENV] = json.dumps({"instruction_sha256": instruction_digest, "mode": mode,
+                                     "observed": observed}, separators=(",", ":"))
+        env[WALL_DEADLINE_ENV] = str(deadline)
+        env["BARGE_PROOF_SUPERVISOR"] = record["supervisor_path"]
+        command = [sys.executable, record["supervisor_path"], "--limit", str(remaining),
+                   "--scratch-budget-mib", str(SCRATCH_BUDGET_MIB), "--root-parent", ".", "--",
+                   sys.executable, SCRIPT_PATH, "--guest-inner", mode,
+                   "--guest-instruction", instruction_path, "--guest-digest", instruction_digest]
+        return subprocess.run(command, env=env, cwd=f"/dev/fd/{leaf}", pass_fds=(leaf,)).returncode
+    except OSError as error:
+        print(json.dumps({"schema": SCHEMA, "ok": False, "refused": f"guest guard launch: {error}"}))
+        return 125
+    finally:
+        os.close(leaf)
 
 
 def carried_route():
