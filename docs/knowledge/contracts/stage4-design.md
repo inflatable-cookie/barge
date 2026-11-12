@@ -1219,9 +1219,17 @@ Barge reads that handoff instead of only the fence string:
 - Both controls must agree: every pool the reading covers carries `/5` at the
   covered floor with one equal `ready` transaction. A mixed `/4`+`/5` pair, two
   different transactions, or a peer with no control document is a one-sided or
-  mid-adoption observation and stays unknown. A pool with no registered
-  removable peer is the same complete pair, because the producer has no second
-  control to fence.
+  mid-adoption observation and stays unknown. Peer membership is Oxide's own
+  registration (`oxide-managed/removable.json`), exactly as `removable::coordinate`
+  decides it: no registration is the internal pool alone — the same complete
+  pair, because the producer has no second control to fence — and a registered
+  pool's control is named even while its own directory is absent, so a
+  registered pair can never be silently narrowed to one control.
+- Discovery keeps a covered pool's missing registry an unknown: when a control
+  state records a covered `/3`–`/5` fence but its `outputs` folder is absent, the
+  snapshot is unknown rather than "no Oxide control directory", because that
+  image is exactly what the gate would read. A pool that never opted in
+  (no fence, or `/1`/`/2`) keeps its historical absence.
 - At the registry-reading consumers the pair and the image are one generation:
   a completed pair requires the `/4` image whose `created_by` is that
   transaction, and a `/4` image requires the completed pair. A mismatch, a
@@ -1237,10 +1245,13 @@ Barge reads that handoff instead of only the fence string:
   pair keeps its historical delegated behaviour unchanged.
 
 Regressions: the reader controls in `pool_custody` (pairing, initialization
-shapes, mixed/unequal/absent peers), the composed snapshot binding
-(`reference::writer_custody_tests`), the composed plan-and-execute refusals in
-`release` (one-sided controls, a mixed generation, and a control that re-enters
-initialization between plan and run), and the delegated-route refusals in
+shapes, mixed/unequal peers), the composed snapshot binding and discovery
+controls (`reference::writer_custody_tests`: registration names a peer even
+while its directory is absent, a registered peer with no control document and a
+covered control state with no `outputs` folder are both unknown), the composed
+plan-and-execute refusals in `release` (one-sided controls, a mixed generation,
+a missing `outputs` folder, and a control that re-enters initialization between
+plan and run), and the delegated-route refusals in
 `oxide_outputs::tests::routes`. The existing release-native apparatus gains
 R16, one finite named coordinated-adoption group: the positive `/5`+`/4`
 handoff releases an eligible root, and the mixed fence, unequal transaction,

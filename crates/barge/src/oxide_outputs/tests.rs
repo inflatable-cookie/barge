@@ -175,10 +175,26 @@ impl Fixture {
         .expect("the control state is written");
     }
 
+    /// Oxide's registration of the removable pool, exactly its own field set.
+    /// Its presence — not a directory — is what names the second control.
+    fn write_peer_registration(&self) {
+        let uuid = crate::testkit::FIXTURE_UUID;
+        std::fs::create_dir_all(&self.control).expect("the control directory is created");
+        std::fs::write(
+            self.control
+                .join(crate::inspect::OXIDE_REGISTRATION_FILE),
+            format!(
+                r#"{{"version":2,"mount_point":"/Volumes/Builds","volume_uuid":"{uuid}","container_uuid":"{uuid}","reserve_bytes":1,"cap_bytes":2,"quota_bytes":null,"capacity_bytes":null,"registered_ms":1,"mode":"ephemeral"}}"#
+            ),
+        )
+        .expect("the peer registration is written");
+    }
+
     /// Both pool controls exactly where Oxide's writer keeps them, carrying
     /// `fence` and its raw initialization member, with the library ledger beside
     /// each state.
     fn write_pool_controls(&self, fence: &str, init: serde_json::Value) {
+        self.write_peer_registration();
         let pools = [
             self.control.clone(),
             self.control

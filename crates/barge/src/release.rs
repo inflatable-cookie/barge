@@ -5014,13 +5014,30 @@ mod tests {
         .expect("the registry is written");
     }
 
-    /// The exact emitted coordinated handoff: both controls `/5` ready under
-    /// one transaction and the `/4` image that transaction created.
+    /// Oxide's registration of the removable pool, exactly its own field set.
+    /// Its presence — not a directory — is what names the second control.
+    fn oxide_peer_registration(fixture: &Fixture) {
+        let document = format!(
+            r#"{{"version":2,"mount_point":"/Volumes/Builds","volume_uuid":"{FIXTURE_UUID}","container_uuid":"{FIXTURE_UUID}","reserve_bytes":1,"cap_bytes":2,"quota_bytes":null,"capacity_bytes":null,"registered_ms":1,"mode":"ephemeral"}}"#
+        );
+        let control = oxide_control(fixture);
+        std::fs::create_dir_all(&control).expect("the control directory is created");
+        std::fs::write(
+            control.join(crate::inspect::OXIDE_REGISTRATION_FILE),
+            document,
+        )
+        .expect("the peer registration is written");
+    }
+
+    /// The exact emitted coordinated handoff: the removable peer registered,
+    /// both controls `/5` ready under one transaction and the `/4` image that
+    /// transaction created.
     fn oxide_coordinated_adoption(
         fixture: &Fixture,
         rows: &[serde_json::Value],
         settled: &[serde_json::Value],
     ) {
+        oxide_peer_registration(fixture);
         for control in oxide_pools(fixture) {
             oxide_pool_state(
                 &control,
@@ -5706,6 +5723,7 @@ mod tests {
         let fixture = Fixture::new("release-coordinated-one-sided-controls");
         let first = fixture.root();
         let second = fixture.root();
+        oxide_peer_registration(&fixture);
         let [internal, removable] = oxide_pools(&fixture);
         for control in [&internal, &removable] {
             oxide_pool_state(
@@ -5752,6 +5770,7 @@ mod tests {
         // different generations.
         let fixture = Fixture::new("release-coordinated-mixed-image");
         let root = fixture.root();
+        oxide_peer_registration(&fixture);
         let [internal, removable] = oxide_pools(&fixture);
         for control in [&internal, &removable] {
             oxide_pool_state(
@@ -5782,6 +5801,46 @@ mod tests {
         .expect_err("a mixed coordinated generation keeps the whole batch");
         assert_eq!(error.kind(), ErrorKind::UnknownState);
         assert!(std::fs::metadata(&root.path).is_ok());
+        assert!(intent_records(&fixture).is_empty());
+    }
+
+    #[test]
+    fn a_covered_control_without_its_outputs_folder_keeps_the_batch() {
+        // The registered pair records `/5` ready, but its `outputs` folder (and
+        // so the `/4` image) is gone. That is never "no registry here": the
+        // plan keeps the whole batch and a presented run refuses before any
+        // effect, because a covered pool's registry image must exist.
+        let fixture = Fixture::new("release-coordinated-missing-outputs");
+        let first = fixture.root();
+        let second = fixture.root();
+        oxide_coordinated_adoption(&fixture, &[], &[]);
+        std::fs::remove_dir_all(oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR))
+            .expect("the outputs folder is removed");
+        let report = fixture.plan();
+        for root in [&first, &second] {
+            let kept = row(&report, root);
+            assert!(!kept.eligible, "{kept:?}");
+            assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+            assert!(!kept.references_complete, "the batch is kept, not one root");
+        }
+        assert_eq!(report.plan.eligible_count, 0);
+        assert!(!report.oxide.complete);
+        assert!(report.needs_human());
+        let (bytes, digest) = presented(&report);
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let error = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &digest,
+        )
+        .expect_err("a covered control with no registry image keeps the batch");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(std::fs::metadata(&first.path).is_ok());
+        assert!(std::fs::metadata(&second.path).is_ok());
         assert!(intent_records(&fixture).is_empty());
     }
 

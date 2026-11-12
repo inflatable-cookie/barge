@@ -223,6 +223,7 @@ fn a_one_sided_coordinated_adoption_never_authorises_the_delegated_route() {
     let fixture = Fixture::new("adapter-coordinated-one-sided-controls");
     let root = fixture.root("root-one");
     fixture.covered(&root, CALLER_ID);
+    fixture.write_peer_registration();
     fixture.write_control_state(
         Some(crate::pool_custody::COORDINATED_OWNED_OUTPUTS_FENCE),
         4,

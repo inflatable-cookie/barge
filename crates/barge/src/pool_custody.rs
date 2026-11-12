@@ -259,6 +259,36 @@ fn coordinate(observed: &[PoolFence], pools: usize) -> Coordination {
     })
 }
 
+/// Whether one control directory records a covered owned-outputs fence.
+///
+/// A covered pool's registry image lives in the `outputs` folder beside this
+/// control directory, so discovery uses this answer to keep a missing folder
+/// from reading as "no registry here": for a covered pool that absence is
+/// unknown, never an empty reference set. An unreadable or divergent state is
+/// unknown too; a pool that never opted in (no fence, or a legacy `/1`/`/2`
+/// fence) answers `false` and keeps its historical disposition.
+pub(crate) fn covered_outputs_state(control: &Path, deadline: Deadline) -> Result<bool, String> {
+    let path = control.join(STATE_FILE);
+    let bytes = match read_document(&path, STATE_CAP_BYTES, deadline)? {
+        Some(bytes) => bytes,
+        None => return Ok(false),
+    };
+    let state = parse_state(&bytes).map_err(|reason| {
+        format!(
+            "{} is not a control state this build reads: {reason}",
+            path.display()
+        )
+    })?;
+    Ok(matches!(
+        state.owned_outputs.as_deref(),
+        Some(
+            COVERED_OWNED_OUTPUTS_FENCE
+                | ROUTED_OWNED_OUTPUTS_FENCE
+                | COORDINATED_OWNED_OUTPUTS_FENCE
+        )
+    ))
+}
+
 /// Read every pool's control state and decide the owned-outputs fence.
 ///
 /// Nothing is created, locked or repaired. The decision is conjunctive: one

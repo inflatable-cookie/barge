@@ -703,7 +703,7 @@ impl OxideSnapshot {
         let outputs = control.join(OXIDE_OUTPUTS_DIR);
         let registry = read_registry(&outputs.join(OXIDE_REGISTRY_FILE), deadline);
         let receipts = read_receipts(&outputs, deadline);
-        let custody = match pools_holding(&control) {
+        let custody = match pools_holding(&control, deadline) {
             Ok(pools) => PoolCustody::read(&pools, deadline),
             Err(reason) => PoolCustody::unknown(reason),
         };
@@ -1137,7 +1137,46 @@ fn control_directory_with(
                 )
                 .with_detail("path", outputs.display().to_string().into()))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // An absent `outputs` folder is only "no registry here" for a
+                // pool that never opted into owned outputs. A control state that
+                // records a covered fence always has (or must have) its registry
+                // image beside it, so the absence is unknown, never an empty
+                // reference set — and a state that cannot be read is unknown too.
+                if deadline.expired() {
+                    return Err(Error::new(
+                        ErrorKind::UnknownState,
+                        format!(
+                            "inspecting a candidate control directory did not finish inside the {REFERENCE_WALL:?} bound"
+                        ),
+                    ));
+                }
+                match crate::pool_custody::covered_outputs_state(control, deadline) {
+                    Ok(false) => continue,
+                    Ok(true) => {
+                        return Err(Error::new(
+                            ErrorKind::UnknownState,
+                            format!(
+                                "{} records a covered owned-outputs fence but {} is absent, so its registry image cannot be read",
+                                control.display(),
+                                outputs.display()
+                            ),
+                        )
+                        .with_detail("path", outputs.display().to_string().into()))
+                    }
+                    Err(reason) => {
+                        return Err(Error::new(
+                            ErrorKind::UnknownState,
+                            format!(
+                                "{} cannot be read while {} is absent: {reason}",
+                                control.display(),
+                                outputs.display()
+                            ),
+                        )
+                        .with_detail("path", control.display().to_string().into()))
+                    }
+                }
+            }
             Err(error) => {
                 return Err(Error::new(
                     ErrorKind::UnknownState,
@@ -1183,68 +1222,58 @@ fn control_directory_with(
 
 /// The pool directories whose writers can name Oxide's outputs under one control
 /// directory: the internal pool, and the removable pool when one is registered.
-/// The removable pool lives at `<internal control>/removable`, and its control
-/// directory is the `oxide-managed` folder inside that. An entry there that is
-/// not a real directory is unknown, never skipped.
-pub(crate) fn pools_holding(control: &Path) -> std::result::Result<Vec<PathBuf>, String> {
+///
+/// Registration is the peer fact, exactly as Oxide's own `removable::coordinate`
+/// decides it: no registration means the internal pool alone, and a registered
+/// pool's control is the sibling `<internal control>/removable/oxide-managed`,
+/// kept inside the internal control directory so it stays readable while the
+/// volume is away. The peer is therefore named even when its own directory is
+/// absent, so a registered pair can never be silently narrowed to one control.
+/// A registration that cannot be read as Oxide's is unknown, never skipped.
+pub(crate) fn pools_holding(
+    control: &Path,
+    deadline: Deadline,
+) -> std::result::Result<Vec<PathBuf>, String> {
     let Some(internal) = control.parent() else {
         return Err(format!(
             "{} has no pool directory above it, so its writers are unknown",
             control.display()
         ));
     };
-    let removable = control.join(REMOVABLE_POOL_DIR);
-    #[cfg(not(test))]
-    match std::fs::symlink_metadata(&removable) {
-        Ok(metadata) if metadata.is_dir() => Ok(vec![internal.to_path_buf(), removable]),
-        Ok(_) => Err(format!(
-            "{} exists and is not a directory, so the removable pool's writers are unknown",
-            removable.display()
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(vec![internal.to_path_buf()])
-        }
-        Err(error) => Err(format!(
-            "{} cannot be inspected, so the removable pool's writers are unknown: {error}",
-            removable.display()
-        )),
+    let registration = control.join(crate::inspect::OXIDE_REGISTRATION_FILE);
+    let expired = || {
+        format!(
+            "the read deadline expired while {} was inspected, so the pools that could hold Oxide's outputs are unknown",
+            registration.display()
+        )
+    };
+    if deadline.expired() {
+        return Err(expired());
     }
+    // The identity row is this site's own observation, and the reader below is
+    // the one strict registration reader the census already uses.
     #[cfg(test)]
-    match std::fs::symlink_metadata(&removable) {
-        Ok(metadata) if metadata.is_dir() => {
-            #[cfg(test)]
-            crate::tape::stat(
-                "reference::pools_holding",
-                &removable,
-                Some((metadata.dev(), metadata.ino(), "directory")),
-            );
-            Ok(vec![internal.to_path_buf(), removable])
-        }
-        Ok(_) => {
-            #[cfg(test)]
-            crate::tape::stat_refused("reference::pools_holding", &removable, "not_a_directory");
-            Err(format!(
-                "{} exists and is not a directory, so the removable pool's writers are unknown",
-                removable.display()
-            ))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            #[cfg(test)]
-            crate::tape::stat("reference::pools_holding", &removable, None);
-            Ok(vec![internal.to_path_buf()])
-        }
-        Err(error) => {
-            #[cfg(test)]
-            crate::tape::stat_refused(
-                "reference::pools_holding",
-                &removable,
-                &crate::tape::errno_class(&error),
-            );
-            Err(format!(
-                "{} cannot be inspected, so the removable pool's writers are unknown: {error}",
-                removable.display()
-            ))
-        }
+    crate::tape::stat(
+        "reference::pools_holding",
+        &registration,
+        std::fs::symlink_metadata(&registration)
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino(), "registration")),
+    );
+    let observation = crate::inspect::read_registration(&registration);
+    if deadline.expired() {
+        return Err(expired());
+    }
+    match observation {
+        crate::inspect::Observation::Absent { .. } => Ok(vec![internal.to_path_buf()]),
+        crate::inspect::Observation::Reported(_) => Ok(vec![
+            internal.to_path_buf(),
+            control.join(REMOVABLE_POOL_DIR),
+        ]),
+        crate::inspect::Observation::Unknown { detail, .. } => Err(format!(
+            "{} cannot be read as Oxide's pool registration, so the pools that could hold its outputs are unknown: {detail}",
+            registration.display()
+        )),
     }
 }
 
@@ -4448,6 +4477,16 @@ mod writer_custody_tests {
 
     /// The coordinated adoption transaction both controls record ready.
     const INIT_TRANSACTION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// Oxide's registration of one removable pool, exactly its own field set.
+    /// Its presence — not a directory — is what names the second control.
+    fn registration_document() -> String {
+        let uuid = crate::testkit::FIXTURE_UUID;
+        format!(
+            r#"{{"version":2,"mount_point":"/Volumes/Builds","volume_uuid":"{uuid}","container_uuid":"{uuid}","reserve_bytes":1,"cap_bytes":2,"quota_bytes":null,"capacity_bytes":null,"registered_ms":1,"mode":"ephemeral"}}"#
+        )
+    }
+
     /// The empty library ledger Oxide writes for a pool with no slot.
     const EMPTY_LEDGER: &str = r#"{"version":1,"store_id":"0123456789abcdef0123456789abcdef","cap_bytes":1024,"next_slot":1,"next_lease":1,"slots":[]}"#;
 
@@ -4509,6 +4548,17 @@ mod writer_custody_tests {
                     &ready,
                 );
             }
+        }
+
+        /// Oxide's registration of one removable pool, exactly its own field set.
+        /// Its presence — not a directory — is what names the second control.
+        fn register_peer(&self) {
+            let document = registration_document();
+            std::fs::write(
+                self.control.join(crate::inspect::OXIDE_REGISTRATION_FILE),
+                document,
+            )
+            .unwrap();
         }
 
         /// The predecessor `/4` pair with its own completed record, as the
@@ -4651,9 +4701,10 @@ mod writer_custody_tests {
             OxideRegistry::Read { version, .. } if version == OXIDE_REGISTRY_V2
         ));
 
-        // A one-sided control pair (mid-adoption: internal `/5`, removable
+        // A registered pair that is mid-adoption (internal `/5`, removable
         // `/4`) is a pool-wide unknown whatever the image says.
         let fixture = CoordinatedFixture::new("coordinated-one-sided-controls");
+        fixture.register_peer();
         fixture.routed_pair();
         let ready = format!(
             r#","outputs_init":{{"ready":{{"transaction":"{INIT_TRANSACTION}","ready_ms":1}}}}"#
@@ -4676,21 +4727,88 @@ mod writer_custody_tests {
     }
 
     #[test]
-    fn the_removable_pool_is_read_only_when_it_is_a_directory() {
+    fn a_registered_peer_and_an_absent_outputs_folder_are_unknown() {
+        // The registration names a second control that never wrote its state,
+        // so the pair is incomplete whatever the internal control records.
+        let fixture = CoordinatedFixture::new("coordinated-registered-absent-peer");
+        fixture.register_peer();
+        let ready = format!(
+            r#","outputs_init":{{"ready":{{"transaction":"{INIT_TRANSACTION}","ready_ms":1}}}}"#
+        );
+        fixture.write_pool(
+            &fixture.internal(),
+            crate::pool_custody::COORDINATED_OWNED_OUTPUTS_FENCE,
+            &ready,
+        );
+        fixture.registry(OXIDE_REGISTRY_V4, 4, INIT_TRANSACTION, true);
+        let snapshot = fixture.snapshot();
+        assert!(!snapshot.complete(), "{snapshot:?}");
+        assert_eq!(snapshot.custody.pools().len(), 2, "{snapshot:?}");
+        assert!(
+            snapshot
+                .custody
+                .unattributed()
+                .is_some_and(|reason| reason.contains("paired adoption is incomplete")),
+            "{snapshot:?}"
+        );
+
+        // A covered control state with its `outputs` folder absent: the registry
+        // image cannot have lived there, so discovery reports unknown rather
+        // than "no Oxide control directory" and no references.
+        let fixture = CoordinatedFixture::new("coordinated-missing-outputs");
+        fixture.coordinated_pair();
+        fixture.registry(OXIDE_REGISTRY_V4, 4, INIT_TRANSACTION, true);
+        std::fs::remove_dir_all(fixture.control.join(OXIDE_OUTPUTS_DIR)).unwrap();
+        let snapshot = fixture.snapshot();
+        assert!(!snapshot.complete(), "{snapshot:?}");
+        assert!(
+            snapshot
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("records a covered owned-outputs fence but")),
+            "{snapshot:?}"
+        );
+        let set = snapshot.references_for(
+            Path::new("/Volumes/Builds/oxide-outputs/app/target"),
+            "oxide/outputs/app",
+            None,
+            None,
+        );
+        assert!(!set.complete, "an unreadable registry keeps every root");
+    }
+
+    #[test]
+    fn registration_names_the_removable_peer_even_when_its_directory_is_absent() {
+        // Registration is the peer fact, exactly as Oxide's own
+        // `removable::coordinate` decides it. A stray directory without a
+        // registration is not a peer; a registration names the sibling even
+        // while the volume (and so its directory) is away; a registration that
+        // cannot be read is unknown, never skipped.
         let dir = TempDir::new("writer-custody-pools");
         let internal = dir.path().join("pool");
         let control = internal.join("oxide-managed");
         std::fs::create_dir_all(&control).unwrap();
-        assert_eq!(pools_holding(&control).unwrap(), vec![internal.clone()]);
+        let deadline = || Deadline::after(Duration::from_secs(10));
+        let registration = control.join(crate::inspect::OXIDE_REGISTRATION_FILE);
 
         std::fs::create_dir(control.join(REMOVABLE_POOL_DIR)).unwrap();
         assert_eq!(
-            pools_holding(&control).unwrap(),
+            pools_holding(&control, deadline()).unwrap(),
+            vec![internal.clone()]
+        );
+
+        std::fs::write(&registration, registration_document()).unwrap();
+        std::fs::remove_dir(control.join(REMOVABLE_POOL_DIR)).unwrap();
+        assert_eq!(
+            pools_holding(&control, deadline()).unwrap(),
             vec![internal.clone(), control.join(REMOVABLE_POOL_DIR)]
         );
 
-        std::fs::remove_dir(control.join(REMOVABLE_POOL_DIR)).unwrap();
-        std::fs::write(control.join(REMOVABLE_POOL_DIR), b"not a pool").unwrap();
-        assert!(pools_holding(&control).is_err());
+        std::fs::write(&registration, b"{}").unwrap();
+        assert!(pools_holding(&control, deadline()).is_err());
+
+        std::fs::remove_file(&registration).unwrap();
+        std::fs::create_dir(&registration).unwrap();
+        assert!(pools_holding(&control, deadline()).is_err());
     }
 }

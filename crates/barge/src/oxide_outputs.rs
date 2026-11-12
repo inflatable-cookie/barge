@@ -1447,7 +1447,7 @@ fn lookup_oxide_intent(
             ))
         }
     };
-    let pools = match reference::pools_holding(&control) {
+    let pools = match reference::pools_holding(&control, deadline) {
         Ok(pools) => pools,
         Err(reason) => return unknown(reason),
     };
