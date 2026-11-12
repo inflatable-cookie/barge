@@ -2839,8 +2839,11 @@ and R11's remount, and clearance after a detach is zero entity rows for the back
 The census is parsed fail-closed: the top-level document, its `images` list, a relevant
 image's `image-path`, the entity list itself and each entity's device, mount point and
 volume UUID must be well formed, and an image that states an empty or missing entity
-list, or a second image that names the same backing, is unknown — never absence. Only a
-fully readable census in which no image names the backing is positive whole-backing
+list, or a second image that names the same backing, is unknown — never absence. Every
+`image-path` must be one canonical absolute path: a relative or non-canonical identity
+cannot be related to this run's backing and is unknown, never "another image", so no
+ambiguous path can be filtered out as unrelated and read as absence. Only a fully
+readable census in which no image names the backing is positive whole-backing
 absence, so a missing, malformed, filtered or unreadable structure can never masquerade
 as clearance. The custody indication is also verified to be the guard's own
 `image-custody.json` inside its published evidence directory before the backing exists and
@@ -2857,11 +2860,13 @@ with no retry and no force detach.
 
 Each pre- and post-detach census and the detach command are retained in the occurrence's
 own receipt: the command's argv, exit and reap, the complete captured byte count and
-SHA-256 of each stream, a bounded raw prefix with an explicit truncation flag, the parsed
-backing and entity identities, and the exact deciding reason (the attach decision's own
-census is recorded too). An unreadable, incomplete or
-truncated deciding fact is recorded as unknown; nothing is inferred from a later path
-absence and no device-state observation is turned into a clearance rule.
+SHA-256 of **both** streams, a bounded raw prefix with an explicit truncation flag, the
+parsed backing and entity identities, and the exact deciding reason (the attach decision's
+own census is recorded too). A command killed at its bound keeps the partial bytes it did
+capture and is marked incomplete with its own reason — never zero bytes as if it had run,
+and never a closure. An unreadable, incomplete or truncated deciding fact is recorded as
+unknown; nothing is inferred from a later path absence and no device-state observation is
+turned into a clearance rule.
 
 R11's intermediate detach and the final one are distinct: each re-derives its own
 authority, and neither borrows the other's census. R11's remount must verify the same

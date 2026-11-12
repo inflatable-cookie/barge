@@ -192,6 +192,13 @@ CUSTODY_VERSION = 1
 ATTACHMENT_CENSUS_SCHEMA = "barge.release.attachment-census/1"
 COMMAND_SCHEMA = "barge.release.command/1"
 CENSUS_PREFIX_BYTES = 4096
+# Every command-evidence field the census copies from its own command record, both streams
+# and the incompleteness facts included.
+COMMAND_EVIDENCE_FIELDS = (
+    "exit", "reaped", "incomplete", "problem",
+    "stdout_bytes", "stdout_sha256", "stdout_prefix", "stdout_truncated",
+    "stderr_bytes", "stderr_sha256", "stderr_prefix", "stderr_truncated",
+)
 # An entity that carries a volume UUID must carry a well-formed one; a malformed value is
 # a structure this census does not understand, never an entity without a UUID.
 VOLUME_UUID_SHAPE = re.compile(
@@ -662,20 +669,60 @@ def custody_document(backing, root, evidence):
     return {"version": CUSTODY_VERSION, "backings": [backing]}
 
 
-def command_record(argv, completed):
+def is_safe_absolute_text(path):
+    """Whether text is one canonical absolute path this census can compare. Pure.
+
+    A relative path, a path with `.` or `..` components, a doubled or trailing separator
+    or an embedded NUL is not something a census can relate to this run's backing, so it
+    is a structure this reader does not understand rather than another image.
+    """
+    if not isinstance(path, str) or not path or "\0" in path:
+        return False
+    return os.path.isabs(path) and os.path.normpath(path) == path
+
+
+def command_record(argv, completed=None, error=None):
     """One bounded external command's own record: argv, exit, reap and captured bytes. Pure.
 
-    A command that never completed has no exit and is not reaped; its captured bytes are
-    empty. Each stream keeps its complete byte count and digest plus a bounded raw prefix
-    with an explicit truncation flag, so a deciding message is judgeable from the receipt.
+    A command that did not complete — including one killed at its bound — is recorded as
+    incomplete with whatever prefix of each stream it did produce; a timeout's partial
+    captures are kept and their complete captured byte counts and digests are of exactly
+    those bytes. `reaped` is true only for a command that returned, and `exit` is null
+    otherwise. Each stream keeps a bounded raw prefix with an explicit truncation flag, so
+    a deciding message is judgeable from the receipt.
     """
-    stdout = completed.stdout if completed is not None and isinstance(completed.stdout, bytes) else b""
-    stderr = completed.stderr if completed is not None and isinstance(completed.stderr, bytes) else b""
+    def captured(value):
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            return value.encode("utf-8", "replace")
+        return b""
+
+    stdout = b""
+    stderr = b""
+    problem = None
+    exit_code = None
+    reaped = False
+    if completed is not None:
+        exit_code = completed.returncode
+        reaped = True
+        stdout = captured(completed.stdout)
+        stderr = captured(completed.stderr)
+    else:
+        if isinstance(error, subprocess.TimeoutExpired):
+            stdout, stderr = captured(error.output), captured(error.stderr)
+            problem = f"the command exceeded its {error.timeout} s bound"
+        elif isinstance(error, BaseException):
+            problem = f"the command did not complete: {error}"
+        else:
+            problem = "the command did not complete"
     return {
         "schema": COMMAND_SCHEMA,
         "argv": list(argv),
-        "exit": None if completed is None else completed.returncode,
-        "reaped": completed is not None,
+        "exit": exit_code,
+        "reaped": reaped,
+        "incomplete": not reaped,
+        "problem": problem,
         "stdout_bytes": len(stdout),
         "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
         "stdout_prefix": stdout[:CENSUS_PREFIX_BYTES].decode("utf-8", "replace"),
@@ -698,6 +745,8 @@ def parse_attachment_census(parsed, backing):
     or a second image naming the same backing — is unreadable, never absence. Entities of
     other images are not interpreted.
     """
+    if not is_safe_absolute_text(backing):
+        return "the backing is not a canonical absolute path", False, [], None
     if not isinstance(parsed, dict):
         return "the census is not a dictionary", False, [], None
     images = parsed.get("images")
@@ -709,8 +758,8 @@ def parse_attachment_census(parsed, backing):
         if not isinstance(image, dict):
             return "an image entry is not a dictionary", matched, entities, None
         path = image.get("image-path")
-        if not isinstance(path, str) or not path:
-            return "an image entry has no usable image-path", matched, entities, None
+        if not is_safe_absolute_text(path):
+            return "an image entry has no canonical absolute image-path", matched, entities, None
         if os.path.realpath(path) != wanted:
             continue
         matched, seen = True, seen + 1
@@ -747,20 +796,30 @@ def attachment_census(backing, environment, runner=None):
     argv = [HDIUTIL, "info", "-plist"]
     document = {
         "schema": ATTACHMENT_CENSUS_SCHEMA, "argv": argv, "exit": None, "reaped": False,
+        "incomplete": True, "command": None,
         "stdout_bytes": 0, "stdout_sha256": None, "stdout_prefix": "",
-        "stdout_truncated": False, "unreadable": True, "problem": None,
+        "stdout_truncated": False, "stderr_bytes": 0, "stderr_sha256": None,
+        "stderr_prefix": "", "stderr_truncated": False,
+        "unreadable": True, "problem": None,
         "backing": backing, "matched": False, "entities": [], "rows": None,
     }
     run_command = runner or (lambda command: subprocess.run(
         command, env=environment, capture_output=True, timeout=INFO_TIMEOUT_SECONDS))
+    if not is_safe_absolute_text(backing):
+        document["problem"] = "the backing is not a canonical absolute path"
+        return document
     try:
         observed = run_command(argv)
-    except (OSError, subprocess.SubprocessError):
-        document["problem"] = "the attachment census did not complete"
+    except (OSError, subprocess.SubprocessError) as error:
+        record = command_record(argv, error=error)
+        document["command"] = record
+        for key in COMMAND_EVIDENCE_FIELDS:
+            document[key] = record[key]
+        document["problem"] = record["problem"] or "the attachment census did not complete"
         return document
     record = command_record(argv, observed)
-    for key in ("exit", "reaped", "stdout_bytes", "stdout_sha256", "stdout_prefix",
-                "stdout_truncated"):
+    document["command"] = record
+    for key in COMMAND_EVIDENCE_FIELDS:
         document[key] = record[key]
     if observed.returncode != 0:
         document["problem"] = f"the attachment census exited {observed.returncode}"
@@ -1606,8 +1665,8 @@ class Proof:
         try:
             observed = subprocess.run(argv, env=self.env, capture_output=True,
                                       timeout=DETACH_TIMEOUT_SECONDS)
-        except (OSError, subprocess.SubprocessError):
-            exit_code, reaped, command = None, False, command_record(argv, None)
+        except (OSError, subprocess.SubprocessError) as error:
+            exit_code, reaped, command = None, False, command_record(argv, error=error)
         else:
             exit_code, reaped = observed.returncode, True
             command = command_record(argv, observed)
@@ -1616,6 +1675,8 @@ class Proof:
                                     not os.path.lexists(self.mount))
         if after["rows"] is None and after.get("problem"):
             document["reason"] = f"{document['reason']}: {after['problem']}"
+        if command["incomplete"]:
+            document["reason"] = f"{document['reason']}; the detach command did not complete: {command['problem']}"
         document["command"] = command
         document["pre_census"] = before
         document["post_census"] = after
@@ -3214,15 +3275,16 @@ def census_controls():
             return [plist_safe(item) for item in value]
         return value
 
-    def completed(payload, returncode=0):
+    def completed(payload, returncode=0, stderr=b""):
         stdout = payload if isinstance(payload, bytes) else plistlib.dumps(plist_safe(payload))
         return subprocess.CompletedProcess(args=["hdiutil"], returncode=returncode,
-                                           stdout=stdout, stderr=b"")
+                                           stdout=stdout, stderr=stderr)
 
     def census(payload, backing_path=backing, returncode=0, **kwargs):
         runner = kwargs.pop("runner", None)
+        stderr = kwargs.pop("stderr", b"")
         if runner is None:
-            runner = lambda _argv: completed(payload, returncode)
+            runner = lambda _argv: completed(payload, returncode, stderr)
         return attachment_census(backing_path, {}, runner=runner)
 
     def attached(entities, image_path=backing):
@@ -3246,6 +3308,13 @@ def census_controls():
         problems.append(f"an attached census does not keep its entities: {document}")
     if document["entities"][1]["volume_uuid"] != volume_uuid:
         problems.append("an attached census loses a parsed volume UUID")
+    document = census(attached([volume]), stderr=b"census warning\n")
+    if (document["unreadable"] or document["incomplete"]
+            or document["stderr_prefix"] != "census warning\n"
+            or document["stderr_bytes"] != len(b"census warning\n")
+            or document["stderr_sha256"] != hashlib.sha256(b"census warning\n").hexdigest()
+            or document["command"]["stderr_bytes"] != len(b"census warning\n")):
+        problems.append(f"a successful census drops its stderr evidence: {document}")
 
     # Every incomplete or malformed relevant structure is unreadable, never absence.
     malformed = [
@@ -3278,6 +3347,16 @@ def census_controls():
          {"images": [{"image-path": backing, "system-entities": [volume]},
                      {"image-path": backing, "system-entities": [volume]}]}, 0),
         ("a non-zero census exit", attached([volume]), 1),
+        ("a relative image-path",
+         {"images": [{"image-path": "release-volume.sparseimage", "system-entities": [volume]}]}, 0),
+        ("a dot-relative image-path",
+         {"images": [{"image-path": "./release-volume.sparseimage", "system-entities": [volume]}]}, 0),
+        ("a parent-relative image-path",
+         {"images": [{"image-path": "/guard/root/../run/release-volume.sparseimage",
+                      "system-entities": [volume]}]}, 0),
+        ("a doubled-separator image-path",
+         {"images": [{"image-path": "/guard//root/run/release-volume.sparseimage",
+                      "system-entities": [volume]}]}, 0),
     ]
     for label, payload, returncode in malformed:
         document = census(payload, returncode=returncode)
@@ -3289,8 +3368,40 @@ def census_controls():
     def raising(_argv):
         raise OSError("the census child cannot run")
     document = attachment_census(backing, {}, runner=raising)
-    if not document["unreadable"] or document["rows"] is not None or document["reaped"]:
+    if (not document["unreadable"] or document["rows"] is not None or document["reaped"]
+            or not document["incomplete"] or not document["problem"]):
         problems.append(f"a census that never ran reads as an answer: {document}")
+    for label, backing_path in (("a relative backing", "release-volume.sparseimage"),
+                                ("a dot-relative backing", "./release-volume.sparseimage"),
+                                ("a parent-relative backing", "/guard/../release-volume.sparseimage")):
+        document = census({"images": []}, backing_path=backing_path)
+        if not document["unreadable"] or document["rows"] is not None:
+            problems.append(f"{label} reads as an absence: {document['rows']}")
+
+    def timing_out(_argv):
+        raise subprocess.TimeoutExpired(cmd=["hdiutil", "info", "-plist"],
+                                        timeout=INFO_TIMEOUT_SECONDS,
+                                        output=b"partial census stdout",
+                                        stderr=b"partial census stderr")
+    document = attachment_census(backing, {}, runner=timing_out)
+    failed = first_failed_predicate([
+        ("unreadable", lambda: not document["unreadable"] or document["rows"] is not None),
+        ("incomplete", lambda: document["incomplete"] is not True),
+        ("reaped", lambda: document["reaped"] is not False),
+        ("exit", lambda: document["exit"] is not None),
+        ("problem", lambda: "bound" not in (document["problem"] or "")),
+        ("stdout", lambda: document["stdout_prefix"] != "partial census stdout"),
+        ("stdout_bytes", lambda: document["stdout_bytes"] != len(b"partial census stdout")),
+        ("stdout_hash",
+         lambda: document["stdout_sha256"] != hashlib.sha256(b"partial census stdout").hexdigest()),
+        ("stderr", lambda: document["stderr_prefix"] != "partial census stderr"),
+        ("stderr_bytes", lambda: document["stderr_bytes"] != len(b"partial census stderr")),
+        ("stderr_hash",
+         lambda: document["stderr_sha256"] != hashlib.sha256(b"partial census stderr").hexdigest()),
+        ("command", lambda: document["command"]["incomplete"] is not True),
+    ])
+    if failed is not None:
+        problems.append(f"a timed-out census loses its partial evidence at {failed}: {document}")
 
     # The raw prefix is bounded and states its truncation; the complete digest still binds
     # the whole captured document.
@@ -3306,7 +3417,7 @@ def census_controls():
 
     # The real detach composition: pre-census binding, the bounded command record and the
     # post-census closure, driven through `Proof.detach` with fake external facts only.
-    def drive(pre_rows, post_rows, detach_exit=0):
+    def drive(pre_rows, post_rows, detach_exit=0, detach_error=None):
         proof = Proof.__new__(Proof)
         proof.attached = True
         proof.mount = mount
@@ -3326,6 +3437,8 @@ def census_controls():
 
         def detach_run(argv, **kwargs):
             seen.append(list(argv))
+            if detach_error is not None:
+                raise detach_error
             return subprocess.CompletedProcess(args=argv, returncode=detach_exit,
                                                stdout=b"", stderr=b"")
         module = sys.modules[__name__]
@@ -3358,6 +3471,33 @@ def census_controls():
         problems.append(f"the three-entity nonempty final census reads as closed: {document}")
     if "3 entities" not in (document.get("reason") or ""):
         problems.append(f"the three-entity failure does not keep its deciding count: {document.get('reason')}")
+
+    # A detach killed at its bound keeps its partial captures and states its
+    # incompleteness; it never closes the image.
+    document, _seen = drive([(container, None), (device, mount)], [],
+                            detach_error=subprocess.TimeoutExpired(
+                                cmd=[HDIUTIL, "detach", mount],
+                                timeout=DETACH_TIMEOUT_SECONDS,
+                                output=b"partial detach stdout",
+                                stderr=b"partial detach stderr"))
+    failed = first_failed_predicate([
+        ("closed", lambda: document["closed"]),
+        ("custody", lambda: document["custody"] != "retained"),
+        ("incomplete", lambda: document["command"]["incomplete"] is not True),
+        ("reaped", lambda: document["command"]["reaped"] is not False),
+        ("exit", lambda: document["command"]["exit"] is not None),
+        ("stdout", lambda: document["command"]["stdout_prefix"] != "partial detach stdout"),
+        ("stdout_hash",
+         lambda: document["command"]["stdout_sha256"]
+         != hashlib.sha256(b"partial detach stdout").hexdigest()),
+        ("stderr", lambda: document["command"]["stderr_prefix"] != "partial detach stderr"),
+        ("stderr_hash",
+         lambda: document["command"]["stderr_sha256"]
+         != hashlib.sha256(b"partial detach stderr").hexdigest()),
+        ("reason", lambda: "did not complete" not in (document["reason"] or "")),
+    ])
+    if failed is not None:
+        problems.append(f"a timed-out detach loses its partial evidence at {failed}: {document.get('reason')}")
 
     # An unreadable post-census is retained with the parser's own reason, and an unbound
     # pre-census refuses the detach before any command runs.
