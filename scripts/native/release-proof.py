@@ -1295,6 +1295,7 @@ def host_guest_launch(instruction_path, instruction_digest, role, run, activatio
     started = host_clock_ns()
     deadline = started + LIMIT_SECONDS * 10 ** 9
     old_handler = None
+    handler_installed = False
     try:
         if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
             return {"ok": False, "refused": ["host deadline timer is already in use"]}
@@ -1302,13 +1303,14 @@ def host_guest_launch(instruction_path, instruction_digest, role, run, activatio
         def expired(_signum, _frame):
             raise TimeoutError("host preflight reached the original stop margin")
         signal.signal(signal.SIGALRM, expired)
+        handler_installed = True
         available = (deadline - host_clock_ns()) / 1e9 - 30
         if available <= 0:
             signal.signal(signal.SIGALRM, old_handler)
             return {"ok": False, "refused": ["host deadline reached its stop margin"]}
         signal.setitimer(signal.ITIMER_REAL, available)
     except (ValueError, OSError) as error:
-        if old_handler is not None:
+        if handler_installed:
             signal.signal(signal.SIGALRM, old_handler)
         return {"ok": False, "refused": [f"host deadline timer unavailable: {error}"]}
     try:
@@ -1816,6 +1818,12 @@ def guest_binding_controls():
         exhausted = host_guest_launch("/owned/record", digest, "author", record["run"], record["activation"], stream_a, stream_b)
         if exhausted.get("ok") is not False or host_calls.called:
             problems.append("exhausted host preflight started a command")
+    with mock.patch("signal.getitimer", return_value=(0.0, 0.0)), \
+            mock.patch("signal.signal", side_effect=ValueError("timer unavailable")), \
+            mock.patch("subprocess.run") as host_calls:
+        unavailable = host_guest_launch("/owned/record", digest, "author", record["run"], record["activation"], stream_a, stream_b)
+        if unavailable.get("ok") is not False or host_calls.called:
+            problems.append("unavailable host deadline timer started a command")
     with mock.patch("os.open", return_value=42), mock.patch("os.close"), \
             mock.patch("os.getuid", return_value=123), \
             mock.patch("os.fstat", side_effect=[info_a, info_b, mock.Mock(st_uid=123, st_mode=0o100600)]), \
