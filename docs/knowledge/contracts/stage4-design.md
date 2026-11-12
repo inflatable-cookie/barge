@@ -2942,7 +2942,18 @@ positive whole-backing clearance and an unchanged real state. The diagnostic is
 always `qualified: false`.
 
 A failed oracle names the one predicate that failed and the decisive values the
-operation already returned — never a conjunction collapsed into one message. The
+operation already returned — never a conjunction collapsed into one message. A generic
+barge-command fault is no exception: an unexpected exit, an unusable or non-JSON result, a
+timeout or a command that cannot start keeps the command's own argv, expected and observed
+exit, reap and incompleteness facts and the complete captured byte counts, digests and
+bounded prefixes of both streams, together with the returned document's deciding fields —
+schema, `ok`, the refusal or error, the presented and fresh plan digests, release, keep,
+stop and replay counts, the bounded plan root ids and each returned outcome and reason with
+their row and character omission facts. Those deciding fields are bounded independently of
+the command record, and the raw prefixes are placed last, so neither a hostile leading
+member nor a long capture can hide a counter, root id or reason. Anything the command or
+document did not state stays `unobserved`; no effect is inferred from a truncated or absent
+payload. The
 predicates keep their original order and short-circuit, so a failure record never runs
 an observation the assertion would not have made: a filesystem fact the branch did not
 reach is reported as `unobserved`, and the release-run record carries

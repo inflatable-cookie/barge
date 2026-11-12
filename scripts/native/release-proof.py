@@ -192,6 +192,10 @@ CUSTODY_VERSION = 1
 ATTACHMENT_CENSUS_SCHEMA = "barge.release.attachment-census/1"
 COMMAND_SCHEMA = "barge.release.command/1"
 CENSUS_PREFIX_BYTES = 4096
+# One barge-command fault record keeps the command's own captured evidence first and the
+# returned document's deciding fields next, each inside its own bound; the raw stream
+# prefixes come last, so no leading member can hide a counter, root id or reason.
+BARGE_FAULT_DETAIL_CHARS = 16384
 # Every command-evidence field the census copies from its own command record, both streams
 # and the incompleteness facts included.
 COMMAND_EVIDENCE_FIELDS = (
@@ -1305,6 +1309,84 @@ def bounded_ids(values, count_limit=ROW_ID_LIMIT, char_limit=ROW_ID_CHARS):
     return kept, max(0, len(values) - len(kept))
 
 
+def barge_document_summary(document):
+    """The deciding fields one returned barge document states, each bounded. Pure.
+
+    Only what the document itself says is reported: a member it does not state is
+    `unobserved`, never guessed, and the raw document is not re-encoded here. Counters,
+    digests, root ids and each returned outcome/reason are kept as their own bounded
+    fields, so an unrelated leading member can never consume the record.
+    """
+    if not isinstance(document, dict):
+        return {"document": "not an object"}
+    error = document.get("error") if isinstance(document.get("error"), dict) else {}
+    data = document.get("data") if isinstance(document.get("data"), dict) else {}
+    plan = data.get("plan") if isinstance(data.get("plan"), dict) else {}
+    rows = [row for row in (data.get("rows") or []) if isinstance(row, dict)]
+    plan_rows = plan.get("rows") if isinstance(plan.get("rows"), dict) else {}
+    listed = plan_rows.get("rows") if isinstance(plan_rows.get("rows"), list) else []
+    root_ids, ids_omitted = bounded_ids([row.get("root_id") for row in listed
+                                         if isinstance(row, dict)])
+
+    def stated(name, value="unobserved"):
+        return data[name] if name in data else value
+
+    fields = {
+        "schema": document.get("schema", "unobserved"),
+        "command": document.get("command", "unobserved"),
+        "ok": document.get("ok", "unobserved"),
+        "error_kind": error.get("kind", "unobserved"),
+        "error_message": error.get("message", "unobserved"),
+        "presented_plan_digest": stated("plan_digest"),
+        "fresh_plan_digest": stated("fresh_plan_digest"),
+        "released_count": stated("released_count"),
+        "kept_count": stated("kept_count"),
+        "stopped": stated("stopped"),
+        "replay_pending": stated("replay_pending"),
+        "plan_eligible_count": plan_rows.get("eligible_count", "unobserved"),
+        "plan_examined_count": plan_rows.get("examined_count", "unobserved"),
+        "plan_root_ids": root_ids,
+        "plan_root_ids_omitted": ids_omitted,
+    }
+    return failure_summary(fields, [{"root_id": row.get("root_id"),
+                                     "outcome": row.get("outcome"),
+                                     "reason": row.get("reason")} for row in rows])
+
+
+def barge_fault_detail(argv, expect, command, document, because, observed_exit=None):
+    """One barge fault: the command's captures, then the deciding fields, then prefixes. Pure.
+
+    `command` is a [`command_record`] of exactly the captured bytes. The deciding summary
+    of the returned document is bounded independently of that command record, and the raw
+    stream prefixes are placed last, so a hostile leading member or a long capture can
+    never hide a counter, digest, root id or reason. Facts the command or document did not
+    state stay `unobserved`.
+    """
+    command_fields = {
+        "argv": command.get("argv"),
+        "expected_exit": expect,
+        "observed_exit": observed_exit if observed_exit is not None else command.get("exit"),
+        "reaped": command.get("reaped"),
+        "incomplete": command.get("incomplete"),
+        "problem": command.get("problem"),
+        "stdout_bytes": command.get("stdout_bytes"),
+        "stdout_sha256": command.get("stdout_sha256"),
+        "stdout_truncated": command.get("stdout_truncated"),
+        "stderr_bytes": command.get("stderr_bytes"),
+        "stderr_sha256": command.get("stderr_sha256"),
+        "stderr_truncated": command.get("stderr_truncated"),
+    }
+    parts = [f"barge {' '.join(argv)} {because}",
+             "command " + json.dumps(command_fields, sort_keys=True)]
+    if document is not None:
+        parts.append("deciding " + json.dumps(barge_document_summary(document), sort_keys=True))
+        parts.append("stdout_prefix " + bounded_text(str(command.get("stdout_prefix") or ""),
+                                                     FAILURE_TEXT_CHARS))
+        parts.append("stderr_prefix " + bounded_text(str(command.get("stderr_prefix") or ""),
+                                                     FAILURE_TEXT_CHARS))
+    return bounded_text("; ".join(parts), BARGE_FAULT_DETAIL_CHARS)
+
+
 def run_report_summary(document, expected_root_id, observations=None):
     """The decisive fields one `barge.prune.run/1` body already returned. Pure.
 
@@ -1706,19 +1788,33 @@ class Proof:
     # -- the CLI ----------------------------------------------------------
 
     def barge(self, *args, expect=None, timeout=120):
-        """Run the binary with `--json`; return (exit, document). `expect` is checked."""
-        command = [self.binary, *args, "--json"]
-        result = run(command, self.env, cwd=self.root, timeout=timeout, check=False)
+        """Run the binary with `--json`; return (exit, document). `expect` is checked.
+
+        The child's streams are captured as bytes, so a fault record's digests and prefixes
+        are of exactly those bytes. A non-JSON result, an unexpected exit, a timeout or a
+        command that cannot run keeps the command's own bounded evidence and the returned
+        document's separately bounded deciding fields — never one 300-character prefix.
+        """
+        argv = [self.binary, *args, "--json"]
         try:
-            document = json.loads(result.stdout)
-        except ValueError:
-            raise Fault("barge", f"{' '.join(args)} printed no JSON (exit {result.returncode})")
+            result = subprocess.run(argv, env=self.env, cwd=self.root,
+                                    capture_output=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise Fault("barge", barge_fault_detail(
+                argv, expect, command_record(argv, error=error), None,
+                f"did not complete: {error}")) from None
+        command = command_record(argv, result)
+        try:
+            document = json.loads((result.stdout or b"").decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise Fault("barge", barge_fault_detail(
+                argv, expect, command, None,
+                f"printed no usable JSON (exit {result.returncode})")) from None
         if expect is not None and result.returncode != expect:
-            raise Fault(
-                "barge",
-                f"{' '.join(args)} exited {result.returncode}, expected {expect}: "
-                f"{json.dumps(document)[:300]}",
-            )
+            raise Fault("barge", barge_fault_detail(
+                argv, expect, command, document,
+                f"exited {result.returncode}, expected {expect}",
+                observed_exit=result.returncode)) from None
         return result.returncode, document
 
     def declare(self, area, prune):
@@ -3251,6 +3347,180 @@ def closure_controls():
     return problems
 
 
+def command_failure_controls():
+    """The barge fault record, through the real command and counted-run composition. Pure.
+
+    Every external command result is a labelled fake. The real `Proof.barge` runs on it,
+    the real `run_cases` turns the raised fault into one failed row and an unexecuted
+    remainder, and the real `receipt_document` publishes them; only the git, supervisor
+    and binary-digest lookups are stubbed for the receipt. The controls assert the
+    deciding counters, digests, root ids, outcomes and reasons survive a hostile leading
+    member far beyond the old 300-character prefix, that omission facts are honest, and
+    that the count stays unqualified with unknown custody retained.
+    """
+    problems = []
+    module = sys.modules[__name__]
+    binary = "/guard/root/proof-binary/barge"
+    plan_digest = "d" * 64
+    fresh_digest = "e" * 64
+
+    def proof():
+        instance = Proof.__new__(Proof)
+        instance.binary = binary
+        instance.env = {}
+        instance.root = "/guard/root/run"
+        instance.results = []
+        instance.references = []
+        instance.first_fault = None
+        instance.unknown_custody = False
+        instance.infrastructure = None
+        instance.diagnostic = False
+        instance.build = {"schema": "barge.release.proof-binary/1", "head": "a" * 40}
+        instance.isolation = {"problems": []}
+        instance.route = {}
+        instance.image = "/guard/root/run/release-volume.sparseimage"
+        instance.uuid = "8A660440-C919-45C6-A3F1-3365B9BD2006"
+        instance.attach_census = None
+        instance.device = "/dev/disk9s1"
+        instance.device_after_remount = None
+        instance.mount_history = []
+        instance.ownership = None
+        instance.custody = None
+        instance.remount = None
+        instance.closure = {"closed": False, "custody": "retained"}
+        instance.evidence = "/guard/root/evidence"
+        instance.preflight = {"problems": []}
+        instance.started = time.time()
+        return instance
+
+    def completed(payload, returncode=0, stderr=b""):
+        stdout = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        return subprocess.CompletedProcess(args=[binary], returncode=returncode,
+                                           stdout=stdout, stderr=stderr)
+
+    # One exit-3 result whose deciding counters, digests, root id and reason all sit
+    # beyond a 4,000-character leading member.
+    document = {
+        "schema": "barge.prune.run/1",
+        "command": "prune.run",
+        "ok": True,
+        "data": {
+            "area": {"namespace": "example", "area": "c01"},
+            "padding": "p" * 4000,
+            "plan_digest": plan_digest,
+            "fresh_plan_digest": fresh_digest,
+            "released_count": 0,
+            "kept_count": 0,
+            "stopped": None,
+            "replay_pending": 0,
+            "rows": [{"root_id": "root-late", "outcome": "kept",
+                      "reason": "the fresh gate keeps the root: custody is not safe"}],
+        },
+    }
+    payload = json.dumps(document).encode()
+    try:
+        with mock.patch("subprocess.run", lambda *args, **kwargs: completed(payload, 3)):
+            proof().barge("prune", "--plan", "/guard/root/R1-plan.json", expect=0)
+    except Fault as error:
+        detail = error.detail
+        failed = first_failed_predicate([
+            ("kind", lambda: error.check != "barge"),
+            ("exit", lambda: '"observed_exit": 3' not in detail or '"expected_exit": 0' not in detail),
+            ("reaped", lambda: '"reaped": true' not in detail),
+            ("complete", lambda: '"incomplete": false' not in detail),
+            ("bytes", lambda: f'"stdout_bytes": {len(payload)}' not in detail),
+            ("hash", lambda: hashlib.sha256(payload).hexdigest() not in detail),
+            ("schema", lambda: "barge.prune.run/1" not in detail),
+            ("presented", lambda: plan_digest not in detail),
+            ("fresh", lambda: fresh_digest not in detail),
+            ("released", lambda: '"released_count": 0' not in detail),
+            ("kept", lambda: '"kept_count": 0' not in detail),
+            ("replay", lambda: '"replay_pending": 0' not in detail),
+            ("root", lambda: "root-late" not in detail),
+            ("outcome", lambda: '"outcome": "kept"' not in detail),
+            ("reason", lambda: "the fresh gate keeps the root" not in detail),
+            ("bound", lambda: len(detail) > BARGE_FAULT_DETAIL_CHARS),
+            ("not_raw", lambda: "p" * 4000 in detail),
+        ])
+        if failed is not None:
+            problems.append(f"the exit-3 fault record lost {failed}: {detail[:600]}")
+    else:
+        problems.append("an unexpected barge exit did not raise")
+
+    # A result that is not JSON keeps the command's own bytes and states the document as
+    # unobserved; malformed captures are never guessed into fields.
+    for label, runner in (
+            ("non-JSON", lambda: completed(b"not json at all", 0)),
+            ("non-UTF-8", lambda: completed(b"\xff\xfe\x00", 0)),
+            ("timeout", None),
+            ("unrunnable", None)):
+        if label == "timeout":
+            def runner():
+                raise subprocess.TimeoutExpired(cmd=binary, timeout=120,
+                                                output=b"partial stdout", stderr=b"partial stderr")
+        elif label == "unrunnable":
+            def runner():
+                raise OSError("the child cannot start")
+        try:
+            with mock.patch("subprocess.run", lambda *args, **kwargs: runner()):
+                proof().barge("prune", "--plan", "/guard/root/R1-plan.json", expect=0)
+        except Fault as error:
+            detail = error.detail
+            expected = {
+                "non-JSON": ("no usable JSON", b"not json at all", False),
+                "non-UTF-8": ("no usable JSON", b"\xff\xfe\x00", False),
+                "timeout": ("did not complete", b"partial stdout", True),
+                "unrunnable": ("did not complete", b"", True),
+            }[label]
+            failed = first_failed_predicate([
+                ("kind", lambda: error.check != "barge"),
+                ("because", lambda: expected[0] not in detail),
+                ("bytes", lambda: f'"stdout_bytes": {len(expected[1])}' not in detail),
+                ("hash", lambda: hashlib.sha256(expected[1]).hexdigest() not in detail),
+                ("incomplete", lambda: f'"incomplete": {str(expected[2]).lower()}' not in detail),
+                ("no_deciding", lambda: "deciding" in detail),
+            ])
+            if failed is not None:
+                problems.append(f"the {label} fault record lost {failed}: {detail[:600]}")
+        else:
+            problems.append(f"a {label} barge result did not raise")
+
+    # The real counted composition: the fault becomes R1 failed, R2-R16 unexecuted, the
+    # receipt unqualified, and unknown custody is retained for the stop/image decision.
+    instance = proof()
+
+    def failing_case():
+        return instance.barge("prune", "--plan", "/guard/root/R1-plan.json", expect=0)
+
+    instance.case_released_one_synthetic_root = failing_case
+    with mock.patch("subprocess.run", lambda *args, **kwargs: completed(payload, 3)), \
+            mock.patch.object(module, "git_head", lambda: "a" * 40), \
+            mock.patch.object(module, "sha256_file", lambda _path: "f" * 64), \
+            mock.patch.object(module, "supervisor_path", lambda: "/guard/supervisor.py"):
+        instance.run_cases()
+        receipt = instance.receipt_document(cancelled=False)
+    rows = receipt.get("cases") or []
+    first = rows[0] if rows else {}
+    unexecuted = [row for row in rows if row.get("status") == "unexecuted"]
+    failed = first_failed_predicate([
+        ("qualified", lambda: receipt.get("qualified") is not False),
+        ("mode", lambda: receipt.get("mode") != "counted"),
+        ("first_fault", lambda: receipt.get("first_fault") != "R1"),
+        ("all_cases", lambda: receipt.get("all_cases_passed") is not False),
+        ("row_count", lambda: len(rows) != len(CASES)),
+        ("first_status", lambda: first.get("status") != "failed" or first.get("kind") != "barge"),
+        ("first_deciding",
+         lambda: not all(needle in (first.get("detail") or "")
+                         for needle in ("root-late", plan_digest, '"released_count": 0'))),
+        ("unexecuted", lambda: [row.get("case") for row in unexecuted] !=
+         [case["id"] for case in CASES[1:]]),
+        ("retained", lambda: instance.unknown_custody is not True),
+    ])
+    if failed is not None:
+        problems.append(f"the real counted composition lost {failed}: {json.dumps(receipt)[:600]}")
+    return problems
+
+
 def census_controls():
     """The attachment census, its fail-closed parser and the real detach composition. Pure.
 
@@ -4459,6 +4729,7 @@ def pure_self_check():
     problems += custody_controls()
     problems += closure_controls()
     problems += census_controls()
+    problems += command_failure_controls()
     problems += containment_controls()
     problems += plan_controls()
     problems += row_failure_controls()
