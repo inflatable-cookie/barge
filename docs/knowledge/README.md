@@ -32,6 +32,12 @@ Contracts own durable interfaces and formats:
   and observed bytes to one attributable operation at the release planner's read
   sites: the provenance classes, the site inventory, the binding limits and
   counterfactuals, and the implementation slices for the capture apparatus.
+- [Controlled proof execution context](contracts/proof-execution-context.md)
+  owns the design of the account, host, volume, scratch root and authority a
+  Barge native proof runs in: the fixed premises it must preserve, the option
+  matrix and recommended dedicated same-host account, the ownership and
+  admission boundaries, the scratch-route difference, the proposed failure-time
+  attribution evidence and the finite readiness and proof route.
 - [Host-job hand-off](contracts/host-job.md) owns how a host job calls
   `barge maintain`: the preview-then-real protocol, the digest it passes, the
   exit codes it records, what it must never do, and one example plist under
