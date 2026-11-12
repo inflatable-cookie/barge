@@ -1960,6 +1960,8 @@ def guest_binding_controls():
         if not guest_binding_problems(record, observed_route):
             problems.append("guest comparison accepted a changed actual route observation")
     problems += guest_entry_controls(record, raw, digest, input_bytes, paired)
+    problems += guest_continuation_controls(record, paired, digest)
+    problems += guest_nonempty_copy_controls(record, paired)
     return problems
 
 
@@ -2057,6 +2059,168 @@ def guest_entry_controls(record, raw, digest, input_bytes, carried_observation):
         if result != 125 or effect or marker not in text:
             failures.append(f"real inner entry missed scripted {change} refusal before effects")
     return failures
+
+
+def guest_continuation_controls(record, observed, digest):
+    """Exercise continuation wiring with synthetic effects, never an admitted entry."""
+    problems = []
+    mode, path, deadline = "diagnostic", record["instruction_guest_path"], 123456789
+    command, env = guest_guard_invocation(mode, path, digest, record, observed, deadline, 42.5,
+                                           {"OXIDE_PROOF_EVIDENCE": "untrusted", "KEEP": "yes"})
+    expected = [sys.executable, record["supervisor_path"], "--limit", "42.5", "--scratch-budget-mib",
+                str(SCRATCH_BUDGET_MIB), "--root-parent", ".", "--", sys.executable, SCRIPT_PATH,
+                "--guest-inner", mode, "--guest-instruction", path, "--guest-digest", digest]
+    carried = {"instruction_sha256": digest, "mode": mode, "observed": observed}
+    if (command != expected or json.loads(env[ROUTE_ENV]) != carried
+            or env[WALL_DEADLINE_ENV] != str(deadline) or "OXIDE_PROOF_EVIDENCE" in env
+            or env["BARGE_PROOF_SUPERVISOR"] != record["supervisor_path"] or env["KEEP"] != "yes"):
+        problems.append("guest outer continuation lost its guard argv, route or deadline")
+    scratch, evidence = "/synthetic/owned/scratch", "/synthetic/owned/evidence"
+    manifest = {"path": scratch + "/stage/barge", "head": record["head"]}
+    order, receipts = [], []
+    class SyntheticProof:
+        def __init__(self, binary, receipt_path, diagnostic, build, evidence=None, route=None):
+            order.append("proof")
+            self.receipt_path, self.route = receipt_path, route
+            self.build, self.attached, self.mount = build, False, None
+            self.results, self.first_fault, self.infrastructure = [], None, None
+            self.real_state, self.isolation, self.unknown_custody = None, None, False
+            self.closure = None
+        def setup(self):
+            raise Infrastructure("synthetic", "no native effect")
+        def receipt_document(self, _cancelled):
+            return {"schema": SCHEMA, "all_cases_passed": False, "first_fault": self.first_fault,
+                    "closure": self.closure, "cases": self.results, "qualified": False}
+        def write_receipt(self, receipt):
+            order.append("receipt")
+            receipts.append(receipt)
+    def stage(parent, roots, limit, got_record, got_observed, observe):
+        order.append("stage")
+        if (parent != scratch or roots != {"owned root": "/synthetic/owned", "evidence directory": evidence}
+                or limit != deadline or got_record != record or got_observed != observed or observe() != observed):
+            raise Infrastructure("synthetic", "stage arguments differ")
+        return manifest, {"synthetic": True}
+    def verify(binary, head, root, got_record):
+        order.append("verify")
+        return [] if (binary, head, root, got_record) == (manifest["path"], record["head"], scratch, record) else ["mismatch"]
+    def invoke(stage_fn=stage, verify_fn=verify):
+        with mock.patch(__name__ + ".guest_stage_proof_binary", side_effect=stage_fn), \
+                mock.patch(__name__ + ".guest_staged_build_problems", side_effect=verify_fn), \
+                mock.patch(__name__ + ".guest_local_observation", return_value=observed), \
+                mock.patch(__name__ + ".Proof", SyntheticProof), \
+                mock.patch(__name__ + ".real_state_observation", return_value={"status": "absent", "digest": None}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return guest_inner_continuation(mode, record, observed, carried, evidence, scratch, deadline)
+    result = invoke()
+    correlation = {key: record[key] for key in ("nonce", "head", "tree", "lock_sha256", "guard_sha256", "inputs_sha256")}
+    if (result != EXIT_INFRASTRUCTURE or order != ["stage", "verify", "proof", "receipt"]
+            or len(receipts) != 1 or any(receipts[0].get(key) != value for key, value in correlation.items())
+            or receipts[0].get("receipt_path") != os.path.join(evidence, PROOF_RECEIPT)):
+        problems.append("guest continuation lost stage/verify/proof order or published receipt correlation")
+    for rejected in ("stage", "missing", "verify"):
+        order.clear(); receipts.clear()
+        def fail_stage(*_args):
+            order.append("stage")
+            raise Infrastructure("synthetic", "missing build")
+        def fail_verify(*_args):
+            order.append("verify")
+            return ["mismatched build"]
+        def missing_stage(*_args):
+            order.append("stage")
+            return {}, {}
+        result = invoke(stage_fn=fail_stage if rejected == "stage" else missing_stage if rejected == "missing" else stage,
+                        verify_fn=fail_verify if rejected == "verify" else verify)
+        if result != 125 or order != (["stage"] if rejected in ("stage", "missing") else ["stage", "verify"]) or receipts:
+            problems.append(f"guest continuation accepted {rejected} refusal")
+    return problems
+
+
+def guest_nonempty_copy_controls(template, observation):
+    """Exercise real Cargo input copying using tiny private synthetic files."""
+    problems = []
+    root = tempfile.mkdtemp(prefix="release-copy-controls-", dir=os.environ["TMPDIR"])
+    payload = b"synthetic authenticated dependency\n"
+    original_walk = os.fwalk
+    for scenario in ("valid", "changed", "missing", "extra", "link", "nonregular", "config", "ancestor-config", "bytes", "deadline"):
+        case = os.path.join(root, scenario)
+        cargo_home, tools, parent = (os.path.join(case, name) for name in ("delivered", "tools", "guard"))
+        os.makedirs(os.path.join(cargo_home, "registry", "cache"), mode=0o700)
+        os.makedirs(os.path.join(tools, "bin"), mode=0o700)
+        os.makedirs(parent, mode=0o700)
+        dependency = os.path.join(cargo_home, "registry", "cache", "fixture.crate")
+        if scenario == "nonregular":
+            os.mkdir(dependency, 0o700)
+        elif scenario != "missing":
+            with open(dependency, "wb") as handle:
+                handle.write(b"changed" if scenario == "changed" else payload)
+        if scenario == "extra":
+            with open(os.path.join(cargo_home, "extra"), "wb") as handle:
+                handle.write(b"extra")
+        if scenario == "link":
+            os.symlink("fixture.crate", os.path.join(cargo_home, "registry", "cache", "link"))
+        if scenario == "config":
+            with open(os.path.join(cargo_home, "config.toml"), "wb") as handle:
+                handle.write(b"[net]\noffline = true\n")
+        tool_files = {}
+        for name in ("cargo", "rustc"):
+            path = os.path.join(tools, "bin", name)
+            data = ("synthetic-" + name).encode()
+            with open(path, "wb") as handle:
+                handle.write(data)
+            tool_files["bin/" + name] = hashlib.sha256(data).hexdigest()
+        inventory = {"registry/cache/fixture.crate": hashlib.sha256(payload).hexdigest()}
+        if scenario == "config":
+            inventory["config.toml"] = hashlib.sha256(b"[net]\noffline = true\n").hexdigest()
+        data = json.dumps({"roots": {cargo_home: inventory, tools: tool_files}}).encode()
+        manifest = os.path.join(case, "inputs.json")
+        with open(manifest, "wb") as handle:
+            handle.write(data)
+        record = dict(template, cargo_home=cargo_home, toolchain_root=tools,
+                      cargo_path=os.path.join(tools, "bin", "cargo"), cargo_sha256=tool_files["bin/cargo"],
+                      rustc_path=os.path.join(tools, "bin", "rustc"), rustc_sha256=tool_files["bin/rustc"],
+                      input_manifest=manifest, inputs_sha256=hashlib.sha256(data).hexdigest())
+        observed = dict(observation, **{key: record[key] for key in
+                          ("cargo_home", "toolchain_root", "cargo_path", "cargo_sha256", "rustc_path",
+                           "rustc_sha256", "input_manifest", "inputs_sha256")})
+        calls = []
+        before = open(dependency, "rb").read() if os.path.isfile(dependency) else None
+        active_copy = [False]; walks = [0]
+        def walk(path, **kwargs):
+            if path == cargo_home:
+                walks[0] += 1
+                if scenario == "deadline" and walks[0] == 2:
+                    active_copy[0] = True
+            return original_walk(path, **kwargs)
+        def fake_build(argv, **kwargs):
+            calls.append(argv)
+            env = kwargs["env"]
+            copied = os.path.join(env["CARGO_HOME"], "registry", "cache", "fixture.crate")
+            if (env["CARGO_HOME"] != os.path.join(parent, "cargo-home")
+                    or os.stat(env["CARGO_HOME"]).st_mode & 0o077
+                    or open(copied, "rb").read() != payload
+                    or hashlib.sha256(open(copied, "rb").read()).hexdigest() != inventory["registry/cache/fixture.crate"]
+                    or open(dependency, "rb").read() != before):
+                raise ValueError("synthetic build did not consume the authenticated private copy")
+            return mock.Mock(returncode=1, stderr="synthetic stop before artifact", stdout="")
+        original_lexists = os.path.lexists
+        def lexists(path):
+            return (scenario == "ancestor-config" and path == os.path.join(REPO_ROOT, ".cargo", "config")) or original_lexists(path)
+        with mock.patch(__name__ + ".guest_clock_ns", side_effect=lambda: 10 ** 12 if active_copy[0] else 1), \
+                mock.patch("os.fwalk", side_effect=walk), mock.patch("os.path.lexists", side_effect=lexists), \
+                mock.patch(__name__ + ".SCRATCH_BUDGET_MIB", 0 if scenario == "bytes" else SCRATCH_BUDGET_MIB):
+            try:
+                guest_stage_proof_binary(parent, {"fixture": case}, 10 ** 12, record, observed,
+                                         lambda: observed, runner=fake_build)
+                problems.append(f"synthetic Cargo input {scenario} unexpectedly staged")
+            except Infrastructure as error:
+                if scenario == "valid":
+                    if len(calls) != 1 or "synthetic stop before artifact" not in error.detail:
+                        problems.append("nonempty authenticated copy did not reach the fake build")
+                elif calls:
+                    problems.append(f"synthetic Cargo input {scenario} reached the fake build")
+        if before is not None and open(dependency, "rb").read() != before:
+            problems.append(f"synthetic Cargo input {scenario} changed delivered bytes")
+    return problems
 
 
 def inner_command(mode):
@@ -4429,6 +4593,26 @@ def guest_inner_gate(record, observed, carried, instruction_path, instruction_di
     return effect()
 
 
+def guest_inner_continuation(mode, record, observed, carried, evidence, scratch, deadline):
+    """Wire the existing guarded body after the entry has accepted its premises."""
+    receipt = os.path.join(evidence, PROOF_RECEIPT)
+    route = dict(carried)
+    route["guest_correlation"] = {key: record[key] for key in
+                                  ("nonce", "head", "tree", "lock_sha256", "guard_sha256", "inputs_sha256")}
+    owned = {"owned root": guard_owned_root(scratch), "evidence directory": evidence}
+    def stage(parent, roots, deadline_ns):
+        result = guest_stage_proof_binary(parent, roots, deadline_ns, record, observed,
+                                          lambda: guest_local_observation(record))
+        if (not isinstance(result, tuple) or len(result) != 2 or not isinstance(result[0], dict)
+                or not isinstance(result[0].get("path"), str) or not result[0]["path"]
+                or not isinstance(result[1], dict)):
+            raise Infrastructure("stage", "guest stage returned an incomplete artifact record")
+        return result
+    verify = lambda binary, head, root: guest_staged_build_problems(binary, head, root, record)
+    return guarded_run(mode, receipt, route, deadline, scratch, owned, stage=stage, verify=verify,
+                       head=record["head"])
+
+
 def guest_inner_half(mode, instruction_path, instruction_digest):
     """Recheck guest facts inside the genuine guard before staging or fixture effects."""
     try:
@@ -4474,16 +4658,7 @@ def guest_inner_half(mode, instruction_path, instruction_digest):
              "supervisor_problems": installed_supervisor_problems(), "route": carried,
              "deadline_ns": deadline}
     def effect():
-        receipt = os.path.join(evidence, PROOF_RECEIPT)
-        route = dict(carried)
-        route["guest_correlation"] = {key: record[key] for key in
-                                      ("nonce", "head", "tree", "lock_sha256", "guard_sha256", "inputs_sha256")}
-        owned = {"owned root": guard_owned_root(scratch), "evidence directory": evidence}
-        stage = lambda parent, roots, deadline_ns: guest_stage_proof_binary(
-            parent, roots, deadline_ns, record, observed, lambda: guest_local_observation(record))
-        verify = lambda binary, head, root: guest_staged_build_problems(binary, head, root, record)
-        return guarded_run(mode, receipt, route, deadline, scratch, owned, stage=stage, verify=verify,
-                           head=record["head"])
+        return guest_inner_continuation(mode, record, observed, carried, evidence, scratch, deadline)
     return guest_inner_gate(record, observed, carried, instruction_path, instruction_digest,
                             mode, facts, route_problems, effect)
 
@@ -4496,6 +4671,22 @@ def guest_outer_gate(record, observed, instruction_path, mode, extra, effect):
     if record.get("mode") != mode:
         problems.append("the guest mode differs from the instruction")
     return (problems, None) if problems else ([], effect())
+
+
+def guest_guard_invocation(mode, instruction_path, instruction_digest, record, observed, deadline, remaining, base):
+    """Construct the guard invocation selected by the guest outer continuation."""
+    env = dict(base)
+    for key in ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_EVIDENCE", "DYLD_INSERT_LIBRARIES", ROUTE_ENV):
+        env.pop(key, None)
+    env[ROUTE_ENV] = json.dumps({"instruction_sha256": instruction_digest, "mode": mode,
+                                 "observed": observed}, separators=(",", ":"))
+    env[WALL_DEADLINE_ENV] = str(deadline)
+    env["BARGE_PROOF_SUPERVISOR"] = record["supervisor_path"]
+    command = [sys.executable, record["supervisor_path"], "--limit", str(remaining),
+               "--scratch-budget-mib", str(SCRATCH_BUDGET_MIB), "--root-parent", ".", "--",
+               sys.executable, SCRIPT_PATH, "--guest-inner", mode,
+               "--guest-instruction", instruction_path, "--guest-digest", instruction_digest]
+    return command, env
 
 
 def guest_outer_half(mode, instruction_path, instruction_digest):
@@ -4526,17 +4717,8 @@ def guest_outer_half(mode, instruction_path, instruction_digest):
         if problems:
             print(json.dumps({"schema": SCHEMA, "ok": False, "refused": "; ".join(problems)}))
             return 125
-        env = dict(os.environ)
-        for key in ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_EVIDENCE", "DYLD_INSERT_LIBRARIES", ROUTE_ENV):
-            env.pop(key, None)
-        env[ROUTE_ENV] = json.dumps({"instruction_sha256": instruction_digest, "mode": mode,
-                                     "observed": observed}, separators=(",", ":"))
-        env[WALL_DEADLINE_ENV] = str(deadline)
-        env["BARGE_PROOF_SUPERVISOR"] = record["supervisor_path"]
-        command = [sys.executable, record["supervisor_path"], "--limit", str(remaining),
-                   "--scratch-budget-mib", str(SCRATCH_BUDGET_MIB), "--root-parent", ".", "--",
-                   sys.executable, SCRIPT_PATH, "--guest-inner", mode,
-                   "--guest-instruction", instruction_path, "--guest-digest", instruction_digest]
+        command, env = guest_guard_invocation(mode, instruction_path, instruction_digest, record,
+                                              observed, deadline, remaining, os.environ)
         return subprocess.run(command, env=env, cwd=f"/dev/fd/{leaf}", pass_fds=(leaf,)).returncode
     except OSError as error:
         print(json.dumps({"schema": SCHEMA, "ok": False, "refused": f"guest guard launch: {error}"}))
