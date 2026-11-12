@@ -96,6 +96,15 @@ SUPERVISOR_SHA256 = "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37
 DESIGNATED_SCRATCH = "/Volumes/Stash/scratch/barge"
 SCRATCH_VOLUME_MOUNT = "/Volumes/Stash"
 SCRATCH_VOLUME_UUID = "8A660440-C919-45C6-A3F1-3365B9BD2006"
+# The guest route is separate from the host Stash identity.  These constants do
+# not activate a guest occurrence or authenticate the host's instruction record.
+GUEST_VM_UUID = "ddf1f166-4796-4f40-925e-eaf35172c63f"
+GUEST_VOLUME_UUID = "74097A39-2EDF-415E-BA9D-9753E0343AD9"
+GUEST_MOUNT = "/System/Volumes/Data"
+GUEST_PARENT = "/System/Volumes/Data/Users/Shared"
+GUEST_UID = 501
+GUEST_GID = 20
+GUEST_HOME = "/Users/inflatable-tester"
 LIMIT_SECONDS = 300
 SCRATCH_BUDGET_MIB = 512
 # One small owned image. Sparse, so the allocated size is far below the logical size.
@@ -951,6 +960,105 @@ def closure_document(purpose, exit_code, reaped, rows, mount_absent):
     document["closed"] = True
     document["custody"] = "closed"
     return document
+
+
+def guest_binding_problems(record, observed):
+    """Check scoped instruction data against separately attributed observations.
+
+    This comparison is not authentication, admission, or closure.  The host
+    participant owns the record and independently verifies the registered VM;
+    the guest cannot observe the host's Nucleus role or Parallels registration.
+    """
+    if not isinstance(record, dict) or not isinstance(observed, dict):
+        return ["guest invocation binding or observations are missing"]
+    required = {
+        "task", "role", "run", "activation", "mode", "vm_uuid", "uid", "gid",
+        "home", "mount", "volume_uuid", "scratch", "head", "tree", "lock_sha256",
+        "guard_sha256", "toolchain", "target", "features", "command_sha256",
+        "inputs_sha256", "nonce",
+    }
+    if set(record) != required:
+        return ["guest invocation binding has missing or unexpected fields"]
+    problems = []
+    fixed = {"task": "0e9abb83-41c5-48b6-88e3-583c849adfef",
+             "vm_uuid": GUEST_VM_UUID, "uid": GUEST_UID, "gid": GUEST_GID,
+             "home": GUEST_HOME, "mount": GUEST_MOUNT,
+             "volume_uuid": GUEST_VOLUME_UUID, "guard_sha256": SUPERVISOR_SHA256,
+             "toolchain": "1.97.1", "target": "aarch64-apple-darwin",
+             "features": [PROOF_FEATURE]}
+    for key, expected in fixed.items():
+        if record[key] != expected:
+            problems.append(f"guest invocation {key} differs from its fixed value")
+    if record["role"] not in ("author", "reviewer") or record["mode"] not in ("diagnostic", "counted"):
+        problems.append("guest role or mode is unsupported")
+    for key in ("run", "activation", "nonce"):
+        if not isinstance(record[key], str) or not re.fullmatch(r"[A-Za-z0-9-]{16,128}", record[key]):
+            problems.append(f"guest invocation {key} is malformed")
+    for key, length in (("head", 40), ("tree", 40), ("lock_sha256", 64),
+                        ("command_sha256", 64), ("inputs_sha256", 64)):
+        if not isinstance(record[key], str) or not re.fullmatch(rf"[0-9a-f]{{{length}}}", record[key]):
+            problems.append(f"guest invocation {key} is malformed")
+    scratch = record["scratch"]
+    if not isinstance(scratch, str) or os.path.dirname(scratch) != GUEST_PARENT or \
+            not re.fullmatch(r"barge-proof-[A-Za-z0-9_-]{8,80}", os.path.basename(scratch)):
+        problems.append("guest scratch is not a named private leaf of the Data parent")
+    for key in ("uid", "gid", "home", "mount", "volume_uuid", "scratch", "head", "tree",
+                "lock_sha256", "guard_sha256", "toolchain", "target", "features", "inputs_sha256"):
+        if observed.get(key) != record[key]:
+            problems.append(f"guest observation {key} differs from the invocation")
+    for key in ("canonical", "nofollow", "owner_only", "same_volume", "reserve"):
+        if observed.get(key) is not True:
+            problems.append(f"guest route {key} is not established")
+    return problems
+
+
+def guest_receipt_problems(record, receipt, actual_digest, expected_digest):
+    """Compare a complete returned receipt without treating correlation as authority."""
+    if not isinstance(record, dict) or not isinstance(receipt, dict):
+        return ["guest receipt or binding is missing"]
+    problems = []
+    if not isinstance(actual_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", actual_digest) or \
+            actual_digest != expected_digest:
+        problems.append("complete guest receipt bytes do not match the expected digest")
+    for key in ("nonce", "head", "tree", "lock_sha256", "guard_sha256", "inputs_sha256"):
+        if not record.get(key) or receipt.get(key) != record[key]:
+            problems.append(f"guest receipt {key} does not match the invocation")
+    return problems
+
+
+def guest_binding_controls():
+    """Exercise the data comparisons; these do not exercise the live guest route."""
+    record = {"task": "0e9abb83-41c5-48b6-88e3-583c849adfef", "role": "author",
+              "run": "r" * 16, "activation": "a" * 16, "mode": "diagnostic",
+              "vm_uuid": GUEST_VM_UUID, "uid": GUEST_UID, "gid": GUEST_GID,
+              "home": GUEST_HOME, "mount": GUEST_MOUNT, "volume_uuid": GUEST_VOLUME_UUID,
+              "scratch": GUEST_PARENT + "/barge-proof-12345678", "head": "a" * 40,
+              "tree": "b" * 40, "lock_sha256": "c" * 64, "guard_sha256": SUPERVISOR_SHA256,
+              "toolchain": "1.97.1", "target": "aarch64-apple-darwin",
+              "features": [PROOF_FEATURE], "command_sha256": "d" * 64,
+              "inputs_sha256": "e" * 64, "nonce": "n" * 16}
+    observed = dict(record, canonical=True, nofollow=True, owner_only=True, same_volume=True, reserve=True)
+    problems = []
+    if guest_binding_problems(record, observed):
+        problems.append("valid guest comparison was refused")
+    for field in ("uid", "gid", "volume_uuid", "head", "tree", "lock_sha256", "guard_sha256",
+                  "toolchain", "scratch", "inputs_sha256", "canonical", "nofollow", "owner_only",
+                  "same_volume", "reserve"):
+        if not guest_binding_problems(record, dict(observed, **{field: None})):
+            problems.append(f"guest comparison accepted changed {field}")
+    for field in record:
+        reduced = dict(record)
+        del reduced[field]
+        if not guest_binding_problems(reduced, observed):
+            problems.append(f"guest comparison accepted missing {field}")
+    receipt = {key: record[key] for key in ("nonce", "head", "tree", "lock_sha256", "guard_sha256", "inputs_sha256")}
+    if guest_receipt_problems(record, receipt, "f" * 64, "f" * 64):
+        problems.append("matching guest receipt comparison was refused")
+    if not guest_receipt_problems(record, dict(receipt, nonce="other"), "f" * 64, "f" * 64):
+        problems.append("guest receipt comparison accepted a different nonce")
+    if not guest_receipt_problems(record, receipt, "f" * 64, "0" * 64):
+        problems.append("guest receipt comparison accepted different bytes")
+    return problems
 
 
 def inner_command(mode):
@@ -4887,6 +4995,7 @@ def pure_self_check():
     if not staged_build_problems("/elsewhere/barge", "0" * 40, scratch):
         problems.append("a binary outside the owned root is not refused")
     problems += route_controls()
+    problems += guest_binding_controls()
     problems += stage_controls()
     problems += custody_controls()
     problems += closure_controls()
