@@ -194,7 +194,9 @@ COMMAND_SCHEMA = "barge.release.command/1"
 CENSUS_PREFIX_BYTES = 4096
 # One barge-command fault record keeps the command's own captured evidence first and the
 # returned document's deciding fields next, each inside its own bound; the raw stream
-# prefixes come last, so no leading member can hide a counter, root id or reason.
+# prefixes come last, so no leading member can hide a counter, root id or reason. Those
+# prefixes are published whether or not any document parsed: the captured bytes are the
+# only explanation of a parse, decode or exit fault.
 BARGE_FAULT_DETAIL_CHARS = 16384
 # Every command-evidence field the census copies from its own command record, both streams
 # and the incompleteness facts included.
@@ -1309,20 +1311,42 @@ def bounded_ids(values, count_limit=ROW_ID_LIMIT, char_limit=ROW_ID_CHARS):
     return kept, max(0, len(values) - len(kept))
 
 
+def stated_rows(data):
+    """A returned document's `rows` member as usable row objects, plus what it stated. Pure.
+
+    A member the document did not state is `unobserved`; a member of the wrong type is
+    `unusable` and contributes no rows, because iterating it would raise before the
+    command's own independently captured evidence could be published. A list whose
+    members are not objects keeps the usable ones and states how many were dropped.
+    """
+    if "rows" not in data:
+        return "unobserved", 0, []
+    raw = data["rows"]
+    if not isinstance(raw, list):
+        return f"unusable ({type(raw).__name__})", "unobserved", []
+    rows = [row for row in raw if isinstance(row, dict)]
+    dropped = len(raw) - len(rows)
+    return ("usable" if not dropped else f"list with {dropped} non-object members",
+            len(raw), rows)
+
+
 def barge_document_summary(document):
     """The deciding fields one returned barge document states, each bounded. Pure.
 
     Only what the document itself says is reported: a member it does not state is
     `unobserved`, never guessed, and the raw document is not re-encoded here. Counters,
     digests, root ids and each returned outcome/reason are kept as their own bounded
-    fields, so an unrelated leading member can never consume the record.
+    fields, so an unrelated leading member can never consume the record. An unusable
+    member shape is stated as such instead of being iterated, so a syntactically valid
+    but unusable result can never raise here — and so can never discard the command
+    record this summary is published beside.
     """
     if not isinstance(document, dict):
-        return {"document": "not an object"}
+        return {"document": f"unusable ({type(document).__name__})"}
     error = document.get("error") if isinstance(document.get("error"), dict) else {}
     data = document.get("data") if isinstance(document.get("data"), dict) else {}
     plan = data.get("plan") if isinstance(data.get("plan"), dict) else {}
-    rows = [row for row in (data.get("rows") or []) if isinstance(row, dict)]
+    rows_shape, rows_stated, rows = stated_rows(data)
     plan_rows = plan.get("rows") if isinstance(plan.get("rows"), dict) else {}
     listed = plan_rows.get("rows") if isinstance(plan_rows.get("rows"), list) else []
     root_ids, ids_omitted = bounded_ids([row.get("root_id") for row in listed
@@ -1347,10 +1371,32 @@ def barge_document_summary(document):
         "plan_examined_count": plan_rows.get("examined_count", "unobserved"),
         "plan_root_ids": root_ids,
         "plan_root_ids_omitted": ids_omitted,
+        "rows_shape": rows_shape,
+        "rows_stated": rows_stated,
     }
     return failure_summary(fields, [{"root_id": row.get("root_id"),
                                      "outcome": row.get("outcome"),
                                      "reason": row.get("reason")} for row in rows])
+
+
+def stream_prefix_evidence(command, name):
+    """One captured stream's bounded prefix with its honest capture facts. Pure.
+
+    A capture the command record marked truncated keeps that flag in the line itself, and
+    the further bound applied here states exactly how many of the captured characters are
+    shown, so the receipt can never imply it published a whole stream. A stream the record
+    did not capture — an unrunnable command captures nothing — says so rather than
+    rendering an empty string that could be mistaken for a stream that was empty.
+    """
+    raw = command.get(name)
+    if not isinstance(raw, str):
+        return f"{name} (capture unobserved)"
+    flag = command.get(name.replace("_prefix", "_truncated"))
+    facts = "capture_truncated=" + (str(flag).lower() if isinstance(flag, bool) else "unobserved")
+    shown = bounded_text(raw, FAILURE_TEXT_CHARS)
+    if len(raw) > FAILURE_TEXT_CHARS:
+        facts += f"; shown {FAILURE_TEXT_CHARS} of {len(raw)} captured chars"
+    return f"{name} ({facts}) " + (shown or "<empty>")
 
 
 def barge_fault_detail(argv, expect, command, document, because, observed_exit=None):
@@ -1358,9 +1404,12 @@ def barge_fault_detail(argv, expect, command, document, because, observed_exit=N
 
     `command` is a [`command_record`] of exactly the captured bytes. The deciding summary
     of the returned document is bounded independently of that command record, and the raw
-    stream prefixes are placed last, so a hostile leading member or a long capture can
-    never hide a counter, digest, root id or reason. Facts the command or document did not
-    state stay `unobserved`.
+    stream prefixes are published last and unconditionally, so neither a hostile leading
+    member nor a long capture can hide a counter, digest, root id or reason, and a fault
+    that parsed no usable document still keeps the bytes that explain it. A summary that
+    cannot render — a last resort, since [`barge_document_summary`] itself states unusable
+    shapes — degrades to an unobserved document instead of discarding the command record.
+    Facts the command or document did not state stay `unobserved`.
     """
     command_fields = {
         "argv": command.get("argv"),
@@ -1378,12 +1427,16 @@ def barge_fault_detail(argv, expect, command, document, because, observed_exit=N
     }
     parts = [f"barge {' '.join(argv)} {because}",
              "command " + json.dumps(command_fields, sort_keys=True)]
-    if document is not None:
-        parts.append("deciding " + json.dumps(barge_document_summary(document), sort_keys=True))
-        parts.append("stdout_prefix " + bounded_text(str(command.get("stdout_prefix") or ""),
-                                                     FAILURE_TEXT_CHARS))
-        parts.append("stderr_prefix " + bounded_text(str(command.get("stderr_prefix") or ""),
-                                                     FAILURE_TEXT_CHARS))
+    if document is None:
+        parts.append("deciding unobserved (no usable document)")
+    else:
+        try:
+            rendered = json.dumps(barge_document_summary(document), sort_keys=True)
+        except Exception as error:  # last resort: never lose the command's own evidence
+            rendered = json.dumps({"document": f"unusable ({type(error).__name__})"})
+        parts.append("deciding " + rendered)
+    parts.append(stream_prefix_evidence(command, "stdout_prefix"))
+    parts.append(stream_prefix_evidence(command, "stderr_prefix"))
     return bounded_text("; ".join(parts), BARGE_FAULT_DETAIL_CHARS)
 
 
@@ -3355,8 +3408,12 @@ def command_failure_controls():
     remainder, and the real `receipt_document` publishes them; only the git, supervisor
     and binary-digest lookups are stubbed for the receipt. The controls assert the
     deciding counters, digests, root ids, outcomes and reasons survive a hostile leading
-    member far beyond the old 300-character prefix, that omission facts are honest, and
-    that the count stays unqualified with unknown custody retained.
+    member far beyond the old 300-character prefix, that omission facts are honest, that
+    capture facts are stated for every stream, that a failure which parsed no document
+    still publishes both captured prefixes, that an oversized capture states its own
+    truncation, that an unusable result shape keeps the command record instead of raising
+    into the generic exception branch, and that each such failure leaves the count
+    unqualified with unknown custody retained and the remaining cases unexecuted.
     """
     problems = []
     module = sys.modules[__name__]
@@ -3397,6 +3454,13 @@ def command_failure_controls():
         stdout = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
         return subprocess.CompletedProcess(args=[binary], returncode=returncode,
                                            stdout=stdout, stderr=stderr)
+
+    def prefix_survived(detail, name, raw):
+        """Whether one stream's own prefix and its capture flag survived. Pure."""
+        truncated = len(raw) > CENSUS_PREFIX_BYTES
+        shown = raw[:FAILURE_TEXT_CHARS].decode("utf-8", "replace") or "<empty>"
+        return (f"{name} (capture_truncated={str(truncated).lower()}" in detail
+                and shown in detail)
 
     # One exit-3 result whose deciding counters, digests, root id and reason all sit
     # beyond a 4,000-character leading member.
@@ -3447,77 +3511,175 @@ def command_failure_controls():
     else:
         problems.append("an unexpected barge exit did not raise")
 
-    # A result that is not JSON keeps the command's own bytes and states the document as
-    # unobserved; malformed captures are never guessed into fields.
-    for label, runner in (
-            ("non-JSON", lambda: completed(b"not json at all", 0)),
-            ("non-UTF-8", lambda: completed(b"\xff\xfe\x00", 0)),
-            ("timeout", None),
-            ("unrunnable", None)):
-        if label == "timeout":
-            def runner():
-                raise subprocess.TimeoutExpired(cmd=binary, timeout=120,
-                                                output=b"partial stdout", stderr=b"partial stderr")
-        elif label == "unrunnable":
-            def runner():
-                raise OSError("the child cannot start")
+    # A result that is not JSON, does not decode, or never completes keeps the command's
+    # own bytes and states the document as unobserved; malformed captures are never guessed
+    # into fields, and each captured stream's own prefix survives even though no document
+    # parsed.
+    def timeout_runner():
+        raise subprocess.TimeoutExpired(cmd=binary, timeout=120,
+                                        output=b"partial stdout", stderr=b"partial stderr")
+
+    def unrunnable_runner():
+        raise OSError("the child cannot start")
+
+    unparsed = (
+        ("non-JSON", lambda: completed(b"not json at all", 0, b"the parse failed here"),
+         b"not json at all", b"the parse failed here", False, "no usable JSON"),
+        ("non-UTF-8", lambda: completed(b"\xff\xfe\x00", 0, b"the decode failed here"),
+         b"\xff\xfe\x00", b"the decode failed here", False, "no usable JSON"),
+        ("timeout", timeout_runner, b"partial stdout", b"partial stderr", True,
+         "did not complete"),
+        ("unrunnable", unrunnable_runner, b"", b"", True, "did not complete"),
+    )
+    for label, runner, stdout, stderr, incomplete, because in unparsed:
         try:
             with mock.patch("subprocess.run", lambda *args, **kwargs: runner()):
                 proof().barge("prune", "--plan", "/guard/root/R1-plan.json", expect=0)
         except Fault as error:
             detail = error.detail
-            expected = {
-                "non-JSON": ("no usable JSON", b"not json at all", False),
-                "non-UTF-8": ("no usable JSON", b"\xff\xfe\x00", False),
-                "timeout": ("did not complete", b"partial stdout", True),
-                "unrunnable": ("did not complete", b"", True),
-            }[label]
             failed = first_failed_predicate([
                 ("kind", lambda: error.check != "barge"),
-                ("because", lambda: expected[0] not in detail),
-                ("bytes", lambda: f'"stdout_bytes": {len(expected[1])}' not in detail),
-                ("hash", lambda: hashlib.sha256(expected[1]).hexdigest() not in detail),
-                ("incomplete", lambda: f'"incomplete": {str(expected[2]).lower()}' not in detail),
-                ("no_deciding", lambda: "deciding" in detail),
+                ("because", lambda: because not in detail),
+                ("bytes", lambda: f'"stdout_bytes": {len(stdout)}' not in detail
+                 or f'"stderr_bytes": {len(stderr)}' not in detail),
+                ("hash", lambda: hashlib.sha256(stdout).hexdigest() not in detail
+                 or hashlib.sha256(stderr).hexdigest() not in detail),
+                ("incomplete", lambda: f'"incomplete": {str(incomplete).lower()}' not in detail),
+                ("no_deciding",
+                 lambda: "deciding unobserved (no usable document)" not in detail),
+                ("stdout_prefix", lambda: not prefix_survived(detail, "stdout_prefix", stdout)),
+                ("stderr_prefix", lambda: not prefix_survived(detail, "stderr_prefix", stderr)),
             ])
             if failed is not None:
                 problems.append(f"the {label} fault record lost {failed}: {detail[:600]}")
         else:
             problems.append(f"a {label} barge result did not raise")
 
-    # The real counted composition: the fault becomes R1 failed, R2-R16 unexecuted, the
+    # A capture larger than the record's own prefix bound keeps its honest truncation facts
+    # and the whole record stays inside its allowance.
+    oversized = b"s" * (CENSUS_PREFIX_BYTES + 1000)
+    try:
+        with mock.patch("subprocess.run",
+                        lambda *args, **kwargs: completed(oversized, 0, b"e" * 900)):
+            proof().barge("prune", "--plan", "/guard/root/R1-plan.json", expect=0)
+    except Fault as error:
+        detail = error.detail
+        failed = first_failed_predicate([
+            ("kind", lambda: error.check != "barge"),
+            ("stdout_capture", lambda: not prefix_survived(detail, "stdout_prefix", oversized)),
+            ("stdout_shown",
+             lambda: f"shown {FAILURE_TEXT_CHARS} of {CENSUS_PREFIX_BYTES} captured chars"
+             not in detail),
+            ("stderr_capture", lambda: not prefix_survived(detail, "stderr_prefix", b"e" * 900)),
+            ("stderr_shown",
+             lambda: f"shown {FAILURE_TEXT_CHARS} of 900 captured chars" not in detail),
+            ("bytes", lambda: f'"stdout_bytes": {len(oversized)}' not in detail),
+            ("bound", lambda: len(detail) > BARGE_FAULT_DETAIL_CHARS),
+        ])
+        if failed is not None:
+            problems.append(f"an oversized capture lost {failed}: {detail[:600]}")
+    else:
+        problems.append("an oversized barge result did not raise")
+
+    # The real counted composition: one fault becomes R1 failed, R2-R16 unexecuted, the
     # receipt unqualified, and unknown custody is retained for the stop/image decision.
-    instance = proof()
+    def composed(runner):
+        instance = proof()
 
-    def failing_case():
-        return instance.barge("prune", "--plan", "/guard/root/R1-plan.json", expect=0)
+        def failing_case():
+            return instance.barge("prune", "--plan", "/guard/root/R1-plan.json", expect=0)
 
-    instance.case_released_one_synthetic_root = failing_case
-    with mock.patch("subprocess.run", lambda *args, **kwargs: completed(payload, 3)), \
-            mock.patch.object(module, "git_head", lambda: "a" * 40), \
-            mock.patch.object(module, "sha256_file", lambda _path: "f" * 64), \
-            mock.patch.object(module, "supervisor_path", lambda: "/guard/supervisor.py"):
-        instance.run_cases()
-        receipt = instance.receipt_document(cancelled=False)
-    rows = receipt.get("cases") or []
-    first = rows[0] if rows else {}
-    unexecuted = [row for row in rows if row.get("status") == "unexecuted"]
-    failed = first_failed_predicate([
-        ("qualified", lambda: receipt.get("qualified") is not False),
-        ("mode", lambda: receipt.get("mode") != "counted"),
-        ("first_fault", lambda: receipt.get("first_fault") != "R1"),
-        ("all_cases", lambda: receipt.get("all_cases_passed") is not False),
-        ("row_count", lambda: len(rows) != len(CASES)),
-        ("first_status", lambda: first.get("status") != "failed" or first.get("kind") != "barge"),
-        ("first_deciding",
-         lambda: not all(needle in (first.get("detail") or "")
-                         for needle in ("root-late", plan_digest, '"released_count": 0'))),
-        ("unexecuted", lambda: [row.get("case") for row in unexecuted] !=
-         [case["id"] for case in CASES[1:]]),
-        ("retained", lambda: instance.unknown_custody is not True),
-    ])
-    if failed is not None:
-        problems.append(f"the real counted composition lost {failed}: {json.dumps(receipt)[:600]}")
+        instance.case_released_one_synthetic_root = failing_case
+        with mock.patch("subprocess.run", lambda *args, **kwargs: runner()), \
+                mock.patch.object(module, "git_head", lambda: "a" * 40), \
+                mock.patch.object(module, "sha256_file", lambda _path: "f" * 64), \
+                mock.patch.object(module, "supervisor_path", lambda: "/guard/supervisor.py"):
+            instance.run_cases()
+            receipt = instance.receipt_document(cancelled=False)
+        return instance, receipt
+
+    def composition_problem(label, instance, receipt):
+        """That one failed case stopped the count and retained unknown custody. Pure."""
+        rows = receipt.get("cases") or []
+        first = rows[0] if rows else {}
+        unexecuted = [row.get("case") for row in rows if row.get("status") == "unexecuted"]
+        failed = first_failed_predicate([
+            ("qualified", lambda: receipt.get("qualified") is not False),
+            ("mode", lambda: receipt.get("mode") != "counted"),
+            ("first_fault", lambda: receipt.get("first_fault") != "R1"),
+            ("all_cases", lambda: receipt.get("all_cases_passed") is not False),
+            ("row_count", lambda: len(rows) != len(CASES)),
+            ("first_status",
+             lambda: first.get("status") != "failed" or first.get("kind") != "barge"),
+            ("unexecuted", lambda: unexecuted != [case["id"] for case in CASES[1:]]),
+            ("retained", lambda: instance.unknown_custody is not True),
+        ])
+        if failed is None:
+            return first, None
+        return first, f"the {label} composition lost {failed}: {json.dumps(receipt)[:600]}"
+
+    instance, receipt = composed(lambda: completed(payload, 3))
+    first, problem = composition_problem("exit-3", instance, receipt)
+    if problem is not None:
+        problems.append(problem)
+    else:
+        decided = first.get("detail") or ""
+        failed = first_failed_predicate([
+            ("deciding", lambda: not all(needle in decided for needle in (
+                "root-late", plan_digest, '"released_count": 0'))),
+            ("stdout_prefix", lambda: not prefix_survived(decided, "stdout_prefix", payload)),
+        ])
+        if failed is not None:
+            problems.append(f"the exit-3 composition lost {failed}: {decided[:600]}")
+
+    # A syntactically valid but unusable result shape keeps the command record: the real
+    # summary states the unusable member, the fault stays the barge kind instead of falling
+    # into the generic exception branch, and the count is still unqualified.
+    malformed_payload = json.dumps({
+        "schema": "barge.prune.run/1", "command": "prune.run", "ok": True,
+        "data": {"rows": 1},
+    }).encode()
+    malformed_instance, malformed_receipt = composed(
+        lambda: completed(malformed_payload, 3, b"rows were not a list"))
+    first, problem = composition_problem("unusable-result", malformed_instance,
+                                         malformed_receipt)
+    if problem is not None:
+        problems.append(problem)
+    else:
+        decided = first.get("detail") or ""
+        failed = first_failed_predicate([
+            ("command", lambda: not all(needle in decided for needle in (
+                binary, '"observed_exit": 3',
+                f'"stdout_bytes": {len(malformed_payload)}',
+                hashlib.sha256(malformed_payload).hexdigest()))),
+            ("rows_shape", lambda: '"rows_shape": "unusable (int)"' not in decided),
+            ("rows_stated", lambda: '"rows_stated": "unobserved"' not in decided),
+            ("stderr_prefix", lambda: not prefix_survived(decided, "stderr_prefix",
+                                                         b"rows were not a list")),
+            ("no_exception", lambda: first.get("trace") is not None or "TypeError" in decided),
+        ])
+        if failed is not None:
+            problems.append(f"the unusable-result composition lost {failed}: {decided[:600]}")
+
+    # A result that parsed no document still publishes both captured prefixes through the
+    # real counted composition.
+    unparsed_instance, unparsed_receipt = composed(
+        lambda: completed(b"not json at all", 0, b"the parse failed here"))
+    first, problem = composition_problem("unparsed", unparsed_instance, unparsed_receipt)
+    if problem is not None:
+        problems.append(problem)
+    else:
+        decided = first.get("detail") or ""
+        failed = first_failed_predicate([
+            ("stdout_prefix", lambda: not prefix_survived(decided, "stdout_prefix",
+                                                         b"not json at all")),
+            ("stderr_prefix", lambda: not prefix_survived(decided, "stderr_prefix",
+                                                         b"the parse failed here")),
+            ("no_deciding",
+             lambda: "deciding unobserved (no usable document)" not in decided),
+        ])
+        if failed is not None:
+            problems.append(f"the unparsed composition lost {failed}: {decided[:600]}")
     return problems
 
 

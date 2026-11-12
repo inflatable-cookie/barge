@@ -2951,9 +2951,16 @@ schema, `ok`, the refusal or error, the presented and fresh plan digests, releas
 stop and replay counts, the bounded plan root ids and each returned outcome and reason with
 their row and character omission facts. Those deciding fields are bounded independently of
 the command record, and the raw prefixes are placed last, so neither a hostile leading
-member nor a long capture can hide a counter, root id or reason. Anything the command or
-document did not state stays `unobserved`; no effect is inferred from a truncated or absent
-payload. The
+member nor a long capture can hide a counter, root id or reason. An unusable member shape
+is stated as `unusable` — a returned `rows` that is not a list contributes none and its
+stated count and shape are recorded — rather than iterated, so a syntactically valid but
+unusable result can never raise and discard the command record it is published beside. The
+stream prefixes are published whether or not any document parsed, because those bytes are
+the only explanation of a parse, decode or exit fault; each carries its own capture
+truncation flag and, where this record bounds it further, the exact number of captured
+characters shown, and an uncaptured stream says so instead of rendering an empty string.
+Anything the command or document did not state stays `unobserved`; no effect is inferred
+from a truncated or absent payload. The
 predicates keep their original order and short-circuit, so a failure record never runs
 an observation the assertion would not have made: a filesystem fact the branch did not
 reach is reported as `unobserved`, and the release-run record carries
