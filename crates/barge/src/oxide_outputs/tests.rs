@@ -175,6 +175,48 @@ impl Fixture {
         .expect("the control state is written");
     }
 
+    /// Both pool controls exactly where Oxide's writer keeps them, carrying
+    /// `fence` and its raw initialization member, with the library ledger beside
+    /// each state.
+    fn write_pool_controls(&self, fence: &str, init: serde_json::Value) {
+        let pools = [
+            self.control.clone(),
+            self.control
+                .join(crate::pool_custody::REMOVABLE_POOL_DIR)
+                .join(crate::inspect::OXIDE_CONTROL_DIR),
+        ];
+        for control in pools {
+            let document = json!({
+                "version": 9,
+                "next_id": 1,
+                "next_use": 1,
+                "tickets": [],
+                "cleans": [],
+                "records": [],
+                "owned_outputs": fence,
+                "outputs_init": init,
+                "recorded_accounting": "oxide.accounting/1",
+                "eviction_accounting": "oxide.eviction-accounting/1",
+                "slot_ceiling": "oxide.slots/256",
+                "holding": "oxide.holding/1",
+            });
+            std::fs::create_dir_all(&control).expect("the control directory is created");
+            std::fs::write(
+                control.join("state.json"),
+                serde_json::to_vec_pretty(&document).expect("the control state encodes"),
+            )
+            .expect("the control state is written");
+            let pool = control
+                .parent()
+                .expect("the control directory is inside a pool");
+            std::fs::write(
+                pool.join("ledger.json"),
+                r#"{"version":1,"store_id":"0123456789abcdef0123456789abcdef","cap_bytes":1024,"next_slot":1,"next_lease":1,"slots":[]}"#,
+            )
+            .expect("the pool ledger is written");
+        }
+    }
+
     /// The covered class, complete: successor fence, ready registry, and the
     /// one live intent for `root` under `caller_id`.
     fn covered(&self, root: &RootFixture, caller_id: &str) {

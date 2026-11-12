@@ -1452,21 +1452,39 @@ fn lookup_oxide_intent(
         Err(reason) => return unknown(reason),
     };
     match pool_custody::owned_outputs_fence(&pools, deadline) {
-        OutputsFence::Covered => {}
+        OutputsFence::Covered { coordinated } => {
+            // Oxide's coordinated single-authority class carries no delegated
+            // deletion route: `/4` refuses `deletion_routes`, its predecessor
+            // intents are drained before adoption, and the operation journal
+            // is the only authority there. Recognising the paired fence must
+            // never re-enable this predecessor join, so it is refused rather
+            // than read as a legacy route.
+            if coordinated.is_some() {
+                return OxideLookup::NotCovered {
+                    reason: "the pools record Oxide's completed coordinated single-authority adoption, whose registry carries no delegated deletion route; the delegated outputs path is not that class's authority".to_owned(),
+                };
+            }
+        }
         OutputsFence::NotCovered { reason } => return OxideLookup::NotCovered { reason },
         OutputsFence::Unknown { reason } => return unknown(reason),
     }
-    let registry = reference::read_registry(
-        &control
-            .join(reference::OXIDE_OUTPUTS_DIR)
-            .join(reference::OXIDE_REGISTRY_FILE),
-        deadline,
+    // A `/4` registry image without its paired controls is one-sided adoption,
+    // so the registry reading is unknown rather than a route's authority.
+    let registry = reference::bind_coordinated_registry(
+        reference::read_registry(
+            &control
+                .join(reference::OXIDE_OUTPUTS_DIR)
+                .join(reference::OXIDE_REGISTRY_FILE),
+            deadline,
+        ),
+        None,
     );
     match registry {
         reference::OxideRegistry::Read {
             rows: _,
             intents,
             complete,
+            ..
         } => {
             if !complete {
                 return unknown(

@@ -49,7 +49,7 @@ use crate::area::{self, AreaDocument, HoldReading, PrunePolicy};
 use crate::cache::{self, PlacementForm, PlacementSet};
 use crate::error::{Error, ErrorKind, Result};
 use crate::os::{AccountFacts, DirHandle, DirOps, VolumeUuid};
-use crate::pool_custody::{Custody, PoolCustody, REMOVABLE_POOL_DIR};
+use crate::pool_custody::{CoordinatedAdoption, Custody, PoolCustody, REMOVABLE_POOL_DIR};
 use crate::state::{self, Bounds, Deadline, ReadOutcome, StatePaths};
 
 /// A reference from one of Barge's own records.
@@ -580,6 +580,10 @@ pub enum OxideRegistry {
         intents: Vec<OxideIntent>,
         /// Its own `complete` flag.
         complete: bool,
+        /// The fence version the document states.
+        version: String,
+        /// The initialization transaction that created this registry.
+        created_by: String,
     },
     /// A registry that could not be read completely. Every root it might name is
     /// kept.
@@ -703,6 +707,9 @@ impl OxideSnapshot {
             Ok(pools) => PoolCustody::read(&pools, deadline),
             Err(reason) => PoolCustody::unknown(reason),
         };
+        // The coordinated control pair and the `/4` registry image are one
+        // handoff: neither decides anything without the other.
+        let registry = bind_coordinated_registry(registry, custody.coordinated());
         let detail = match (&registry, &receipts) {
             (OxideRegistry::Unknown { reason }, _) => Some(reason.clone()),
             (_, OxideReceipts::Unknown { reason }) => Some(reason.clone()),
@@ -779,6 +786,7 @@ impl OxideSnapshot {
                 rows,
                 intents,
                 complete,
+                ..
             } => {
                 if !complete {
                     set.absorb(ReferenceSet::unknown(
@@ -1299,6 +1307,49 @@ pub(crate) fn read_registry(path: &Path, deadline: Deadline) -> OxideRegistry {
     }
 }
 
+/// Bind Oxide's coordinated control pair to the registry image it published.
+///
+/// The producer writes both pools' `oxide.outputs/5` fence and `initializing`
+/// record under one transaction, publishes the atomic `/4` registry image
+/// created by that transaction, and only then records `ready` on each control.
+/// So a completed pair and a `/4` image exist together or not at all: an image
+/// without the pair is one-sided adoption, and a pair whose transaction is not
+/// the image's `created_by` is a mixed generation. Either way the registry is
+/// unknown, and every root it might name is kept.
+pub(crate) fn bind_coordinated_registry(
+    registry: OxideRegistry,
+    coordinated: Option<&CoordinatedAdoption>,
+) -> OxideRegistry {
+    let (version, created_by) = match &registry {
+        OxideRegistry::Read {
+            version,
+            created_by,
+            ..
+        } => (Some(version.as_str()), Some(created_by.as_str())),
+        OxideRegistry::Absent => (None, None),
+        // An unreadable registry is already the reading's own unknown fact.
+        OxideRegistry::Unknown { .. } => return registry,
+    };
+    let coordinated_image = version == Some(OXIDE_REGISTRY_V4);
+    let reason = match (coordinated, coordinated_image) {
+        (Some(adoption), true) if created_by == Some(adoption.transaction()) => return registry,
+        (Some(adoption), true) => format!(
+            "the registry image records transaction {:?}, not the completed coordinated transaction {:?}, so the paired adoption is mixed",
+            created_by.unwrap_or_default(),
+            adoption.transaction()
+        ),
+        (Some(_), false) => format!(
+            "the pools record the completed coordinated adoption but the registry image is {}, not {OXIDE_REGISTRY_V4}",
+            version.unwrap_or("absent")
+        ),
+        (None, true) => format!(
+            "the registry image is {OXIDE_REGISTRY_V4} but no pool control records the completed coordinated fence that creates it"
+        ),
+        (None, false) => return registry,
+    };
+    OxideRegistry::Unknown { reason }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRegistry {
@@ -1786,6 +1837,8 @@ fn parse_registry(bytes: &[u8]) -> std::result::Result<OxideRegistry, String> {
         rows,
         intents,
         complete: raw.complete,
+        version: raw.version,
+        created_by: raw.created_by,
     })
 }
 
@@ -4383,6 +4436,243 @@ mod writer_custody_tests {
     fn a_pool_wide_unknown_makes_the_snapshot_incomplete() {
         assert!(snapshot(PoolCustody::default()).complete());
         assert!(!snapshot(PoolCustody::unknown("a pool cannot be read")).complete());
+    }
+
+    /// One private synthetic account home whose Oxide control directory holds
+    /// the internal pool, the removable pool and one outputs registry image.
+    struct CoordinatedFixture {
+        _dir: TempDir,
+        home: PathBuf,
+        control: PathBuf,
+    }
+
+    /// The coordinated adoption transaction both controls record ready.
+    const INIT_TRANSACTION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    /// The empty library ledger Oxide writes for a pool with no slot.
+    const EMPTY_LEDGER: &str = r#"{"version":1,"store_id":"0123456789abcdef0123456789abcdef","cap_bytes":1024,"next_slot":1,"next_lease":1,"slots":[]}"#;
+
+    impl CoordinatedFixture {
+        fn new(label: &str) -> Self {
+            let dir = TempDir::new(label);
+            let home = dir.path().join("home");
+            let control = home
+                .join("Library/Caches/oxide/build-pool")
+                .join(crate::inspect::OXIDE_CONTROL_DIR);
+            std::fs::create_dir_all(control.join(OXIDE_OUTPUTS_DIR)).unwrap();
+            Self {
+                _dir: dir,
+                home,
+                control,
+            }
+        }
+
+        fn internal(&self) -> PathBuf {
+            self.control
+                .parent()
+                .expect("the control directory is inside a pool")
+                .to_path_buf()
+        }
+
+        fn removable(&self) -> PathBuf {
+            self.control.join(REMOVABLE_POOL_DIR)
+        }
+
+        /// A version-9 control state carrying `fence` and its raw
+        /// initialization member(s), exactly as Oxide serializes them.
+        fn state(fence: &str, init: &str) -> String {
+            format!(
+                r#"{{"version":9,"next_id":1,"next_use":1,"tickets":[],"cleans":[],"records":[],"owned_outputs":"{fence}"{init},"recorded_accounting":"oxide.accounting/1","eviction_accounting":"oxide.eviction-accounting/1","slot_ceiling":"oxide.slots/256","holding":"oxide.holding/1"}}"#
+            )
+        }
+
+        fn write_pool(&self, pool: &Path, fence: &str, init: &str) {
+            let control = pool.join(crate::pool_custody::CONTROL_DIR);
+            std::fs::create_dir_all(&control).unwrap();
+            std::fs::write(
+                control.join(crate::pool_custody::STATE_FILE),
+                Self::state(fence, init),
+            )
+            .unwrap();
+            std::fs::write(pool.join(crate::pool_custody::LEDGER_FILE), EMPTY_LEDGER).unwrap();
+        }
+
+        /// The exact emitted adoption: both controls `/5` ready, one
+        /// transaction.
+        fn coordinated_pair(&self) {
+            let ready = format!(
+                r#","outputs_init":{{"ready":{{"transaction":"{INIT_TRANSACTION}","ready_ms":1}}}}"#
+            );
+            for pool in [self.internal(), self.removable()] {
+                self.write_pool(
+                    &pool,
+                    crate::pool_custody::COORDINATED_OWNED_OUTPUTS_FENCE,
+                    &ready,
+                );
+            }
+        }
+
+        /// The predecessor `/4` pair with its own completed record, as the
+        /// published class writes it.
+        fn routed_pair(&self) {
+            let ready = format!(
+                r#","outputs_init":{{"ready":{{"transaction":"{INIT_TRANSACTION}","ready_ms":1}}}}"#
+            );
+            for pool in [self.internal(), self.removable()] {
+                self.write_pool(
+                    &pool,
+                    crate::pool_custody::ROUTED_OWNED_OUTPUTS_FENCE,
+                    &ready,
+                );
+            }
+        }
+
+        fn registry(&self, version: &str, schema: u32, created_by: &str, settled: bool) {
+            let settled = if settled { r#","settled":[]"# } else { "" };
+            let document = format!(
+                r#"{{"version":"{version}","schema":{schema},"revision":1,"complete":true,"created_by":"{created_by}","rows":[]{settled}}}"#
+            );
+            std::fs::write(
+                self.control
+                    .join(OXIDE_OUTPUTS_DIR)
+                    .join(OXIDE_REGISTRY_FILE),
+                document,
+            )
+            .unwrap();
+        }
+
+        fn snapshot(&self) -> OxideSnapshot {
+            OxideSnapshot::read_within(
+                &crate::testkit::FakeAccount {
+                    home: self.home.clone(),
+                },
+                Duration::from_secs(10),
+            )
+        }
+    }
+
+    #[test]
+    fn the_snapshot_binds_the_coordinated_control_pair_to_its_registry() {
+        // The registered pair and the `/4` image it created are one handoff:
+        // the snapshot reads both, and an unrelated root's set is complete and
+        // unreferenced.
+        let fixture = CoordinatedFixture::new("coordinated-bound-pair");
+        fixture.coordinated_pair();
+        fixture.registry(OXIDE_REGISTRY_V4, 4, INIT_TRANSACTION, true);
+        let snapshot = fixture.snapshot();
+        assert!(snapshot.complete(), "{snapshot:?}");
+        match &snapshot.registry {
+            OxideRegistry::Read {
+                version,
+                created_by,
+                ..
+            } => {
+                assert_eq!(version, OXIDE_REGISTRY_V4);
+                assert_eq!(created_by, INIT_TRANSACTION);
+            }
+            other => panic!("the coordinated image read as {other:?}"),
+        }
+        let set = fixture.snapshot().references_for(
+            Path::new("/Volumes/Builds/oxide-outputs/app/target"),
+            "oxide/outputs/app",
+            None,
+            None,
+        );
+        assert!(set.complete, "{set:?}");
+        assert!(!set.any_current());
+    }
+
+    #[test]
+    fn a_mixed_or_one_sided_coordinated_adoption_is_unknown() {
+        // The pair records one transaction and the image another: the ready
+        // handoff and the image are different generations.
+        let fixture = CoordinatedFixture::new("coordinated-mixed-transaction");
+        fixture.coordinated_pair();
+        fixture.registry(
+            OXIDE_REGISTRY_V4,
+            4,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            true,
+        );
+        let snapshot = fixture.snapshot();
+        assert!(!snapshot.complete(), "{snapshot:?}");
+        assert!(
+            matches!(&snapshot.registry, OxideRegistry::Unknown { reason } if reason.contains("not the completed coordinated transaction")),
+            "{snapshot:?}"
+        );
+        let set = snapshot.references_for(
+            Path::new("/Volumes/Builds/oxide-outputs/app/target"),
+            "oxide/outputs/app",
+            None,
+            None,
+        );
+        assert!(!set.complete, "an unbound image keeps every root");
+
+        // A completed pair whose image is still the predecessor version.
+        let fixture = CoordinatedFixture::new("coordinated-predecessor-image");
+        fixture.coordinated_pair();
+        fixture.registry(OXIDE_REGISTRY_V2, 2, INIT_TRANSACTION, false);
+        let snapshot = fixture.snapshot();
+        assert!(!snapshot.complete(), "{snapshot:?}");
+        assert!(
+            matches!(&snapshot.registry, OxideRegistry::Unknown { reason } if reason.contains("not oxide.outputs.registry/4")),
+            "{snapshot:?}"
+        );
+
+        // A `/4` image with no coordinated controls at all: the reverse
+        // one-sided adoption.
+        let fixture = CoordinatedFixture::new("coordinated-image-only");
+        fixture.registry(OXIDE_REGISTRY_V4, 4, INIT_TRANSACTION, true);
+        let snapshot = fixture.snapshot();
+        assert!(!snapshot.complete(), "{snapshot:?}");
+        assert!(
+            matches!(&snapshot.registry, OxideRegistry::Unknown { reason } if reason.contains("no pool control records the completed coordinated fence")),
+            "{snapshot:?}"
+        );
+
+        // A completed pair whose image is absent is never rebuilt or guessed.
+        let fixture = CoordinatedFixture::new("coordinated-image-absent");
+        fixture.coordinated_pair();
+        let snapshot = fixture.snapshot();
+        assert!(!snapshot.complete(), "{snapshot:?}");
+        assert!(
+            matches!(&snapshot.registry, OxideRegistry::Unknown { reason } if reason.contains("not oxide.outputs.registry/4")),
+            "{snapshot:?}"
+        );
+
+        // The published `/4` pair keeps its own historical disposition: both
+        // controls and a `/2` image are a complete legacy reading.
+        let fixture = CoordinatedFixture::new("coordinated-routed-legacy");
+        fixture.routed_pair();
+        fixture.registry(OXIDE_REGISTRY_V2, 2, INIT_TRANSACTION, false);
+        let snapshot = fixture.snapshot();
+        assert!(snapshot.complete(), "{snapshot:?}");
+        assert!(matches!(
+            &snapshot.registry,
+            OxideRegistry::Read { version, .. } if version == OXIDE_REGISTRY_V2
+        ));
+
+        // A one-sided control pair (mid-adoption: internal `/5`, removable
+        // `/4`) is a pool-wide unknown whatever the image says.
+        let fixture = CoordinatedFixture::new("coordinated-one-sided-controls");
+        fixture.routed_pair();
+        let ready = format!(
+            r#","outputs_init":{{"ready":{{"transaction":"{INIT_TRANSACTION}","ready_ms":1}}}}"#
+        );
+        fixture.write_pool(
+            &fixture.internal(),
+            crate::pool_custody::COORDINATED_OWNED_OUTPUTS_FENCE,
+            &ready,
+        );
+        fixture.registry(OXIDE_REGISTRY_V4, 4, INIT_TRANSACTION, true);
+        let snapshot = fixture.snapshot();
+        assert!(!snapshot.complete(), "{snapshot:?}");
+        assert!(
+            snapshot
+                .custody
+                .unattributed()
+                .is_some_and(|reason| reason.contains("paired adoption is incomplete")),
+            "{snapshot:?}"
+        );
     }
 
     #[test]

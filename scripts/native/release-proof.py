@@ -18,7 +18,7 @@ What it does, in one sentence: after the unchanged qualified supervisor's bytes 
 this host's Stash scratch route are verified, and under that supervisor (pinned below,
 executed with the same interpreter), it creates one private run root inside the
 guard's owned scratch, attaches one owned APFS sparse image of 64 MiB with ownership
-enabled, registers that image as the only volume, and runs fifteen release cases
+enabled, registers that image as the only volume, and runs sixteen release cases
 through the staged `barge` CLI against a private HOME, a private state directory and a
 synthetic account home (BARGE_ACCOUNT_HOME, equal to HOME). Each case declares its own
 area, so one case's roots never reach another case's plan.
@@ -123,6 +123,19 @@ OXIDE_REGISTRY_VERSION = "oxide.outputs.registry/2"
 # generic release and census readers must read strictly (settled required,
 # deletion_routes gone).
 OXIDE_COORDINATED_REGISTRY_VERSION = "oxide.outputs.registry/4"
+# Oxide's coordinated control fence (`COORDINATED_OUTPUTS_FENCE`) and the
+# predecessor `/4` fence. The coordinated class is a paired, completed handoff:
+# both pool controls record it `ready` under one transaction before the `/4`
+# registry image exists, and that image's `created_by` is the same transaction.
+OXIDE_COORDINATED_FENCE = "oxide.outputs/5"
+OXIDE_ROUTED_FENCE = "oxide.outputs/4"
+# The one adoption transaction this proof's fixtures record, as Oxide's own
+# 32-hex nonce spells it.
+OXIDE_TRANSACTION = "a" * 32
+# The internal pool's control directory under the synthetic home: the default
+# pool the proof build resolves, whose own `removable/` child is the second
+# control a registered pair writes.
+OXIDE_RELATIVE_CONTROL = os.path.dirname(os.path.dirname(OXIDE_RELATIVE_REGISTRY))
 VOLUME_UUID_KEY = "VolumeUUID"
 HOLDER = "release-native-holder"
 PROOF_RECEIPT = "release-proof-receipt.json"
@@ -246,6 +259,9 @@ CASES = [
     {"id": "R15", "method": "case_coordinated_census_reports_the_registry",
      "claim": "the census reads the same coordinated /4 document as reported document facts, and its malformed twin stays unknown",
      "carried_by": "the_coordinated_census_reads_the_release_fixture_and_a_malformed_one_stays_unknown"},
+    {"id": "R16", "method": "case_coordinated_adoption_group",
+     "claim": "the emitted paired /5 controls with their /4 image release an eligible root, while a mixed fence, an unequal transaction, a re-entered initialization and a one-sided image each keep the whole batch and change nothing",
+     "carried_by": "a_one_sided_coordinated_adoption_keeps_the_whole_batch_and_changes_nothing"},
 ]
 
 # The byte-level oracle for the identity record: its path inside the state directory.
@@ -1496,8 +1512,68 @@ class Proof:
     def area_folder(self, area):
         return os.path.join(self.mount, area)
 
-    def oxide_registry(self, rows, complete=True):
-        """Publish one Oxide output-registry document under the private HOME."""
+    def pool_controls(self):
+        """Both control directories the emitted pair writes, under the private HOME."""
+        control = os.path.join(self.home, OXIDE_RELATIVE_CONTROL)
+        return [control, os.path.join(control, "removable", "oxide-managed")]
+
+    def clear_pool_controls(self):
+        """Remove the adoption documents an earlier case wrote under this HOME."""
+        for control in self.pool_controls():
+            for name in ("state.json",):
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(os.path.join(control, name))
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(os.path.join(os.path.dirname(control), "ledger.json"))
+
+    def pool_state(self, control, fence, init):
+        """One pool control state and its library ledger, exactly as Oxide writes them."""
+        os.makedirs(control, exist_ok=True)
+        document = {
+            "version": 9,
+            "next_id": 1,
+            "next_use": 1,
+            "tickets": [],
+            "cleans": [],
+            "records": [],
+            "owned_outputs": fence,
+            "recorded_accounting": "oxide.accounting/1",
+            "eviction_accounting": "oxide.eviction-accounting/1",
+            "slot_ceiling": "oxide.slots/256",
+            "holding": "oxide.holding/1",
+        }
+        if init is not None:
+            document["outputs_init"] = init
+        with open(os.path.join(control, "state.json"), "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+        with open(os.path.join(os.path.dirname(control), "ledger.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"version": 1, "store_id": "0123456789abcdef0123456789abcdef",
+                       "cap_bytes": 1024, "next_slot": 1, "next_lease": 1, "slots": []}, handle)
+
+    def write_pair(self, internal, removable):
+        """Write both pool controls; each side is `(fence, initialization-or-None)`."""
+        for control, side in zip(self.pool_controls(), (internal, removable)):
+            self.pool_state(control, *side)
+
+    @staticmethod
+    def ready(transaction=OXIDE_TRANSACTION):
+        """Oxide's completed initialization record."""
+        return {"ready": {"transaction": transaction, "ready_ms": 1}}
+
+    @staticmethod
+    def initializing(transaction=OXIDE_TRANSACTION):
+        """Oxide's mid-adoption initialization record."""
+        return {"initializing": {"transaction": transaction, "started_ms": 1}}
+
+    def coordinated_adoption(self, rows=(), settled=()):
+        """The exact emitted handoff: both `/5` controls ready, then their `/4` image."""
+        self.write_pair((OXIDE_COORDINATED_FENCE, self.ready()),
+                        (OXIDE_COORDINATED_FENCE, self.ready()))
+        self.coordinated_registry(list(rows), list(settled))
+
+    def legacy_registry(self, rows, complete=True):
+        """Publish one legacy `/2` output-registry document, leaving the controls alone."""
         path = os.path.join(self.home, OXIDE_RELATIVE_REGISTRY)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         document = {
@@ -1511,12 +1587,25 @@ class Proof:
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(document, handle)
 
-    def coordinated_registry(self, rows, settled, complete=True, path=None):
+    def oxide_registry(self, rows, complete=True):
+        """Publish one legacy `/2` registry with no coordinated controls beside it.
+
+        Every case runs against one synthetic home, so the adoption documents a
+        previous case wrote are cleared here: a legacy image is read against
+        controls that establish no coordinated handoff.
+        """
+        self.clear_pool_controls()
+        self.legacy_registry(rows, complete=complete)
+
+    def coordinated_registry(self, rows, settled, complete=True, path=None,
+                             created_by=OXIDE_TRANSACTION):
         """Publish one coordinated (/4) output-registry document.
 
         The default path is the release reader's resolution under the private
         HOME; `path` publishes the identical document where another reader —
         the census — resolves the registry, so one fixture can serve both.
+        `created_by` is the initialization transaction that created the image;
+        the emitted handoff uses the transaction both controls record ready.
         """
         path = path or os.path.join(self.home, OXIDE_RELATIVE_REGISTRY)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1525,7 +1614,7 @@ class Proof:
             "schema": 4,
             "revision": 2,
             "complete": complete,
-            "created_by": "oxide",
+            "created_by": created_by,
             "rows": rows,
             "settled": settled,
         }
@@ -1988,7 +2077,7 @@ class Proof:
         protected = self.new_root(area, aged=True)
         unrelated = self.new_root(area, aged=True)
         checkout = os.path.join(self.home, "checkouts", "coordinated")
-        self.coordinated_registry(
+        self.coordinated_adoption(
             [self.oxide_row(protected, checkout, selected=True)],
             [self.settlement(unrelated["path"])],
         )
@@ -2023,8 +2112,11 @@ class Proof:
         area = self.fresh_area("c14", f"oldest-idle:{AREA_AGE_SECONDS}")
         first = self.new_root(area, aged=True)
         second = self.new_root(area, aged=True)
-        # The exact malformed shape: the coordinated version without its
-        # settlement set, as no /4-aware writer ever publishes it.
+        # The exact malformed shape: the completed paired controls beside a
+        # coordinated image without its settlement set, as no /4-aware writer
+        # ever publishes it. The fault is the image alone.
+        self.write_pair((OXIDE_COORDINATED_FENCE, self.ready()),
+                        (OXIDE_COORDINATED_FENCE, self.ready()))
         path = os.path.join(self.home, OXIDE_RELATIVE_REGISTRY)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         document = {
@@ -2032,7 +2124,7 @@ class Proof:
             "schema": 4,
             "revision": 2,
             "complete": True,
-            "created_by": "oxide",
+            "created_by": OXIDE_TRANSACTION,
             "rows": [],
         }
         with open(path, "w", encoding="utf-8") as handle:
@@ -2110,6 +2202,95 @@ class Proof:
                 "detail": bounded_text(detail, FAILURE_TEXT_CHARS)})))
         return {"census_version": OXIDE_COORDINATED_REGISTRY_VERSION, "rows": 1,
                 "malformed_state": "unknown_state"}
+
+    def adoption_refusal(self, case, label, area, roots):
+        """One incomplete coordinated adoption: the plan keeps and the run refuses.
+
+        The whole batch is kept (never a single root), the plan exits its
+        needs-human code, the presented run refuses as unknown state, and every
+        named root is still on disk.
+        """
+        self.current_area = area
+        plan_file = self.plan_path(f"{case}-{label}")
+        _code, preview = self.preview(area, plan_file, expect=3)
+        entries = preview["data"]
+        if entries["oxide"]["complete"]:
+            raise Fault(case, failure_detail(
+                f"{label}_complete",
+                failure_summary({"step": label, "oxide": entries["oxide"]})))
+        for root in roots:
+            row = self.row_for(preview, root)
+            if row["eligible"]:
+                raise Fault(case, failure_detail(
+                    f"{label}_eligible",
+                    failure_summary({"step": label, "root": root["root_id"],
+                                     "blocked_by": row.get("blocked_by")})))
+        refusal = self.refused(plan_file, entries["plan_digest"], area)
+        if refusal["kind"] != "unknown_state":
+            raise Fault(case, failure_detail(
+                f"{label}_refusal",
+                failure_summary({"step": label, "refusal": refusal,
+                                 "expected_kind": "unknown_state"})))
+        for root in roots:
+            if not os.path.lexists(root["path"]):
+                raise Fault(case, failure_detail(
+                    f"{label}_released",
+                    failure_summary({"step": label, "root": root["root_id"],
+                                     "path_present": False})))
+        return {"step": label, "roots_kept": len(roots), "refusal": refusal}
+
+    def case_coordinated_adoption_group(self):
+        """The coordinated adoption group: the emitted handoff releases, and every
+        one-sided, mid-adoption or mixed generation keeps the whole batch.
+
+        Positive first: both `/5` controls ready under one transaction with the
+        `/4` image that transaction created, over which an aged, unreferenced
+        root releases. Then the four ways that handoff can be incomplete, each
+        on a fresh area and its own eligible root: a mixed fence pair, an
+        unequal transaction, a re-entered initialization, and a complete pair
+        whose image is still the legacy `/2` one.
+        """
+        area = self.fresh_area("c16", f"oldest-idle:{AREA_AGE_SECONDS}")
+        root = self.new_root(area, aged=True)
+        self.coordinated_adoption(rows=[], settled=[])
+        preview, unrelated, plan_file = self.plan_and_run(
+            "R16", area, root, expect_eligible=True)
+        _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
+        failed, observations = root_released_failure(
+            run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
+        if failed is not None:
+            raise Fault("R16", failure_detail(failed, run_report_summary(
+                run_doc["data"], root["root_id"], observations)))
+        steps = [
+            ("mixed-fence",
+             [lambda: self.write_pair(
+                 (OXIDE_COORDINATED_FENCE, self.ready()),
+                 (OXIDE_ROUTED_FENCE, self.ready())),
+              lambda: self.coordinated_registry([], [])]),
+            ("unequal-transaction",
+             [lambda: self.write_pair(
+                 (OXIDE_COORDINATED_FENCE, self.ready()),
+                 (OXIDE_COORDINATED_FENCE, self.ready("b" * 32))),
+              lambda: self.coordinated_registry([], [])]),
+            ("initializing",
+             [lambda: self.write_pair(
+                 (OXIDE_COORDINATED_FENCE, self.ready()),
+                 (OXIDE_COORDINATED_FENCE, self.initializing())),
+              lambda: self.coordinated_registry([], [])]),
+            ("one-sided-image",
+             [lambda: self.write_pair(
+                 (OXIDE_COORDINATED_FENCE, self.ready()),
+                 (OXIDE_COORDINATED_FENCE, self.ready())),
+              lambda: self.legacy_registry([], complete=True)]),
+        ]
+        refusals = []
+        for index, (label, writes) in enumerate(steps):
+            step_area = self.fresh_area(f"c16-{index}", f"oldest-idle:{AREA_AGE_SECONDS}")
+            kept = self.new_root(step_area, aged=True)
+            for write in writes:
+                write()
+            refusals.append(self.adoption_refusal("R16", label, step_area, [kept]))
+        return {"released": 1, "released_root": root["root_id"], "refusals": refusals}
 
     # -- the run ----------------------------------------------------------
 
@@ -3091,8 +3272,8 @@ def r13_case_controls():
         proof.oxide_row = lambda root, checkout, **kwargs: \
             calls.append(("oxide_row", root["root_id"])) or {"row": root["root_id"]}
         proof.settlement = lambda path: {"root": path}
-        proof.coordinated_registry = lambda rows, settled, **kwargs: \
-            calls.append(("coordinated_registry", rows[0]["row"], settled[0]["root"]))
+        proof.coordinated_adoption = lambda rows, settled, **kwargs: \
+            calls.append(("coordinated_adoption", rows[0]["row"], settled[0]["root"]))
         proof.row_for = lambda document, root: calls.append(("row_for", root["root_id"])) or kept
 
         def planned_run(case, area, root, **kwargs):
@@ -3124,7 +3305,7 @@ def r13_case_controls():
             ("run_digest",
              lambda: ("real", "/guard/root/R13-plan.json", "d" * 64, 0) not in calls),
             ("published_document",
-             lambda: ("coordinated_registry", "protected", unrelated["path"]) not in calls),
+             lambda: ("coordinated_adoption", "protected", unrelated["path"]) not in calls),
             ("released", lambda: evidence.get("released") != 1),
         ])
         if failed is not None:
@@ -3152,6 +3333,157 @@ def r13_case_controls():
         if error.check != "R13" or "path_present" not in error.detail:
             problems.append(f"a surviving unrelated root failed as {error.check}: "
                             f"{error.detail[:FAILURE_TEXT_CHARS]}")
+    return problems
+
+
+def r16_case_controls():
+    """Drive the real R16 body and its refusal step on fake seams. Pure.
+
+    The group's own body runs: the positive handoff plans an eligible root, the
+    real run presents the planned digest, and the four incomplete-adoption steps
+    each write their own fixture through the real pair/image writers. Every
+    external query is faked per scenario, so a surviving positive root, a
+    complete plan at the refusal step, an eligible row there, a wrong refusal
+    kind and a released root are each refused by the real code.
+    """
+    problems = []
+    released = {"root_id": "released", "path": "/guard/root/c16/released"}
+    kept = {"root_id": "kept", "path": "/guard/root/c16/kept"}
+    planned = ({"data": {"plan_digest": "d" * 64}},
+               {"eligible": True, "blocked_by": None}, "/guard/root/R16-plan.json")
+    run_report = {"released_count": 1, "kept_count": 0, "stopped": False,
+                  "replay_pending": 0,
+                  "rows": [{"root_id": "released", "outcome": "released"}]}
+
+    def build():
+        proof = Proof.__new__(Proof)
+        proof.home = "/guard/home"
+        calls = []
+        areas = iter(["c16", "c16-0", "c16-1", "c16-2", "c16-3"])
+        roots = iter([released] + [dict(kept, root_id=f"kept-{index}") for index in range(4)])
+        proof.fresh_area = lambda name, prune: calls.append(("fresh_area", name)) or next(areas)
+        proof.new_root = lambda area, aged=True: calls.append(("new_root", area, aged)) or next(roots)
+        proof.coordinated_adoption = lambda rows=(), settled=(), **kwargs: calls.append(
+            ("coordinated_adoption", len(rows), len(settled)))
+        proof.write_pair = lambda internal, removable: calls.append(
+            ("write_pair", internal[0], removable[0], removable[1]))
+        proof.ready = lambda transaction=OXIDE_TRANSACTION: {"ready": transaction}
+        proof.initializing = lambda transaction=OXIDE_TRANSACTION: {"initializing": transaction}
+        proof.coordinated_registry = lambda rows, settled, **kwargs: calls.append(
+            ("coordinated_registry", list(rows), list(settled)))
+        proof.legacy_registry = lambda rows, complete=True: calls.append(
+            ("legacy_registry", list(rows), complete))
+        proof.plan_and_run = lambda case, area, root, **kwargs: calls.append(
+            ("plan_and_run", case, root["root_id"], kwargs.get("expect_eligible"))) or planned
+        proof.real = lambda plan_file, digest, expect=0: calls.append(
+            ("real", plan_file, digest, expect)) or (0, {"data": run_report})
+        proof.adoption_refusal = lambda case, label, area, roots: calls.append(
+            ("adoption_refusal", label, len(roots))) or {"step": label}
+        return proof, calls
+
+    def lexists_for(released_present):
+        def check(path):
+            if path == released["path"]:
+                return released_present
+            raise AssertionError(f"an unexpected path observation: {path}")
+        return check
+
+    proof, calls = build()
+    try:
+        with mock.patch("os.path.lexists", lexists_for(False)):
+            evidence = proof.case_coordinated_adoption_group()
+    except Fault as error:
+        problems.append(f"the real R16 body refused its correct outcome: "
+                        f"{error.check}: {error.detail[:FAILURE_TEXT_CHARS]}")
+    else:
+        failed = first_failed_predicate([
+            ("positive_handoff", lambda: ("coordinated_adoption", 0, 0) not in calls),
+            ("plan_subject", lambda: ("plan_and_run", "R16", "released", True) not in calls),
+            ("run_digest",
+             lambda: ("real", "/guard/root/R16-plan.json", "d" * 64, 0) not in calls),
+            ("mixed_fence",
+             lambda: ("write_pair", OXIDE_COORDINATED_FENCE, OXIDE_ROUTED_FENCE,
+                      proof.ready()) not in calls),
+            ("unequal_transaction",
+             lambda: ("write_pair", OXIDE_COORDINATED_FENCE, OXIDE_COORDINATED_FENCE,
+                      proof.ready("b" * 32)) not in calls),
+            ("initializing",
+             lambda: ("write_pair", OXIDE_COORDINATED_FENCE, OXIDE_COORDINATED_FENCE,
+                      proof.initializing()) not in calls),
+            ("one_sided_image",
+             lambda: ("legacy_registry", [], True) not in calls),
+            ("refusals",
+             lambda: [call[1] for call in calls if call[0] == "adoption_refusal"]
+             != ["mixed-fence", "unequal-transaction", "initializing", "one-sided-image"]),
+            ("released", lambda: evidence.get("released") != 1),
+            ("root", lambda: evidence.get("released_root") != released["root_id"]),
+        ])
+        if failed is not None:
+            problems.append(f"the real R16 body failed its correct outcome at {failed}: "
+                            f"{calls}, {evidence}")
+
+    # A surviving positive root fails the release oracle's own polarity.
+    proof, _calls = build()
+    with mock.patch("os.path.lexists", lexists_for(True)):
+        try:
+            proof.case_coordinated_adoption_group()
+            problems.append("a still-present positive root passed R16")
+        except Fault as error:
+            if error.check != "R16" or "path_present" not in error.detail:
+                problems.append(f"a surviving positive root failed as {error.check}: "
+                                f"{error.detail[:FAILURE_TEXT_CHARS]}")
+
+    # The refusal step itself, on its own seams.
+    def refusal_proof(preview_document, preview_exit, row, refused, lexists=True):
+        proof = Proof.__new__(Proof)
+        proof.current_area = None
+        proof.plan_path = lambda case: f"/guard/root/{case}-plan.json"
+        proof.preview = lambda area, plan_file, named=(), expect=0: (preview_exit, {
+            "data": dict(preview_document, plan_digest="d" * 64)})
+        proof.row_for = lambda document, root: row
+        proof.refused = lambda plan_file, digest, area: refused
+        return proof, (lambda path: lexists)
+
+    proof, _lexists = refusal_proof({"oxide": {"complete": True}}, 0, {"eligible": False},
+                                    {"exit": 4, "kind": "unknown_state"})
+    try:
+        proof.adoption_refusal("R16", "complete", "c16", [kept])
+        problems.append("a complete coordinated adoption passed the refusal step")
+    except Fault as error:
+        if error.check != "R16" or "complete" not in error.detail:
+            problems.append(f"a complete adoption failed the refusal step as {error.check}: "
+                            f"{error.detail[:FAILURE_TEXT_CHARS]}")
+
+    proof, _lexists = refusal_proof({"oxide": {"complete": False}}, 3, {"eligible": True},
+                                    {"exit": 4, "kind": "unknown_state"})
+    try:
+        proof.adoption_refusal("R16", "eligible", "c16", [kept])
+        problems.append("an eligible row passed the refusal step")
+    except Fault as error:
+        if error.check != "R16" or "eligible" not in error.detail:
+            problems.append(f"an eligible row failed the refusal step as {error.check}: "
+                            f"{error.detail[:FAILURE_TEXT_CHARS]}")
+
+    proof, _lexists = refusal_proof({"oxide": {"complete": False}}, 3, {"eligible": False},
+                                    {"exit": 1, "kind": "refused"})
+    try:
+        proof.adoption_refusal("R16", "kind", "c16", [kept])
+        problems.append("a non-unknown refusal kind passed the refusal step")
+    except Fault as error:
+        if error.check != "R16" or "expected_kind" not in error.detail:
+            problems.append(f"a wrong refusal kind failed the refusal step as {error.check}: "
+                            f"{error.detail[:FAILURE_TEXT_CHARS]}")
+
+    proof, _lexists = refusal_proof({"oxide": {"complete": False}}, 3, {"eligible": False},
+                                    {"exit": 4, "kind": "unknown_state"})
+    with mock.patch("os.path.lexists", lambda path: False):
+        try:
+            proof.adoption_refusal("R16", "released", "c16", [kept])
+            problems.append("a released root passed the refusal step")
+        except Fault as error:
+            if error.check != "R16" or "released" not in error.detail:
+                problems.append(f"a released root failed the refusal step as {error.check}: "
+                                f"{error.detail[:FAILURE_TEXT_CHARS]}")
     return problems
 
 
@@ -3362,6 +3694,7 @@ def pure_self_check():
     problems += containment_controls()
     problems += plan_controls()
     problems += r13_case_controls()
+    problems += r16_case_controls()
     problems += failure_report_controls()
     problems += guarded_controls()
     # Exercise the same path and rollback helpers used by R11, without a filesystem.

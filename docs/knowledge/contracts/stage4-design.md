@@ -683,8 +683,11 @@ Rules that keep the handover safe:
   tombstone, control state or ledger. It reads `oxide.outputs.root/2` markers,
   `oxide.outputs.registry/1`–`/4` rows and settlement sets (each version in its
   own exact field set), the receipts and each pool's `state.json` and
-  `ledger.json` strictly, bounded and in place, and reports them. It takes no
-  Oxide lock and creates no file.
+  `ledger.json` strictly, bounded and in place, and reports them. The control
+  state's covered fences (`oxide.outputs/3`–`/5`) include the coordinated `/5`
+  handoff with its completed paired initialization and its one `/4` registry
+  image ([barge#061](#the-coordinated-control-pair-and-its-one-registry-image-2026-11-12)).
+  It takes no Oxide lock and creates no file.
 - Where Oxide's own rule is stricter than Barge's — the complete-receipt
   requirement, and the operator list that can waive it for named legacy roots —
   Oxide's rule wins while Oxide owns the prune.
@@ -1086,6 +1089,8 @@ Pool fence `oxide.outputs/4` joins /3 in the covered predicate without raising
 the numeric control-state version. Earlier fence meanings are preserved.
 Recognizing /4 gives generic release no new permission: the outputs family
 remains exclusively adapter-owned. Old readers refuse the successor formats.
+The coordinated `/5` fence joins them under its own paired rule
+([barge#061](#the-coordinated-control-pair-and-its-one-registry-image-2026-11-12)).
 
 `DelegatedRequest` adds `request_sha256: Option<String>`, the immutable original
 sidecar's byte SHA-256. For schema 3 execution and replay it must equal this
@@ -1181,6 +1186,69 @@ accepted exact head, on the unchanged qualified supervisor and image bounds.
 This correction establishes neither Oxide304's adoption, the production
 account lookup, nor any live-drive behavior, and the synthetic-versus-native
 evidence limit of the retained diagnostic stands.
+
+### The coordinated control pair and its one registry image (2026-11-12)
+
+Oxide#304's single-authority adoption writes one more durable handoff than the
+`/4` registry image alone: the coordinated pool fence `oxide.outputs/5` and its
+initialization record. Read-only source at
+`5c8aa823b464c130cd5b133d32343120e0b5dbaf`, tree
+`59d041a81680ba3e0725ecddb6a63d01ac694ff8`, states the order: both pool
+controls carry `/5` together with an `outputs_init` record
+(`{"initializing":{"transaction":…,"started_ms":…}}`) under one transaction,
+then the atomic `/4` registry image whose `created_by` is that transaction is
+published, and only then does each control record
+`{"ready":{"transaction":…,"ready_ms":…}}`. The numeric control-state floor
+stays 4 — `/5` does not raise it — and a partial, mixed or unfinished adoption
+is never usable.
+
+Barge reads that handoff instead of only the fence string:
+
+- `oxide.outputs/5` is covered beside `/3` and `/4`. `/1`, `/2`, an absent
+  fence and every other value (including a future `/6`) keep their existing
+  dispositions: a legacy class, or unknown when the document is not one this
+  build reads.
+- `outputs_init` is read as Oxide's exact typed record (`initializing` /
+  `ready`, snake case, `deny_unknown_fields`, bounded transaction text), not
+  discarded. For `/5` the reading requires the completed `ready` variant;
+  absent, explicit `null`, `initializing`, malformed, extra-member, duplicate,
+  oversized or unknown-variant shapes make the control state unreadable, which
+  is a pool-wide unknown and keeps every root the reading covers. The
+  predecessor `/3` and `/4` classes keep their historical disposition — their
+  record is accepted but decides nothing.
+- Both controls must agree: every pool the reading covers carries `/5` at the
+  covered floor with one equal `ready` transaction. A mixed `/4`+`/5` pair, two
+  different transactions, or a peer with no control document is a one-sided or
+  mid-adoption observation and stays unknown. A pool with no registered
+  removable peer is the same complete pair, because the producer has no second
+  control to fence.
+- At the registry-reading consumers the pair and the image are one generation:
+  a completed pair requires the `/4` image whose `created_by` is that
+  transaction, and a `/4` image requires the completed pair. A mismatch, a
+  predecessor image under `/5`, or a `/5` pair with no image is unknown, so the
+  whole affected batch is kept. `reference::OxideSnapshot` binds the two
+  readings, and the census still reports the `/4` document as document facts
+  only, with no release authority.
+- The delegated outputs lookup refuses the coordinated class outright: its
+  `/4` registry carries no `deletion_routes`, its predecessor intents are
+  drained before adoption, and the operation journal is the only authority
+  there. Recognizing the paired fence never re-enables the predecessor join,
+  its sidecars or a bypass of the operation coordinator. The published `/4`
+  pair keeps its historical delegated behaviour unchanged.
+
+Regressions: the reader controls in `pool_custody` (pairing, initialization
+shapes, mixed/unequal/absent peers), the composed snapshot binding
+(`reference::writer_custody_tests`), the composed plan-and-execute refusals in
+`release` (one-sided controls, a mixed generation, and a control that re-enters
+initialization between plan and run), and the delegated-route refusals in
+`oxide_outputs::tests::routes`. The existing release-native apparatus gains
+R16, one finite named coordinated-adoption group: the positive `/5`+`/4`
+handoff releases an eligible root, and the mixed fence, unequal transaction,
+re-entered initialization and one-sided image each keep the whole batch with no
+effect. These are readiness cases only; every native occurrence remains
+separately owner-activated, and this correction establishes neither Oxide304's
+adoption integration, the production account lookup, nor any live-drive
+behaviour.
 
 ### Delegated checkout absence bound to its volume (2026-11-10)
 
@@ -2760,7 +2828,7 @@ authority, and neither borrows the other's census. R11's remount must verify the
 backing, the same volume UUID and the same recorded relative path before its replay
 binds them, and R12 begins only after that remount and its digest-bound registration
 succeed. The final closure is the script's own; the guard's cleanup is authorized
-separately by the guard's own custody scan, so a counted pass correlates all fifteen
+separately by the guard's own custody scan, so a counted pass correlates all sixteen
 case rows, this whole-backing clearance and the supervisor's own receipt, and a
 missing or unclear half is a missing proof.
 
@@ -2768,7 +2836,7 @@ It creates one owned 64 MiB sparse APFS image inside that run root and registers
 as the only volume. Its environment binds `HOME`, `BARGE_ACCOUNT_HOME` and
 `BARGE_STATE_DIR` inside the owned scratch, and it checks that each path resolves
 there. Each case's receipt records the reference control its previews chose, and a
-control outside the owned scratch faults the case. Each of its fifteen cases declares
+control outside the owned scratch faults the case. Each of its sixteen cases declares
 its own area, so one case's roots never reach another case's plan:
 
 | Case | Claim | Counterfactual of |
@@ -2788,6 +2856,7 @@ its own area, so one case's roots never reach another case's plan:
 | R13 | a valid coordinated `/4` registry keeps its live Oxide reference's root and releases an unrelated eligible root past a settlement naming that root's exact path | R1, the coordinated format |
 | R14 | a coordinated `/4` registry without its settlement set refuses the whole batch (`unknown_state`) and changes nothing | R13, the settlement set |
 | R15 | the census reads the same coordinated `/4` document as reported facts; its malformed twin stays unknown | the census observation on R13's document |
+| R16 | the emitted paired `/5` controls with their `/4` image release an eligible root, while a mixed fence, an unequal transaction, a re-entered initialization and a one-sided image each keep the whole batch (`unknown_state`) and change nothing | R13, the paired control handoff |
 
 R11 retains the original identity record, marker, inode and fixture content through
 replay. It binds the recorded relative path to the reattached mount only after the

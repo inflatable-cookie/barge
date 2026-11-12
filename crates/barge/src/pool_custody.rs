@@ -21,7 +21,13 @@
 //! - [`Custody::Closed`]: the reading positively shows no writer for it;
 //! - [`Custody::Held`]: a writer, an acquiring lease or a running clean names it;
 //! - [`Custody::Unknown`]: a lost, unreadable, malformed, oversized, unknown-version
-//!   or mid-read-changed fact, or a record that cannot be read as closed.
+//!   or mid-read-changed fact, or a record that cannot be read as closed; a
+//!   coordinated `/5` handoff that is one-sided or unfinished is one of them.
+//!
+//! The covered owned-outputs fences are `oxide.outputs/3`–`/5`. `/5` is the
+//! coordinated single-authority handoff: both controls carry it with one
+//! completed `ready` transaction, and the `/4` registry image records that
+//! transaction as its `created_by` (see [`CoordinatedAdoption`]).
 //!
 //! Unknown keeps. A fact that cannot be tied to one checkout (a held row with no
 //! record, an active or unclosed record that names no checkout, an unreadable
@@ -85,11 +91,12 @@ const LEDGER_VERSION: u32 = 1;
 /// The capacity-policy fences Oxide's ledger writes (`1..=4`).
 const CAPACITY_POLICIES: std::ops::RangeInclusive<u32> = 1..=4;
 
-const OWNED_OUTPUTS_FENCES: [&str; 4] = [
+const OWNED_OUTPUTS_FENCES: [&str; 5] = [
     "oxide.outputs/1",
     "oxide.outputs/2",
     "oxide.outputs/3",
     "oxide.outputs/4",
+    "oxide.outputs/5",
 ];
 
 /// The owned-outputs fence the covered delegation class requires.
@@ -103,11 +110,32 @@ pub const COVERED_OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/3";
 /// The explicit deletion-route fence; it does not raise the numeric state version.
 pub const ROUTED_OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/4";
 
+/// Oxide's coordinated single-authority fence (its own `COORDINATED_OUTPUTS_FENCE`).
+///
+/// It is written by the explicit forward adoption only, keeps the numeric state
+/// floor of its `/4` predecessor, and always travels with one completed paired
+/// initialization whose transaction also created the `/4` registry image. A
+/// `/6` or any other value is not this reader's document and stays unknown.
+pub const COORDINATED_OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/5";
+
+/// The numeric state floor every covered fence implies.
+const COVERED_STATE_FLOOR: u32 = 4;
+
+/// Oxide's byte cap for the outputs-initialization transaction
+/// (`MAX_INIT_TRANSACTION_BYTES`).
+const INIT_TRANSACTION_CAP_BYTES: usize = 64;
+
 /// Whether the pools' control states carry the covered class's fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputsFence {
-    /// Every pool that was read parses and carries the successor fence.
-    Covered,
+    /// Every pool that was read parses and carries a covered fence. A
+    /// coordinated `/5` handoff also reports the completed transaction its
+    /// registry image must have been created by.
+    Covered {
+        /// The paired coordinated adoption, when the controls carry `/5`;
+        /// `None` for the historical `/3` and `/4` classes.
+        coordinated: Option<CoordinatedAdoption>,
+    },
     /// The pools were read completely and at least one is not on the covered
     /// class: a legacy fence, or no fence at all. A known not-covered is a
     /// refusal, never an unknown.
@@ -123,12 +151,124 @@ pub enum OutputsFence {
     },
 }
 
+/// Oxide's completed coordinated outputs adoption, as the pool controls record it.
+///
+/// The producer writes both controls' `/5` fence and `initializing` record under
+/// one transaction, publishes the atomic `/4` registry image, and only then
+/// records `ready` on each control. A `/5` control without that completed
+/// record, or a pair whose transactions differ, is an incomplete observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatedAdoption {
+    transaction: String,
+}
+
+impl CoordinatedAdoption {
+    /// The transaction both controls record `ready` with, and that the
+    /// coordinated registry image records as its `created_by`.
+    pub fn transaction(&self) -> &str {
+        &self.transaction
+    }
+}
+
+/// One control document's owned-outputs facts, as the pairing rules read them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PoolFence {
+    pool: PathBuf,
+    version: u32,
+    fence: Option<String>,
+    /// The completed transaction when the control records `ready`.
+    ready: Option<String>,
+}
+
+impl PoolFence {
+    fn of(pool: &Path, state: &RawState) -> Self {
+        Self {
+            pool: pool.to_path_buf(),
+            version: state.version,
+            fence: state.owned_outputs.clone(),
+            ready: state
+                .outputs_init
+                .as_ref()
+                .and_then(RawOutputsInit::ready_transaction)
+                .map(str::to_owned),
+        }
+    }
+}
+
+/// What the controls that were read say about Oxide's coordinated adoption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Coordination {
+    /// No control carries the coordinated fence.
+    Absent,
+    /// Every control carries it with one completed ready transaction.
+    Ready(CoordinatedAdoption),
+    /// The observation is one-sided, mid-adoption or contradictory.
+    Unknown(String),
+}
+
+/// Bind the pools' own control documents into one adoption decision.
+///
+/// `/5` is a paired handoff: every control that was read must carry it, at the
+/// covered numeric floor, with one completed `ready` transaction. A control
+/// that still says `/4`, a pool with no control document, or two different
+/// transactions is a one-sided or mid-adoption observation and never a
+/// covered pair; unknown keeps every root the reading covers.
+fn coordinate(observed: &[PoolFence], pools: usize) -> Coordination {
+    let coordinated: Vec<&PoolFence> = observed
+        .iter()
+        .filter(|fact| fact.fence.as_deref() == Some(COORDINATED_OWNED_OUTPUTS_FENCE))
+        .collect();
+    if coordinated.is_empty() {
+        return Coordination::Absent;
+    }
+    if coordinated.len() != pools {
+        return Coordination::Unknown(format!(
+            "only {} of {pools} pool controls record the coordinated fence {COORDINATED_OWNED_OUTPUTS_FENCE}, so the paired adoption is incomplete",
+            coordinated.len()
+        ));
+    }
+    if coordinated
+        .iter()
+        .any(|fact| fact.version < COVERED_STATE_FLOOR)
+    {
+        return Coordination::Unknown(format!(
+            "a pool control carries {COORDINATED_OWNED_OUTPUTS_FENCE} below version {COVERED_STATE_FLOOR}, which no state Oxide writes does"
+        ));
+    }
+    let Some(first) = coordinated.first() else {
+        return Coordination::Absent;
+    };
+    let Some(transaction) = first.ready.as_deref() else {
+        return Coordination::Unknown(format!(
+            "{} carries the coordinated fence without a completed ready initialization",
+            first.pool.display()
+        ));
+    };
+    if let Some(other) = coordinated
+        .iter()
+        .find(|fact| fact.ready.as_deref() != Some(transaction))
+    {
+        return Coordination::Unknown(format!(
+            "{} and {} record different coordinated transactions, so no one adoption is established",
+            first.pool.display(),
+            other.pool.display()
+        ));
+    }
+    Coordination::Ready(CoordinatedAdoption {
+        transaction: transaction.to_owned(),
+    })
+}
+
 /// Read every pool's control state and decide the owned-outputs fence.
 ///
 /// Nothing is created, locked or repaired. The decision is conjunctive: one
 /// unreadable pool is unknown for the whole set, and one legacy or fenceless
-/// pool keeps the whole set out of the covered class.
+/// pool keeps the whole set out of the covered class. The coordinated `/5`
+/// fence is decided as the pair it is: every pool control must carry it with
+/// one completed `ready` transaction, and a mixed, unequal or one-sided pair
+/// is unknown rather than covered.
 pub fn owned_outputs_fence(pools: &[PathBuf], deadline: Deadline) -> OutputsFence {
+    let mut observed: Vec<PoolFence> = Vec::with_capacity(pools.len());
     for pool in pools {
         let control = pool.join(CONTROL_DIR);
         let path = control.join(STATE_FILE);
@@ -161,20 +301,27 @@ pub fn owned_outputs_fence(pools: &[PathBuf], deadline: Deadline) -> OutputsFenc
         };
         match state.owned_outputs.as_deref() {
             Some(fence)
-                if [COVERED_OWNED_OUTPUTS_FENCE, ROUTED_OWNED_OUTPUTS_FENCE].contains(&fence) => {
+                if [
+                    COVERED_OWNED_OUTPUTS_FENCE,
+                    ROUTED_OWNED_OUTPUTS_FENCE,
+                    COORDINATED_OWNED_OUTPUTS_FENCE,
+                ]
+                .contains(&fence) =>
+            {
                 // The successor fence is the one that advances the numeric
                 // state version past its predecessors, so a covered pool is
                 // always at version 4 or later; the other fences' own
                 // version pairing was checked by the parse.
-                if state.version < 4 {
+                if state.version < COVERED_STATE_FLOOR {
                     return OutputsFence::Unknown {
                         reason: format!(
-                            "{} carries the successor fence at version {}, which no state Oxide writes does",
+                            "{} carries the covered fence {fence} at version {}, which no state Oxide writes does",
                             path.display(),
                             state.version
                         ),
                     };
                 }
+                observed.push(PoolFence::of(pool, &state));
             }
             Some(fence) => {
                 return OutputsFence::NotCovered {
@@ -194,7 +341,13 @@ pub fn owned_outputs_fence(pools: &[PathBuf], deadline: Deadline) -> OutputsFenc
             }
         }
     }
-    OutputsFence::Covered
+    match coordinate(&observed, pools.len()) {
+        Coordination::Absent => OutputsFence::Covered { coordinated: None },
+        Coordination::Ready(adoption) => OutputsFence::Covered {
+            coordinated: Some(adoption),
+        },
+        Coordination::Unknown(reason) => OutputsFence::Unknown { reason },
+    }
 }
 const RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
 const ONE_USE_FENCE: &str = "oxide.one-use/1";
@@ -223,6 +376,10 @@ pub struct PoolCustody {
     /// Facts no single checkout owns: an unreadable pool, a held row with no
     /// record. Any of them keeps every root the reading covers.
     unattributed: Vec<String>,
+    /// The coordinated outputs adoption every pool control records ready, when
+    /// they do. `None` for the historical `/1`–`/4` controls, whose own
+    /// registry binding is not part of this reading.
+    coordinated: Option<CoordinatedAdoption>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -253,8 +410,16 @@ impl PoolCustody {
             pools: pools.to_vec(),
             ..Self::default()
         };
-        for pool in pools {
-            reading.read_pool(pool, deadline, state_cap, ledger_cap);
+        let observed: Vec<PoolFence> = pools
+            .iter()
+            .filter_map(|pool| reading.read_pool(pool, deadline, state_cap, ledger_cap))
+            .collect();
+        // The paired `/5` handoff is decided over every pool that was given,
+        // so a one-sided adoption is a pool-wide unknown and keeps the batch.
+        match coordinate(&observed, pools.len()) {
+            Coordination::Absent => {}
+            Coordination::Ready(adoption) => reading.coordinated = Some(adoption),
+            Coordination::Unknown(reason) => reading.unattributed.push(reason),
         }
         reading
     }
@@ -271,6 +436,14 @@ impl PoolCustody {
     /// The pool directories this reading covers.
     pub fn pools(&self) -> &[PathBuf] {
         &self.pools
+    }
+
+    /// The coordinated outputs adoption both pool controls record ready, when
+    /// they do. A `/5` reading never establishes one unless every control
+    /// agrees, and such a control pair's registry image must be created by
+    /// this transaction.
+    pub fn coordinated(&self) -> Option<&CoordinatedAdoption> {
+        self.coordinated.as_ref()
     }
 
     /// Why the reading as a whole is unknown, when a fact belongs to no single
@@ -299,10 +472,19 @@ impl PoolCustody {
         }
     }
 
-    fn read_pool(&mut self, pool: &Path, deadline: Deadline, state_cap: usize, ledger_cap: usize) {
+    /// Read one pool. `Some` is the pool's own owned-outputs fact when its
+    /// control state was read; `None` when the pool was already recorded as
+    /// unknown, so a coordinated pair can never be assembled from it.
+    fn read_pool(
+        &mut self,
+        pool: &Path,
+        deadline: Deadline,
+        state_cap: usize,
+        ledger_cap: usize,
+    ) -> Option<PoolFence> {
         if deadline.expired() {
             self.pool_unknown(pool, "the read deadline expired before the pool was read");
-            return;
+            return None;
         }
         // A control state beside the ledger is a layout this reader does not read.
         // Its presence is unknown, never a reason to read the pool as empty.
@@ -313,11 +495,11 @@ impl PoolCustody {
                     pool,
                     "a control state sits beside the ledger, outside oxide-managed, and is not read",
                 );
-                return;
+                return None;
             }
             Err(error) => {
                 self.pool_unknown(pool, &error);
-                return;
+                return None;
             }
         }
         let control = pool.join(CONTROL_DIR);
@@ -326,11 +508,16 @@ impl PoolCustody {
         let ledger = read_document(&pool.join(LEDGER_FILE), ledger_cap, deadline)
             .and_then(|bytes| bytes.map(|bytes| parse_ledger(&bytes)).transpose());
         match (state, ledger) {
-            (Ok(state), Ok(ledger)) => self.classify(pool, &control, state, ledger),
+            (Ok(state), Ok(ledger)) => {
+                let fact = state.as_ref().map(|state| PoolFence::of(pool, state));
+                self.classify(pool, &control, state, ledger);
+                fact
+            }
             (state, ledger) => {
                 for error in [state.err(), ledger.err()].into_iter().flatten() {
                     self.pool_unknown(pool, &error);
                 }
+                None
             }
         }
     }
@@ -632,6 +819,34 @@ fn parse_state(bytes: &[u8]) -> Result<RawState, String> {
                 "the control state has an unknown owned-outputs fence {fence:?}"
             ));
         }
+        // The coordinated fence is a completed paired handoff: Oxide writes it
+        // with its initialization record and only records `ready` after the
+        // registry image and its directory are durable. An absent, null,
+        // initializing, malformed or extra-shaped record is not that handoff.
+        if fence == COORDINATED_OWNED_OUTPUTS_FENCE {
+            match &raw.outputs_init {
+                Some(RawOutputsInit::Ready { .. }) => {}
+                Some(RawOutputsInit::Initializing { .. }) => {
+                    return Err(format!(
+                        "the control state carries {COORDINATED_OWNED_OUTPUTS_FENCE} with an initialization that is not ready"
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "the control state carries {COORDINATED_OWNED_OUTPUTS_FENCE} without the paired initialization it always travels with"
+                    ))
+                }
+            }
+        }
+    }
+    // The producer bounds the initialization transaction on either variant, so
+    // an unusable one is its document, not this reader's.
+    if raw.outputs_init.as_ref().is_some_and(|init| {
+        init.transaction().is_empty() || init.transaction().len() > INIT_TRANSACTION_CAP_BYTES
+    }) {
+        return Err(
+            "the control state's outputs-initialization transaction is not bounded text".to_owned(),
+        );
     }
     let fences_ok = fence_matches(
         raw.recorded_accounting.as_deref(),
@@ -726,8 +941,10 @@ struct RawState {
     flushes: Vec<IgnoredAny>,
     #[serde(default)]
     owned_outputs: Option<String>,
-    #[serde(default, rename = "outputs_init")]
-    _outputs_init: Option<IgnoredAny>,
+    /// Oxide's durable outputs-initialization record. Its deciding fact is
+    /// read strictly: `/5` requires the completed `ready` variant.
+    #[serde(default)]
+    outputs_init: Option<RawOutputsInit>,
     #[serde(default)]
     recorded_accounting: Option<String>,
     #[serde(default)]
@@ -747,6 +964,42 @@ struct RawClean {
     checkout: PathBuf,
     #[serde(default, rename = "process_group")]
     _process_group: Option<IgnoredAny>,
+}
+
+/// Oxide's outputs-initialization record, exactly the field set it writes
+/// (`serde` snake_case, `deny_unknown_fields`): `initializing` is durable
+/// before either control is fenced, and `ready` only after the coordinated
+/// registry image and its directory are durable.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum RawOutputsInit {
+    Initializing {
+        transaction: String,
+        #[allow(dead_code)]
+        started_ms: u64,
+    },
+    Ready {
+        transaction: String,
+        #[allow(dead_code)]
+        ready_ms: u64,
+    },
+}
+
+impl RawOutputsInit {
+    /// The transaction this record names, ready or not.
+    fn transaction(&self) -> &str {
+        match self {
+            Self::Initializing { transaction, .. } | Self::Ready { transaction, .. } => transaction,
+        }
+    }
+
+    /// The transaction this record names, once initialization completed.
+    fn ready_transaction(&self) -> Option<&str> {
+        match self {
+            Self::Initializing { .. } => None,
+            Self::Ready { transaction, .. } => Some(transaction),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -872,6 +1125,10 @@ mod tests {
 
     const CHECKOUT: &str = "/work/app";
     const OTHER: &str = "/work/other";
+    /// One coordinated adoption transaction, as Oxide's 32-hex nonce spells it.
+    const TRANSACTION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    /// A different transaction, for the unequal-pair case.
+    const OTHER_TRANSACTION: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     /// A fresh pool directory with its control directory, under a self-removing
     /// fixture. Nothing outside the fixture is written.
@@ -1016,7 +1273,7 @@ mod tests {
                 std::slice::from_ref(&pool),
                 Deadline::after(Duration::from_secs(10)),
             );
-            assert_eq!(matches!(reading, OutputsFence::Covered), covered);
+            assert_eq!(matches!(reading, OutputsFence::Covered { .. }), covered);
         }
         let mut unknown: serde_json::Value =
             serde_json::from_str(&state(&[], "")).expect("state encodes");
@@ -1029,6 +1286,241 @@ mod tests {
         .expect("fixture state writes");
         assert!(matches!(
             owned_outputs_fence(&[pool], Deadline::after(Duration::from_secs(10))),
+            OutputsFence::Unknown { .. }
+        ));
+        drop(fixture);
+    }
+
+    /// A version-9 control state carrying the coordinated fence and the raw
+    /// initialization member(s) a case states, exactly as the producer writes
+    /// them.
+    fn coordinated_state(init: &str) -> String {
+        format!(
+            r#"{{"version":9,"next_id":9,"next_use":1,"tickets":[],"cleans":[],"records":[],"owned_outputs":"{COORDINATED_OWNED_OUTPUTS_FENCE}"{init},"recorded_accounting":"oxide.accounting/1","eviction_accounting":"oxide.eviction-accounting/1","slot_ceiling":"oxide.slots/256","holding":"oxide.holding/1"}}"#
+        )
+    }
+
+    /// The completed initialization member, exactly Oxide's `ready` shape.
+    fn ready(transaction: &str) -> String {
+        format!(r#","outputs_init":{{"ready":{{"transaction":"{transaction}","ready_ms":1}}}} "#)
+            .trim_end()
+            .to_owned()
+    }
+
+    /// The mid-adoption initialization member, exactly Oxide's shape.
+    fn initializing(transaction: &str) -> String {
+        format!(
+            r#","outputs_init":{{"initializing":{{"transaction":"{transaction}","started_ms":1}}}} "#
+        )
+        .trim_end()
+        .to_owned()
+    }
+
+    /// Two pool directories: the internal pool and the removable pool inside
+    /// its control directory, exactly where Oxide's writer sees them.
+    fn pair(label: &str) -> (TempDir, PathBuf, PathBuf) {
+        let dir = TempDir::new(label);
+        let internal = dir.path().join("pool");
+        std::fs::create_dir_all(internal.join(CONTROL_DIR)).unwrap();
+        let removable = internal.join(CONTROL_DIR).join("removable");
+        std::fs::create_dir_all(removable.join(CONTROL_DIR)).unwrap();
+        (dir, internal, removable)
+    }
+
+    fn coordinated_read(pools: &[PathBuf]) -> OutputsFence {
+        owned_outputs_fence(pools, Deadline::after(Duration::from_secs(10)))
+    }
+
+    fn coordinated_adoption(reading: &OutputsFence) -> Option<&str> {
+        match reading {
+            OutputsFence::Covered {
+                coordinated: Some(adoption),
+            } => Some(adoption.transaction()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_coordinated_fence_is_one_completed_paired_handoff() {
+        // The actual emitted adoption: both controls record `/5` ready under
+        // one transaction, and the custody reading reports that transaction
+        // while keeping the checkout closed on the records alone.
+        let (_dir, internal, removable) = pair("coordinated-pair");
+        for pool in [&internal, &removable] {
+            write(
+                pool,
+                Some(&coordinated_state(&ready(TRANSACTION))),
+                Some(&ledger(&[])),
+            );
+        }
+        let pools = [internal.clone(), removable.clone()];
+        let fence = coordinated_read(&pools);
+        assert_eq!(coordinated_adoption(&fence), Some(TRANSACTION), "{fence:?}");
+        let both = PoolCustody::read(&pools, Deadline::after(Duration::from_secs(10)));
+        assert_eq!(both.unattributed(), None, "{both:?}");
+        assert_eq!(
+            both.coordinated().map(CoordinatedAdoption::transaction),
+            Some(TRANSACTION)
+        );
+        assert_closed(&both, checkout());
+
+        // A single pool with no removable peer is the same complete pair: the
+        // producer has no second control to fence.
+        let (_single_dir, single, _unused) = pair("coordinated-single");
+        write(
+            &single,
+            Some(&coordinated_state(&ready(TRANSACTION))),
+            Some(&ledger(&[])),
+        );
+        let fence = coordinated_read(std::slice::from_ref(&single));
+        assert_eq!(coordinated_adoption(&fence), Some(TRANSACTION), "{fence:?}");
+    }
+
+    #[test]
+    fn a_one_sided_or_contradictory_coordinated_pair_is_unknown() {
+        // The internal control adopted `/5` while the removable control still
+        // says `/4`: mid-adoption, never a covered pair.
+        let (_dir, internal, removable) = pair("coordinated-mixed");
+        write(
+            &internal,
+            Some(&coordinated_state(&ready(TRANSACTION))),
+            Some(&ledger(&[])),
+        );
+        write(
+            &removable,
+            Some(
+                &coordinated_state("")
+                    .replace(COORDINATED_OWNED_OUTPUTS_FENCE, ROUTED_OWNED_OUTPUTS_FENCE),
+            ),
+            Some(&ledger(&[])),
+        );
+        let pools = [internal.clone(), removable.clone()];
+        assert!(matches!(
+            coordinated_read(&pools),
+            OutputsFence::Unknown { .. }
+        ));
+        let both = PoolCustody::read(&pools, Deadline::after(Duration::from_secs(10)));
+        assert_pool_unknown(&both);
+        assert_eq!(both.coordinated(), None);
+
+        // Both controls carry `/5`, but under two different transactions: no
+        // one adoption is established.
+        let (_dir2, internal2, removable2) = pair("coordinated-unequal");
+        write(
+            &internal2,
+            Some(&coordinated_state(&ready(TRANSACTION))),
+            Some(&ledger(&[])),
+        );
+        write(
+            &removable2,
+            Some(&coordinated_state(&ready(OTHER_TRANSACTION))),
+            Some(&ledger(&[])),
+        );
+        let pools2 = [internal2, removable2];
+        assert!(matches!(
+            coordinated_read(&pools2),
+            OutputsFence::Unknown { .. }
+        ));
+        assert_pool_unknown(&PoolCustody::read(
+            &pools2,
+            Deadline::after(Duration::from_secs(10)),
+        ));
+
+        // One control adopted `/5` and the peer has no control document at all
+        // (ready-only partial adoption on the other side).
+        let (_dir3, internal3, removable3) = pair("coordinated-absent-peer");
+        write(
+            &internal3,
+            Some(&coordinated_state(&ready(TRANSACTION))),
+            Some(&ledger(&[])),
+        );
+        let pools3 = [internal3, removable3];
+        assert!(matches!(
+            coordinated_read(&pools3),
+            OutputsFence::Unknown { .. }
+        ));
+        assert_pool_unknown(&PoolCustody::read(
+            &pools3,
+            Deadline::after(Duration::from_secs(10)),
+        ));
+    }
+
+    #[test]
+    fn the_coordinated_fence_requires_a_completed_bounded_initialization() {
+        // Every shape that is not the producer's completed record is an
+        // unknown document, never a clear or a legacy one.
+        let (fixture, pool) = fixture("coordinated-init-shapes");
+        for (label, init) in [
+            ("absent", String::new()),
+            ("null", r#","outputs_init":null"#.to_owned()),
+            ("initializing", initializing(TRANSACTION)),
+            (
+                "empty-transaction",
+                r#","outputs_init":{"ready":{"transaction":"","ready_ms":1}}"#.to_owned(),
+            ),
+            (
+                "missing-time",
+                format!(
+                    r#","outputs_init":{{"ready":{{"transaction":"{TRANSACTION}"}}}}"#
+                ),
+            ),
+            (
+                "extra-member",
+                format!(
+                    r#","outputs_init":{{"ready":{{"transaction":"{TRANSACTION}","ready_ms":1,"extra":true}}}}"#
+                ),
+            ),
+            (
+                "unknown-variant",
+                format!(
+                    r#","outputs_init":{{"done":{{"transaction":"{TRANSACTION}","ready_ms":1}}}}"#
+                ),
+            ),
+            (
+                "duplicate",
+                format!(
+                    r#","outputs_init":{{"ready":{{"transaction":"{TRANSACTION}","ready_ms":1}}}},&#10;"outputs_init":{{"ready":{{"transaction":"{TRANSACTION}","ready_ms":1}}}}"#
+                )
+                .replace("&#10;", ""),
+            ),
+        ] {
+            let document = coordinated_state(&init);
+            assert!(
+                parse_state(document.as_bytes()).is_err(),
+                "{label} read as a completed initialization"
+            );
+            std::fs::write(pool.join(CONTROL_DIR).join(STATE_FILE), &document)
+                .expect("fixture state writes");
+            let reading = coordinated_read(std::slice::from_ref(&pool));
+            assert!(
+                matches!(reading, OutputsFence::Unknown { .. }),
+                "{label} fence read as {reading:?}"
+            );
+            assert_pool_unknown(&read(&pool));
+        }
+
+        // An unknown future fence and a coordinated fence below its numeric
+        // floor stay unknown too.
+        std::fs::write(
+            pool.join(CONTROL_DIR).join(STATE_FILE),
+            coordinated_state(&ready(TRANSACTION))
+                .replace(COORDINATED_OWNED_OUTPUTS_FENCE, "oxide.outputs/6"),
+        )
+        .expect("fixture state writes");
+        assert!(matches!(
+            coordinated_read(std::slice::from_ref(&pool)),
+            OutputsFence::Unknown { .. }
+        ));
+        std::fs::write(
+            pool.join(CONTROL_DIR).join(STATE_FILE),
+            format!(
+                r#"{{"version":3,"next_id":9,"next_use":1,"tickets":[],"records":[],"owned_outputs":"{COORDINATED_OWNED_OUTPUTS_FENCE}"{}}}"#,
+                ready(TRANSACTION)
+            ),
+        )
+        .expect("fixture state writes");
+        assert!(matches!(
+            coordinated_read(std::slice::from_ref(&pool)),
             OutputsFence::Unknown { .. }
         ));
         drop(fixture);

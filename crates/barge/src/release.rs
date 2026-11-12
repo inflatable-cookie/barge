@@ -4945,6 +4945,92 @@ mod tests {
             .expect("the registry is written");
     }
 
+    /// The coordinated adoption transaction the fixture's controls record.
+    const OXIDE_TRANSACTION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    /// The empty library ledger Oxide writes for a pool with no slot.
+    const OXIDE_EMPTY_LEDGER: &str = r#"{"version":1,"store_id":"0123456789abcdef0123456789abcdef","cap_bytes":1024,"next_slot":1,"next_lease":1,"slots":[]}"#;
+
+    /// One pool control state exactly as Oxide serializes it, with its library
+    /// ledger beside it. `init` is the raw `outputs_init` value, when the
+    /// document carries one.
+    fn oxide_pool_state(control: &Path, fence: &str, init: Option<&str>) {
+        let init = init.map_or(String::new(), |init| format!(r#","outputs_init":{init}"#));
+        let document = format!(
+            r#"{{"version":9,"next_id":1,"next_use":1,"tickets":[],"cleans":[],"records":[],"owned_outputs":"{fence}"{init},"recorded_accounting":"oxide.accounting/1","eviction_accounting":"oxide.eviction-accounting/1","slot_ceiling":"oxide.slots/256","holding":"oxide.holding/1"}}"#
+        );
+        std::fs::create_dir_all(control).expect("the control directory is created");
+        std::fs::write(control.join("state.json"), document).expect("the control state is written");
+        let pool = control
+            .parent()
+            .expect("the control directory is inside a pool");
+        std::fs::write(pool.join("ledger.json"), OXIDE_EMPTY_LEDGER)
+            .expect("the pool ledger is written");
+    }
+
+    /// The completed `ready` initialization member.
+    fn oxide_ready(transaction: &str) -> String {
+        format!(r#"{{"ready":{{"transaction":"{transaction}","ready_ms":1}}}}"#)
+    }
+
+    /// The mid-adoption `initializing` member.
+    fn oxide_initializing(transaction: &str) -> String {
+        format!(r#"{{"initializing":{{"transaction":"{transaction}","started_ms":1}}}}"#)
+    }
+
+    /// Both pool controls, exactly where Oxide's writer sees them: the
+    /// internal pool and the removable pool inside its control directory.
+    fn oxide_pools(fixture: &Fixture) -> [PathBuf; 2] {
+        let control = oxide_control(fixture);
+        [
+            control.clone(),
+            control
+                .join(crate::pool_custody::REMOVABLE_POOL_DIR)
+                .join(crate::inspect::OXIDE_CONTROL_DIR),
+        ]
+    }
+
+    /// One coordinated `/4` registry image, exactly Oxide's field set.
+    fn oxide_coordinated_registry(
+        fixture: &Fixture,
+        created_by: &str,
+        rows: &[serde_json::Value],
+        settled: &[serde_json::Value],
+    ) {
+        let outputs = oxide_control(fixture).join(reference::OXIDE_OUTPUTS_DIR);
+        std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
+        let document = serde_json::json!({
+            "version": reference::OXIDE_REGISTRY_V4,
+            "schema": 4,
+            "revision": 2,
+            "complete": true,
+            "created_by": created_by,
+            "rows": rows,
+            "settled": settled,
+        });
+        std::fs::write(
+            outputs.join(reference::OXIDE_REGISTRY_FILE),
+            serde_json::to_vec(&document).expect("the registry encodes"),
+        )
+        .expect("the registry is written");
+    }
+
+    /// The exact emitted coordinated handoff: both controls `/5` ready under
+    /// one transaction and the `/4` image that transaction created.
+    fn oxide_coordinated_adoption(
+        fixture: &Fixture,
+        rows: &[serde_json::Value],
+        settled: &[serde_json::Value],
+    ) {
+        for control in oxide_pools(fixture) {
+            oxide_pool_state(
+                &control,
+                crate::pool_custody::COORDINATED_OWNED_OUTPUTS_FENCE,
+                Some(&oxide_ready(OXIDE_TRANSACTION)),
+            );
+        }
+        oxide_coordinated_registry(fixture, OXIDE_TRANSACTION, rows, settled);
+    }
+
     #[test]
     fn an_oxide_reference_that_is_not_settled_keeps_the_root() {
         for flags in [
@@ -5489,10 +5575,19 @@ mod tests {
             "schema": 4,
             "revision": 2,
             "complete": true,
-            "created_by": "oxide",
+            "created_by": OXIDE_TRANSACTION,
             "rows": [live_row],
             "settled": [settlement],
         });
+        // The exact emitted handoff: both pool controls record `/5` ready
+        // under the transaction that created this `/4` image.
+        for control in oxide_pools(&fixture) {
+            oxide_pool_state(
+                &control,
+                crate::pool_custody::COORDINATED_OWNED_OUTPUTS_FENCE,
+                Some(&oxide_ready(OXIDE_TRANSACTION)),
+            );
+        }
         let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
         std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
         std::fs::write(
@@ -5550,9 +5645,18 @@ mod tests {
             "schema": 4,
             "revision": 2,
             "complete": true,
-            "created_by": "oxide",
+            "created_by": OXIDE_TRANSACTION,
             "rows": [],
         });
+        // The controls are the completed pair, so the refusal is attributable
+        // to the malformed image alone.
+        for control in oxide_pools(&fixture) {
+            oxide_pool_state(
+                &control,
+                crate::pool_custody::COORDINATED_OWNED_OUTPUTS_FENCE,
+                Some(&oxide_ready(OXIDE_TRANSACTION)),
+            );
+        }
         let outputs = oxide_control(&fixture).join(reference::OXIDE_OUTPUTS_DIR);
         std::fs::create_dir_all(&outputs).expect("the outputs folder is created");
         std::fs::write(
@@ -5590,6 +5694,127 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::UnknownState);
         assert!(std::fs::metadata(&first.path).is_ok());
         assert!(std::fs::metadata(&second.path).is_ok());
+        assert!(intent_records(&fixture).is_empty());
+    }
+
+    #[test]
+    fn a_one_sided_coordinated_adoption_keeps_the_whole_batch_and_changes_nothing() {
+        // Mid-adoption: the internal control carries the coordinated `/5`
+        // fence while the removable control still says `/4`. The pair is
+        // incomplete, so the whole batch the custody covers is kept and a
+        // presented plan refuses before any effect.
+        let fixture = Fixture::new("release-coordinated-one-sided-controls");
+        let first = fixture.root();
+        let second = fixture.root();
+        let [internal, removable] = oxide_pools(&fixture);
+        for control in [&internal, &removable] {
+            oxide_pool_state(
+                control,
+                crate::pool_custody::ROUTED_OWNED_OUTPUTS_FENCE,
+                Some(&oxide_ready(OXIDE_TRANSACTION)),
+            );
+        }
+        oxide_pool_state(
+            &internal,
+            crate::pool_custody::COORDINATED_OWNED_OUTPUTS_FENCE,
+            Some(&oxide_ready(OXIDE_TRANSACTION)),
+        );
+        oxide_coordinated_registry(&fixture, OXIDE_TRANSACTION, &[], &[]);
+        let report = fixture.plan();
+        for root in [&first, &second] {
+            let kept = row(&report, root);
+            assert!(!kept.eligible, "{kept:?}");
+            assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+            assert!(!kept.references_complete, "the batch is kept, not one root");
+        }
+        assert_eq!(report.plan.eligible_count, 0);
+        assert!(!report.oxide.complete);
+        assert!(report.needs_human());
+        let (bytes, digest) = presented(&report);
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let error = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &digest,
+        )
+        .expect_err("a one-sided adoption keeps the whole batch");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(std::fs::metadata(&first.path).is_ok());
+        assert!(std::fs::metadata(&second.path).is_ok());
+        assert!(intent_records(&fixture).is_empty());
+
+        // The reverse one-sided adoption: an equal `/5` pair whose `/4` image
+        // records another transaction, so the handoff and the image are
+        // different generations.
+        let fixture = Fixture::new("release-coordinated-mixed-image");
+        let root = fixture.root();
+        let [internal, removable] = oxide_pools(&fixture);
+        for control in [&internal, &removable] {
+            oxide_pool_state(
+                control,
+                crate::pool_custody::COORDINATED_OWNED_OUTPUTS_FENCE,
+                Some(&oxide_ready(OXIDE_TRANSACTION)),
+            );
+        }
+        oxide_coordinated_registry(&fixture, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &[], &[]);
+        let report = fixture.plan();
+        let kept = row(&report, &root);
+        assert!(!kept.eligible, "{kept:?}");
+        assert_eq!(kept.blocked_by.as_deref(), Some("references"));
+        assert!(!kept.references_complete);
+        assert_eq!(report.plan.eligible_count, 0);
+        assert!(report.needs_human());
+        let (bytes, digest) = presented(&report);
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let error = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &digest,
+        )
+        .expect_err("a mixed coordinated generation keeps the whole batch");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(std::fs::metadata(&root.path).is_ok());
+        assert!(intent_records(&fixture).is_empty());
+    }
+
+    #[test]
+    fn a_control_adoption_that_changes_after_the_plan_keeps_the_batch() {
+        // A complete pair and its `/4` image plan an eligible root, then one
+        // control goes back to `initializing` before the run. The presented
+        // plan refuses as unknown and nothing is released or journalled.
+        let fixture = Fixture::new("release-coordinated-race");
+        let root = fixture.root();
+        oxide_coordinated_adoption(&fixture, &[], &[]);
+        let report = fixture.plan();
+        assert!(row(&report, &root).eligible, "{report:?}");
+        let (bytes, digest) = presented(&report);
+        let [internal, _removable] = oxide_pools(&fixture);
+        oxide_pool_state(
+            &internal,
+            crate::pool_custody::COORDINATED_OWNED_OUTPUTS_FENCE,
+            Some(&oxide_initializing(OXIDE_TRANSACTION)),
+        );
+        let observer = fixture.volume.observer();
+        let facts = fixture.volume.facts();
+        let error = release_with(
+            &fixture,
+            &observer,
+            &facts,
+            fixture.overdue(),
+            &bytes,
+            &digest,
+        )
+        .expect_err("a control that re-enters initialization keeps the batch");
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(std::fs::metadata(&root.path).is_ok(), "the root is kept");
         assert!(intent_records(&fixture).is_empty());
     }
 

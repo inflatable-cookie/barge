@@ -167,3 +167,119 @@ fn terminal_recovery_checks_the_stored_operation_and_tolerates_remount_devices()
         assert!(!root.path.exists());
     }
 }
+
+/// The transaction both controls record ready in the coordinated fixtures.
+const TRANSACTION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+/// Publish the coordinated `/4` image over the fixture's `/2` registry,
+/// keeping its row and its live intent, and created by `transaction`.
+fn coordinated_image(fixture: &Fixture, transaction: &str) {
+    let path = fixture
+        .control
+        .join(crate::reference::OXIDE_OUTPUTS_DIR)
+        .join(crate::reference::OXIDE_REGISTRY_FILE);
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    document["version"] = json!(crate::reference::OXIDE_REGISTRY_V4);
+    document["schema"] = json!(4);
+    document["created_by"] = json!(transaction);
+    document["settled"] = json!([]);
+    std::fs::write(path, serde_json::to_vec(&document).unwrap()).unwrap();
+}
+
+#[test]
+fn the_coordinated_handoff_refuses_the_delegated_route() {
+    // The actual emitted single-authority handoff: both controls `/5` ready
+    // under the transaction, and the `/4` image that transaction created. The
+    // `/4` registry carries no deletion route, and the predecessor join this
+    // path implements is not that class's authority, so recognising the fence
+    // refuses rather than deleting through the old route.
+    let fixture = Fixture::new("adapter-coordinated-ready");
+    let root = fixture.root("root-one");
+    fixture.covered(&root, CALLER_ID);
+    fixture.write_pool_controls(
+        crate::pool_custody::COORDINATED_OWNED_OUTPUTS_FENCE,
+        json!({"ready": {"transaction": TRANSACTION, "ready_ms": 1}}),
+    );
+    coordinated_image(&fixture, TRANSACTION);
+    let intent = fixture.live_intent(&root, CALLER_ID);
+    let result = run(&fixture, &intent);
+    assert_eq!(result.kind, OutcomeKind::Refused, "{result:?}");
+    assert!(root.path.exists());
+    assert!(
+        state::read_intents(&fixture.volume.state, crate::contract::INTENT_ROWS)
+            .unwrap()
+            .records
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_one_sided_coordinated_adoption_never_authorises_the_delegated_route() {
+    // Mid-adoption on the controls: the internal control records `/5` ready
+    // while the removable control still says `/4`, with the `/4` image the
+    // record names. The pair establishes nothing, so the answer is unknown and
+    // the root is kept.
+    let fixture = Fixture::new("adapter-coordinated-one-sided-controls");
+    let root = fixture.root("root-one");
+    fixture.covered(&root, CALLER_ID);
+    fixture.write_control_state(
+        Some(crate::pool_custody::COORDINATED_OWNED_OUTPUTS_FENCE),
+        4,
+    );
+    {
+        let path = fixture.control.join("state.json");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["outputs_init"] = json!({"ready": {"transaction": TRANSACTION, "ready_ms": 1}});
+        std::fs::write(path, serde_json::to_vec(&document).unwrap()).unwrap();
+    }
+    let removable = fixture
+        .control
+        .join(crate::pool_custody::REMOVABLE_POOL_DIR)
+        .join(crate::inspect::OXIDE_CONTROL_DIR);
+    std::fs::create_dir_all(&removable).expect("the removable control directory is created");
+    std::fs::write(
+        removable.join("state.json"),
+        serde_json::to_vec(&json!({
+            "version": 9,
+            "next_id": 1,
+            "next_use": 1,
+            "tickets": [],
+            "cleans": [],
+            "records": [],
+            "owned_outputs": crate::pool_custody::ROUTED_OWNED_OUTPUTS_FENCE,
+            "outputs_init": {"ready": {"transaction": TRANSACTION, "ready_ms": 1}},
+            "recorded_accounting": "oxide.accounting/1",
+            "eviction_accounting": "oxide.eviction-accounting/1",
+            "slot_ceiling": "oxide.slots/256",
+            "holding": "oxide.holding/1",
+        }))
+        .unwrap(),
+    )
+    .expect("the removable control state is written");
+    coordinated_image(&fixture, TRANSACTION);
+    let intent = fixture.live_intent(&root, CALLER_ID);
+    let result = run(&fixture, &intent);
+    assert_eq!(result.kind, OutcomeKind::Unknown, "{result:?}");
+    assert!(root.path.exists());
+
+    // One-sided on the image instead: the published `/4` control pair beside
+    // the `/4` image that only the coordinated handoff creates. No pool control
+    // records `/5`, so the image is unknown and nothing is deleted.
+    let fixture = Fixture::new("adapter-coordinated-image-only");
+    let root = fixture.root("root-one");
+    fixture.covered(&root, CALLER_ID);
+    fixture.write_control_state(Some(crate::pool_custody::ROUTED_OWNED_OUTPUTS_FENCE), 4);
+    coordinated_image(&fixture, TRANSACTION);
+    let intent = fixture.live_intent(&root, CALLER_ID);
+    let result = run(&fixture, &intent);
+    assert_eq!(result.kind, OutcomeKind::Unknown, "{result:?}");
+    assert!(root.path.exists());
+    assert!(
+        state::read_intents(&fixture.volume.state, crate::contract::INTENT_ROWS)
+            .unwrap()
+            .records
+            .is_empty()
+    );
+}
