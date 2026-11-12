@@ -40,27 +40,51 @@ reads and writes, and they are premise-bound by the nine-item checklist, but
 they do not change who shares the caller's uid. **A private home is not process
 isolation.**
 
-The retained barge#061 facts point at exactly that seam and at nothing more.
-The adequate uncounted diagnostic `27339d0c`/`6823896179` and the two failed
-author occurrences `20cf43a4`/`6823148735` and `68af0f27`/`6824114210`, with the
-read-only disposition `6824496034`, retain a case row that refused on an unknown
-descriptor-custody verdict with its deciding facts unretained, a later row that
-refused on the same closed-descriptor policy, and an occurrence whose sixteen
-rows passed while its own final closure left a whole-backing attachment census
-uncertain. Those are product refusals and one closure uncertainty under real
-conditions; they establish neither an apparatus defect nor an attributable
-host-transient cause, and the blocked-versus-slow boundary inside the guard's
-own census remains unknown. The historical occurrence is therefore not
-re-examined, reinterpreted or retried here. What the facts support is narrower
-and useful: the ambient same-uid process set is a variable the fixture cannot
-control, and it is the one variable a controlled execution context can.
+The retained barge#061 facts point at the descriptor class and at nothing more,
+and each bound identity keeps its own recorded result at the bound head
+`6d88ee2`/tree `9860345c`:
+
+- the adequate uncounted diagnostic `27339d0c`/`6823896179` passed all sixteen
+  rows with no first fault, skip or unexecuted row; its own image
+  `DB8B16B1-52BE-43C9-B4F3-C6E725DBC145` closed positively (ordinary detach exit
+  0, reaped, mount absent, readable post-census `backing_attached=false`,
+  `closed=true`); and its separate group closure was positive — one started and
+  completed census round, `joined=true`, with both the deciding and the final
+  census certain, `members=0` and `uncertain=0`. Its disclosure that the raw
+  census prefixes are truncated and the full census bytes are not retained for
+  independent re-parsing is a retention limit, not an uncertain attach or
+  closure verdict;
+- the failed author `20cf43a4`/`6823148735` retains a failed R1 with an
+  insufficient deciding payload, R2–R16 unexecuted, and the open image
+  `94838906-EC5B-4DB6-AD01-A97077D370A7`; its joined deciding and final
+  certain-empty group closure was accepted separately from the failed count and
+  image, and its cause and partial effects remain unknown;
+- the failed author `68af0f27`/`6824114210` retains a closed-descriptor R6
+  refusal and the open image
+  `B5E838A9-A661-4998-8B93-133B4EAC86D8`;
+- the open image `7E9A11B8-FA79-4CD0-8080-0C7D038C6F42` stays a retained
+  obligation, and nothing here reconstructs a cause or a present detach binding
+  for it.
+
+So the retained evidence is one product descriptor-policy refusal, one count
+whose deciding payload and image are failed or open, and one uncounted
+diagnostic whose rows and both closures were recorded positively and which the
+disposition still accepted only as uncounted. None of that establishes an
+apparatus defect or an attributable host-transient cause.
+
+The deployed qualified default's own census round that never completed before a
+fixed window is a different identity with its own result: the lane's
+proof-supervision assessment, which names no barge#061 occurrence and keeps its
+blocked-versus-slow boundary unknown. The bound diagnostic's completed round
+neither reproduces nor explains it, no observation of that default follows here,
+and no retained root is inspected.
 
 The guard's own closure is a *different* observation and stays session-scoped:
 the qualified supervisor's census settles only over its cooperative session and
 previously tracked identities, and an escaped, untracked child can be classified
 foreign. Controlling the account does not make that census complete; it removes
-the unrelated same-uid processes from the product's scan, which is the
-dependency the retained facts actually exhibit. No claim is made that a quieter
+the unrelated same-uid processes from the product's scan, which is the part of
+that dependency a shared account cannot bound. No claim is made that a quieter
 context would have prevented the historical stall.
 
 ## Fixed premises (none of these move)
@@ -75,7 +99,7 @@ for Tom to select, never relax one silently.
 | Staging | installed toolchain `1.97.1`, `--locked` and offline, no auto-install, one fresh stage inside the guarded occurrence through ordinary Oxide; the artifact and its manifest are re-verified before any effect, and no earlier or shared binary is accepted |
 | Feature | `proof-synthetic-account` (release) or `proof-descriptor-listing` (listing); the ordinary production build names neither |
 | Nine premises | Oxide's read-only proof-authoring premise checklist, each with its executable disposition (`premise_dispositions()`), unchanged |
-| Cases | the sixteen rows of the release proof at the bound source head `6d88ee2e31d2f0611b7001791cdc3a706e1bed5b` (R1–R16, including R3's held writer, R2/R9's identity, R13–R15's registry facts and R16's paired control handoff), and the listing proof's L1–L4 |
+| Cases | the sixteen rows of the release proof at the bound source head `6d88ee2e31d2f0611b7001791cdc3a706e1bed5b` (R1–R16: R3's held writer, R2's missing identity record, R9's changed-digest refusal, R13–R15's registry facts and R16's paired control handoff), and the listing proof's L1–L4 |
 | Bounds | release: 300 s total, 512 MiB monitored scratch, one 64 MiB sparse APFS image, the original 30 s work stop; listing: 600 s, 512 MiB, no image. Oxide#304's 600 s / 512 MiB / 128 MiB integrated gates stay separate. |
 | Exclusion | none. No parent or driver process is excluded from the scan, no scan set is narrowed, no descriptor is skipped or reclassified, no retry or bound increase is added, and no new liveness policy exists. |
 
@@ -176,11 +200,12 @@ occurrence; it is never proof that a future writer is absent.
 - **Admission.** Effigy `heavy` admission and the Nucleus run identity are the
   proof account's own, obtained through the documented interfaces. Until the
   Queue admission-hook adapter (Queue #381) lands, the interim allowance's
-  disclosure — "Effigy heavy admission unavailable; not host-admitted", plus the
-  fresh scheduler headroom receipt — is carried unchanged. Tickets are never
-  transferred between accounts, guard variables (`OXIDE_TASK_SCRATCH_ROOT`,
-  `OXIDE_PROOF_EVIDENCE`) are never fabricated, and no production or retained
-  root is reused as a fixture parent.
+  disclosure is carried unchanged and in full: "Effigy heavy admission
+  unavailable (f6b3b50 retired host-run client; Queue #381 pending); not
+  host-admitted", beside the fresh scheduler headroom receipt. Tickets are
+  never transferred between accounts, guard variables
+  (`OXIDE_TASK_SCRATCH_ROOT`, `OXIDE_PROOF_EVIDENCE`) are never fabricated, and
+  no production or retained root is reused as a fixture parent.
 
 ## Volume and filesystem reconciliation
 
