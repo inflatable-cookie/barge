@@ -1219,12 +1219,17 @@ Barge reads that handoff instead of only the fence string:
 - Both controls must agree: every pool the reading covers carries `/5` at the
   covered floor with one equal `ready` transaction. A mixed `/4`+`/5` pair, two
   different transactions, or a peer with no control document is a one-sided or
-  mid-adoption observation and stays unknown. Peer membership is Oxide's own
-  registration (`oxide-managed/removable.json`), exactly as `removable::coordinate`
-  decides it: no registration is the internal pool alone — the same complete
-  pair, because the producer has no second control to fence — and a registered
-  pool's control is named even while its own directory is absent, so a
-  registered pair can never be silently narrowed to one control.
+  mid-adoption observation and stays unknown. Coordinated pair membership is
+  Oxide's own registration (`oxide-managed/removable.json`), exactly as
+  `removable::coordinate` decides it: no registration is the internal pool alone —
+  the same complete pair, because the producer has no second control to fence —
+  and a registered pool's control is named even while its own directory is absent,
+  so a registered pair can never be silently narrowed to one control. Custody is
+  broader than pair membership in the safe direction: an extant `removable` entry
+  is still read whatever the registration says, because a historical product kept
+  its control state and ledger there and those writers keep their checkouts; an
+  entry that is not a real directory, and a registration that cannot be read, are
+  unknown.
 - Discovery keeps a covered pool's missing registry an unknown: when a control
   state records a covered `/3`–`/5` fence but its `outputs` folder is absent, the
   snapshot is unknown rather than "no Oxide control directory", because that
@@ -1247,16 +1252,22 @@ Barge reads that handoff instead of only the fence string:
 Regressions: the reader controls in `pool_custody` (pairing, initialization
 shapes, mixed/unequal peers), the composed snapshot binding and discovery
 controls (`reference::writer_custody_tests`: registration names a peer even
-while its directory is absent, a registered peer with no control document and a
-covered control state with no `outputs` folder are both unknown), the composed
+while its directory is absent, an unregistered legacy `removable` entry keeps its
+live writer's checkout and never completes a coordinated pair, a registered peer
+with no control document and a covered control state with no `outputs` folder are
+both unknown), the composed
 plan-and-execute refusals in `release` (one-sided controls, a mixed generation,
 a missing `outputs` folder, and a control that re-enters initialization between
 plan and run), and the delegated-route refusals in
 `oxide_outputs::tests::routes`. The existing release-native apparatus gains
-R16, one finite named coordinated-adoption group: the positive `/5`+`/4`
-handoff releases an eligible root, and the mixed fence, unequal transaction,
-re-entered initialization and one-sided image each keep the whole batch with no
-effect. These are readiness cases only; every native occurrence remains
+R16, one finite named coordinated-adoption group: the positive emitted handoff —
+the removable peer registered, both `/5` controls ready and the `/4` image that
+transaction created — releases an eligible root, and the mixed fence, unequal
+transaction, re-entered initialization and one-sided image each keep the whole
+batch with no effect. Its effect-free control drives the real fixture writers and
+the real refusal body through one scripted write seam, and checks the exact
+published footprint (registration, both control states, both ledgers, the one
+registry image) against the producer's own field set. These are readiness cases only; every native occurrence remains
 separately owner-activated, and this correction establishes neither Oxide304's
 adoption integration, the production account lookup, nor any live-drive
 behaviour.
@@ -2867,7 +2878,7 @@ its own area, so one case's roots never reach another case's plan:
 | R13 | a valid coordinated `/4` registry keeps its live Oxide reference's root and releases an unrelated eligible root past a settlement naming that root's exact path | R1, the coordinated format |
 | R14 | a coordinated `/4` registry without its settlement set refuses the whole batch (`unknown_state`) and changes nothing | R13, the settlement set |
 | R15 | the census reads the same coordinated `/4` document as reported facts; its malformed twin stays unknown | the census observation on R13's document |
-| R16 | the emitted paired `/5` controls with their `/4` image release an eligible root, while a mixed fence, an unequal transaction, a re-entered initialization and a one-sided image each keep the whole batch (`unknown_state`) and change nothing | R13, the paired control handoff |
+| R16 | the emitted handoff — the removable peer registered, both `/5` controls ready and their `/4` image — releases an eligible root, while a mixed fence, an unequal transaction, a re-entered initialization and a one-sided image each keep the whole batch (`unknown_state`) and change nothing | R13, the paired control handoff |
 
 R11 retains the original identity record, marker, inode and fixture content through
 replay. It binds the recorded relative path to the reattached mount only after the

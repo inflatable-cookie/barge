@@ -1221,15 +1221,24 @@ fn control_directory_with(
 }
 
 /// The pool directories whose writers can name Oxide's outputs under one control
-/// directory: the internal pool, and the removable pool when one is registered.
+/// directory: the internal pool, and the removable pool whenever one is either
+/// registered or still present on disk.
 ///
-/// Registration is the peer fact, exactly as Oxide's own `removable::coordinate`
-/// decides it: no registration means the internal pool alone, and a registered
-/// pool's control is the sibling `<internal control>/removable/oxide-managed`,
-/// kept inside the internal control directory so it stays readable while the
-/// volume is away. The peer is therefore named even when its own directory is
-/// absent, so a registered pair can never be silently narrowed to one control.
-/// A registration that cannot be read as Oxide's is unknown, never skipped.
+/// Two facts decide the peer, and both are conservative:
+///
+/// - **Registration** is the coordinated pair membership, exactly as Oxide's own
+///   `removable::coordinate` decides it: a registered pool's control is the
+///   sibling `<internal control>/removable/oxide-managed`, kept inside the
+///   internal control directory so it stays readable while the volume is away.
+///   The peer is therefore named even when its own directory is absent, so a
+///   registered pair can never be silently narrowed to one control.
+/// - **An extant `removable` entry** is a peer for custody's sake whatever the
+///   registration says: a historical product kept its control state and ledger
+///   there, and its writers still hold their checkouts. Dropping the entry would
+///   read those writers as closed. An entry that is not a real directory is
+///   unknown, never skipped.
+///
+/// A registration that cannot be read as Oxide's is unknown too.
 pub(crate) fn pools_holding(
     control: &Path,
     deadline: Deadline,
@@ -1241,6 +1250,7 @@ pub(crate) fn pools_holding(
         ));
     };
     let registration = control.join(crate::inspect::OXIDE_REGISTRATION_FILE);
+    let removable = control.join(REMOVABLE_POOL_DIR);
     let expired = || {
         format!(
             "the read deadline expired while {} was inspected, so the pools that could hold Oxide's outputs are unknown",
@@ -1260,20 +1270,47 @@ pub(crate) fn pools_holding(
             .ok()
             .map(|metadata| (metadata.dev(), metadata.ino(), "registration")),
     );
-    let observation = crate::inspect::read_registration(&registration);
+    let registered = match crate::inspect::read_registration(&registration) {
+        crate::inspect::Observation::Absent { .. } => false,
+        crate::inspect::Observation::Reported(_) => true,
+        crate::inspect::Observation::Unknown { detail, .. } => {
+            return Err(format!(
+                "{} cannot be read as Oxide's pool registration, so the pools that could hold its outputs are unknown: {detail}",
+                registration.display()
+            ))
+        }
+    };
     if deadline.expired() {
         return Err(expired());
     }
-    match observation {
-        crate::inspect::Observation::Absent { .. } => Ok(vec![internal.to_path_buf()]),
-        crate::inspect::Observation::Reported(_) => Ok(vec![
-            internal.to_path_buf(),
-            control.join(REMOVABLE_POOL_DIR),
-        ]),
-        crate::inspect::Observation::Unknown { detail, .. } => Err(format!(
-            "{} cannot be read as Oxide's pool registration, so the pools that could hold its outputs are unknown: {detail}",
-            registration.display()
+    // The peer entry's own identity, read even when nothing registers it: a
+    // legacy pool's writers are custody facts, not a registration claim.
+    let entry = match std::fs::symlink_metadata(&removable) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "{} cannot be inspected, so the removable pool's writers are unknown: {error}",
+                removable.display()
+            ))
+        }
+    };
+    #[cfg(test)]
+    crate::tape::stat(
+        "reference::pools_holding",
+        &removable,
+        entry
+            .as_ref()
+            .map(|metadata| (metadata.dev(), metadata.ino(), "removable-entry")),
+    );
+    match entry {
+        Some(metadata) if !metadata.is_dir() => Err(format!(
+            "{} exists and is not a directory, so the removable pool's writers are unknown",
+            removable.display()
         )),
+        Some(_) => Ok(vec![internal.to_path_buf(), removable]),
+        None if registered => Ok(vec![internal.to_path_buf(), removable]),
+        None => Ok(vec![internal.to_path_buf()]),
     }
 }
 
@@ -4778,37 +4815,114 @@ mod writer_custody_tests {
     }
 
     #[test]
-    fn registration_names_the_removable_peer_even_when_its_directory_is_absent() {
-        // Registration is the peer fact, exactly as Oxide's own
-        // `removable::coordinate` decides it. A stray directory without a
-        // registration is not a peer; a registration names the sibling even
-        // while the volume (and so its directory) is away; a registration that
-        // cannot be read is unknown, never skipped.
+    fn registration_names_the_removable_peer_and_a_legacy_entry_stays_a_peer() {
+        // Registration is the coordinated pair membership, exactly as Oxide's own
+        // `removable::coordinate` decides it; an extant `removable` entry stays a
+        // custody peer whatever the registration says. A registration that cannot
+        // be read, and an entry that is not a real directory, are unknown.
         let dir = TempDir::new("writer-custody-pools");
         let internal = dir.path().join("pool");
         let control = internal.join("oxide-managed");
         std::fs::create_dir_all(&control).unwrap();
+        let removable = control.join(REMOVABLE_POOL_DIR);
         let deadline = || Deadline::after(Duration::from_secs(10));
         let registration = control.join(crate::inspect::OXIDE_REGISTRATION_FILE);
 
-        std::fs::create_dir(control.join(REMOVABLE_POOL_DIR)).unwrap();
+        // Nothing registered, nothing present: the internal pool alone.
         assert_eq!(
             pools_holding(&control, deadline()).unwrap(),
             vec![internal.clone()]
         );
 
+        // A registration names the sibling even while its own directory is away.
         std::fs::write(&registration, registration_document()).unwrap();
-        std::fs::remove_dir(control.join(REMOVABLE_POOL_DIR)).unwrap();
         assert_eq!(
             pools_holding(&control, deadline()).unwrap(),
-            vec![internal.clone(), control.join(REMOVABLE_POOL_DIR)]
+            vec![internal.clone(), removable.clone()]
         );
 
+        // Without the registration and the entry, the peer is gone again.
+        std::fs::remove_file(&registration).unwrap();
+        assert_eq!(
+            pools_holding(&control, deadline()).unwrap(),
+            vec![internal.clone()]
+        );
+
+        // A legacy directory with no registration is still a custody peer.
+        std::fs::create_dir(&removable).unwrap();
+        assert_eq!(
+            pools_holding(&control, deadline()).unwrap(),
+            vec![internal.clone(), removable.clone()]
+        );
+
+        // A malformed registration is unknown, never skipped.
         std::fs::write(&registration, b"{}").unwrap();
         assert!(pools_holding(&control, deadline()).is_err());
 
+        // An entry that is not a directory is unknown even without a registration.
         std::fs::remove_file(&registration).unwrap();
+        std::fs::remove_dir(&removable).unwrap();
+        std::fs::write(&removable, b"not a pool").unwrap();
+        assert!(pools_holding(&control, deadline()).is_err());
+
+        // An unreadable registration document (a directory) is unknown too.
+        std::fs::remove_file(&removable).unwrap();
         std::fs::create_dir(&registration).unwrap();
         assert!(pools_holding(&control, deadline()).is_err());
+    }
+
+    #[test]
+    fn a_legacy_removable_peer_keeps_its_writers_and_an_unregistered_pair_is_unknown() {
+        // Historical disposition: a `removable` directory with no registration is
+        // still read, so its live writer holds the checkout instead of reading as
+        // closed. Without this the shared lookup would release a checkout whose
+        // old peer's Cargo may still be writing.
+        let dir = TempDir::new("writer-custody-legacy-peer");
+        let internal = dir.path().join("pool");
+        let control = internal.join("oxide-managed");
+        let removable = control.join(REMOVABLE_POOL_DIR);
+        let removable_control = removable.join("oxide-managed");
+        std::fs::create_dir_all(&removable_control).unwrap();
+        let running = r#"{"id":1,"identity":"i","compatibility":"c","profile":"release","checkout":"/work/app","phase":"running","process_group":null,"last_used":1}"#;
+        std::fs::write(removable_control.join("state.json"), state_with(running)).unwrap();
+        std::fs::write(
+            removable.join("ledger.json"),
+            r#"{"version":1,"store_id":"0123456789abcdef0123456789abcdef","cap_bytes":1024,"next_slot":1,"next_lease":1,"slots":[]}"#,
+        )
+        .unwrap();
+        let deadline = || Deadline::after(Duration::from_secs(10));
+        let pools = pools_holding(&control, deadline()).unwrap();
+        assert_eq!(pools, vec![internal.clone(), removable.clone()]);
+        let reading = PoolCustody::read(&pools, Deadline::after(Duration::from_secs(10)));
+        assert!(
+            matches!(reading.for_checkout(Path::new(CHECKOUT)), Custody::Held(_)),
+            "{reading:?}"
+        );
+
+        // With the internal control on the coordinated fence, a peer that records
+        // nothing is a one-sided adoption: unknown, so the batch is kept.
+        std::fs::create_dir_all(&control).unwrap();
+        let ready = format!(
+            r#","outputs_init":{{"ready":{{"transaction":"{INIT_TRANSACTION}","ready_ms":1}}}}"#
+        );
+        let state = format!(
+            r#"{{"version":9,"next_id":1,"next_use":1,"tickets":[],"cleans":[],"records":[],"owned_outputs":"{}"{ready},"recorded_accounting":"oxide.accounting/1","eviction_accounting":"oxide.eviction-accounting/1","slot_ceiling":"oxide.slots/256","holding":"oxide.holding/1"}}"#,
+            crate::pool_custody::COORDINATED_OWNED_OUTPUTS_FENCE
+        );
+        std::fs::write(control.join("state.json"), state).unwrap();
+        // The delegated lookup refuses the incomplete pair either way: a peer
+        // that records no covered fence is a known not-covered, and one that
+        // cannot be read is unknown. Neither is ever the covered class.
+        assert!(
+            !matches!(
+                crate::pool_custody::owned_outputs_fence(&pools, deadline()),
+                crate::pool_custody::OutputsFence::Covered { .. }
+            ),
+            "an unregistered legacy peer never completes a coordinated pair"
+        );
+        // The generic release's custody reading is the one that must keep the
+        // batch, and it does: the pair is one-sided.
+        let reading = PoolCustody::read(&pools, Deadline::after(Duration::from_secs(10)));
+        assert!(reading.unattributed().is_some(), "{reading:?}");
     }
 }

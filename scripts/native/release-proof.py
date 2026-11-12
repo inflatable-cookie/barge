@@ -136,6 +136,11 @@ OXIDE_TRANSACTION = "a" * 32
 # pool the proof build resolves, whose own `removable/` child is the second
 # control a registered pair writes.
 OXIDE_RELATIVE_CONTROL = os.path.dirname(os.path.dirname(OXIDE_RELATIVE_REGISTRY))
+# The registration's own name inside that control directory, and the synthetic
+# pool volume UUID its field set carries (a UUID this fixture names, never a
+# real drive).
+OXIDE_REGISTRATION_NAME = "removable.json"
+OXIDE_POOL_VOLUME_UUID = "8a660440-c919-45c6-a3f1-3365b9bd2006"
 VOLUME_UUID_KEY = "VolumeUUID"
 HOLDER = "release-native-holder"
 PROOF_RECEIPT = "release-proof-receipt.json"
@@ -260,7 +265,7 @@ CASES = [
      "claim": "the census reads the same coordinated /4 document as reported document facts, and its malformed twin stays unknown",
      "carried_by": "the_coordinated_census_reads_the_release_fixture_and_a_malformed_one_stays_unknown"},
     {"id": "R16", "method": "case_coordinated_adoption_group",
-     "claim": "the emitted paired /5 controls with their /4 image release an eligible root, while a mixed fence, an unequal transaction, a re-entered initialization and a one-sided image each keep the whole batch and change nothing",
+     "claim": "the emitted handoff — the removable peer registered, both /5 controls ready and their /4 image — releases an eligible root, while a mixed fence, an unequal transaction, a re-entered initialization and a one-sided image each keep the whole batch and change nothing",
      "carried_by": "a_one_sided_coordinated_adoption_keeps_the_whole_batch_and_changes_nothing"},
 ]
 
@@ -291,6 +296,27 @@ def pool_state_document(fence, init=None):
     if init is not None:
         document["outputs_init"] = init
     return document
+
+
+def registration_document():
+    """Oxide's removable-pool registration, exactly its own field set. Pure.
+
+    Registration is the coordinated pair membership: while it is here the
+    reader must name the sibling control, and no fixture in this proof may rely
+    on a directory alone to stand in for it.
+    """
+    return {
+        "version": 2,
+        "mount_point": "/Volumes/Builds",
+        "volume_uuid": OXIDE_POOL_VOLUME_UUID,
+        "container_uuid": OXIDE_POOL_VOLUME_UUID,
+        "reserve_bytes": 1,
+        "cap_bytes": 2,
+        "quota_bytes": None,
+        "capacity_bytes": None,
+        "registered_ms": 1,
+        "mode": "ephemeral",
+    }
 
 
 def ledger_document():
@@ -1583,6 +1609,13 @@ class Proof:
                     os.unlink(os.path.join(control, name))
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(os.path.join(os.path.dirname(control), "ledger.json"))
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(os.path.join(self.home, OXIDE_RELATIVE_CONTROL, OXIDE_REGISTRATION_NAME))
+
+    def peer_registration(self):
+        """Publish Oxide's registration of the removable pool under the private HOME."""
+        self.publish(os.path.join(self.home, OXIDE_RELATIVE_CONTROL, OXIDE_REGISTRATION_NAME),
+                     registration_document())
 
     def publish(self, path, document):
         """Write one fixture JSON document at `path`.
@@ -1617,7 +1650,9 @@ class Proof:
         return {"initializing": {"transaction": transaction, "started_ms": 1}}
 
     def coordinated_adoption(self, rows=(), settled=()):
-        """The exact emitted handoff: both `/5` controls ready, then their `/4` image."""
+        """The exact emitted handoff: the peer registered, both `/5` controls ready,
+        then their `/4` image."""
+        self.peer_registration()
         self.write_pair((OXIDE_COORDINATED_FENCE, self.ready()),
                         (OXIDE_COORDINATED_FENCE, self.ready()))
         self.coordinated_registry(list(rows), list(settled))
@@ -2144,6 +2179,7 @@ class Proof:
         # The exact malformed shape: the completed paired controls beside a
         # coordinated image without its settlement set, as no /4-aware writer
         # ever publishes it. The fault is the image alone.
+        self.peer_registration()
         self.write_pair((OXIDE_COORDINATED_FENCE, self.ready()),
                         (OXIDE_COORDINATED_FENCE, self.ready()))
         path = os.path.join(self.home, OXIDE_RELATIVE_REGISTRY)
@@ -2272,12 +2308,13 @@ class Proof:
         """The coordinated adoption group: the emitted handoff releases, and every
         one-sided, mid-adoption or mixed generation keeps the whole batch.
 
-        Positive first: both `/5` controls ready under one transaction with the
-        `/4` image that transaction created, over which an aged, unreferenced
-        root releases. Then the four ways that handoff can be incomplete, each
-        on a fresh area and its own eligible root: a mixed fence pair, an
-        unequal transaction, a re-entered initialization, and a complete pair
-        whose image is still the legacy `/2` one.
+        Positive first: the removable peer registered, both `/5` controls ready
+        under one transaction, and the `/4` image that transaction created — over
+        which an aged, unreferenced root releases. Then the four ways that
+        handoff can be incomplete, each on a fresh area and its own eligible
+        root: a mixed fence pair, an unequal transaction, a re-entered
+        initialization, and a complete pair whose image is still the legacy `/2`
+        one.
         """
         area = self.fresh_area("c16", f"oldest-idle:{AREA_AGE_SECONDS}")
         root = self.new_root(area, aged=True)
@@ -2292,24 +2329,28 @@ class Proof:
                 run_doc["data"], root["root_id"], observations)))
         steps = [
             ("mixed-fence",
-             [lambda: self.write_pair(
-                 (OXIDE_COORDINATED_FENCE, self.ready()),
-                 (OXIDE_ROUTED_FENCE, self.ready())),
+             [lambda: self.peer_registration(),
+              lambda: self.write_pair(
+                  (OXIDE_COORDINATED_FENCE, self.ready()),
+                  (OXIDE_ROUTED_FENCE, self.ready())),
               lambda: self.coordinated_registry([], [])]),
             ("unequal-transaction",
-             [lambda: self.write_pair(
-                 (OXIDE_COORDINATED_FENCE, self.ready()),
-                 (OXIDE_COORDINATED_FENCE, self.ready("b" * 32))),
+             [lambda: self.peer_registration(),
+              lambda: self.write_pair(
+                  (OXIDE_COORDINATED_FENCE, self.ready()),
+                  (OXIDE_COORDINATED_FENCE, self.ready("b" * 32))),
               lambda: self.coordinated_registry([], [])]),
             ("initializing",
-             [lambda: self.write_pair(
-                 (OXIDE_COORDINATED_FENCE, self.ready()),
-                 (OXIDE_COORDINATED_FENCE, self.initializing())),
+             [lambda: self.peer_registration(),
+              lambda: self.write_pair(
+                  (OXIDE_COORDINATED_FENCE, self.ready()),
+                  (OXIDE_COORDINATED_FENCE, self.initializing())),
               lambda: self.coordinated_registry([], [])]),
             ("one-sided-image",
-             [lambda: self.write_pair(
-                 (OXIDE_COORDINATED_FENCE, self.ready()),
-                 (OXIDE_COORDINATED_FENCE, self.ready())),
+             [lambda: self.peer_registration(),
+              lambda: self.write_pair(
+                  (OXIDE_COORDINATED_FENCE, self.ready()),
+                  (OXIDE_COORDINATED_FENCE, self.ready())),
               lambda: self.legacy_registry([], complete=True)]),
         ]
         refusals = []
@@ -3435,6 +3476,37 @@ def r16_case_controls():
         return [document for path, document in published
                 if path.endswith("registry.json")]
 
+    def registration_documents(published):
+        return [document for path, document in published
+                if path.endswith(OXIDE_REGISTRATION_NAME)]
+
+    # The exact paired footprint this fixture must publish under the private
+    # HOME: the registration, both control states and the one registry image.
+    # Nothing else may stand in for them.
+    control = os.path.join("/guard/home", OXIDE_RELATIVE_CONTROL)
+    # The producer's own registration field set, spelled here rather than read
+    # back from the fixture's writer.
+    expected_registration = {
+        "version": 2,
+        "mount_point": "/Volumes/Builds",
+        "volume_uuid": OXIDE_POOL_VOLUME_UUID,
+        "container_uuid": OXIDE_POOL_VOLUME_UUID,
+        "reserve_bytes": 1,
+        "cap_bytes": 2,
+        "quota_bytes": None,
+        "capacity_bytes": None,
+        "registered_ms": 1,
+        "mode": "ephemeral",
+    }
+    expected_positive_footprint = [
+        os.path.join(control, OXIDE_REGISTRATION_NAME),
+        os.path.join(control, "state.json"),
+        os.path.join(os.path.dirname(control), "ledger.json"),
+        os.path.join(control, "removable", "oxide-managed", "state.json"),
+        os.path.join(control, "removable", "ledger.json"),
+        os.path.join("/guard/home", OXIDE_RELATIVE_REGISTRY),
+    ]
+
     def controls_are(published):
         states = state_documents(published)
         return [(document.get("owned_outputs"), document.get("outputs_init"))
@@ -3473,10 +3545,16 @@ def r16_case_controls():
                               if document["version"] == OXIDE_COORDINATED_REGISTRY_VERSION]
         legacy_images = [document for document in images
                          if document["version"] == OXIDE_REGISTRY_VERSION]
+        registrations = registration_documents(published)
+        positive_paths = [path for path, _document in published][:6]
         failed = first_failed_predicate([
             ("positive_plan", lambda: ("plan_and_run", "R16", "released", True) not in calls),
             ("positive_run",
              lambda: ("real", "/guard/root/R16-plan.json", "d" * 64, 0) not in calls),
+            ("peer_registration",
+             lambda: not registrations or registrations[0] != expected_registration),
+            ("positive_footprint",
+             lambda: positive_paths != expected_positive_footprint),
             ("positive_pair",
              lambda: positive_pair != [(OXIDE_COORDINATED_FENCE, ready_shape)] * 2),
             ("positive_image",
