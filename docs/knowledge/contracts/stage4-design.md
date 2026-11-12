@@ -2836,6 +2836,16 @@ mount, a mismatched device, and a failed, partial or unreadable attach are each 
 custody; nothing is detached, repaired or retried. The same rule decides the pre-detach binding
 and R11's remount, and clearance after a detach is zero entity rows for the backing.
 
+The census is parsed fail-closed: the top-level document, its `images` list, a relevant
+image's `image-path`, the entity list itself and each entity's device, mount point and
+volume UUID must be well formed, and an image that states an empty or missing entity
+list, or a second image that names the same backing, is unknown — never absence. Only a
+fully readable census in which no image names the backing is positive whole-backing
+absence, so a missing, malformed, filtered or unreadable structure can never masquerade
+as clearance. The custody indication is also verified to be the guard's own
+`image-custody.json` inside its published evidence directory before the backing exists and
+before any attach.
+
 **Closure.** Each detach is one ordinary `hdiutil detach` of the run's own mount,
 authorized by a fresh rebind census taken immediately before it (the same backing,
 mount, device and volume UUID), and accepted only when all of these hold: the child
@@ -2844,6 +2854,14 @@ for the backing at all — whole-backing absence, not merely an absent mount pat
 and the mount path is gone. A non-zero or unreaped child, an unreadable census, or a
 missing mount with the backing still attached is a retained, unqualified outcome
 with no retry and no force detach.
+
+Each pre- and post-detach census and the detach command are retained in the occurrence's
+own receipt: the command's argv, exit and reap, the complete captured byte count and
+SHA-256 of each stream, a bounded raw prefix with an explicit truncation flag, the parsed
+backing and entity identities, and the exact deciding reason (the attach decision's own
+census is recorded too). An unreadable, incomplete or
+truncated deciding fact is recorded as unknown; nothing is inferred from a later path
+absence and no device-state observation is turned into a clearance rule.
 
 R11's intermediate detach and the final one are distinct: each re-derives its own
 authority, and neither borrows the other's census. R11's remount must verify the same
@@ -2889,7 +2907,24 @@ digest-bound `volume register` plan for the same verified image; the old registr
 is never rewritten. A failed R11 skips R12. Unknown command, device or custody
 outcomes stop collection and retain the image without a repair attempt; receipts
 identify skipped and unexecuted cases. The effect-free self-check exercises the
-rebind, rollback and dispatch gates; it supplies no native credit.
+rebind, rollback and dispatch gates plus the attachment census and closure composition
+(fail-closed parsing of malformed and truncated external facts, the real pre/post-detach
+receipt record and the custody-indication target); it supplies no native credit.
+
+Occurrences after the accepted source judgment are recorded here as history, never as
+qualification or credit, and none of their bytes is reconstructed. The `a83b86c`
+diagnostic failed R6 on unknown descriptor custody with the deciding facts unretained.
+Its replacement `ed89fa37` observed all sixteen case rows pass at `d850e6a` but kept no
+actual index listing, so it is uncredited. `939f46f8` failed R12 on the same closed-
+descriptor policy. `25c2187e` then passed all sixteen case rows with complete source and
+index evidence, but its own final ordinary detach returned exit 0 and was reaped with the
+mount absent while the whole-backing census still named three attached entities with no
+mount point: `closed` false, `custody` retained. That occurrence is failed/inadequate/
+spent, and image UUID `7E9A11B8-FA79-4CD0-8080-0C7D038C6F42` (recorded device
+`/dev/disk25s1`, backing under the guard's cleaned scratch) is an exact open custody
+obligation for owner disposition. The later reported backing-path absence is not
+detachment, no guard-cleanup explanation is established, and no detach, repair, retry or
+old-resource inspection is authorized here.
 
 The receipt, `release-proof-receipt.json` under `OXIDE_PROOF_EVIDENCE`, records the
 head, the binary's and the supervisor's digests, the verified scratch route, the

@@ -188,6 +188,14 @@ ROUTE_SCHEMA = "barge.release.proof-route/1"
 # the backing and keeps the root while it is mounted or attached-but-unmounted.
 CUSTODY_NAME = "image-custody.json"
 CUSTODY_VERSION = 1
+# The attachment census report and the bounded raw prefix each command record keeps.
+ATTACHMENT_CENSUS_SCHEMA = "barge.release.attachment-census/1"
+COMMAND_SCHEMA = "barge.release.command/1"
+CENSUS_PREFIX_BYTES = 4096
+# An entity that carries a volume UUID must carry a well-formed one; a malformed value is
+# a structure this census does not understand, never an entity without a UUID.
+VOLUME_UUID_SHAPE = re.compile(
+    r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")
 INFO_TIMEOUT_SECONDS = 10
 DETACH_TIMEOUT_SECONDS = 30
 HDIUTIL = "/usr/bin/hdiutil"
@@ -654,41 +662,145 @@ def custody_document(backing, root, evidence):
     return {"version": CUSTODY_VERSION, "backings": [backing]}
 
 
-def image_attachments(backing, environment):
-    """The live attachment census for one backing, or None when it is unreadable.
+def command_record(argv, completed):
+    """One bounded external command's own record: argv, exit, reap and captured bytes. Pure.
 
-    Each row is `(device, mount_point)`, with `mount_point` None for an attached but
-    unmounted entity. A backing named by no image is `[]`, which is the only positive
-    whole-backing absence. An unreadable or divergent census is None: never absence.
+    A command that never completed has no exit and is not reaped; its captured bytes are
+    empty. Each stream keeps its complete byte count and digest plus a bounded raw prefix
+    with an explicit truncation flag, so a deciding message is judgeable from the receipt.
     """
-    try:
-        observed = subprocess.run([HDIUTIL, "info", "-plist"], env=environment,
-                                  capture_output=True, timeout=INFO_TIMEOUT_SECONDS)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if observed.returncode != 0:
-        return None
-    try:
-        images = plistlib.loads(observed.stdout)["images"]
-    except (ValueError, KeyError, TypeError, plistlib.InvalidFileException):
-        return None
+    stdout = completed.stdout if completed is not None and isinstance(completed.stdout, bytes) else b""
+    stderr = completed.stderr if completed is not None and isinstance(completed.stderr, bytes) else b""
+    return {
+        "schema": COMMAND_SCHEMA,
+        "argv": list(argv),
+        "exit": None if completed is None else completed.returncode,
+        "reaped": completed is not None,
+        "stdout_bytes": len(stdout),
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+        "stdout_prefix": stdout[:CENSUS_PREFIX_BYTES].decode("utf-8", "replace"),
+        "stdout_truncated": len(stdout) > CENSUS_PREFIX_BYTES,
+        "stderr_bytes": len(stderr),
+        "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+        "stderr_prefix": stderr[:CENSUS_PREFIX_BYTES].decode("utf-8", "replace"),
+        "stderr_truncated": len(stderr) > CENSUS_PREFIX_BYTES,
+    }
+
+
+def parse_attachment_census(parsed, backing):
+    """The parsed census for one backing, fail-closed. Pure.
+
+    Returns `(problem, matched, entities, rows)`. `rows is None` is an unreadable
+    census; `rows == []` is the only positive whole-backing absence and only a fully
+    readable document with no image naming this backing establishes it. Every incomplete
+    or malformed *relevant* structure — the top-level document, `images`, an
+    `image-path`, the entity list itself, an entity's device, mount point or volume UUID,
+    or a second image naming the same backing — is unreadable, never absence. Entities of
+    other images are not interpreted.
+    """
+    if not isinstance(parsed, dict):
+        return "the census is not a dictionary", False, [], None
+    images = parsed.get("images")
+    if not isinstance(images, list):
+        return "the census has no image list", False, [], None
     wanted = os.path.realpath(backing)
-    rows = []
+    matched, entities, seen = False, [], 0
     for image in images:
+        if not isinstance(image, dict):
+            return "an image entry is not a dictionary", matched, entities, None
         path = image.get("image-path")
         if not isinstance(path, str) or not path:
-            return None
+            return "an image entry has no usable image-path", matched, entities, None
         if os.path.realpath(path) != wanted:
             continue
-        for entity in image.get("system-entities") or []:
+        matched, seen = True, seen + 1
+        if seen > 1:
+            return "more than one image names this backing", matched, entities, None
+        listed = image.get("system-entities")
+        if not isinstance(listed, list) or not listed:
+            return "the image's entity list is missing, empty or not a list", matched, entities, None
+        for entity in listed:
+            if not isinstance(entity, dict):
+                return "an attachment entity is not a dictionary", matched, entities, None
             device = entity.get("dev-entry")
-            mount = entity.get("mount-point")
             if not isinstance(device, str) or not device:
-                return None
+                return "an attachment entity has no usable device", matched, entities, None
+            mount = entity.get("mount-point")
             if mount is not None and (not isinstance(mount, str) or not mount):
-                return None
-            rows.append((device, mount))
-    return rows
+                return "an attachment entity has an unusable mount point", matched, entities, None
+            volume_uuid = entity.get("volume-uuid")
+            if volume_uuid is not None and (
+                    not isinstance(volume_uuid, str) or not VOLUME_UUID_SHAPE.match(volume_uuid)):
+                return "an attachment entity has an unusable volume UUID", matched, entities, None
+            entities.append({"device": device, "mount": mount, "volume_uuid": volume_uuid})
+    return None, matched, entities, [(entity["device"], entity["mount"]) for entity in entities]
+
+
+def attachment_census(backing, environment, runner=None):
+    """One bounded, fail-closed attachment census for one backing. Pure but for the command.
+
+    The report keeps the command's own argv, exit, reap, captured byte counts and digests
+    and a bounded raw prefix, plus this backing's parsed entity identities and the exact
+    deciding reason when it is unreadable. `rows is None` is unknown for every reason but
+    a fully readable census that names no attachment of this backing.
+    """
+    argv = [HDIUTIL, "info", "-plist"]
+    document = {
+        "schema": ATTACHMENT_CENSUS_SCHEMA, "argv": argv, "exit": None, "reaped": False,
+        "stdout_bytes": 0, "stdout_sha256": None, "stdout_prefix": "",
+        "stdout_truncated": False, "unreadable": True, "problem": None,
+        "backing": backing, "matched": False, "entities": [], "rows": None,
+    }
+    run_command = runner or (lambda command: subprocess.run(
+        command, env=environment, capture_output=True, timeout=INFO_TIMEOUT_SECONDS))
+    try:
+        observed = run_command(argv)
+    except (OSError, subprocess.SubprocessError):
+        document["problem"] = "the attachment census did not complete"
+        return document
+    record = command_record(argv, observed)
+    for key in ("exit", "reaped", "stdout_bytes", "stdout_sha256", "stdout_prefix",
+                "stdout_truncated"):
+        document[key] = record[key]
+    if observed.returncode != 0:
+        document["problem"] = f"the attachment census exited {observed.returncode}"
+        return document
+    try:
+        parsed = plistlib.loads(observed.stdout or b"")
+    except (ValueError, TypeError, plistlib.InvalidFileException):
+        document["problem"] = "the attachment census is not a readable property list"
+        return document
+    problem, matched, entities, rows = parse_attachment_census(parsed, backing)
+    document.update({"matched": matched, "entities": entities, "rows": rows})
+    if problem is not None:
+        document["problem"] = problem
+        return document
+    document["unreadable"] = False
+    return document
+
+
+def custody_target_problems(path, evidence, guard_evidence=None):
+    """Why the custody indication is not at the guard's own evidence path. Pure.
+
+    The indication must be the guard's `image-custody.json` inside the evidence directory
+    the guard published for this occurrence; a path outside it, a symlink or a relative
+    evidence directory refuses before any attach.
+    """
+    problems = []
+    if not isinstance(evidence, str) or not os.path.isabs(evidence):
+        problems.append("the guard's evidence directory is not an absolute path")
+        return problems
+    wanted = os.path.normpath(os.path.join(evidence, CUSTODY_NAME))
+    if not isinstance(path, str) or os.path.normpath(path) != wanted:
+        problems.append(f"the custody indication {path!r} is not the guard's {wanted!r}")
+    if guard_evidence is not None:
+        if not isinstance(guard_evidence, str) or not os.path.isabs(guard_evidence):
+            problems.append("the guard's own evidence variable is not an absolute path")
+        elif os.path.realpath(evidence) != os.path.realpath(guard_evidence):
+            problems.append("the custody indication is not inside the guard's own evidence directory")
+    if os.path.islink(path):
+        problems.append("the custody indication path is a symbolic link")
+    return problems
 
 
 def attach_document(exit_code, reaped, rows, mount, device):
@@ -1320,6 +1432,7 @@ class Proof:
         self.device_after_remount = None
         self.remount = None
         self.custody = None
+        self.attach_census = None
         self.env = None
         self.attached = False
         self.results = []
@@ -1381,9 +1494,19 @@ class Proof:
             raise Fault("premise", "the binary under test does not run `describe`")
 
     def publish_custody(self):
-        """Publish the guard's image-custody indication: one bounded atomic document."""
-        document = custody_document(self.image, self.root, self.evidence)
-        path = os.path.join(self.evidence, CUSTODY_NAME)
+        """Publish the guard's image-custody indication: one bounded atomic document.
+
+        The indication must land at the guard's own evidence path for this occurrence,
+        which is verified before anything is written and therefore before any attach.
+        """
+        guard_evidence = os.environ.get("OXIDE_PROOF_EVIDENCE")
+        evidence = guard_evidence or self.evidence
+        document = custody_document(self.image, self.root, evidence)
+        path = os.path.join(evidence, CUSTODY_NAME)
+        problems = custody_target_problems(path, evidence, guard_evidence)
+        if problems:
+            raise Infrastructure("custody", "; ".join(problems))
+        self.evidence = evidence
         temporary = path + ".tmp"
         try:
             descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -1427,10 +1550,14 @@ class Proof:
                 device = mounted[0].get("dev-entry")
         except (ValueError, KeyError, TypeError, plistlib.InvalidFileException):
             device = None
-        document = attach_document(spawn.returncode, True, image_attachments(self.image, self.env),
-                                   mount, device)
+        census = attachment_census(self.image, self.env)
+        self.attach_census = census
+        document = attach_document(spawn.returncode, True, census["rows"], mount, device)
         if document["state"] != "attached":
-            raise Infrastructure("attach", document["reason"])
+            reason = document["reason"]
+            if census.get("problem"):
+                reason = f"{reason}: {census['problem']}"
+            raise Infrastructure("attach", reason)
         info = run([DISKUTIL, "info", "-plist", mount], self.env)
         parsed = plistlib.loads(info.stdout.encode())
         uuid = parsed.get(VOLUME_UUID_KEY)
@@ -1467,21 +1594,31 @@ class Proof:
             return {"purpose": purpose, "exit": None, "reaped": False, "mount_absent": False,
                     "backing_attached": None, "closed": False, "custody": "retained",
                     "reason": "no positively recorded attachment to detach"}
-        problems = detach_binding_problems(image_attachments(self.image, self.env), self.mount,
+        before = attachment_census(self.image, self.env)
+        problems = detach_binding_problems(before["rows"], self.mount,
                                            self.device, self.uuid, volume_uuid(self.mount))
         if problems:
             return {"purpose": purpose, "exit": None, "reaped": False, "mount_absent": False,
                     "backing_attached": None, "closed": False, "custody": "unknown",
-                    "reason": "; ".join(problems)}
+                    "reason": "; ".join(problems), "command": None,
+                    "pre_census": before, "post_census": None}
+        argv = [HDIUTIL, "detach", self.mount]
         try:
-            result = subprocess.run([HDIUTIL, "detach", self.mount], env=self.env,
-                                    capture_output=True, timeout=DETACH_TIMEOUT_SECONDS)
-            exit_code, reaped = result.returncode, True
+            observed = subprocess.run(argv, env=self.env, capture_output=True,
+                                      timeout=DETACH_TIMEOUT_SECONDS)
         except (OSError, subprocess.SubprocessError):
-            exit_code, reaped = None, False
-        document = closure_document(purpose, exit_code, reaped,
-                                    image_attachments(self.image, self.env),
+            exit_code, reaped, command = None, False, command_record(argv, None)
+        else:
+            exit_code, reaped = observed.returncode, True
+            command = command_record(argv, observed)
+        after = attachment_census(self.image, self.env)
+        document = closure_document(purpose, exit_code, reaped, after["rows"],
                                     not os.path.lexists(self.mount))
+        if after["rows"] is None and after.get("problem"):
+            document["reason"] = f"{document['reason']}: {after['problem']}"
+        document["command"] = command
+        document["pre_census"] = before
+        document["post_census"] = after
         if document["closed"]:
             self.attached = False
         return document
@@ -2460,6 +2597,7 @@ class Proof:
             "supervisor": {"path": supervisor_path(), "sha256": SUPERVISOR_SHA256},
             "route": self.route,
             "image": {"size_mib": IMAGE_MIB, "backing": self.image, "volume_uuid": self.uuid,
+                      "attach_census": self.attach_census,
                       "device": self.device, "device_after_remount": self.device_after_remount,
                       "mounts": self.mount_history, "ownership": self.ownership,
                       "custody": self.custody, "remount": self.remount},
@@ -3049,6 +3187,213 @@ def closure_controls():
             problems.append(f"an unclosed detach {exit_code, reaped, rows, mount_absent} is accepted")
     if closure_document("intermediate", 0, True, [], True)["purpose"] != "intermediate":
         problems.append("the closure record does not keep the detach's purpose")
+    return problems
+
+
+def census_controls():
+    """The attachment census, its fail-closed parser and the real detach composition. Pure.
+
+    Every external fact is a labelled fake: canned `hdiutil info` property lists and a
+    faked command runner. The composition controls drive the actual `Proof.detach`, so the
+    pre-census binding, the bounded command record and the post-census closure are the
+    real code. The historically observed nonempty three-entity final census is preserved
+    as a failure, and no unreadable, malformed or truncated structure is ever absence.
+    """
+    problems = []
+    backing = "/guard/root/run/release-volume.sparseimage"
+    mount = "/Volumes/barge-release-proof-1-2-a"
+    device = "/dev/disk9s1"
+    container = "/dev/disk9"
+    volume_uuid = "8A660440-C919-45C6-A3F1-3365B9BD2006"
+
+    def plist_safe(value):
+        """A plist-encodable copy: hdiutil omits absent members rather than writing null."""
+        if isinstance(value, dict):
+            return {key: plist_safe(item) for key, item in value.items() if item is not None}
+        if isinstance(value, list):
+            return [plist_safe(item) for item in value]
+        return value
+
+    def completed(payload, returncode=0):
+        stdout = payload if isinstance(payload, bytes) else plistlib.dumps(plist_safe(payload))
+        return subprocess.CompletedProcess(args=["hdiutil"], returncode=returncode,
+                                           stdout=stdout, stderr=b"")
+
+    def census(payload, backing_path=backing, returncode=0, **kwargs):
+        runner = kwargs.pop("runner", None)
+        if runner is None:
+            runner = lambda _argv: completed(payload, returncode)
+        return attachment_census(backing_path, {}, runner=runner)
+
+    def attached(entities, image_path=backing):
+        return {"images": [{"image-path": image_path, "system-entities": entities}]}
+
+    volume = {"dev-entry": device, "mount-point": mount, "volume-uuid": volume_uuid}
+    container_entity = {"dev-entry": container}
+
+    # Positives: a readable census that names no attachment of this backing is the only
+    # whole-backing absence, and a readable attached census keeps its entity identities.
+    for payload in ({"images": []},
+                    {"images": [{"image-path": "/elsewhere/other.sparseimage",
+                                 "system-entities": [{"dev-entry": "/dev/disk7s1"}]}]}):
+        document = census(payload)
+        if document["unreadable"] or document["rows"] != [] or document["matched"]:
+            problems.append(f"a positive absence census reads as {document['rows']}: {document}")
+        if document["stdout_bytes"] <= 0 or not document["stdout_sha256"]:
+            problems.append("a census record keeps no captured byte count or digest")
+    document = census(attached([container_entity, volume]))
+    if document["unreadable"] or document["rows"] != [(container, None), (device, mount)]:
+        problems.append(f"an attached census does not keep its entities: {document}")
+    if document["entities"][1]["volume_uuid"] != volume_uuid:
+        problems.append("an attached census loses a parsed volume UUID")
+
+    # Every incomplete or malformed relevant structure is unreadable, never absence.
+    malformed = [
+        ("not a plist", b"<not a plist", 0),
+        ("a plist that is not a dictionary", plistlib.dumps(["images"]), 0),
+        ("no image list", {"version": 1}, 0),
+        ("an image list of the wrong type", {"images": {}}, 0),
+        ("an image entry that is not a dictionary", {"images": ["x"]}, 0),
+        ("no image-path", {"images": [{"system-entities": [volume]}]}, 0),
+        ("an empty image-path", {"images": [{"image-path": "", "system-entities": [volume]}]}, 0),
+        ("no entity list for this backing",
+         {"images": [{"image-path": backing}]}, 0),
+        ("an entity list stated as text",
+         {"images": [{"image-path": backing, "system-entities": "none"}]}, 0),
+        ("an empty entity list for this backing",
+         {"images": [{"image-path": backing, "system-entities": []}]}, 0),
+        ("an entity list of the wrong type",
+         {"images": [{"image-path": backing, "system-entities": {"dev-entry": device}}]}, 0),
+        ("an entity that is not a dictionary",
+         {"images": [{"image-path": backing, "system-entities": ["x"]}]}, 0),
+        ("an entity with no device",
+         {"images": [{"image-path": backing, "system-entities": [container_entity, {"mount-point": mount}]}]}, 0),
+        ("an entity with an empty device",
+         {"images": [{"image-path": backing, "system-entities": [{"dev-entry": ""}]}]}, 0),
+        ("an entity with an empty mount point",
+         {"images": [{"image-path": backing, "system-entities": [dict(volume, **{"mount-point": ""})]}]}, 0),
+        ("an entity with a malformed volume UUID",
+         {"images": [{"image-path": backing, "system-entities": [dict(volume, **{"volume-uuid": "not-a-uuid"})]}]}, 0),
+        ("two images naming this backing",
+         {"images": [{"image-path": backing, "system-entities": [volume]},
+                     {"image-path": backing, "system-entities": [volume]}]}, 0),
+        ("a non-zero census exit", attached([volume]), 1),
+    ]
+    for label, payload, returncode in malformed:
+        document = census(payload, returncode=returncode)
+        if not document["unreadable"] or document["rows"] is not None:
+            problems.append(f"{label} reads as an answer: rows={document['rows']} problem={document['problem']}")
+        if not document["problem"]:
+            problems.append(f"{label} keeps no deciding reason")
+
+    def raising(_argv):
+        raise OSError("the census child cannot run")
+    document = attachment_census(backing, {}, runner=raising)
+    if not document["unreadable"] or document["rows"] is not None or document["reaped"]:
+        problems.append(f"a census that never ran reads as an answer: {document}")
+
+    # The raw prefix is bounded and states its truncation; the complete digest still binds
+    # the whole captured document.
+    big = plistlib.dumps({"images": [{"image-path": backing, "system-entities": [
+        {"dev-entry": f"/dev/disk{index}s1"} for index in range(400)]}]})
+    document = census(big)
+    if not document["stdout_truncated"]:
+        problems.append("a census larger than the prefix is not marked truncated")
+    if len(document["stdout_prefix"].encode()) > CENSUS_PREFIX_BYTES:
+        problems.append("the census raw prefix exceeds its bound")
+    if document["stdout_bytes"] != len(big) or document["stdout_sha256"] != hashlib.sha256(big).hexdigest():
+        problems.append("the census record does not bind the complete captured bytes")
+
+    # The real detach composition: pre-census binding, the bounded command record and the
+    # post-census closure, driven through `Proof.detach` with fake external facts only.
+    def drive(pre_rows, post_rows, detach_exit=0):
+        proof = Proof.__new__(Proof)
+        proof.attached = True
+        proof.mount = mount
+        proof.uuid = volume_uuid
+        proof.device = device
+        proof.image = backing
+        proof.env = {}
+        def census_for(rows):
+            if rows is None:
+                return census(b"<not a plist")
+            if rows == []:
+                return census({"images": []})
+            return census(attached([{"dev-entry": row[0], "mount-point": row[1]}
+                                    for row in rows]))
+        censuses = iter([census_for(pre_rows), census_for(post_rows)])
+        seen = []
+
+        def detach_run(argv, **kwargs):
+            seen.append(list(argv))
+            return subprocess.CompletedProcess(args=argv, returncode=detach_exit,
+                                               stdout=b"", stderr=b"")
+        module = sys.modules[__name__]
+        with mock.patch.object(module, "attachment_census", lambda *args, **kwargs: next(censuses)), \
+                mock.patch.object(module, "volume_uuid", lambda _mount: volume_uuid), \
+                mock.patch("subprocess.run", detach_run), \
+                mock.patch("os.path.lexists", lambda _path: False):
+            document = proof.detach("final")
+        return document, seen
+
+    document, seen = drive([(container, None), (device, mount)], [])
+    failed = first_failed_predicate([
+        ("closed", lambda: not document["closed"]),
+        ("command", lambda: document["command"]["argv"] != [HDIUTIL, "detach", mount]),
+        ("exit", lambda: document["command"]["exit"] != 0),
+        ("reaped", lambda: document["command"]["reaped"] is not True),
+        ("hash", lambda: not document["command"]["stdout_sha256"]),
+        ("pre_census", lambda: document["pre_census"]["rows"] != [(container, None), (device, mount)]),
+        ("post_census", lambda: document["post_census"]["rows"] != []),
+        ("ran_once", lambda: seen != [[HDIUTIL, "detach", mount]]),
+    ])
+    if failed is not None:
+        problems.append(f"the real detach composition failed at {failed}: {document.get('reason')}")
+
+    # The historically observed final census: three attached entities, none mounted. It
+    # stays a retained, unqualified outcome, and the reason keeps the deciding count.
+    document, _seen = drive([(container, None), (device, mount)],
+                            [(container, None), (device, None), ("/dev/disk25s1", None)])
+    if document["closed"] or document["custody"] != "retained":
+        problems.append(f"the three-entity nonempty final census reads as closed: {document}")
+    if "3 entities" not in (document.get("reason") or ""):
+        problems.append(f"the three-entity failure does not keep its deciding count: {document.get('reason')}")
+
+    # An unreadable post-census is retained with the parser's own reason, and an unbound
+    # pre-census refuses the detach before any command runs.
+    document, seen = drive([(container, None), (device, mount)], None, detach_exit=0)
+    if document["closed"] or "unreadable" not in (document.get("reason") or ""):
+        problems.append(f"an unreadable post-census reads as an answer: {document.get('reason')}")
+    proof = Proof.__new__(Proof)
+    proof.attached = True
+    proof.mount = mount
+    proof.uuid = volume_uuid
+    proof.device = device
+    proof.image = backing
+    proof.env = {}
+    module = sys.modules[__name__]
+    unbound_census = census({"images": []})
+    with mock.patch.object(module, "attachment_census", lambda *args, **kwargs: unbound_census), \
+            mock.patch.object(module, "volume_uuid", lambda _mount: volume_uuid), \
+            mock.patch("subprocess.run", lambda *args, **kwargs: problems.append("a detach ran unbound")), \
+            mock.patch("os.path.lexists", lambda _path: True):
+        document = proof.detach("final")
+    if document["custody"] != "unknown" or document["command"] is not None:
+        problems.append(f"an unbound detach is not refused: {document}")
+    if proof.attached is not True:
+        problems.append("a refused detach forgets that the image is still attached")
+
+    # The custody indication must be the guard's own evidence child, verified before attach.
+    evidence = "/guard/root/evidence"
+    if custody_target_problems(os.path.join(evidence, CUSTODY_NAME), evidence, evidence):
+        problems.append("the guard's own custody path is refused")
+    for path, observed_evidence, guard_evidence in (
+            (os.path.join("/guard/root", CUSTODY_NAME), evidence, evidence),
+            (os.path.join(evidence, "other.json"), evidence, evidence),
+            (os.path.join(evidence, CUSTODY_NAME), "/guard/other", evidence),
+            (os.path.join(evidence, CUSTODY_NAME), "relative/evidence", None)):
+        if not custody_target_problems(path, observed_evidence, guard_evidence):
+            problems.append(f"a custody target {path!r} in {observed_evidence!r} is accepted")
     return problems
 
 
@@ -3973,6 +4318,7 @@ def pure_self_check():
     problems += stage_controls()
     problems += custody_controls()
     problems += closure_controls()
+    problems += census_controls()
     problems += containment_controls()
     problems += plan_controls()
     problems += row_failure_controls()
