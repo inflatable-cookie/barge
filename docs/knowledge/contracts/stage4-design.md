@@ -2918,10 +2918,14 @@ and its reason, and each gate's own verdict and reason (`identity`,
 `references_current`, `absence_verdict`/`absence_reason`) — before the bounded raw row.
 Every case's own plan-row oracle failure uses that same record, not a hand-picked
 subset of its fields: a custody block therefore publishes the custody verdict and its
-reason, which is what a failed occurrence needs after its run root is gone. A plan row is a
-sorted-key document whose `absence` member alone can exceed a short cap, so a truncated
-row would not name the gate; the deciding fields are what make a failed case judgeable
-from the receipt. This changes no eligibility decision.
+reason, which is what a failed occurrence needs after its run root is gone. The record
+also carries the row's own `root_id`, and each deciding field is capped on its own, so a
+long reason that sorts before another gate can never hide that gate's verdict — bounding
+the whole deciding object as one string could. A plan row is a
+sorted-key document whose `absence` member alone can exceed a short cap, so the raw row
+that follows the deciding fields is bounded separately and may be truncated; the deciding
+fields, not the row, are what make a failed case judgeable from the receipt. This changes
+no eligibility decision.
 
 The receipt also carries `qualification_inputs`: the case rows and the image
 clearance are its own, and the qualified supervisor's receipt is named as a required

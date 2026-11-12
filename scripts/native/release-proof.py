@@ -151,6 +151,10 @@ PROOF_RECEIPT = "release-proof-receipt.json"
 ROW_EVIDENCE_CHARS = 2000
 # How much of one free-text value a failure record keeps; the marker states the remainder.
 FAILURE_TEXT_CHARS = 400
+# A plan-row failure record keeps every deciding field, so each free-text field is
+# capped on its own here: no single long reason can push another gate's verdict out of
+# the record. The raw row that follows uses ROW_EVIDENCE_CHARS.
+ROW_FAILURE_FIELD_CHARS = 240
 # Any holder or name that is not this proof's own is refused.
 NAMESPACE = "example"
 # The one Cargo feature the staged binary is built with. It is named here, in the
@@ -1239,7 +1243,9 @@ def row_deciding_summary(row):
     A plan row is a sorted-key document, so `absence` sorts first and can consume a
     whole truncation by itself. The frozen oracle decides on `eligible` alone; this
     summary only makes a failing row judgeable from the receipt after the run root is
-    gone, by recording each gate's own verdict, its reason and the first blocker.
+    gone, by recording the row's own id, each gate's own verdict, its reason and the
+    first blocker. `root_id` is here, not only in the raw row, so a truncated row can
+    never hide which root the record is about.
     """
     identity = row.get("identity") or {}
     idle = row.get("idle") or {}
@@ -1247,6 +1253,7 @@ def row_deciding_summary(row):
     references = [reference for reference in (row.get("references") or [])
                   if isinstance(reference, dict)]
     return {
+        "root_id": row.get("root_id"),
         "eligible": row.get("eligible"),
         "blocked_by": row.get("blocked_by"),
         "reason": row.get("reason"),
@@ -1269,20 +1276,25 @@ def row_failure(predicate, row, **extra):
     """One plan-row oracle failure: every deciding field, then the bounded row. Pure.
 
     A failed native occurrence is judged after its run root is gone, so a record
-    that names only the first blocker is not enough. The row's own gates and their
-    reasons are recorded first and in full — the custody verdict and its reason
-    included — then the raw row inside `ROW_EVIDENCE_CHARS`, then any caller
-    comparison field. `predicate` names the one check that failed.
+    that names only the first blocker is not enough. Every deciding field is
+    published — the row's own id, each gate's verdict and its reason, the custody
+    verdict and its reason included — and each free-text value is capped **on its
+    own**, inside `ROW_FAILURE_FIELD_CHARS`, so one long reason cannot hide the
+    fields that follow it in sorted order. The raw row then rides inside
+    `ROW_EVIDENCE_CHARS`, and any caller comparison field follows it.
+    `predicate` names the one check that failed.
     """
-    deciding = bounded_text(json.dumps(row_deciding_summary(row), sort_keys=True),
-                            ROW_EVIDENCE_CHARS)
+    deciding = {
+        name: bounded_text(value, ROW_FAILURE_FIELD_CHARS)
+        for name, value in row_deciding_summary(row).items()
+    }
     rendered = bounded_text(json.dumps(row, sort_keys=True), ROW_EVIDENCE_CHARS)
     fields = "".join(
         f"; {name} "
         f"{bounded_text(value if isinstance(value, str) else json.dumps(value, sort_keys=True))}"
         for name, value in extra.items()
     )
-    return f"{predicate} failed: deciding {deciding}; row {rendered}{fields}"
+    return f"{predicate} failed: deciding {json.dumps(deciding, sort_keys=True)}; row {rendered}{fields}"
 
 
 class Proof:
@@ -3276,13 +3288,32 @@ def row_failure_controls():
     ])
     if failed is not None:
         problems.append(f"a plan-row failure record is missing {failed}: {detail[:300]}")
+    # A long reason that sorts before the custody fields must not hide them: the
+    # deciding fields are capped one by one, and the row id is one of them rather
+    # than only a member of the truncated raw row.
     hostile = dict(row, padding="p" * 9000)
+    hostile["absence"] = {"path": "/Volumes/x/" + "q" * 9000,
+                          "reason": "r" * 9000, "verdict": "present"}
+    hostile["root_id"] = "r"
     hostile_detail = row_failure("blocked_by", hostile)
-    if "...[+" not in hostile_detail:
-        problems.append("a hostile plan row is not capped with an explicit omission marker")
-    if len(hostile_detail) > 3 * ROW_EVIDENCE_CHARS:
+    for name, needle in [
+        ("omission marker", "...[+"),
+        ("root_id", '"root_id": "r"'),
+        ("custody verdict", '"custody": "unknown"'),
+        ("custody reason", "open-descriptor scan is unreadable"),
+        ("absence reason cap", '"absence_reason": "r'),
+    ]:
+        if needle not in hostile_detail:
+            problems.append(
+                f"a hostile plan-row failure record is missing its {name}: "
+                f"{hostile_detail[:400]}")
+    # The bound: every deciding field capped on its own, plus the bounded raw row.
+    allowance = len(row_deciding_summary(row)) * ROW_FAILURE_FIELD_CHARS + \
+        2 * ROW_EVIDENCE_CHARS
+    if len(hostile_detail) > allowance:
         problems.append(
-            f"a hostile plan-row failure record exceeds its allowance: {len(hostile_detail)}")
+            f"a hostile plan-row failure record exceeds its allowance: "
+            f"{len(hostile_detail)} > {allowance}")
 
     # The real R6 body, on canned seams: its own failure path must carry the
     # custody verdict and reason the plan returned.
@@ -3336,7 +3367,7 @@ def plan_controls():
            "reason": "a reference still names this root: oxide-registry",
            "references": references, "references_complete": True, "root_id": "r"}
     summary = row_deciding_summary(row)
-    expected = {"eligible": False, "blocked_by": "references",
+    expected = {"root_id": "r", "eligible": False, "blocked_by": "references",
                 "reason": "a reference still names this root: oxide-registry",
                 "identity_verdict": "verified", "identity_reason": None,
                 "custody": "safe", "custody_reason": None,
