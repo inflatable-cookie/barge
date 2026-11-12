@@ -175,6 +175,12 @@ BUILD_COMMAND = [
     "oxide", "build", "-p", "barge-cli", "--locked", "--offline",
     "--features", PROOF_FEATURE, "--message-format", "json",
 ]
+# Only the separately verified guest path may select this command. Merely
+# constructing the argv is not a guest, admission, or guarded-run assertion.
+GUEST_BUILD_COMMAND = [
+    "cargo", "build", "-p", "barge-cli", "--locked", "--offline",
+    "--features", PROOF_FEATURE, "--message-format", "json",
+]
 TOOLCHAIN_CHANNEL = "1.97.1"
 # The staged copy lives inside this occurrence's guarded root, never a shared stage
 # directory and never outside the guard, and its directory name is exclusive.
@@ -667,6 +673,17 @@ def stage_environment(base, tmpdir):
     return environment
 
 
+def guest_stage_environment(base, tmpdir, target_dir):
+    """Describe a guest build confined to the guard, without granting authority."""
+    if (not isinstance(target_dir, str) or not isinstance(tmpdir, str)
+            or not os.path.isabs(tmpdir) or os.path.normpath(tmpdir) != tmpdir
+            or target_dir != os.path.join(tmpdir, "cargo-target")):
+        raise ValueError("the guest target directory is not inside this guard's scratch")
+    environment = stage_environment(base, tmpdir)
+    environment["CARGO_TARGET_DIR"] = target_dir
+    return environment
+
+
 def custody_document(backing, root, evidence):
     """The guard's opt-in image-custody indication for this run's one backing. Pure.
 
@@ -967,30 +984,55 @@ def guest_route_facts(path):
     result = {"scratch": path, "uid": os.geteuid(), "gid": os.getegid(),
               "home": os.environ.get("HOME"), "mount": GUEST_MOUNT,
               "volume_uuid": None, "canonical": False, "nofollow": False,
-              "owner_only": False, "same_volume": False, "reserve": False}
+              "owner_only": False, "same_volume": False, "reserve": False,
+              "route_identity": None}
     if not isinstance(path, str) or os.path.dirname(path) != GUEST_PARENT or not re.fullmatch(
             r"barge-proof-[A-Za-z0-9_-]{8,80}", os.path.basename(path)):
         return result
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if not getattr(os, "O_DIRECTORY", 0) or not getattr(os, "O_NOFOLLOW", 0):
+        return result
+    descriptors = []
     try:
-        # Every component is examined rather than trusting realpath alone.
-        parts = path.split(os.sep)[1:]
-        current = os.sep
-        for part in parts:
-            current = os.path.join(current, part)
-            info = os.lstat(current)
-            if __import__("stat").S_ISLNK(info.st_mode) or not __import__("stat").S_ISDIR(info.st_mode):
+        # Resolve each component relative to the opened parent, never through a link.
+        fd = os.open(os.sep, flags)
+        descriptors.append(fd)
+        current = ""
+        mount_info = None
+        parent_info = None
+        for part in path.split(os.sep)[1:]:
+            fd = os.open(part, flags, dir_fd=fd)
+            descriptors.append(fd)
+            info = os.fstat(fd)
+            if not __import__("stat").S_ISDIR(info.st_mode):
                 return result
-        mount_info = os.stat(GUEST_MOUNT)
-        leaf_info = os.lstat(path)
+            current += os.sep + part
+            if current == GUEST_MOUNT:
+                mount_info = info
+            if current == GUEST_PARENT:
+                parent_info = info
+        leaf_info = os.fstat(fd)
         result["canonical"] = os.path.realpath(path) == path
         result["nofollow"] = True
-        result["owner_only"] = leaf_info.st_uid == GUEST_UID and (leaf_info.st_mode & 0o777) == 0o700
-        result["same_volume"] = leaf_info.st_dev == mount_info.st_dev
+        result["owner_only"] = (parent_info is not None and parent_info.st_uid == 0
+                                and parent_info.st_gid == 0 and (parent_info.st_mode & 0o777) == 0o777
+                                and leaf_info.st_uid == GUEST_UID and leaf_info.st_gid == GUEST_GID
+                                and (leaf_info.st_mode & 0o777) == 0o700)
+        result["same_volume"] = (mount_info is not None and parent_info is not None
+                                 and leaf_info.st_dev == parent_info.st_dev == mount_info.st_dev)
+        result["route_identity"] = {
+            "mount": [mount_info.st_dev, mount_info.st_ino],
+            "parent": [parent_info.st_dev, parent_info.st_ino],
+            "leaf": [leaf_info.st_dev, leaf_info.st_ino],
+        }
         result["volume_uuid"] = volume_uuid(GUEST_MOUNT)
-        space = os.statvfs(path)
+        space = os.fstatvfs(fd)
         result["reserve"] = space.f_bavail * space.f_frsize >= 20 * 1024 ** 3
     except OSError:
         pass
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
     return result
 
 
@@ -1056,6 +1098,8 @@ def guest_binding_problems(record, observed):
     for key, expected in fixed.items():
         if record[key] != expected:
             problems.append(f"guest invocation {key} differs from its fixed value")
+    if type(record["uid"]) is not int or type(record["gid"]) is not int:
+        problems.append("guest invocation uid and gid must be integers")
     if record["role"] not in ("author", "reviewer") or record["mode"] not in ("diagnostic", "counted"):
         problems.append("guest role or mode is unsupported")
     for key in ("run", "activation", "nonce"):
@@ -1093,8 +1137,31 @@ def guest_receipt_problems(record, receipt, actual_digest, expected_digest):
     return problems
 
 
+def guest_recheck_problems(outer, inner):
+    """Compare independently observed local identities, never host authority."""
+    if not isinstance(outer, dict) or not isinstance(inner, dict):
+        return ["guest outer or inner observation is missing"]
+    keys = ("uid", "gid", "home", "mount", "volume_uuid", "scratch", "head", "tree",
+            "lock_sha256", "guard_sha256", "toolchain", "target", "features", "inputs_sha256",
+            "route_identity")
+    return [f"guest {key} changed between outer and inner" for key in keys
+            if outer.get(key) is None or outer.get(key) != inner.get(key)]
+
+
 def guest_binding_controls():
     """Exercise the data comparisons; these do not exercise the live guest route."""
+    problems = []
+    if BUILD_COMMAND[0] != "oxide" or GUEST_BUILD_COMMAND != ["cargo", *BUILD_COMMAND[1:]]:
+        problems.append("host and guest build commands are not the pinned separate routes")
+    environment = guest_stage_environment({"CARGO_TARGET_DIR": "/foreign", "RUSTFLAGS": "bad"},
+                                          "/guard/scratch", "/guard/scratch/cargo-target")
+    if environment.get("CARGO_TARGET_DIR") != "/guard/scratch/cargo-target" or stage_environment_problems(environment):
+        problems.append("guest build environment did not bind the guarded target and offline settings")
+    try:
+        guest_stage_environment({}, "/guard/scratch", "/foreign")
+        problems.append("guest build environment accepted an external target")
+    except ValueError:
+        pass
     record = {"task": "0e9abb83-41c5-48b6-88e3-583c849adfef", "role": "author",
               "run": "r" * 16, "activation": "a" * 16, "mode": "diagnostic",
               "vm_uuid": GUEST_VM_UUID, "uid": GUEST_UID, "gid": GUEST_GID,
@@ -1105,7 +1172,6 @@ def guest_binding_controls():
               "features": [PROOF_FEATURE], "command_sha256": "d" * 64,
               "inputs_sha256": "e" * 64, "nonce": "n" * 16}
     observed = dict(record, canonical=True, nofollow=True, owner_only=True, same_volume=True, reserve=True)
-    problems = []
     if guest_binding_problems(record, observed):
         problems.append("valid guest comparison was refused")
     for field in ("uid", "gid", "volume_uuid", "head", "tree", "lock_sha256", "guard_sha256",
@@ -1113,6 +1179,9 @@ def guest_binding_controls():
                   "same_volume", "reserve"):
         if not guest_binding_problems(record, dict(observed, **{field: None})):
             problems.append(f"guest comparison accepted changed {field}")
+    for field in ("uid", "gid"):
+        if not guest_binding_problems(dict(record, **{field: True}), observed):
+            problems.append(f"guest comparison accepted boolean {field}")
     for field in record:
         reduced = dict(record)
         del reduced[field]
@@ -1125,6 +1194,13 @@ def guest_binding_controls():
         problems.append("guest receipt comparison accepted a different nonce")
     if not guest_receipt_problems(record, receipt, "f" * 64, "0" * 64):
         problems.append("guest receipt comparison accepted different bytes")
+    paired = dict(observed, route_identity={"mount": [17, 1], "parent": [17, 2], "leaf": [17, 3]})
+    if guest_recheck_problems(paired, dict(paired)):
+        problems.append("matching guest observations did not compare equal")
+    for key in ("uid", "gid", "volume_uuid", "scratch", "head", "tree", "lock_sha256",
+                "guard_sha256", "toolchain", "target", "features", "inputs_sha256", "route_identity"):
+        if not guest_recheck_problems(paired, dict(paired, **{key: None})):
+            problems.append(f"guest recheck accepted changed {key}")
     raw = json.dumps(record).encode()
     digest = hashlib.sha256(raw).hexdigest()
     def read_instruction(data, expected, *, uid=123, mode=0o100600):
@@ -1146,22 +1222,31 @@ def guest_binding_controls():
             problems.append(f"guest instruction accepted {name}")
         except (OSError, ValueError):
             pass
-    directory = mock.Mock(st_mode=0o40700, st_uid=GUEST_UID, st_dev=17)
-    def observe_route(*, leaf=directory, mount=directory, real=None, free=21 * 1024 ** 3, uuid=GUEST_VOLUME_UUID):
+    directory = mock.Mock(st_mode=0o40700, st_uid=GUEST_UID, st_gid=GUEST_GID, st_dev=17)
+    parent = mock.Mock(st_mode=0o40777, st_uid=0, st_gid=0, st_dev=17)
+    def observe_route(*, leaf=directory, mount=directory, parent_info=parent, real=None,
+                      free=21 * 1024 ** 3, uuid=GUEST_VOLUME_UUID, open_error=None):
         path = record["scratch"]
-        with mock.patch("os.lstat", return_value=leaf), mock.patch("os.stat", return_value=mount), \
+        components = path.split(os.sep)[1:]
+        infos = [directory] * len(components)
+        infos[components.index("Data")] = mount
+        infos[-2] = parent_info
+        infos[-1] = leaf
+        with mock.patch("os.open", side_effect=open_error or iter(range(len(components) + 1))), \
+                mock.patch("os.close"), mock.patch("os.fstat", side_effect=infos + [leaf]), \
                 mock.patch("os.path.realpath", return_value=path if real is None else real), \
                 mock.patch("os.geteuid", return_value=GUEST_UID), mock.patch("os.getegid", return_value=GUEST_GID), \
                 mock.patch.dict(os.environ, {"HOME": GUEST_HOME}), \
-                mock.patch("os.statvfs", return_value=mock.Mock(f_bavail=free, f_frsize=1)), \
+                mock.patch("os.fstatvfs", return_value=mock.Mock(f_bavail=free, f_frsize=1)), \
                 mock.patch(__name__ + ".volume_uuid", return_value=uuid):
             return guest_route_facts(path)
     route = observe_route()
     if any(route[key] is not True for key in ("canonical", "nofollow", "owner_only", "same_volume", "reserve")):
         problems.append("guest route observations did not retain valid local facts")
-    for changed in (observe_route(leaf=mock.Mock(st_mode=0o120777, st_uid=GUEST_UID, st_dev=17)),
-                    observe_route(leaf=mock.Mock(st_mode=0o40755, st_uid=GUEST_UID, st_dev=17)),
-                    observe_route(mount=mock.Mock(st_dev=18)), observe_route(real="/other"),
+    for changed in (observe_route(open_error=OSError("no-follow refusal")),
+                    observe_route(leaf=mock.Mock(st_mode=0o40755, st_uid=GUEST_UID, st_gid=GUEST_GID, st_dev=17)),
+                    observe_route(parent_info=mock.Mock(st_mode=0o40777, st_uid=1, st_gid=0, st_dev=17)),
+                    observe_route(mount=mock.Mock(st_mode=0o40755, st_dev=18)), observe_route(real="/other"),
                     observe_route(free=0), observe_route(uuid="other")):
         observed_route = dict(observed, **changed)
         if not guest_binding_problems(record, observed_route):
