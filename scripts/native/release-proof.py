@@ -1265,6 +1265,26 @@ def row_deciding_summary(row):
     }
 
 
+def row_failure(predicate, row, **extra):
+    """One plan-row oracle failure: every deciding field, then the bounded row. Pure.
+
+    A failed native occurrence is judged after its run root is gone, so a record
+    that names only the first blocker is not enough. The row's own gates and their
+    reasons are recorded first and in full — the custody verdict and its reason
+    included — then the raw row inside `ROW_EVIDENCE_CHARS`, then any caller
+    comparison field. `predicate` names the one check that failed.
+    """
+    deciding = bounded_text(json.dumps(row_deciding_summary(row), sort_keys=True),
+                            ROW_EVIDENCE_CHARS)
+    rendered = bounded_text(json.dumps(row, sort_keys=True), ROW_EVIDENCE_CHARS)
+    fields = "".join(
+        f"; {name} "
+        f"{bounded_text(value if isinstance(value, str) else json.dumps(value, sort_keys=True))}"
+        for name, value in extra.items()
+    )
+    return f"{predicate} failed: deciding {deciding}; row {rendered}{fields}"
+
+
 class Proof:
     """One counted or diagnostic run: one image, one private HOME and state, many areas."""
 
@@ -1844,10 +1864,7 @@ class Proof:
             ("age_waived", lambda: bool(young.get("age_waived"))),
         ])
         if failed is not None:
-            raise Fault("R4", failure_detail(failed, failure_summary({
-                "blocked_by": young["blocked_by"], "age_waived": young.get("age_waived"),
-                "reason": young.get("reason"),
-                "identity_verdict": (young.get("identity") or {}).get("verdict")})))
+            raise Fault("R4", row_failure(failed, young))
         preview, row, plan_file = self.plan_and_run(
             "R4-named", area, root, named=[root["root_id"]], expect_eligible=True
         )
@@ -1857,10 +1874,10 @@ class Proof:
              lambda: preview["data"]["plan"]["named_roots"] != [root["root_id"]]),
         ])
         if failed is not None:
-            raise Fault("R4", failure_detail(failed, failure_summary({
-                "age_waived": row.get("age_waived"),
-                "named_roots": preview["data"]["plan"]["named_roots"],
-                "expected_named_roots": [root["root_id"]]})))
+            raise Fault("R4", row_failure(
+                failed, row,
+                named_roots=preview["data"]["plan"]["named_roots"],
+                expected_named_roots=[root["root_id"]]))
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
         failed, observations = root_released_failure(
             run_doc["data"], root["root_id"], lambda: os.path.lexists(root["path"]))
@@ -1903,9 +1920,7 @@ class Proof:
             ("absence_verdict", lambda: absence.get("verdict") != "present"),
         ])
         if failed is not None:
-            raise Fault("R6", failure_detail(failed, failure_summary({
-                "blocked_by": row["blocked_by"], "absence_verdict": absence.get("verdict"),
-                "absence_reason": absence.get("reason")})))
+            raise Fault("R6", row_failure(failed, row))
         os.rmdir(checkout)
         preview, row, plan_file = self.plan_and_run("R6-absent", area, root, expect_eligible=True)
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
@@ -2154,10 +2169,10 @@ class Proof:
             ("unrelated_eligible", lambda: not unrelated_row["eligible"]),
         ])
         if failed is not None:
-            raise Fault("R13", failure_detail(failed, failure_summary({
-                "protected": {"eligible": kept["eligible"], "blocked_by": kept.get("blocked_by")},
-                "unrelated": {"eligible": unrelated_row["eligible"],
-                              "blocked_by": unrelated_row.get("blocked_by")}})))
+            raise Fault("R13", row_failure(
+                failed, kept,
+                unrelated={"eligible": unrelated_row["eligible"],
+                           "blocked_by": unrelated_row.get("blocked_by")}))
         _code, run_doc = self.real(plan_file, preview["data"]["plan_digest"], expect=0)
         failed, observations = root_released_failure(
             run_doc["data"], unrelated["root_id"], lambda: os.path.lexists(unrelated["path"]))
@@ -2202,8 +2217,7 @@ class Proof:
         for root in (first, second):
             row = self.row_for(preview, root)
             if row["eligible"]:
-                raise Fault("R14", failure_detail("eligible", failure_summary({
-                    "root": root["root_id"], "blocked_by": row.get("blocked_by")})))
+                raise Fault("R14", row_failure("eligible", row, root=root["root_id"]))
         if preview["data"]["oxide"]["complete"]:
             raise Fault("R14", "a malformed coordinated registry reads as complete")
         refusal = self.refused(plan_file, preview["data"]["plan_digest"], area)
@@ -3226,6 +3240,77 @@ def failure_report_controls():
     return problems
 
 
+def row_failure_controls():
+    """Every plan-row oracle failure keeps the row's deciding facts. Pure.
+
+    The reported defect was a failed native oracle whose record named the first
+    blocker but not the deciding gate's own verdict and reason, so the occurrence
+    could not be judged once its run root was gone. These controls pin the shared
+    record, bound a hostile row, and drive the real R6 failure path — with the
+    fixture's directory creation mocked — so the actual case body supplies the
+    record rather than a copy of its predicate. No plan, image or child is touched.
+    """
+    problems = []
+    row = {
+        "absence": {"path": "/Volumes/x/checkouts/settled", "verdict": "present",
+                    "reason": None},
+        "blocked_by": "custody",
+        "custody": "unknown",
+        "custody_reason": ("custody is not safe: the open-descriptor scan is unreadable: "
+                           "both reads of descriptor 16 of pid 52265 report it closed"),
+        "eligible": False,
+        "identity": {"verdict": "verified", "reason": None},
+        "idle": {"last_activity_ms": 1700000000000, "reason": None},
+        "reason": "custody is not safe",
+        "references": [],
+        "references_complete": True,
+        "root_id": "r",
+    }
+    detail = row_failure("blocked_by", row)
+    failed = first_failed_predicate([
+        ("predicate", lambda: not detail.startswith("blocked_by failed: deciding ")),
+        ("custody", lambda: '"custody": "unknown"' not in detail[:600]),
+        ("custody_reason", lambda: "open-descriptor scan is unreadable" not in detail[:1600]),
+        ("blocked_by", lambda: '"blocked_by": "custody"' not in detail[:600]),
+        ("raw_row", lambda: '"root_id": "r"' not in detail),
+    ])
+    if failed is not None:
+        problems.append(f"a plan-row failure record is missing {failed}: {detail[:300]}")
+    hostile = dict(row, padding="p" * 9000)
+    hostile_detail = row_failure("blocked_by", hostile)
+    if "...[+" not in hostile_detail:
+        problems.append("a hostile plan row is not capped with an explicit omission marker")
+    if len(hostile_detail) > 3 * ROW_EVIDENCE_CHARS:
+        problems.append(
+            f"a hostile plan-row failure record exceeds its allowance: {len(hostile_detail)}")
+
+    # The real R6 body, on canned seams: its own failure path must carry the
+    # custody verdict and reason the plan returned.
+    proof = Proof.__new__(Proof)
+    proof.current_area = None
+    proof.mount = "/Volumes/x"
+    proof.fresh_area = lambda name, prune: "c06"
+    proof.new_root = lambda area, aged=True: {"root_id": "r", "path": "/guard/root/c06/r"}
+    proof.oxide_registry = lambda *args, **kwargs: None
+    proof.oxide_row = lambda *args, **kwargs: {}
+    proof.plan_and_run = lambda *args, **kwargs: (
+        {"data": {"plan_digest": "d" * 64}}, row, "/guard/root/R6-present-plan.json")
+    try:
+        with mock.patch("os.makedirs"):
+            proof.case_release_by_reference_needs_the_consumer_path_absent()
+    except Fault as error:
+        if error.check != "R6":
+            problems.append(f"the real R6 failure path reported {error.check}")
+        elif (not error.detail.startswith("blocked_by failed: deciding ")
+              or '"custody": "unknown"' not in error.detail[:600]
+              or "open-descriptor scan is unreadable" not in error.detail[:1600]):
+            problems.append(
+                f"the real R6 failure path dropped its deciding facts: {error.detail[:300]}")
+    else:
+        problems.append("the real R6 failure path did not fail on a custody-blocked row")
+    return problems
+
+
 def plan_controls():
     """A failing plan row stays judgeable from the receipt, and the oracle still decides.
 
@@ -3859,6 +3944,7 @@ def pure_self_check():
     problems += closure_controls()
     problems += containment_controls()
     problems += plan_controls()
+    problems += row_failure_controls()
     problems += r13_case_controls()
     problems += r16_case_controls()
     problems += failure_report_controls()
