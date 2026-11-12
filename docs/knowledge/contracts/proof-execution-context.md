@@ -191,6 +191,14 @@ The host command uses the serialized default-exec route and credential-free
 The original host deadline cannot be established in the guest by passing a
 remaining duration across an unbounded transport delay. A timing binding remains
 required before guest execution; a host timeout does not establish guest closure.
+The host timer starts before preflight, and the guest entries refuse before
+creating a leaf or starting a build while that binding is absent. Guest staging
+copies authenticated default Cargo cache inputs into a fresh writable Cargo home
+inside the guard; target and temporary files use the same monitored root. An
+external Cargo configuration is refused rather than used as a write route.
+The copy and all build output share the original 512 MiB limit. These source
+controls do not establish that the inputs will fit or that guest admission,
+timing or evidence transfer is available.
 
 The guest must actually run the same hash-pinned Oxide qualified supervisor
 `fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b`

@@ -72,6 +72,7 @@ import pwd
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -689,6 +690,11 @@ def guest_stage_environment(base, tmpdir, target_dir):
                  "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"):
         environment.pop(name, None)
     environment["CARGO_TARGET_DIR"] = target_dir
+    environment["CARGO_HOME"] = os.path.join(tmpdir, "cargo-home")
+    environment["TMP"] = tmpdir
+    environment["TEMP"] = tmpdir
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
     return environment
 
 
@@ -1212,13 +1218,26 @@ def host_guest_argv(record, instruction_digest):
     return ["prlctl", "exec", GUEST_VM_UUID, shlex.join(["/bin/sh", "-c", script])]
 
 
-def host_guest_preflight(instruction_path, instruction_digest, role, run, activation):
+def host_clock_ns():
+    """The host occurrence's CLOCK_MONOTONIC clock, never a guest deadline."""
+    return time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+
+
+def host_guest_preflight(instruction_path, instruction_digest, role, run, activation, deadline_ns=None):
     """Bind the retained host participant's record to current source and VM metadata.
 
     The authenticated Nucleus report, not this comparison, establishes the
     participant and activation. No guest fact or admission is inferred here.
     """
+    if deadline_ns is None:
+        deadline_ns = host_clock_ns() + LIMIT_SECONDS * 10 ** 9
+    def remaining():
+        available = (deadline_ns - host_clock_ns()) / 1e9 - 30
+        if available <= 0:
+            raise ValueError("host deadline has reached the original stop margin")
+        return min(INFO_TIMEOUT_SECONDS, available)
     try:
+        remaining()
         record = guest_instruction(instruction_path, instruction_digest)
         problems = guest_record_problems(record)
         for key, expected in (("role", role), ("run", run), ("activation", activation)):
@@ -1234,7 +1253,7 @@ def host_guest_preflight(instruction_path, instruction_digest, role, run, activa
                 problems.append("guest transport paths need an independently verified lossless argument route")
         def git(*args):
             result = subprocess.run(["git", "-C", REPO_ROOT, *args], capture_output=True,
-                                    text=True, timeout=INFO_TIMEOUT_SECONDS,
+                                    text=True, timeout=remaining(),
                                     env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))
             if result.returncode:
                 raise ValueError("host source identity is unreadable")
@@ -1245,10 +1264,11 @@ def host_guest_preflight(instruction_path, instruction_digest, role, run, activa
                 or sha256_file(os.path.join(REPO_ROOT, "Cargo.lock")) != record.get("lock_sha256")):
             problems.append("host source, tree, lock or checkout differs from the instruction")
         problems += installed_supervisor_problems()
+        remaining()
         if problems:
             return record, problems, None
         metadata_argv = ["prlctl", "list", "-a", "-i", "--json"]
-        metadata = subprocess.run(metadata_argv, capture_output=True, timeout=INFO_TIMEOUT_SECONDS)
+        metadata = subprocess.run(metadata_argv, capture_output=True, timeout=remaining())
         if metadata.returncode or len(metadata.stdout) > 1024 * 1024 or len(metadata.stderr) > 1024 * 1024:
             problems.append("fresh registered VM metadata was unsuccessful or exceeded its bound")
         else:
@@ -1272,6 +1292,37 @@ def host_guest_launch(instruction_path, instruction_digest, role, run, activatio
     and guest admission and a complete receipt channel before calling. The
     returned transport status is not proof of guest group or image closure.
     """
+    started = host_clock_ns()
+    deadline = started + LIMIT_SECONDS * 10 ** 9
+    old_handler = None
+    try:
+        if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
+            return {"ok": False, "refused": ["host deadline timer is already in use"]}
+        old_handler = signal.getsignal(signal.SIGALRM)
+        def expired(_signum, _frame):
+            raise TimeoutError("host preflight reached the original stop margin")
+        signal.signal(signal.SIGALRM, expired)
+        available = (deadline - host_clock_ns()) / 1e9 - 30
+        if available <= 0:
+            signal.signal(signal.SIGALRM, old_handler)
+            return {"ok": False, "refused": ["host deadline reached its stop margin"]}
+        signal.setitimer(signal.ITIMER_REAL, available)
+    except (ValueError, OSError) as error:
+        if old_handler is not None:
+            signal.signal(signal.SIGALRM, old_handler)
+        return {"ok": False, "refused": [f"host deadline timer unavailable: {error}"]}
+    try:
+        return host_guest_launch_bounded(instruction_path, instruction_digest, role, run, activation,
+                                         stdout, stderr, started, deadline)
+    except TimeoutError as error:
+        return {"ok": False, "refused": [str(error)], "guest_closure": "not established"}
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
+def host_guest_launch_bounded(instruction_path, instruction_digest, role, run, activation, stdout, stderr, started, deadline):
+    """Run host preflight only within the original host timer."""
     try:
         identities = []
         for stream in (stdout, stderr):
@@ -1284,22 +1335,15 @@ def host_guest_launch(instruction_path, instruction_digest, role, run, activatio
             return {"ok": False, "refused": ["host streams identify the same file"]}
     except (OSError, ValueError, AttributeError):
         return {"ok": False, "refused": ["host stream descriptors are unavailable"]}
-    record, problems, metadata = host_guest_preflight(instruction_path, instruction_digest, role, run, activation)
+    record, problems, metadata = host_guest_preflight(instruction_path, instruction_digest, role, run, activation, deadline)
     if problems:
         return {"ok": False, "refused": problems, "vm_metadata": metadata}
-    argv = host_guest_argv(record, instruction_digest)
-    started = time.time()
-    try:
-        result = subprocess.run(argv, stdout=stdout, stderr=stderr, timeout=LIMIT_SECONDS)
-        return {"ok": False, "transport_ok": result.returncode == 0, "argv": argv, "exit": result.returncode,
-                "reaped": True, "elapsed_seconds": round(time.time() - started, 3),
-                "vm_metadata": metadata, "receipt": "not yet independently transferred",
-                "guest_closure": "not established by transport"}
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return {"ok": False, "argv": argv, "exit": None,
-                "reaped": isinstance(error, subprocess.TimeoutExpired),
-                "elapsed_seconds": round(time.time() - started, 3), "problem": str(error),
-                "vm_metadata": metadata, "guest_closure": "unknown; preserve guest resources"}
+    # No supported cross-VM timing binding is established. A duration sent
+    # before an unbounded delivery delay cannot establish the original wall.
+    return {"ok": False, "refused": ["guest start is not bound to the original host deadline"],
+            "planned_argv": host_guest_argv(record, instruction_digest), "vm_metadata": metadata,
+            "elapsed_seconds": (host_clock_ns() - started) / 1e9,
+            "guest_closure": "not established; guest execution held"}
 
 
 def host_guest_receipt(record, path, expected_digest):
@@ -1661,6 +1705,7 @@ def guest_binding_controls():
     build = mock.Mock(returncode=0, stdout=output, stderr="")
     def stage_control(after, response=build, manifest_bytes=input_bytes):
         writer = mock.mock_open()
+        attempted_writes = []
         def open_file(path, mode="r", *args, **kwargs):
             return io.BytesIO(manifest_bytes) if path == record["input_manifest"] and mode == "rb" else writer(path, mode, *args, **kwargs)
         def walk(root, **kwargs):
@@ -1672,9 +1717,20 @@ def guest_binding_controls():
                 mock.patch("os.path.realpath", side_effect=lambda path: path), \
                 mock.patch(__name__ + ".sha256_file", return_value="f" * 64), \
                 mock.patch(__name__ + ".guest_clock_ns", return_value=1):
+            def fake_build(*_args, **kwargs):
+                env = kwargs["env"]
+                attempted_writes.extend([os.path.join(env["CARGO_HOME"], "registry", "cache", "write"),
+                                         os.path.join(env["CARGO_TARGET_DIR"], "build", "write"),
+                                         os.path.join(env["TMPDIR"], "temp-write")])
+                if (not all(path.startswith("/guard/scratch/") for path in attempted_writes)
+                        or any(path.startswith(record["cargo_home"] + "/") for path in attempted_writes)):
+                    raise ValueError("fake Cargo write escaped the monitored root")
+                for path in attempted_writes:
+                    with open(path, "wb") as cache_file:
+                        cache_file.write(b"synthetic cache write")
+                return response
             return guest_stage_proof_binary("/guard/scratch", {"guard": "/guard"}, 10 ** 12,
-                                            record, paired, lambda: after,
-                                            runner=lambda *args, **kwargs: response)
+                                            record, paired, lambda: after, runner=fake_build)
     try:
         staged, _ = stage_control(paired)
         if (staged.get("tree") != record["tree"] or staged.get("build_command") !=
@@ -1704,6 +1760,8 @@ def guest_binding_controls():
     raw = json.dumps(record).encode()
     digest = hashlib.sha256(raw).hexdigest()
     def host_command(argv, **kwargs):
+        if kwargs.get("timeout", INFO_TIMEOUT_SECONDS) > INFO_TIMEOUT_SECONDS:
+            raise ValueError("host preflight command exceeded its clipped allowance")
         if argv[0] == "prlctl":
             if argv[1] == "exec":
                 return mock.Mock(returncode=0, stdout=b"", stderr=b"")
@@ -1747,9 +1805,26 @@ def guest_binding_controls():
             mock.patch(__name__ + ".sha256_file", side_effect=host_hash):
         launched = host_guest_launch("/owned/record", digest, "author", record["run"], record["activation"], stream_a, stream_b)
         commands = [call.args[0] for call in host_calls.call_args_list if call.args[0][0] == "prlctl"]
-        if (launched.get("ok") is not False or launched.get("transport_ok") is not True
-                or not commands or commands[-1] != host_guest_argv(record, digest)):
-            problems.append("host launcher did not preserve actual argv or kept transport unqualified")
+        if (launched.get("ok") is not False
+                or launched.get("planned_argv") != host_guest_argv(record, digest)
+                or any(command[:2] == ["prlctl", "exec"] for command in commands)):
+            problems.append("host launcher did not refuse unbound guest timing before transport")
+    with mock.patch("os.getuid", return_value=123), \
+            mock.patch("os.fstat", side_effect=[info_a, info_b]), \
+            mock.patch(__name__ + ".host_clock_ns", side_effect=[0, 270 * 10 ** 9]), \
+            mock.patch("subprocess.run") as host_calls:
+        exhausted = host_guest_launch("/owned/record", digest, "author", record["run"], record["activation"], stream_a, stream_b)
+        if exhausted.get("ok") is not False or host_calls.called:
+            problems.append("exhausted host preflight started a command")
+    with mock.patch("os.open", return_value=42), mock.patch("os.close"), \
+            mock.patch("os.getuid", return_value=123), \
+            mock.patch("os.fstat", side_effect=[info_a, info_b, mock.Mock(st_uid=123, st_mode=0o100600)]), \
+            mock.patch("os.fdopen", return_value=io.BytesIO(raw)), \
+            mock.patch(__name__ + ".host_clock_ns", side_effect=[0, 0, 0, 270 * 10 ** 9]), \
+            mock.patch("subprocess.run") as host_calls:
+        slow = host_guest_launch("/owned/record", digest, "author", record["run"], record["activation"], stream_a, stream_b)
+        if slow.get("ok") is not False or host_calls.called:
+            problems.append("slow host preflight started a command after the stop margin")
     def read_instruction(data, expected, *, uid=123, mode=0o100600):
         with mock.patch("os.open", return_value=42), mock.patch("os.close"), \
                 mock.patch("os.getuid", return_value=123), \
@@ -1876,7 +1951,104 @@ def guest_binding_controls():
         observed_route = dict(observed, **changed)
         if not guest_binding_problems(record, observed_route):
             problems.append("guest comparison accepted a changed actual route observation")
+    problems += guest_entry_controls(record, raw, digest, input_bytes, paired)
     return problems
+
+
+def guest_entry_controls(record, raw, digest, input_bytes, carried_observation):
+    """Script OS observations through the real entries; no guard or guest is run."""
+    failures = []
+    def exercise(entry, change=None):
+        change = change or "valid"
+        fd_paths = {10: record["instruction_guest_path"]}
+        def open_fd(path, flags, *args, **kwargs):
+            if path == record["instruction_guest_path"]:
+                return 10
+            parent_fd = kwargs.get("dir_fd")
+            full = path if os.path.isabs(path) else os.path.join(fd_paths[parent_fd], path)
+            fd = len(fd_paths) + 20
+            fd_paths[fd] = full
+            return fd
+        def fstat(fd):
+            path = fd_paths[fd]
+            if fd == 10:
+                return mock.Mock(st_mode=0o100600, st_uid=GUEST_UID)
+            uid = GUEST_UID if path == record["scratch"] else 0
+            gid = GUEST_GID if path == record["scratch"] else 0
+            mode = 0o40700 if path == record["scratch"] else 0o40777
+            if change == "ownership" and path == record["scratch"]:
+                uid = 999
+            return mock.Mock(st_mode=mode, st_uid=uid, st_gid=gid, st_dev=17,
+                             st_ino=3 if path == record["scratch"] else 1 if path == GUEST_MOUNT else 2)
+        def command(argv, **_kwargs):
+            if argv[0] == DISKUTIL:
+                uuid = "wrong" if change == "volume_uuid" else GUEST_VOLUME_UUID
+                return mock.Mock(returncode=0, stdout=plistlib.dumps({"VolumeUUID": uuid}))
+            if argv[0] == "git":
+                value = record["head"] if argv[-1] == "HEAD" else record["tree"] if argv[-1] == "HEAD^{tree}" else ""
+                if change == "head" and argv[-1] == "HEAD":
+                    value = "0" * 40
+                if change == "tree" and argv[-1] == "HEAD^{tree}":
+                    value = "0" * 40
+            elif argv[0] == record["rustc_path"]:
+                value = "rustc 0.0.0 bad" if change == "toolchain" else "rustc 1.97.1 test\nhost: aarch64-apple-darwin"
+            elif argv[0] == record["cargo_path"]:
+                value = "cargo 1.97.1 test"
+            else:
+                value = "python " + record["supervisor_path"]
+            return mock.Mock(returncode=0, stdout=value, stderr="")
+        def file_hash(path):
+            values = {os.path.join(record["source_path"], "Cargo.lock"): record["lock_sha256"],
+                      record["supervisor_path"]: record["guard_sha256"],
+                      record["cargo_path"]: record["cargo_sha256"], record["rustc_path"]: record["rustc_sha256"],
+                      record["python_path"]: record["python_sha256"], record["input_manifest"]: record["inputs_sha256"]}
+            if change == "lock" and path.endswith("Cargo.lock") or change == "guard" and path == record["supervisor_path"]:
+                return "0" * 64
+            return values[path]
+        carried = {"instruction_sha256": digest, "mode": "diagnostic", "observed": dict(carried_observation)}
+        if change == "outer_inner":
+            carried["observed"]["head"] = "0" * 40
+        env = {"HOME": GUEST_HOME, "BARGE_PROOF_SUPERVISOR": record["supervisor_path"],
+               ROUTE_ENV: json.dumps(carried)}
+        output = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for target, kwargs in (
+                    ("os.open", {"side_effect": open_fd}), ("os.close", {}), ("os.fstat", {"side_effect": fstat}),
+                    ("os.fdopen", {"side_effect": lambda *_a, **_k: io.BytesIO(raw)}),
+                    ("os.getuid", {"return_value": GUEST_UID}),
+                    ("os.geteuid", {"return_value": 999 if change == "uid" else GUEST_UID}),
+                    ("os.getegid", {"return_value": 999 if change == "gid" else GUEST_GID}),
+                    ("os.fstatvfs", {"return_value": mock.Mock(f_bavail=21 * 1024 ** 3, f_frsize=1)}),
+                    ("os.path.realpath", {"side_effect": lambda path: "/alias" if ((change == "route" and path == record["scratch"]) or (change == "source" and path == record["source_path"])) else path}),
+                    ("os.path.isdir", {"return_value": True}),
+                    ("os.fwalk", {"side_effect": lambda root, **_k: iter([(root, [], [], 99)])}),
+                    ("builtins.open", {"side_effect": lambda *_a, **_k: io.BytesIO(input_bytes)}),
+                    ("subprocess.run", {"side_effect": command}),
+                    (__name__ + ".sha256_file", {"side_effect": file_hash}),
+                    (__name__ + ".guest_clock_ns", {"return_value": 1}),
+                    (__name__ + ".REPO_ROOT", {"new": record["source_path"]}),
+                    ("sys.executable", {"new": record["python_path"]})):
+                stack.enter_context(mock.patch(target, **kwargs))
+            stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
+            mkdir = stack.enter_context(mock.patch("os.mkdir"))
+            guarded = stack.enter_context(mock.patch(__name__ + ".guarded_run"))
+            stack.enter_context(contextlib.redirect_stdout(output))
+            result = entry("diagnostic", record["instruction_guest_path"], digest)
+        return result, output.getvalue(), mkdir.called or guarded.called
+    for entry in (guest_outer_half, guest_inner_half):
+        result, text, effect = exercise(entry)
+        if result != 125 or effect or "no qualified guest timing binding" not in text or "guest observation" in text:
+            failures.append("real guest entry did not refuse only at the synthetic timing/guard boundary")
+    for change, marker in (("uid", "observation uid"), ("gid", "observation gid"), ("source", "observation source_path"),
+                           ("head", "observation head"), ("tree", "observation tree"),
+                           ("lock", "observation lock_sha256"), ("guard", "observation guard_sha256"),
+                           ("toolchain", "observation head"), ("ownership", "route owner_only"),
+                           ("route", "route canonical"), ("volume_uuid", "observation volume_uuid"),
+                           ("outer_inner", "outer")):
+        result, text, effect = exercise(guest_inner_half, change)
+        if result != 125 or effect or marker not in text:
+            failures.append(f"real inner entry missed scripted {change} refusal before effects")
+    return failures
 
 
 def inner_command(mode):
@@ -2137,6 +2309,57 @@ def stage_proof_binary(parent, owned, deadline_ns=None, runner=None):
                                       ("RUSTUP_TOOLCHAIN", "RUSTUP_AUTO_INSTALL", "CARGO_NET_OFFLINE")}}
 
 
+def guest_copy_cargo_inputs(record, destination, deadline_ns):
+    """Copy authenticated default Cargo cache inputs into the monitored guard root."""
+    with open(record["input_manifest"], "rb") as handle:
+        raw = handle.read(16 * 1024 * 1024 + 1)
+    if len(raw) > 16 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != record["inputs_sha256"]:
+        raise ValueError("offline input manifest changed before copy")
+    expected = json.loads(raw)["roots"][record["cargo_home"]]
+    if not isinstance(expected, dict):
+        raise ValueError("offline Cargo input inventory is malformed")
+    actual = {}
+    total = 0
+    os.mkdir(destination, 0o700)
+    def fail_walk(error):
+        raise error
+    for directory, subdirs, files, directory_fd in os.fwalk(record["cargo_home"], follow_symlinks=False, onerror=fail_walk):
+        relative = os.path.relpath(directory, record["cargo_home"])
+        target = destination if relative == "." else os.path.join(destination, relative)
+        for name in subdirs:
+            if not __import__("stat").S_ISDIR(os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_mode):
+                raise ValueError("offline Cargo input contains a link or special directory")
+            os.mkdir(os.path.join(target, name), 0o700)
+        for name in files:
+            if relative == "." and name in ("config", "config.toml"):
+                raise ValueError("delivered Cargo configuration is not an authorized source route")
+            path = name if relative == "." else os.path.join(relative, name)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            try:
+                info = os.fstat(fd)
+                if not __import__("stat").S_ISREG(info.st_mode) or total + info.st_size > SCRATCH_BUDGET_MIB * 1024 * 1024:
+                    raise ValueError("offline Cargo input is not regular or exceeds the guard budget")
+                out = os.open(os.path.join(target, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                digest = hashlib.sha256()
+                with os.fdopen(out, "wb") as output, os.fdopen(fd, "rb", closefd=False) as input_file:
+                    while True:
+                        if guest_clock_ns() >= deadline_ns:
+                            raise ValueError("offline Cargo input copy exceeded the guard deadline")
+                        data = input_file.read(1024 * 1024)
+                        if not data:
+                            break
+                        total += len(data)
+                        if total > SCRATCH_BUDGET_MIB * 1024 * 1024:
+                            raise ValueError("offline Cargo input copy exceeds the guard budget")
+                        digest.update(data)
+                        output.write(data)
+                actual[path] = digest.hexdigest()
+            finally:
+                os.close(fd)
+    if actual != expected:
+        raise ValueError("copied Cargo inputs do not match the authenticated inventory")
+
+
 def guest_stage_proof_binary(parent, owned, deadline_ns, record, before, observe, runner=None):
     """Stage the guest's fresh Cargo artifact within the existing guard's owned root.
 
@@ -2162,18 +2385,26 @@ def guest_stage_proof_binary(parent, owned, deadline_ns, record, before, observe
     target_dir = os.path.join(parent, "cargo-target")
     environment = guest_stage_environment(dict(os.environ), parent, target_dir)
     environment["RUSTC"] = record["rustc_path"]
-    environment["CARGO_HOME"] = record["cargo_home"]
+    ancestor = REPO_ROOT
+    while True:
+        if any(os.path.lexists(os.path.join(ancestor, ".cargo", name)) for name in ("config", "config.toml")):
+            raise Infrastructure("stage", "external Cargo configuration is not an authorized source route")
+        next_ancestor = os.path.dirname(ancestor)
+        if next_ancestor == ancestor:
+            break
+        ancestor = next_ancestor
     problems = stage_environment_problems(environment)
     if problems:
         raise Infrastructure("stage", "; ".join(problems))
     try:
+        guest_copy_cargo_inputs(record, environment["CARGO_HOME"], deadline_ns)
         os.mkdir(target_dir, 0o700)
         remaining = (deadline_ns - guest_clock_ns()) / 1e9
         if remaining <= 0:
             raise Infrastructure("stage", "the guard wall expired before the guest build")
         build = (runner or subprocess.run)([cargo, *GUEST_BUILD_COMMAND[1:]], cwd=REPO_ROOT, env=environment,
                                           capture_output=True, text=True, timeout=remaining)
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
         raise Infrastructure("stage", f"guest Cargo could not complete: {error}") from None
     if build.returncode != 0:
         raise Infrastructure("stage", f"guest Cargo exited {build.returncode}: {build.stderr[-400:]}")
@@ -4199,7 +4430,7 @@ def guest_inner_half(mode, instruction_path, instruction_digest):
         return 125
     observed = guest_local_observation(record)
     carried = carried_route()
-    route_problems = []
+    route_problems = ["the original host deadline has no qualified guest timing binding"]
     if supervisor_path() != record.get("supervisor_path"):
         route_problems.append("the guest guard path differs from the instruction")
     try:
@@ -4261,11 +4492,13 @@ def guest_outer_gate(record, observed, instruction_path, mode, extra, effect):
 
 def guest_outer_half(mode, instruction_path, instruction_digest):
     """Validate guest-local facts, create the private leaf and launch the same guard."""
-    deadline = guest_clock_ns() + (LIMIT_SECONDS - 2) * 10 ** 9
+    # This bounds read-only local input inspection only; it is not a host wall.
+    deadline = guest_clock_ns() + INFO_TIMEOUT_SECONDS * 10 ** 9
     try:
         record = guest_instruction(instruction_path, instruction_digest)
         observed = guest_local_observation(record)
         offline = guest_offline_inputs_problems(record, deadline)
+        offline.append("the original host deadline has no qualified guest timing binding")
         problems, leaf = guest_outer_gate(record, observed, instruction_path, mode, offline,
                                           lambda: guest_create_leaf(record))
         if problems:
