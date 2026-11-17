@@ -42,7 +42,7 @@ and this file is corrected.
 Frozen inputs, recorded before this design and unchanged by it:
 
 - **Tom's rulings**, as carried into Barge by
-  [architecture](../architecture.md#space-policy-carried-from-oxide-tom-2026-10-25-and-2026-10-26)
+  [architecture](../architecture.md#space-policy)
   and [vision](../vision.md#what-it-does): the reserve is a prune trigger, only a
   hard floor (default 10 GiB, a registration field) stops work, a floor above the
   reserve wins, an area's soft cap counts that area's own bytes only, low space

@@ -32,7 +32,7 @@ own scoped brief based on this accepted design.
 ### Frozen inputs
 
 - Tom's scope ruling and the authority list in [vision](../vision.md); the
-  invariants in [architecture](../architecture.md#invariants).
+  invariants in [architecture](../architecture.md#safety-model).
 - Tom decision `d2c34987` (answered 2026-11-02): complete parent-descriptor
   identity observations are a separate, separately reviewed follow-up; B-S1
   keeps affected rows unproven meanwhile and does not wait for this design.
