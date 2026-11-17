@@ -12,11 +12,14 @@ use crate::state::publish;
 
 /// The schema name of a root marker.
 pub const ROOT_SCHEMA: &str = "barge.root/1";
+/// The schema name of an adopted root marker with a recorded folder.
+pub const ADOPTED_ROOT_SCHEMA: &str = "barge.root/2";
 
 /// The marker file that makes a folder a Barge-owned root.
 pub const MARKER_NAME: &str = ".barge-root.json";
 
-const ID_BYTES: usize = 8;
+const MAX_ID: usize = 64;
+const MINT_ID_BYTES: usize = 8;
 const MAX_LABEL: usize = 32;
 
 /// A root's marker: the area it belongs to, its ID, its label and when it was
@@ -32,6 +35,8 @@ pub struct RootMarker {
     pub created_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
 }
 
 /// A root Barge created.
@@ -40,14 +45,16 @@ pub struct Root {
     pub id: String,
     pub label: String,
     pub path: PathBuf,
+    /// The root's actual directory name, which can differ from its label and ID.
+    pub folder: String,
     pub created_unix_ms: u64,
     pub expires_unix_ms: Option<u64>,
 }
 
 impl Root {
-    /// The folder name, `<label>-<id>`.
+    /// The root's actual folder name.
     pub fn folder_name(&self) -> String {
-        folder_name(&self.label, &self.id)
+        self.folder.clone()
     }
 
     /// Whether this root's expiry has passed at `now_unix_ms`.
@@ -130,9 +137,9 @@ pub(crate) fn read_marker(folder: &Path) -> MarkerRead {
             return MarkerRead::Invalid(format!("cannot parse {}: {source}", path.display()))
         }
     };
-    if marker.schema != ROOT_SCHEMA {
+    if marker.schema != ROOT_SCHEMA && marker.schema != ADOPTED_ROOT_SCHEMA {
         return MarkerRead::Invalid(format!(
-            "{} has schema {}, not {ROOT_SCHEMA}",
+            "{} has unsupported root schema {}",
             path.display(),
             marker.schema
         ));
@@ -142,6 +149,17 @@ pub(crate) fn read_marker(folder: &Path) -> MarkerRead {
             "{} has an invalid root id {:?}",
             path.display(),
             marker.id
+        ));
+    }
+    if marker.schema == ADOPTED_ROOT_SCHEMA
+        && marker
+            .folder
+            .as_deref()
+            .is_none_or(|folder| !valid_folder(folder))
+    {
+        return MarkerRead::Invalid(format!(
+            "{} has an invalid recorded root folder",
+            path.display()
         ));
     }
     MarkerRead::Valid(marker)
@@ -176,10 +194,15 @@ pub fn validate_label(label: &str) -> Result<()> {
 
 /// Validate a root ID.
 pub fn valid_id(id: &str) -> bool {
-    id.len() == ID_BYTES * 2
+    !id.is_empty()
+        && id.len() <= MAX_ID
         && id
             .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        && id
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
 }
 
 /// Validate a root ID, naming the field on failure.
@@ -188,15 +211,31 @@ pub fn validate_id(id: &str) -> Result<()> {
         Ok(())
     } else {
         Err(Error::usage(format!(
-            "root id {id:?} must be {} lowercase hex characters",
-            ID_BYTES * 2
+            "root id {id:?} must be a 1-{MAX_ID} character plain token of letters, digits, '-' or '_'",
         )))
     }
 }
 
+/// Whether `folder` is one plain directory name.
+pub fn valid_folder(folder: &str) -> bool {
+    !folder.is_empty()
+        && folder != "."
+        && folder != ".."
+        && !folder.contains(['/', '\\', '\0'])
+        && !folder.chars().any(char::is_control)
+}
+
+/// The directory recorded by a marker, or the legacy derived name.
+pub fn marker_folder(marker: &RootMarker) -> String {
+    marker
+        .folder
+        .clone()
+        .unwrap_or_else(|| folder_name(&marker.label, &marker.id))
+}
+
 /// Mint a new root ID from the operating system's random source.
 pub(crate) fn mint_id() -> Result<String> {
-    let mut bytes = [0_u8; ID_BYTES];
+    let mut bytes = [0_u8; MINT_ID_BYTES];
     let mut source = File::open("/dev/urandom").map_err(|source| {
         Error::io(
             "cannot open the random source",
@@ -211,7 +250,7 @@ pub(crate) fn mint_id() -> Result<String> {
             &source,
         )
     })?;
-    let mut id = String::with_capacity(ID_BYTES * 2);
+    let mut id = String::with_capacity(MINT_ID_BYTES * 2);
     for byte in bytes {
         id.push_str(&format!("{byte:02x}"));
     }

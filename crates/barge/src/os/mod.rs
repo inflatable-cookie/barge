@@ -20,6 +20,15 @@ use crate::error::{Error, Result};
 
 pub use fake::FakeOs;
 
+/// The effective user ID for filesystem ownership checks.
+pub(crate) fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and returns the process's effective UID.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::geteuid()
+    }
+}
+
 /// The platform facts Barge needs. Tests replace this with [`FakeOs`].
 pub trait Os: fmt::Debug + Send + Sync {
     /// The volume UUID that owns `mount`, or `None` when it cannot be read.

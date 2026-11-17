@@ -5,6 +5,7 @@
 mod common;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::time::Duration;
 
@@ -374,6 +375,159 @@ fn a_fallback_root_stays_listed_holdable_and_pinnable_after_the_volume_returns()
     let fresh = area.create_root("slot").unwrap();
     assert!(fresh.path.starts_with(fixture.mount.join("oxide/pool")));
     assert_ne!(fresh.id, root.id);
+}
+
+#[test]
+fn an_adopted_root_keeps_its_folder_and_uses_the_normal_lifecycle() {
+    let fixture = Fixture::new();
+    fixture.register();
+    let area = fixture.area("pool");
+    let folder = "Existing Pool";
+    let path = fixture.area_dir("pool").join(folder);
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("contents"), b"keep until eviction").unwrap();
+
+    let root = area.adopt_root(folder, "slot", "oxide-72ea0e6b").unwrap();
+    assert_eq!(root.path, path);
+    assert_eq!(root.folder_name(), folder);
+    assert_eq!(
+        area.adopt_root(folder, "slot", "oxide-72ea0e6b").unwrap(),
+        root
+    );
+    assert_eq!(
+        fs::read(path.join("contents")).unwrap(),
+        b"keep until eviction"
+    );
+    let marker: serde_json::Value =
+        serde_json::from_slice(&fs::read(path.join(".barge-root.json")).unwrap()).unwrap();
+    assert_eq!(marker["schema"], "barge.root/2");
+    assert_eq!(marker["folder"], folder);
+
+    assert_eq!(area.list().unwrap().get(&root.id).unwrap().path, path);
+    let hold = area.hold(&root.id, Mode::Shared).unwrap();
+    drop(hold);
+    area.pin(&root.id, "selected").unwrap();
+    assert!(area.list().unwrap().get(&root.id).unwrap().pinned);
+    area.unpin(&root.id).unwrap();
+    let eviction = area.evict(&root.id).unwrap();
+    assert!(eviction.deleted);
+    assert!(!path.exists());
+}
+
+#[test]
+fn dot_prefixed_adopted_folders_are_listed() {
+    let fixture = Fixture::new();
+    fixture.register();
+    let area = fixture.area("pool");
+    let path = fixture.area_dir("pool").join(".cache");
+    fs::create_dir_all(&path).unwrap();
+    let root = area.adopt_root(".cache", "cache", "cache-id").unwrap();
+    assert_eq!(area.list().unwrap().get(&root.id).unwrap().path, path);
+}
+
+#[test]
+fn adoption_refuses_conflicts_and_unsafe_directories() {
+    let fixture = Fixture::new();
+    fixture.register();
+    let area = fixture.area("pool");
+    let area_dir = fixture.area_dir("pool");
+    fs::create_dir_all(&area_dir).unwrap();
+    let make_folder = |name: &str| {
+        let path = area_dir.join(name);
+        fs::create_dir_all(&path).unwrap();
+        path
+    };
+
+    for invalid in ["", ".", "..", "nested/name", "nested\\name", "UPPER"] {
+        assert!(area.adopt_root(invalid, "slot", "adopted-id").is_err());
+    }
+    let outside = fixture.temp.folder("outside-adopt").unwrap();
+    assert!(area
+        .adopt_root("outside-adopt", "slot", "outside-id")
+        .is_err());
+    let link = area_dir.join("linked");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    assert!(area.adopt_root("linked", "slot", "linked-id").is_err());
+
+    let group_writable = make_folder("group-writable");
+    fs::set_permissions(&group_writable, fs::Permissions::from_mode(0o775)).unwrap();
+    assert!(area
+        .adopt_root("group-writable", "slot", "group-writable-id")
+        .is_err());
+    let other_writable = make_folder("other-writable");
+    fs::set_permissions(&other_writable, fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(area
+        .adopt_root("other-writable", "slot", "other-writable-id")
+        .is_err());
+
+    make_folder("valid-folder");
+    area.adopt_root("valid-folder", "slot", "duplicate-id")
+        .unwrap();
+    let second = make_folder("second-folder");
+    assert!(area
+        .adopt_root("second-folder", "slot", "duplicate-id")
+        .unwrap_err()
+        .message()
+        .contains("already used"));
+    assert!(second.is_dir());
+
+    let foreign = make_folder("foreign-folder");
+    fs::write(foreign.join(".barge-root.json"), r#"{"schema":"barge.root/2","area":"other/area","id":"foreign-id","label":"slot","created_unix_ms":1,"folder":"foreign-folder"}"#).unwrap();
+    assert!(area
+        .adopt_root("foreign-folder", "slot", "foreign-id")
+        .unwrap_err()
+        .message()
+        .contains("area"));
+    let mismatch = make_folder("mismatch-folder");
+    fs::write(mismatch.join(".barge-root.json"), r#"{"schema":"barge.root/2","area":"test/pool","id":"mismatch-id","label":"other","created_unix_ms":1,"folder":"mismatch-folder"}"#).unwrap();
+    assert!(area
+        .adopt_root("mismatch-folder", "slot", "mismatch-id")
+        .unwrap_err()
+        .message()
+        .contains("label"));
+    let wrong_id = make_folder("wrong-id-folder");
+    fs::write(wrong_id.join(".barge-root.json"), r#"{"schema":"barge.root/2","area":"test/pool","id":"recorded-id","label":"slot","created_unix_ms":1,"folder":"wrong-id-folder"}"#).unwrap();
+    assert!(area
+        .adopt_root("wrong-id-folder", "slot", "requested-id")
+        .unwrap_err()
+        .message()
+        .contains("id"));
+    let wrong_folder = make_folder("wrong-folder");
+    fs::write(wrong_folder.join(".barge-root.json"), r#"{"schema":"barge.root/2","area":"test/pool","id":"wrong-folder-id","label":"slot","created_unix_ms":1,"folder":"recorded-folder"}"#).unwrap();
+    assert!(area
+        .adopt_root("wrong-folder", "slot", "wrong-folder-id")
+        .unwrap_err()
+        .message()
+        .contains("folder"));
+}
+
+#[test]
+fn adoption_uses_the_declared_fallback_and_v1_markers_remain_readable() {
+    let fixture = Fixture::new();
+    fixture.register();
+    let fallback = fixture.temp.folder("adopt-fallback").unwrap();
+    let area = fixture
+        .barge
+        .area(
+            AreaSpec::new("test", "pool", "Builds").absent(Absent::Fallback {
+                path: fallback.clone(),
+            }),
+        )
+        .unwrap();
+    fixture.os.set_uuid(&fixture.mount, None);
+    let existing = fallback.join("existing-output");
+    fs::create_dir(&existing).unwrap();
+    let adopted = area
+        .adopt_root("existing-output", "output", "fallback-id")
+        .unwrap();
+    assert_eq!(adopted.path, existing);
+    assert!(!area.list().unwrap().get("fallback-id").unwrap().on_volume);
+
+    fixture.os.set_uuid(&fixture.mount, Some(UUID));
+    let legacy = fixture.area_dir("pool").join("legacy-0123456789abcdef");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join(".barge-root.json"), r#"{"schema":"barge.root/1","area":"test/pool","id":"0123456789abcdef","label":"legacy","created_unix_ms":1}"#).unwrap();
+    assert_eq!(area.resolve("0123456789abcdef").unwrap().path, legacy);
 }
 
 #[test]

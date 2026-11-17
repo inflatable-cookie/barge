@@ -21,7 +21,7 @@ Answer: links first; a tool's own setting is written only during an explicit ado
 ## Q-004 — How does Oxide's existing state migrate?
 
 Status: revised 2026-11-17
-Answer: nothing moves on disk: Oxide's areas map to its existing folder names. Barge no longer reads Oxide's formats; Oxide adopts the lean library and keeps its own records (Tom, 2026-11-17); see [architecture](architecture.md#layout-on-a-volume).
+Answer: nothing moves on disk: consumers declare their areas and adopt existing directories under their current folder names. Barge records ownership without reading consumer formats; Oxide keeps its own records (Tom, 2026-11-17); see [architecture](architecture.md#library-surface).
 
 ## Q-005 — Which platforms are in scope?
 

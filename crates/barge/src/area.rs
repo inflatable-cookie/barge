@@ -339,6 +339,135 @@ impl Area {
         self.create_root_with_expiry(label, None)
     }
 
+    /// Adopt an existing directory directly inside this area's volume location
+    /// or declared fallback. Adoption records ownership without changing its
+    /// contents.
+    pub fn adopt_root(&self, folder: &str, label: &str, id: &str) -> Result<Root> {
+        root::validate_label(label)?;
+        root::validate_id(id)?;
+        if !root::valid_folder(folder) {
+            return Err(Error::usage(format!(
+                "root folder {folder:?} must be one plain name without separators, control characters, '.' or '..'"
+            )));
+        }
+        if matches!(folder, BARGE_DIR | TRASH_DIR) {
+            return Err(Error::refused(format!(
+                "root folder {folder:?} is reserved by Barge"
+            )));
+        }
+        let key = self.key().label();
+        let mut candidates = Vec::new();
+        for (directory, _) in self.search_dirs()? {
+            let path = directory.join(folder);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(Error::refused(format!(
+                            "root folder {} is not a real directory",
+                            path.display()
+                        )));
+                    }
+                    candidates.push((directory, path, metadata));
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(Error::io("cannot inspect", &path, &source)),
+            }
+        }
+        let (directory, path, metadata) = candidates.into_iter().next().ok_or_else(|| {
+            Error::not_found(format!(
+                "root folder {folder:?} does not exist directly inside area {}",
+                self.key().label()
+            ))
+        })?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != crate::os::effective_uid() {
+            return Err(Error::refused(format!(
+                "root folder {} is not owned by the calling user",
+                path.display()
+            )));
+        }
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return Err(Error::refused(format!(
+                "root folder {} is group- or other-writable",
+                path.display()
+            )));
+        }
+
+        for info in self.list()?.roots {
+            if info.id == id && info.path != path {
+                return Err(Error::refused(format!(
+                    "root id {id} is already used by folder {} in area {}",
+                    info.path.display(),
+                    key
+                )));
+            }
+        }
+
+        match read_marker(&path) {
+            MarkerRead::Valid(marker) => {
+                let mut differences = Vec::new();
+                if marker.area != key {
+                    differences.push("area");
+                }
+                if marker
+                    .folder
+                    .as_deref()
+                    .unwrap_or(&folder_name(&marker.label, &marker.id))
+                    != folder
+                {
+                    differences.push("folder");
+                }
+                if marker.label != label {
+                    differences.push("label");
+                }
+                if marker.id != id {
+                    differences.push("id");
+                }
+                if differences.is_empty() {
+                    return Ok(root_from_marker(path, marker));
+                }
+                return Err(Error::refused(format!(
+                    "root marker differs in {}",
+                    differences.join(", ")
+                )));
+            }
+            MarkerRead::Invalid(reason) => {
+                return Err(Error::refused(format!(
+                    "cannot adopt {}: {reason}",
+                    path.display()
+                )))
+            }
+            MarkerRead::Missing => {}
+        }
+        self.ensure_layout(&directory)?;
+        let _lock = AreaLock::acquire(&directory)?;
+        let marker = RootMarker {
+            schema: crate::root::ADOPTED_ROOT_SCHEMA.to_string(),
+            area: key,
+            id: id.to_string(),
+            label: label.to_string(),
+            created_unix_ms: self.core.clock.now_unix_ms(),
+            expires_unix_ms: None,
+            folder: Some(folder.to_string()),
+        };
+        match read_marker(&path) {
+            MarkerRead::Missing => root::write_marker(&path, &marker)?,
+            MarkerRead::Valid(existing)
+                if existing.area == marker.area
+                    && existing.id == marker.id
+                    && existing.label == marker.label
+                    && root::marker_folder(&existing) == folder =>
+            {
+                return Ok(root_from_marker(path, existing));
+            }
+            MarkerRead::Valid(_) => {
+                return Err(Error::refused("root marker changed during adoption"))
+            }
+            MarkerRead::Invalid(reason) => return Err(Error::refused(reason)),
+        }
+        Ok(root_from_marker(path, marker))
+    }
+
     /// Create a root that expires at `expires_unix_ms` (scratch uses this).
     pub(crate) fn create_root_with_expiry(
         &self,
@@ -362,16 +491,19 @@ impl Area {
                         label: label.to_string(),
                         created_unix_ms: now,
                         expires_unix_ms,
+                        folder: None,
                     };
                     if let Err(error) = root::write_marker(&path, &marker) {
                         let _ = fs::remove_dir_all(&path);
                         return Err(error);
                     }
                     self.record_activity(&directory, &id, now);
+                    let folder = folder_name(label, &id);
                     return Ok(Root {
                         id,
                         label: label.to_string(),
                         path,
+                        folder,
                         created_unix_ms: now,
                         expires_unix_ms,
                     });
@@ -407,7 +539,7 @@ impl Area {
                 let entry = entry
                     .map_err(|source| Error::io("cannot list the area at", &directory, &source))?;
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') {
+                if matches!(name.as_str(), BARGE_DIR | TRASH_DIR) {
                     continue;
                 }
                 let path = entry.path();
@@ -434,7 +566,7 @@ impl Area {
                         })
                     }
                     MarkerRead::Valid(marker) => {
-                        if name != folder_name(&marker.label, &marker.id) {
+                        if name != root::marker_folder(&marker) {
                             listing.stragglers.push(Straggler {
                                 path,
                                 reason: "its folder name does not match its marker".to_string(),
@@ -485,7 +617,6 @@ impl Area {
     pub fn resolve(&self, id: &str) -> Result<Root> {
         root::validate_id(id)?;
         let key = self.key().label();
-        let suffix = format!("-{id}");
         for (directory, _) in self.search_dirs()? {
             let entries = match fs::read_dir(&directory) {
                 Ok(entries) => entries,
@@ -496,9 +627,6 @@ impl Area {
             };
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if !name.ends_with(&suffix) {
-                    continue;
-                }
                 let path = entry.path();
                 let Ok(metadata) = fs::symlink_metadata(&path) else {
                     continue;
@@ -507,14 +635,9 @@ impl Area {
                     continue;
                 }
                 if let MarkerRead::Valid(marker) = read_marker(&path) {
-                    if marker.area == key && marker.id == id {
-                        return Ok(Root {
-                            id: marker.id,
-                            label: marker.label,
-                            path,
-                            created_unix_ms: marker.created_unix_ms,
-                            expires_unix_ms: marker.expires_unix_ms,
-                        });
+                    if marker.area == key && marker.id == id && name == root::marker_folder(&marker)
+                    {
+                        return Ok(root_from_marker(path, marker));
                     }
                 }
             }
@@ -919,6 +1042,17 @@ fn parent(path: &Path) -> Result<PathBuf> {
     path.parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| Error::unknown_state(format!("{} has no parent folder", path.display())))
+}
+
+fn root_from_marker(path: PathBuf, marker: RootMarker) -> Root {
+    Root {
+        id: marker.id.clone(),
+        label: marker.label.clone(),
+        folder: root::marker_folder(&marker),
+        path,
+        created_unix_ms: marker.created_unix_ms,
+        expires_unix_ms: marker.expires_unix_ms,
+    }
 }
 
 fn pin_path(directory: &Path, id: &str) -> PathBuf {
