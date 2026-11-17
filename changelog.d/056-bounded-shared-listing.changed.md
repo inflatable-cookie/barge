@@ -1,1 +1,0 @@
-Grow shared descriptor listings within the original scan budgets, with conservative identity/refusal checks and exact descriptor-set proof readiness; retain bounded staging logs and producer custody through failures under a prospective, separately activated 600-second proof window.

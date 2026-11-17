@@ -5,9 +5,7 @@ works with nothing else installed. Other tools use the CLI and its JSON output.
 There is no daemon: state lives in small files, guarded by file locks.
 
 This is the lean design adopted on 2026-11-17 ([vision](vision.md#authority)).
-It replaces the earlier writer-custody, operation-journal, capture-tape and
-native-proof-ladder design. The files under `contracts/` describe that earlier
-design; they are deleted together with its code.
+It replaces the earlier design, whose files are deleted together with its code.
 
 ## Safety model
 
@@ -72,9 +70,10 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
   <namespace>/<area>/          one declared area
     <label>-<id>/              a root, with .barge-root.json
     .trash/                    evicted roots awaiting deletion
-    .barge/locks/<id>.lock     hold lock files
+    .barge/area.lock           the area lock pinning, eviction and sweeps take
+    .barge/locks/<id>.lock     hold lock files (removed with an evicted root)
     .barge/pins/<id>.json      pins
-    .barge/activity/<id>       last hold and release times
+    .barge/activity/<id>.json  last hold and release times
   scratch/<project>/           Barge's own scratch area per project
 ```
 
@@ -94,32 +93,38 @@ code reads better, as long as the behaviour holds.
 
 ```rust
 let barge = Barge::open()?;                       // account state dir
-barge.register_volume(VolumeSpec { .. })?;
-let vol = barge.volume("Builds")?.check()?;       // Present | Absent | Mismatch
+barge.register_volume(VolumeRegistration::new("Builds", mount))?;
+let vol = barge.volume("Builds")?;
+vol.state()?;                                     // Present | Absent | Mismatch
 
-let area = barge.area(AreaSpec {
-    namespace: "oxide", name: "pool",
-    absent: Absent::Fallback("/path/to/internal/pool".into()), // or Absent::Fail
-    soft_cap: Some(200 << 30), counts_toward_reserve: true,
-    ..
-})?;
+let area = barge.area(
+    AreaSpec::new("oxide", "pool", "Builds")
+        .absent(Absent::Fallback(path))           // or Absent::Fail (the default)
+        .soft_cap_bytes(Some(200 << 30))
+        .counts_toward_reserve(true),
+)?;
 match area.location()? { Location::Volume(p) | Location::Fallback(p) => .., Location::Unavailable(why) => .. }
 
 let root = area.create_root("slot")?;             // new <label>-<id>
-let hold = area.hold(&root.id, Mode::Exclusive)?; // flock; blocks or try_
+let hold = area.hold(&root.id, Mode::Exclusive)?; // flock; try_hold never waits
 let donor = area.hold(&other.id, Mode::Shared)?;  // seeding: hold a donor too
-area.roots()?;                                    // id, path, held, pinned, last_used, bytes
+hold.set_inheritable(true)?;                      // the child keeps the hold across exec
+area.list()?;                                     // roots, holds, pins, bytes, stragglers
 area.pin(&root.id, "selected output")?; area.unpin(&root.id)?;
 area.evict(&root.id)?;                            // refuses if held or pinned
 
 barge.space("Builds")?;                           // free, reserve, floor
-barge.prune("Builds", Plan::Reserve)?;            // LRU idle unpinned roots until above reserve
-barge.admit("Builds")?;                           // prune if needed; refuse only below the floor
+barge.prune("Builds", false)?;                    // LRU idle unpinned roots to the reserve
+barge.admit("Builds")?;                           // prune to the floor; refuse only below it
 barge.sweep_trash("Builds")?;
 
-let run = barge.scratch("effigy")?.create("test-run", ttl)?;
-barge.scratch("effigy")?.sweep()?;                // expired idle roots
+let run = barge.scratch("Builds", "effigy")?.create("test-run", ttl)?;
+barge.sweep_scratch("Builds", Some("effigy"))?;   // expired idle roots
 ```
+
+The stored documents carry their own schema names (`barge.volumes/1`,
+`barge.area/1`, `barge.root/1`, `barge.pin/1`, `barge.activity/1`); a reader
+that does not know one refuses it rather than guessing.
 
 Warm reuse is the consumer's choice: a consumer that finds an idle root it
 wants takes an exclusive hold on it and reuses it, contents and all. Barge
