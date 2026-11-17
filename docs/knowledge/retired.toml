@@ -1,3 +1,58 @@
 # Concepts that no longer exist. The retired-concepts check fails on any listed
 # term, path or config key found outside `allow`. See the Northstar skill's
 # references/knowledge.md.
+#
+# Each entry names what replaced the concept and the knowledge file that owns
+# the replacement. `allow` lists files where a current-truth statement has to
+# name the retired concept to say it is gone.
+
+[[retired]]
+id = "writer-custody"
+retired = "2026-11-17"
+replacement = "cooperative holds (architecture.md#safety-model)"
+owner = "docs/knowledge/architecture.md"
+terms = ["writer custody", "writer-custody", "custody scan", "descriptor scan"]
+
+[[retired]]
+id = "operation-journal"
+retired = "2026-11-17"
+replacement = "atomic rename into the area's trash (architecture.md#safety-model)"
+owner = "docs/knowledge/architecture.md"
+terms = ["operation journal", "operation-journal", "journal store"]
+
+[[retired]]
+id = "capture-tape"
+retired = "2026-11-17"
+replacement = "ordinary tests (architecture.md#testing)"
+owner = "docs/knowledge/architecture.md"
+terms = ["capture tape", "capture-tape", "capture harness", "capture wire"]
+allow = ["AGENTS.md", "docs/knowledge/architecture.md", "docs/knowledge/vision.md"]
+
+[[retired]]
+id = "native-proof-ladder"
+retired = "2026-11-17"
+replacement = "ordinary tests and one independent review (architecture.md#testing)"
+owner = "docs/knowledge/architecture.md"
+terms = [
+  "native proof",
+  "native-proof",
+  "proof ladder",
+  "proof-synthetic-account",
+  "proof-journal",
+  "proof-descriptor-listing",
+]
+allow = ["AGENTS.md", "docs/knowledge/architecture.md", "docs/knowledge/vision.md"]
+
+[[retired]]
+id = "descriptor-listing"
+retired = "2026-11-17"
+replacement = "cooperative holds on a root's lock file (architecture.md#safety-model)"
+owner = "docs/knowledge/architecture.md"
+terms = ["descriptor listing", "descriptor-listing"]
+
+[[retired]]
+id = "oxide-adapters"
+retired = "2026-11-17"
+replacement = "Barge knows nothing about Oxide (architecture.md#boundary-with-oxide)"
+owner = "docs/knowledge/architecture.md"
+terms = ["oxide_outputs", "oxide-outputs", "oxide_settlement", "oxide-settlement"]

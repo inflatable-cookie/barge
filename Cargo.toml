@@ -1,5 +1,5 @@
 # Barge's workspace: one library that holds every mechanic and one thin CLI
-# over it (docs/knowledge/contracts/stage1-design.md, "Crate and CLI skeleton").
+# over it (docs/knowledge/architecture.md, "Library surface").
 [workspace]
 members = ["crates/barge", "crates/barge-cli"]
 resolver = "2"
@@ -8,9 +8,8 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 # The declared toolchain is the first consumer's: Oxide declares
-# `rust-version = "1.97.1"` and pins the same channel, so Barge's MSRV is
-# re-derived from Oxide's manifests rather than invented here (design,
-# "Declared toolchain and RustQuality resolution", O-007).
+# `rust-version = "1.97.1"` and pins the same channel, so Barge's MSRV follows
+# the consumer rather than inventing its own.
 rust-version = "1.97.1"
 # No registry is chosen in stage 1; the library is consumed by path or git.
 publish = false

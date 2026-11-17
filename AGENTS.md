@@ -23,9 +23,10 @@ the human summary. Toolchain `1.97.1` and edition 2021, pinned in
 `rust-toolchain.toml`; `Cargo.lock` is committed. Oxide depends on the library
 at an exact Git commit.
 
-The pre-reset code (writer custody, descriptor listing, operation journal,
-release, capture tape, Oxide adapters, proof features and scripts) is being
-deleted by the lean-core task. Do not extend it.
+The library follows [architecture](docs/knowledge/architecture.md#library-surface):
+platform facts sit behind the `os` seam, account state under `state`, and
+areas, roots, holds, pins, trash, space policy and scratch are their own
+modules. A new mechanic is a module and an ordinary test, not a framework.
 
 ## Validate
 
@@ -39,8 +40,8 @@ Rust runs through `oxide` (see the block below).
 - `effigy docs:check` — Northstar link and retired-concept checks, the
   changelog check, and `git diff --check HEAD`. Check its exit code.
 
-Selectors not listed here belong to the pre-reset design and are removed with
-it; do not run them as validation for new work.
+Those are the repository's only selectors. Add one only for a check this
+section names, and run it through Effigy rather than raw `cargo`.
 
 RustQuality strict is active for the Rust source, manifests, tests and their
 documentation: `docs/knowledge/contracts/language-quality-activation.json` opts

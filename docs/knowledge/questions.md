@@ -33,16 +33,6 @@ Answer: macOS on APFS only for now, with an OS layer throughout so Linux can fol
 Status: answered 2026-10-26
 Answer: outside Barge's own folders and every declared area, not outside `root_dir` (design freeze d3e170db, O-004, matching Tom's ruling c80e2034). The Vault needs no layout change; see [architecture](architecture.md#layout-on-a-volume).
 
-## Q-007 — Can a same-uid descriptor scan read every process it must decide?
-
-Status: retired 2026-11-17
-Answer: moot. The lean design removed the writer custody machinery this answered (Tom, 2026-11-17); see [architecture](architecture.md#safety-model). The earlier answer stays in Git history.
-
-## Q-008 — What about this account's own processes whose descriptors cannot be read?
-
-Status: retired 2026-11-17
-Answer: moot. The lean design removed the writer custody machinery this answered (Tom, 2026-11-17); see [architecture](architecture.md#safety-model). The earlier answer stays in Git history.
-
 ## Q-009 — Should Barge manage VM mounts, such as Colima profiles?
 
 Open (raised by Effigy, Tom 2026-10-27). Container fixtures run in a Colima VM
@@ -52,34 +42,16 @@ designed: a VM mount is another tool-configuration placement under Q-003. Barge
 would write a profile's `mounts:` entry only on explicit adopt, mount only a
 declared folder (for example `scratch/`) and never the whole volume, report the
 change exactly and undo it. It would also need a rule for an absent volume at VM
-start. This is not in stage 1. Until it is designed, mount changes stay manual
-operator changes to the Colima profile.
-
-## Q-010 — What about a vnode descriptor that is dead (revoked or reclaimed)?
-
-Status: retired 2026-11-17
-Answer: moot. The lean design removed the writer custody machinery this answered (Tom, 2026-11-17); see [architecture](architecture.md#safety-model). The earlier answer stays in Git history.
-
-## Q-011 — What makes an interrupted release unknown?
-
-Status: retired 2026-11-17
-Answer: moot. The lean design removed the activity record recovery machinery this answered (Tom, 2026-11-17); see [architecture](architecture.md#safety-model). The earlier answer stays in Git history.
-
-## Q-012 — How is an unconfirmed activity record marked as unknown when the state volume refuses every write?
-
-Status: retired 2026-11-17
-Answer: moot. The lean design removed the activity record recovery machinery this answered (Tom, 2026-11-17); see [architecture](architecture.md#safety-model). The earlier answer stays in Git history.
+start. This is not in the lean core. Until it is designed, mount changes stay
+manual operator changes to the Colima profile.
 
 ## Q-013 — Who is authoritative for an area declaration, the stored record or the caller's object?
 
 Status: answered 2026-11-01
-Answer: the stored `barge.area/1` record. A library caller presents the same
-declaration or is refused before any effect, naming the differing `folder`,
-`overrides`, `absent`, `prune` or `reserve`; the first creation, when no record
-exists, publishes the caller's validated declaration under `barge area declare`'s
-rules with generation 1, and a later creation can only match it. The library reads
-the state directory itself, so a caller object can no longer override a stored
-policy, and the effective declaration recorded in a root's marker is the governing
-record's (Tom's Q-G decision `12729764`; Oxide Supervisor's Barge design ruling,
-Queue decision `5e57544c-dfc8-4d2c-9c0b-a7a363c7b547`; D2 of Oxide's F6 adoption
-contract, closing O-003); see the [architecture](architecture.md#concepts).
+Answer: the stored declaration. A library caller presents the same declaration
+or is refused before any effect, naming the differing `volume`, `folder`,
+`absent`, `soft_cap_bytes` or `counts_toward_reserve`; the first declaration,
+when no record exists, publishes the caller's validated declaration, and a later
+one can only match it. The effective declaration in a root's marker is the
+governing record's (Tom's Q-G decision `12729764`); see the
+[architecture](architecture.md#concepts).

@@ -4,73 +4,17 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "Barge's library: volume identity, account state and placement mechanics"
+description = "Barge's storage library: volumes, areas, owned roots, holds, pins, pruning and scratch"
 
 [dependencies]
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 
-# The only platform dependency: every use of it sits behind the `os` layer's
-# macOS implementation, and no other module names a syscall, errno or platform
-# path convention.
-[target.'cfg(target_os = "macos")'.dependencies]
+# The one platform dependency. Every use of it sits behind the `os` layer (volume
+# identity and free space) and the hold's `flock`; no other module names a
+# syscall or errno.
+[target.'cfg(unix)'.dependencies]
 libc = "=0.2.190"
-
-# The proof-only synthetic account (docs/knowledge/contracts/stage4-design.md,
-# "F6-R1 landed surface"). No ordinary build enables it. Under this feature alone,
-# Oxide's state and cache directories, which feed the reference set, come from one
-# validated private account home. Every other fact and rule is unchanged.
-#
-# The proof-only operation journal driver (scripts/native/journal-proof.py): under
-# this feature alone the journal's labelled publication-failure injection
-# endpoints exist (`operation::fail_next_document_publish`,
-# `fail_next_watermark_publish`), so the staged proof build can stop the actual
-# store exactly at a crash window and label the injection in its evidence. No
-# ordinary build enables it; every other fact and rule is unchanged.
-[features]
-proof-synthetic-account = []
-proof-journal = []
-# The targeted shared-listing kernel proof. No ordinary build enables its
-# single-PID endpoint or its driver; it does not replace the custody scan.
-proof-descriptor-listing = []
 
 [lints]
 workspace = true
-
-# The Oxide outputs adapter's proof-only driver (scripts/native/oxide-outputs-proof.py):
-# one case per invocation, over the synthetic account home the proof feature binds.
-# `required-features` keeps it out of every ordinary build, including --all-targets
-# without the feature; only the staged proof build compiles it.
-[[example]]
-name = "oxide_outputs_proof"
-required-features = ["proof-synthetic-account"]
-
-# The operation journal's proof-only driver (scripts/native/journal-proof.py):
-# one case group per invocation, through the actual journal store, lock and
-# publication code on fresh private filesystem fixtures. `required-features`
-# keeps it out of every ordinary build, including --all-targets without the
-# feature; only the staged proof build compiles it.
-[[example]]
-name = "journal_proof"
-required-features = ["proof-journal"]
-
-[[example]]
-name = "operation_coordinator_proof"
-required-features = ["proof-journal", "proof-synthetic-account"]
-
-[[example]]
-name = "descriptor_listing_proof"
-required-features = ["proof-descriptor-listing"]
-
-# The F6-O2 B-S1 capture harness (docs/knowledge/contracts/o2-tape.md): a
-# standalone executable whose argv contract is
-# `--fixture-root --manifest --transcript-out --case`. `harness = false` keeps
-# libtest out of the way, and the target compiles the library's own sources
-# through `#[path]` includes with `cfg(test)` set, so the cfg(test)-only leaf
-# record statements are active in exactly this target and in no production
-# build. `oxide test --test tape_eval` runs its embedded end-to-end fixture
-# exercise; the exported binary is the one a later Oxide-side orchestrator
-# invokes under the manifest.
-[[test]]
-name = "tape_eval"
-harness = false
