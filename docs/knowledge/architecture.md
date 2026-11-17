@@ -70,9 +70,10 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
   <namespace>/<area>/          one declared area
     <label>-<id>/              a root, with .barge-root.json
     .trash/                    evicted roots awaiting deletion
-    .barge/locks/<id>.lock     hold lock files
+    .barge/area.lock           the area lock pinning, eviction and sweeps take
+    .barge/locks/<id>.lock     hold lock files (removed with an evicted root)
     .barge/pins/<id>.json      pins
-    .barge/activity/<id>       last hold and release times
+    .barge/activity/<id>.json  last hold and release times
   scratch/<project>/           Barge's own scratch area per project
 ```
 

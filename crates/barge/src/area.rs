@@ -203,6 +203,12 @@ impl AreaRecord {
         validate_name("area name", &self.name)?;
         crate::state::validate_volume_name("area volume", &self.volume)?;
         if let Some(folder) = &self.folder {
+            if folder.is_empty() {
+                return Err(Error::usage(format!(
+                    "area {}/{} folder override must not be empty",
+                    self.namespace, self.name
+                )));
+            }
             validate_relative_path("area folder", folder)?;
         }
         if let Absent::Fallback { path } = &self.absent {
@@ -494,6 +500,12 @@ impl Area {
                     continue;
                 }
                 let path = entry.path();
+                let Ok(metadata) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    continue;
+                }
                 if let MarkerRead::Valid(marker) = read_marker(&path) {
                     if marker.area == key && marker.id == id {
                         return Ok(Root {
@@ -542,6 +554,17 @@ impl Area {
             .map_err(|source| Error::io("cannot open the hold lock", &lock_path, &source))?;
         if !hold::flock(&file, mode, wait)? {
             return Ok(None);
+        }
+        // An eviction holds this same lock across its rename. A waiting hold can
+        // therefore wake up on a root that no longer exists; it must not report
+        // a hold on a path a later root may use. Dropping `file` releases the
+        // lock in every early return.
+        let current = self.resolve(id)?;
+        if current.path != root.path {
+            return Err(Error::not_found(format!(
+                "root {id} in area {} moved while it was being held",
+                self.key().label()
+            )));
         }
         let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
         self.record_activity(&directory, id, self.core.clock.now_unix_ms());
@@ -638,6 +661,10 @@ impl Area {
         let trash_path = unique_trash_path(&trash, &root.folder_name());
         fs::rename(&root.path, &trash_path)
             .map_err(|source| Error::io("cannot evict the root to", &trash_path, &source))?;
+        // The root is renamed: a waiting holder wakes to a missing root and the
+        // lock file is no longer useful. Unlinking it does not release our lock;
+        // dropping the descriptor does.
+        let _ = fs::remove_file(&lock_path);
         let deleted = match crate::trash::remove_owned_tree(&trash_path, &self.key().label()) {
             Ok(deletion) => deletion.skipped.is_empty(),
             Err(_) => false,
@@ -672,7 +699,19 @@ impl Area {
             let _lock = AreaLock::acquire(&directory)?;
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_dir() {
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(source) => return Err(Error::io("cannot inspect", &path, &source)),
+                };
+                if metadata.file_type().is_symlink() {
+                    report.kept.push(SkippedRoot {
+                        path,
+                        reason: "a symbolic link, never followed".to_string(),
+                    });
+                    continue;
+                }
+                if metadata.is_dir() {
                     match read_marker(&path) {
                         MarkerRead::Valid(marker) if marker.area == key => {
                             match crate::trash::remove_owned_tree(&path, &key) {

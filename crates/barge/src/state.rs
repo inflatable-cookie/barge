@@ -209,6 +209,9 @@ struct VolumesDocument {
 /// The held account state lock. Dropping it releases the lock.
 #[derive(Debug)]
 pub struct StateLock {
+    /// Held only for the lock its descriptor carries; dropping it releases the
+    /// lock, so the value is never read.
+    #[allow(dead_code)]
     file: File,
 }
 
@@ -229,8 +232,8 @@ impl StateLock {
 
 impl Drop for StateLock {
     fn drop(&mut self) {
-        let _ = crate::hold::flock(&self.file, Mode::Exclusive, false).map(|_| ());
-        // Closing the descriptor releases the lock in every case.
+        // Closing the descriptor releases the lock; there is no explicit unlock
+        // call, and taking the lock again here would be wrong.
     }
 }
 

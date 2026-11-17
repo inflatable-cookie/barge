@@ -120,6 +120,42 @@ fn admit_evicts_idle_roots_to_reach_the_floor_and_keeps_pinned_ones() {
 }
 
 #[test]
+fn admit_prunes_only_to_the_floor_while_prune_reaches_the_reserve() {
+    let mut fixture = Fixture::new();
+    fixture.reserve = TIB;
+    fixture.floor = 100;
+    fixture.os.set_free(&fixture.mount, 1_000);
+    fixture.register();
+    let area = fixture.area("pool");
+    let root = area.create_root("slot").unwrap();
+
+    let admitted = fixture.barge.admit("Builds").unwrap();
+    assert!(
+        admitted.evicted.is_empty(),
+        "free space is above the floor, so admission evicts nothing"
+    );
+    assert_eq!(admitted.target_bytes, 100);
+    assert!(root.path.is_dir());
+
+    let pruned = fixture.barge.prune("Builds", false).unwrap();
+    assert_eq!(pruned.target_bytes, TIB);
+    assert_eq!(pruned.evicted.len(), 1);
+    assert!(!root.path.exists());
+}
+
+#[test]
+fn an_empty_area_folder_override_is_refused() {
+    let fixture = Fixture::new();
+    fixture.register();
+    let error = fixture
+        .barge
+        .area(AreaSpec::new("test", "empty", "Builds").folder(""))
+        .expect_err("an empty folder override is refused");
+    assert_eq!(error.kind(), ErrorKind::Usage);
+    assert!(error.message().contains("must not be empty"), "{error}");
+}
+
+#[test]
 fn scratch_sweep_covers_every_project_on_a_volume() {
     let fixture = Fixture::new();
     fixture.register();

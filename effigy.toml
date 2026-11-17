@@ -2,14 +2,9 @@
 alias = "barge"
 
 [tasks]
-# The changelog fragments: one short file per unreleased change, folded at
-# release. `docs:check` runs the same check.
-"barge:changelog:check" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/changelog.py check"
-"barge:changelog:fold" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/changelog.py fold {args}"
-"barge:changelog:test" = "bash scripts/changelog.test.sh"
-
-# Northstar's link and retired-concept checks, the changelog check and the
-# whitespace check (AGENTS.md, "Validate").
+# Northstar's link and retired-concept checks, the changelog check (one short
+# fragment per unreleased change) and the whitespace check (AGENTS.md,
+# "Validate").
 "docs:check" = [
   "python3 scripts/check-docs.py check-links",
   "python3 scripts/check-docs.py retired-concepts",

@@ -7,9 +7,9 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# The declared toolchain is the first consumer's: Oxide declares
-# `rust-version = "1.97.1"` and pins the same channel, so Barge's MSRV follows
-# the consumer rather than inventing its own.
+# The declared toolchain is the first consumer's (`rust-version = "1.97.1"`,
+# same channel), so Barge's MSRV follows that consumer rather than inventing its
+# own.
 rust-version = "1.97.1"
 # No registry is chosen in stage 1; the library is consumed by path or git.
 publish = false
@@ -30,7 +30,7 @@ all = { level = "deny", priority = -1 }
 undocumented_unsafe_blocks = { level = "deny", priority = -1 }
 
 # Shared workspace profile: our own units keep the toolchain's dev debug
-# recipe (Oxide selects it), while dependency units carry no debug info, so a
-# test build stays small.
+# recipe, while dependency units carry no debug info, so a test build stays
+# small.
 [profile.dev.package."*"]
 debug = false

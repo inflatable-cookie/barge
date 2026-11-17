@@ -68,6 +68,36 @@ fn a_hold_or_pin_taken_after_an_idle_reading_stops_the_eviction() {
 }
 
 #[test]
+fn a_hold_that_wakes_after_an_eviction_reports_not_found() {
+    let fixture = Fixture::new();
+    fixture.register();
+    let area = fixture.area("pool");
+    let root = area.create_root("slot").unwrap();
+    let trash = fixture.area_dir("pool").join(".trash");
+    fs::create_dir_all(&trash).unwrap();
+
+    let first = area.hold(&root.id, Mode::Exclusive).unwrap();
+    let waiter = {
+        let area = area.clone();
+        let id = root.id.clone();
+        std::thread::spawn(move || area.hold(&id, Mode::Exclusive))
+    };
+    // Let the waiter resolve the root and block on the lock, then rename the
+    // root the way an eviction does before the first hold releases.
+    std::thread::sleep(Duration::from_millis(250));
+    fs::rename(&root.path, trash.join(root.folder_name())).unwrap();
+    drop(first);
+
+    let result = waiter.join().expect("the waiting thread finished");
+    let error = result.expect_err("a hold on an evicted root is refused");
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    assert!(
+        area.try_hold(&root.id, Mode::Exclusive).is_err(),
+        "a vanished root cannot be held"
+    );
+}
+
+#[test]
 fn eviction_renames_into_trash_and_a_crash_leaves_owned_trash() {
     let fixture = Fixture::new();
     fixture.register();

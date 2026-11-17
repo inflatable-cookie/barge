@@ -122,6 +122,8 @@ impl SweepReport {
 /// Prune a volume: sweep its trash, enforce each area's soft cap, then return
 /// free space above the volume's reserve by evicting least-recently-used idle
 /// unpinned roots.
+/// `target_bytes` overrides the reserve: `prune` leaves it unset, while `admit`
+/// passes the floor, so an admission evicts only what the floor needs.
 pub(crate) fn prune(
     core: &Core,
     volume_name: &str,
@@ -134,9 +136,7 @@ pub(crate) fn prune(
     let free_before = core.os.free_bytes(&mount)?;
     let areas = areas(core, &volume)?;
 
-    let target_bytes = target_bytes
-        .map(|target| target.max(spec.reserve_bytes))
-        .unwrap_or(spec.reserve_bytes);
+    let target_bytes = target_bytes.unwrap_or(spec.reserve_bytes);
     let mut report = PruneReport {
         volume: volume_name.to_string(),
         dry_run,
