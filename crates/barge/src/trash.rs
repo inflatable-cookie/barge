@@ -149,6 +149,7 @@ mod tests {
                 label: "slot".to_string(),
                 created_unix_ms: 1,
                 expires_unix_ms: None,
+                folder: None,
             },
         )
         .unwrap();
@@ -181,6 +182,7 @@ mod tests {
                 label: "slot".to_string(),
                 created_unix_ms: 1,
                 expires_unix_ms: None,
+                folder: None,
             },
         )
         .unwrap();
@@ -219,6 +221,7 @@ mod tests {
                 label: "slot".to_string(),
                 created_unix_ms: 1,
                 expires_unix_ms: None,
+                folder: None,
             },
         )
         .unwrap();

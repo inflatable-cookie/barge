@@ -11,18 +11,18 @@ It replaces the earlier design, whose files are deleted together with its code.
 
 Everything Barge prunes can be rebuilt. The guarantee is sized to match:
 
-- **Barge deletes only what it owns:** a root it created, whose marker matches
-  the area and root ID. Anything else in an area is reported and never deleted.
+- **Barge deletes only what it owns:** a root whose marker matches the area and
+  root ID. Anything else in an area is reported and never deleted.
 - **Holds are cooperative.** A consumer holds a root with a file lock while it
   uses it. A root is idle only when its lock can be taken. Barge does not scan
   processes or open files. A process that writes into a root without holding
   it, or that closes an inherited hold descriptor, is outside the guarantee,
   and these docs say so rather than claiming more.
-- **Eviction never reuses a path.** Evicting a root renames it into the area's
-  trash and deletes it there. A later root always gets a new ID and a new path.
-  A straggler that escaped its hold can reach only the trash copy, or recreate
-  an unmarked stray folder under the old path; it can never write into a root
-  that a new holder owns.
+- **Barge never reuses a path it named itself.** Eviction renames a root into
+  the area's trash and deletes it there. A later Barge-created root gets a new
+  ID and path. A caller-chosen folder may be adopted again after eviction;
+  protection from a straggler at that path then rests on the caller's holds and
+  pins.
 - **Eviction decides atomically.** Eviction takes the root's exclusive lock
   without waiting, then rechecks the pin under the area lock, which pinning
   also takes, before it renames. An earlier "idle and unpinned" reading never
@@ -51,10 +51,11 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
   and whether it counts toward the volume reserve. The stored declaration is
   authoritative: a caller that presents a different one is refused, with the
   differing fields named (Q-013).
-- **Root.** A directory inside an area that Barge created, named
-  `<label>-<id>` with a random `id`. Its marker, `.barge-root.json`, records
-  the area, ID, label and creation time. What the root contains is opaque to
-  Barge.
+- **Root.** A directory inside an area that Barge owns. Barge-created roots are
+  named `<label>-<id>` with a random `id`; an existing directory can be adopted
+  under its caller-chosen folder name. Its `.barge-root.json` marker records
+  the area, ID, label, folder when needed, and creation time. What it contains
+  is opaque to Barge.
 - **Hold.** An advisory `flock` on the root's lock file, exclusive or shared.
   A consumer that keeps the descriptor inheritable passes the hold to its child
   processes, so the root stays held until the whole process tree has exited.
@@ -68,7 +69,8 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
 ```
 <mount>/<root_dir>/
   <namespace>/<area>/          one declared area
-    <label>-<id>/              a root, with .barge-root.json
+    <label>-<id>/              a Barge-created root, with .barge-root.json
+    <caller-folder>/           an adopted root, with .barge-root.json
     .trash/                    evicted roots awaiting deletion
     .barge/area.lock           the area lock pinning, eviction and sweeps take
     .barge/locks/<id>.lock     hold lock files (removed with an evicted root)
@@ -106,6 +108,7 @@ let area = barge.area(
 match area.location()? { Location::Volume(p) | Location::Fallback(p) => .., Location::Unavailable(why) => .. }
 
 let root = area.create_root("slot")?;             // new <label>-<id>
+let root = area.adopt_root("pool-slot", "slot", "oxide-72ea0e6b")?;
 let hold = area.hold(&root.id, Mode::Exclusive)?; // flock; try_hold never waits
 let donor = area.hold(&other.id, Mode::Shared)?;  // seeding: hold a donor too
 hold.set_inheritable(true)?;                      // the child keeps the hold across exec
@@ -123,8 +126,10 @@ barge.sweep_scratch("Builds", Some("effigy"))?;   // expired idle roots
 ```
 
 The stored documents carry their own schema names (`barge.volumes/1`,
-`barge.area/1`, `barge.root/1`, `barge.pin/1`, `barge.activity/1`); a reader
-that does not know one refuses it rather than guessing.
+`barge.area/1`, `barge.root/1` and `/2`, `barge.pin/1`, `barge.activity/1`);
+root schema 1 keeps the derived `<label>-<id>` folder rule, while schema 2
+records an adopted folder. A reader that does not know a schema refuses it
+rather than guessing.
 
 Warm reuse is the consumer's choice: a consumer that finds an idle root it
 wants takes an exclusive hold on it and reuses it, contents and all. Barge
