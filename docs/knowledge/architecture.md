@@ -25,6 +25,14 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
   A straggler that escaped its hold can reach only the trash copy, or recreate
   an unmarked stray folder under the old path; it can never write into a root
   that a new holder owns.
+- **Eviction decides atomically.** Eviction takes the root's exclusive lock
+  without waiting, then rechecks the pin under the area lock, which pinning
+  also takes, before it renames. An earlier "idle and unpinned" reading never
+  authorises an eviction by itself.
+- **Deletion stays inside what it owns.** Deleting never follows a symlink and
+  never descends into another filesystem (a nested mount). A trash entry is
+  deleted only when its marker still matches the area; being inside `.trash/`
+  is not enough.
 - **A crash leaves trash, not ambiguity.** A rename is atomic. A crash before
   the rename leaves the root intact; a crash after it leaves owned trash, which
   the next prune or sweep removes. No journal is needed.
@@ -140,6 +148,11 @@ Each area declares one of two policies:
   new roots go back to it; fallback roots stay where they are until they are
   pruned and are never merged back.
 
+A root is found by its ID wherever it lives. `area.location()` decides only
+where *new* roots go. Listing, holds, pins and eviction resolve an existing
+root on the volume or in the fallback, so a fallback root that a consumer
+still uses or wants to reuse stays visible after the volume returns.
+
 Kept data (VMs, archives) is simply unavailable while its volume is away.
 
 ## CLI
@@ -161,7 +174,11 @@ support is a new identity and space implementation, not a redesign.
 Unit and integration tests run on temporary directories, with a fake volume
 identity. Required cases:
 
-- a hold blocks eviction and prune; a released hold allows them;
+- a hold blocks eviction and prune; a released hold allows them; a hold or
+  pin taken after an idle reading but before the rename stops the eviction;
+- deletion and the trash sweep don't follow symlinks or cross into a nested
+  mount, and skip trash entries whose marker doesn't match;
+- a fallback root stays listed, holdable and pinnable after the volume returns;
 - a hold survives `fork` and `exec` when its descriptor is inherited;
 - eviction renames to trash first; a crash after the rename leaves trash that
   the next sweep removes; a later root never reuses an evicted path;
