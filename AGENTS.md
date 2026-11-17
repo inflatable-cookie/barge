@@ -1,245 +1,51 @@
 # Barge
 
-Barge moves heavy, rebuildable developer data off the internal drive onto a dedicated external volume and keeps it there safely. Read [docs/README.md](docs/README.md), then the owning knowledge files, before changing anything.
+Barge moves heavy, rebuildable developer data off the internal drive onto a dedicated external volume and keeps it there safely. Read [docs/README.md](docs/README.md), then [vision](docs/knowledge/vision.md) and [architecture](docs/knowledge/architecture.md), before changing anything.
 
 ## Ownership and work
 
-Repository: `inflatable-cookie/barge`, planned inside Queue project `oxide` and owned by the Oxide workspace (Tom, 2026-10-26); there is no separate Barge project, workspace or agent. Planning, briefs, tasks and reviews live in that Queue project; do not create repository planning or status mirrors. Product implementation needs an approved Queue brief and independent exact-head review, as in Oxide. Design freezes: Tom delegated them to the Oxide Supervisor (the architect, Paseo agent in the Oxide workspace) on 2026-10-26. A design is frozen only after it passes independent review, and anything that changes Barge's scope or direction still goes to Tom.
-
-Tom's scope and authority ruling lives in [vision](docs/knowledge/vision.md). Concepts, invariants and the Oxide boundary live in [architecture](docs/knowledge/architecture.md). Read [questions](docs/knowledge/questions.md) and [retirements](docs/knowledge/retired.toml) before planning.
+Repository: `inflatable-cookie/barge`. Since 2026-11-17 Barge has its own planner (a Claude Code thread) and is no longer planned by the Oxide Supervisor; Oxide's planner keeps Oxide (Tom). Briefs, tasks and reviews run through Nucleus; do not create repository planning or status mirrors. Product changes go through a brief, a PR and one independent review. Scope or direction changes go to Tom.
 
 ## Guardrails
 
-- No moving live data, changing host or tool settings, or deleting existing data without explicit operator approval for that action.
-  Oxide's own idle-slot eviction and output placement during ordinary Oxide-routed builds are not Barge data deletion.
-- Never write scratch to a home folder or a drive root. Use `/Volumes/Stash/scratch/barge/` when the Stash drive is present.
-- Do not change Oxide from this repository. Oxide changes go through Oxide's own Queue project.
+- Keep it small. The lean design in [architecture](docs/knowledge/architecture.md) is the target: cooperative holds, trash-then-delete, no process scanning, no journals, no capture harnesses, no native proof ladders. Adding machinery of that kind is a scope change for Tom.
+- No Oxide coupling: no Oxide-specific modules, formats or adapters in Barge. Do not change Oxide from this repository.
+- No moving live data, changing host or tool settings, or deleting data outside Barge's own roots without explicit operator approval for that action.
+- Never write scratch to a home folder or a drive root. Tests use their own temporary directories.
 - When a change alters current truth, update its owning knowledge file in the same change. Record operator rulings before yielding.
-- Every pull request adds one short `changelog.d/<task-or-pr>-<slug>.<type>.md` fragment. Keep `CHANGELOG.md`'s `[Unreleased]` section empty; put changelog guidance outside `changelog.d/*.md` because every Markdown file there is treated as a fragment.
+- Every pull request adds one short `changelog.d/<task-or-pr>-<slug>.<type>.md` fragment. Keep `CHANGELOG.md`'s `[Unreleased]` section empty.
 
 ## Layout
 
 `crates/barge` is the library: every mechanic, no argv. `crates/barge-cli` is
-the thin binary named `barge`: argument parsing, the JSON envelope, exit codes
-and the human summary. Toolchain `1.97.1`, edition 2021 and `rust-version`
-follow the first consumer's manifests and are pinned in `rust-toolchain.toml`;
-`Cargo.lock` is committed.
+the thin binary named `barge`: argument parsing, JSON output, exit codes and
+the human summary. Toolchain `1.97.1` and edition 2021, pinned in
+`rust-toolchain.toml`; `Cargo.lock` is committed. Oxide depends on the library
+at an exact Git commit.
 
-The `proof-synthetic-account` feature (both crates) is proof-only. No ordinary build
-enables it, and under it alone Oxide's reference directories come from a validated
-synthetic account home ([stage 4 design](docs/knowledge/contracts/stage4-design.md),
-"Proof build").
-
-The library's `proof-descriptor-listing` feature is also proof-only. Its targeted
-owned-child endpoint and example are absent from ordinary builds; it does not
-replace the real, unfiltered consumer scan.
+The pre-reset code (writer custody, descriptor listing, operation journal,
+release, capture tape, Oxide adapters, proof features and scripts) is being
+deleted by the lean-core task. Do not extend it.
 
 ## Validate
 
-Ordinary Rust selectors run through `oxide`; the `oxide:begin` block below lists
-the commands. The named capture-only Cargo selectors below are a separately
-guarded exception. Each selector covers what it names:
+Rust runs through `oxide` (see the block below).
 
-- `effigy rust:compile:cargo`, `rust:compile:release:cargo`, `rust:format:cargo`
-  and `rust:lint:cargo` — the corresponding locked capture covering checks with
-  the owner's pinned Cargo and qualified supervisor. Release compilation plus
-  cfg(test) source discipline supports compile-away; it is not a binary behavior test.
-- `effigy rust:test:tape:cargo` — recorder controls and the embedded harness
-  fixture; `rust:test:tape-eval:cargo` runs the harness target's embedded exercise;
-  `rust:test:tape-stage:cargo` builds that target without running it and emits
-  artifact metadata. These checks do not qualify the private launcher, its
-  isolation, or the private export producer and do not authorize consumer adoption.
-
-- `effigy barge:install:test` — synthetic installer refusal and receipt fixtures; no real build or install.
-- `effigy barge:install` / `effigy barge:reinstall` — planner only, after a reviewed merge; Tom's go-ahead is required for the first host install. Set `BARGE_INSTALL_PIN` and `BARGE_INSTALL_SCRATCH` as documented in the [consumer contract](docs/knowledge/contracts/consumption.md).
-- `effigy rust:compile` — `oxide check --workspace --all-targets --all-features --locked`,
-  so the proof-only `proof-synthetic-account` feature is compiled too.
-- `effigy rust:compile:release` — `oxide check --release --workspace --bins --locked`,
-  the default-feature release profile: the mechanical proof that the cfg(test)-only
-  capture tape ([o2-tape](docs/knowledge/contracts/o2-tape.md)) compiles away, since a
-  production build names none of it.
-- `effigy rust:format` — `oxide fmt --all -- --check`; run it when formatted
-  Rust changed. `rust:format:apply` applies that formatting.
-- `effigy rust:lint` — clippy at the RustQuality strict profile. Every finding
-  is repaired or recorded as a concrete deviation in
+- `effigy rust:compile` — `oxide check --workspace --all-targets --all-features --locked`.
+- `effigy rust:test` — the unit and integration suites through `oxide test`.
+- `effigy rust:lint` — clippy; repair findings or record a deviation in
   `docs/knowledge/contracts/rust-quality-deviations.json`.
-- `effigy rust:test` — the unit and integration suites, through `oxide test`
-  with 300 s admission and 600 s execution, including compilation and Cargo-lock
-  waits. Expiry still forces closure; historical 300 s timeouts remain failures.
-  For fixture-bound runs, set `BARGE_TEST_SCRATCH_ROOT` and `TMPDIR`/`TMP`/`TEMP`
-  to the same fresh Stash scratch directory; compiler output stays in Oxide's pool.
-- `effigy rust:test:listing` — focused actual shared-helper and macOS adapter
-  controls; `rust:compile:listing:proof` checks the driver with only its proof
-  feature. `rust:test:listing:proof` exercises the endpoint's fixture/argument
-  refusals and lossless bounded reporting without a process read or native proof.
-- `effigy os:volumes:probe` — the read-only OS-layer diagnostic:
-  `BARGE_OS_PROBE_PATH` names one directory on a volume, whose facts are read
-  and then verified against that identity; nothing is written. Evidence, not a
-  test.
-- `effigy docs:check` — the Northstar link and retired-concept checks plus
-  `git diff --check HEAD`. Check its exit code. The check wrapper resolves the
-  installed Northstar skill from the effective account (or repository override)
-  and passes its explicit path, so a private fixture `HOME` does not hide it;
-  missing or ambiguous skill installations still refuse.
-- `effigy barge:changelog:test` — synthetic CLI controls for validation and
-  deterministic fold/dry-run behavior, using only temporary fixture repositories.
-- `effigy barge:changelog:check` — validates fragment shape and an empty
-  `[Unreleased]` section. `docs:check` includes this check.
-- `effigy barge:changelog:fold --version <x.y.z> [--date YYYY-MM-DD]` —
-  release-preparation fold; use `--dry-run` to preview. Requires the project's
-  existing explicit release authority.
-- `effigy scratch:expiry:test` — the scratch native proof's own apparatus
-  self-check: its case map, the hash-pinned supervisor and the premise record.
-  No image, no scratch and no child process.
-- `effigy scratch:expiry:shim:test` — the proof-only interposer exercise, in
-  fresh caller scratch; no image and no native proof.
-- `effigy scratch:expiry:native` and `effigy scratch:expiry:native:diagnostic`
-  — S4's one bounded native under Oxide's qualified shared supervisor. HELD for
-  owner activation: the declarations activate nothing, `BARGE_PROOF_BIN` names
-  the binary, and each run is separately activated (diagnostic first, then the
-  counted pass at the exact head). A missing receipt is a missing proof.
-- `effigy space:native:test` — the stage 3 native proof's effect-free apparatus
-  self-check; `effigy space:native:plan` prints its effect-free plan.
-- `effigy space:native` and `effigy space:native:diagnostic` — the stage 3 space
-  proof under the qualified supervisor. HELD for owner activation: diagnostic,
-  counted author and independent reviewer runs are separately activated.
-- `effigy maintain:native:test` — the `barge maintain` native proof's own
-  apparatus self-check: its case map and dispatch, the hash-pinned supervisor,
-  the nine-premise trace and the environment inventory. No image, no scratch and
-  no child process.
-- `effigy maintain:native` and `effigy maintain:native:diagnostic` — S7's one
-  bounded native for `barge maintain`, on one owned 64 MiB image under the same
-  qualified supervisor. HELD for owner activation on the same terms: the
-  declarations activate nothing, and each run is separately activated.
-- `effigy rust:test:proof-account` — the proof-only account's checks, with the
-  `proof-synthetic-account` feature on. The ordinary `rust:test` never enables it.
-- `effigy rust:test:tape` — tape controls, a deterministic positive fixture and
-  a real-host bounded-outcome exercise of the actual release-plan harness
-  ([o2-tape](docs/knowledge/contracts/o2-tape.md)). Read-only: fixtures live in the
-  run root and the plan changes nothing.
-- `effigy rust:test:tape:pure` — the recorder's in-memory self-tests only;
-  excludes the harness exercise and its real process scan. It does not replace
-  the required end-to-end exercise or establish capture qualification.
-- `effigy rust:test:tape:custody` — the retained fixture custody setup controls
-  ([o2-tape](docs/knowledge/contracts/o2-tape.md), "Retained fixture custody"):
-  ordinary cleanup versus retained lifetime on drop, an injected failing setup
-  step and unwinding, the opt-in and run-root premises, the bounded kept-fixture
-  line and the manifest-before-run order. No engine window, host-volume probe,
-  image or native run; the mode itself is a test-only fixture lifetime.
-- `effigy rust:test:tape-eval` — the harness executable's own run with no arguments,
-  which is its embedded exercise; with the argv contract it runs one manifest window.
-- `effigy rust:test:tape-stage` — build the default-feature harness without running it;
-  a separately verified export must bind source, lockfile, toolchain and executable.
-- `effigy rust:test:tape-export` — source-defined archive/build/export producer;
-  held until its private wrapper's admission and resource gates are established.
-- `effigy rust:test:tape-export:pure` — pure Git blob identity controls; no
-  build, fixture or export.
-- `effigy rust:test:tape-admission:pure` — mocked admission refusal controls;
-  includes composition with the hash-bound Oxide candidate component named by
-  `BARGE_TEST_CANDIDATE_COMPONENT`; no live inventory, fixture or build.
-- `effigy rust:test:tape-private-export` — source-defined private wrapper; it
-  requires independently reviewed admission and resource evidence and a new
-  authorized block. Neither is established for the retained failed route.
-- `effigy release:native:test` and `effigy release:native:plan` — F6-R1's native
-  proof apparatus, effect-free: the pinned supervisor, the argv guard, the case
-  table checked against its named regressions, the proof feature's declarations,
-  the Stash scratch route, the stage route and the attach/custody/closure gates,
-  and the held bounds. No image, no scratch and no child process.
-- `effigy release:native:stage` — builds the proof-feature binary of HEAD through
-  Oxide and stages a hashed copy in an exclusive directory under the designated
-  Stash scratch (`/Volumes/Stash/scratch/barge`). It runs no proof; a native run
-  never reads that copy.
-- `effigy release:native` and `effigy release:native:diagnostic` — F6-R1's one
-  bounded native for the release effect, on one owned 64 MiB APFS image under the
-  qualified supervisor (300 s, 512 MiB). Each run verifies the supervisor's bytes
-  and the verified Stash scratch UUID before any effect, then stages the
-  proof-feature build of HEAD inside the guarded run and runs only that staged
-  file; the ordinary production build is never the one tested. The guard's opt-in
-  image-custody indication is published before the backing exists, and closure
-  requires the ordinary detach's success and reap plus whole-backing attachment
-  absence, so an uncertain attach or detach retains the image and faults the run.
-  The proof feature tests release logic over synthetic
-  AccountFacts and does not establish the production account lookup's
-  equivalence. HELD for owner activation: the declarations activate nothing; the
-  diagnostic runs first, then the counted author pass and a distinct reviewer pass,
-  each separately activated at an exact head.
-- `effigy outputs:native:test` and `effigy outputs:native:plan` — the Oxide
-  outputs adapter's proof apparatus, effect-free: the pinned supervisor, the
-  guard containment and argv guard, the case table checked against its named
-  regressions in `crates/barge/src/oxide_outputs/tests.rs`, the proof feature's
-  declarations and the driver's `required-features`, the Stash scratch route,
-  the nine premise dispositions and the held 128 MiB / 300 s / 512 MiB bounds
-  with the 30 s work stop. No image, no scratch and no child process.
-- `effigy outputs:native` and `effigy outputs:native:diagnostic` — the
-  adapter's one bounded native for the delegated deletion, on one owned
-  128 MiB APFS image under the qualified supervisor (300 s, 512 MiB), reusing
-  the release proof's staging, custody and closure helpers. Each run verifies
-  the supervisor's bytes and the verified Stash scratch UUID, refuses any
-  non-guard caller, stages the proof-feature driver build of HEAD inside the
-  guarded run, and runs only that staged file. The guard's image-custody
-  indication is published before the backing exists, work stops 30 s before
-  the deadline, and closure requires the ordinary detach's success and reap
-  plus whole-backing attachment absence, so uncertain custody retains the
-  image and faults the run. It tests the adapter over synthetic AccountFacts
-  and does not establish the production account lookup, a live drive, or any
-  adoption. HELD for owner activation on the same terms as the release proof's
-  natives.
-- `effigy listing:native:test` and `effigy listing:native:plan` — effect-free
-  controls and the fixed targeted shared-listing plan. The plan reads only the
-  caller's own descriptor limit; controls use tiny synthetic files and fake
-  external executors, without a build, holder or kernel proof.
-- `effigy listing:native` and `effigy listing:native:diagnostic` — one targeted
-  owned-child kernel proof, no image, under the same qualified supervisor
-  (600 s / 512 MiB, 30 s work stop; production scans remain 10 s). Each occurrence stages its own fresh
-  source-bound proof-feature driver inside the guard through ordinary Oxide.
-  HELD for separate owner activation: diagnostic, counted author and distinct
-  reviewer runs. Targeted listing evidence grants no whole-host custody or
-  consumer qualification. See the [proof contract](docs/knowledge/contracts/descriptor-listing-proof.md).
+- `effigy rust:format` — `oxide fmt --all -- --check`; `rust:format:apply` applies it.
+- `effigy docs:check` — Northstar link and retired-concept checks, the
+  changelog check, and `git diff --check HEAD`. Check its exit code.
 
-- `effigy journal:native:test` and `effigy journal:native:plan` — the
-  operation journal's proof apparatus, effect-free: the pinned supervisor, the
-  twelve-group case table checked against its named regressions in
-  `crates/barge/src/operation.rs`, the `proof-journal` feature's declarations,
-  the verified Stash route, the nine premises with dispositions, the held
-  bounds, and composition controls that instantiate the REAL
-  `OuterEffects.from_environment()` / `InnerEffects.from_environment()`
-  factories and drive the actual `outer_half` and `inner_half` entries —
-  launch, guarded supervisor child, case driver, verdict parsing, report
-  publication and receipt composition — with only the external process, Git,
-  clock, route and storage queries scripted at named module-level query
-  points; no factory is replaced and no stage record is faked. No image, no
-  guarded launch and no child process. Storage: each control harness owns one
-  fresh private per-run fixture directory under the run's own TMPDIR, with
-  the real 0755/0700 guard layout materialized inside that fixture; the
-  module's designated scratch points into the fixture for the duration of
-  each control, every harness fixture is closed deterministically (never by
-  the garbage collector), and a write-audit control judges only the audited
-  call's own capture window — collection is flushed before and suspended
-  inside the window, the window's fixture stays alive through it, and any
-  write outside the audited composition's own fixture (or any fd-relative
-  event that cannot be attributed to a location) refuses — so no entry is
-  ever created in the shared designated scratch root, and forced-GC runs
-  return the same verdict the ordinary run does.
-- `effigy journal:native` and `effigy journal:native:diagnostic` — the
-  operation journal's one bounded native, journal-only, on fresh private
-  filesystem fixtures inside the guard's owned scratch under the same
-  qualified supervisor. Each run verifies the supervisor's bytes and the
-  verified Stash scratch UUID, stages the proof-journal build of HEAD with a
-  source-bound manifest (head, tree, lock, toolchain, feature, source and
-  binary digests), and runs the twelve case groups as direct children of the
-  inner runner. Counted fail-fast preserves skipped/unexecuted states;
-  diagnostic keeps going within custody and budget and is always
-  `qualified: false` and nonzero. HELD for owner activation on the same terms
-  as the release and outputs proofs.
-- `effigy coordinator:native:test` and `effigy coordinator:native:plan` —
-  effect-free preparation controls and the held case plan for the coordinator
-  proof. The [proof contract](docs/knowledge/contracts/operation-coordinator-proof.md)
-  records the remaining readiness gap. No image or native run is activated.
+Selectors not listed here belong to the pre-reset design and are removed with
+it; do not run them as validation for new work.
 
 RustQuality strict is active for the Rust source, manifests, tests and their
 documentation: `docs/knowledge/contracts/language-quality-activation.json` opts
-in, `rust-quality-profile.json` declares the strict profile and its MSRV
-sources, and `rust-quality-deviations.json` records every accepted deviation.
+in, `rust-quality-profile.json` declares the profile, and
+`rust-quality-deviations.json` records every accepted deviation.
 
 <!-- northstar:rust-quality:start -->
 ## Northstar Rust Quality

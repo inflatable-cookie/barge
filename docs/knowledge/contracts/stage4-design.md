@@ -50,7 +50,7 @@ only when an operator runs it on a presented plan, and nothing in Barge calls it
 ### Frozen inputs
 
 - Tom's scope ruling and the authority list in [vision](../vision.md).
-- The invariants in [architecture](../architecture.md#invariants), including the
+- The invariants in [architecture](../architecture.md#safety-model), including the
   one this contract implements: owned-root identity survives remounts, as
   volume UUID plus a stable per-root identity, never the raw device number
   alone.
