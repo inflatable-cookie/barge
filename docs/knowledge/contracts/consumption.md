@@ -18,9 +18,15 @@ check both and handle unknown versions rather than assuming a compatible
 shape. [Architecture](../architecture.md#cli) owns the CLI's verbs and exit
 codes.
 
-Move plans are `barge.move-plan/1` documents, printed directly by `barge move
---plan` and supplied unchanged to `barge move --apply --plan`. Successful JSON
-apply output is a `barge.move/1` envelope containing the plan and doctor report.
+Move plans are `barge.move-plan/2` documents, printed directly by `barge move
+--plan` and supplied unchanged to `barge move --apply --plan`. A version 1 plan
+is refused: make a fresh one. A `barge.bind-plan/2` document records the
+destination's device and inode as well, so `barge bind apply` refuses a
+destination that was replaced since it was reviewed; a version 1 plan is refused
+the same way. A plan lists the links at [known link locations](../resources.md#known-link-locations)
+that no binding records, and applying it needs `--retarget-unrecorded` while it
+lists any. Successful JSON apply output is a `barge.move/1` envelope containing
+the plan and doctor report.
 
 Except for standalone move plans, every success document has `schema` and `data`. The fields of `data` are:
 
@@ -43,7 +49,7 @@ Except for standalone move plans, every success document has `schema` and `data`
 | `barge.path/1` | `path` | path |
 | `barge.survey/1` | `volume`, `items` | survey |
 | `barge.binding-list/1` | `bindings` | bind list |
-| `barge.bind-plan/1` | `plan` | bind plan |
+| `barge.bind-plan/2` | `plan` | bind plan |
 | `barge.binding/1` | `action`, `binding` | bind apply, adopt, undo |
 | `barge.move/1` | `report` | move apply |
 | `barge.doctor/1` | `ok`, `volumes`, `bindings` | doctor |

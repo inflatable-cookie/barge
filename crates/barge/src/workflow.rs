@@ -444,6 +444,7 @@ impl Barge {
             applied: Applied {
                 value: resolved.rendered.scratch.clone(),
                 at_unix_ms: self.core.clock.now_unix_ms(),
+                identity: None,
             },
             prior: Prior::InPlace,
         };

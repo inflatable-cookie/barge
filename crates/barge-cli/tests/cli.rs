@@ -99,7 +99,7 @@ fn parse_document(output: &Output) -> Value {
         "barge.path/1" => &["path"],
         "barge.survey/1" => &["volume", "items"],
         "barge.binding-list/1" => &["bindings"],
-        "barge.bind-plan/1" => &["plan"],
+        "barge.bind-plan/2" => &["plan"],
         "barge.binding/1" => &["action", "binding"],
         "barge.doctor/1" => &["ok", "volumes", "bindings"],
         "barge.init/1" => &[
@@ -701,7 +701,7 @@ fn bindings_record_drift_and_doctor_report_it() {
     ]);
     assert!(plan.status.success(), "{}", stderr(&plan));
     let document = parse_document(&plan);
-    assert_eq!(document["schema"], "barge.bind-plan/1");
+    assert_eq!(document["schema"], "barge.bind-plan/2");
     assert_eq!(document["data"]["plan"]["before"]["state"], "absent");
     assert_eq!(document["data"]["plan"]["after"]["state"], "link");
     assert_eq!(document["data"]["plan"]["replace"], false);
@@ -732,7 +732,7 @@ fn bindings_record_drift_and_doctor_report_it() {
     std::fs::write(&foreign, br#"{"schema":"barge.other/1","data":{}}"#).unwrap();
     let foreign = fixture.run(&["bind", "apply", "--plan", foreign.to_str().unwrap()]);
     assert_eq!(foreign.status.code(), Some(2), "{}", stderr(&foreign));
-    assert!(stderr(&foreign).contains("barge.bind-plan/1"));
+    assert!(stderr(&foreign).contains("barge.bind-plan/2"));
 
     let applied = fixture.json(&["bind", "apply", "--plan", plan_path.to_str().unwrap()]);
     assert!(applied.status.success(), "{}", stderr(&applied));

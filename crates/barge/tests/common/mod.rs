@@ -23,6 +23,9 @@ pub struct Fixture {
     /// Held for its lifetime: dropping it removes every fixture file.
     pub temp: TempDir,
     pub mount: PathBuf,
+    /// A temporary home folder, so known link locations are looked for here and
+    /// a test never reads the real one.
+    pub home: PathBuf,
     pub os: Arc<FakeOs>,
     pub clock: Arc<ManualClock>,
     pub barge: Barge,
@@ -36,13 +39,17 @@ impl Fixture {
         let temp = TempDir::new("lean-core").expect("a temporary directory");
         let mount = temp.folder("Builds").expect("a mount folder");
         let state = temp.folder("state").expect("a state folder");
+        let home = temp.folder("home").expect("a home folder");
         let os = Arc::new(FakeOs::new());
         os.add_volume(mount.clone(), Some(UUID), TIB);
         let clock = Arc::new(ManualClock::new(1_700_000_000_000));
-        let barge = Barge::open_with(state, os.clone(), clock.clone()).expect("open Barge");
+        let barge = Barge::open_with(state, os.clone(), clock.clone())
+            .expect("open Barge")
+            .with_home(&home);
         Self {
             temp,
             mount,
+            home,
             os,
             clock,
             barge,
