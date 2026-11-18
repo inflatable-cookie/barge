@@ -17,10 +17,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::Clock;
 use crate::error::{Error, Result};
+use crate::root::tree_bytes;
 use crate::state::publish;
 
 /// The schema name of an activity record.
-pub const ACTIVITY_SCHEMA: &str = "barge.activity/1";
+pub const ACTIVITY_SCHEMA: &str = "barge.activity/2";
+const PREVIOUS_ACTIVITY_SCHEMA: &str = "barge.activity/1";
 
 /// How a consumer holds a root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +57,7 @@ pub struct Hold {
     mode: Mode,
     file: Option<File>,
     activity_dir: PathBuf,
+    root_path: PathBuf,
     clock: Arc<dyn Clock>,
 }
 
@@ -64,6 +67,7 @@ impl Hold {
         mode: Mode,
         file: File,
         activity_dir: PathBuf,
+        root_path: PathBuf,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
@@ -71,6 +75,7 @@ impl Hold {
             mode,
             file: Some(file),
             activity_dir,
+            root_path,
             clock,
         }
     }
@@ -142,7 +147,8 @@ impl Hold {
 impl Drop for Hold {
     fn drop(&mut self) {
         let now = self.clock.now_unix_ms();
-        let _ = record_activity(&self.activity_dir, &self.root_id, now);
+        let bytes = tree_bytes(&self.root_path);
+        let _ = record_activity(&self.activity_dir, &self.root_id, now, Some(bytes));
         // Closing the descriptor releases the lock in every case.
         self.file.take();
     }
@@ -190,15 +196,24 @@ struct ActivityRecord {
     schema: String,
     root_id: String,
     last_used_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root_bytes: Option<u64>,
 }
 
 /// Record a root's last use. The record is advisory: a failure is not a reason
 /// to fail the hold, it only makes the root look older to prune.
-pub(crate) fn record_activity(activity_dir: &Path, root_id: &str, unix_ms: u64) -> Result<()> {
+pub(crate) fn record_activity(
+    activity_dir: &Path,
+    root_id: &str,
+    unix_ms: u64,
+    root_bytes: Option<u64>,
+) -> Result<()> {
+    let root_bytes = root_bytes.or_else(|| read_activity_record(activity_dir, root_id)?.root_bytes);
     let record = ActivityRecord {
         schema: ACTIVITY_SCHEMA.to_string(),
         root_id: root_id.to_string(),
         last_used_unix_ms: unix_ms,
+        root_bytes,
     };
     let bytes = serde_json::to_vec_pretty(&record).map_err(|source| {
         Error::unknown_state(format!("cannot encode an activity record: {source}"))
@@ -208,12 +223,24 @@ pub(crate) fn record_activity(activity_dir: &Path, root_id: &str, unix_ms: u64) 
 
 /// Read a root's last use, when a readable record exists.
 pub(crate) fn read_activity(activity_dir: &Path, root_id: &str) -> Option<u64> {
+    read_activity_record(activity_dir, root_id).map(|record| record.last_used_unix_ms)
+}
+
+pub(crate) fn read_activity_bytes(activity_dir: &Path, root_id: &str) -> Option<u64> {
+    read_activity_record(activity_dir, root_id).and_then(|record| record.root_bytes)
+}
+
+fn read_activity_record(activity_dir: &Path, root_id: &str) -> Option<ActivityRecord> {
     let bytes = std::fs::read(activity_path(activity_dir, root_id)).ok()?;
     let record: ActivityRecord = serde_json::from_slice(&bytes).ok()?;
-    if record.schema != ACTIVITY_SCHEMA || record.root_id != root_id {
+    if !matches!(
+        record.schema.as_str(),
+        ACTIVITY_SCHEMA | PREVIOUS_ACTIVITY_SCHEMA
+    ) || record.root_id != root_id
+    {
         return None;
     }
-    Some(record.last_used_unix_ms)
+    Some(record)
 }
 
 pub(crate) fn activity_path(activity_dir: &Path, root_id: &str) -> PathBuf {

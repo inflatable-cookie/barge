@@ -76,7 +76,7 @@ usage: barge [--json] <command>
     [--folder DIR] [--absent fail|fallback:PATH] [--soft-cap SIZE]
     [--counts-toward-reserve true|false]
   area list [--volume V]                  declared areas and their location
-  root list <namespace>/<area>            roots, holds, pins, bytes and stragglers
+  root list <namespace>/<area> [--bytes]   roots, holds, pins and stragglers
   root pin <namespace>/<area> <id> [--reason TEXT]
   root unpin <namespace>/<area> <id>
   root evict <namespace>/<area> <id>      rename into trash, then delete
@@ -365,15 +365,20 @@ fn root(arguments: &[String], json: bool) -> Result<()> {
     let barge = Barge::open()?;
     match subcommand {
         "list" => {
-            let options = Options::parse(rest, &[], &[])?;
+            let options = Options::parse(rest, &[], &["bytes"])?;
             let key = options.single("root list", "area")?;
             let area = area_for(&barge, &key)?;
-            let listing = area.list()?;
+            let listing = if options.flag("bytes") {
+                area.list()?
+            } else {
+                area.list_without_bytes()?
+            };
             if json {
                 document(
                     "barge.roots/1",
                     vec![
                         ("area", json!(area.key().label())),
+                        ("bytes_included", json!(options.flag("bytes"))),
                         ("roots", json!(listing.roots)),
                         ("stragglers", json!(listing.stragglers)),
                     ],
@@ -383,12 +388,16 @@ fn root(arguments: &[String], json: bool) -> Result<()> {
                     println!("no roots in {}", area.key().label());
                 }
                 for root in &listing.roots {
-                    println!(
-                        "{} {} {}",
-                        root.id,
-                        format_size(root.bytes),
-                        describe_root(root)
-                    );
+                    if options.flag("bytes") {
+                        println!(
+                            "{} {} {}",
+                            root.id,
+                            format_size(root.bytes),
+                            describe_root(root)
+                        );
+                    } else {
+                        println!("{} {}", root.id, describe_root(root));
+                    }
                 }
                 for straggler in &listing.stragglers {
                     println!("kept {}: {}", straggler.path.display(), straggler.reason);

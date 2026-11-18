@@ -76,6 +76,7 @@ pub struct RootInfo {
     pub expires_unix_ms: Option<u64>,
     pub held: bool,
     pub pinned: bool,
+    /// Root tree size, or zero when using `Area::list_without_bytes`.
     pub bytes: u64,
     /// True when the root lives on the volume; false in the area's fallback.
     pub on_volume: bool,
@@ -264,6 +265,12 @@ pub(crate) fn mint_id() -> Result<String> {
 /// The bytes a folder holds, without following symlinks or crossing into
 /// another filesystem.
 pub(crate) fn tree_bytes(path: &Path) -> u64 {
+    #[cfg(test)]
+    TREE_BYTES_CALLS.with(|calls| calls.set(calls.get() + 1));
+    tree_bytes_inner(path)
+}
+
+fn tree_bytes_inner(path: &Path) -> u64 {
     let mut total = 0_u64;
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return 0;
@@ -283,10 +290,25 @@ pub(crate) fn tree_bytes(path: &Path) -> u64 {
             continue;
         }
         if child_metadata.is_dir() {
-            total = total.saturating_add(tree_bytes(&child));
+            total = total.saturating_add(tree_bytes_inner(&child));
         } else {
             total = total.saturating_add(child_metadata.len());
         }
     }
     total
+}
+
+#[cfg(test)]
+thread_local! {
+    static TREE_BYTES_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_tree_bytes_calls() {
+    TREE_BYTES_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn tree_bytes_calls() -> usize {
+    TREE_BYTES_CALLS.with(std::cell::Cell::get)
 }
