@@ -6,7 +6,7 @@ from pathlib import Path
 import pwd
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("check", choices=("check-links", "retired-concepts"))
+parser.add_argument("check", choices=("check-links",))
 args = parser.parse_args()
 # Match named-skill precedence and ambiguity refusal. The effective account's
 # installed skills are authority; HOME may deliberately be a private fixture.
