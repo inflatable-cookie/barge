@@ -96,7 +96,7 @@ carefully laid out"). Its main areas, eventually:
 
 The first release ships Machines only, inside a layout that already has room
 for the rest. A menu-bar entry keeps the daily power controls one click away.
-The design pass produces the layout and visual system, reviewed by Tom before
+The [UI design](ui.md) specifies the layout and visual system for Tom’s review before
 the build brief.
 
 ## Repository layout
