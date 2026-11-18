@@ -1,1 +1,1 @@
-Add read-only move planning for resource folders and items.
+Add reviewed same-volume moves that update bindings and placements.

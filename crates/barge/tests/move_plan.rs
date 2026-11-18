@@ -146,4 +146,83 @@ fn held_root_inside_source_refuses_move() {
     let error = f.barge.apply_move(&plan, true).unwrap_err();
     assert!(error.message().contains("held"));
     drop(hold);
+    let result = f.barge.apply_move(&plan, true).unwrap();
+    assert!(result.doctor.ok);
+    let moved = f
+        .barge
+        .areas()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.key().label() == "test/pool")
+        .unwrap();
+    let listing = moved.list_without_bytes().unwrap();
+    assert_eq!(
+        listing.roots[0].path,
+        f.mount.join("new-builds/test/pool").join(root.folder)
+    );
+}
+
+#[test]
+fn moves_a_binding_link_inside_the_source() {
+    let f = Fixture::new();
+    f.register();
+    for (class, name) in [(Class::Vms, "vms"), (Class::Caches, "caches")] {
+        f.barge
+            .set_layout(
+                class,
+                Placement {
+                    volume: "Builds".into(),
+                    path: name.into(),
+                    absent: Absent::Fail,
+                },
+            )
+            .unwrap();
+        fs::create_dir(f.mount.join(name)).unwrap();
+    }
+    fs::create_dir(f.mount.join("caches/target")).unwrap();
+    symlink(f.mount.join("caches/target"), f.mount.join("vms/link")).unwrap();
+    f.barge
+        .bindings()
+        .adopt(&Binding::link(
+            "nested",
+            Class::Caches,
+            f.mount.join("vms/link"),
+        ))
+        .unwrap();
+    let plan = f.barge.plan_class_move(Class::Vms, "machines").unwrap();
+    assert_eq!(plan.bindings[0].link_after, f.mount.join("machines/link"));
+    let result = f.barge.apply_move(&plan, true).unwrap();
+    assert!(result.doctor.ok);
+    assert_eq!(
+        f.barge
+            .bindings()
+            .get("nested")
+            .unwrap()
+            .unwrap()
+            .link_path(),
+        f.mount.join("machines/link")
+    );
+}
+
+#[test]
+fn item_outside_its_destination_volume_is_refused() {
+    let f = Fixture::new();
+    f.register();
+    f.barge
+        .set_layout(
+            Class::Vms,
+            Placement {
+                volume: "Builds".into(),
+                path: "vms".into(),
+                absent: Absent::Fail,
+            },
+        )
+        .unwrap();
+    fs::create_dir(f.mount.join("vms")).unwrap();
+    let other = f.temp.folder("other-volume").unwrap();
+    fs::create_dir(other.join("item")).unwrap();
+    assert!(f
+        .barge
+        .plan_item_move(&other.join("item"), Class::Vms, "item")
+        .is_err());
 }

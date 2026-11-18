@@ -249,26 +249,6 @@ pub(crate) fn open_lock(path: &Path, context: &str) -> Result<File> {
         .map_err(|e| Error::io(context, path, &e))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::canonical_uuid;
-    #[test]
-    fn uuid_is_canonical_and_requires_exact_shape() {
-        assert_eq!(
-            canonical_uuid("  abcdef01-2345-6789-abcd-ef0123456789  ").unwrap(),
-            "ABCDEF01-2345-6789-ABCD-EF0123456789"
-        );
-        for value in [
-            "",
-            "abcdef0123456789abcdef0123456789",
-            "abcdef01-2345-6789-abcd-ef012345678z",
-            "abcdef01_2345-6789-abcd-ef0123456789",
-        ] {
-            assert!(canonical_uuid(value).is_err(), "{value:?}");
-        }
-    }
-}
-
 /// Rename only if the destination is absent, without a check-then-rename race.
 pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
@@ -299,5 +279,25 @@ pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_uuid;
+    #[test]
+    fn uuid_is_canonical_and_requires_exact_shape() {
+        assert_eq!(
+            canonical_uuid("  abcdef01-2345-6789-abcd-ef0123456789  ").unwrap(),
+            "ABCDEF01-2345-6789-ABCD-EF0123456789"
+        );
+        for value in [
+            "",
+            "abcdef0123456789abcdef0123456789",
+            "abcdef01-2345-6789-abcd-ef012345678z",
+            "abcdef01_2345-6789-abcd-ef0123456789",
+        ] {
+            assert!(canonical_uuid(value).is_err(), "{value:?}");
+        }
     }
 }

@@ -242,16 +242,17 @@ barge move --item <path> --into <class>/<sub> --plan > plan.json
 barge move --apply --plan plan.json --confirm-stopped
 ```
 
-The plan lists:
+The reviewed JSON plan records volume and filesystem identities and lists:
 - the data to move. A move within one APFS volume is a rename: instant,
   atomic, and with no copy.
 - every binding that points at the old path, with its exact change;
 - the workflow blocks to regenerate;
-- the consumers that must be stopped first.
+- the consumers that must be stopped first;
+- area declarations carried by a moved folder, whose consumers must update their declarations.
 
 Barge doesn't scan processes, so for tool-owned data the operator confirms the
 tool is stopped. For Barge-owned roots, holds already prove it. Apply renames,
-then updates each binding, then runs doctor. A failure leaves both the old
+then updates each binding and any moved area declaration and layout, then runs doctor. An item inside an area cannot be moved out on its own because that would orphan its root. A failure leaves both the old
 binding and the old data in place, or rolls the rename back. The apply step
 always needs Tom's explicit approval for live data (AGENTS.md guardrail).
 
@@ -300,7 +301,7 @@ Each step is its own brief, reviewed as usual.
    Cargo links is the operator's step after merge.
 3. `init` with workflow blocks; adopt this repository, then Effigy's.
 4. Adapters: Paseo, Nucleus, Effigy, Colima, shell environment.
-5. `move --plan|--apply`; the Stash layout lane then uses it item by item.
+5. **Built:** `move --plan|--apply`; the Stash layout lane then uses it item by item.
 
 ## Questions
 

@@ -1,4 +1,4 @@
-//! Read-only plans for moving resources on a registered volume.
+//! Reviewed resource moves on a registered volume.
 
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::bindings::{observe, BindingRecord, Observed};
-use crate::{Barge, Class, Error, Placement, Result};
+use crate::{AreaRecord, Barge, BindingTarget, Class, Error, Placement, Result};
 
 /// The filesystem identity captured for an existing entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +22,7 @@ pub struct MoveBinding {
     pub record: BindingRecord,
     pub before: Observed,
     pub after: PathBuf,
+    pub link_after: PathBuf,
 }
 
 /// A reviewed rename and the state that must still match when applied.
@@ -30,12 +31,14 @@ pub struct MoveBinding {
 pub struct MovePlan {
     pub schema: String,
     pub volume: String,
+    pub volume_spec: crate::VolumeSpec,
     pub source: PathBuf,
     pub source_identity: MoveIdentity,
     pub destination: PathBuf,
     pub destination_parent_identity: MoveIdentity,
     pub bindings: Vec<MoveBinding>,
     pub layout: Option<MoveLayout>,
+    pub areas: Vec<MoveArea>,
     pub consumers: Vec<String>,
     pub manual_steps: Vec<String>,
 }
@@ -46,6 +49,13 @@ pub struct MoveLayout {
     pub class: Class,
     pub before: Placement,
     pub after: Placement,
+}
+
+/// A declared area carried with a moved folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveArea {
+    pub before: AreaRecord,
+    pub after: AreaRecord,
 }
 
 fn identity(path: &Path) -> Result<MoveIdentity> {
@@ -103,6 +113,13 @@ impl Barge {
         let volume = self.volume(&placement.volume)?;
         volume.require_present()?;
         let base = canonical(&volume.base())?;
+        if fs::symlink_metadata(source)
+            .map_err(|e| Error::io("cannot inspect", source, &e))?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(Error::refused("move source must not be a symlink"));
+        }
         let source = canonical(source)?;
         if source.parent() != Some(base.as_path()) {
             return Err(Error::refused(
@@ -130,6 +147,13 @@ impl Barge {
         let volume = self.volume(volume_name)?;
         volume.require_present()?;
         let base = canonical(&volume.base())?;
+        if fs::symlink_metadata(source)
+            .map_err(|e| Error::io("cannot inspect", source, &e))?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(Error::refused("move source must not be a symlink"));
+        }
         let source = canonical(source)?;
         let parent = destination
             .parent()
@@ -165,30 +189,90 @@ impl Barge {
                 "move crosses a filesystem; copy is not supported",
             ));
         }
+        for (other_class, placement) in &self.layout()?.classes {
+            if placement.volume == volume_name
+                && layout
+                    .as_ref()
+                    .is_none_or(|change| change.class != *other_class)
+            {
+                let other = base.join(&placement.path);
+                if other.starts_with(&source) {
+                    return Err(Error::refused(format!(
+                        "move contains class {}; move it separately first",
+                        other_class.name()
+                    )));
+                }
+            }
+        }
         let mut bindings = Vec::new();
         for record in self.bindings().list()? {
-            if let Ok(suffix) = record.applied.value.strip_prefix(&source) {
-                let before = observe(record.link_path())?;
+            let link = record.link_path();
+            let link_parent = link
+                .parent()
+                .ok_or_else(|| Error::usage("link has no parent"))?;
+            let resolved_link = canonical(link_parent)?.join(
+                link.file_name()
+                    .ok_or_else(|| Error::usage("link has no name"))?,
+            );
+            let value_suffix = record.applied.value.strip_prefix(&source).ok();
+            let link_suffix = resolved_link.strip_prefix(&source).ok();
+            if value_suffix.is_some() || link_suffix.is_some() {
+                let before = observe(link)?;
                 if !matches!(&before, Observed::Link { .. })
-                    || canonical(record.link_path())? != record.applied.value
+                    || canonical(link)? != record.applied.value
                 {
                     return Err(Error::refused(format!(
                         "binding {} has drifted",
                         record.consumer
                     )));
                 }
-                let after = destination.join(suffix);
+                let after = value_suffix.map_or_else(
+                    || record.applied.value.clone(),
+                    |suffix| destination.join(suffix),
+                );
+                let link_after = link_suffix
+                    .map_or_else(|| link.to_path_buf(), |suffix| destination.join(suffix));
                 bindings.push(MoveBinding {
                     record,
                     before,
                     after,
+                    link_after,
                 });
+            }
+        }
+        let mut areas = Vec::new();
+        for before in self.core.state.read_areas()? {
+            if before.volume != volume_name {
+                continue;
+            }
+            let area_path = base.join(before.effective_folder());
+            if let Ok(suffix) = area_path.strip_prefix(&source) {
+                let new_path = destination.join(suffix);
+                let relative = new_path
+                    .strip_prefix(&base)
+                    .map_err(|_| Error::refused("area would leave volume"))?;
+                let mut after = before.clone();
+                after.folder = Some(
+                    relative
+                        .to_str()
+                        .ok_or_else(|| Error::usage("area path is not UTF-8"))?
+                        .to_string(),
+                );
+                after.validate()?;
+                areas.push(MoveArea { before, after });
             }
         }
         let consumers = bindings.iter().map(|b| b.record.consumer.clone()).collect();
         let mut manual_steps = vec![
             "Update any unrecorded settings or workflows that refer to the old path.".to_string(),
         ];
+        for area in &areas {
+            manual_steps.push(format!(
+                "Update the {} area declaration to use folder {}.",
+                area.before.key().label(),
+                area.after.effective_folder()
+            ));
+        }
         if source
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("pvm"))
@@ -201,12 +285,14 @@ impl Barge {
         Ok(MovePlan {
             schema: "barge.move-plan/1".into(),
             volume: volume_name.into(),
+            volume_spec: volume.spec().clone(),
             source,
             source_identity,
             destination,
             destination_parent_identity,
             bindings,
             layout,
+            areas,
             consumers,
             manual_steps,
         })
@@ -232,36 +318,55 @@ impl Barge {
                 "bound consumers must be stopped; pass --confirm-stopped",
             ));
         }
-        // Hold all affected roots until the move is complete, including roots
-        // containing the source. A listing alone is only a snapshot.
-        let mut holds = Vec::new();
-        let mut overlaps_area = false;
+        let _lock = self.core.state.lock()?;
+        // Lock each affected area against new roots, then hold its roots without
+        // waiting. This order avoids deadlock with eviction, which locks a root first.
+        let mut area_locks = Vec::new();
+        let mut root_locks = Vec::new();
+        let mut partial_area = false;
         for area in self.areas()? {
             if area.volume().name() != plan.volume {
                 continue;
             }
-            if let crate::Location::Volume(path) = area.location()? {
-                if path.starts_with(&plan.source) || plan.source.starts_with(&path) {
-                    overlaps_area = true;
-                }
+            let crate::Location::Volume(path) = area.location()? else {
+                continue;
+            };
+            let base = canonical(&area.volume().base())?;
+            let relative = path
+                .strip_prefix(area.volume().base())
+                .map_err(|_| Error::unknown_state("area is outside its volume"))?;
+            let path = base.join(relative);
+            if !path.starts_with(&plan.source) && !plan.source.starts_with(&path) {
+                continue;
+            }
+            if plan.source.starts_with(&path) && plan.source != path {
+                partial_area = true;
+            }
+            if path.exists() {
+                area.ensure_layout(&path)?;
+                area_locks.push(crate::area::AreaLock::acquire(&path)?);
             }
             for root in area.list_without_bytes()?.roots {
                 if root.path.starts_with(&plan.source) || plan.source.starts_with(&root.path) {
-                    let hold = area
-                        .try_hold(&root.id, crate::Mode::Exclusive)?
+                    let lock_path = root
+                        .path
+                        .parent()
+                        .ok_or_else(|| Error::unknown_state("root has no area"))?
+                        .join(".barge/locks")
+                        .join(format!("{}.lock", root.id));
+                    let file = crate::area::lock_root(&lock_path, crate::Mode::Exclusive, false)?
                         .ok_or_else(|| {
-                            Error::refused(format!("root {} is held", root.path.display()))
-                        })?;
-                    holds.push(hold);
+                        Error::refused(format!("root {} is held", root.path.display()))
+                    })?;
+                    root_locks.push(file);
                 }
             }
         }
-        if overlaps_area {
+        if partial_area {
             return Err(Error::refused(
-                "moving an area or its roots requires area placement updates",
+                "moving part of an area would orphan its roots",
             ));
         }
-        let _lock = self.core.state.lock()?;
         let current = self.plan_move(
             &plan.volume,
             &plan.source,
@@ -307,15 +412,21 @@ impl Barge {
                 if FAIL_AFTER.with(|count| count.get() == 1) {
                     return Err(Error::refused("injected binding failure"));
                 }
-                replace_link(binding.record.link_path(), &binding.after)?;
+                replace_link(&binding.link_after, &binding.after)?;
                 changed.push(binding);
                 let record = records
                     .iter_mut()
                     .find(|r| r.consumer == binding.record.consumer)
                     .ok_or_else(|| Error::unknown_state("binding disappeared"))?;
                 record.applied.value = binding.after.clone();
+                record.target = BindingTarget::Link {
+                    path: binding.link_after.clone(),
+                };
             }
             crate::bindings::write(&self.core, &records)?;
+            for area in &plan.areas {
+                self.core.state.write_area(&area.after)?;
+            }
             if let Some(change) = &plan.layout {
                 let mut layout = before_layout.clone();
                 layout.classes.insert(change.class, change.after.clone());
@@ -332,7 +443,26 @@ impl Barge {
             let mut failures = Vec::new();
             // Restore the data first, then the links. No rollback removes data.
             if let Err(e) = crate::os::rename_no_replace(&plan.destination, &plan.source) {
-                failures.push(format!("rename could not be restored: {e}"));
+                // The source name was occupied or the filesystem refused recovery.
+                // Keep links on the surviving destination when possible rather
+                // than knowingly pointing them at the absent old source.
+                for binding in &plan.bindings {
+                    if let Err(problem) = replace_link(&binding.link_after, &binding.after) {
+                        failures.push(format!(
+                            "link {} could not be repaired: {problem}",
+                            binding.link_after.display()
+                        ));
+                    }
+                }
+                return Err(Error::new(
+                    error.kind(),
+                    format!(
+                        "{}; rollback rename failed: {e}; data remains at {}; {}",
+                        error.message(),
+                        plan.destination.display(),
+                        failures.join("; ")
+                    ),
+                ));
             }
             for binding in changed.iter().rev() {
                 if let Observed::Link { destination } = &binding.before {
@@ -346,6 +476,11 @@ impl Barge {
             }
             if let Err(e) = crate::bindings::write(&self.core, &original_records) {
                 failures.push(format!("binding records could not be restored: {e}"));
+            }
+            for area in &plan.areas {
+                if let Err(e) = self.core.state.write_area(&area.before) {
+                    failures.push(format!("area record could not be restored: {e}"));
+                }
             }
             if plan.layout.is_some() {
                 if let Ok(volume) = self.volume(&plan.volume) {
@@ -373,7 +508,8 @@ impl Barge {
             ));
         }
         drop(_lock);
-        drop(holds);
+        drop(root_locks);
+        drop(area_locks);
         Ok(MoveReport {
             plan: plan.clone(),
             doctor: self.doctor()?,
