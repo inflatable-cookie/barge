@@ -3,14 +3,15 @@
 //!
 //! Eviction is least-recently-used first and only over idle, unpinned roots. A
 //! root that is held or pinned keeps the run going, and is reported as the reason
-//! the run stopped.
+//! the run stopped. An eviction the filesystem refuses is returned as an error
+//! with its cause, never hidden as another policy refusal.
 
 use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
 use crate::area::Area;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 use crate::root::RootInfo;
 use crate::volume::Volume;
 use crate::Core;
@@ -51,6 +52,8 @@ pub struct EvictedRoot {
     pub label: String,
     pub path: std::path::PathBuf,
     pub bytes: u64,
+    /// True when the tree size could not be measured exactly.
+    pub bytes_approximate: bool,
     pub reason: PruneReason,
 }
 
@@ -61,6 +64,8 @@ pub struct KeptRoot {
     pub id: String,
     pub label: String,
     pub bytes: u64,
+    /// True when the tree size could not be measured exactly.
+    pub bytes_approximate: bool,
     pub reason: KeepReason,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -179,8 +184,8 @@ pub(crate) fn prune(
         let mut bytes = 0_u64;
         for info in &listing.roots {
             let size = area.recorded_or_measure_bytes(info, !dry_run);
-            bytes = bytes.saturating_add(size);
-            sizes.insert(info.id.clone(), size);
+            bytes = bytes.saturating_add(size.bytes);
+            sizes.insert(info.id.clone(), size.bytes);
         }
         if bytes <= cap {
             continue;
@@ -205,7 +210,7 @@ pub(crate) fn prune(
             bytes = bytes.saturating_sub(size);
         }
         if bytes > cap {
-            keep_protected(area, &mut report, Some("the area is over its soft cap"));
+            keep_protected(area, &mut report, Some("the area is over its soft cap"))?;
         }
     }
 
@@ -265,11 +270,13 @@ pub(crate) fn prune(
     };
     if (dry_run && estimate < target_bytes) || (!dry_run && free_after < target_bytes) {
         for (area, info) in &protected {
+            let size = area.recorded_or_measure_bytes(info, false);
             report.kept.push(KeptRoot {
                 area: area.key().label(),
                 id: info.id.clone(),
                 label: info.label.clone(),
-                bytes: info.bytes,
+                bytes: size.bytes,
+                bytes_approximate: size.approximate,
                 reason: if info.held {
                     KeepReason::Held
                 } else {
@@ -291,27 +298,35 @@ fn evict(
     report: &mut PruneReport,
 ) -> Result<Option<EvictedRoot>> {
     if dry_run {
-        let bytes = crate::root::tree_bytes(&info.path);
+        let size = crate::root::tree_bytes(&info.path);
         let planned = EvictedRoot {
             area: area.key().label(),
             id: info.id.clone(),
             label: info.label.clone(),
             path: info.path.clone(),
-            bytes,
+            bytes: size.bytes,
+            bytes_approximate: size.approximate,
             reason,
         };
-        report.freed_bytes = report.freed_bytes.saturating_add(bytes);
+        report.freed_bytes = report.freed_bytes.saturating_add(planned.bytes);
         report.evicted.push(planned.clone());
         return Ok(Some(planned));
     }
     match area.evict(&info.id) {
         Ok(eviction) => {
+            if let Some(kept_reason) = &eviction.kept_reason {
+                report.trash_kept.push(SkippedRoot {
+                    path: eviction.trash_path.clone(),
+                    reason: kept_reason.clone(),
+                });
+            }
             let evicted = EvictedRoot {
                 area: area.key().label(),
                 id: info.id.clone(),
                 label: info.label.clone(),
                 path: eviction.path,
                 bytes: eviction.bytes,
+                bytes_approximate: eviction.bytes_approximate,
                 reason,
             };
             report.freed_bytes = report.freed_bytes.saturating_add(evicted.bytes);
@@ -319,32 +334,42 @@ fn evict(
             Ok(Some(evicted))
         }
         Err(error) => {
-            report.kept.push(KeptRoot {
+            let size = area.recorded_or_measure_bytes(info, false);
+            let kept = KeptRoot {
                 area: area.key().label(),
                 id: info.id.clone(),
                 label: info.label.clone(),
-                bytes: 0,
+                bytes: size.bytes,
+                bytes_approximate: size.approximate,
                 reason: KeepReason::Refused,
                 detail: Some(error.message().to_string()),
-            });
-            Ok(None)
+            };
+            match error.kind() {
+                // A policy refusal keeps the root and the run carries on.
+                ErrorKind::Refused | ErrorKind::NotFound => {
+                    report.kept.push(kept);
+                    Ok(None)
+                }
+                // A broken filesystem is never reported as a refusal.
+                _ => Err(error),
+            }
         }
     }
 }
 
-fn keep_protected(area: &Area, report: &mut PruneReport, detail: Option<&str>) {
-    let Ok(listing) = area.list_without_bytes() else {
-        return;
-    };
-    for info in listing.roots {
+fn keep_protected(area: &Area, report: &mut PruneReport, detail: Option<&str>) -> Result<()> {
+    let listing = area.list_without_bytes()?;
+    for info in &listing.roots {
         if info.idle_and_unpinned() {
             continue;
         }
+        let size = area.recorded_or_measure_bytes(info, false);
         report.kept.push(KeptRoot {
             area: area.key().label(),
             id: info.id.clone(),
             label: info.label.clone(),
-            bytes: info.bytes,
+            bytes: size.bytes,
+            bytes_approximate: size.approximate,
             reason: if info.held {
                 KeepReason::Held
             } else {
@@ -353,6 +378,7 @@ fn keep_protected(area: &Area, report: &mut PruneReport, detail: Option<&str>) {
             detail: detail.map(str::to_string),
         });
     }
+    Ok(())
 }
 
 fn volume(core: &Core, name: &str) -> Result<Volume> {

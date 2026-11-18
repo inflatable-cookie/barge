@@ -17,7 +17,10 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
   uses it. A root is idle only when its lock can be taken. Barge does not scan
   processes or open files. A process that writes into a root without holding
   it, or that closes an inherited hold descriptor, is outside the guarantee,
-  and these docs say so rather than claiming more.
+  and these docs say so rather than claiming more. Taking a hold compares the
+  descriptor it locked with the file the lock path names and retries once, so a
+  hold that woke on a lock file an eviction had already unlinked cannot protect
+  a later root invisibly.
 - **Barge never reuses a path it named itself.** Eviction renames a root into
   the area's trash and deletes it there. A later Barge-created root gets a new
   ID and path. A caller-chosen folder may be adopted again after eviction;
@@ -28,16 +31,26 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
   also takes, and revalidates the root marker’s area, ID, label and folder
   under both locks immediately before it renames. Marker writes take the area
   lock too. An earlier "idle and unpinned" reading never
-  authorises an eviction by itself.
+  authorises an eviction by itself. Pinning takes the same lock and rechecks
+  the marker, so a pin cannot land on a root an eviction has already renamed
+  away.
 - **Deletion stays inside what it owns.** Deleting never follows a symlink and
-  never descends into another filesystem (a nested mount). A trash entry is
+  never descends into another filesystem (a nested mount). The walk is
+  descriptor-relative — `openat` with `O_NOFOLLOW`, `fstatat`, `unlinkat` — and
+  both the marker that proves ownership and the filesystem each folder is on are
+  read from the descriptor that was opened, never from a path or an entry seen a
+  moment earlier. A folder swapped for a symlink, or a mount swapped for a plain
+  folder, therefore cannot redirect the walk; a folder a racing writer puts at
+  the path after it is opened is never walked. Measuring a root uses the same
+  walk, holds the same boundary and stops at the same depth. A trash entry is
   deleted only when its marker still matches the area; being inside `.trash/`
   is not enough.
 - **A crash leaves trash, not ambiguity.** A rename is atomic. A crash before
   the rename leaves the root intact; a crash after it leaves owned trash, which
   the next prune or sweep removes. No journal is needed.
 - **Unknown is never safe.** A volume whose identity can't be read, a marker
-  that can't be parsed, or a lock that can't be tested all count as "keep".
+  that can't be parsed, a lock that can't be tested, or a pin that can't be
+  inspected all count as "keep".
 
 ## Concepts
 
@@ -170,7 +183,16 @@ compatibility, freshness or what a root contains.
 - An area's **soft cap** counts only that area's own bytes; above it, the
   area's own LRU idle roots are evicted. Root sizes are recorded when holds are
   released; roots without a recorded size are measured once on the next
-  soft-cap check. The total is approximate between releases.
+  soft-cap check. The total is approximate between releases. A size a walk could
+  not take exactly, because an entry was unreadable, a folder could not be
+  enumerated or the tree is deeper than deletion reaches, is reported as
+  approximate rather than as exact. Only a complete measurement is recorded, and
+  an incomplete release forgets any size recorded earlier, so a lower bound is
+  never later read back as an exact size.
+- An eviction that fails for a reason the filesystem gives — a rename or a
+  delete that cannot be done — fails the prune with that error. Only a policy
+  refusal is reported as a kept root. A trash copy a delete left behind is
+  reported with the reason it stayed.
 - Only the **floor** (default 10 GiB) refuses work, and only once nothing idle
   is left to evict.
 - Low space never moves work to the internal drive. The drive-absent fallback

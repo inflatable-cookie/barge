@@ -146,11 +146,20 @@ impl Hold {
 
 impl Drop for Hold {
     fn drop(&mut self) {
-        let now = self.clock.now_unix_ms();
-        let bytes = tree_bytes(&self.root_path);
-        let _ = record_activity(&self.activity_dir, &self.root_id, now, Some(bytes));
-        // Closing the descriptor releases the lock in every case.
+        // Release first: a consumer waiting for the lock must not wait for this
+        // walk, and an eviction may follow the release immediately. The recorded
+        // size is advisory, so a tree that changes under it is not a problem.
         self.file.take();
+        let now = self.clock.now_unix_ms();
+        let size = tree_bytes(&self.root_path);
+        // Only a complete measurement is cached, and an incomplete one clears any
+        // earlier cached size: a stale number must never read back as exact.
+        let recorded = if size.approximate {
+            RecordedSize::Unknown
+        } else {
+            RecordedSize::Exact(size.bytes)
+        };
+        let _ = record_activity(&self.activity_dir, &self.root_id, now, recorded);
     }
 }
 
@@ -181,6 +190,11 @@ pub(crate) fn flock(file: &File, mode: Mode, wait: bool) -> Result<bool> {
 ///
 /// A missing lock file is an unheld root. A lock file that cannot be opened is
 /// an error: unknown is never safe.
+///
+/// The probe takes the exclusive lock for the moment it reads it, because a
+/// shared probe cannot tell a shared holder from an idle root. A `try_hold`
+/// racing a probe can therefore fail spuriously once; it retries, and a real
+/// holder still reports as held here.
 pub(crate) fn is_locked(path: &Path) -> Result<bool> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -190,12 +204,26 @@ pub(crate) fn is_locked(path: &Path) -> Result<bool> {
     Ok(!flock(&file, Mode::Exclusive, false)?)
 }
 
+/// What a call records about a root's size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordedSize {
+    /// The caller measured nothing: keep whatever complete size is stored.
+    Unchanged,
+    /// A measurement that saw the whole tree.
+    Exact(u64),
+    /// A measurement that did not: forget any stored size, because a later
+    /// reader would otherwise report an old number as an exact one.
+    Unknown,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ActivityRecord {
     schema: String,
     root_id: String,
     last_used_unix_ms: u64,
+    /// The root's size, recorded only when a walk saw the whole tree: a lower
+    /// bound is never cached where a later reader would report it as exact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     root_bytes: Option<u64>,
 }
@@ -206,9 +234,15 @@ pub(crate) fn record_activity(
     activity_dir: &Path,
     root_id: &str,
     unix_ms: u64,
-    root_bytes: Option<u64>,
+    size: RecordedSize,
 ) -> Result<()> {
-    let root_bytes = root_bytes.or_else(|| read_activity_record(activity_dir, root_id)?.root_bytes);
+    let root_bytes = match size {
+        RecordedSize::Unchanged => {
+            read_activity_record(activity_dir, root_id).and_then(|record| record.root_bytes)
+        }
+        RecordedSize::Exact(bytes) => Some(bytes),
+        RecordedSize::Unknown => None,
+    };
     let record = ActivityRecord {
         schema: ACTIVITY_SCHEMA.to_string(),
         root_id: root_id.to_string(),
@@ -226,6 +260,7 @@ pub(crate) fn read_activity(activity_dir: &Path, root_id: &str) -> Option<u64> {
     read_activity_record(activity_dir, root_id).map(|record| record.last_used_unix_ms)
 }
 
+/// A root's last complete size measurement, when one was recorded.
 pub(crate) fn read_activity_bytes(activity_dir: &Path, root_id: &str) -> Option<u64> {
     read_activity_record(activity_dir, root_id).and_then(|record| record.root_bytes)
 }

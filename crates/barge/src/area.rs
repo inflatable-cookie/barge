@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::hold::{self, Hold, Mode};
+use crate::os::TreeSize;
 use crate::root::{
     self, folder_name, mint_id, read_marker, tree_bytes, Listing, MarkerRead, Root, RootInfo,
     RootMarker, Straggler, ROOT_SCHEMA,
@@ -281,8 +282,13 @@ pub struct Eviction {
     pub path: PathBuf,
     pub trash_path: PathBuf,
     pub bytes: u64,
+    /// True when the tree size could not be measured exactly.
+    pub bytes_approximate: bool,
     /// False when the trash copy could not be deleted and is left for a sweep.
     pub deleted: bool,
+    /// Why the trash copy stayed, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept_reason: Option<String>,
 }
 
 /// One declared area with the volume it belongs to.
@@ -395,15 +401,13 @@ impl Area {
             )));
         }
 
-        for info in self.list_without_bytes()?.roots {
-            if info.id == id && info.path != path {
-                return Err(Error::refused(format!(
-                    "root id {id} is already used by folder {} in area {}",
-                    info.path.display(),
-                    key
-                )));
+        #[cfg(test)]
+        ADOPT_HOOK.with(|hook| {
+            let callback = hook.borrow_mut().take();
+            if let Some(hook) = callback {
+                hook();
             }
-        }
+        });
 
         match read_marker(&path) {
             MarkerRead::Valid(marker) => {
@@ -443,6 +447,18 @@ impl Area {
         }
         self.ensure_layout(&directory)?;
         let _lock = AreaLock::acquire(&directory)?;
+        // Two adoptions can find the folder free at the same moment, so the
+        // duplicate-ID check belongs under the lock that serialises them: an
+        // earlier reading never authorises a second root with the same ID.
+        for info in self.list_without_bytes()?.roots {
+            if info.id == id && info.path != path {
+                return Err(Error::refused(format!(
+                    "root id {id} is already used by folder {} in area {}",
+                    info.path.display(),
+                    key
+                )));
+            }
+        }
         let marker = RootMarker {
             schema: crate::root::ADOPTED_ROOT_SCHEMA.to_string(),
             area: key,
@@ -548,7 +564,6 @@ impl Area {
             };
             let barge = directory.join(BARGE_DIR);
             let locks = barge.join(LOCKS_DIR);
-            let pins = barge.join(PINS_DIR);
             let activity = barge.join(ACTIVITY_DIR);
             for entry in entries {
                 let entry = entry
@@ -589,11 +604,17 @@ impl Area {
                             continue;
                         }
                         let held = hold::is_locked(&locks.join(format!("{}.lock", marker.id)))?;
-                        let pinned = pins.join(format!("{}.json", marker.id)).is_file();
+                        // An unreadable pin is never read as "unpinned": unknown is
+                        // never safe. Eviction reports the real reason.
+                        let pinned = pin_state(&directory, &marker.id).unwrap_or(true);
                         let last_used = hold::read_activity(&activity, &marker.id)
                             .unwrap_or(marker.created_unix_ms)
                             .max(marker.created_unix_ms);
-                        let bytes = if include_bytes { tree_bytes(&path) } else { 0 };
+                        let size = if include_bytes {
+                            tree_bytes(&path)
+                        } else {
+                            TreeSize::default()
+                        };
                         listing.roots.push(RootInfo {
                             id: marker.id.clone(),
                             label: marker.label.clone(),
@@ -603,7 +624,8 @@ impl Area {
                             expires_unix_ms: marker.expires_unix_ms,
                             held,
                             pinned,
-                            bytes,
+                            bytes: size.bytes,
+                            bytes_approximate: size.approximate,
                             on_volume,
                         });
                     }
@@ -628,19 +650,32 @@ impl Area {
         Ok(self.list()?.bytes())
     }
 
-    pub(crate) fn recorded_or_measure_bytes(&self, info: &RootInfo, persist: bool) -> u64 {
+    /// A root's bytes: its recorded size when one was taken completely, its
+    /// measured size otherwise. Only complete measurements are recorded, so a
+    /// cached value is never a lower bound reported as exact.
+    pub(crate) fn recorded_or_measure_bytes(&self, info: &RootInfo, persist: bool) -> TreeSize {
         let Ok(directory) = parent(&info.path) else {
             return tree_bytes(&info.path);
         };
         let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
         if let Some(bytes) = hold::read_activity_bytes(&activity, &info.id) {
-            return bytes;
+            return TreeSize {
+                bytes,
+                approximate: false,
+            };
         }
-        let bytes = tree_bytes(&info.path);
+        let size = tree_bytes(&info.path);
         if persist {
-            let _ = hold::record_activity(&activity, &info.id, info.last_used_unix_ms, Some(bytes));
+            // A complete measurement is cached; an incomplete one clears any
+            // earlier cached size rather than leaving a stale number behind.
+            let recorded = if size.approximate {
+                hold::RecordedSize::Unknown
+            } else {
+                hold::RecordedSize::Exact(size.bytes)
+            };
+            let _ = hold::record_activity(&activity, &info.id, info.last_used_unix_ms, recorded);
         }
-        bytes
+        size
     }
 
     /// Find a root by its ID, on the volume or in the fallback.
@@ -689,6 +724,12 @@ impl Area {
     /// Try to hold a root without waiting. `None` means something else holds it.
     pub fn try_hold(&self, id: &str, mode: Mode) -> Result<Option<Hold>> {
         self.core.ensure_writable()?;
+        if let Some(hold) = self.acquire(id, mode, false)? {
+            return Ok(Some(hold));
+        }
+        // Listing a root probes its lock exclusively to report it as held, so a
+        // probe running right now can make one non-waiting attempt fail
+        // spuriously. One retry covers that window; a real holder still wins.
         self.acquire(id, mode, false)
     }
 
@@ -700,16 +741,9 @@ impl Area {
             .join(BARGE_DIR)
             .join(LOCKS_DIR)
             .join(format!("{id}.lock"));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|source| Error::io("cannot open the hold lock", &lock_path, &source))?;
-        if !hold::flock(&file, mode, wait)? {
+        let Some(file) = lock_root(&lock_path, mode, wait)? else {
             return Ok(None);
-        }
+        };
         // An eviction holds this same lock across its rename. A waiting hold can
         // therefore wake up on a root that no longer exists; it must not report
         // a hold on a path a later root may use. Dropping `file` releases the
@@ -737,9 +771,24 @@ impl Area {
     pub fn pin(&self, id: &str, reason: &str) -> Result<()> {
         self.core.ensure_writable()?;
         let root = self.resolve(id)?;
+        #[cfg(test)]
+        PIN_HOOK.with(|hook| {
+            let callback = hook.borrow_mut().take();
+            if let Some(hook) = callback {
+                hook();
+            }
+        });
         let directory = parent(&root.path)?;
         self.ensure_layout(&directory)?;
         let _lock = AreaLock::acquire(&directory)?;
+        // Eviction renames under this same lock, so the root resolved a moment
+        // ago can already be trash: pin only the root this path still is.
+        if !unchanged_marker(&root, &self.key().label()) {
+            return Err(Error::refused(format!(
+                "root {id} in area {} changed before it could be pinned; nothing was pinned",
+                self.key().label()
+            )));
+        }
         let record = PinRecord {
             schema: PIN_SCHEMA.to_string(),
             root_id: id.to_string(),
@@ -802,36 +851,24 @@ impl Area {
             .join(BARGE_DIR)
             .join(LOCKS_DIR)
             .join(format!("{id}.lock"));
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|source| Error::io("cannot open the hold lock", &lock_path, &source))?;
-        if !hold::flock(&lock_file, Mode::Exclusive, false)? {
+        let Some(_lock_file) = lock_root(&lock_path, Mode::Exclusive, false)? else {
             return Err(Error::refused(format!(
                 "root {id} is held; refusing to evict it"
             )));
-        }
+        };
         let _area_lock = AreaLock::acquire(&directory)?;
-        if pin_path(&directory, id).is_file() {
+        if pin_state(&directory, id)? {
             return Err(Error::refused(format!(
                 "root {id} is pinned; refusing to evict it"
             )));
         }
-        let bytes = tree_bytes(&root.path);
+        let size = tree_bytes(&root.path);
         let trash = directory.join(TRASH_DIR);
         fs::create_dir_all(&trash)
             .map_err(|source| Error::io("cannot create the trash at", &trash, &source))?;
         let trash_path = unique_trash_path(&trash, &root.folder_name());
-        match read_marker(&root.path) {
-            MarkerRead::Valid(marker)
-                if marker.area == self.key().label()
-                    && marker.id == root.id
-                    && marker.label == root.label
-                    && root::marker_folder(&marker) == root.folder => {}
-            _ => return Err(Error::refused("root marker changed before eviction")),
+        if !unchanged_marker(&root, &self.key().label()) {
+            return Err(Error::refused("root marker changed before eviction"));
         }
         fs::rename(&root.path, &trash_path)
             .map_err(|source| Error::io("cannot evict the root to", &trash_path, &source))?;
@@ -839,10 +876,23 @@ impl Area {
         // lock file is no longer useful. Unlinking it does not release our lock;
         // dropping the descriptor does.
         let _ = fs::remove_file(&lock_path);
-        let deleted =
+        let (deleted, kept_reason) =
             match crate::trash::remove_owned_tree_for_id(&trash_path, &self.key().label(), id) {
-                Ok(deletion) => deletion.skipped.is_empty(),
-                Err(_) => false,
+                Ok(deletion) if deletion.skipped.is_empty() => (true, None),
+                Ok(deletion) => (
+                    false,
+                    Some(format!(
+                        "{} entr{} stayed in place, starting at {}",
+                        deletion.skipped.len(),
+                        if deletion.skipped.len() == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        },
+                        deletion.skipped[0].display()
+                    )),
+                ),
+                Err(error) => (false, Some(error.message().to_string())),
             };
         let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
         let _ = fs::remove_file(hold::activity_path(&activity, id));
@@ -854,8 +904,10 @@ impl Area {
             label: root.label,
             path: root.path,
             trash_path,
-            bytes,
+            bytes: size.bytes,
+            bytes_approximate: size.approximate,
             deleted,
+            kept_reason,
         })
     }
 
@@ -1034,7 +1086,7 @@ impl Area {
         let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
         if fs::create_dir_all(&activity).is_ok() {
             // Advisory only: a failure makes the root look older, never unsafe.
-            let _ = hold::record_activity(&activity, id, unix_ms, None);
+            let _ = hold::record_activity(&activity, id, unix_ms, hold::RecordedSize::Unchanged);
         }
     }
 }
@@ -1116,6 +1168,94 @@ fn pin_path(directory: &Path, id: &str) -> PathBuf {
         .join(format!("{id}.json"))
 }
 
+/// Whether a pin protects a root. A pin path that exists but cannot be
+/// inspected counts as pinned: unknown is never safe.
+fn pin_state(directory: &Path, id: &str) -> Result<bool> {
+    let path = pin_path(directory, id);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(Error::io("cannot inspect the pin at", &path, &source)),
+    }
+}
+
+/// Whether a resolved root's marker still names its area, ID, label and folder.
+/// Eviction and pinning both hold the area lock when they ask, so a `false` here
+/// means the root was replaced since it was resolved.
+fn unchanged_marker(root: &Root, area: &str) -> bool {
+    matches!(
+        read_marker(&root.path),
+        MarkerRead::Valid(marker)
+            if marker.area == area
+                && marker.id == root.id
+                && marker.label == root.label
+                && root::marker_folder(&marker) == root.folder
+    )
+}
+
+/// Open the root's hold lock and take it, then require the descriptor to be the
+/// file the path names now.
+///
+/// Eviction unlinks `<id>.lock` while it holds it, so a waiting hold can wake
+/// holding a file nobody else can see; a caller-chosen folder re-adopted with
+/// the same ID would then reopen and lock the same root twice. A descriptor that
+/// does not match the path is dropped and the attempt repeated once; a second
+/// mismatch is refused.
+fn lock_root(lock_path: &Path, mode: Mode, wait: bool) -> Result<Option<File>> {
+    for attempt in 0..2 {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(|source| Error::io("cannot open the hold lock", lock_path, &source))?;
+        // The window an eviction exploits: the file is open, the lock is not yet
+        // taken, so an eviction may rename the root, unlink this file and a
+        // caller may re-adopt the folder with the same ID before the lock lands.
+        #[cfg(test)]
+        LOCK_OPEN_HOOK.with(|hooks| {
+            let hook = hooks.borrow_mut().pop();
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
+        if !hold::flock(&file, mode, wait)? {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        LOCK_HOOK.with(|hooks| {
+            let hook = hooks.borrow_mut().pop();
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
+        if lock_is_current(&file, lock_path)? {
+            return Ok(Some(file));
+        }
+        // `file` falls out of scope at the end of the attempt, releasing the lock
+        // on the file the path no longer names.
+        if attempt == 1 {
+            return Err(Error::unknown_state(format!(
+                "the hold lock {} was replaced while it was being taken; refusing to hold it",
+                lock_path.display()
+            )));
+        }
+    }
+    Err(Error::unknown_state(format!(
+        "the hold lock {} could not be taken",
+        lock_path.display()
+    )))
+}
+
+fn lock_is_current(file: &File, path: &Path) -> Result<bool> {
+    let held = crate::os::file_identity(file)
+        .map_err(|source| Error::io("cannot inspect the hold lock", path, &source))?;
+    let now = crate::os::path_identity(path)
+        .map_err(|source| Error::io("cannot inspect the hold lock", path, &source))?;
+    Ok(now == Some(held))
+}
+
 fn unique_trash_path(trash: &Path, name: &str) -> PathBuf {
     let mut candidate = trash.join(name);
     let mut counter = 0;
@@ -1129,7 +1269,21 @@ fn unique_trash_path(trash: &Path, name: &str) -> PathBuf {
 #[cfg(test)]
 thread_local! {
     static EVICT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static PIN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static ADOPT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static LOCK_HOOK: std::cell::RefCell<Vec<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(Vec::new()) };
+    static LOCK_OPEN_HOOK: std::cell::RefCell<Vec<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(Vec::new()) };
     static LIST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn push_lock_hook(hook: impl FnOnce() + 'static) {
+    LOCK_HOOK.with(|hooks| hooks.borrow_mut().push(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn push_lock_open_hook(hook: impl FnOnce() + 'static) {
+    LOCK_OPEN_HOOK.with(|hooks| hooks.borrow_mut().push(Box::new(hook)));
 }
 
 #[cfg(test)]
@@ -1373,5 +1527,317 @@ mod eviction_identity_tests {
         let held = replace_on_resolve(scratch.area(), &root);
         assert!(scratch.sweep().unwrap().deleted.is_empty());
         assert_replacement(scratch.area(), &root, &held);
+    }
+
+    fn lock_file(area_path: &std::path::Path, id: &str) -> PathBuf {
+        area_path
+            .join(BARGE_DIR)
+            .join(LOCKS_DIR)
+            .join(format!("{id}.lock"))
+    }
+
+    fn directory_of(root: &Root) -> PathBuf {
+        root.path.parent().unwrap().to_path_buf()
+    }
+
+    #[test]
+    fn a_pin_that_resolves_to_an_evicted_root_is_refused() {
+        let (_temp, barge) = fixture();
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let root = area.create_root("slot").unwrap();
+        let hook_area = area.clone();
+        let hook_id = root.id.clone();
+        PIN_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                hook_area.evict(&hook_id).unwrap();
+            }))
+        });
+
+        let error = area.pin(&root.id, "selected output").unwrap_err();
+
+        assert_eq!(error.kind(), crate::error::ErrorKind::Refused);
+        assert!(!root.path.exists(), "the eviction in between stands");
+        let pin = directory_of(&root)
+            .join(BARGE_DIR)
+            .join(PINS_DIR)
+            .join(format!("{}.json", root.id));
+        assert!(!pin.exists(), "no pin names a root that is gone");
+    }
+
+    #[test]
+    fn a_hold_that_wakes_on_a_replaced_lock_file_takes_the_current_one() {
+        let (_temp, barge) = fixture();
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let root = area.create_root("slot").unwrap();
+        let path = lock_file(&directory_of(&root), &root.id);
+        // An eviction unlinks the lock while it holds it, and a caller-chosen
+        // folder re-adopted with the same id makes the path name a new file.
+        let replaced = path.clone();
+        push_lock_hook(move || {
+            fs::remove_file(&replaced).unwrap();
+            fs::write(&replaced, b"").unwrap();
+        });
+
+        let hold = area.hold(&root.id, Mode::Exclusive).unwrap();
+
+        let probe = File::open(&path).unwrap();
+        assert!(
+            !hold::flock(&probe, Mode::Exclusive, false).unwrap(),
+            "the hold is visible on the file the path names"
+        );
+        drop(hold);
+        assert!(
+            hold::flock(&probe, Mode::Exclusive, false).unwrap(),
+            "dropping the hold frees that same file"
+        );
+    }
+
+    #[test]
+    fn a_lock_file_replaced_twice_is_refused() {
+        let (_temp, barge) = fixture();
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let root = area.create_root("slot").unwrap();
+        let path = lock_file(&directory_of(&root), &root.id);
+        for _ in 0..2 {
+            let replaced = path.clone();
+            push_lock_hook(move || {
+                fs::remove_file(&replaced).unwrap();
+                fs::write(&replaced, b"").unwrap();
+            });
+        }
+
+        let error = area.hold(&root.id, Mode::Exclusive).unwrap_err();
+
+        assert_eq!(error.kind(), crate::error::ErrorKind::UnknownState);
+        assert!(area.try_hold(&root.id, Mode::Exclusive).unwrap().is_some());
+    }
+
+    #[test]
+    fn two_adoptions_of_one_id_cannot_both_win() {
+        let (_temp, barge) = fixture();
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let directory = area.location().unwrap().path().unwrap().to_path_buf();
+        fs::create_dir_all(&directory).unwrap();
+        for folder in ["first", "second"] {
+            fs::create_dir(directory.join(folder)).unwrap();
+        }
+        let hook_area = area.clone();
+        ADOPT_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                hook_area.adopt_root("first", "slot", "shared-id").unwrap();
+            }))
+        });
+
+        let error = area.adopt_root("second", "slot", "shared-id").unwrap_err();
+
+        assert_eq!(error.kind(), crate::error::ErrorKind::Refused);
+        assert!(error.message().contains("already used"), "{error}");
+        assert!(!directory.join("second").join(root::MARKER_NAME).exists());
+        assert!(area
+            .list_without_bytes()
+            .unwrap()
+            .get("shared-id")
+            .is_some());
+    }
+
+    #[test]
+    fn a_hold_that_woke_on_an_evicted_lock_file_holds_the_re_adopted_root() {
+        let (_temp, barge) = fixture();
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let directory = area.location().unwrap().path().unwrap().to_path_buf();
+        let folder = directory.join("slot-folder");
+        fs::create_dir_all(&folder).unwrap();
+        // A caller-chosen folder, so eviction can be followed by a re-adoption
+        // with the same ID.
+        let root = area.adopt_root("slot-folder", "slot", "shared-id").unwrap();
+        fs::write(folder.join("contents"), b"first").unwrap();
+        // The waiter opens the lock file; while it is open, the eviction renames
+        // the root and unlinks that file, and the folder is re-adopted with the
+        // same ID. Only then does the waiter take its lock, on the file the path
+        // no longer names.
+        let hook_area = area.clone();
+        let hook_folder = folder.clone();
+        push_lock_open_hook(move || {
+            hook_area.evict("shared-id").unwrap();
+            fs::create_dir(&hook_folder).unwrap();
+            fs::write(hook_folder.join("contents"), b"second").unwrap();
+            hook_area
+                .adopt_root("slot-folder", "slot", "shared-id")
+                .unwrap();
+        });
+
+        let hold = area.hold("shared-id", Mode::Exclusive).unwrap();
+
+        assert_eq!(hold.root_id(), "shared-id");
+        assert_eq!(
+            area.resolve("shared-id").unwrap().path,
+            folder,
+            "the hold is on the re-adopted root"
+        );
+        assert_eq!(
+            fs::read(folder.join("contents")).unwrap(),
+            b"second",
+            "the re-adopted root is the one that survived"
+        );
+        assert!(
+            area.try_hold("shared-id", Mode::Exclusive)
+                .unwrap()
+                .is_none(),
+            "another holder cannot take the root: the lock is visible"
+        );
+        let error = area.evict("shared-id").unwrap_err();
+        assert!(
+            error.message().contains("held"),
+            "eviction sees the hold: {error}"
+        );
+        drop(hold);
+        area.evict("shared-id").unwrap();
+        assert!(!folder.exists(), "the released root is evictable again");
+        assert_eq!(root.id, "shared-id");
+    }
+
+    #[test]
+    fn a_hold_that_woke_on_an_evicted_lock_file_does_not_hold_a_missing_root() {
+        let (_temp, barge) = fixture();
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let root = area.create_root("slot").unwrap();
+        // The same window without the re-adoption: the root is gone by the time
+        // the waiter looks at it, so it must not report a hold.
+        let hook_area = area.clone();
+        let hook_id = root.id.clone();
+        push_lock_open_hook(move || {
+            hook_area.evict(&hook_id).unwrap();
+        });
+
+        let error = area.hold(&root.id, Mode::Exclusive).unwrap_err();
+
+        assert_eq!(error.kind(), crate::error::ErrorKind::NotFound);
+        assert!(!root.path.exists());
+    }
+
+    #[test]
+    fn an_incomplete_measurement_is_never_cached_as_exact() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, barge) = fixture_with_space(10, 1);
+        let area = barge
+            .area(AreaSpec::new("test", "roots", "disk").soft_cap_bytes(Some(1)))
+            .unwrap();
+        let root = area.create_root("slot").unwrap();
+        fs::write(root.path.join("readable.bin"), vec![b'x'; 16]).unwrap();
+        let hidden = root.path.join("hidden");
+        fs::create_dir(&hidden).unwrap();
+        fs::write(hidden.join("unread.bin"), vec![b'x'; 64]).unwrap();
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+        let _guard = ModeGuard(hidden);
+
+        // Releasing a hold over an incomplete tree records no size at all.
+        drop(area.hold(&root.id, Mode::Exclusive).unwrap());
+        let activity = directory_of(&root).join(BARGE_DIR).join(ACTIVITY_DIR);
+        assert_eq!(hold::read_activity_bytes(&activity, &root.id), None);
+
+        let info = area
+            .list()
+            .unwrap()
+            .get(&root.id)
+            .cloned()
+            .expect("the root is listed");
+        assert!(info.bytes >= 16, "the readable part is counted");
+        assert!(
+            info.bytes_approximate,
+            "the unreadable part is not called exact"
+        );
+
+        // A prune that measures it reports the same, and still caches nothing.
+        let report = barge.prune("disk", true).unwrap();
+        let measured = report
+            .evicted
+            .iter()
+            .find(|evicted| evicted.id == root.id)
+            .expect("the soft cap plans this root");
+        assert!(
+            measured.bytes_approximate,
+            "a lower bound stays approximate"
+        );
+        assert_eq!(hold::read_activity_bytes(&activity, &root.id), None);
+    }
+
+    #[test]
+    fn an_incomplete_release_forgets_an_earlier_cached_size() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, barge) = fixture_with_space(10, 1);
+        let area = barge
+            .area(AreaSpec::new("test", "roots", "disk").soft_cap_bytes(Some(1)))
+            .unwrap();
+        let root = area.create_root("slot").unwrap();
+        fs::write(root.path.join("small.bin"), vec![b'x'; 8]).unwrap();
+        let activity = directory_of(&root).join(BARGE_DIR).join(ACTIVITY_DIR);
+
+        // A complete release caches the size it measured.
+        drop(area.hold(&root.id, Mode::Exclusive).unwrap());
+        let cached =
+            hold::read_activity_bytes(&activity, &root.id).expect("a complete size is cached");
+        assert!(cached >= 8, "cached: {cached}");
+
+        // More data arrives and this release cannot see all of it, so the old
+        // number is forgotten instead of being read back as exact.
+        let hidden = root.path.join("hidden");
+        fs::create_dir(&hidden).unwrap();
+        fs::write(hidden.join("unread.bin"), vec![b'x'; 64]).unwrap();
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+        let _guard = ModeGuard(hidden);
+        drop(area.hold(&root.id, Mode::Exclusive).unwrap());
+
+        assert_eq!(hold::read_activity_bytes(&activity, &root.id), None);
+        let info = area
+            .list()
+            .unwrap()
+            .get(&root.id)
+            .cloned()
+            .expect("the root is listed");
+        assert!(info.bytes >= 8, "the readable part is measured");
+        assert!(info.bytes_approximate, "the stale size is not reused");
+
+        let report = barge.prune("disk", true).unwrap();
+        let planned = report
+            .evicted
+            .iter()
+            .find(|evicted| evicted.id == root.id)
+            .expect("the soft cap plans this root");
+        assert!(
+            planned.bytes_approximate,
+            "prune measures instead of reusing an old number"
+        );
+    }
+
+    /// Restores a folder's mode so the fixture can still be removed.
+    struct ModeGuard(PathBuf);
+
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[test]
+    fn an_unreadable_pin_is_never_read_as_unpinned() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, barge) = fixture();
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let root = area.create_root("slot").unwrap();
+        area.pin(&root.id, "selected output").unwrap();
+        let pins = directory_of(&root).join(BARGE_DIR).join(PINS_DIR);
+        fs::set_permissions(&pins, fs::Permissions::from_mode(0o000)).unwrap();
+        let _guard = ModeGuard(pins);
+
+        let listing = area.list_without_bytes().unwrap();
+        assert!(
+            listing.get(&root.id).unwrap().pinned,
+            "a pin that cannot be read still protects the root"
+        );
+        let error = area.evict(&root.id).unwrap_err();
+
+        assert_eq!(error.kind(), crate::error::ErrorKind::Io);
+        assert!(root.path.is_dir(), "the root was not evicted");
     }
 }

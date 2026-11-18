@@ -1,13 +1,14 @@
 //! Roots: a directory Barge created inside an area, its marker, and what a
 //! listing reports about it.
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::os::TreeSize;
 use crate::state::publish;
 
 /// The schema name of a root marker.
@@ -78,6 +79,9 @@ pub struct RootInfo {
     pub pinned: bool,
     /// Root tree size, or zero when using `Area::list_without_bytes`.
     pub bytes: u64,
+    /// True when the tree size could not be measured exactly: an entry could not
+    /// be read, or the tree is deeper than the walk goes.
+    pub bytes_approximate: bool,
     /// True when the root lives on the volume; false in the area's fallback.
     pub on_volume: bool,
 }
@@ -124,8 +128,18 @@ pub(crate) enum MarkerRead {
 
 /// Read the marker in `folder`.
 pub(crate) fn read_marker(folder: &Path) -> MarkerRead {
+    read_marker_opened(crate::os::open_marker(folder, MARKER_NAME), folder)
+}
+
+/// Read the marker through an already open folder, so the ownership check names
+/// the folder the caller then acts on.
+pub(crate) fn read_marker_in(directory: &File, folder: &Path) -> MarkerRead {
+    read_marker_opened(crate::os::open_marker_at(directory, MARKER_NAME), folder)
+}
+
+fn read_marker_opened(opened: std::io::Result<File>, folder: &Path) -> MarkerRead {
     let path = folder.join(MARKER_NAME);
-    let bytes = match crate::os::open_marker(folder, MARKER_NAME).and_then(|mut file| {
+    let bytes = match opened.and_then(|mut file| {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         Ok(bytes)
@@ -263,39 +277,21 @@ pub(crate) fn mint_id() -> Result<String> {
 }
 
 /// The bytes a folder holds, without following symlinks or crossing into
-/// another filesystem.
-pub(crate) fn tree_bytes(path: &Path) -> u64 {
+/// another filesystem. Any part of the tree the walk could not see is reported
+/// as an approximate size rather than silently counted as nothing.
+pub(crate) fn tree_bytes(path: &Path) -> TreeSize {
     #[cfg(test)]
     TREE_BYTES_CALLS.with(|calls| calls.set(calls.get() + 1));
-    tree_bytes_inner(path)
+    crate::os::measure_tree(path)
 }
 
-fn tree_bytes_inner(path: &Path) -> u64 {
-    let mut total = 0_u64;
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return 0;
-    };
-    if !metadata.is_dir() {
-        return metadata.len();
-    }
-    let Ok(entries) = fs::read_dir(path) else {
-        return 0;
-    };
-    for entry in entries.flatten() {
-        let child = entry.path();
-        let Ok(child_metadata) = fs::symlink_metadata(&child) else {
-            continue;
-        };
-        if child_metadata.file_type().is_symlink() {
-            continue;
-        }
-        if child_metadata.is_dir() {
-            total = total.saturating_add(tree_bytes_inner(&child));
-        } else {
-            total = total.saturating_add(child_metadata.len());
-        }
-    }
-    total
+/// The testable core of [`tree_bytes`]: `device` answers which filesystem a
+/// folder is on, so a test can claim a nested folder is another mount.
+#[cfg(test)]
+pub(crate) fn tree_bytes_with(path: &Path, device: &dyn Fn(&Path, u64) -> u64) -> TreeSize {
+    #[cfg(test)]
+    TREE_BYTES_CALLS.with(|calls| calls.set(calls.get() + 1));
+    crate::os::tree::measure_tree_with(path, device)
 }
 
 #[cfg(test)]
@@ -311,4 +307,83 @@ pub(crate) fn reset_tree_bytes_calls() {
 #[cfg(test)]
 pub(crate) fn tree_bytes_calls() -> usize {
     TREE_BYTES_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+mod tree_size_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Restores a folder's mode so the fixture can still remove it.
+    struct ModeGuard(PathBuf);
+
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    fn folder(label: &str) -> (crate::testing::TempDir, PathBuf) {
+        let temp = crate::testing::TempDir::new(label).unwrap();
+        let root = temp.path().join("slot-0123456789abcdef");
+        fs::create_dir(&root).unwrap();
+        (temp, root)
+    }
+
+    #[test]
+    fn a_nested_mount_is_neither_walked_nor_counted() {
+        let (_temp, root) = folder("root-device");
+        let nested = root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("other.bin"), vec![b'x'; 64]).unwrap();
+        fs::write(root.join("ours.bin"), vec![b'x'; 8]).unwrap();
+
+        let exact = tree_bytes(&root);
+        assert_eq!(exact.bytes, 72, "both files are on one filesystem");
+        assert!(!exact.approximate);
+
+        // The fixture cannot mount a second filesystem, so the seam reports one
+        // for the folder a mount would appear as.
+        let measured = tree_bytes_with(&root, &|child, device| {
+            if child.ends_with("nested") {
+                device + 1
+            } else {
+                device
+            }
+        });
+        assert_eq!(measured.bytes, 8, "only this filesystem's data counts");
+        assert!(!measured.approximate, "a mount is skipped by design");
+    }
+
+    #[test]
+    fn a_tree_deeper_than_the_cap_is_approximate() {
+        let (_temp, root) = folder("root-depth");
+        fs::write(root.join("top.bin"), vec![b'x'; 4]).unwrap();
+        let mut deepest = root.clone();
+        for _ in 0..crate::os::tree::MAX_DEPTH + 1 {
+            deepest = deepest.join("nested");
+            fs::create_dir(&deepest).unwrap();
+        }
+        fs::write(deepest.join("buried.bin"), vec![b'x'; 32]).unwrap();
+
+        let size = tree_bytes(&root);
+        assert_eq!(size.bytes, 4, "the buried file is past the cap");
+        assert!(size.approximate, "an uncounted tree is never exact");
+    }
+
+    #[test]
+    fn an_unreadable_entry_makes_the_size_approximate() {
+        let (_temp, root) = folder("root-unreadable");
+        fs::write(root.join("readable.bin"), vec![b'x'; 6]).unwrap();
+        let hidden = root.join("hidden");
+        fs::create_dir(&hidden).unwrap();
+        fs::write(hidden.join("unread.bin"), vec![b'x'; 16]).unwrap();
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+        let _guard = ModeGuard(hidden);
+
+        let size = tree_bytes(&root);
+        assert_eq!(size.bytes, 6, "the readable file is still counted");
+        assert!(size.approximate, "an unreadable entry is never zero");
+    }
 }
