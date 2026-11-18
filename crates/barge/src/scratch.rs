@@ -92,7 +92,7 @@ impl Scratch {
 
     /// Every root in this project's scratch area.
     pub fn roots(&self) -> Result<Listing> {
-        self.area.list()
+        self.area.list_without_bytes()
     }
 
     /// Evict expired, idle, unpinned scratch roots.

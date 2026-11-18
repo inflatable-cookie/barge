@@ -5,7 +5,7 @@
 //! root that is held or pinned keeps the run going, and is reported as the reason
 //! the run stopped.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
@@ -153,6 +153,14 @@ pub(crate) fn prune(
     };
     let mut planned: HashSet<(String, String)> = HashSet::new();
 
+    if free_before >= target_bytes
+        && areas
+            .iter()
+            .all(|area| area.record().soft_cap_bytes.is_none())
+    {
+        return Ok(report);
+    }
+
     if !dry_run {
         for area in &areas {
             let sweep = area.sweep_trash()?;
@@ -166,8 +174,14 @@ pub(crate) fn prune(
         let Some(cap) = area.record().soft_cap_bytes else {
             continue;
         };
-        let listing = area.list()?;
-        let mut bytes = listing.bytes();
+        let listing = area.list_without_bytes()?;
+        let mut sizes = HashMap::with_capacity(listing.roots.len());
+        let mut bytes = 0_u64;
+        for info in &listing.roots {
+            let size = area.recorded_or_measure_bytes(info, !dry_run);
+            bytes = bytes.saturating_add(size);
+            sizes.insert(info.id.clone(), size);
+        }
         if bytes <= cap {
             continue;
         }
@@ -187,11 +201,22 @@ pub(crate) fn prune(
                 continue;
             }
             planned.insert((area.key().label(), info.id.clone()));
-            bytes = bytes.saturating_sub(info.bytes);
+            let size = sizes.get(&info.id).copied().unwrap_or(0);
+            bytes = bytes.saturating_sub(size);
         }
         if bytes > cap {
             keep_protected(area, &mut report, Some("the area is over its soft cap"));
         }
+    }
+
+    let current_free = if dry_run {
+        free_before.saturating_add(report.freed_bytes)
+    } else {
+        core.os.free_bytes(&mount)?
+    };
+    if current_free >= target_bytes {
+        report.free_after_bytes = if dry_run { free_before } else { current_free };
+        return Ok(report);
     }
 
     // The reserve: least-recently-used idle, unpinned roots on the volume, from
@@ -202,7 +227,7 @@ pub(crate) fn prune(
         if !area.record().counts_toward_reserve {
             continue;
         }
-        for info in area.list()?.roots {
+        for info in area.list_without_bytes()?.roots {
             if !info.on_volume {
                 continue;
             }
@@ -218,7 +243,12 @@ pub(crate) fn prune(
     });
     let mut estimate = free_before.saturating_add(report.freed_bytes);
     for (area, info) in &candidates {
-        if estimate >= target_bytes {
+        let free = if dry_run {
+            estimate
+        } else {
+            core.os.free_bytes(&mount)?
+        };
+        if free >= target_bytes {
             break;
         }
         if planned.contains(&(area.key().label(), info.id.clone())) {
@@ -228,7 +258,12 @@ pub(crate) fn prune(
             estimate = estimate.saturating_add(evicted.bytes);
         }
     }
-    if estimate < target_bytes {
+    let free_after = if dry_run {
+        free_before
+    } else {
+        core.os.free_bytes(&mount)?
+    };
+    if (dry_run && estimate < target_bytes) || (!dry_run && free_after < target_bytes) {
         for (area, info) in &protected {
             report.kept.push(KeptRoot {
                 area: area.key().label(),
@@ -244,13 +279,7 @@ pub(crate) fn prune(
             });
         }
     }
-    report.free_after_bytes = if dry_run {
-        free_before
-    } else {
-        core.os
-            .free_bytes(&mount)
-            .unwrap_or(free_before.saturating_add(report.freed_bytes))
-    };
+    report.free_after_bytes = free_after;
     Ok(report)
 }
 
@@ -262,15 +291,16 @@ fn evict(
     report: &mut PruneReport,
 ) -> Result<Option<EvictedRoot>> {
     if dry_run {
+        let bytes = crate::root::tree_bytes(&info.path);
         let planned = EvictedRoot {
             area: area.key().label(),
             id: info.id.clone(),
             label: info.label.clone(),
             path: info.path.clone(),
-            bytes: info.bytes,
+            bytes,
             reason,
         };
-        report.freed_bytes = report.freed_bytes.saturating_add(info.bytes);
+        report.freed_bytes = report.freed_bytes.saturating_add(bytes);
         report.evicted.push(planned.clone());
         return Ok(Some(planned));
     }
@@ -293,7 +323,7 @@ fn evict(
                 area: area.key().label(),
                 id: info.id.clone(),
                 label: info.label.clone(),
-                bytes: info.bytes,
+                bytes: 0,
                 reason: KeepReason::Refused,
                 detail: Some(error.message().to_string()),
             });
@@ -303,7 +333,7 @@ fn evict(
 }
 
 fn keep_protected(area: &Area, report: &mut PruneReport, detail: Option<&str>) {
-    let Ok(listing) = area.list() else {
+    let Ok(listing) = area.list_without_bytes() else {
         return;
     };
     for info in listing.roots {

@@ -115,7 +115,8 @@ let root = area.adopt_root("pool-slot", "slot", "oxide-72ea0e6b")?;
 let hold = area.hold(&root.id, Mode::Exclusive)?; // flock; try_hold never waits
 let donor = area.hold(&other.id, Mode::Shared)?;  // seeding: hold a donor too
 hold.set_inheritable(true)?;                      // the child keeps the hold across exec
-area.list()?;                                     // roots, holds, pins, bytes, stragglers
+area.list_without_bytes()?;                       // roots, holds, pins and stragglers
+area.list()?;                                     // same listing, with root byte totals
 area.pin(&root.id, "selected output")?; area.unpin(&root.id)?;
 area.evict(&root.id)?;                            // refuses if held or pinned
 
@@ -135,7 +136,9 @@ Missing state is empty. Mutating operations refuse before filesystem access;
 reported as unheld.
 
 The stored documents carry their own schema names (`barge.volumes/1`,
-`barge.area/1`, `barge.root/1` and `/2`, `barge.pin/1`, `barge.activity/1`);
+`barge.area/1`, `barge.root/1` and `/2`, `barge.pin/1`, `barge.activity/1`
+and `/2`); activity schema 2 also records each root's bytes at hold release,
+and readers continue to accept schema 1 records.
 root schema 1 keeps the derived `<label>-<id>` folder rule, while schema 2
 records an adopted folder. A reader that does not know a schema refuses it
 rather than guessing.
@@ -151,7 +154,9 @@ compatibility, freshness or what a root contains.
   Barge evicts the least-recently-used idle, unpinned roots, from areas that
   count toward the reserve, until free space is back above it.
 - An area's **soft cap** counts only that area's own bytes; above it, the
-  area's own LRU idle roots are evicted.
+  area's own LRU idle roots are evicted. Root sizes are recorded when holds are
+  released; roots without a recorded size are measured once on the next
+  soft-cap check. The total is approximate between releases.
 - Only the **floor** (default 10 GiB) refuses work, and only once nothing idle
   is left to evict.
 - Low space never moves work to the internal drive. The drive-absent fallback
@@ -177,7 +182,7 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
 ## CLI
 
 `barge` wraps the library: `volume register|list|status`, `area list`,
-`root list|pin|unpin|evict`, `prune [--dry-run]`, `scratch new|sweep`,
+`root list [--bytes]|pin|unpin|evict`, `prune [--dry-run]`, `scratch new|sweep`,
 `status`. `--json` prints one document with a top-level `schema` field
 (`barge.<kind>/<n>`); consumers check it and refuse unknown versions. Exit
 codes: 0 success, 1 refused (nothing changed), 2 usage error, 3 internal error.

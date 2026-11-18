@@ -395,7 +395,7 @@ impl Area {
             )));
         }
 
-        for info in self.list()?.roots {
+        for info in self.list_without_bytes()?.roots {
             if info.id == id && info.path != path {
                 return Err(Error::refused(format!(
                     "root id {id} is already used by folder {} in area {}",
@@ -523,8 +523,19 @@ impl Area {
         }
     }
 
-    /// Everything the area holds: owned roots, and folders Barge will not delete.
+    /// List owned roots and stragglers without walking root contents.
+    pub fn list_without_bytes(&self) -> Result<Listing> {
+        self.list_impl(false)
+    }
+
+    /// List owned roots and stragglers, including the size of each root tree.
     pub fn list(&self) -> Result<Listing> {
+        self.list_impl(true)
+    }
+
+    fn list_impl(&self, include_bytes: bool) -> Result<Listing> {
+        #[cfg(test)]
+        LIST_CALLS.with(|calls| calls.set(calls.get() + 1));
         let mut listing = Listing::default();
         let key = self.key().label();
         for (directory, on_volume) in self.search_dirs()? {
@@ -582,7 +593,7 @@ impl Area {
                         let last_used = hold::read_activity(&activity, &marker.id)
                             .unwrap_or(marker.created_unix_ms)
                             .max(marker.created_unix_ms);
-                        let bytes = tree_bytes(&path);
+                        let bytes = if include_bytes { tree_bytes(&path) } else { 0 };
                         listing.roots.push(RootInfo {
                             id: marker.id.clone(),
                             label: marker.label.clone(),
@@ -615,6 +626,21 @@ impl Area {
     /// The bytes the area's owned roots hold.
     pub fn bytes(&self) -> Result<u64> {
         Ok(self.list()?.bytes())
+    }
+
+    pub(crate) fn recorded_or_measure_bytes(&self, info: &RootInfo, persist: bool) -> u64 {
+        let Ok(directory) = parent(&info.path) else {
+            return tree_bytes(&info.path);
+        };
+        let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
+        if let Some(bytes) = hold::read_activity_bytes(&activity, &info.id) {
+            return bytes;
+        }
+        let bytes = tree_bytes(&info.path);
+        if persist {
+            let _ = hold::record_activity(&activity, &info.id, info.last_used_unix_ms, Some(bytes));
+        }
+        bytes
     }
 
     /// Find a root by its ID, on the volume or in the fallback.
@@ -702,6 +728,7 @@ impl Area {
             mode,
             file,
             activity,
+            current.path,
             self.core.clock.clone(),
         )))
     }
@@ -902,7 +929,7 @@ impl Area {
         self.core.ensure_writable()?;
         let now = self.core.clock.now_unix_ms();
         let mut report = SweepReport::default();
-        for info in self.list()?.roots {
+        for info in self.list_without_bytes()?.roots {
             if info.expires_unix_ms.is_none_or(|expires| expires > now) {
                 continue;
             }
@@ -1007,7 +1034,7 @@ impl Area {
         let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
         if fs::create_dir_all(&activity).is_ok() {
             // Advisory only: a failure makes the root look older, never unsafe.
-            let _ = hold::record_activity(&activity, id, unix_ms);
+            let _ = hold::record_activity(&activity, id, unix_ms, None);
         }
     }
 }
@@ -1102,6 +1129,17 @@ fn unique_trash_path(trash: &Path, name: &str) -> PathBuf {
 #[cfg(test)]
 thread_local! {
     static EVICT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static LIST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_list_calls() {
+    LIST_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn list_calls() -> usize {
+    LIST_CALLS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -1114,6 +1152,10 @@ mod eviction_identity_tests {
     use std::time::Duration;
 
     fn fixture() -> (crate::testing::TempDir, Barge) {
+        fixture_with_space(0, 1)
+    }
+
+    fn fixture_with_space(free: u64, reserve: u64) -> (crate::testing::TempDir, Barge) {
         let temp = crate::testing::TempDir::new("identity").unwrap();
         let mount = temp.folder("mount").unwrap();
         let state = temp.folder("state").unwrap();
@@ -1121,17 +1163,131 @@ mod eviction_identity_tests {
         os.add_volume(
             mount.clone(),
             Some("11111111-2222-3333-4444-555555555555"),
-            0,
+            free,
         );
         let barge = Barge::open_with(state, os, Arc::new(ManualClock::new(1000))).unwrap();
         barge
             .register_volume(
                 VolumeRegistration::new("disk", mount)
-                    .reserve_bytes(1)
+                    .reserve_bytes(reserve)
                     .floor_bytes(0),
             )
             .unwrap();
         (temp, barge)
+    }
+
+    #[test]
+    fn adopting_many_roots_does_not_walk_root_bytes() {
+        let (_temp, barge) = fixture();
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let directory = area.location().unwrap().path().unwrap().to_path_buf();
+        fs::create_dir_all(&directory).unwrap();
+        for index in 0..24 {
+            let folder = format!("root-{index}");
+            let path = directory.join(&folder);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("data"), b"large enough to expose a walk").unwrap();
+        }
+        crate::root::reset_tree_bytes_calls();
+        for index in 0..24 {
+            area.adopt_root(
+                &format!("root-{index}"),
+                "adopted",
+                &format!("root-{index}"),
+            )
+            .unwrap();
+        }
+        assert_eq!(crate::root::tree_bytes_calls(), 0);
+    }
+
+    #[test]
+    fn metadata_listing_matches_full_listing_except_for_bytes() {
+        let (_temp, barge) = fixture();
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let root = area.create_root("slot").unwrap();
+        fs::write(root.path.join("data"), b"payload").unwrap();
+        let expected_bytes = fs::symlink_metadata(root.path.join(root::MARKER_NAME))
+            .unwrap()
+            .len()
+            + 7;
+        let metadata = area.list_without_bytes().unwrap();
+        let full = area.list().unwrap();
+        assert_eq!(metadata.stragglers, full.stragglers);
+        let mut metadata_root = metadata.get(&root.id).unwrap().clone();
+        let mut full_root = full.get(&root.id).unwrap().clone();
+        metadata_root.bytes = 0;
+        full_root.bytes = 0;
+        assert_eq!(metadata_root, full_root);
+        assert_eq!(full.get(&root.id).unwrap().bytes, expected_bytes);
+    }
+
+    #[test]
+    fn prune_above_reserve_without_soft_caps_does_not_list_or_walk() {
+        let (_temp, barge) = fixture_with_space(10, 1);
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let root = area.create_root("slot").unwrap();
+        fs::write(root.path.join("data"), b"payload").unwrap();
+        crate::root::reset_tree_bytes_calls();
+        reset_list_calls();
+        assert!(barge.prune("disk", false).unwrap().evicted.is_empty());
+        assert_eq!(list_calls(), 0);
+        assert_eq!(crate::root::tree_bytes_calls(), 0);
+    }
+
+    #[test]
+    fn reserve_prune_walks_only_the_root_it_evicts() {
+        let (_temp, barge) = fixture_with_space(0, 1);
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let root = area.create_root("slot").unwrap();
+        fs::write(root.path.join("data"), b"payload larger than reserve").unwrap();
+        crate::root::reset_tree_bytes_calls();
+        let report = barge.prune("disk", false).unwrap();
+        assert_eq!(report.evicted.len(), 1);
+        assert_eq!(crate::root::tree_bytes_calls(), 1);
+    }
+
+    #[test]
+    fn hold_release_records_root_size_and_soft_cap_reuses_it() {
+        let (_temp, barge) = fixture_with_space(10, 1);
+        let area = barge
+            .area(AreaSpec::new("test", "roots", "disk").soft_cap_bytes(Some(10_000)))
+            .unwrap();
+        let recorded = area.create_root("recorded").unwrap();
+        fs::write(recorded.path.join("data"), b"known").unwrap();
+        let recorded_bytes = fs::symlink_metadata(recorded.path.join(root::MARKER_NAME))
+            .unwrap()
+            .len()
+            + 5;
+        drop(area.hold(&recorded.id, Mode::Exclusive).unwrap());
+        let activity = recorded
+            .path
+            .parent()
+            .unwrap()
+            .join(BARGE_DIR)
+            .join(ACTIVITY_DIR);
+        assert_eq!(
+            hold::read_activity_bytes(&activity, &recorded.id),
+            Some(recorded_bytes)
+        );
+
+        let unknown = area.create_root("unknown").unwrap();
+        fs::write(unknown.path.join("data"), b"unknown").unwrap();
+        let unknown_bytes = fs::symlink_metadata(unknown.path.join(root::MARKER_NAME))
+            .unwrap()
+            .len()
+            + 7;
+        crate::root::reset_tree_bytes_calls();
+        barge.prune("disk", true).unwrap();
+        assert_eq!(crate::root::tree_bytes_calls(), 1);
+        assert_eq!(hold::read_activity_bytes(&activity, &unknown.id), None);
+
+        crate::root::reset_tree_bytes_calls();
+        barge.prune("disk", false).unwrap();
+        assert_eq!(crate::root::tree_bytes_calls(), 1);
+        assert_eq!(
+            hold::read_activity_bytes(&activity, &unknown.id),
+            Some(unknown_bytes)
+        );
     }
 
     fn replace_on_resolve(area: &Area, root: &Root) -> Rc<RefCell<Option<crate::hold::Hold>>> {

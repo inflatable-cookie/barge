@@ -140,7 +140,18 @@ fn the_cli_registers_reports_and_manages_roots() {
     assert!(roots.status.success(), "{}", stderr(&roots));
     let document = parse_document(&roots);
     assert_eq!(document["schema"], "barge.roots/1");
+    assert_eq!(document["data"]["bytes_included"], false);
     assert_eq!(document["data"]["roots"][0]["id"], id.as_str());
+
+    let roots_with_bytes = fixture.json(&["root", "list", "scratch/tests", "--bytes"]);
+    assert!(
+        roots_with_bytes.status.success(),
+        "{}",
+        stderr(&roots_with_bytes)
+    );
+    let document = parse_document(&roots_with_bytes);
+    assert_eq!(document["data"]["bytes_included"], true);
+    assert!(document["data"]["roots"][0]["bytes"].as_u64().unwrap() > 0);
 
     let pinned = fixture.run(&[
         "root",
