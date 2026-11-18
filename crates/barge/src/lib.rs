@@ -56,7 +56,6 @@ pub use space::{
     EvictedRoot, KeepReason, KeptRoot, PruneReason, PruneReport, SkippedRoot, Space, SweepReport,
     SweptRoot,
 };
-pub use state::StateLock;
 pub use volume::{
     Availability, Durability, Volume, VolumeRegistration, VolumeSpec, VolumeState, VolumeStatus,
 };

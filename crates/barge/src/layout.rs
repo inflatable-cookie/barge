@@ -158,7 +158,9 @@ fn read(path: &Path) -> Result<Option<Layout>> {
     };
     let layout: Layout = serde_json::from_slice(&bytes)
         .map_err(|e| Error::unknown_state(format!("cannot parse {}: {e}", path.display())))?;
-    layout.validate()?;
+    layout
+        .validate()
+        .map_err(|e| Error::unknown_state(format!("invalid {}: {e}", path.display())))?;
     Ok(Some(layout))
 }
 

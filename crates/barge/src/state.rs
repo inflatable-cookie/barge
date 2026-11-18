@@ -28,7 +28,7 @@ static PUBLISH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A directory that holds Barge's account state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StateDir {
+pub(crate) struct StateDir {
     root: PathBuf,
 }
 
@@ -40,6 +40,7 @@ impl StateDir {
                 return Ok(PathBuf::from(explicit));
             }
         }
+        #[cfg(target_os = "linux")]
         if let Some(state_home) = std::env::var_os("XDG_STATE_HOME") {
             if !state_home.is_empty() {
                 return Ok(PathBuf::from(state_home).join("barge"));
@@ -130,7 +131,8 @@ impl StateDir {
             )));
         }
         for spec in &document.volumes {
-            spec.validate()?;
+            spec.validate()
+                .map_err(|e| Error::unknown_state(format!("invalid {}: {e}", path.display())))?;
         }
         Ok(document.volumes)
     }
@@ -157,7 +159,9 @@ impl StateDir {
         let record: AreaRecord = serde_json::from_slice(&bytes).map_err(|source| {
             Error::unknown_state(format!("cannot parse {}: {source}", path.display()))
         })?;
-        record.validate()?;
+        record
+            .validate()
+            .map_err(|e| Error::unknown_state(format!("invalid {}: {e}", path.display())))?;
         if record.key() != *key {
             return Err(Error::unknown_state(format!(
                 "{} declares area {}, not {}",
@@ -189,7 +193,16 @@ impl StateDir {
             let record: AreaRecord = serde_json::from_slice(&bytes).map_err(|source| {
                 Error::unknown_state(format!("cannot parse {}: {source}", path.display()))
             })?;
-            record.validate()?;
+            record
+                .validate()
+                .map_err(|e| Error::unknown_state(format!("invalid {}: {e}", path.display())))?;
+            if path != self.area_path(&record.key()) {
+                return Err(Error::unknown_state(format!(
+                    "{} declares area {}, but its file name differs",
+                    path.display(),
+                    record.key().label()
+                )));
+            }
             records.push(record);
         }
         Ok(records)
@@ -219,11 +232,10 @@ struct VolumesDocument {
 
 /// The held account state lock. Dropping it releases the lock.
 #[derive(Debug)]
-pub struct StateLock {
+pub(crate) struct StateLock {
     /// Held only for the lock its descriptor carries; dropping it releases the
     /// lock, so the value is never read.
-    #[allow(dead_code)]
-    file: File,
+    _file: File,
 }
 
 impl StateLock {
@@ -237,14 +249,7 @@ impl StateLock {
             .open(&path)
             .map_err(|source| Error::io("cannot open the state lock", &path, &source))?;
         crate::hold::flock(&file, Mode::Exclusive, true)?;
-        Ok(Self { file })
-    }
-}
-
-impl Drop for StateLock {
-    fn drop(&mut self) {
-        // Closing the descriptor releases the lock; there is no explicit unlock
-        // call, and taking the lock again here would be wrong.
+        Ok(Self { _file: file })
     }
 }
 
@@ -341,4 +346,51 @@ pub fn validate_relative_path(field: &str, value: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ErrorKind;
+
+    #[test]
+    fn validators_reject_unsafe_names_and_paths() {
+        for name in ["", ".", "..", "Upper", "a/b", "-a"] {
+            assert!(validate_name("name", name).is_err(), "{name:?}");
+        }
+        for name in ["a", "a-b_c.d", "0"] {
+            assert!(validate_name("name", name).is_ok(), "{name:?}");
+        }
+        for path in ["/a", "a/../b", "a//b", "a/./b", "a\\b"] {
+            assert!(validate_relative_path("path", path).is_err(), "{path:?}");
+        }
+        assert!(validate_relative_path("path", "a/b").is_ok());
+    }
+
+    #[test]
+    fn area_filename_and_invalid_state_are_rejected() {
+        let tmp = crate::testing::TempDir::new("state-read").unwrap();
+        let state = StateDir::open(tmp.path().to_path_buf()).unwrap();
+        let key = AreaKey::new("test", "area").unwrap();
+        let record = crate::area::AreaSpec::new("test", "area", "Builds").into_record();
+        state.write_area(&record).unwrap();
+        fs::rename(state.area_path(&key), state.areas_dir().join("wrong.json")).unwrap();
+        assert_eq!(
+            state.read_areas().unwrap_err().kind(),
+            ErrorKind::UnknownState
+        );
+        fs::write(state.volumes_path(), br#"{"schema":"future","volumes":[]}"#).unwrap();
+        assert_eq!(
+            state.read_volumes().unwrap_err().kind(),
+            ErrorKind::UnknownState
+        );
+    }
+
+    #[test]
+    fn failed_publish_removes_temporary_file() {
+        let tmp = crate::testing::TempDir::new("publish").unwrap();
+        let destination = tmp.folder("destination").unwrap();
+        assert!(publish(&destination, b"data").is_err());
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
 }
