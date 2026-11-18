@@ -28,8 +28,10 @@ fn main() -> ExitCode {
 fn run(arguments: &[String]) -> Result<()> {
     let mut config_path = PathBuf::from(DEFAULT_CONFIG);
     let mut index = 0;
+    let mut pair = false;
     while index < arguments.len() {
         match arguments[index].as_str() {
+            "pair" => pair = true,
             "--config" => {
                 index += 1;
                 let path = arguments
@@ -51,6 +53,34 @@ fn run(arguments: &[String]) -> Result<()> {
     }
 
     let config = Config::load(&config_path)?;
+    if pair {
+        if config.mode != barged::AuthMode::Lan {
+            return Err(barged::Error::new("pair requires LAN mode"));
+        }
+        let path = config
+            .key_path()
+            .ok_or_else(|| barged::Error::new("missing key file"))?;
+        let key = barge_machine::auth::hex(
+            &barge_machine::auth::random(32).map_err(|e| barged::Error::new(e.to_string()))?,
+        );
+        barge_machine::auth::write_key(&path, &key)
+            .map_err(|e| barged::Error::new(format!("cannot write key: {e}")))?;
+        println!("{key}");
+        return Ok(());
+    }
+    if config.listen.ip().is_unspecified() {
+        eprintln!("barged: warning: listening on all interfaces");
+    }
+    if config.mode == barged::AuthMode::Lan {
+        let path = config
+            .key_path()
+            .ok_or_else(|| barged::Error::new("missing key file"))?;
+        let key = std::fs::read_to_string(path)
+            .map_err(|e| barged::Error::new(format!("cannot read LAN key: {e}")))?;
+        if barge_machine::auth::decode(key.trim(), 32).is_none() {
+            return Err(barged::Error::new("invalid LAN key"));
+        }
+    }
     let clock = Arc::new(SystemClock);
     let controller = PowerController::new(Arc::new(platform_power()), clock.clone());
     let peers = Arc::new(platform_lookup(&config));

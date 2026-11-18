@@ -7,6 +7,9 @@ publish.workspace = true
 description = "Barge's machine registry, Wake-on-LAN and daemon protocol types"
 
 [dependencies]
+getrandom = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
 serde.workspace = true
 serde_json.workspace = true
 # The client for `barged` (see the workspace manifest for why it carries no TLS

@@ -15,7 +15,7 @@ pub mod peer;
 pub mod power;
 pub mod server;
 
-pub use config::Config;
+pub use config::{AuthMode, Config};
 #[cfg(unix)]
 pub use peer::TailscaleLookup;
 pub use peer::{Allowlist, PeerError, PeerLookup, PeerNode};

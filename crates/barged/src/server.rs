@@ -5,11 +5,12 @@
 //! pending power action, so a thread pool would add concurrency (and races)
 //! without adding anything.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use barge_machine::{
@@ -33,6 +34,9 @@ pub struct Daemon {
     peers: Arc<dyn PeerLookup>,
     allowlist: Allowlist,
     clock: Arc<dyn Clock>,
+    key_path: Option<std::path::PathBuf>,
+    lan: bool,
+    nonces: Mutex<HashMap<String, u64>>,
 }
 
 impl fmt::Debug for Daemon {
@@ -62,6 +66,9 @@ impl Daemon {
             peers,
             allowlist: config.allowlist(),
             clock,
+            key_path: config.key_path(),
+            lan: config.mode == crate::AuthMode::Lan,
+            nonces: Mutex::new(HashMap::new()),
         }
     }
 
@@ -108,14 +115,38 @@ impl Daemon {
     }
 
     fn route(&self, request: &mut Request, peer: Option<SocketAddr>) -> Answer {
-        let caller = self.authorize(peer)?;
+        let tailnet_caller = if self.lan {
+            None
+        } else {
+            Some(self.authorize(peer)?)
+        };
+        let body = read_body(request).map_err(|e| {
+            if self.lan {
+                (401, failure("not_authorized", "authentication failed"))
+            } else {
+                e
+            }
+        })?;
+        let caller = if self.lan {
+            let key = self
+                .key_path
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|s| barge_machine::auth::decode(s.trim(), 32))
+                .ok_or_else(|| (401, failure("not_authorized", "authentication failed")))?;
+            self.authorize_lan(request, &key, body.as_bytes())?;
+            PeerNode::new("lan", "LAN client")
+        } else {
+            tailnet_caller
+                .ok_or_else(|| (403, failure("not_authorized", "authentication failed")))?
+        };
         let url = request.url().to_string();
         let path = url.split(['?', '#']).next().unwrap_or("").to_string();
         let method = request.method().as_str();
         match (method, path.as_str()) {
             ("GET", "/v1/state") => self.state_answer(),
-            ("POST", "/v1/power") => self.power(request, &caller),
-            ("POST", "/v1/power/cancel") => self.cancel(request),
+            ("POST", "/v1/power") => self.power(&body, &caller),
+            ("POST", "/v1/power/cancel") => self.cancel(&body),
             (_, known @ ("/v1/state" | "/v1/power" | "/v1/power/cancel")) => Err((
                 405,
                 failure(
@@ -162,14 +193,56 @@ impl Daemon {
         Ok(node)
     }
 
+    fn authorize_lan(
+        &self,
+        request: &Request,
+        key: &[u8],
+        body: &[u8],
+    ) -> std::result::Result<(), Refusal> {
+        let refused = || (401, failure("not_authorized", "authentication failed"));
+        let header = |name: &'static str| {
+            request
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv(name))
+                .map(|h| h.value.as_str())
+        };
+        let timestamp = header(barge_machine::auth::TIMESTAMP).ok_or_else(refused)?;
+        let nonce = header(barge_machine::auth::NONCE).ok_or_else(refused)?;
+        let signature = header(barge_machine::auth::SIGNATURE).ok_or_else(refused)?;
+        let seconds: u64 = timestamp.parse().map_err(|_| refused())?;
+        let now = self.clock.now_unix_ms() / 1000;
+        if seconds.abs_diff(now) > 60
+            || barge_machine::auth::decode(nonce, 16).is_none()
+            || !barge_machine::auth::verify(
+                key,
+                request.method().as_str(),
+                request.url(),
+                timestamp,
+                nonce,
+                body,
+                signature,
+            )
+        {
+            return Err(refused());
+        }
+        let mut nonces = self.nonces.lock().map_err(|_| refused())?;
+        nonces.retain(|_, expiry| *expiry >= now);
+        if nonces.contains_key(nonce) || nonces.len() >= 10000 {
+            return Err(refused());
+        }
+        nonces.insert(nonce.to_string(), seconds.saturating_add(60));
+        Ok(())
+    }
+
     fn state_answer(&self) -> Answer {
         let state = State::new(PowerState::Awake, self.clock.now_unix_ms())
             .with_pending(self.controller.pending());
         Ok((200, encode(&state)?))
     }
 
-    fn power(&self, request: &mut Request, caller: &PeerNode) -> Answer {
-        let document: PowerRequest = self.document(request)?;
+    fn power(&self, body: &str, caller: &PeerNode) -> Answer {
+        let document: PowerRequest = self.document(body)?;
         if document.schema != POWER_REQUEST_SCHEMA {
             return Err(schema_mismatch(POWER_REQUEST_SCHEMA, &document.schema));
         }
@@ -196,8 +269,8 @@ impl Daemon {
         }
     }
 
-    fn cancel(&self, request: &mut Request) -> Answer {
-        let document: Cancel = self.document(request)?;
+    fn cancel(&self, body: &str) -> Answer {
+        let document: Cancel = self.document(body)?;
         if document.schema != CANCEL_SCHEMA {
             return Err(schema_mismatch(CANCEL_SCHEMA, &document.schema));
         }
@@ -207,16 +280,15 @@ impl Daemon {
 
     fn document<T: serde::de::DeserializeOwned>(
         &self,
-        request: &mut Request,
+        body: &str,
     ) -> std::result::Result<T, Refusal> {
-        let body = read_body(request)?;
         if body.trim().is_empty() {
             return Err((
                 400,
                 failure("bad_request", "the request body must be a JSON document"),
             ));
         }
-        serde_json::from_str(&body).map_err(|error| {
+        serde_json::from_str(body).map_err(|error| {
             (
                 400,
                 failure(

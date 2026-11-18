@@ -365,3 +365,125 @@ fn an_absent_daemon_is_unreachable_and_never_read_as_asleep() {
     assert!(error.message().contains("is unreachable"), "{error}");
     assert!(!error.message().contains("asleep"), "{error}");
 }
+
+#[test]
+fn lan_pairing_and_authenticated_requests() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let dir = std::env::temp_dir().join(format!(
+        "barged-lan-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let key_path = dir.join("lan.key");
+    let config_path = dir.join("config.json");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"{{"listen":"127.0.0.1:0","mode":"lan","key_file":{}}}"#,
+            serde_json::to_string(&key_path).unwrap()
+        ),
+    )
+    .unwrap();
+    let pair = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_barged"))
+            .arg("pair")
+            .arg("--config")
+            .arg(&config_path)
+            .output()
+            .unwrap()
+    };
+    let first = pair();
+    assert!(first.status.success());
+    let second = pair();
+    assert!(second.status.success());
+    assert_ne!(first.stdout, second.stdout);
+    assert_eq!(
+        std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let key_text = String::from_utf8(second.stdout).unwrap();
+    let key = barge_machine::auth::decode(key_text.trim(), 32).unwrap();
+    let config = Config::load(&config_path).unwrap();
+    let clock = Arc::new(barged::SystemClock);
+    let controller = PowerController::new(Arc::new(RecordingBackend::default()), clock.clone());
+    let daemon = Arc::new(Daemon::new(
+        &config,
+        controller,
+        Arc::new(FixedLookup(None)),
+        clock,
+    ));
+    let server = daemon.bind().unwrap();
+    let address = server.server_addr().to_ip().unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    let flag = running.clone();
+    let thread = thread::spawn(move || daemon.serve(server, &flag).unwrap());
+    let client = DaemonClient::at(format!("http://{address}")).with_key(key.clone());
+    assert_eq!(client.state().unwrap().power, PowerState::Awake);
+    assert!(DaemonClient::at(format!("http://{address}"))
+        .with_key(vec![0; 32])
+        .state()
+        .is_err());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let request = |timestamp: u64, nonce: &str, signed_body: &str, body: &str| {
+        let ts = timestamp.to_string();
+        let sig = barge_machine::auth::sign(
+            &key,
+            "POST",
+            "/v1/power/cancel",
+            &ts,
+            nonce,
+            signed_body.as_bytes(),
+        )
+        .unwrap();
+        format!("POST /v1/power/cancel HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {}\r\nx-barge-timestamp: {ts}\r\nx-barge-nonce: {nonce}\r\nx-barge-signature: {sig}\r\n\r\n{body}", body.len())
+    };
+    let raw = |request: &str| {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response.lines().next().unwrap().to_string()
+    };
+    let body = r#"{"schema":"barge.power-cancel/1"}"#;
+    let nonce = "00112233445566778899aabbccddeeff";
+    let valid = request(now, nonce, body, body);
+    assert!(raw(&valid).contains(" 200 "));
+    assert!(raw(&valid).contains(" 401 "));
+    assert!(raw(&request(
+        now - 61,
+        "11112233445566778899aabbccddeeff",
+        body,
+        body
+    ))
+    .contains(" 401 "));
+    assert!(raw(&request(
+        now,
+        "22222233445566778899aabbccddeeff",
+        body,
+        "{}"
+    ))
+    .contains(" 401 "));
+    assert!(
+        raw("GET /v1/state HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").contains(" 401 ")
+    );
+    let rotated = pair();
+    assert!(rotated.status.success());
+    assert!(client.state().is_err());
+    let new_key =
+        barge_machine::auth::decode(String::from_utf8(rotated.stdout).unwrap().trim(), 32).unwrap();
+    assert!(DaemonClient::at(format!("http://{address}"))
+        .with_key(new_key)
+        .state()
+        .is_ok());
+    running.store(false, Ordering::SeqCst);
+    thread.join().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}

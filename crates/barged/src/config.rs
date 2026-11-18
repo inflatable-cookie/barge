@@ -22,12 +22,27 @@ pub const DEFAULT_TAILSCALE_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
 pub struct Config {
     /// The address `barged` binds: the machine's Tailscale address in production.
     pub listen: SocketAddr,
+    #[serde(default)]
+    pub mode: AuthMode,
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
+    #[serde(default)]
+    pub allow_wildcard: bool,
     /// Tailscale node identities allowed to call. A node matches by stable ID
     /// (`n1234ABCD`) or by its MagicDNS name.
+    #[serde(default)]
     pub allowed_nodes: Vec<String>,
     /// Tailscaled's local API socket, used for `whois`.
     #[serde(default = "default_tailscale_socket")]
     pub tailscale_socket: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    #[default]
+    Tailscale,
+    Lan,
 }
 
 fn default_tailscale_socket() -> PathBuf {
@@ -51,11 +66,17 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.listen.ip().is_unspecified() {
+        if self.listen.ip().is_unspecified() && !self.allow_wildcard {
             return Err(Error::new(format!(
                 "listen {} is a wildcard address; bind the machine's Tailscale address instead",
                 self.listen
             )));
+        }
+        if self.mode == AuthMode::Lan {
+            if self.key_file.is_none() {
+                return Err(Error::new("LAN mode needs key_file"));
+            }
+            return Ok(());
         }
         if self.allowed_nodes.is_empty() {
             return Err(Error::new(
@@ -68,6 +89,17 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    pub fn key_path(&self) -> Option<PathBuf> {
+        self.key_file.as_ref().map(|path| {
+            if let Ok(rest) = path.strip_prefix("~") {
+                std::env::var_os("HOME")
+                    .map_or_else(|| path.clone(), |home| PathBuf::from(home).join(rest))
+            } else {
+                path.clone()
+            }
+        })
     }
 
     /// The allowlist this config declares.
@@ -92,6 +124,7 @@ mod tests {
             config.listen,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)), 9777)
         );
+        assert_eq!(config.mode, AuthMode::Tailscale);
         assert_eq!(config.allowed_nodes, vec!["macbook".to_string()]);
         assert_eq!(
             config.tailscale_socket,
@@ -100,6 +133,14 @@ mod tests {
         assert!(config
             .allowlist()
             .accepts(&crate::PeerNode::new("n1", "macbook")));
+    }
+
+    #[test]
+    fn lan_wildcard_requires_explicit_opt_in() {
+        let denied = br#"{"listen":"0.0.0.0:9777","mode":"lan","key_file":"/test/key"}"#;
+        let allowed = br#"{"listen":"0.0.0.0:9777","mode":"lan","key_file":"/test/key","allow_wildcard":true}"#;
+        assert!(Config::parse(denied).is_err());
+        assert_eq!(Config::parse(allowed).unwrap().mode, AuthMode::Lan);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Machines
 
-Status: design outline approved by Tom, 2026-11-18. Build steps 1 and 2 are
+Status: design outline approved by Tom, 2026-11-18. Build steps 1, 2 and LAN authentication are
 complete; later steps remain unbuilt.
 
 Barge manages the machines it distributes resources across. The first is the
@@ -10,14 +10,12 @@ Remote menu-bar app ([vision](vision.md#direction)).
 
 ## Parts
 
-- **`barge` CLI on the Mac:** `barge machine add|list|remove|wake|status|sleep|restart|shutdown|cancel`.
+- **`barge` CLI on the Mac:** `barge machine add|list|remove|wake|pair|unpair|status|sleep|restart|shutdown|cancel`.
   Wake-on-LAN is a client operation and needs nothing running on the PC.
 - **`barged` on the PC:** a small Rust daemon. It reports state and performs
   power actions. On Bazzite it runs as a systemd user unit and asks logind over
   D-Bus for sleep, restart and shutdown, with a polkit rule granting only those
-  actions. It never runs a shell command it was sent. It binds one configured
-  address — the machine's Tailscale address — and answers only nodes on the
-  allowlist in its config. [Install guide](../install-barged.md).
+  actions. It never runs a shell command it was sent. It binds one configured address and accepts either allowlisted Tailscale nodes or authenticated LAN clients. [Install guide](../install-barged.md).
 - **Barge UI:** a fresh Tauri app (Tom, 2026-11-18). Machine control comes
   first. Storage, worktrees and resources join later in the same app.
 
@@ -59,15 +57,19 @@ exit 2 — and is refused where the machine is built.
 
 ## Protocol and trust
 
-- HTTP with JSON over the tailnet. `barged` binds only the single address in
-  its config — the machine's Tailscale address — so the network decides who can
-  reach it. It refuses a wildcard bind.
-- Authorisation: Tailscale identifies the caller's node. `barged` asks
-  tailscaled's local API (`whois`) for the peer's node and accepts only nodes on
-  an allowlist written at pairing — by stable node ID or MagicDNS name — so no
-  PIN flow is needed. A paired client stores nothing secret beyond its tailnet
-  identity. An unidentifiable caller and a node off the allowlist are both
-  refused with `403`, before an endpoint runs.
+- Tailscale mode (the default for existing configs) binds the configured tailnet
+  address and authorizes callers through Tailscale `whois` and an allowlist.
+  Tailscale encrypts traffic and is recommended across networks.
+- LAN mode uses a shared 256-bit key installed once on each client. Requests
+  carry an HMAC of the method, path, timestamp, nonce and body digest; the
+  daemon checks a 60-second clock window and rejects repeated nonces. Re-pairing
+  the daemon replaces the key and invalidates old clients. The key is stored
+  separately from `machines.json`, owner-only. Removing a machine removes its
+  stored key before the name can be reused.
+- LAN HTTP authenticates requests but does not encrypt them. Someone on the LAN
+  can see that a power action happened, but cannot forge or replay it. Keep
+  clocks synchronized. Bind a specific LAN address; wildcard binding requires
+  `allow_wildcard` and produces a warning.
 - Endpoints: `GET /v1/state`, `POST /v1/power` (`{action, delay_s}`),
   `POST /v1/power/cancel`. Every response carries a `schema` field, under the
   same contract as the CLI's JSON; a non-2xx response is a
@@ -118,10 +120,11 @@ the build brief.
    `barge-machine`, `barge machine status|sleep|restart|shutdown|cancel`, the
    systemd unit and polkit rule in `packaging/barged/`, and the
    [install guide](../install-barged.md) for Bazzite.
-3. UI design pass: information architecture and visual system, for Tom's
+3. **Built:** LAN pairing and authenticated requests, with no Tailscale required.
+4. UI design pass: information architecture and visual system, for Tom's
    review.
-4. The Tauri app: Machines plus the menu-bar entry.
-5. Retire MoonDeck Buddy on the PC. This changes host software, so it needs
+5. The Tauri app: Machines plus the menu-bar entry.
+6. Retire MoonDeck Buddy on the PC. This changes host software, so it needs
    Tom's go-ahead. The Steam Deck needs a `barged` client first, or loses
    remote control until it has one.
 

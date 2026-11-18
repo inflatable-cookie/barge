@@ -23,10 +23,20 @@ const POWER_PATH: &str = "/v1/power";
 const CANCEL_PATH: &str = "/v1/power/cancel";
 
 /// A client for one machine's `barged`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DaemonClient {
     agent: ureq::Agent,
     base: String,
+    key: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for DaemonClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonClient")
+            .field("base", &self.base)
+            .field("lan", &self.key.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl DaemonClient {
@@ -42,6 +52,7 @@ impl DaemonClient {
         Self {
             agent,
             base: base.into(),
+            key: None,
         }
     }
 
@@ -54,6 +65,45 @@ impl DaemonClient {
             host.to_string()
         };
         Self::at(format!("http://{host}:{}", machine.daemon_port()))
+    }
+
+    /// Authenticate requests using a LAN key.
+    pub fn with_key(mut self, key: Vec<u8>) -> Self {
+        self.key = Some(key);
+        self
+    }
+
+    /// Connect to the machine's LAN hostname using its key.
+    pub fn for_lan(machine: &Machine, key: Vec<u8>) -> Self {
+        let host = machine.hostname();
+        let host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        Self::at(format!("http://{host}:{}", machine.daemon_port())).with_key(key)
+    }
+
+    fn auth_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<Option<(String, String, String)>> {
+        let Some(key) = &self.key else {
+            return Ok(None);
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| Error::new(ErrorKind::Io, e.to_string()))?
+            .as_secs()
+            .to_string();
+        let nonce = crate::auth::hex(
+            &crate::auth::random(16).map_err(|e| Error::new(ErrorKind::Io, e.to_string()))?,
+        );
+        let signature = crate::auth::sign(key, method, path, &timestamp, &nonce, body)
+            .ok_or_else(|| Error::new(ErrorKind::Io, "cannot sign request"))?;
+        Ok(Some((timestamp, nonce, signature)))
     }
 
     /// The base URL this client dials; also the name an error reports.
@@ -85,11 +135,14 @@ impl DaemonClient {
     }
 
     fn get(&self, path: &str) -> Result<(u16, String)> {
-        let mut response = self
-            .agent
-            .get(&self.url(path))
-            .call()
-            .map_err(|error| self.unreachable(error))?;
+        let mut request = self.agent.get(&self.url(path));
+        if let Some((timestamp, nonce, signature)) = self.auth_headers("GET", path, b"")? {
+            request = request
+                .header(crate::auth::TIMESTAMP, &timestamp)
+                .header(crate::auth::NONCE, &nonce)
+                .header(crate::auth::SIGNATURE, &signature);
+        }
+        let mut response = request.call().map_err(|error| self.unreachable(error))?;
         let status = response.status().as_u16();
         let body = response
             .body_mut()
@@ -102,10 +155,19 @@ impl DaemonClient {
         let encoded = serde_json::to_string(document).map_err(|error| {
             Error::new(ErrorKind::Usage, format!("cannot encode request: {error}"))
         })?;
-        let mut response = self
+        let mut request = self
             .agent
             .post(&self.url(path))
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Some((timestamp, nonce, signature)) =
+            self.auth_headers("POST", path, encoded.as_bytes())?
+        {
+            request = request
+                .header(crate::auth::TIMESTAMP, &timestamp)
+                .header(crate::auth::NONCE, &nonce)
+                .header(crate::auth::SIGNATURE, &signature);
+        }
+        let mut response = request
             .send(encoded.as_str())
             .map_err(|error| self.unreachable(error))?;
         let status = response.status().as_u16();
@@ -173,7 +235,7 @@ impl DaemonClient {
         };
         let kind = match status {
             400 => ErrorKind::Usage,
-            403 | 409 => ErrorKind::Refused,
+            401 | 403 | 409 => ErrorKind::Refused,
             404 => ErrorKind::NotFound,
             _ => ErrorKind::Io,
         };

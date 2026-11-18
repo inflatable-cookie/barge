@@ -53,7 +53,9 @@ Except for standalone move plans, every success document has `schema` and `data`
 | `barge.machine-list/1` | `machines` | machine list |
 | `barge.machine-removed/1` | `removed` | machine remove |
 | `barge.machine-wake/1` | `machine`, `destination`, `bytes_sent` | machine wake |
-| `barge.machine-status/1` | `machine`, `state` | machine status |
+| `barge.machine-paired/1` | `machine` | machine pair |
+| `barge.machine-unpaired/1` | `machine` | machine unpair |
+| `barge.machine-status/1` | `machine`, `mode`, `state` | machine status |
 | `barge.machine-power/1` | `machine`, `action`, `deadline_unix_ms` | machine sleep, restart, shutdown |
 | `barge.machine-cancel/1` | `machine`, `cancelled` | machine cancel |
 
