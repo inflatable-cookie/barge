@@ -3,15 +3,16 @@
 //! Deletion never follows a symlink and never descends into another filesystem,
 //! so a nested mount or a link planted in a root is skipped rather than followed.
 //! A trash entry is deleted only when its marker still names the area.
+//!
+//! The walk itself is descriptor-relative and lives behind the `os` seam; a
+//! process racing inside an evicted tree cannot swap a folder for a symlink
+//! between the check and the descent because no step names a path.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::os::{remove_tree, Removed};
 use crate::root::{read_marker, MarkerRead, MARKER_NAME};
-
-/// The deepest tree deletion descends before it gives up on an entry.
-pub const MAX_DEPTH: usize = 128;
 
 /// What one tree deletion removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -24,41 +25,14 @@ pub struct Deletion {
 /// Delete a tree Barge owns. `area` is the `<namespace>/<area>` the marker must
 /// name; anything else is refused and nothing is removed.
 pub(crate) fn remove_owned_tree(path: &Path, area: &str) -> Result<Deletion> {
-    remove_owned_tree_checked(path, area, None, &device_of)
+    remove_owned_tree_checked(path, area, None)
 }
 
 pub(crate) fn remove_owned_tree_for_id(path: &Path, area: &str, id: &str) -> Result<Deletion> {
-    remove_owned_tree_checked(path, area, Some(id), &device_of)
+    remove_owned_tree_checked(path, area, Some(id))
 }
 
-/// The testable core of [`remove_owned_tree`]: `device` answers which filesystem
-/// an entry is on, so a test can claim a nested folder is another mount.
-#[cfg(test)]
-pub(crate) fn remove_owned_tree_with(
-    path: &Path,
-    area: &str,
-    device: &dyn Fn(&fs::Metadata) -> u64,
-) -> Result<Deletion> {
-    remove_owned_tree_checked(path, area, None, device)
-}
-
-fn remove_owned_tree_checked(
-    path: &Path,
-    area: &str,
-    id: Option<&str>,
-    device: &dyn Fn(&fs::Metadata) -> u64,
-) -> Result<Deletion> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|source| Error::io("cannot inspect", path, &source))?;
-    if !metadata.is_dir() {
-        if id.is_some() {
-            return Err(Error::refused("evicted root is not a directory"));
-        }
-        // A sticky symlink or a file where a root folder should be: remove the
-        // entry itself, never what it points at.
-        fs::remove_file(path).map_err(|source| Error::io("cannot remove", path, &source))?;
-        return Ok(Deletion::default());
-    }
+fn remove_owned_tree_checked(path: &Path, area: &str, id: Option<&str>) -> Result<Deletion> {
     match read_marker(path) {
         MarkerRead::Valid(marker) if marker.area == area && id.is_none_or(|id| marker.id == id) => {
         }
@@ -82,74 +56,35 @@ fn remove_owned_tree_checked(
             )))
         }
     }
-    let mut deletion = Deletion::default();
-    let root_device = device(&metadata);
-    if remove_contents(path, root_device, device, 0, &mut deletion)? {
-        fs::remove_dir(path).map_err(|source| Error::io("cannot remove", path, &source))?;
-    } else {
+    let Removed {
+        bytes,
+        mut skipped,
+        removed,
+    } = remove_tree(path)?;
+    if !removed && skipped.is_empty() {
         // A nested mount or an over-deep tree stays: Barge never reaches across.
-        deletion.skipped.push(path.to_path_buf());
+        skipped.push(path.to_path_buf());
     }
-    Ok(deletion)
-}
-
-fn remove_contents(
-    directory: &Path,
-    root_device: u64,
-    device: &dyn Fn(&fs::Metadata) -> u64,
-    depth: usize,
-    deletion: &mut Deletion,
-) -> Result<bool> {
-    if depth >= MAX_DEPTH {
-        deletion.skipped.push(directory.to_path_buf());
-        return Ok(false);
-    }
-    let mut empty = true;
-    let entries =
-        fs::read_dir(directory).map_err(|source| Error::io("cannot list", directory, &source))?;
-    for entry in entries {
-        let entry = entry.map_err(|source| Error::io("cannot list", directory, &source))?;
-        let child = entry.path();
-        let metadata = match fs::symlink_metadata(&child) {
-            Ok(metadata) => metadata,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(Error::io("cannot inspect", &child, &source)),
-        };
-        let file_type = metadata.file_type();
-        if file_type.is_symlink() {
-            fs::remove_file(&child)
-                .map_err(|source| Error::io("cannot remove a symlink", &child, &source))?;
-            continue;
-        }
-        if file_type.is_dir() {
-            if device(&metadata) != root_device {
-                deletion.skipped.push(child);
-                empty = false;
-                continue;
-            }
-            if remove_contents(&child, root_device, device, depth + 1, deletion)? {
-                fs::remove_dir(&child)
-                    .map_err(|source| Error::io("cannot remove", &child, &source))?;
-            } else {
-                empty = false;
-            }
-        } else {
-            deletion.bytes = deletion.bytes.saturating_add(metadata.len());
-            fs::remove_file(&child)
-                .map_err(|source| Error::io("cannot remove", &child, &source))?;
-        }
-    }
-    Ok(empty)
-}
-
-fn device_of(metadata: &fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.dev()
+    Ok(Deletion { bytes, skipped })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn marker(id: &str) -> crate::root::RootMarker {
+        crate::root::RootMarker {
+            schema: crate::root::ROOT_SCHEMA.to_string(),
+            area: "test/area".to_string(),
+            id: id.to_string(),
+            label: "slot".to_string(),
+            created_unix_ms: 1,
+            expires_unix_ms: None,
+            folder: None,
+        }
+    }
+
     #[test]
     fn a_symlink_is_removed_but_never_followed() {
         let temp = crate::testing::TempDir::new("trash-symlink").unwrap();
@@ -158,25 +93,14 @@ mod tests {
         fs::write(outside.join("keep.txt"), b"keep").unwrap();
         let root = temp.path().join("slot-0123456789abcdef");
         fs::create_dir(&root).unwrap();
-        crate::root::write_marker(
-            &root,
-            &crate::root::RootMarker {
-                schema: crate::root::ROOT_SCHEMA.to_string(),
-                area: "test/area".to_string(),
-                id: "0123456789abcdef".to_string(),
-                label: "slot".to_string(),
-                created_unix_ms: 1,
-                expires_unix_ms: None,
-                folder: None,
-            },
-        )
-        .unwrap();
+        crate::root::write_marker(&root, &marker("0123456789abcdef")).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
         fs::write(root.join("file.txt"), b"data").unwrap();
 
         let deletion = remove_owned_tree(&root, "test/area").unwrap();
 
         assert!(deletion.bytes >= 4, "the file's bytes are counted");
+        assert!(deletion.skipped.is_empty());
         assert!(!root.exists());
         assert!(
             outside.join("keep.txt").exists(),
@@ -185,64 +109,11 @@ mod tests {
     }
 
     #[test]
-    fn a_nested_filesystem_is_skipped() {
-        use std::os::unix::fs::MetadataExt;
-        let temp = crate::testing::TempDir::new("trash-device").unwrap();
-        let root = temp.path().join("slot-0123456789abcdef");
-        let nested = root.join("nested");
-        fs::create_dir_all(&nested).unwrap();
-        crate::root::write_marker(
-            &root,
-            &crate::root::RootMarker {
-                schema: crate::root::ROOT_SCHEMA.to_string(),
-                area: "test/area".to_string(),
-                id: "0123456789abcdef".to_string(),
-                label: "slot".to_string(),
-                created_unix_ms: 1,
-                expires_unix_ms: None,
-                folder: None,
-            },
-        )
-        .unwrap();
-        fs::write(nested.join("keep.txt"), b"keep").unwrap();
-        let nested_inode = fs::symlink_metadata(&nested).unwrap().ino();
-        let root_device = fs::symlink_metadata(&root).unwrap().dev();
-
-        let deletion = remove_owned_tree_with(&root, "test/area", &|metadata| {
-            if metadata.is_dir() && metadata.ino() == nested_inode {
-                root_device + 1
-            } else {
-                root_device
-            }
-        })
-        .unwrap();
-
-        assert!(
-            nested.join("keep.txt").exists(),
-            "the nested mount survives"
-        );
-        assert!(deletion.skipped.contains(&nested));
-        assert!(deletion.skipped.contains(&root));
-    }
-
-    #[test]
     fn eviction_delete_refuses_a_different_root_id() {
         let temp = crate::testing::TempDir::new("trash-id").unwrap();
         let root = temp.path().join("root");
         fs::create_dir(&root).unwrap();
-        crate::root::write_marker(
-            &root,
-            &crate::root::RootMarker {
-                schema: crate::root::ROOT_SCHEMA.to_string(),
-                area: "test/area".to_string(),
-                id: "replacement".to_string(),
-                label: "slot".to_string(),
-                created_unix_ms: 1,
-                expires_unix_ms: None,
-                folder: None,
-            },
-        )
-        .unwrap();
+        crate::root::write_marker(&root, &marker("replacement")).unwrap();
         assert!(remove_owned_tree_for_id(&root, "test/area", "original").is_err());
         assert!(root.exists());
     }

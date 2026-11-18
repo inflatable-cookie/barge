@@ -673,7 +673,7 @@ fn root(arguments: &[String], json: bool) -> Result<()> {
                         println!(
                             "{} {} {}",
                             root.id,
-                            format_size(root.bytes),
+                            describe_size(root.bytes, root.bytes_approximate),
                             describe_root(root)
                         );
                     } else {
@@ -718,9 +718,12 @@ fn root(arguments: &[String], json: bool) -> Result<()> {
                             "evicted {} from {} ({}), trash at {}",
                             eviction.id,
                             eviction.area,
-                            format_size(eviction.bytes),
+                            describe_size(eviction.bytes, eviction.bytes_approximate),
                             eviction.trash_path.display()
                         );
+                        if let Some(reason) = &eviction.kept_reason {
+                            println!("trash kept at {}: {reason}", eviction.trash_path.display());
+                        }
                     }
                 }
             }
@@ -843,7 +846,7 @@ fn print_prune(report: &barge::PruneReport) {
             "{prefix} {} from {} ({}, {})",
             root.id,
             root.area,
-            format_size(root.bytes),
+            describe_size(root.bytes, root.bytes_approximate),
             match root.reason {
                 barge::PruneReason::SoftCap => "soft cap",
                 barge::PruneReason::Reserve => "reserve",
@@ -855,7 +858,7 @@ fn print_prune(report: &barge::PruneReport) {
             "kept {} from {} ({}, {})",
             root.id,
             root.area,
-            format_size(root.bytes),
+            describe_size(root.bytes, root.bytes_approximate),
             match root.reason {
                 barge::KeepReason::Held => "held",
                 barge::KeepReason::Pinned => "pinned",
@@ -1016,6 +1019,15 @@ fn format_size(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// A size a tree walk could not take exactly is shown as approximate.
+fn describe_size(bytes: u64, approximate: bool) -> String {
+    if approximate {
+        format!("~{} (approximate)", format_size(bytes))
+    } else {
+        format_size(bytes)
     }
 }
 

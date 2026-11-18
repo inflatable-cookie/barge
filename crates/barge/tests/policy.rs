@@ -296,3 +296,63 @@ fn pins_are_removed_with_the_root_they_protect() {
     let error = area.pin(&root.id, "gone").unwrap_err();
     assert_eq!(error.kind(), ErrorKind::NotFound);
 }
+
+/// Restores a folder's mode so the fixture can still be removed.
+struct ModeGuard(std::path::PathBuf);
+
+impl Drop for ModeGuard {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[test]
+fn a_failed_eviction_is_reported_as_an_error_not_a_refusal() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fixture = Fixture::new();
+    fixture.reserve = TIB;
+    fixture.os.set_free(&fixture.mount, 0);
+    fixture.register();
+    let area = fixture.area("pool");
+    let root = area.create_root("slot").unwrap();
+    fill(&root, 64);
+    // The trash exists, so the eviction reaches its rename, which the read-only
+    // area folder refuses.
+    let area_dir = fixture.area_dir("pool");
+    fs::create_dir_all(area_dir.join(".trash")).unwrap();
+    fs::set_permissions(&area_dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let _guard = ModeGuard(area_dir);
+
+    let error = fixture.barge.prune("Builds", false).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Io, "{error}");
+    assert!(
+        root.path.is_dir(),
+        "a refused rename leaves the root intact"
+    );
+}
+
+#[test]
+fn a_kept_root_reports_the_size_it_holds() {
+    let mut fixture = Fixture::new();
+    fixture.reserve = TIB;
+    fixture.os.set_free(&fixture.mount, 0);
+    fixture.register();
+    let area = fixture.area("pool");
+    let root = area.create_root("keeper").unwrap();
+    fill(&root, 512);
+    let hold = area.hold(&root.id, Mode::Exclusive).unwrap();
+
+    let report = fixture.barge.prune("Builds", false).unwrap();
+
+    let kept = report
+        .kept
+        .iter()
+        .find(|kept| kept.id == root.id)
+        .expect("a held root is kept and reported");
+    assert_eq!(kept.reason, KeepReason::Held);
+    assert!(kept.bytes >= 512, "kept bytes: {}", kept.bytes);
+    assert!(!kept.bytes_approximate);
+    drop(hold);
+}

@@ -78,6 +78,9 @@ pub struct RootInfo {
     pub pinned: bool,
     /// Root tree size, or zero when using `Area::list_without_bytes`.
     pub bytes: u64,
+    /// True when the tree size could not be measured exactly: an entry could not
+    /// be read, or the tree is deeper than the walk goes.
+    pub bytes_approximate: bool,
     /// True when the root lives on the volume; false in the area's fallback.
     pub on_volume: bool,
 }
@@ -262,40 +265,96 @@ pub(crate) fn mint_id() -> Result<String> {
     Ok(id)
 }
 
-/// The bytes a folder holds, without following symlinks or crossing into
-/// another filesystem.
-pub(crate) fn tree_bytes(path: &Path) -> u64 {
-    #[cfg(test)]
-    TREE_BYTES_CALLS.with(|calls| calls.set(calls.get() + 1));
-    tree_bytes_inner(path)
+/// A measured tree size, and whether the walk saw all of it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TreeSize {
+    pub bytes: u64,
+    /// True when part of the tree was not counted, so `bytes` is a lower bound.
+    pub approximate: bool,
 }
 
-fn tree_bytes_inner(path: &Path) -> u64 {
-    let mut total = 0_u64;
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return 0;
+impl TreeSize {
+    fn add(&mut self, other: Self) {
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        self.approximate = self.approximate || other.approximate;
+    }
+}
+
+/// The bytes a folder holds, without following symlinks or crossing into
+/// another filesystem. Anything the walk could not read is reported as an
+/// approximate size rather than silently counted as nothing.
+pub(crate) fn tree_bytes(path: &Path) -> TreeSize {
+    #[cfg(test)]
+    TREE_BYTES_CALLS.with(|calls| calls.set(calls.get() + 1));
+    tree_bytes_inner(path, 0, &|_child, device| device)
+}
+
+/// The testable core of [`tree_bytes`]: `device` answers which filesystem a
+/// folder is on, so a test can claim a nested folder is another mount.
+#[cfg(test)]
+pub(crate) fn tree_bytes_with(path: &Path, device: &dyn Fn(&Path, u64) -> u64) -> TreeSize {
+    tree_bytes_inner(path, 0, device)
+}
+
+fn tree_bytes_inner(path: &Path, depth: usize, device: &dyn Fn(&Path, u64) -> u64) -> TreeSize {
+    let mut size = TreeSize::default();
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return size,
+        Err(_) => {
+            size.approximate = true;
+            return size;
+        }
     };
     if !metadata.is_dir() {
-        return metadata.len();
+        size.bytes = metadata.len();
+        return size;
     }
-    let Ok(entries) = fs::read_dir(path) else {
-        return 0;
+    if depth >= crate::os::MAX_DEPTH {
+        // Deeper than deletion goes, so the rest is neither counted nor claimed.
+        size.approximate = true;
+        return size;
+    }
+    let root_device = crate::os::device_of(&metadata);
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => {
+            size.approximate = true;
+            return size;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                size.approximate = true;
+                continue;
+            }
+        };
         let child = entry.path();
-        let Ok(child_metadata) = fs::symlink_metadata(&child) else {
-            continue;
+        let child_metadata = match fs::symlink_metadata(&child) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                size.approximate = true;
+                continue;
+            }
         };
         if child_metadata.file_type().is_symlink() {
             continue;
         }
         if child_metadata.is_dir() {
-            total = total.saturating_add(tree_bytes_inner(&child));
+            if device(&child, crate::os::device_of(&child_metadata)) != root_device {
+                // A nested mount is another filesystem's data, so it is skipped
+                // by design rather than counted or marked approximate.
+                continue;
+            }
+            size.add(tree_bytes_inner(&child, depth + 1, device));
         } else {
-            total = total.saturating_add(child_metadata.len());
+            size.bytes = size.bytes.saturating_add(child_metadata.len());
         }
     }
-    total
+    size
 }
 
 #[cfg(test)]
@@ -311,4 +370,82 @@ pub(crate) fn reset_tree_bytes_calls() {
 #[cfg(test)]
 pub(crate) fn tree_bytes_calls() -> usize {
     TREE_BYTES_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+mod tree_size_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Restores a folder's mode so the fixture can still remove it.
+    struct ModeGuard(PathBuf);
+
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    fn folder(label: &str) -> (crate::testing::TempDir, PathBuf) {
+        let temp = crate::testing::TempDir::new(label).unwrap();
+        let root = temp.path().join("slot-0123456789abcdef");
+        fs::create_dir(&root).unwrap();
+        (temp, root)
+    }
+
+    #[test]
+    fn a_nested_mount_is_neither_walked_nor_counted() {
+        let (_temp, root) = folder("root-device");
+        let nested = root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("other.bin"), vec![b'x'; 64]).unwrap();
+        fs::write(root.join("ours.bin"), vec![b'x'; 8]).unwrap();
+
+        let exact = tree_bytes(&root);
+        assert_eq!(exact.bytes, 72, "both files are on one filesystem");
+        assert!(!exact.approximate);
+
+        // The fixture cannot mount a second filesystem, so the seam reports one
+        // for the folder a mount would appear as.
+        let measured = tree_bytes_with(&root, &|child, device| {
+            if child.ends_with("nested") {
+                device + 1
+            } else {
+                device
+            }
+        });
+        assert_eq!(measured.bytes, 8, "only this filesystem's data counts");
+        assert!(!measured.approximate, "a mount is skipped by design");
+    }
+
+    #[test]
+    fn a_tree_deeper_than_the_cap_is_approximate() {
+        let (_temp, root) = folder("root-depth");
+        fs::write(root.join("top.bin"), vec![b'x'; 4]).unwrap();
+        let mut deepest = root.clone();
+        for _ in 0..crate::os::MAX_DEPTH + 1 {
+            deepest = deepest.join("nested");
+            fs::create_dir(&deepest).unwrap();
+        }
+        fs::write(deepest.join("buried.bin"), vec![b'x'; 32]).unwrap();
+
+        let size = tree_bytes(&root);
+        assert_eq!(size.bytes, 4, "the buried file is past the cap");
+        assert!(size.approximate, "an uncounted tree is never exact");
+    }
+
+    #[test]
+    fn an_unreadable_entry_makes_the_size_approximate() {
+        let (_temp, root) = folder("root-unreadable");
+        fs::write(root.join("readable.bin"), vec![b'x'; 6]).unwrap();
+        let hidden = root.join("hidden");
+        fs::create_dir(&hidden).unwrap();
+        fs::write(hidden.join("unread.bin"), vec![b'x'; 16]).unwrap();
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+        let _guard = ModeGuard(hidden);
+
+        let size = tree_bytes(&root);
+        assert_eq!(size.bytes, 6, "the readable file is still counted");
+        assert!(size.approximate, "an unreadable entry is never zero");
+    }
 }

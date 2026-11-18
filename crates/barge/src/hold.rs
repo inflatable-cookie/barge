@@ -146,11 +146,13 @@ impl Hold {
 
 impl Drop for Hold {
     fn drop(&mut self) {
-        let now = self.clock.now_unix_ms();
-        let bytes = tree_bytes(&self.root_path);
-        let _ = record_activity(&self.activity_dir, &self.root_id, now, Some(bytes));
-        // Closing the descriptor releases the lock in every case.
+        // Release first: a consumer waiting for the lock must not wait for this
+        // walk, and an eviction may follow the release immediately. The recorded
+        // size is advisory, so a tree that changes under it is not a problem.
         self.file.take();
+        let now = self.clock.now_unix_ms();
+        let bytes = tree_bytes(&self.root_path).bytes;
+        let _ = record_activity(&self.activity_dir, &self.root_id, now, Some(bytes));
     }
 }
 
@@ -181,6 +183,11 @@ pub(crate) fn flock(file: &File, mode: Mode, wait: bool) -> Result<bool> {
 ///
 /// A missing lock file is an unheld root. A lock file that cannot be opened is
 /// an error: unknown is never safe.
+///
+/// The probe takes the exclusive lock for the moment it reads it, because a
+/// shared probe cannot tell a shared holder from an idle root. A `try_hold`
+/// racing a probe can therefore fail spuriously once; it retries, and a real
+/// holder still reports as held here.
 pub(crate) fn is_locked(path: &Path) -> Result<bool> {
     let file = match File::open(path) {
         Ok(file) => file,

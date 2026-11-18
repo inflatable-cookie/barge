@@ -11,14 +11,41 @@ pub mod fake;
 
 #[cfg(target_os = "macos")]
 mod macos;
+mod tree;
 
 use std::fmt;
+use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
 
 pub use fake::FakeOs;
+/// Removal walks with descriptors: `openat`, `fstatat`, `unlinkat`.
+pub(crate) use tree::{remove_tree, Removed, MAX_DEPTH};
+
+/// The filesystem an entry lives on, for the checks that must not cross one.
+pub(crate) fn device_of(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.dev()
+}
+
+/// The filesystem and inode an open descriptor names.
+pub(crate) fn file_identity(file: &File) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// The filesystem and inode a path names right now, or `None` when it is gone.
+pub(crate) fn path_identity(path: &Path) -> std::io::Result<Option<(u64, u64)>> {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some((metadata.dev(), metadata.ino()))),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(source),
+    }
+}
 
 /// The effective user ID for filesystem ownership checks.
 pub(crate) fn effective_uid() -> u32 {
