@@ -189,6 +189,29 @@ impl Barge {
         })
     }
 
+    /// Present volumes whose layout record differs from the account copy.
+    pub fn layout_disagreements(&self) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        for volume in self.volumes()? {
+            if matches!(volume.state()?, crate::VolumeState::Present)
+                && self.layout_disagrees(volume.name())?
+            {
+                names.push(volume.name().to_string());
+            }
+        }
+        Ok(names)
+    }
+
+    /// Whether a volume offers a layout that this account has not imported.
+    pub fn has_unimported_volume_layout(&self, name: &str) -> Result<bool> {
+        Ok(self.volume_layout(name)?.is_some()
+            && self
+                .layout()?
+                .classes
+                .values()
+                .all(|placement| placement.volume != name))
+    }
+
     /// Import an offered record only when this account has no placements for it.
     pub fn import_volume_layout(&self, volume: &str) -> Result<Layout> {
         self.core.ensure_writable()?;

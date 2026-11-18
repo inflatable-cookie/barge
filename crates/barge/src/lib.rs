@@ -222,6 +222,29 @@ impl Barge {
         Ok(areas)
     }
 
+    /// Find a declared area by its namespace/name key.
+    pub fn find_area(&self, key: &str) -> Result<Area> {
+        let key = area::AreaKey::parse(key)?;
+        self.areas()?
+            .into_iter()
+            .find(|area| area.key() == key)
+            .ok_or_else(|| {
+                Error::not_found(format!(
+                    "area {} is not declared; declare it with `barge area declare`",
+                    key.label()
+                ))
+            })
+    }
+
+    /// Status of declared areas, optionally limited to a volume.
+    pub fn area_statuses(&self, volume: Option<&str>) -> Result<Vec<AreaStatus>> {
+        self.areas()?
+            .into_iter()
+            .filter(|area| volume.is_none_or(|name| area.record().volume == name))
+            .map(|area| area.status())
+            .collect()
+    }
+
     /// Free space, reserve and floor for a volume.
     pub fn space(&self, volume_name: &str) -> Result<Space> {
         let volume = self.volume(volume_name)?;
