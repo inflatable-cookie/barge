@@ -21,10 +21,15 @@ alias = "barge"
 # this task composes it so one name selects it.
 "rust:test" = [{ task = "test rust" }]
 
+"app:check" = "cd apps/barge-app && npm run check"
+"app:test" = "cd apps/barge-app && npm run test"
+"app:dev" = "cd apps/barge-app && oxide exec -- npm run tauri -- dev"
+
 [test.suites.rust]
-# The whole workspace's suites: the library, the CLI, the machine client and the
-# daemon. The budgets are the test route's timeout and forced exit: an expired
-# admission window starts no child, and an expired execution window stops the
-# owned group, so a hung test or a leaked hold cannot keep the run open.
+# The whole workspace's suites: the library, the CLI, the machine client, the
+# daemon and the app's Tauri backend. The budgets are the test route's timeout
+# and forced exit: an expired admission window starts no child, and an expired
+# execution window stops the owned group, so a hung test or a leaked hold cannot
+# keep the run open.
 run = "oxide test --admission-budget 300s --execution-budget 600s --workspace --all-targets --locked"
 default = false

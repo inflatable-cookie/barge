@@ -1,8 +1,9 @@
 # Barge's workspace: the storage library, the thin CLI over it, the machine
 # registry and the machine daemon (docs/knowledge/architecture.md, "Library
-# surface"; docs/knowledge/machines.md, "Repository layout").
+# surface"; docs/knowledge/machines.md, "Repository layout"), beside the app's
+# Tauri backend (docs/knowledge/app.md).
 [workspace]
-members = ["crates/barge", "crates/barge-cli", "crates/barge-machine", "crates/barged"]
+members = ["crates/barge", "crates/barge-cli", "crates/barge-machine", "crates/barged", "apps/barge-app/src-tauri"]
 resolver = "2"
 
 [workspace.package]

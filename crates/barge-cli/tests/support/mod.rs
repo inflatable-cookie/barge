@@ -29,6 +29,9 @@ pub struct Fixture {
     pub temp: TempDir,
     pub state: PathBuf,
     pub mount: PathBuf,
+    /// The fixture's own home folder, so a documented known-link location is a
+    /// fixture path and no command reads the host's home folder.
+    pub home: PathBuf,
 }
 
 impl Fixture {
@@ -36,17 +39,24 @@ impl Fixture {
         let temp = TempDir::new("cli").unwrap();
         let state = temp.folder("state").unwrap();
         let mount = temp.folder("Builds").unwrap();
-        Self { temp, state, mount }
+        let home = temp.folder("home").unwrap();
+        Self {
+            temp,
+            state,
+            mount,
+            home,
+        }
     }
 
-    /// The environment every run gets: the fixture's own state directory and the
-    /// fixed volume identity.
+    /// The environment every run gets: the fixture's own state directory, its own
+    /// home folder and the fixed volume identity.
     pub fn barge(&self, arguments: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_barge"));
         command
             .args(arguments)
             .env("BARGE_STATE_DIR", &self.state)
-            .env("BARGE_TEST_VOLUME_UUID", TEST_UUID);
+            .env("BARGE_TEST_VOLUME_UUID", TEST_UUID)
+            .env("HOME", &self.home);
         command
     }
 

@@ -147,7 +147,7 @@ fn every_documented_success_document_matches_its_commands_output() {
     parse_document(&fixture.json(&["survey", "Builds", "--no-bytes"]));
 
     // Bindings: plan, apply, adopt and list.
-    let home = fixture.temp.folder("home").unwrap();
+    let home = fixture.home.clone();
     let link = home.join("registry");
     let link_text = link.to_str().unwrap().to_string();
     let destination = fixture.mount.join("caches/cargo/registry");
@@ -249,6 +249,13 @@ fn every_documented_success_document_matches_its_commands_output() {
 
     // A reviewed move: the standalone plan is its own document, and apply
     // answers with the envelope that carries it and the doctor report.
+    //
+    // A documented known-link location in the fixture's own home points into the
+    // moved folder and no binding records it, so the plan lists it and apply only
+    // goes ahead with `--retarget-unrecorded`.
+    let registry_link = home.join(".cargo/registry");
+    std::fs::create_dir_all(registry_link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&destination, &registry_link).unwrap();
     let plan = fixture.run(&["move", "caches", "caches2", "--plan"]);
     assert!(plan.status.success(), "{}", stderr(&plan));
     let plan_document: Value = serde_json::from_slice(&plan.stdout).expect("a move plan");
@@ -261,17 +268,43 @@ fn every_documented_success_document_matches_its_commands_output() {
         !plan_document["areas"].as_array().unwrap().is_empty(),
         "the area inside the moved folder is carried in the plan: {plan_document}"
     );
+    assert!(
+        !plan_document["unrecorded_links"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the unrecorded known link is listed: {plan_document}"
+    );
     let plan_path = fixture.temp.child("move.json");
     std::fs::write(&plan_path, &plan.stdout).unwrap();
-    let applied = fixture.json(&[
+    let refused = fixture.run(&[
         "move",
         "--apply",
         "--plan",
         plan_path.to_str().unwrap(),
         "--confirm-stopped",
     ]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("--retarget-unrecorded"),
+        "{}",
+        stderr(&refused)
+    );
+    let applied = fixture.json(&[
+        "move",
+        "--apply",
+        "--plan",
+        plan_path.to_str().unwrap(),
+        "--confirm-stopped",
+        "--retarget-unrecorded",
+    ]);
     assert!(applied.status.success(), "{}", stderr(&applied));
     parse_document(&applied);
+    assert_eq!(
+        std::fs::canonicalize(&registry_link).unwrap(),
+        std::fs::canonicalize(fixture.mount.join("caches2/cargo/registry")).unwrap(),
+        "the plan retargets the unrecorded known link"
+    );
 
     // The other direction: a documented schema no command produced would let a
     // stale row pass unnoticed.

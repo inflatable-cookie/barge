@@ -3,8 +3,9 @@
 Barge is a small Rust workspace with one job per crate: `crates/barge` is the
 storage library, `crates/barge-cli` the thin `barge` binary over it,
 `crates/barge-machine` the machine registry, Wake-on-LAN and `barged` client,
-and `crates/barged` the machine daemon ([machines](machines.md)). Oxide links
-the storage library and works with nothing else installed. Other tools use the
+`crates/barged` the machine daemon ([machines](machines.md)), and
+`apps/barge-app` the menu-bar app ([app](app.md)). Oxide links the storage
+library and works with nothing else installed. Other tools use the
 CLI and its JSON output. Storage needs no daemon: state lives in small files,
 guarded by file locks.
 
@@ -258,7 +259,7 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
 - `init [--project p] [--path dir] [--check]`, which writes or reports the
   managed `AGENTS.md` workflow block from the layout
   ([resources](resources.md#reaching-tools-and-agents-without-coupling));
-- `move --plan | --apply`;
+- `move --plan | --apply [--retarget-unrecorded]`;
 - `doctor`;
 - `machine add | list | remove | wake | pair | unpair | status | sleep | restart | shutdown | cancel`
   ([machines](machines.md)).

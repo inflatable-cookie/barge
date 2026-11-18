@@ -1,7 +1,7 @@
 # Barge app
 
-Status: spec proposed 2026-11-18 for Tom's sign-off. Nothing here is built
-yet.
+Status: scaffold built; the remaining first-release capabilities below are
+planned. Tom's review includes native tray and popover verification.
 
 The Barge app is a macOS menu-bar app for the two things an operator checks
 most often: the machines Barge controls, and the storage it manages. It sits
@@ -193,7 +193,7 @@ interfaces never disagree.
 
 ## Build order
 
-1. **Scaffold:** Tauri, the Longhorn minimal shape and Poodle; tray icon,
+1. **Scaffold (built):** Tauri, the Longhorn minimal shape and Poodle; tray icon,
    popover and window; settings; an empty Machines view with real navigation.
    Tom reviews it running.
 2. **Machines:** list, detail, power with countdown and cancel, pairing, and

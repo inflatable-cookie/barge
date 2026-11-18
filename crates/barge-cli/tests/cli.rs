@@ -465,7 +465,7 @@ fn bindings_record_drift_and_doctor_report_it() {
     assert!(set.status.success(), "{}", stderr(&set));
     let destination = fixture.mount.join("caches/cargo/registry");
     std::fs::create_dir_all(&destination).unwrap();
-    let home = fixture.temp.folder("home").unwrap();
+    let home = fixture.home.clone();
     let link = home.join("registry");
     let link_text = link.to_str().unwrap();
     let destination_text = destination.to_str().unwrap();
@@ -485,7 +485,7 @@ fn bindings_record_drift_and_doctor_report_it() {
     ]);
     assert!(plan.status.success(), "{}", stderr(&plan));
     let document = parse_document(&plan);
-    assert_eq!(document["schema"], "barge.bind-plan/1");
+    assert_eq!(document["schema"], "barge.bind-plan/2");
     assert_eq!(document["data"]["plan"]["before"]["state"], "absent");
     assert_eq!(document["data"]["plan"]["after"]["state"], "link");
     assert_eq!(document["data"]["plan"]["replace"], false);
@@ -516,7 +516,7 @@ fn bindings_record_drift_and_doctor_report_it() {
     std::fs::write(&foreign, br#"{"schema":"barge.other/1","data":{}}"#).unwrap();
     let foreign = fixture.run(&["bind", "apply", "--plan", foreign.to_str().unwrap()]);
     assert_eq!(foreign.status.code(), Some(2), "{}", stderr(&foreign));
-    assert!(stderr(&foreign).contains("barge.bind-plan/1"));
+    assert!(stderr(&foreign).contains("barge.bind-plan/2"));
 
     let applied = fixture.json(&["bind", "apply", "--plan", plan_path.to_str().unwrap()]);
     assert!(applied.status.success(), "{}", stderr(&applied));

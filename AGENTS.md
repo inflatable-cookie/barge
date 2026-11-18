@@ -26,7 +26,8 @@ Tailscale `whois` and logind behind seams; `packaging/barged/` holds its unit,
 polkit rule and example config. Its platform limits are
 [architecture](docs/knowledge/architecture.md#platforms). Toolchain `1.97.1` and
 edition 2021 are pinned in `rust-toolchain.toml`; `Cargo.lock` is committed.
-Oxide depends on the library at an exact Git commit.
+Oxide depends on the library at an exact Git commit. `apps/barge-app` contains
+the Tauri menu-bar app and Svelte renderer.
 
 The library's module surface is
 [architecture](docs/knowledge/architecture.md#library-surface). A new mechanic is
@@ -42,6 +43,9 @@ Rust runs through `oxide` (see the block below).
 - `effigy rust:format` — `oxide fmt --all -- --check`; `rust:format:apply` applies it.
 - `effigy docs:check` — Northstar's link check, the changelog check, and
   `git diff --check HEAD`. Check its exit code.
+- `effigy app:check` — typecheck the Svelte renderer.
+- `effigy app:test` — renderer tests.
+- `effigy app:dev` — run the app locally.
 
 Those are the repository's only selectors. Add one only for a check this
 section names, and run it through Effigy rather than raw `cargo`.

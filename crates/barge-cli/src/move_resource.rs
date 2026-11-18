@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use barge::{Barge, Error, ErrorKind, MovePlan, Result};
+use barge::{Barge, Error, ErrorKind, MoveApplyOptions, MovePlan, Result};
 use serde_json::json;
 
 use crate::args::{expect_no_positionals, Options};
@@ -8,7 +8,11 @@ use crate::output::document;
 
 pub(crate) fn move_resource(arguments: &[String], json: bool) -> Result<()> {
     if arguments.iter().any(|arg| arg == "--apply") {
-        let options = Options::parse(arguments, &["plan"], &["apply", "confirm-stopped"])?;
+        let options = Options::parse(
+            arguments,
+            &["plan"],
+            &["apply", "confirm-stopped", "retarget-unrecorded"],
+        )?;
         expect_no_positionals(&options)?;
         let path = options.required("plan")?;
         let source = if path == "-" {
@@ -20,14 +24,32 @@ pub(crate) fn move_resource(arguments: &[String], json: bool) -> Result<()> {
         };
         let plan: MovePlan = serde_json::from_str(&source)
             .map_err(|e| Error::usage(format!("invalid move plan: {e}")))?;
-        let report = Barge::open()?.apply_move(&plan, options.flag("confirm-stopped"))?;
+        let report = Barge::open()?.apply_move(
+            &plan,
+            MoveApplyOptions {
+                confirm_stopped: options.flag("confirm-stopped"),
+                retarget_unrecorded: options.flag("retarget-unrecorded"),
+            },
+        )?;
         if json {
             document("barge.move/1", vec![("report", json!(report))])?;
         } else {
             println!(
-                "moved {} -> {}\ndoctor: {}",
+                "moved {} -> {}",
                 plan.source.display(),
-                plan.destination.display(),
+                plan.destination.display()
+            );
+            for link in &plan.unrecorded_links {
+                println!(
+                    "retargeted unrecorded {} link {} -> {}",
+                    link.location,
+                    link.link.display(),
+                    link.after.display()
+                );
+                println!("  record it with: {}", link.adopt);
+            }
+            println!(
+                "doctor: {}",
                 if report.doctor.ok {
                     "ok"
                 } else {

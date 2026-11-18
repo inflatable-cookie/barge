@@ -38,7 +38,7 @@ pub(crate) fn bind(arguments: &[String], json: bool) -> Result<()> {
             let binding = binding_from_options(&options)?;
             let plan = Barge::open_read_only()?.bindings().plan(&binding)?;
             if json {
-                document("barge.bind-plan/1", vec![("plan", json!(plan))])?;
+                document("barge.bind-plan/2", vec![("plan", json!(plan))])?;
             } else {
                 println!(
                     "link {} -> {}",
@@ -178,9 +178,9 @@ pub(crate) fn read_plan(path: &str) -> Result<LinkPlan> {
         .get("schema")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if schema != "barge.bind-plan/1" {
+    if schema != "barge.bind-plan/2" {
         return Err(Error::usage(format!(
-            "{path} is {schema:?}, not a barge.bind-plan/1 document"
+            "{path} is {schema:?}, not a barge.bind-plan/2 document"
         )));
     }
     let plan = document

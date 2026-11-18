@@ -137,8 +137,13 @@ The `link` kind's rules:
   caller passes the explicit replace. It is renamed beside the link
   (`<name>.barge-prior`) and undo renames it back; moving data is not part of
   this kind;
-- a destination must be an existing folder inside the class folder, and Barge
-  never creates it;
+- a destination is an existing folder or regular file inside the class folder,
+  and Barge never creates it. A VM disk is a regular file, so both are
+  destinations; the value is resolved first, so a link that leaves the class
+  folder is refused rather than followed;
+- a destination is recorded with its device and inode, so doctor reports one
+  that was replaced at the same path, and an apply refuses a destination that
+  changed since its plan;
 - deleting a link removes the link itself and never follows it.
 
 One record names one consumer, so a tool with two links records two consumers
@@ -269,7 +274,8 @@ one command with a plan:
 ```
 barge move <class> <new-path> --plan > plan.json
 barge move --item <path> --into <class>/<sub> --plan > plan.json
-barge move --apply --plan plan.json --confirm-stopped
+barge move --apply --plan plan.json --confirm-stopped \
+  [--retarget-unrecorded]
 ```
 
 The reviewed JSON plan records volume and filesystem identities and lists:
@@ -285,6 +291,39 @@ tool is stopped. For Barge-owned roots, holds already prove it. Apply renames,
 then updates each binding and any moved area declaration and layout, then runs doctor. An item inside an area cannot be moved out on its own because that would orphan its root. A failure leaves both the old
 binding and the old data in place, or rolls the rename back. The apply step
 always needs Tom's explicit approval for live data (AGENTS.md guardrail).
+
+The plan also checks the [known link locations](#known-link-locations). A link
+there that points inside the moved source and that no binding records is listed
+with the exact `barge bind adopt` command that records it afterwards. While the
+plan lists any, apply refuses unless the caller passes `--retarget-unrecorded`,
+which retargets those links in the same transaction and rolls them back with
+everything else. Nothing is scanned beyond that fixed list.
+
+A VM's disk link must be retargeted before the VM starts. Lima recreates a
+missing disk, so a VM started with a dangling link boots a blank machine instead
+of failing; the operator sees a working VM with no data rather than an error.
+
+## Known link locations
+
+`barge move --plan` checks exactly these paths, and never the home folder at
+large:
+
+| Location | Path | Consumer an adoption uses |
+|---|---|---|
+| `colima-disk` | `~/.colima/_lima/*/disk` | `colima-<profile>-disk` |
+| `cargo-registry` | `~/.cargo/registry` | `cargo-registry` |
+| `cargo-git` | `~/.cargo/git` | `cargo-git` |
+
+The list is data (`crates/barge/src/known_links.rs`): adding a place is adding a
+row, not an adapter. A link a tool keeps anywhere else is still the operator's to
+find, and the plan's manual steps say so.
+
+Every folder on the way below the home folder must be a real folder: a symlink at
+`.colima`, `_lima`, a profile folder or `.cargo` is not followed, so a documented
+location can never be reached through a link and apply can only retarget the one
+link the pattern ends at. The home folder itself is resolved once, because where
+the account's home lives is a platform fact. Apply re-plans first, so a location
+that stopped being real between plan and apply is refused as a changed plan.
 
 ## Survey
 

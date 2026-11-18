@@ -258,6 +258,12 @@ fn binding_report(
                     expected: record.applied.value.clone(),
                     reason: "the link points somewhere else".to_string(),
                 }
+            } else if destination_replaced(record) {
+                BindingState::Drifted {
+                    observed: resolved,
+                    expected: record.applied.value.clone(),
+                    reason: "the destination was replaced".to_string(),
+                }
             } else {
                 match fs::canonicalize(&class_folder) {
                     Ok(folder) if !record.applied.value.starts_with(&folder) => {
@@ -273,6 +279,21 @@ fn binding_report(
         }
     };
     Ok(report(state))
+}
+
+/// Whether the destination entry is no longer the one Barge linked. A record
+/// written before identities were captured cannot tell, and is compared by path
+/// alone, which is what doctor did before.
+fn destination_replaced(record: &BindingRecord) -> bool {
+    let Some(expected) = record.applied.identity else {
+        return false;
+    };
+    match crate::bindings::entry_identity(&record.applied.value) {
+        Ok(current) => current != expected,
+        // The link resolved, so an entry is there; a race that removed it since
+        // is reported by the next doctor run rather than guessed at here.
+        Err(_) => false,
+    }
 }
 
 /// What a recorded workflow block is now. Unlike a link, it renders while the

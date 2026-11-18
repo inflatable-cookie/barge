@@ -1,0 +1,29 @@
+[package]
+name = "barge-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+barge.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-autostart = "2"
+longhorn-core = { git = "https://github.com/inflatable-cookie/longhorn", tag = "v0.5.0" }
+longhorn-config = { git = "https://github.com/inflatable-cookie/longhorn", tag = "v0.5.0" }
+longhorn-settings = { git = "https://github.com/inflatable-cookie/longhorn", tag = "v0.5.0" }
+longhorn-settings-config = { git = "https://github.com/inflatable-cookie/longhorn", tag = "v0.5.0" }
+longhorn-tauri-config = { git = "https://github.com/inflatable-cookie/longhorn", tag = "v0.5.0" }
+longhorn-tauri-settings = { git = "https://github.com/inflatable-cookie/longhorn", tag = "v0.5.0" }
+longhorn-storage-layout = { git = "https://github.com/inflatable-cookie/longhorn", tag = "v0.5.0" }
+
+[dev-dependencies]
+barge = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

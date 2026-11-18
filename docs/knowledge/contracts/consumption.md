@@ -18,9 +18,15 @@ check both and handle unknown versions rather than assuming a compatible
 shape. [Architecture](../architecture.md#cli) owns the CLI's verbs and exit
 codes.
 
-Move plans are `barge.move-plan/1` documents, printed directly by `barge move
---plan` and supplied unchanged to `barge move --apply --plan`. Successful JSON
-apply output is a `barge.move/1` envelope containing the plan and doctor report.
+Move plans are `barge.move-plan/2` documents, printed directly by `barge move
+--plan` and supplied unchanged to `barge move --apply --plan`. A version 1 plan
+is refused: make a fresh one. A `barge.bind-plan/2` document records the
+destination's device and inode as well, so `barge bind apply` refuses a
+destination that was replaced since it was reviewed; a version 1 plan is refused
+the same way. A plan lists the links at [known link locations](../resources.md#known-link-locations)
+that no binding records, and applying it needs `--retarget-unrecorded` while it
+lists any. Successful JSON apply output is a `barge.move/1` envelope containing
+the plan and doctor report.
 
 ## Success documents
 
@@ -60,7 +66,7 @@ below read `_name`, `_key` and `_state`.
 | `barge.path/1` | `path: string`, `fallback: bool` | path |
 | `barge.survey/1` | `volume_name: string`, `items: [survey-item]` | survey |
 | `barge.binding-list/1` | `bindings: [binding-record]` | bind list |
-| `barge.bind-plan/1` | `plan: link-plan` | bind plan |
+| `barge.bind-plan/2` | `plan: link-plan` | bind plan |
 | `barge.binding/1` | `action: string`, `binding: binding-record` | bind apply, bind adopt, bind undo |
 | `barge.move/1` | `report: move-report` | move apply |
 | `barge.doctor/1` | `ok: bool`, `volume_reports: [volume-report]`, `binding_reports: [binding-report]` | doctor |
@@ -109,9 +115,10 @@ shell assignments and refuses `--json`.
 | `survey-item` | `path: string`, `classification: string`, `bytes: int?`, `bytes_approximate: bool` |
 | `binding-record` | `consumer: string`, `class: string`, `kind: string`, `target: binding-target`, `applied: applied`, `prior: prior` |
 | `binding-target` | `kind: string`, `path?: string`, `repository?: string`, `project?: string` |
-| `applied` | `value: string`, `at_unix_ms: int` |
+| `applied` | `value: string`, `at_unix_ms: int`, `identity?: entry-identity` |
 | `prior` | `state: string`, `destination?: string`, `path?: string`, `entry?: string` |
-| `link-plan` | `consumer: string`, `class: string`, `link: string`, `before: observed`, `after: observed`, `replace: bool` |
+| `link-plan` | `consumer: string`, `class: string`, `link: string`, `before: observed`, `after: observed`, `destination_identity: entry-identity`, `replace: bool` |
+| `entry-identity` | `dev: int`, `ino: int` |
 | `observed` | `state: string`, `destination?: string`, `dev?: int`, `ino?: int` |
 | `volume-report` | `name: string`, `mount: string`, `state: volume-state`, `layout: layout-report?` |
 | `layout-report` | `agrees: bool`, `classes: [class-folder]`, `unknown: [string]` |
@@ -119,9 +126,10 @@ shell assignments and refuses `--json`.
 | `binding-report` | `consumer: string`, `class: string`, `kind: string`, `path: string`, `state: string`, `observed?: string?`, `expected?: string`, `reason?: string` |
 | `doctor-report` | `ok: bool`, `volume_reports: [volume-report]`, `binding_reports: [binding-report]` |
 | `move-report` | `plan: move-plan`, `doctor: doctor-report` |
-| `move-plan` | `schema: string`, `volume: string`, `volume_spec: volume-spec`, `source: string`, `source_identity: move-identity`, `destination: string`, `destination_parent_identity: move-identity`, `create_directory?: string`, `bindings: [move-binding]`, `layout: move-layout?`, `areas: [move-area]`, `consumers: [string]`, `manual_steps: [string]` |
+| `move-plan` | `schema: string`, `volume: string`, `volume_spec: volume-spec`, `class: string`, `source: string`, `source_identity: move-identity`, `destination: string`, `destination_parent_identity: move-identity`, `create_directory?: string`, `bindings: [move-binding]`, `unrecorded_links: [unrecorded-link]`, `layout: move-layout?`, `areas: [move-area]`, `consumers: [string]`, `manual_steps: [string]` |
 | `move-identity` | `dev: int`, `ino: int` |
 | `move-binding` | `record: binding-record`, `before: observed`, `after: string`, `link_after: string` |
+| `unrecorded-link` | `location: string`, `link: string`, `before: string`, `after: string`, `consumer: string`, `adopt: string` |
 | `move-layout` | `class: string`, `before: placement`, `after: placement` |
 | `move-area` | `before: area-record`, `after: area-record` |
 | `area-record` | `schema: string`, `namespace: string`, `name: string`, `volume: string`, `folder?: string`, `absent: absent`, `soft_cap_bytes?: int`, `counts_toward_reserve: bool` |

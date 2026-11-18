@@ -1,4 +1,11 @@
 //! Reviewed resource moves on a registered volume.
+//!
+//! A plan lists the data, every binding and area it carries, and any link in a
+//! documented tool location ([`crate::known_links`]) that points into the moved
+//! source and that no binding records. Such a link would be stranded by the
+//! move, so applying the plan refuses until the caller passes
+//! [`MoveApplyOptions::retarget_unrecorded`]; then those links are retargeted in
+//! the same transaction and rolled back with everything else.
 
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -6,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::bindings::{observe, BindingRecord, Observed};
+use crate::bindings::{observe, same_target, BindingRecord, Observed};
 use crate::{AreaRecord, Barge, BindingTarget, Class, Error, Placement, Result};
 
 /// The filesystem identity captured for an existing entry.
@@ -32,6 +39,8 @@ pub struct MovePlan {
     pub schema: String,
     pub volume: String,
     pub volume_spec: crate::VolumeSpec,
+    /// The class the source belongs to, or is being moved into.
+    pub class: Class,
     pub source: PathBuf,
     pub source_identity: MoveIdentity,
     pub destination: PathBuf,
@@ -39,10 +48,44 @@ pub struct MovePlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_directory: Option<PathBuf>,
     pub bindings: Vec<MoveBinding>,
+    /// Links in a documented tool location that point into the source and that no
+    /// binding records. Apply refuses them unless the caller asks to retarget
+    /// them.
+    pub unrecorded_links: Vec<UnrecordedLink>,
     pub layout: Option<MoveLayout>,
     pub areas: Vec<MoveArea>,
     pub consumers: Vec<String>,
     pub manual_steps: Vec<String>,
+}
+
+/// A link in a documented tool location that points inside the moved source and
+/// that no binding records, so the move would strand it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnrecordedLink {
+    /// The documented location it was found at, for example `colima-disk`.
+    pub location: String,
+    /// The link itself, as it sits in the tool's own folder.
+    pub link: PathBuf,
+    /// What the link holds now, exactly as it was read, so a rollback restores
+    /// the same bytes.
+    pub before: PathBuf,
+    /// What the link must hold once the source has moved.
+    pub after: PathBuf,
+    /// The consumer name an adoption should use.
+    pub consumer: String,
+    /// The exact command that records the link after the move.
+    pub adopt: String,
+}
+
+/// How apply treats links that no binding records.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MoveApplyOptions {
+    /// The operator confirms the bound consumers are stopped.
+    pub confirm_stopped: bool,
+    /// Retarget the unrecorded known links the plan listed, in the same
+    /// transaction. Without it, a plan that lists any is refused.
+    pub retarget_unrecorded: bool,
 }
 
 /// A class placement before and after its folder is moved.
@@ -93,6 +136,7 @@ impl Barge {
         after.path = new_path.to_string();
         self.plan_move(
             &before.volume.clone(),
+            class,
             &source,
             &destination,
             Some(MoveLayout {
@@ -140,6 +184,7 @@ impl Barge {
         let class_dir = volume.base().join(&placement.path);
         self.plan_move(
             &placement.volume,
+            class,
             &source,
             &destination,
             None,
@@ -150,6 +195,7 @@ impl Barge {
     fn plan_move(
         &self,
         volume_name: &str,
+        class: Class,
         source: &Path,
         destination: &Path,
         layout: Option<MoveLayout>,
@@ -238,7 +284,8 @@ impl Barge {
             }
         }
         let mut bindings = Vec::new();
-        for record in self.bindings().list()? {
+        let records = self.bindings().list()?;
+        for record in &records {
             // A workflow binding is not a link, and a move does not regenerate
             // its block: doctor reports the block stale until `barge init` runs.
             let BindingTarget::Link { path } = &record.target else {
@@ -271,13 +318,14 @@ impl Barge {
                 let link_after = link_suffix
                     .map_or_else(|| link.to_path_buf(), |suffix| destination.join(suffix));
                 bindings.push(MoveBinding {
-                    record,
+                    record: record.clone(),
                     before,
                     after,
                     link_after,
                 });
             }
         }
+        let unrecorded_links = self.unrecorded_links(&records, class, &source, &destination)?;
         let mut areas = Vec::new();
         for before in self.core.state.read_areas()? {
             if before.volume != volume_name {
@@ -304,6 +352,14 @@ impl Barge {
         let mut manual_steps = vec![
             "Update any unrecorded settings or workflows that refer to the old path.".to_string(),
         ];
+        for unrecorded in &unrecorded_links {
+            manual_steps.push(format!(
+                "Record the {} link at {}: {}",
+                unrecorded.location,
+                unrecorded.link.display(),
+                unrecorded.adopt
+            ));
+        }
         for area in &areas {
             manual_steps.push(format!(
                 "Update the {} area declaration to use folder {}.",
@@ -321,20 +377,101 @@ impl Barge {
             ));
         }
         Ok(MovePlan {
-            schema: "barge.move-plan/1".into(),
+            schema: "barge.move-plan/2".into(),
             volume: volume_name.into(),
             volume_spec: volume.spec().clone(),
+            class,
             source,
             source_identity,
             destination,
             destination_parent_identity,
             create_directory,
             bindings,
+            unrecorded_links,
             layout,
             areas,
             consumers,
             manual_steps,
         })
+    }
+
+    /// The known links under the home folder that point into `source` and that no
+    /// binding records. Only the documented list is read, never the home folder
+    /// at large.
+    fn unrecorded_links(
+        &self,
+        records: &[BindingRecord],
+        class: Class,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<Vec<UnrecordedLink>> {
+        let Some(home) = self.core.home() else {
+            return Ok(Vec::new());
+        };
+        let mut found = Vec::new();
+        for candidate in crate::known_links::candidates(&home)? {
+            if records
+                .iter()
+                .any(|record| same_target(&record.owned_path(), &candidate.path))
+            {
+                continue;
+            }
+            let metadata = match fs::symlink_metadata(&candidate.path) {
+                Ok(metadata) => metadata,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => return Err(Error::io("cannot inspect", &candidate.path, &source)),
+            };
+            if !metadata.file_type().is_symlink() {
+                continue;
+            }
+            let before = fs::read_link(&candidate.path)
+                .map_err(|source| Error::io("cannot read the link at", &candidate.path, &source))?;
+            let resolved = resolve_link(&candidate.path, &before)?;
+            let Ok(suffix) = resolved.strip_prefix(source) else {
+                continue;
+            };
+            found.push(UnrecordedLink {
+                location: candidate.known.location.to_string(),
+                adopt: format!(
+                    "barge bind adopt --consumer {} --class {} --link {}",
+                    candidate.consumer,
+                    class.name(),
+                    shell_word(&candidate.path)
+                ),
+                consumer: candidate.consumer,
+                link: candidate.path,
+                before,
+                after: destination.join(suffix),
+            });
+        }
+        Ok(found)
+    }
+}
+
+/// What a link points at, resolved when the target exists so an equivalent path
+/// still counts, and read literally when it dangles.
+fn resolve_link(link: &Path, target: &Path) -> Result<PathBuf> {
+    let joined = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        let parent = link
+            .parent()
+            .ok_or_else(|| Error::usage(format!("link {} has no parent", link.display())))?;
+        parent.join(target)
+    };
+    Ok(fs::canonicalize(&joined).unwrap_or(joined))
+}
+
+/// A path as one shell word, quoted only when it needs to be.
+fn shell_word(path: &Path) -> String {
+    let text = path.display().to_string();
+    if text
+        .chars()
+        .any(|character| character.is_whitespace() || matches!(character, '\'' | '"' | '$' | '`'))
+    {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    } else {
+        text
     }
 }
 
@@ -346,16 +483,30 @@ pub struct MoveReport {
 }
 
 impl Barge {
-    /// Apply exactly a reviewed plan, refusing drift and held roots.
-    pub fn apply_move(&self, plan: &MovePlan, confirm_stopped: bool) -> Result<MoveReport> {
+    /// Apply exactly a reviewed plan, refusing drift and held roots. A plan that
+    /// lists a known link no binding records is refused unless the caller asks to
+    /// retarget those links in the same transaction.
+    pub fn apply_move(&self, plan: &MovePlan, options: MoveApplyOptions) -> Result<MoveReport> {
         self.core.ensure_writable()?;
-        if plan.schema != "barge.move-plan/1" {
+        if plan.schema != "barge.move-plan/2" {
             return Err(Error::usage("unknown move plan schema"));
         }
-        if !plan.consumers.is_empty() && !confirm_stopped {
+        if !plan.consumers.is_empty() && !options.confirm_stopped {
             return Err(Error::refused(
                 "bound consumers must be stopped; pass --confirm-stopped",
             ));
+        }
+        if !plan.unrecorded_links.is_empty() && !options.retarget_unrecorded {
+            return Err(Error::refused(format!(
+                "{} link(s) point into the moved source and no binding records them ({}); \
+                 pass --retarget-unrecorded to retarget them in the same move",
+                plan.unrecorded_links.len(),
+                plan.unrecorded_links
+                    .iter()
+                    .map(|link| link.link.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
         let _lock = self.core.state.lock()?;
         // Lock each affected area against new roots, then hold its roots without
@@ -407,6 +558,7 @@ impl Barge {
         }
         let current = self.plan_move(
             &plan.volume,
+            plan.class,
             &plan.source,
             &plan.destination,
             plan.layout.clone(),
@@ -444,6 +596,7 @@ impl Barge {
         crate::os::rename_no_replace(&plan.source, &plan.destination)
             .map_err(|e| Error::io("cannot rename", &plan.source, &e))?;
         let mut changed = Vec::new();
+        let mut retargeted = Vec::new();
         let operation = (|| -> Result<()> {
             for binding in &plan.bindings {
                 #[cfg(test)]
@@ -467,6 +620,21 @@ impl Barge {
                 record.target = BindingTarget::Link {
                     path: binding.link_after.clone(),
                 };
+            }
+            for link in &plan.unrecorded_links {
+                #[cfg(test)]
+                FAIL_AFTER.with(|count| {
+                    let remaining = count.get();
+                    if remaining > 0 {
+                        count.set(remaining - 1);
+                    }
+                });
+                #[cfg(test)]
+                if FAIL_AFTER.with(|count| count.get() == 1) {
+                    return Err(Error::refused("injected binding failure"));
+                }
+                replace_link(&link.link, &link.after)?;
+                retargeted.push(link);
             }
             crate::bindings::write(&self.core, &records)?;
             for area in &plan.areas {
@@ -502,6 +670,14 @@ impl Barge {
                         ));
                     }
                 }
+                for link in &plan.unrecorded_links {
+                    if let Err(problem) = replace_link(&link.link, &link.after) {
+                        failures.push(format!(
+                            "link {} could not be repaired: {problem}",
+                            link.link.display()
+                        ));
+                    }
+                }
                 return Err(Error::new(
                     error.kind(),
                     format!(
@@ -520,6 +696,14 @@ impl Barge {
                             binding.record.owned_path().display()
                         ));
                     }
+                }
+            }
+            for link in retargeted.iter().rev() {
+                if let Err(e) = replace_link(&link.link, &link.before) {
+                    failures.push(format!(
+                        "link {} could not be restored: {e}",
+                        link.link.display()
+                    ));
                 }
             }
             if let Err(e) = crate::bindings::write(&self.core, &original_records) {
@@ -610,13 +794,16 @@ mod tests {
         let temp = crate::testing::TempDir::new("move-rollback").unwrap();
         let mount = temp.folder("volume").unwrap();
         let state = temp.folder("state").unwrap();
+        let home = temp.folder("home").unwrap();
         let os = Arc::new(FakeOs::new());
         os.add_volume(
             mount.clone(),
             Some("11111111-2222-3333-4444-555555555555"),
             1000,
         );
-        let b = Barge::open_with(state, os, Arc::new(ManualClock::new(1))).unwrap();
+        let b = Barge::open_with(state, os, Arc::new(ManualClock::new(1)))
+            .unwrap()
+            .with_home(&home);
         b.register_volume(VolumeRegistration::new("volume", &mount).floor_bytes(0))
             .unwrap();
         b.set_layout(
@@ -639,7 +826,15 @@ mod tests {
         }
         let plan = b.plan_class_move(Class::Vms, "new-vms").unwrap();
         FAIL_AFTER.with(|count| count.set(3));
-        let error = b.apply_move(&plan, true).unwrap_err();
+        let error = b
+            .apply_move(
+                &plan,
+                MoveApplyOptions {
+                    confirm_stopped: true,
+                    retarget_unrecorded: false,
+                },
+            )
+            .unwrap_err();
         FAIL_AFTER.with(|count| count.set(0));
         assert!(error.message().contains("restored"));
         assert!(mount.join("vms").exists());
@@ -649,6 +844,69 @@ mod tests {
                 fs::read_link(temp.path().join(name)).unwrap(),
                 mount.join("vms").join(name)
             );
+        }
+        assert!(b.doctor().unwrap().ok);
+    }
+
+    #[test]
+    fn unrecorded_link_failure_restores_data_and_links() {
+        let temp = crate::testing::TempDir::new("move-unrecorded-rollback").unwrap();
+        let mount = temp.folder("volume").unwrap();
+        let state = temp.folder("state").unwrap();
+        let home = temp.folder("home").unwrap();
+        let os = Arc::new(FakeOs::new());
+        os.add_volume(
+            mount.clone(),
+            Some("11111111-2222-3333-4444-555555555555"),
+            1000,
+        );
+        let b = Barge::open_with(state, os, Arc::new(ManualClock::new(1)))
+            .unwrap()
+            .with_home(&home);
+        b.register_volume(VolumeRegistration::new("volume", &mount).floor_bytes(0))
+            .unwrap();
+        b.set_layout(
+            Class::Vms,
+            Placement {
+                volume: "volume".into(),
+                path: "vms".into(),
+                absent: Absent::Fail,
+            },
+        )
+        .unwrap();
+        fs::create_dir(mount.join("vms")).unwrap();
+        fs::create_dir(mount.join("vms/colima")).unwrap();
+        let disk = mount.join("vms/colima/disk");
+        fs::write(&disk, b"disk-image").unwrap();
+        let mut links = Vec::new();
+        for profile in ["one", "two"] {
+            let folder = home.join(".colima/_lima").join(profile);
+            fs::create_dir_all(&folder).unwrap();
+            let link = folder.join("disk");
+            symlink(&disk, &link).unwrap();
+            links.push(link);
+        }
+        let plan = b.plan_class_move(Class::Vms, "machines").unwrap();
+        assert_eq!(plan.unrecorded_links.len(), 2);
+
+        // Fail after the first link was retargeted, so the rollback has to put a
+        // retargeted link back as well as the data and the records.
+        FAIL_AFTER.with(|count| count.set(3));
+        let error = b
+            .apply_move(
+                &plan,
+                MoveApplyOptions {
+                    confirm_stopped: false,
+                    retarget_unrecorded: true,
+                },
+            )
+            .unwrap_err();
+        FAIL_AFTER.with(|count| count.set(0));
+        assert!(error.message().contains("restored"), "{}", error.message());
+        assert!(mount.join("vms/colima/disk").exists());
+        assert!(!mount.join("machines").exists());
+        for link in &links {
+            assert_eq!(fs::read_link(link).unwrap(), disk);
         }
         assert!(b.doctor().unwrap().ok);
     }

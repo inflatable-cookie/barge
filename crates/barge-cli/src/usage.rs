@@ -34,7 +34,7 @@ usage: barge [--json] <command>
   bind undo <consumer>                    restore what was there before
   move <class> <new-path> --plan           review a class move
   move --item PATH --into CLASS[/SUB] --plan
-  move --apply --plan FILE|- [--confirm-stopped]
+  move --apply --plan FILE|- [--confirm-stopped] [--retarget-unrecorded]
   doctor                                  volumes, layout and binding drift
   init [--project P] [--path DIR] [--check]
                                           write the AGENTS.md scratch block;
