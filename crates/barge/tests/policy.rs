@@ -87,6 +87,11 @@ fn a_dry_run_reports_evictions_and_changes_nothing() {
     assert_eq!(report.evicted[0].id, root.id);
     assert_eq!(report.evicted[0].reason, PruneReason::Reserve);
     assert_eq!(report.freed_bytes, report.evicted[0].bytes);
+    assert_eq!(
+        report.free_after_bytes,
+        report.free_before_bytes + report.freed_bytes,
+        "a dry run reports the space the plan would leave"
+    );
     assert!(root.path.is_dir(), "a dry run keeps every root");
     assert!(pin.path.is_dir());
 

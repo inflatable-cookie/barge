@@ -14,8 +14,7 @@ path = "src/main.rs"
 barge-machine = { path = "../barge-machine" }
 serde.workspace = true
 serde_json.workspace = true
-# The server (see the workspace manifest).
-tiny_http.workspace = true
+httparse = "1"
 
 # logind over D-Bus, Linux only (see the workspace manifest).
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -32,7 +32,7 @@ impl AreaKey {
             namespace: namespace.into(),
             name: name.into(),
         };
-        validate_name("area namespace", &key.namespace)?;
+        validate_namespace(&key.namespace)?;
         validate_name("area name", &key.name)?;
         Ok(key)
     }
@@ -59,9 +59,24 @@ impl AreaKey {
     }
 
     /// The state file's stem, `<namespace>.<area>`.
+    ///
+    /// The first `.` is the separator, so a namespace never carries one: that is
+    /// what keeps `a.b/c` and `a/b.c` for two different files.
     pub(crate) fn file_stem(&self) -> String {
         format!("{}.{}", self.namespace, self.name)
     }
+}
+
+/// Validate an area namespace: a name without the `.` that separates it from the
+/// area name in the state file's stem.
+fn validate_namespace(namespace: &str) -> Result<()> {
+    validate_name("area namespace", namespace)?;
+    if namespace.contains('.') {
+        return Err(Error::usage(format!(
+            "area namespace {namespace:?} must not contain '.', which separates the namespace from the area in the state file name"
+        )));
+    }
+    Ok(())
 }
 
 /// A consumer's area declaration.
@@ -163,14 +178,19 @@ impl AreaRecord {
     }
 
     /// Validate every stored field before the record is used as truth.
+    ///
+    /// The kinds here are the caller's: a declaration built by a caller and
+    /// refused is a `Usage` error. A reader of stored state wraps whatever this
+    /// returns as `UnknownState`, because then the file is the thing that is
+    /// wrong.
     pub fn validate(&self) -> Result<()> {
         if self.schema != AREA_SCHEMA {
-            return Err(Error::unknown_state(format!(
+            return Err(Error::usage(format!(
                 "area {}/{} has schema {}, not {AREA_SCHEMA}",
                 self.namespace, self.name, self.schema
             )));
         }
-        validate_name("area namespace", &self.namespace)?;
+        validate_namespace(&self.namespace)?;
         validate_name("area name", &self.name)?;
         crate::state::validate_volume_name("area volume", &self.volume)?;
         if let Some(folder) = &self.folder {
@@ -184,7 +204,7 @@ impl AreaRecord {
         }
         if let Absent::Fallback { path } = &self.absent {
             if !path.is_absolute() {
-                return Err(Error::unknown_state(format!(
+                return Err(Error::usage(format!(
                     "area {}/{} fallback {} is not absolute",
                     self.namespace,
                     self.name,
@@ -215,5 +235,55 @@ impl AreaRecord {
             fields.push("counts_toward_reserve");
         }
         fields
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ErrorKind;
+
+    fn record(namespace: &str, name: &str) -> AreaRecord {
+        AreaSpec::new(namespace, name, "disk").into_record()
+    }
+
+    #[test]
+    fn a_dot_in_the_namespace_is_refused_so_two_areas_never_share_a_file() {
+        // `a.b/c` and `a/b.c` both read as the stem `a.b.c` with the first `.` as
+        // the separator. A namespace without `.` makes the stem unambiguous.
+        let error = AreaKey::new("a.b", "c").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert!(error.message().contains("namespace"), "{error}");
+        assert_eq!(
+            AreaKey::new("a", "b.c").unwrap().file_stem(),
+            "a.b.c",
+            "an area name may still carry a dot"
+        );
+        assert_ne!(
+            AreaKey::new("a", "b.c").unwrap().file_stem(),
+            AreaKey::new("ab", "c").unwrap().file_stem()
+        );
+        assert_eq!(
+            record("a.b", "c").validate().unwrap_err().kind(),
+            ErrorKind::Usage
+        );
+    }
+
+    #[test]
+    fn a_caller_built_declaration_that_fails_validation_is_a_usage_error() {
+        let mut wrong_schema = record("oxide", "pool");
+        wrong_schema.schema = "barge.area/99".to_string();
+        assert_eq!(
+            wrong_schema.validate().unwrap_err().kind(),
+            ErrorKind::Usage
+        );
+
+        let relative = AreaSpec::new("oxide", "pool", "disk").absent(Absent::Fallback {
+            path: PathBuf::from("relative/pool"),
+        });
+        assert_eq!(
+            relative.into_record().validate().unwrap_err().kind(),
+            ErrorKind::Usage
+        );
     }
 }

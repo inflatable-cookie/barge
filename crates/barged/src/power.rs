@@ -157,19 +157,19 @@ impl PowerController {
     /// moving a fake clock, so the countdown's real path is exercised without
     /// waiting.
     pub fn fire_due(&self) -> Option<PowerActionKind> {
-        let due = {
-            let mut pending = self.lock();
-            let now = self.clock.now_unix_ms();
-            if pending
-                .as_ref()
-                .is_some_and(|entry| entry.deadline_unix_ms <= now)
-            {
-                pending.take()
-            } else {
-                None
-            }
-        };
-        let requested = due?;
+        let mut pending = self.lock();
+        if self.shared.stopped.load(Ordering::SeqCst) {
+            return None;
+        }
+        let now = self.clock.now_unix_ms();
+        let requested = if pending
+            .as_ref()
+            .is_some_and(|entry| entry.deadline_unix_ms <= now)
+        {
+            pending.take()
+        } else {
+            None
+        }?;
         if let Err(error) = self.backend.perform(requested.action) {
             eprintln!("barged: {} failed: {error}", requested.action.as_str());
         }
@@ -188,6 +188,7 @@ impl PowerController {
     /// Ask the countdown thread to finish. A pending action is dropped, not
     /// fired: a daemon being stopped must not power off the machine.
     pub fn stop(&self) {
+        let _pending = self.lock();
         self.shared.stopped.store(true, Ordering::SeqCst);
         self.shared.changed.notify_all();
     }
@@ -195,12 +196,17 @@ impl PowerController {
     fn run(&self) {
         while !self.shared.stopped.load(Ordering::SeqCst) {
             self.wait_for_change();
-            self.fire_due();
+            if !self.shared.stopped.load(Ordering::SeqCst) {
+                self.fire_due();
+            }
         }
     }
 
     fn wait_for_change(&self) {
         let pending = self.lock();
+        if self.shared.stopped.load(Ordering::SeqCst) {
+            return;
+        }
         match pending.as_ref() {
             Some(entry) => {
                 let wait = Duration::from_millis(
@@ -275,6 +281,36 @@ impl PowerBackend for Unavailable {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn stop_before_runner_wait_does_not_fire_due_action() {
+        let (controller, backend, _) = controller();
+        controller.request(PowerActionKind::Shutdown, 0).unwrap();
+        controller.stop();
+        controller.run();
+        assert_eq!(controller.fire_due(), None);
+        assert!(backend.called().is_empty());
+    }
+
+    #[test]
+    fn stop_synchronizes_with_the_wait_mutex() {
+        let (controller, backend, _) = controller();
+        controller.request(PowerActionKind::Shutdown, 0).unwrap();
+        let guard = controller.lock();
+        let (started, received) = std::sync::mpsc::channel();
+        let stop = controller.clone();
+        let thread = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            stop.stop();
+        });
+        received.recv().unwrap();
+        assert!(!controller.shared.stopped.load(Ordering::SeqCst));
+        drop(guard);
+        thread.join().unwrap();
+        controller.wait_for_change();
+        assert_eq!(controller.fire_due(), None);
+        assert!(backend.called().is_empty());
+    }
 
     #[derive(Debug, Default)]
     struct RecordingBackend(Mutex<Vec<PowerActionKind>>);

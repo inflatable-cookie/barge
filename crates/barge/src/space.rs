@@ -7,11 +7,13 @@
 //! with its cause, never hidden as another policy refusal.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use serde::Serialize;
 
 use crate::area::Area;
 use crate::error::{ErrorKind, Result};
+use crate::os::TreeSize;
 use crate::root::RootInfo;
 use crate::volume::Volume;
 use crate::Core;
@@ -199,12 +201,12 @@ fn soft_cap_pass(
             continue;
         };
         let listing = area.list_without_bytes()?;
-        let mut sizes = HashMap::with_capacity(listing.roots.len());
+        let mut sizes: HashMap<String, TreeSize> = HashMap::with_capacity(listing.roots.len());
         let mut bytes = 0_u64;
         for info in &listing.roots {
             let size = area.recorded_or_measure_bytes(info, !dry_run);
             bytes = bytes.saturating_add(size.bytes);
-            sizes.insert(info.id.clone(), size.bytes);
+            sizes.insert(info.id.clone(), size);
         }
         if bytes <= cap {
             continue;
@@ -221,12 +223,14 @@ fn soft_cap_pass(
             if bytes <= cap {
                 break;
             }
-            if evict(area, &info, PruneReason::SoftCap, dry_run, report)?.is_none() {
+            // A dry run plans with the size this pass already measured instead of
+            // walking the root a second time.
+            let size = sizes.get(&info.id).copied();
+            if evict(area, &info, PruneReason::SoftCap, dry_run, size, report)?.is_none() {
                 continue;
             }
             planned.insert((area.key().label(), info.id.clone()));
-            let size = sizes.get(&info.id).copied().unwrap_or(0);
-            bytes = bytes.saturating_sub(size);
+            bytes = bytes.saturating_sub(size.map_or(0, |size| size.bytes));
         }
         if bytes > cap {
             keep_protected(area, report, Some("the area is over its soft cap"))?;
@@ -236,26 +240,28 @@ fn soft_cap_pass(
     Ok(())
 }
 
+/// Free space as this run sees it: a dry run predicts it from the reading taken
+/// before the run plus the bytes already freed, and a real run reads it again.
+fn free_bytes(core: &Core, mount: &Path, dry_run: bool, report: &PruneReport) -> Result<u64> {
+    if dry_run {
+        Ok(report.free_before_bytes.saturating_add(report.freed_bytes))
+    } else {
+        core.os.free_bytes(mount)
+    }
+}
+
 fn reserve_pass(
     core: &Core,
-    mount: &std::path::Path,
+    mount: &Path,
     areas: &[Area],
     dry_run: bool,
     target_bytes: u64,
     planned: &HashSet<(String, String)>,
     report: &mut PruneReport,
 ) -> Result<()> {
-    let current_free = if dry_run {
-        report.free_before_bytes.saturating_add(report.freed_bytes)
-    } else {
-        core.os.free_bytes(mount)?
-    };
-    if current_free >= target_bytes {
-        report.free_after_bytes = if dry_run {
-            report.free_before_bytes
-        } else {
-            current_free
-        };
+    let free = free_bytes(core, mount, dry_run, report)?;
+    if free >= target_bytes {
+        report.free_after_bytes = free;
         return Ok(());
     }
 
@@ -282,27 +288,16 @@ fn reserve_pass(
         (left.1.last_used_unix_ms, &left.1.id).cmp(&(right.1.last_used_unix_ms, &right.1.id))
     });
     for (area, info) in &candidates {
-        let free = if dry_run {
-            report.free_before_bytes.saturating_add(report.freed_bytes)
-        } else {
-            core.os.free_bytes(mount)?
-        };
-        if free >= target_bytes {
+        if free_bytes(core, mount, dry_run, report)? >= target_bytes {
             break;
         }
         if planned.contains(&(area.key().label(), info.id.clone())) {
             continue;
         }
-        evict(area, info, PruneReason::Reserve, dry_run, report)?;
+        evict(area, info, PruneReason::Reserve, dry_run, None, report)?;
     }
-    let free_after = if dry_run {
-        report.free_before_bytes
-    } else {
-        core.os.free_bytes(mount)?
-    };
-    if (dry_run && report.free_before_bytes.saturating_add(report.freed_bytes) < target_bytes)
-        || (!dry_run && free_after < target_bytes)
-    {
+    let free_after = free_bytes(core, mount, dry_run, report)?;
+    if free_after < target_bytes {
         for (area, info) in &protected {
             let size = area.recorded_or_measure_bytes(info, false);
             report.kept.push(KeptRoot {
@@ -329,10 +324,11 @@ fn evict(
     info: &RootInfo,
     reason: PruneReason,
     dry_run: bool,
+    size: Option<TreeSize>,
     report: &mut PruneReport,
 ) -> Result<Option<EvictedRoot>> {
     if dry_run {
-        let size = crate::root::tree_bytes(&info.path);
+        let size = size.unwrap_or_else(|| crate::root::tree_bytes(&info.path));
         let planned = EvictedRoot {
             area: area.key().label(),
             id: info.id.clone(),
@@ -346,7 +342,7 @@ fn evict(
         report.evicted.push(planned.clone());
         return Ok(Some(planned));
     }
-    match area.evict(&info.id) {
+    match area.evict_listed(info) {
         Ok(eviction) => {
             if let Some(kept_reason) = &eviction.kept_reason {
                 report.trash_kept.push(SkippedRoot {
@@ -370,7 +366,7 @@ fn evict(
             Ok(Some(evicted))
         }
         Err(error) => {
-            let size = area.recorded_or_measure_bytes(info, false);
+            let size = size.unwrap_or_else(|| area.recorded_or_measure_bytes(info, false));
             let kept = KeptRoot {
                 area: area.key().label(),
                 id: info.id.clone(),

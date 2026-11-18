@@ -22,5 +22,8 @@ longhorn-tauri-config = { git = "https://github.com/inflatable-cookie/longhorn",
 longhorn-tauri-settings = { git = "https://github.com/inflatable-cookie/longhorn", tag = "v0.5.0" }
 longhorn-storage-layout = { git = "https://github.com/inflatable-cookie/longhorn", tag = "v0.5.0" }
 
+[dev-dependencies]
+barge = { path = "../../../crates/barge", features = ["testing"] }
+
 [lints]
 workspace = true

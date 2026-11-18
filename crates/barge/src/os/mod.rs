@@ -1,8 +1,11 @@
-//! The small platform seam: volume identity at a mount and free space. Nothing
-//! else in the crate names a syscall, errno or platform path convention.
+//! The platform seam: everything in the crate that names a syscall, an errno or a
+//! platform path convention lives here — volume identity at a mount, free space,
+//! and the descriptor-relative helpers every other module calls: opening a folder
+//! or a lock without following a symlink, advisory locks, an inheritable
+//! descriptor and a no-replace rename.
 //!
-//! Locks, renames and markers are portable; a new platform is a new identity and
-//! free-space implementation here, not a redesign.
+//! Markers are portable, so a new platform is a new identity, free-space and
+//! lock-call implementation here, not a redesign.
 
 #[cfg(not(unix))]
 compile_error!("Barge supports unix platforms; macOS is first and Linux follows.");
@@ -16,10 +19,12 @@ pub(crate) mod tree;
 
 use std::fmt;
 use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::hold::Mode;
 
 pub use fake::FakeOs;
 pub(crate) use tree::{measure_tree, Removed, Tree, TreeSize};
@@ -39,6 +44,13 @@ pub(crate) fn path_identity(path: &Path) -> std::io::Result<Option<(u64, u64)>> 
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(source),
     }
+}
+
+/// Whether the test process runs as root, which ignores file modes. A test that
+/// relies on a mode denying access has nothing to test there and skips.
+#[cfg(test)]
+pub(crate) fn running_as_root() -> bool {
+    effective_uid() == 0
 }
 
 /// The effective user ID for filesystem ownership checks.
@@ -212,9 +224,6 @@ fn free_space(path: &Path) -> Result<u64> {
     Ok(u64::try_from(free).unwrap_or(u64::MAX))
 }
 
-use crate::hold::Mode;
-use std::os::fd::AsRawFd;
-
 /// Take an advisory lock on a file. `wait` blocks; otherwise the call reports
 /// whether the lock was available.
 pub(crate) fn flock(file: &File, mode: Mode, wait: bool) -> Result<bool> {
@@ -239,10 +248,9 @@ pub(crate) fn flock(file: &File, mode: Mode, wait: bool) -> Result<bool> {
         if !wait && source.kind() == std::io::ErrorKind::WouldBlock {
             return Ok(false);
         }
-        return Err(Error::new(
-            crate::error::ErrorKind::Io,
-            format!("cannot take a file lock: {source}"),
-        ));
+        return Err(Error::io_message(format!(
+            "cannot take a file lock: {source}"
+        )));
     }
 }
 
@@ -253,13 +261,10 @@ pub(crate) fn set_inheritable(file: &File, inheritable: bool) -> Result<()> {
     #[allow(unsafe_code)]
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
     if flags < 0 {
-        return Err(Error::new(
-            crate::error::ErrorKind::Io,
-            format!(
-                "cannot read the hold descriptor flags: {}",
-                std::io::Error::last_os_error()
-            ),
-        ));
+        return Err(Error::io_message(format!(
+            "cannot read the hold descriptor flags: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     let wanted = if inheritable {
         flags & !libc::FD_CLOEXEC
@@ -270,13 +275,10 @@ pub(crate) fn set_inheritable(file: &File, inheritable: bool) -> Result<()> {
     #[allow(unsafe_code)]
     let result = unsafe { libc::fcntl(descriptor, libc::F_SETFD, wanted) };
     if result < 0 {
-        return Err(Error::new(
-            crate::error::ErrorKind::Io,
-            format!(
-                "cannot set the hold descriptor flags: {}",
-                std::io::Error::last_os_error()
-            ),
-        ));
+        return Err(Error::io_message(format!(
+            "cannot set the hold descriptor flags: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     Ok(())
 }

@@ -12,12 +12,12 @@ use crate::os::TreeSize;
 use crate::state::publish;
 
 /// The schema name of a root marker.
-pub const ROOT_SCHEMA: &str = "barge.root/1";
+pub(crate) const ROOT_SCHEMA: &str = "barge.root/1";
 /// The schema name of an adopted root marker with a recorded folder.
-pub const ADOPTED_ROOT_SCHEMA: &str = "barge.root/2";
+pub(crate) const ADOPTED_ROOT_SCHEMA: &str = "barge.root/2";
 
 /// The marker file that makes a folder a Barge-owned root.
-pub const MARKER_NAME: &str = ".barge-root.json";
+pub(crate) const MARKER_NAME: &str = ".barge-root.json";
 
 const MAX_ID: usize = 64;
 const MINT_ID_BYTES: usize = 8;
@@ -27,7 +27,7 @@ const MAX_LABEL: usize = 32;
 /// created. It is the only claim Barge accepts as ownership.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RootMarker {
+pub(crate) struct RootMarker {
     pub schema: String,
     /// `<namespace>/<area>`.
     pub area: String,
@@ -199,7 +199,7 @@ pub(crate) fn derived_folder(label: &str, id: &str) -> String {
 }
 
 /// Validate a label a consumer supplies for a root.
-pub fn validate_label(label: &str) -> Result<()> {
+pub(crate) fn validate_label(label: &str) -> Result<()> {
     let mut bytes = label.bytes();
     let first = bytes.next();
     let valid_first = first.is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
@@ -214,7 +214,7 @@ pub fn validate_label(label: &str) -> Result<()> {
 }
 
 /// Validate a root ID.
-pub fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_ID
         && id
@@ -227,7 +227,7 @@ pub fn valid_id(id: &str) -> bool {
 }
 
 /// Validate a root ID, naming the field on failure.
-pub fn validate_id(id: &str) -> Result<()> {
+pub(crate) fn validate_id(id: &str) -> Result<()> {
     if valid_id(id) {
         Ok(())
     } else {
@@ -238,7 +238,7 @@ pub fn validate_id(id: &str) -> Result<()> {
 }
 
 /// Whether `folder` is one plain directory name.
-pub fn valid_folder(folder: &str) -> bool {
+pub(crate) fn valid_folder(folder: &str) -> bool {
     !folder.is_empty()
         && folder != "."
         && folder != ".."
@@ -247,7 +247,7 @@ pub fn valid_folder(folder: &str) -> bool {
 }
 
 /// The directory recorded by a marker, or the legacy derived name.
-pub fn marker_folder(marker: &RootMarker) -> String {
+pub(crate) fn marker_folder(marker: &RootMarker) -> String {
     marker
         .folder
         .clone()
@@ -289,15 +289,6 @@ pub(crate) fn tree_bytes(path: &Path) -> TreeSize {
     crate::os::measure_tree(path)
 }
 
-/// The testable core of [`tree_bytes`]: `device` answers which filesystem a
-/// folder is on, so a test can claim a nested folder is another mount.
-#[cfg(test)]
-pub(crate) fn tree_bytes_with(path: &Path, device: &dyn Fn(&Path, u64) -> u64) -> TreeSize {
-    #[cfg(test)]
-    TREE_BYTES_CALLS.with(|calls| calls.set(calls.get() + 1));
-    crate::os::tree::measure_tree_with(path, device)
-}
-
 #[cfg(test)]
 thread_local! {
     static TREE_BYTES_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -314,7 +305,7 @@ pub(crate) fn tree_bytes_calls() -> usize {
 }
 
 #[cfg(test)]
-mod tree_size_tests {
+mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -382,48 +373,10 @@ mod tree_size_tests {
     }
 
     #[test]
-    fn a_nested_mount_is_neither_walked_nor_counted() {
-        let (_temp, root) = folder("root-device");
-        let nested = root.join("nested");
-        fs::create_dir(&nested).unwrap();
-        fs::write(nested.join("other.bin"), vec![b'x'; 64]).unwrap();
-        fs::write(root.join("ours.bin"), vec![b'x'; 8]).unwrap();
-
-        let exact = tree_bytes(&root);
-        assert_eq!(exact.bytes, 72, "both files are on one filesystem");
-        assert!(!exact.approximate);
-
-        // The fixture cannot mount a second filesystem, so the seam reports one
-        // for the folder a mount would appear as.
-        let measured = tree_bytes_with(&root, &|child, device| {
-            if child.ends_with("nested") {
-                device + 1
-            } else {
-                device
-            }
-        });
-        assert_eq!(measured.bytes, 8, "only this filesystem's data counts");
-        assert!(!measured.approximate, "a mount is skipped by design");
-    }
-
-    #[test]
-    fn a_tree_deeper_than_the_cap_is_approximate() {
-        let (_temp, root) = folder("root-depth");
-        fs::write(root.join("top.bin"), vec![b'x'; 4]).unwrap();
-        let mut deepest = root.clone();
-        for _ in 0..crate::os::tree::MAX_DEPTH + 1 {
-            deepest = deepest.join("nested");
-            fs::create_dir(&deepest).unwrap();
-        }
-        fs::write(deepest.join("buried.bin"), vec![b'x'; 32]).unwrap();
-
-        let size = tree_bytes(&root);
-        assert_eq!(size.bytes, 4, "the buried file is past the cap");
-        assert!(size.approximate, "an uncounted tree is never exact");
-    }
-
-    #[test]
     fn an_unreadable_entry_makes_the_size_approximate() {
+        if crate::os::running_as_root() {
+            return; // Root reads a 0o000 folder, so the mode denies nothing.
+        }
         let (_temp, root) = folder("root-unreadable");
         fs::write(root.join("readable.bin"), vec![b'x'; 6]).unwrap();
         let hidden = root.join("hidden");

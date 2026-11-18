@@ -39,16 +39,11 @@ const BINDINGS_NAME: &str = "bindings.json";
 /// The suffix a preserved directory or file is renamed to beside its link.
 const PRESERVED_SUFFIX: &str = ".barge-prior";
 
-/// How a consumer learns where a class lives.
+/// How a consumer is pointed at a class. Only the kinds Barge records today are
+/// listed: a stored record naming another kind is refused rather than guessed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BindingKind {
-    /// The consumer links the library and asks it: no record, never drifts.
-    Linked,
-    /// The consumer runs `barge path` or `barge env`: no record, never drifts.
-    Queried,
-    /// An adapter writes the consumer's own configuration file.
-    Setting,
     /// Barge owns a symlink at the consumer's own path.
     Link,
     /// A managed block in a repository's `AGENTS.md`.
@@ -58,9 +53,6 @@ pub enum BindingKind {
 impl BindingKind {
     pub fn name(self) -> &'static str {
         match self {
-            Self::Linked => "linked",
-            Self::Queried => "queried",
-            Self::Setting => "setting",
             Self::Link => "link",
             Self::Workflow => "workflow",
         }
@@ -382,7 +374,7 @@ impl Bindings {
                     problem.message()
                 ));
             }
-            return Err(Error::new(ErrorKind::Io, message));
+            return Err(Error::io_message(message));
         }
         let record = BindingRecord {
             consumer: binding.consumer.clone(),

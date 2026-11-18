@@ -34,7 +34,6 @@ ureq = { version = "3.4.2", default-features = false }
 
 # The daemon's server. Blocking, one thread, no async runtime: it answers three
 # endpoints for one operator.
-tiny_http = "0.12.0"
 
 # logind over D-Bus, Linux only. The macOS workspace checks never build it, so
 # the daemon still compiles (and reports state) on the Mac.
