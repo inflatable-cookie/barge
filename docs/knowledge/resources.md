@@ -116,10 +116,11 @@ it, and what was there before, so undo restores it exactly.
 
 Only the `link` kind is built. Its rules:
 
-- `plan` shows the exact before and after; `apply` takes that plan document back,
-  so the entry it observed (including which real directory or file) and the
-  destination it reviewed are what it enforces, and refuses a target that
-  changed since;
+- `plan` shows the exact before and after, with the destination already resolved
+  as the link will hold it; `apply` takes that plan document back, so the entry
+  it observed (including which real directory or file) and the resolved
+  destination it reviewed are what it enforces, and it refuses a target or a
+  destination that changed since;
 - `adopt` records a symlink that already points into a class folder without
   changing it;
 - `undo` restores the prior state exactly: nothing, an older link, or a real

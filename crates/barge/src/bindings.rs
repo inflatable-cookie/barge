@@ -287,11 +287,12 @@ impl Bindings {
             .find(|record| record.consumer == consumer))
     }
 
-    /// The exact before and after of a link binding; writes nothing.
+    /// The exact before and after of a link binding; writes nothing. The after
+    /// value is the resolved destination, because that is what the link will
+    /// hold.
     pub fn plan(&self, binding: &Binding) -> Result<LinkPlan> {
         binding.validate()?;
-        let value = binding.value()?;
-        self.destination(binding.class, value)?;
+        let destination = self.destination(binding.class, binding.value()?)?;
         require_parent(&binding.link)?;
         self.check_free(&binding.consumer, &binding.link)?;
         let before = observe(&binding.link)?;
@@ -299,17 +300,16 @@ impl Bindings {
             consumer: binding.consumer.clone(),
             class: binding.class,
             link: binding.link.clone(),
-            after: Observed::Link {
-                destination: value.to_path_buf(),
-            },
+            after: Observed::Link { destination },
             replace: matches!(before, Observed::Directory { .. } | Observed::File { .. }),
             before,
         })
     }
 
     /// Apply a reviewed plan. The target must still be the entry the plan
-    /// observed, the plan must apply this binding's destination, and a real
-    /// directory or file is only replaced when the caller passes it explicitly.
+    /// observed, the destination must still resolve to what the plan recorded,
+    /// and a real directory or file is only replaced when the caller passes it
+    /// explicitly.
     pub fn apply(
         &self,
         binding: &Binding,
@@ -318,8 +318,6 @@ impl Bindings {
     ) -> Result<BindingRecord> {
         self.core.ensure_writable()?;
         binding.validate()?;
-        check_plan(binding, plan)?;
-        let destination = self.destination(binding.class, binding.value()?)?;
         require_parent(&binding.link)?;
         let _lock = self.core.state.lock()?;
         let mut records = read(&self.core)?;
@@ -333,6 +331,8 @@ impl Bindings {
                 observed
             )));
         }
+        let destination = self.destination(binding.class, binding.value()?)?;
+        check_plan(binding, plan, &destination)?;
         let prior = prior_for(&binding.link, &observed)?;
         if let Prior::Preserved { path, .. } = &prior {
             if !options.replace {
@@ -570,20 +570,31 @@ impl Bindings {
 }
 
 /// Check that a plan is the one made for this binding, observes what its replace
-/// flag claims, and applies the destination the binding asks for.
-fn check_plan(binding: &Binding, plan: &LinkPlan) -> Result<()> {
+/// flag claims, and still resolves to the destination the plan recorded.
+fn check_plan(binding: &Binding, plan: &LinkPlan, destination: &Path) -> Result<()> {
     if plan.consumer != binding.consumer || plan.class != binding.class || plan.link != binding.link
     {
         return Err(Error::usage("the plan was made for a different binding"));
     }
-    let expected = Observed::Link {
-        destination: binding.value()?.to_path_buf(),
-    };
-    if plan.after != expected {
-        return Err(Error::refused(format!(
-            "the plan applies {}, not the binding's {}",
-            plan.after, expected
-        )));
+    match &plan.after {
+        Observed::Link {
+            destination: planned,
+        } if planned == destination => {}
+        Observed::Link {
+            destination: planned,
+        } => {
+            return Err(Error::refused(format!(
+                "destination {} now resolves to {}, not the planned {}; refusing to apply a changed plan",
+                binding.value()?.display(),
+                destination.display(),
+                planned.display()
+            )))
+        }
+        other => {
+            return Err(Error::usage(format!(
+                "the plan's after is {other}, not a link"
+            )))
+        }
     }
     if plan.replace
         != matches!(

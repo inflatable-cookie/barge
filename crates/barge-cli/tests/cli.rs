@@ -369,7 +369,7 @@ fn bindings_record_drift_and_doctor_report_it() {
     assert_eq!(document["data"]["binding"]["kind"], "link");
     assert_eq!(
         std::fs::read_link(&link).unwrap(),
-        destination,
+        std::fs::canonicalize(&destination).unwrap(),
         "apply follows the reviewed plan"
     );
 

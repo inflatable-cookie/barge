@@ -56,13 +56,19 @@ fn plan_and_apply_a_new_link() {
     let plan = bindings.plan(&binding).unwrap();
     assert_eq!(plan.before, Observed::Absent);
     assert!(!plan.replace);
-    assert!(matches!(&plan.after, Observed::Link { .. }));
+    assert_eq!(
+        plan.after,
+        Observed::Link {
+            destination: canonical(&destination)
+        },
+        "the plan records the destination the link will hold"
+    );
     assert!(!link.exists(), "plan writes nothing");
 
     let record = bindings
         .apply(&binding, &plan, ApplyOptions::default())
         .unwrap();
-    assert_eq!(fs::read_link(&link).unwrap(), destination);
+    assert_eq!(fs::read_link(&link).unwrap(), canonical(&destination));
     assert_eq!(canonical(&link), canonical(&destination));
     assert_eq!(record.consumer, "cargo-registry");
     assert_eq!(record.class, Class::Caches);
@@ -322,11 +328,48 @@ fn apply_refuses_a_plan_for_another_destination() {
         .apply(&different, &plan, ApplyOptions::default())
         .unwrap_err();
     assert!(
-        refused.message().contains("not the binding's"),
+        refused.message().contains("not the planned"),
         "{}",
         refused.message()
     );
     assert!(fs::symlink_metadata(&link).is_err());
+}
+
+#[test]
+fn apply_refuses_a_destination_that_now_resolves_elsewhere() {
+    let fixture = Fixture::new();
+    fixture.register();
+    layout(&fixture);
+    let first = class_folder(&fixture, "cargo/a");
+    let second = class_folder(&fixture, "cargo/b");
+    let current = fixture.base().join("caches/current");
+    symlink(&first, &current).unwrap();
+    let link = home(&fixture).join("registry");
+
+    let bindings = fixture.barge.bindings();
+    let binding = Binding::link("cargo-registry", Class::Caches, &link).to(&current);
+    let plan = bindings.plan(&binding).unwrap();
+    assert_eq!(
+        plan.after,
+        Observed::Link {
+            destination: canonical(&first)
+        },
+        "the plan resolves the destination through the symlink"
+    );
+
+    // The destination path resolves somewhere else now, although both folders
+    // are valid destinations.
+    fs::remove_file(&current).unwrap();
+    symlink(&second, &current).unwrap();
+    let refused = bindings
+        .apply(&binding, &plan, ApplyOptions::default())
+        .unwrap_err();
+    assert!(
+        refused.message().contains("now resolves to"),
+        "{}",
+        refused.message()
+    );
+    assert!(fs::symlink_metadata(&link).is_err(), "nothing was linked");
 }
 
 #[test]
