@@ -23,7 +23,7 @@ libc.workspace = true
 # even when a test panics. The dependency is test-only, so `crates/barge`'s own
 # dependency tree is unchanged.
 [dev-dependencies]
-barge = { path = "../barge", features = ["testing"] }
+barge = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

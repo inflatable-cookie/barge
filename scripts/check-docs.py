@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Run the installed Northstar check under a fixture HOME without losing skill discovery."""
+"""Run the installed Northstar check with the account's own skill, never a copy.
+
+The check is Northstar's link check: `effigy skill run --path <skill>
+northstar/check-links`. The skill is found the way a named skill is found on
+this account (a repository-local `.agents/skills/northstar` first, then the
+account's own install), and an ambiguous or missing install refuses rather than
+skipping the check.
+"""
 import argparse
 import os
 from pathlib import Path
@@ -8,8 +15,8 @@ import pwd
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("check", choices=("check-links",))
 args = parser.parse_args()
-# Match named-skill precedence and ambiguity refusal. The effective account's
-# installed skills are authority; HOME may deliberately be a private fixture.
+# Match named-skill precedence and ambiguity refusal: the effective account's
+# installed skills are authority.
 local = Path.cwd() / ".agents/skills/northstar"
 account = Path(pwd.getpwuid(os.geteuid()).pw_dir)
 candidates = [local] if local.is_dir() else [

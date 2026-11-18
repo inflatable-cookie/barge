@@ -22,7 +22,7 @@ libc.workspace = true
 # The crate's own integration tests use `barge::testing`, so the dependency on
 # itself turns that feature on for test builds only; a normal build never sees it.
 [dev-dependencies]
-barge = { path = ".", features = ["testing"] }
+barge = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

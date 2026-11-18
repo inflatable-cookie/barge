@@ -1,6 +1,12 @@
-use super::*;
+use std::path::Path;
 
-pub(super) fn layout(arguments: &[String], json: bool) -> Result<()> {
+use barge::{Absent, Barge, Class, Error, ErrorKind, Placement, Result};
+use serde_json::json;
+
+use crate::args::{expect_no_positionals, parse_absent, Options};
+use crate::output::document;
+
+pub(crate) fn layout(arguments: &[String], json: bool) -> Result<()> {
     let (command, rest) = arguments
         .split_first()
         .ok_or_else(|| Error::usage("layout needs show or set"))?;
@@ -37,19 +43,27 @@ pub(super) fn layout(arguments: &[String], json: bool) -> Result<()> {
         "set" => {
             let options = Options::parse(rest, &["volume", "path", "absent"], &[])?;
             let class = options.single("layout set", "class")?.parse::<Class>()?;
-            let barge = Barge::open()?;
+            let volume = options.required("volume")?;
+            let path = options.required("path")?;
+            // Every argument is validated before the account is opened, so a
+            // refused set creates no state.
             let absent = match options.get("absent") {
-                Some(value) => parse_absent(&value)?,
+                Some(value) => Some(parse_absent(&value)?),
+                None => None,
+            };
+            let barge = Barge::open()?;
+            let absent = match absent {
+                Some(absent) => absent,
                 None => barge
                     .layout()?
                     .classes
                     .get(&class)
-                    .map(|p| p.absent.clone())
+                    .map(|placement| placement.absent.clone())
                     .unwrap_or(Absent::Fail),
             };
             let placement = Placement {
-                volume: options.required("volume")?,
-                path: options.required("path")?,
+                volume,
+                path,
                 absent,
             };
             let result = barge.set_layout(class, placement)?;
@@ -64,7 +78,7 @@ pub(super) fn layout(arguments: &[String], json: bool) -> Result<()> {
     }
 }
 
-pub(super) fn resource_path(arguments: &[String], json: bool) -> Result<()> {
+pub(crate) fn resource_path(arguments: &[String], json: bool) -> Result<()> {
     let options = Options::parse(arguments, &["project"], &[])?;
     let class = options.single("path", "class")?.parse::<Class>()?;
     let resolved =
@@ -73,14 +87,20 @@ pub(super) fn resource_path(arguments: &[String], json: bool) -> Result<()> {
         eprintln!("barge: using fallback for {}", class.name());
     }
     if json {
-        document("barge.path/1", vec![("path", json!(resolved))])?;
+        document(
+            "barge.path/1",
+            vec![
+                ("path", json!(resolved.path)),
+                ("fallback", json!(resolved.fallback)),
+            ],
+        )?;
     } else {
         println!("{}", resolved.path.display());
     }
     Ok(())
 }
 
-pub(super) fn resource_env(arguments: &[String]) -> Result<()> {
+pub(crate) fn resource_env(arguments: &[String]) -> Result<()> {
     let options = Options::parse(arguments, &["shell"], &[])?;
     expect_no_positionals(&options)?;
     let shell = options.get("shell").unwrap_or_else(|| "zsh".to_string());
@@ -105,7 +125,7 @@ pub(super) fn resource_env(arguments: &[String]) -> Result<()> {
 }
 
 /// Render one shell assignment, quoting paths without invoking a shell.
-pub(super) fn shell_assignment(shell: &str, name: &str, value: &Path) -> Result<String> {
+pub(crate) fn shell_assignment(shell: &str, name: &str, value: &Path) -> Result<String> {
     let value = value
         .to_str()
         .ok_or_else(|| Error::usage("resource path is not valid UTF-8"))?;
@@ -116,5 +136,24 @@ pub(super) fn shell_assignment(shell: &str, name: &str, value: &Path) -> Result<
             value.replace('\\', "\\\\").replace('\'', "\\'")
         )),
         _ => Err(Error::usage("shell must be zsh, bash or fish")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_assignment;
+    use std::path::Path;
+
+    #[test]
+    fn shell_assignments_quote_paths() {
+        let path = Path::new("/some path/it's here");
+        assert_eq!(
+            shell_assignment("bash", "BARGE_SCRATCH", path).unwrap(),
+            "export BARGE_SCRATCH='/some path/it'\\''s here'"
+        );
+        assert_eq!(
+            shell_assignment("fish", "BARGE_SCRATCH", path).unwrap(),
+            "set -gx BARGE_SCRATCH '/some path/it\\'s here';"
+        );
     }
 }

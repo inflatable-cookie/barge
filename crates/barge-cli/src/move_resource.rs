@@ -1,6 +1,12 @@
-use super::*;
+use std::path::Path;
 
-pub(super) fn move_resource(arguments: &[String], json: bool) -> Result<()> {
+use barge::{Barge, Error, ErrorKind, MovePlan, Result};
+use serde_json::json;
+
+use crate::args::{expect_no_positionals, Options};
+use crate::output::document;
+
+pub(crate) fn move_resource(arguments: &[String], json: bool) -> Result<()> {
     if arguments.iter().any(|arg| arg == "--apply") {
         let options = Options::parse(arguments, &["plan"], &["apply", "confirm-stopped"])?;
         expect_no_positionals(&options)?;
@@ -12,7 +18,7 @@ pub(super) fn move_resource(arguments: &[String], json: bool) -> Result<()> {
             std::fs::read_to_string(&path)
                 .map_err(|e| Error::usage(format!("cannot read plan {path}: {e}")))?
         };
-        let plan: barge::MovePlan = serde_json::from_str(&source)
+        let plan: MovePlan = serde_json::from_str(&source)
             .map_err(|e| Error::usage(format!("invalid move plan: {e}")))?;
         let report = Barge::open()?.apply_move(&plan, options.flag("confirm-stopped"))?;
         if json {

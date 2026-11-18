@@ -1,6 +1,9 @@
-use super::*;
+use barge::{
+    AreaStatus, BindingState, BlockState, DoctorReport, InitAction, InitCheck, InitReport,
+    KeepReason, PruneReason, PruneReport, RootInfo, SweepReport, VolumeState, VolumeStatus,
+};
 
-pub(super) fn print_prune(report: &barge::PruneReport) {
+pub(crate) fn print_prune(report: &PruneReport) {
     let prefix = if report.dry_run {
         "would evict"
     } else {
@@ -13,8 +16,8 @@ pub(super) fn print_prune(report: &barge::PruneReport) {
             root.area,
             describe_size(root.bytes, root.bytes_approximate),
             match root.reason {
-                barge::PruneReason::SoftCap => "soft cap",
-                barge::PruneReason::Reserve => "reserve",
+                PruneReason::SoftCap => "soft cap",
+                PruneReason::Reserve => "reserve",
             }
         );
     }
@@ -25,9 +28,9 @@ pub(super) fn print_prune(report: &barge::PruneReport) {
             root.area,
             describe_size(root.bytes, root.bytes_approximate),
             match root.reason {
-                barge::KeepReason::Held => "held",
-                barge::KeepReason::Pinned => "pinned",
-                barge::KeepReason::Refused => "refused",
+                KeepReason::Held => "held",
+                KeepReason::Pinned => "pinned",
+                KeepReason::Refused => "refused",
             }
         );
     }
@@ -51,7 +54,7 @@ pub(super) fn print_prune(report: &barge::PruneReport) {
     );
 }
 
-pub(super) fn print_sweep(report: &barge::SweepReport) {
+pub(crate) fn print_sweep(report: &SweepReport) {
     for swept in &report.deleted {
         println!(
             "deleted {} ({})",
@@ -69,7 +72,7 @@ pub(super) fn print_sweep(report: &barge::SweepReport) {
     );
 }
 
-pub(super) fn volume_line(volume: &VolumeStatus) -> String {
+pub(crate) fn volume_line(volume: &VolumeStatus) -> String {
     format!(
         "{} at {}: {}{}",
         volume.spec.name,
@@ -82,7 +85,7 @@ pub(super) fn volume_line(volume: &VolumeStatus) -> String {
     )
 }
 
-pub(super) fn area_line(area: &barge::AreaStatus) -> String {
+pub(crate) fn area_line(area: &AreaStatus) -> String {
     match (&area.location, &area.unavailable) {
         (Some(path), _) => format!(
             "area {}/{} at {}{} roots {}, {}{}",
@@ -106,7 +109,7 @@ pub(super) fn area_line(area: &barge::AreaStatus) -> String {
     }
 }
 
-pub(super) fn describe_state(state: &VolumeState) -> String {
+pub(crate) fn describe_state(state: &VolumeState) -> String {
     match state {
         VolumeState::Present => "present".to_string(),
         VolumeState::Absent => "absent".to_string(),
@@ -116,7 +119,7 @@ pub(super) fn describe_state(state: &VolumeState) -> String {
     }
 }
 
-pub(super) fn describe_root(root: &RootInfo) -> String {
+pub(crate) fn describe_root(root: &RootInfo) -> String {
     let mut parts = Vec::new();
     parts.push(if root.held { "held" } else { "idle" }.to_string());
     if root.pinned {
@@ -128,8 +131,8 @@ pub(super) fn describe_root(root: &RootInfo) -> String {
     parts.join(", ")
 }
 
-pub(super) fn print_doctor(report: &DoctorReport) {
-    for volume in &report.volumes {
+pub(crate) fn print_doctor(report: &DoctorReport) {
+    for volume in &report.volume_reports {
         println!(
             "volume {} at {}: {}",
             volume.name,
@@ -158,7 +161,7 @@ pub(super) fn print_doctor(report: &DoctorReport) {
             }
         }
     }
-    for binding in &report.bindings {
+    for binding in &report.binding_reports {
         println!(
             "binding {} {} {} at {}: {}",
             binding.consumer,
@@ -178,7 +181,7 @@ pub(super) fn print_doctor(report: &DoctorReport) {
     );
 }
 
-pub(super) fn describe_binding(state: &BindingState) -> String {
+pub(crate) fn describe_binding(state: &BindingState) -> String {
     match state {
         BindingState::Ok => "ok".to_string(),
         BindingState::Missing => "missing: nothing is at the target".to_string(),
@@ -199,7 +202,7 @@ pub(super) fn describe_binding(state: &BindingState) -> String {
     }
 }
 
-pub(super) fn print_init(report: &InitReport) {
+pub(crate) fn print_init(report: &InitReport) {
     println!(
         "{} the barge workflow block in {}",
         match report.action {
@@ -213,13 +216,13 @@ pub(super) fn print_init(report: &InitReport) {
     if !report.volume_present() {
         eprintln!(
             "barge: volume {} is {}; rendered from the layout",
-            report.volume,
+            report.volume_name,
             describe_state(&report.volume_state)
         );
     }
 }
 
-pub(super) fn print_init_check(check: &InitCheck) {
+pub(crate) fn print_init_check(check: &InitCheck) {
     match check.state {
         BlockState::Current => println!(
             "the barge workflow block in {} is current",
@@ -239,13 +242,13 @@ pub(super) fn print_init_check(check: &InitCheck) {
     if !check.volume_present() {
         eprintln!(
             "barge: volume {} is {}; rendered from the layout",
-            check.volume,
+            check.volume_name,
             describe_state(&check.volume_state)
         );
     }
 }
 
-pub(super) fn format_size(bytes: u64) -> String {
+pub(crate) fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = 0;
@@ -261,7 +264,7 @@ pub(super) fn format_size(bytes: u64) -> String {
 }
 
 /// A size a tree walk could not take exactly is shown as approximate.
-pub(super) fn describe_size(bytes: u64, approximate: bool) -> String {
+pub(crate) fn describe_size(bytes: u64, approximate: bool) -> String {
     if approximate {
         format!("~{} (approximate)", format_size(bytes))
     } else {

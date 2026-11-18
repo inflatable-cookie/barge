@@ -533,10 +533,10 @@ fn doctor_reports_ok_drifted_missing_and_unavailable() {
     let report = fixture.barge.doctor().unwrap();
     assert!(report.ok, "{report:?}");
     assert_eq!(report.problems(), 0);
-    assert_eq!(report.bindings.len(), 1);
-    assert_eq!(report.bindings[0].state, BindingState::Ok);
-    assert_eq!(report.bindings[0].path, link);
-    let volume = &report.volumes[0];
+    assert_eq!(report.binding_reports.len(), 1);
+    assert_eq!(report.binding_reports[0].state, BindingState::Ok);
+    assert_eq!(report.binding_reports[0].path, link);
+    let volume = &report.volume_reports[0];
     assert_eq!(volume.name, "Builds");
     let layout = volume.layout.as_ref().unwrap();
     assert!(layout.agrees);
@@ -549,7 +549,7 @@ fn doctor_reports_ok_drifted_missing_and_unavailable() {
     let report = fixture.barge.doctor().unwrap();
     assert!(!report.ok);
     assert_eq!(report.problems(), 1);
-    match &report.bindings[0].state {
+    match &report.binding_reports[0].state {
         BindingState::Drifted {
             observed,
             expected,
@@ -566,15 +566,15 @@ fn doctor_reports_ok_drifted_missing_and_unavailable() {
     fs::remove_file(&link).unwrap();
     let report = fixture.barge.doctor().unwrap();
     assert!(!report.ok);
-    assert_eq!(report.bindings[0].state, BindingState::Missing);
+    assert_eq!(report.binding_reports[0].state, BindingState::Missing);
 
     // Unavailable: the volume is away.
     fixture.os.add_volume(fixture.mount.clone(), None, 0);
     let report = fixture.barge.doctor().unwrap();
     assert!(!report.ok);
-    assert_eq!(report.volumes[0].state, barge::VolumeState::Absent);
-    assert!(report.volumes[0].layout.is_none());
-    match &report.bindings[0].state {
+    assert_eq!(report.volume_reports[0].state, barge::VolumeState::Absent);
+    assert!(report.volume_reports[0].layout.is_none());
+    match &report.binding_reports[0].state {
         BindingState::Unavailable { reason } => assert!(reason.contains("absent"), "{reason}"),
         other => panic!("expected unavailable, got {other:?}"),
     }
@@ -589,14 +589,14 @@ fn doctor_reports_ok_drifted_missing_and_unavailable() {
     )
     .unwrap();
     let report = fixture.barge.doctor().unwrap();
-    let layout = report.volumes[0].layout.as_ref().unwrap();
+    let layout = report.volume_reports[0].layout.as_ref().unwrap();
     assert!(!layout.agrees);
     assert!(!report.ok);
 
     // A class folder is missing.
     fs::remove_dir_all(fixture.base().join("caches")).unwrap();
     let report = fixture.barge.doctor().unwrap();
-    let layout = report.volumes[0].layout.as_ref().unwrap();
+    let layout = report.volume_reports[0].layout.as_ref().unwrap();
     assert!(layout.classes.iter().any(|class| !class.exists));
     assert!(!report.ok);
 }

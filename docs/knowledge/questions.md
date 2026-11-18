@@ -26,7 +26,7 @@ Answer: nothing moves on disk: consumers declare their areas and adopt existing 
 ## Q-005 — Which platforms are in scope?
 
 Status: answered 2026-10-26
-Answer: macOS on APFS only for now, with an OS layer throughout so Linux can follow later (Tom); see [architecture](architecture.md#platforms).
+Answer: macOS on APFS only for now, with an OS layer throughout so Linux can follow later (Tom). `barged` targets Linux, because its power backend is logind over D-Bus; it still builds on macOS so the workspace checks cover it; see [architecture](architecture.md#platforms).
 
 ## Q-006 — Does kept data have to sit outside `root_dir`, or only outside its managed folders?
 

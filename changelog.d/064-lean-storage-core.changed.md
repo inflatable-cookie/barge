@@ -1,1 +1,1 @@
-Replace Barge with the lean storage core: volumes, areas, owned roots, cooperative holds, pins, trash-then-delete eviction, reserve and soft-cap pruning, scratch and the thin CLI. The earlier design and its proof and installer apparatus are deleted.
+Reset Barge to a lean storage design: volumes, areas, owned roots, cooperative holds, pins, trash-then-delete eviction, reserve and soft-cap pruning, scratch and the thin CLI. The earlier design and its proof and installer apparatus are deleted.

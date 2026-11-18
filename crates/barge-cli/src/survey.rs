@@ -1,13 +1,18 @@
-use super::*;
+use barge::{Barge, Result};
+use serde_json::json;
 
-pub(super) fn survey(arguments: &[String], json: bool) -> Result<()> {
+use crate::args::Options;
+use crate::human::describe_size;
+use crate::output::document;
+
+pub(crate) fn survey(arguments: &[String], json: bool) -> Result<()> {
     let options = Options::parse(arguments, &[], &["no-bytes"])?;
     let name = options.single("survey", "volume")?;
     let items = Barge::open_read_only()?.survey(&name, !options.flag("no-bytes"))?;
     if json {
         document(
             "barge.survey/1",
-            vec![("volume", json!(name)), ("items", json!(items))],
+            vec![("volume_name", json!(name)), ("items", json!(items))],
         )?;
     } else {
         for item in items {

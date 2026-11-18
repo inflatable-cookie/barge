@@ -194,7 +194,7 @@ pub struct InitReport {
     /// The `AGENTS.md` that holds the block.
     pub path: PathBuf,
     pub action: InitAction,
-    pub volume: String,
+    pub volume_name: String,
     pub volume_state: VolumeState,
     /// The scratch folder the block names.
     pub scratch: PathBuf,
@@ -236,7 +236,7 @@ pub struct InitCheck {
     /// The `AGENTS.md` that should hold the block.
     pub path: PathBuf,
     pub state: BlockState,
-    pub volume: String,
+    pub volume_name: String,
     pub volume_state: VolumeState,
     /// The scratch folder the block should name.
     pub scratch: PathBuf,
@@ -262,7 +262,7 @@ struct Resolved {
     project: String,
     file: PathBuf,
     rendered: Rendered,
-    volume: String,
+    volume_name: String,
     volume_state: VolumeState,
 }
 
@@ -275,7 +275,7 @@ impl Barge {
         let text = rendered.text();
         Ok(WorkflowBlock {
             project: project.to_string(),
-            volume,
+            volume_name: volume,
             volume_state,
             scratch: rendered.scratch,
             text,
@@ -325,7 +325,7 @@ impl Barge {
             project: resolved.project,
             path: resolved.file,
             action,
-            volume: resolved.volume,
+            volume_name: resolved.volume_name,
             volume_state: resolved.volume_state,
             scratch: resolved.rendered.scratch,
         })
@@ -369,7 +369,7 @@ impl Barge {
             project: resolved.project,
             path: resolved.file,
             state,
-            volume: resolved.volume,
+            volume_name: resolved.volume_name,
             volume_state: resolved.volume_state,
             scratch: resolved.rendered.scratch,
             diff,
@@ -409,7 +409,7 @@ impl Barge {
             repository,
             project,
             rendered,
-            volume,
+            volume_name: volume,
             volume_state,
         })
     }
@@ -471,7 +471,7 @@ impl Barge {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkflowBlock {
     pub project: String,
-    pub volume: String,
+    pub volume_name: String,
     pub volume_state: VolumeState,
     /// The scratch folder the block names.
     pub scratch: PathBuf,

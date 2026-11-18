@@ -2,9 +2,8 @@
 alias = "barge"
 
 [tasks]
-# Northstar's link and retired-concept checks, the changelog check (one short
-# fragment per unreleased change) and the whitespace check (AGENTS.md,
-# "Validate").
+# Northstar's link check, the changelog check (one short fragment per unreleased
+# change) and the whitespace check (AGENTS.md, "Validate").
 "docs:check" = [
   "python3 scripts/check-docs.py check-links",
   "PYTHONDONTWRITEBYTECODE=1 python3 scripts/changelog.py check",
@@ -23,9 +22,9 @@ alias = "barge"
 "rust:test" = [{ task = "test rust" }]
 
 [test.suites.rust]
-# The library and CLI suites. The budgets are the test route's timeout and
-# forced exit: an expired admission window starts no child, and an expired
-# execution window stops the owned group, so a hung test or a leaked hold
-# cannot keep the run open.
+# The whole workspace's suites: the library, the CLI, the machine client and the
+# daemon. The budgets are the test route's timeout and forced exit: an expired
+# admission window starts no child, and an expired execution window stops the
+# owned group, so a hung test or a leaked hold cannot keep the run open.
 run = "oxide test --admission-budget 300s --execution-budget 600s --workspace --all-targets --locked"
 default = false

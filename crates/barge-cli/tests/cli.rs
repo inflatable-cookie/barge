@@ -7,140 +7,18 @@
 // may unwrap, expect and panic; the shipped crates may not.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::io::{Read, Write};
+mod support;
+
+use support::{
+    parse_document, register_machine, run_with_stdin, stderr, stdout, stub_daemon,
+    stub_daemon_routes, Fixture, TEST_UUID,
+};
+
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::process::{Command, Output};
 
-use barge::testing::TempDir;
 use serde_json::Value;
-
-/// The identity the test-only seam hook reports for every fixture mount
-/// (`BARGE_TEST_VOLUME_UUID`), so no test depends on the host's own volume.
-const TEST_UUID: &str = "11111111-2222-3333-4444-555555555555";
-
-struct Fixture {
-    temp: TempDir,
-    state: PathBuf,
-    mount: PathBuf,
-}
-
-impl Fixture {
-    fn new() -> Self {
-        let temp = TempDir::new("cli").unwrap();
-        let state = temp.folder("state").unwrap();
-        let mount = temp.folder("Builds").unwrap();
-        Self { temp, state, mount }
-    }
-
-    /// The environment every run gets: the fixture's own state directory and the
-    /// fixed volume identity.
-    fn barge(&self, arguments: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_barge"));
-        command
-            .args(arguments)
-            .env("BARGE_STATE_DIR", &self.state)
-            .env("BARGE_TEST_VOLUME_UUID", TEST_UUID);
-        command
-    }
-
-    fn run(&self, arguments: &[&str]) -> Output {
-        self.barge(arguments)
-            .output()
-            .expect("run the barge binary")
-    }
-
-    fn json(&self, arguments: &[&str]) -> Output {
-        let mut with_json = vec!["--json"];
-        with_json.extend_from_slice(arguments);
-        self.run(&with_json)
-    }
-
-    fn mount(&self) -> &str {
-        self.mount.to_str().unwrap()
-    }
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-fn parse_document(output: &Output) -> Value {
-    let document: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-        panic!(
-            "stdout is not JSON ({error}): {}{}",
-            stdout(output),
-            stderr(output)
-        )
-    });
-    let schema = document["schema"].as_str().unwrap();
-    let fields: &[&str] = match schema {
-        "barge.status/1" => &["volumes"],
-        "barge.volume-registered/1" => &["volume", "state"],
-        "barge.volume-list/1" => &["volumes"],
-        "barge.volume/1" => &["volume", "state", "free_bytes"],
-        "barge.area-declared/1" => &["area"],
-        "barge.areas/1" => &["areas"],
-        "barge.roots/1" => &["area", "bytes_included", "roots", "stragglers"],
-        "barge.root-action/1" => &["area", "id", "action"],
-        "barge.root-evicted/1" => &["action", "eviction"],
-        "barge.prune/1" => &["prune"],
-        "barge.scratch/1" => &["area", "root"],
-        "barge.sweep/1" => &["sweep"],
-        "barge.layout-show/1" => &["layout", "disagreements"],
-        "barge.layout-updated/1" => &["layout"],
-        "barge.path/1" => &["path"],
-        "barge.survey/1" => &["volume", "items"],
-        "barge.binding-list/1" => &["bindings"],
-        "barge.bind-plan/1" => &["plan"],
-        "barge.binding/1" => &["action", "binding"],
-        "barge.doctor/1" => &["ok", "volumes", "bindings"],
-        "barge.init/1" => &[
-            "project",
-            "path",
-            "action",
-            "scratch",
-            "volume",
-            "volume_state",
-        ],
-        "barge.init-check/1" => &[
-            "project",
-            "path",
-            "state",
-            "scratch",
-            "volume",
-            "volume_state",
-            "diff",
-        ],
-        "barge.machine/1" => &["machine"],
-        "barge.machine-list/1" => &["machines"],
-        "barge.machine-removed/1" => &["removed"],
-        "barge.machine-wake/1" => &["machine", "destination", "bytes_sent"],
-        "barge.machine-status/1" => &["machine", "mode", "state"],
-        "barge.machine-power/1" => &["machine", "action", "deadline_unix_ms"],
-        "barge.machine-cancel/1" => &["machine", "cancelled"],
-        _ => panic!("unexpected schema {schema}"),
-    };
-    let mut actual: Vec<_> = document["data"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    actual.sort_unstable();
-    let mut expected = fields.to_vec();
-    expected.sort_unstable();
-    assert_eq!(actual, expected, "{schema}");
-    assert_eq!(document.as_object().unwrap().len(), 2);
-    document
-}
 
 fn register(fixture: &Fixture) -> Output {
     fixture.run(&[
@@ -380,103 +258,6 @@ fn env_rejects_json_output() {
     assert!(stderr(&output).contains("does not support --json"));
 }
 
-/// A canned `barged` on loopback: one answer for up to four requests, each
-/// recorded so a test can prove whether anything was sent at all.
-fn stub_daemon(status: u16, body: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
-    stub_daemon_routes(vec![("/", status, body)])
-}
-
-/// The same stub, with one answer per endpoint (first matching prefix wins).
-type Routes = Vec<(&'static str, u16, &'static str)>;
-
-fn stub_daemon_routes(routes: Routes) -> (u16, Arc<Mutex<Vec<String>>>) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&requests);
-    thread::spawn(move || {
-        for stream in listener.incoming().take(4) {
-            let Ok(mut stream) = stream else { break };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut bytes = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            loop {
-                let read = stream.read(&mut buffer).unwrap_or(0);
-                if read == 0 {
-                    break;
-                }
-                bytes.extend_from_slice(&buffer[..read]);
-                let text = String::from_utf8_lossy(&bytes).into_owned();
-                let Some((head, sent)) = text.split_once("\r\n\r\n") else {
-                    continue;
-                };
-                let length = head
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                if sent.len() >= length {
-                    recorded.lock().unwrap().push(text);
-                    break;
-                }
-            }
-            let request = recorded.lock().unwrap().last().cloned().unwrap_or_default();
-            let target = request.split_whitespace().nth(1).unwrap_or("/").to_string();
-            let (status, body) = routes
-                .iter()
-                .find(|(path, _, _)| target.starts_with(path))
-                .map(|(_, status, body)| (*status, *body))
-                .unwrap_or((404, "{}"));
-            let response = format!(
-                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes());
-        }
-    });
-    (port, requests)
-}
-
-/// Register a machine whose daemon is the fixture's loopback stub.
-fn register_machine(fixture: &Fixture, daemon_port: u16) {
-    let output = fixture.run(&[
-        "machine",
-        "add",
-        "--name",
-        "pc",
-        "--hostname",
-        "127.0.0.1",
-        "--mac",
-        "00:11:22:33:44:ff",
-        "--daemon-port",
-        &daemon_port.to_string(),
-    ]);
-    assert!(output.status.success(), "{}", stderr(&output));
-}
-
-fn run_with_stdin(fixture: &Fixture, arguments: &[&str], input: &str) -> Output {
-    let mut child = fixture
-        .barge(arguments)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the barge binary");
-    child
-        .stdin
-        .as_mut()
-        .expect("a piped stdin")
-        .write_all(input.as_bytes())
-        .expect("write the answer");
-    child.wait_with_output().expect("collect the run")
-}
-
 #[test]
 fn machine_power_confirms_restart_and_shutdown_unless_yes_is_given() {
     let fixture = Fixture::new();
@@ -561,8 +342,11 @@ fn machine_sleep_sends_at_once_and_status_reports_what_the_daemon_said() {
     assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
     let document = parse_document(&status);
     assert_eq!(document["schema"], "barge.machine-status/1");
-    assert_eq!(document["data"]["state"]["power"], "awake");
-    assert_eq!(document["data"]["state"]["pending"]["action"], "sleep");
+    assert_eq!(document["data"]["machine_state"]["power"], "awake");
+    assert_eq!(
+        document["data"]["machine_state"]["pending"]["action"],
+        "sleep"
+    );
 
     let cancel = fixture.json(&["machine", "cancel", "pc"]);
     assert_eq!(cancel.status.code(), Some(0), "{}", stderr(&cancel));
@@ -765,8 +549,11 @@ fn bindings_record_drift_and_doctor_report_it() {
     let document = parse_document(&doctor);
     assert_eq!(document["schema"], "barge.doctor/1");
     assert_eq!(document["data"]["ok"], true);
-    assert_eq!(document["data"]["bindings"][0]["state"], "ok");
-    assert_eq!(document["data"]["volumes"][0]["layout"]["agrees"], true);
+    assert_eq!(document["data"]["binding_reports"][0]["state"], "ok");
+    assert_eq!(
+        document["data"]["volume_reports"][0]["layout"]["agrees"],
+        true
+    );
 
     // Point the link somewhere else: a drifted binding exits 1.
     std::fs::remove_file(&link).unwrap();
@@ -776,9 +563,9 @@ fn bindings_record_drift_and_doctor_report_it() {
     assert_eq!(doctor.status.code(), Some(1), "{}", stderr(&doctor));
     let document = parse_document(&doctor);
     assert_eq!(document["data"]["ok"], false);
-    assert_eq!(document["data"]["bindings"][0]["state"], "drifted");
+    assert_eq!(document["data"]["binding_reports"][0]["state"], "drifted");
     assert_eq!(
-        document["data"]["bindings"][0]["reason"],
+        document["data"]["binding_reports"][0]["reason"],
         "the link points somewhere else"
     );
 
@@ -915,6 +702,9 @@ fn usage_and_passive_commands_do_not_create_state() {
         vec!["area", "bogus"],
         vec!["bind", "bogus"],
         vec!["init", "--bogus"],
+        // Arguments that are valid up to a missing required option are still
+        // refused before the account is opened.
+        vec!["layout", "set", "caches", "--path", "caches"],
     ] {
         let output = run(&args);
         assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
@@ -931,6 +721,8 @@ fn usage_and_passive_commands_do_not_create_state() {
         vec!["env"],
         vec!["survey", "missing"],
         vec!["doctor"],
+        // A dry run is a preview and must not create state either.
+        vec!["prune", "--volume", "Builds", "--dry-run"],
     ] {
         let _ = run(&args);
         assert!(!missing.exists(), "{args:?} created state");
@@ -1035,7 +827,7 @@ fn init_checks_and_doctor_report_the_workflow_block() {
     assert_eq!(check.status.code(), Some(0), "{}", stderr(&check));
     let document = parse_document(&check);
     assert_eq!(document["schema"], "barge.init-check/1");
-    assert_eq!(document["data"]["state"], "current");
+    assert_eq!(document["data"]["block_state"], "current");
     assert_eq!(document["data"]["project"], "repo");
     assert_eq!(document["data"]["path"], agents.to_str().unwrap());
     assert_eq!(document["data"]["diff"].as_array().unwrap().len(), 0);
@@ -1043,10 +835,10 @@ fn init_checks_and_doctor_report_the_workflow_block() {
     let doctor = fixture.json(&["doctor"]);
     assert_eq!(doctor.status.code(), Some(0), "{}", stderr(&doctor));
     let document = parse_document(&doctor);
-    assert_eq!(document["data"]["bindings"][0]["kind"], "workflow");
-    assert_eq!(document["data"]["bindings"][0]["state"], "ok");
+    assert_eq!(document["data"]["binding_reports"][0]["kind"], "workflow");
+    assert_eq!(document["data"]["binding_reports"][0]["state"], "ok");
     assert_eq!(
-        document["data"]["bindings"][0]["path"],
+        document["data"]["binding_reports"][0]["path"],
         canonical_repo.join("AGENTS.md").to_str().unwrap()
     );
 
@@ -1060,7 +852,7 @@ fn init_checks_and_doctor_report_the_workflow_block() {
     let stale = fixture.json(&["init", "--check", "--path", repo_text]);
     assert_eq!(stale.status.code(), Some(1), "{}", stderr(&stale));
     let document = parse_document(&stale);
-    assert_eq!(document["data"]["state"], "stale");
+    assert_eq!(document["data"]["block_state"], "stale");
     assert!(document["data"]["diff"]
         .as_array()
         .unwrap()
@@ -1078,7 +870,7 @@ fn init_checks_and_doctor_report_the_workflow_block() {
     let doctor = fixture.json(&["doctor"]);
     assert_eq!(doctor.status.code(), Some(1), "{}", stderr(&doctor));
     let document = parse_document(&doctor);
-    assert_eq!(document["data"]["bindings"][0]["state"], "stale");
+    assert_eq!(document["data"]["binding_reports"][0]["state"], "stale");
 
     // `init` fixes it, reports the action, and a second run changes nothing.
     let fixed = fixture.json(&["init", "--path", repo_text]);

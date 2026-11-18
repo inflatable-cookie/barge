@@ -1,7 +1,15 @@
-use super::*;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use barge::{Barge, Error, ErrorKind, Result};
+use serde_json::json;
+
+use crate::args::{expect_no_positionals, Options};
+use crate::human::{print_init, print_init_check};
+use crate::output::document;
 
 /// `barge init`: write the managed AGENTS.md block, or report it with `--check`.
-pub(super) fn init(arguments: &[String], json: bool) -> Result<ExitCode> {
+pub(crate) fn init(arguments: &[String], json: bool) -> Result<ExitCode> {
     let options = Options::parse(arguments, &["project", "path"], &["check"])?;
     expect_no_positionals(&options)?;
     let repository = match options.get("path") {
@@ -22,9 +30,9 @@ pub(super) fn init(arguments: &[String], json: bool) -> Result<ExitCode> {
                 vec![
                     ("project", json!(check.project)),
                     ("path", json!(check.path)),
-                    ("state", json!(check.state)),
+                    ("block_state", json!(check.state)),
                     ("scratch", json!(check.scratch)),
-                    ("volume", json!(check.volume)),
+                    ("volume_name", json!(check.volume_name)),
                     ("volume_state", json!(check.volume_state)),
                     ("diff", json!(check.diff)),
                 ],
@@ -47,7 +55,7 @@ pub(super) fn init(arguments: &[String], json: bool) -> Result<ExitCode> {
                 ("path", json!(report.path)),
                 ("action", json!(report.action)),
                 ("scratch", json!(report.scratch)),
-                ("volume", json!(report.volume)),
+                ("volume_name", json!(report.volume_name)),
                 ("volume_state", json!(report.volume_state)),
             ],
         )?;

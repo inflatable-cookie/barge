@@ -11,15 +11,15 @@ name = "barge"
 path = "src/main.rs"
 
 [dependencies]
-barge = { path = "../barge" }
-barge-machine = { path = "../barge-machine" }
+barge = { workspace = true }
+barge-machine = { workspace = true }
 # The JSON envelope: the CLI encodes one document per command.
 serde_json.workspace = true
 
 # Tests use the storage library's `testing::TempDir`; the feature stays off in the
 # library the binary links.
 [dev-dependencies]
-barge = { path = "../barge", features = ["testing"] }
+barge = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true
