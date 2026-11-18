@@ -2,12 +2,18 @@
 //! temporary directories with a fake volume identity. Nothing here touches a
 //! real external drive.
 
+// An integration test target is its own crate, and its fixture helpers are not
+// inside a `#[test]` function, where `clippy.toml` grants the exception. Tests
+// may unwrap, expect and panic; the shipped crates may not.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 mod common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use barge::{
@@ -233,14 +239,22 @@ fn a_hold_that_wakes_after_an_eviction_reports_not_found() {
     fs::create_dir_all(&trash).unwrap();
 
     let first = area.hold(&root.id, Mode::Exclusive).unwrap();
+    // The waiter signals that it is about to block on the root's lock, so the
+    // test never sleeps to order the two threads. Whichever way the interleaving
+    // falls — the waiter blocks before or reaches the lock after it is released
+    // — it re-resolves the root under the lock, so a hold on the evicted root is
+    // refused either way.
+    let (started, waiting) = mpsc::channel();
     let waiter = {
         let area = area.clone();
         let id = root.id.clone();
-        std::thread::spawn(move || area.hold(&id, Mode::Exclusive))
+        std::thread::spawn(move || {
+            started.send(()).unwrap();
+            area.hold(&id, Mode::Exclusive)
+        })
     };
-    // Let the waiter resolve the root and block on the lock, then rename the
-    // root the way an eviction does before the first hold releases.
-    std::thread::sleep(Duration::from_millis(250));
+    waiting.recv().unwrap();
+    // Rename the root the way an eviction does before the first hold releases.
     fs::rename(&root.path, trash.join(&root.folder)).unwrap();
     drop(first);
 
@@ -694,11 +708,15 @@ fn a_hold_survives_fork_and_exec_when_its_descriptor_is_inherited() {
 
     let hold = area.hold(&root.id, Mode::Exclusive).unwrap();
     hold.set_inheritable(true).unwrap();
+    // The child blocks on its stdin pipe instead of sleeping, so the test says
+    // when the inherited hold ends: closing the pipe releases the child.
     let mut child = Command::new("/bin/sh")
         .arg("-c")
-        .arg("sleep 0.6")
+        .arg("cat > /dev/null")
+        .stdin(Stdio::piped())
         .spawn()
         .expect("spawn a child that inherits the hold descriptor");
+    let input = child.stdin.take().expect("a piped stdin");
 
     // The parent's descriptor closes here; the child's inherited copy keeps the
     // same open file description, and with it the lock.
@@ -706,6 +724,8 @@ fn a_hold_survives_fork_and_exec_when_its_descriptor_is_inherited() {
     let error = area.evict(&root.id).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Refused);
     assert!(root.path.is_dir());
+
+    drop(input);
 
     assert!(child.wait().unwrap().success());
     area.evict(&root.id)

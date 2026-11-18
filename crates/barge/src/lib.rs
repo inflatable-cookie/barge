@@ -11,10 +11,6 @@
 //! `docs/knowledge/architecture.md` is the design this crate implements.
 
 #![deny(unsafe_code)]
-#![cfg_attr(
-    not(test),
-    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
-)]
 
 pub mod area;
 pub mod area_spec;

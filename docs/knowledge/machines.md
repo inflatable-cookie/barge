@@ -10,7 +10,7 @@ Remote menu-bar app ([vision](vision.md#direction)).
 
 ## Parts
 
-- **`barge` CLI on the Mac:** `barge machine list|status|wake|sleep|restart|shutdown|cancel`.
+- **`barge` CLI on the Mac:** `barge machine add|list|remove|wake|status|sleep|restart|shutdown|cancel`.
   Wake-on-LAN is a client operation and needs nothing running on the PC.
 - **`barged` on the PC:** a small Rust daemon. It reports state and performs
   power actions. On Bazzite it runs as a systemd user unit and asks logind over
@@ -103,8 +103,11 @@ the build brief.
 
 - `crates/barge-machine`: machine registry, Wake-on-LAN, protocol types and
   the client, shared by the CLI and UI.
-- `crates/barged`: the daemon (Linux first).
-- `apps/barge-ui`: the Tauri app.
+- `crates/barged`: the daemon (Linux first), with its unit, polkit rule and
+  example config in `packaging/barged/`.
+- `crates/barge-cli`: the `barge` binary, which carries the machine verbs
+  beside the storage ones.
+- `apps/barge-ui`: the Tauri app, planned and not yet built.
 
 ## Build order
 

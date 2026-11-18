@@ -110,6 +110,9 @@ pub fn platform() -> Arc<dyn Os> {
 
 impl Os for PlatformOs {
     fn volume_identity(&self, mount: &Path) -> Result<Option<String>> {
+        if let Some(uuid) = test_identity(mount) {
+            return Ok(Some(uuid));
+        }
         #[cfg(target_os = "macos")]
         {
             macos::volume_uuid(mount)
@@ -124,6 +127,35 @@ impl Os for PlatformOs {
     fn free_bytes(&self, path: &Path) -> Result<u64> {
         free_space(path)
     }
+}
+
+/// The environment variable that replaces the real volume identity.
+///
+/// This is Barge's only test affordance in the shipped binary: the CLI contract
+/// tests register a fixture folder, so they set this to a fixed UUID instead of
+/// depending on the host's own volume. It exists because a platform whose real
+/// identity Barge cannot read yet (Linux) would otherwise have no CLI contract
+/// coverage at all. Nothing in Barge sets it.
+const TEST_IDENTITY_VAR: &str = "BARGE_TEST_VOLUME_UUID";
+
+/// The fake identity, when the test hook is set and the path is a temporary one.
+///
+/// Only a path inside the process's own temporary directory is affected, so the
+/// hook can never name a registered volume on a real drive. A value that is not
+/// a canonical UUID is ignored rather than refused: this hook only stands in for
+/// a fact the platform could not supply, and a real run never has it.
+fn test_identity(mount: &Path) -> Option<String> {
+    let value = std::env::var_os(TEST_IDENTITY_VAR)?;
+    let value = value.to_str()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let temporary = std::fs::canonicalize(std::env::temp_dir()).ok()?;
+    let candidate = std::fs::canonicalize(mount).ok()?;
+    if !candidate.starts_with(&temporary) {
+        return None;
+    }
+    canonical_uuid(value).ok()
 }
 
 /// Normalise a volume UUID to the canonical uppercase 8-4-4-4-12 form.

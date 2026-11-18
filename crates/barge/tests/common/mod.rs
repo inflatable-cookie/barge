@@ -1,5 +1,9 @@
 //! Shared fixture: a temporary directory, a fake volume and a manual clock.
 
+// An integration test target is its own crate, and its fixture helpers are not
+// inside a `#[test]` function, where `clippy.toml` grants the exception. Tests
+// may unwrap, expect and panic; the shipped crates may not.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![allow(dead_code)]
 
 use std::fs;
