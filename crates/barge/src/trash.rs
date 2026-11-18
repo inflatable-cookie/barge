@@ -2,23 +2,22 @@
 //!
 //! Deletion never follows a symlink and never descends into another filesystem,
 //! so a nested mount or a link planted in a root is skipped rather than followed.
-//! A trash entry is deleted only when its marker still names the area.
-//!
-//! The walk itself is descriptor-relative and lives behind the `os` seam; a
-//! process racing inside an evicted tree cannot swap a folder for a symlink
-//! between the check and the descent because no step names a path.
+//! A trash entry is deleted only when its marker still names the area, and the
+//! marker is read through the descriptor the deletion then walks: the folder
+//! whose ownership was checked is the folder that is removed.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::os::{remove_tree, Removed};
-use crate::root::{read_marker, MarkerRead, MARKER_NAME};
+use crate::os::{Removed, Tree};
+use crate::root::{read_marker_in, MarkerRead, MARKER_NAME};
 
 /// What one tree deletion removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Deletion {
     pub bytes: u64,
-    /// Entries left in place: another filesystem, or a tree that is too deep.
+    /// Entries left in place: another filesystem, a tree that is too deep, or a
+    /// folder a racing writer replaced at the path.
     pub skipped: Vec<PathBuf>,
 }
 
@@ -33,7 +32,17 @@ pub(crate) fn remove_owned_tree_for_id(path: &Path, area: &str, id: &str) -> Res
 }
 
 fn remove_owned_tree_checked(path: &Path, area: &str, id: Option<&str>) -> Result<Deletion> {
-    match read_marker(path) {
+    // One descriptor for the ownership check and for the walk, so a replacement
+    // at the path between the two is never walked.
+    let tree = Tree::open(path)?;
+    #[cfg(test)]
+    OPEN_TREE_HOOK.with(|hook| {
+        let callback = hook.borrow_mut().take();
+        if let Some(hook) = callback {
+            hook();
+        }
+    });
+    match read_marker_in(tree.directory(), tree.path()) {
         MarkerRead::Valid(marker) if marker.area == area && id.is_none_or(|id| marker.id == id) => {
         }
         MarkerRead::Valid(marker) => {
@@ -60,12 +69,18 @@ fn remove_owned_tree_checked(path: &Path, area: &str, id: Option<&str>) -> Resul
         bytes,
         mut skipped,
         removed,
-    } = remove_tree(path)?;
+    } = tree.remove()?;
     if !removed && skipped.is_empty() {
         // A nested mount or an over-deep tree stays: Barge never reaches across.
         skipped.push(path.to_path_buf());
     }
     Ok(Deletion { bytes, skipped })
+}
+
+#[cfg(test)]
+thread_local! {
+    static OPEN_TREE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -105,6 +120,42 @@ mod tests {
         assert!(
             outside.join("keep.txt").exists(),
             "the link target survives"
+        );
+    }
+
+    #[test]
+    fn a_replacement_at_the_trash_path_is_never_walked() {
+        let temp = crate::testing::TempDir::new("trash-replaced").unwrap();
+        let entry = temp.path().join("slot-0123456789abcdef");
+        fs::create_dir(&entry).unwrap();
+        crate::root::write_marker(&entry, &marker("0123456789abcdef")).unwrap();
+        fs::write(entry.join("owned.bin"), b"owned").unwrap();
+        // Ask the hook to put a folder with no marker of its own where the entry
+        // is, in the moment between opening the entry and reading its marker.
+        let moved = temp.path().join("moved");
+        let hook_entry = entry.clone();
+        let hook_moved = moved.clone();
+        OPEN_TREE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&hook_entry, &hook_moved).unwrap();
+                fs::create_dir(&hook_entry).unwrap();
+                fs::write(hook_entry.join("replacement.bin"), b"keep me").unwrap();
+            }))
+        });
+
+        let deletion = remove_owned_tree(&entry, "test/area").unwrap();
+
+        assert!(
+            entry.join("replacement.bin").exists(),
+            "the replacement at the path is never walked"
+        );
+        assert!(
+            !moved.join("owned.bin").exists(),
+            "the entry whose marker was read is the one deleted"
+        );
+        assert!(
+            deletion.skipped.contains(&entry),
+            "the path changed under it"
         );
     }
 

@@ -11,7 +11,8 @@ pub mod fake;
 
 #[cfg(target_os = "macos")]
 mod macos;
-mod tree;
+/// Walks that never follow a symlink: `openat`, `fstatat`, `unlinkat`.
+pub(crate) mod tree;
 
 use std::fmt;
 use std::fs::File;
@@ -21,14 +22,7 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 
 pub use fake::FakeOs;
-/// Removal walks with descriptors: `openat`, `fstatat`, `unlinkat`.
-pub(crate) use tree::{remove_tree, Removed, MAX_DEPTH};
-
-/// The filesystem an entry lives on, for the checks that must not cross one.
-pub(crate) fn device_of(metadata: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.dev()
-}
+pub(crate) use tree::{measure_tree, Removed, Tree, TreeSize};
 
 /// The filesystem and inode an open descriptor names.
 pub(crate) fn file_identity(file: &File) -> std::io::Result<(u64, u64)> {
@@ -57,15 +51,26 @@ pub(crate) fn effective_uid() -> u32 {
 }
 
 /// Open a marker without following a symlink at either the root or marker.
-pub(crate) fn open_marker(folder: &Path, name: &str) -> std::io::Result<std::fs::File> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
+pub(crate) fn open_marker(folder: &Path, name: &str) -> std::io::Result<File> {
+    let directory = open_directory(folder)?;
+    open_marker_at(&directory, name)
+}
+
+/// Open a folder without following a symlink at it.
+pub(crate) fn open_directory(folder: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    let directory = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(folder)?;
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(folder)
+}
+
+/// Open a file inside an open folder, without following a symlink at it.
+pub(crate) fn open_marker_at(directory: &File, name: &str) -> std::io::Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
     let name = CString::new(name).map_err(|_| std::io::ErrorKind::InvalidInput)?;
     // SAFETY: the directory descriptor and NUL-terminated name are valid;
     // a successful openat returns a new descriptor owned by File.

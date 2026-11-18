@@ -16,9 +16,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::hold::{self, Hold, Mode};
+use crate::os::TreeSize;
 use crate::root::{
     self, folder_name, mint_id, read_marker, tree_bytes, Listing, MarkerRead, Root, RootInfo,
-    RootMarker, Straggler, TreeSize, ROOT_SCHEMA,
+    RootMarker, Straggler, ROOT_SCHEMA,
 };
 use crate::space::{SkippedRoot, SweepReport, SweptRoot};
 use crate::state::{publish, validate_name, validate_relative_path};
@@ -649,6 +650,9 @@ impl Area {
         Ok(self.list()?.bytes())
     }
 
+    /// A root's bytes: its recorded size when one was taken completely, its
+    /// measured size otherwise. Only complete measurements are recorded, so a
+    /// cached value is never a lower bound reported as exact.
     pub(crate) fn recorded_or_measure_bytes(&self, info: &RootInfo, persist: bool) -> TreeSize {
         let Ok(directory) = parent(&info.path) else {
             return tree_bytes(&info.path);
@@ -661,7 +665,7 @@ impl Area {
             };
         }
         let size = tree_bytes(&info.path);
-        if persist {
+        if persist && !size.approximate {
             let _ = hold::record_activity(
                 &activity,
                 &info.id,
@@ -1204,6 +1208,16 @@ fn lock_root(lock_path: &Path, mode: Mode, wait: bool) -> Result<Option<File>> {
             .truncate(false)
             .open(lock_path)
             .map_err(|source| Error::io("cannot open the hold lock", lock_path, &source))?;
+        // The window an eviction exploits: the file is open, the lock is not yet
+        // taken, so an eviction may rename the root, unlink this file and a
+        // caller may re-adopt the folder with the same ID before the lock lands.
+        #[cfg(test)]
+        LOCK_OPEN_HOOK.with(|hooks| {
+            let hook = hooks.borrow_mut().pop();
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
         if !hold::flock(&file, mode, wait)? {
             return Ok(None);
         }
@@ -1256,12 +1270,18 @@ thread_local! {
     static PIN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static ADOPT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static LOCK_HOOK: std::cell::RefCell<Vec<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(Vec::new()) };
+    static LOCK_OPEN_HOOK: std::cell::RefCell<Vec<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(Vec::new()) };
     static LIST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 fn push_lock_hook(hook: impl FnOnce() + 'static) {
     LOCK_HOOK.with(|hooks| hooks.borrow_mut().push(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn push_lock_open_hook(hook: impl FnOnce() + 'static) {
+    LOCK_OPEN_HOOK.with(|hooks| hooks.borrow_mut().push(Box::new(hook)));
 }
 
 #[cfg(test)]
@@ -1616,6 +1636,127 @@ mod eviction_identity_tests {
             .unwrap()
             .get("shared-id")
             .is_some());
+    }
+
+    #[test]
+    fn a_hold_that_woke_on_an_evicted_lock_file_holds_the_re_adopted_root() {
+        let (_temp, barge) = fixture();
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let directory = area.location().unwrap().path().unwrap().to_path_buf();
+        let folder = directory.join("slot-folder");
+        fs::create_dir_all(&folder).unwrap();
+        // A caller-chosen folder, so eviction can be followed by a re-adoption
+        // with the same ID.
+        let root = area.adopt_root("slot-folder", "slot", "shared-id").unwrap();
+        fs::write(folder.join("contents"), b"first").unwrap();
+        // The waiter opens the lock file; while it is open, the eviction renames
+        // the root and unlinks that file, and the folder is re-adopted with the
+        // same ID. Only then does the waiter take its lock, on the file the path
+        // no longer names.
+        let hook_area = area.clone();
+        let hook_folder = folder.clone();
+        push_lock_open_hook(move || {
+            hook_area.evict("shared-id").unwrap();
+            fs::create_dir(&hook_folder).unwrap();
+            fs::write(hook_folder.join("contents"), b"second").unwrap();
+            hook_area
+                .adopt_root("slot-folder", "slot", "shared-id")
+                .unwrap();
+        });
+
+        let hold = area.hold("shared-id", Mode::Exclusive).unwrap();
+
+        assert_eq!(hold.root_id(), "shared-id");
+        assert_eq!(
+            area.resolve("shared-id").unwrap().path,
+            folder,
+            "the hold is on the re-adopted root"
+        );
+        assert_eq!(
+            fs::read(folder.join("contents")).unwrap(),
+            b"second",
+            "the re-adopted root is the one that survived"
+        );
+        assert!(
+            area.try_hold("shared-id", Mode::Exclusive)
+                .unwrap()
+                .is_none(),
+            "another holder cannot take the root: the lock is visible"
+        );
+        let error = area.evict("shared-id").unwrap_err();
+        assert!(
+            error.message().contains("held"),
+            "eviction sees the hold: {error}"
+        );
+        drop(hold);
+        area.evict("shared-id").unwrap();
+        assert!(!folder.exists(), "the released root is evictable again");
+        assert_eq!(root.id, "shared-id");
+    }
+
+    #[test]
+    fn a_hold_that_woke_on_an_evicted_lock_file_does_not_hold_a_missing_root() {
+        let (_temp, barge) = fixture();
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let root = area.create_root("slot").unwrap();
+        // The same window without the re-adoption: the root is gone by the time
+        // the waiter looks at it, so it must not report a hold.
+        let hook_area = area.clone();
+        let hook_id = root.id.clone();
+        push_lock_open_hook(move || {
+            hook_area.evict(&hook_id).unwrap();
+        });
+
+        let error = area.hold(&root.id, Mode::Exclusive).unwrap_err();
+
+        assert_eq!(error.kind(), crate::error::ErrorKind::NotFound);
+        assert!(!root.path.exists());
+    }
+
+    #[test]
+    fn an_incomplete_measurement_is_never_cached_as_exact() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, barge) = fixture_with_space(10, 1);
+        let area = barge
+            .area(AreaSpec::new("test", "roots", "disk").soft_cap_bytes(Some(1)))
+            .unwrap();
+        let root = area.create_root("slot").unwrap();
+        fs::write(root.path.join("readable.bin"), vec![b'x'; 16]).unwrap();
+        let hidden = root.path.join("hidden");
+        fs::create_dir(&hidden).unwrap();
+        fs::write(hidden.join("unread.bin"), vec![b'x'; 64]).unwrap();
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+        let _guard = ModeGuard(hidden);
+
+        // Releasing a hold over an incomplete tree records no size at all.
+        drop(area.hold(&root.id, Mode::Exclusive).unwrap());
+        let activity = directory_of(&root).join(BARGE_DIR).join(ACTIVITY_DIR);
+        assert_eq!(hold::read_activity_bytes(&activity, &root.id), None);
+
+        let info = area
+            .list()
+            .unwrap()
+            .get(&root.id)
+            .cloned()
+            .expect("the root is listed");
+        assert!(info.bytes >= 16, "the readable part is counted");
+        assert!(
+            info.bytes_approximate,
+            "the unreadable part is not called exact"
+        );
+
+        // A prune that measures it reports the same, and still caches nothing.
+        let report = barge.prune("disk", true).unwrap();
+        let measured = report
+            .evicted
+            .iter()
+            .find(|evicted| evicted.id == root.id)
+            .expect("the soft cap plans this root");
+        assert!(
+            measured.bytes_approximate,
+            "a lower bound stays approximate"
+        );
+        assert_eq!(hold::read_activity_bytes(&activity, &root.id), None);
     }
 
     /// Restores a folder's mode so the fixture can still be removed.

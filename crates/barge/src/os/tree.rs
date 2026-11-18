@@ -1,15 +1,16 @@
-//! Removing a tree without following a symlink.
+//! Walking a tree without following a symlink: removal and measurement.
 //!
 //! Every step is descriptor-relative: the folder is opened with `O_NOFOLLOW`,
 //! each entry is classified with `fstatat(.., AT_SYMLINK_NOFOLLOW)`, each child
-//! folder is opened from its parent's descriptor, and each removal is an
-//! `unlinkat` on that descriptor. A process racing inside the tree therefore
-//! cannot swap a folder for a symlink between the check and the descent: the
-//! descriptor names the folder the check was made on.
+//! folder is opened from its parent's descriptor, and both the folder's
+//! ownership and the filesystem it lives on are read from the descriptor that
+//! was opened — never from a path or an entry seen a moment earlier. A process
+//! racing inside the tree therefore cannot swap a folder for a symlink, or a
+//! mount for a plain folder, between a check and the step that acts on it.
 
 #![allow(unsafe_code)]
 
-use std::ffi::{CStr, CString, OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -17,6 +18,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+
+use super::open_directory;
 
 /// The deepest tree a walk descends before it gives up on an entry. Measuring a
 /// root and deleting it use the same cap, so a size never counts a tree the
@@ -28,48 +31,99 @@ pub const MAX_DEPTH: usize = 128;
 pub(crate) struct Removed {
     /// The bytes of the regular files it removed.
     pub bytes: u64,
-    /// Entries left in place: another filesystem, or a tree that is too deep.
+    /// Entries left in place: another filesystem, a tree that is too deep, or a
+    /// folder whose path stopped naming it.
     pub skipped: Vec<PathBuf>,
-    /// True when the root folder itself was removed.
+    /// True when the folder this walk was opened on was removed.
     pub removed: bool,
 }
 
-/// Remove `root` and the tree under it without following a symlink and without
-/// crossing into another filesystem.
-pub(crate) fn remove_tree(root: &Path) -> Result<Removed> {
-    walk(root, &same_device)
+/// A measured tree size, and whether the walk saw all of it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TreeSize {
+    pub bytes: u64,
+    /// True when part of the tree was not counted, so `bytes` is a lower bound.
+    pub approximate: bool,
 }
 
-/// The testable core of [`remove_tree`]: `device` answers which filesystem an
-/// entry is on, so a test can claim a nested folder is another mount.
-#[cfg(test)]
-pub(crate) fn remove_tree_with(
-    root: &Path,
-    device: &dyn Fn(&OsStr, u64) -> u64,
-) -> Result<Removed> {
-    walk(root, device)
+/// A folder opened once, so its ownership, its filesystem and its tree are the
+/// same folder. Removal and measurement both walk from this descriptor.
+#[derive(Debug)]
+pub(crate) struct Tree {
+    directory: File,
+    path: PathBuf,
 }
 
-type DeviceFn<'a> = &'a dyn Fn(&OsStr, u64) -> u64;
+impl Tree {
+    /// Open a folder without following a symlink at it.
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        let directory =
+            open_directory(path).map_err(|source| Error::io("cannot open", path, &source))?;
+        Ok(Self {
+            directory,
+            path: path.to_path_buf(),
+        })
+    }
 
-fn same_device(_name: &OsStr, device: u64) -> u64 {
+    /// The descriptor the marker is read through and the walk descends.
+    pub(crate) fn directory(&self) -> &File {
+        &self.directory
+    }
+
+    /// The path the folder was opened at, for the reports that name it.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Remove this folder and its tree.
+    pub(crate) fn remove(self) -> Result<Removed> {
+        remove_opened(self, &same_device)
+    }
+
+    /// The testable core of [`Tree::remove`].
+    #[cfg(test)]
+    pub(crate) fn remove_with(self, device: DeviceFn<'_>) -> Result<Removed> {
+        remove_opened(self, device)
+    }
+}
+
+/// The testable core: `device` answers which filesystem a folder is on, so a
+/// test can claim a nested folder is another mount. It is asked with the path
+/// and the device of the descriptor that was opened.
+type DeviceFn<'a> = &'a dyn Fn(&Path, u64) -> u64;
+
+fn same_device(_path: &Path, device: u64) -> u64 {
     device
 }
 
-fn walk(root: &Path, device: DeviceFn<'_>) -> Result<Removed> {
-    let directory = open_at(None, root.as_os_str())
-        .map_err(|source| Error::io("cannot open", root, &source))?;
-    let root_device = directory
-        .metadata()
-        .map_err(|source| Error::io("cannot inspect", root, &source))?
-        .dev();
+/// Remove a tree without following a symlink and without crossing into another
+/// filesystem.
+#[cfg(test)]
+pub(crate) fn remove_tree_with(path: &Path, device: DeviceFn<'_>) -> Result<Removed> {
+    Tree::open(path)?.remove_with(device)
+}
+
+fn remove_opened(tree: Tree, device: DeviceFn<'_>) -> Result<Removed> {
+    let Tree { directory, path } = tree;
+    let root_device =
+        device_of(&directory).map_err(|source| Error::io("cannot inspect", &path, &source))?;
     let mut removed = Removed::default();
-    if remove_contents(&directory, root, root_device, 0, device, &mut removed)? {
-        std::fs::remove_dir(root).map_err(|source| Error::io("cannot remove", root, &source))?;
+    if !remove_contents(&directory, &path, root_device, 0, device, &mut removed)? {
+        // A nested mount or an over-deep tree stays: Barge never reaches across.
+        removed.skipped.push(path);
+        return Ok(removed);
+    }
+    // The folder is empty. Remove it only while the path still names the folder
+    // this walk was opened on.
+    let current = super::file_identity(&directory)
+        .ok()
+        .zip(super::path_identity(&path).ok().flatten())
+        .is_some_and(|(opened, named)| opened == named);
+    if current {
+        std::fs::remove_dir(&path).map_err(|source| Error::io("cannot remove", &path, &source))?;
         removed.removed = true;
     } else {
-        // A nested mount or an over-deep tree stays: Barge never reaches across.
-        removed.skipped.push(root.to_path_buf());
+        removed.skipped.push(path);
     }
     Ok(removed)
 }
@@ -110,16 +164,34 @@ fn remove_contents(
                 .map_err(|source| Error::io("cannot remove", &child, &source))?;
             continue;
         }
-        if device(&name, u64::try_from(metadata.st_dev).unwrap_or(0)) != root_device {
+        let nested = match open_at(Some(directory), &name) {
+            Ok(nested) => nested,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(Error::io("cannot open", &child, &source)),
+        };
+        // The filesystem is read from the descriptor, not from the entry seen a
+        // moment ago: a replacement mount cannot be descended.
+        let nested_device =
+            device_of(&nested).map_err(|source| Error::io("cannot inspect", &child, &source))?;
+        if device(&child, nested_device) != root_device {
             removed.skipped.push(child);
             empty = false;
             continue;
         }
-        let nested = open_at(Some(directory), &name)
-            .map_err(|source| Error::io("cannot open", &child, &source))?;
         if remove_contents(&nested, &child, root_device, depth + 1, device, removed)? {
-            unlink_at(directory, &name, libc::AT_REMOVEDIR)
-                .map_err(|source| Error::io("cannot remove", &child, &source))?;
+            // Remove the folder this walk emptied, and only while the name still
+            // means it: a replacement must not lose an empty folder.
+            let current = super::file_identity(&nested)
+                .ok()
+                .zip(super::path_identity(&child).ok().flatten())
+                .is_some_and(|(opened, named)| opened == named);
+            if current {
+                unlink_at(directory, &name, libc::AT_REMOVEDIR)
+                    .map_err(|source| Error::io("cannot remove", &child, &source))?;
+            } else {
+                removed.skipped.push(child);
+                empty = false;
+            }
         } else {
             empty = false;
         }
@@ -127,10 +199,119 @@ fn remove_contents(
     Ok(empty)
 }
 
+/// Measure a tree without following a symlink, without crossing into another
+/// filesystem and without descending past [`MAX_DEPTH`]. Anything the walk could
+/// not see is reported as an approximate size rather than counted as nothing.
+pub(crate) fn measure_tree(path: &Path) -> TreeSize {
+    measure_opened(path, &same_device)
+}
+
+/// The testable core of [`measure_tree`].
+#[cfg(test)]
+pub(crate) fn measure_tree_with(path: &Path, device: DeviceFn<'_>) -> TreeSize {
+    measure_opened(path, device)
+}
+
+fn measure_opened(path: &Path, device: DeviceFn<'_>) -> TreeSize {
+    let mut measured = TreeSize::default();
+    let directory = match open_directory(path) {
+        Ok(directory) => directory,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return measured,
+        Err(_) => {
+            // Not a folder: a plain file is counted, anything else is unknown.
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if !metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    measured.bytes = metadata.len();
+                }
+                _ => measured.approximate = true,
+            }
+            return measured;
+        }
+    };
+    let root_device = match device_of(&directory) {
+        Ok(device) => device,
+        Err(_) => {
+            measured.approximate = true;
+            return measured;
+        }
+    };
+    measure_contents(&directory, path, root_device, 0, device, &mut measured);
+    measured
+}
+
+fn measure_contents(
+    directory: &File,
+    path: &Path,
+    root_device: u64,
+    depth: usize,
+    device: DeviceFn<'_>,
+    measured: &mut TreeSize,
+) {
+    if depth >= MAX_DEPTH {
+        // Deeper than deletion goes, so the rest is neither counted nor claimed.
+        measured.approximate = true;
+        return;
+    }
+    let entries = match read_names(directory) {
+        Ok(entries) => entries,
+        Err(_) => {
+            measured.approximate = true;
+            return;
+        }
+    };
+    for name in entries {
+        let child = path.join(&name);
+        let metadata = match stat_at(directory, &name) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                measured.approximate = true;
+                continue;
+            }
+        };
+        let kind = metadata.st_mode & libc::S_IFMT;
+        if kind == libc::S_IFLNK {
+            // A symlink is never followed, so its target is not counted.
+            continue;
+        }
+        if kind != libc::S_IFDIR {
+            measured.bytes = measured
+                .bytes
+                .saturating_add(u64::try_from(metadata.st_size).unwrap_or(0));
+            continue;
+        }
+        let nested = match open_at(Some(directory), &name) {
+            Ok(nested) => nested,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                measured.approximate = true;
+                continue;
+            }
+        };
+        let nested_device = match device_of(&nested) {
+            Ok(device) => device,
+            Err(_) => {
+                measured.approximate = true;
+                continue;
+            }
+        };
+        if device(&child, nested_device) != root_device {
+            // Another filesystem's data is not Barge's to count.
+            continue;
+        }
+        measure_contents(&nested, &child, root_device, depth + 1, device, measured);
+    }
+}
+
+fn device_of(directory: &File) -> std::io::Result<u64> {
+    Ok(directory.metadata()?.dev())
+}
+
 /// The names in an open folder. A read error mid-stream is not distinguished
 /// from the end of the stream: `errno` access is platform-specific, and a missed
-/// entry leaves the folder non-empty, so the caller fails loudly on a removal
-/// instead of claiming a folder it did not empty.
+/// entry leaves the folder non-empty, so a removal fails loudly instead of
+/// claiming a folder it did not empty, and a measurement that missed an entry is
+/// still a lower bound.
 fn read_names(directory: &File) -> std::io::Result<Vec<OsString>> {
     // `fdopendir` takes ownership of the descriptor it is given, so hand it a
     // duplicate and keep the caller's.
@@ -158,7 +339,7 @@ fn read_names(directory: &File) -> std::io::Result<Vec<OsString>> {
             break;
         }
         // SAFETY: the entry pointer is non-null and its name is NUL-terminated.
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
         let bytes = name.to_bytes();
         if bytes == b"." || bytes == b".." {
             continue;
@@ -171,7 +352,7 @@ fn read_names(directory: &File) -> std::io::Result<Vec<OsString>> {
     Ok(names)
 }
 
-/// Open one folder, without following a symlink and without waiting on a fifo.
+/// Open one folder, without following a symlink at it.
 fn open_at(directory: Option<&File>, name: &OsStr) -> std::io::Result<File> {
     let name = c_name(name)?;
     let parent = directory.map_or(libc::AT_FDCWD, AsRawFd::as_raw_fd);
@@ -246,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn a_nested_filesystem_is_skipped() {
+    fn a_nested_filesystem_is_skipped_by_the_opened_descriptor() {
         let temp = crate::testing::TempDir::new("tree-device").unwrap();
         let root = temp.path().join("slot-0123456789abcdef");
         let nested = root.join("nested");
@@ -259,9 +440,11 @@ mod tests {
             .len();
 
         // The fixture cannot mount a second filesystem, so the seam reports one
-        // for the folder a mount would appear as.
-        let removed = remove_tree_with(&root, &|name, device| {
-            if name == "nested" {
+        // for the folder a mount would appear as. The decision is taken on the
+        // descriptor that was opened, so a swap between the entry and the open
+        // cannot change it.
+        let removed = remove_tree_with(&root, &|path, device| {
+            if path.ends_with("nested") {
                 device + 1
             } else {
                 device
@@ -285,6 +468,34 @@ mod tests {
     }
 
     #[test]
+    fn an_opened_tree_keeps_the_folder_it_was_opened_on() {
+        let temp = crate::testing::TempDir::new("tree-replaced").unwrap();
+        let root = temp.path().join("slot-0123456789abcdef");
+        std::fs::create_dir(&root).unwrap();
+        crate::root::write_marker(&root, &marker("0123456789abcdef")).unwrap();
+        std::fs::write(root.join("owned.bin"), b"owned").unwrap();
+
+        let tree = Tree::open(&root).unwrap();
+        // A replacement at the path after the open, as a racing writer does.
+        let held = temp.path().join("held");
+        std::fs::rename(&root, &held).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("replacement.bin"), b"keep me").unwrap();
+
+        assert_eq!(tree.path(), root.as_path(), "the tree names what it opened");
+        let removed = tree.remove().unwrap();
+
+        assert!(removed.skipped.contains(&root), "the path changed under it");
+        assert!(!removed.removed);
+        assert!(
+            root.join("replacement.bin").exists(),
+            "the replacement was never walked"
+        );
+        assert!(!held.join("owned.bin").exists(), "the opened tree was");
+        assert!(held.is_dir(), "the folder that moved is left empty");
+    }
+
+    #[test]
     fn the_walk_stops_at_the_depth_cap() {
         let temp = crate::testing::TempDir::new("tree-depth").unwrap();
         let root = temp.path().join("slot-0123456789abcdef");
@@ -295,7 +506,7 @@ mod tests {
             deepest = deepest.join("nested");
             std::fs::create_dir(&deepest).unwrap();
         }
-        let removed = remove_tree(&root).unwrap();
+        let removed = Tree::open(&root).unwrap().remove().unwrap();
         assert!(!removed.skipped.is_empty(), "the deep tree stays in place");
         assert!(!removed.removed);
         assert!(deepest.is_dir());

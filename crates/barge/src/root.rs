@@ -1,13 +1,14 @@
 //! Roots: a directory Barge created inside an area, its marker, and what a
 //! listing reports about it.
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::os::TreeSize;
 use crate::state::publish;
 
 /// The schema name of a root marker.
@@ -127,8 +128,18 @@ pub(crate) enum MarkerRead {
 
 /// Read the marker in `folder`.
 pub(crate) fn read_marker(folder: &Path) -> MarkerRead {
+    read_marker_opened(crate::os::open_marker(folder, MARKER_NAME), folder)
+}
+
+/// Read the marker through an already open folder, so the ownership check names
+/// the folder the caller then acts on.
+pub(crate) fn read_marker_in(directory: &File, folder: &Path) -> MarkerRead {
+    read_marker_opened(crate::os::open_marker_at(directory, MARKER_NAME), folder)
+}
+
+fn read_marker_opened(opened: std::io::Result<File>, folder: &Path) -> MarkerRead {
     let path = folder.join(MARKER_NAME);
-    let bytes = match crate::os::open_marker(folder, MARKER_NAME).and_then(|mut file| {
+    let bytes = match opened.and_then(|mut file| {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         Ok(bytes)
@@ -265,96 +276,22 @@ pub(crate) fn mint_id() -> Result<String> {
     Ok(id)
 }
 
-/// A measured tree size, and whether the walk saw all of it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct TreeSize {
-    pub bytes: u64,
-    /// True when part of the tree was not counted, so `bytes` is a lower bound.
-    pub approximate: bool,
-}
-
-impl TreeSize {
-    fn add(&mut self, other: Self) {
-        self.bytes = self.bytes.saturating_add(other.bytes);
-        self.approximate = self.approximate || other.approximate;
-    }
-}
-
 /// The bytes a folder holds, without following symlinks or crossing into
-/// another filesystem. Anything the walk could not read is reported as an
-/// approximate size rather than silently counted as nothing.
+/// another filesystem. Any part of the tree the walk could not see is reported
+/// as an approximate size rather than silently counted as nothing.
 pub(crate) fn tree_bytes(path: &Path) -> TreeSize {
     #[cfg(test)]
     TREE_BYTES_CALLS.with(|calls| calls.set(calls.get() + 1));
-    tree_bytes_inner(path, 0, &|_child, device| device)
+    crate::os::measure_tree(path)
 }
 
 /// The testable core of [`tree_bytes`]: `device` answers which filesystem a
 /// folder is on, so a test can claim a nested folder is another mount.
 #[cfg(test)]
 pub(crate) fn tree_bytes_with(path: &Path, device: &dyn Fn(&Path, u64) -> u64) -> TreeSize {
-    tree_bytes_inner(path, 0, device)
-}
-
-fn tree_bytes_inner(path: &Path, depth: usize, device: &dyn Fn(&Path, u64) -> u64) -> TreeSize {
-    let mut size = TreeSize::default();
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return size,
-        Err(_) => {
-            size.approximate = true;
-            return size;
-        }
-    };
-    if !metadata.is_dir() {
-        size.bytes = metadata.len();
-        return size;
-    }
-    if depth >= crate::os::MAX_DEPTH {
-        // Deeper than deletion goes, so the rest is neither counted nor claimed.
-        size.approximate = true;
-        return size;
-    }
-    let root_device = crate::os::device_of(&metadata);
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(_) => {
-            size.approximate = true;
-            return size;
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                size.approximate = true;
-                continue;
-            }
-        };
-        let child = entry.path();
-        let child_metadata = match fs::symlink_metadata(&child) {
-            Ok(metadata) => metadata,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                size.approximate = true;
-                continue;
-            }
-        };
-        if child_metadata.file_type().is_symlink() {
-            continue;
-        }
-        if child_metadata.is_dir() {
-            if device(&child, crate::os::device_of(&child_metadata)) != root_device {
-                // A nested mount is another filesystem's data, so it is skipped
-                // by design rather than counted or marked approximate.
-                continue;
-            }
-            size.add(tree_bytes_inner(&child, depth + 1, device));
-        } else {
-            size.bytes = size.bytes.saturating_add(child_metadata.len());
-        }
-    }
-    size
+    #[cfg(test)]
+    TREE_BYTES_CALLS.with(|calls| calls.set(calls.get() + 1));
+    crate::os::tree::measure_tree_with(path, device)
 }
 
 #[cfg(test)]
@@ -375,6 +312,7 @@ pub(crate) fn tree_bytes_calls() -> usize {
 #[cfg(test)]
 mod tree_size_tests {
     use super::*;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
     /// Restores a folder's mode so the fixture can still remove it.
@@ -423,7 +361,7 @@ mod tree_size_tests {
         let (_temp, root) = folder("root-depth");
         fs::write(root.join("top.bin"), vec![b'x'; 4]).unwrap();
         let mut deepest = root.clone();
-        for _ in 0..crate::os::MAX_DEPTH + 1 {
+        for _ in 0..crate::os::tree::MAX_DEPTH + 1 {
             deepest = deepest.join("nested");
             fs::create_dir(&deepest).unwrap();
         }

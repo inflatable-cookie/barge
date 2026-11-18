@@ -36,11 +36,15 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
   away.
 - **Deletion stays inside what it owns.** Deleting never follows a symlink and
   never descends into another filesystem (a nested mount). The walk is
-  descriptor-relative — `openat` with `O_NOFOLLOW`, `fstatat`, `unlinkat` — so a
-  folder swapped for a symlink between the check and the descent cannot
-  redirect it. Measuring a root holds the same boundary and stops at the same
-  depth. A trash entry is deleted only when its marker still matches the area;
-  being inside `.trash/` is not enough.
+  descriptor-relative — `openat` with `O_NOFOLLOW`, `fstatat`, `unlinkat` — and
+  both the marker that proves ownership and the filesystem each folder is on are
+  read from the descriptor that was opened, never from a path or an entry seen a
+  moment earlier. A folder swapped for a symlink, or a mount swapped for a plain
+  folder, therefore cannot redirect the walk; a folder a racing writer puts at
+  the path after it is opened is never walked. Measuring a root uses the same
+  walk, holds the same boundary and stops at the same depth. A trash entry is
+  deleted only when its marker still matches the area; being inside `.trash/`
+  is not enough.
 - **A crash leaves trash, not ambiguity.** A rename is atomic. A crash before
   the rename leaves the root intact; a crash after it leaves owned trash, which
   the next prune or sweep removes. No journal is needed.
@@ -170,7 +174,9 @@ compatibility, freshness or what a root contains.
   released; roots without a recorded size are measured once on the next
   soft-cap check. The total is approximate between releases. A size a walk could
   not take exactly, because an entry was unreadable or the tree is deeper than
-  deletion reaches, is reported as approximate rather than as exact.
+  deletion reaches, is reported as approximate rather than as exact, and only a
+  complete measurement is recorded: a lower bound is never later read back as an
+  exact size.
 - An eviction that fails for a reason the filesystem gives — a rename or a
   delete that cannot be done — fails the prune with that error. Only a policy
   refusal is reported as a kept root. A trash copy a delete left behind is

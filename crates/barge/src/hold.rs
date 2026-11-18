@@ -151,8 +151,15 @@ impl Drop for Hold {
         // size is advisory, so a tree that changes under it is not a problem.
         self.file.take();
         let now = self.clock.now_unix_ms();
-        let bytes = tree_bytes(&self.root_path).bytes;
-        let _ = record_activity(&self.activity_dir, &self.root_id, now, Some(bytes));
+        let size = tree_bytes(&self.root_path);
+        // Only a complete measurement is cached: a lower bound recorded as an
+        // exact size would be reported as exact by every later reader.
+        let recorded = if size.approximate {
+            None
+        } else {
+            Some(size.bytes)
+        };
+        let _ = record_activity(&self.activity_dir, &self.root_id, now, recorded);
     }
 }
 
@@ -203,12 +210,16 @@ struct ActivityRecord {
     schema: String,
     root_id: String,
     last_used_unix_ms: u64,
+    /// The root's size, recorded only when a walk saw the whole tree: a lower
+    /// bound is never cached where a later reader would report it as exact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     root_bytes: Option<u64>,
 }
 
 /// Record a root's last use. The record is advisory: a failure is not a reason
-/// to fail the hold, it only makes the root look older to prune.
+/// to fail the hold, it only makes the root look older to prune. A `root_bytes`
+/// of `None` keeps whatever complete size was recorded before, so an incomplete
+/// measurement never replaces one.
 pub(crate) fn record_activity(
     activity_dir: &Path,
     root_id: &str,
@@ -233,6 +244,7 @@ pub(crate) fn read_activity(activity_dir: &Path, root_id: &str) -> Option<u64> {
     read_activity_record(activity_dir, root_id).map(|record| record.last_used_unix_ms)
 }
 
+/// A root's last complete size measurement, when one was recorded.
 pub(crate) fn read_activity_bytes(activity_dir: &Path, root_id: &str) -> Option<u64> {
     read_activity_record(activity_dir, root_id).and_then(|record| record.root_bytes)
 }
