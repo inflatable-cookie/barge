@@ -99,6 +99,9 @@ code reads better, as long as the behaviour holds.
 let barge = Barge::open()?;                       // account state dir
 let preview = Barge::open_read_only()?;           // passive account inspection
 barge.register_volume(VolumeRegistration::new("Builds", mount))?;
+let layout = barge.layout()?;                     // account resource placements
+let scratch = barge.resource_path(Class::Scratch, Some("project"))?;
+let survey = barge.survey("Builds", true)?;       // read-only inventory
 let vol = barge.volume("Builds")?;
 vol.state()?;                                     // Present | Absent | Mismatch
 
@@ -183,7 +186,8 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
 
 `barge` wraps the library: `volume register|list|status`, `area list`,
 `root list [--bytes]|pin|unpin|evict`, `prune [--dry-run]`, `scratch new|sweep`,
-`status`. `--json` prints one document with a top-level `schema` field
+`status`, `layout show|set`, `path`, `env`, `survey`. `--json` prints one
+document with a top-level `schema` field
 (`barge.<kind>/<n>`); consumers check it and refuse unknown versions. Exit
 codes: 0 success, 1 refused (nothing changed), 2 usage error, 3 internal error.
 
@@ -228,8 +232,7 @@ path keeps the hold descriptor inherited.
 
 Designed separately, not yet built:
 
-- **Resource classes, layout, bindings, cache and kept placements, doctor and
-  moves:** [resources](resources.md).
+- **Bindings, cache and kept placements, doctor and moves:** [resources](resources.md).
 - **Worktree pools:** areas of git worktrees leased through holds; see
   [vision](vision.md#direction).
 - **Machine control:** [machines](machines.md).

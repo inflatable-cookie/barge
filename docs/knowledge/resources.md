@@ -1,7 +1,6 @@
 # Resources and bindings
 
-Status: design approved by Tom, 2026-11-18. Not built yet; see the build order. Nothing here is built
-yet. The lean storage core in [architecture](architecture.md) is the mechanism
+Status: design approved by Tom, 2026-11-18. Step 1 is built; later steps remain planned. The lean storage core in [architecture](architecture.md) is the mechanism
 this design builds on and does not change.
 
 ## The problem
@@ -263,7 +262,7 @@ CLI:
 
 Each step is its own brief, reviewed as usual.
 
-1. Classes and the layout manifest; `path` and `env`; `survey`.
+1. **Built:** classes and the layout manifest; `path` and `env`; `survey`.
 2. Binding records, the `link` kind and `doctor`; adopt the Cargo links.
 3. `init` with workflow blocks; adopt this repository, then Effigy's.
 4. Adapters: Paseo, Nucleus, Effigy, Colima, shell environment.

@@ -12,8 +12,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use barge::{
-    Absent, AreaSpec, Availability, Barge, Durability, Error, ErrorKind, Result, RootInfo,
-    VolumeRegistration, VolumeState, VolumeStatus,
+    Absent, AreaSpec, Availability, Barge, Class, Durability, Error, ErrorKind, Placement, Result,
+    RootInfo, VolumeRegistration, VolumeState, VolumeStatus,
 };
 use serde_json::{json, Value};
 
@@ -48,6 +48,10 @@ fn run(arguments: &[String], json: bool) -> Result<()> {
             Ok(())
         }
         "status" => status(rest, json),
+        "layout" => layout(rest, json),
+        "path" => resource_path(rest, json),
+        "env" => resource_env(rest),
+        "survey" => survey(rest, json),
         "volume" => volume(rest, json),
         "area" => area(rest, json),
         "root" => root(rest, json),
@@ -66,6 +70,10 @@ barge — storage volumes, areas, roots, holds, pins, pruning and scratch
 
 usage: barge [--json] <command>
 
+  layout show|set                          inspect or change placements
+  path <class> [--project P]              resolve a resource path
+  env [--shell zsh|bash|fish]             shell assignments
+  survey <volume> [--no-bytes]            inspect top-level items
   status                                  every volume, area and free space
   volume register --name N --mount PATH   register a volume (reads its UUID)
     [--uuid U] [--root-dir DIR] [--availability permanent|ephemeral]
@@ -87,6 +95,140 @@ usage: barge [--json] <command>
 SIZES: integer bytes, or KiB, MiB, GiB, TiB.
 "
     .to_string()
+}
+
+fn layout(arguments: &[String], json: bool) -> Result<()> {
+    let (command, rest) = arguments
+        .split_first()
+        .ok_or_else(|| Error::usage("layout needs show or set"))?;
+    match command.as_str() {
+        "show" => {
+            let options = Options::parse(rest, &[], &[])?;
+            expect_no_positionals(&options)?;
+            let barge = Barge::open_read_only()?;
+            let layout = barge.layout()?;
+            let mut disagreements = Vec::new();
+            for volume in barge.volumes()? {
+                if matches!(volume.state()?, VolumeState::Present)
+                    && barge.layout_disagrees(volume.name())?
+                {
+                    disagreements.push(volume.name().to_string());
+                }
+            }
+            if json {
+                document(
+                    "barge.layout-show/1",
+                    vec![
+                        ("layout", json!(layout)),
+                        ("disagreements", json!(disagreements)),
+                    ],
+                )?;
+            } else {
+                for (class, placement) in &layout.classes {
+                    println!(
+                        "{}: {} / {}",
+                        class.name(),
+                        placement.volume,
+                        placement.path
+                    );
+                }
+                for name in disagreements {
+                    eprintln!("barge: layout record on {name} disagrees with account");
+                }
+            }
+            Ok(())
+        }
+        "set" => {
+            let options = Options::parse(rest, &["volume", "path", "absent"], &[])?;
+            let class = options.single("layout set", "class")?.parse::<Class>()?;
+            let barge = Barge::open()?;
+            let absent = match options.get("absent") {
+                Some(value) => parse_absent(&value)?,
+                None => barge
+                    .layout()?
+                    .classes
+                    .get(&class)
+                    .map(|p| p.absent.clone())
+                    .unwrap_or(Absent::Fail),
+            };
+            let placement = Placement {
+                volume: options.required("volume")?,
+                path: options.required("path")?,
+                absent,
+            };
+            let result = barge.set_layout(class, placement)?;
+            if json {
+                document("barge.layout/1", vec![("layout", json!(result))])?;
+            } else {
+                println!("updated {} layout", class.name());
+            }
+            Ok(())
+        }
+        _ => Err(Error::usage("layout needs show or set")),
+    }
+}
+
+fn resource_path(arguments: &[String], json: bool) -> Result<()> {
+    let options = Options::parse(arguments, &["project"], &[])?;
+    let class = options.single("path", "class")?.parse::<Class>()?;
+    let resolved =
+        Barge::open_read_only()?.resource_path(class, options.get("project").as_deref())?;
+    if resolved.fallback {
+        eprintln!("barge: using fallback for {}", class.name());
+    }
+    if json {
+        document("barge.path/1", vec![("path", json!(resolved))])?;
+    } else {
+        println!("{}", resolved.path.display());
+    }
+    Ok(())
+}
+
+fn resource_env(arguments: &[String]) -> Result<()> {
+    let options = Options::parse(arguments, &["shell"], &[])?;
+    expect_no_positionals(&options)?;
+    let shell = options.get("shell").unwrap_or_else(|| "zsh".to_string());
+    if !["zsh", "bash", "fish"].contains(&shell.as_str()) {
+        return Err(Error::usage("shell must be zsh, bash or fish"));
+    }
+    let barge = Barge::open_read_only()?;
+    match barge.resource_env(&shell) {
+        Ok((assignment, fallback)) => {
+            if fallback {
+                eprintln!("barge: using fallback for scratch");
+            }
+            println!("{assignment}");
+        }
+        Err(error) if matches!(error.kind(), ErrorKind::Refused | ErrorKind::NotFound) => {
+            eprintln!("barge: {}", error.message())
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+fn survey(arguments: &[String], json: bool) -> Result<()> {
+    let options = Options::parse(arguments, &[], &["no-bytes"])?;
+    let name = options.single("survey", "volume")?;
+    let items = Barge::open_read_only()?.survey(&name, !options.flag("no-bytes"))?;
+    if json {
+        document(
+            "barge.survey/1",
+            vec![("volume", json!(name)), ("items", json!(items))],
+        )?;
+    } else {
+        for item in items {
+            println!(
+                "{}  {}{}",
+                item.path.display(),
+                item.classification,
+                item.bytes
+                    .map(|b| format!("  {}", format_size(b)))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn status(arguments: &[String], json: bool) -> Result<()> {
@@ -138,7 +280,7 @@ fn volume(arguments: &[String], json: bool) -> Result<()> {
                     "reserve",
                     "floor",
                 ],
-                &[],
+                &["import-layout"],
             )?;
             expect_no_positionals(&options)?;
             let name = options.required("name")?;
@@ -181,6 +323,13 @@ fn volume(arguments: &[String], json: bool) -> Result<()> {
             let barge = Barge::open()?;
             let volume = barge.register_volume(registration)?;
             let state = volume.state()?;
+            if options.flag("import-layout") {
+                barge.import_volume_layout(&name)?;
+            } else if barge.volume_layout(&name)?.is_some()
+                && barge.layout()?.classes.values().all(|p| p.volume != name)
+            {
+                eprintln!("barge: volume {name} has a layout record; register with --import-layout to import it");
+            }
             if json {
                 document(
                     "barge.volume/1",
