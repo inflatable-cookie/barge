@@ -363,7 +363,9 @@ fn evict(
                 bytes_approximate: eviction.bytes_approximate,
                 reason,
             };
-            report.freed_bytes = report.freed_bytes.saturating_add(evicted.bytes);
+            if eviction.deleted {
+                report.freed_bytes = report.freed_bytes.saturating_add(evicted.bytes);
+            }
             report.evicted.push(evicted.clone());
             Ok(Some(evicted))
         }

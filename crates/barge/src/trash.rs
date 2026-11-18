@@ -90,6 +90,7 @@ fn remove_owned_tree_checked(path: &Path, area: &str, id: Option<&str>) -> Resul
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static FAIL_DELETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static OPEN_TREE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
 }
@@ -138,28 +139,48 @@ impl Area {
         // lock file is no longer useful. Unlinking it does not release our lock;
         // dropping the descriptor does.
         let _ = fs::remove_file(&lock_path);
-        let (deleted, kept_reason) =
-            match crate::trash::remove_owned_tree_for_id(&trash_path, &self.key().label(), id) {
-                Ok(deletion) if deletion.skipped.is_empty() => (true, None),
-                Ok(deletion) => (
-                    false,
-                    Some(format!(
-                        "{} entr{} stayed in place, starting at {}",
-                        deletion.skipped.len(),
-                        if deletion.skipped.len() == 1 {
-                            "y"
-                        } else {
-                            "ies"
-                        },
-                        deletion.skipped[0].display()
-                    )),
-                ),
-                Err(error) => (false, Some(error.message().to_string())),
-            };
         let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
         let _ = fs::remove_file(hold::activity_path(&activity, id));
         let pin = pin_path(&directory, id);
         let _ = fs::remove_file(&pin);
+        #[cfg(test)]
+        let injected = FAIL_DELETE.with(|flag| flag.replace(false));
+        #[cfg(not(test))]
+        let injected = false;
+        let deletion = if injected {
+            Err(Error::new(
+                crate::ErrorKind::Io,
+                "injected deletion failure",
+            ))
+        } else {
+            crate::trash::remove_owned_tree_for_id(&trash_path, &self.key().label(), id)
+        };
+        let (deleted, kept_reason) = match deletion {
+            Ok(deletion) if deletion.skipped.is_empty() => (true, None),
+            Ok(deletion) => (
+                false,
+                Some(format!(
+                    "{} entr{} stayed in place, starting at {}",
+                    deletion.skipped.len(),
+                    if deletion.skipped.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
+                    deletion.skipped[0].display()
+                )),
+            ),
+            Err(error) => {
+                return Err(Error::new(
+                    crate::ErrorKind::Io,
+                    format!(
+                        "{}; evicted root remains in trash at {}",
+                        error.message(),
+                        trash_path.display()
+                    ),
+                ))
+            }
+        };
         Ok(Eviction {
             area: self.key().label(),
             id: id.to_string(),

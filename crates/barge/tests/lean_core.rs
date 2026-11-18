@@ -888,3 +888,62 @@ fn readonly_scratch_refuses_a_different_declaration() {
     let error = read.scratch("Builds", "project").unwrap_err();
     assert!(error.message().contains("soft_cap_bytes"));
 }
+
+#[test]
+fn scratch_follows_placed_class() {
+    let fixture = Fixture::new();
+    fixture.register();
+    fixture
+        .barge
+        .set_layout(
+            barge::Class::Scratch,
+            barge::Placement {
+                volume: "Builds".into(),
+                path: "custom-scratch".into(),
+                absent: Absent::Fail,
+            },
+        )
+        .unwrap();
+    let scratch = fixture.barge.scratch("Builds", "project").unwrap();
+    assert_eq!(
+        scratch.location().unwrap().path().unwrap(),
+        fixture.mount.join("custom-scratch/project")
+    );
+    assert_eq!(
+        fixture
+            .barge
+            .resource_path(barge::Class::Scratch, Some("project"))
+            .unwrap()
+            .path,
+        scratch.location().unwrap().path().unwrap()
+    );
+}
+
+#[test]
+fn survey_survives_unreadable_and_skips_system_entries() {
+    let fixture = Fixture::new();
+    fixture.register();
+    let unreadable = fixture.mount.join("private");
+    fs::create_dir(&unreadable).unwrap();
+    fs::write(unreadable.join("file"), b"hidden").unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o0)).unwrap();
+    let system = fixture.mount.join(".Spotlight-V100");
+    fs::create_dir(&system).unwrap();
+    fs::set_permissions(&system, fs::Permissions::from_mode(0o0)).unwrap();
+    let survey = fixture.barge.survey("Builds", true).unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&system, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        survey
+            .iter()
+            .find(|item| item.path == unreadable)
+            .unwrap()
+            .bytes_approximate
+    );
+    assert!(survey
+        .iter()
+        .find(|item| item.path == system)
+        .unwrap()
+        .bytes
+        .is_none());
+}

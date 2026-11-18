@@ -120,13 +120,20 @@ impl Os for PlatformOs {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = mount;
-            Ok(None)
+            unsupported_identity()
         }
     }
 
     fn free_bytes(&self, path: &Path) -> Result<u64> {
         free_space(path)
     }
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn unsupported_identity() -> Result<Option<String>> {
+    Err(Error::unsupported(
+        "volume identity is not supported on this platform",
+    ))
 }
 
 /// The environment variable that replaces the real volume identity.
@@ -218,21 +225,25 @@ pub(crate) fn flock(file: &File, mode: Mode, wait: bool) -> Result<bool> {
     if !wait {
         operation |= libc::LOCK_NB;
     }
-    // SAFETY: `flock` takes one descriptor this process owns and one integer of
-    // flags; it reads and writes no memory of ours.
-    #[allow(unsafe_code)]
-    let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
-    if result == 0 {
-        return Ok(true);
+    loop {
+        // SAFETY: flock takes an owned descriptor and integer flags.
+        #[allow(unsafe_code)]
+        let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
+        if result == 0 {
+            return Ok(true);
+        }
+        let source = std::io::Error::last_os_error();
+        if source.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if !wait && source.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(false);
+        }
+        return Err(Error::new(
+            crate::error::ErrorKind::Io,
+            format!("cannot take a file lock: {source}"),
+        ));
     }
-    let source = std::io::Error::last_os_error();
-    if !wait && source.kind() == std::io::ErrorKind::WouldBlock {
-        return Ok(false);
-    }
-    Err(Error::new(
-        crate::error::ErrorKind::Io,
-        format!("cannot take a file lock: {source}"),
-    ))
 }
 
 pub(crate) fn set_inheritable(file: &File, inheritable: bool) -> Result<()> {
@@ -331,5 +342,16 @@ mod tests {
         ] {
             assert!(canonical_uuid(value).is_err(), "{value:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    #[test]
+    fn unsupported_identity_is_not_absent() {
+        assert_eq!(
+            super::unsupported_identity().unwrap_err().kind(),
+            crate::ErrorKind::Unsupported
+        );
     }
 }

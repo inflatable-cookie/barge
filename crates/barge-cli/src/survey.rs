@@ -16,7 +16,7 @@ pub(super) fn survey(arguments: &[String], json: bool) -> Result<()> {
                 item.path.display(),
                 item.classification,
                 item.bytes
-                    .map(|b| format!("  {}", format_size(b)))
+                    .map(|b| format!("  {}", describe_size(b, item.bytes_approximate)))
                     .unwrap_or_default()
             );
         }

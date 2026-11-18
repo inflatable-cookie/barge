@@ -368,15 +368,15 @@ impl Barge {
             } else {
                 SurveyClassification::Unknown
             };
-            let bytes = if with_bytes {
-                Some(survey_bytes(&path)?)
-            } else {
-                None
-            };
+            let measured = (with_bytes && classification != SurveyClassification::System)
+                .then(|| crate::os::measure_tree(&path));
+            let bytes = measured.as_ref().map(|size| size.bytes);
+            let bytes_approximate = measured.as_ref().is_some_and(|size| size.approximate);
             items.push(SurveyItem {
                 path,
                 classification,
                 bytes,
+                bytes_approximate,
             });
         }
         items.sort_by(|a, b| a.path.cmp(&b.path));
@@ -421,19 +421,7 @@ pub struct SurveyItem {
     pub path: PathBuf,
     pub classification: SurveyClassification,
     pub bytes: Option<u64>,
-}
-
-fn survey_bytes(path: &Path) -> Result<u64> {
-    let metadata = fs::symlink_metadata(path).map_err(|e| Error::io("cannot inspect", path, &e))?;
-    if !metadata.is_dir() {
-        return Ok(metadata.len());
-    }
-    let mut total = 0_u64;
-    for entry in fs::read_dir(path).map_err(|e| Error::io("cannot list", path, &e))? {
-        let entry = entry.map_err(|e| Error::io("cannot list", path, &e))?;
-        total = total.saturating_add(survey_bytes(&entry.path())?);
-    }
-    Ok(total)
+    pub bytes_approximate: bool,
 }
 
 #[cfg(test)]

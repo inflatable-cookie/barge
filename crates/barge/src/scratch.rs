@@ -24,10 +24,33 @@ pub struct Scratch {
 impl Scratch {
     pub(crate) fn open(core: Core, volume_name: &str, project: &str) -> Result<Self> {
         validate_name("scratch project", project)?;
-        let proposed = AreaSpec::new(NAMESPACE, project, volume_name)
-            .absent(Absent::Fail)
-            .counts_toward_reserve(true)
-            .into_record();
+        let placement = core
+            .account_layout()?
+            .classes
+            .get(&crate::Class::Scratch)
+            .cloned();
+        let mut spec = AreaSpec::new(NAMESPACE, project, volume_name);
+        if let Some(placement) = placement {
+            if placement.volume != volume_name {
+                return Err(Error::refused(format!(
+                    "scratch is placed on {}, not {volume_name}",
+                    placement.volume
+                )));
+            }
+            let absent = match placement.absent {
+                Absent::Fail => Absent::Fail,
+                Absent::Fallback { path } => Absent::Fallback {
+                    path: path.join(project),
+                },
+            };
+            if placement.path != NAMESPACE {
+                spec = spec.folder(format!("{}/{}", placement.path, project));
+            }
+            spec = spec.absent(absent);
+        } else {
+            spec = spec.absent(Absent::Fail);
+        }
+        let proposed = spec.counts_toward_reserve(true).into_record();
         Ok(Self {
             area: core.declare_area(proposed)?,
         })

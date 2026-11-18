@@ -49,24 +49,29 @@ pub struct Hold {
     file: Option<File>,
     activity_dir: PathBuf,
     root_path: PathBuf,
+    marker: crate::root::RootMarker,
+    root_directory: File,
     clock: Arc<dyn Clock>,
 }
 
 impl Hold {
     pub(crate) fn new(
-        root_id: String,
         mode: Mode,
         file: File,
         activity_dir: PathBuf,
         root_path: PathBuf,
+        marker: crate::root::RootMarker,
+        root_directory: File,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
-            root_id,
+            root_id: marker.id.clone(),
             mode,
             file: Some(file),
             activity_dir,
             root_path,
+            marker,
+            root_directory,
             clock,
         }
     }
@@ -112,6 +117,12 @@ impl Drop for Hold {
         // walk, and an eviction may follow the release immediately. The recorded
         // size is advisory, so a tree that changes under it is not a problem.
         self.file.take();
+        #[cfg(test)]
+        DROP_HOOK.with(|hook| {
+            if let Some(callback) = hook.borrow_mut().take() {
+                callback();
+            }
+        });
         let now = self.clock.now_unix_ms();
         let size = tree_bytes(&self.root_path);
         // Only a complete measurement is cached, and an incomplete one clears any
@@ -121,7 +132,19 @@ impl Drop for Hold {
         } else {
             RecordedSize::Exact(size.bytes)
         };
-        let _ = record_activity(&self.activity_dir, &self.root_id, now, recorded);
+        if let Some(directory) = self.root_path.parent() {
+            if let Ok(_lock) = crate::area::AreaLock::acquire(directory) {
+                if crate::os::file_identity(&self.root_directory)
+                    .ok()
+                    .is_some_and(|identity| {
+                        crate::os::path_identity(&self.root_path).ok().flatten() == Some(identity)
+                    })
+                    && matches!(crate::root::read_marker(&self.root_path), crate::root::MarkerRead::Valid(ref marker) if marker == &self.marker)
+                {
+                    let _ = record_activity(&self.activity_dir, &self.root_id, now, recorded);
+                }
+            }
+        }
     }
 }
 
@@ -219,4 +242,9 @@ fn read_activity_record(activity_dir: &Path, root_id: &str) -> Option<ActivityRe
 
 pub(crate) fn activity_path(activity_dir: &Path, root_id: &str) -> PathBuf {
     activity_dir.join(format!("{root_id}.json"))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DROP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }

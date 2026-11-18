@@ -204,7 +204,9 @@ compatibility, freshness or what a root contains.
 - An eviction that fails for a reason the filesystem gives — a rename or a
   delete that cannot be done — fails the prune with that error. Only a policy
   refusal is reported as a kept root. A trash copy a delete left behind is
-  reported with the reason it stayed.
+  reported with the reason it stayed when deletion skips a boundary. A deletion
+  error fails the operation and names the trash path; retained trash is not
+  counted as freed.
 - Only the **floor** (default 10 GiB) refuses work, and only once nothing idle
   is left to evict.
 - Low space never moves work to the internal drive. The drive-absent fallback

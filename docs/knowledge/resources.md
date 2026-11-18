@@ -265,7 +265,8 @@ always needs Tom's explicit approval for live data (AGENTS.md guardrail).
 
 `barge survey <volume>` is read-only. It lists every top-level item with its
 size and classifies it: inside a declared class, a known consumer path not yet
-under a class, or unknown. It's the input to the Stash layout lane's migration
+under a class, or unknown. System items are classified without measuring them;
+unreadable or incomplete trees have approximate sizes. It's the input to the Stash layout lane's migration
 plan.
 
 ## Library and CLI additions

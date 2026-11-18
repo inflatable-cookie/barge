@@ -174,7 +174,7 @@ impl Area {
                 Err(source) => return Err(Error::io("cannot inspect", &path, &source)),
             }
         }
-        let (directory, path, metadata) = candidate.ok_or_else(|| {
+        let (_directory, path, metadata) = candidate.ok_or_else(|| {
             Error::not_found(format!(
                 "root folder {folder:?} does not exist directly inside area {}",
                 self.key().label()
@@ -201,8 +201,17 @@ impl Area {
             }
         });
 
-        self.ensure_layout(&directory)?;
-        let _lock = AreaLock::acquire(&directory)?;
+        let directories = self.search_dirs()?;
+        let mut locks = Vec::new();
+        for (dir, _) in &directories {
+            self.ensure_layout(dir)?;
+            if !locks
+                .iter()
+                .any(|(locked, _): &(PathBuf, AreaLock)| locked == dir)
+            {
+                locks.push((dir.clone(), AreaLock::acquire(dir)?));
+            }
+        }
         match read_marker(&path) {
             MarkerRead::Valid(marker) => {
                 let mut differences = Vec::new();
@@ -417,6 +426,7 @@ impl Area {
                 approximate: false,
             };
         }
+        let identity = crate::os::path_identity(&info.path).ok().flatten();
         let size = tree_bytes(&info.path);
         if persist {
             // A complete measurement is cached; an incomplete one clears any
@@ -426,7 +436,19 @@ impl Area {
             } else {
                 hold::RecordedSize::Exact(size.bytes)
             };
-            let _ = hold::record_activity(&activity, &info.id, info.last_used_unix_ms, recorded);
+            if let Ok(_lock) = AreaLock::acquire(&directory) {
+                if identity.is_some()
+                    && crate::os::path_identity(&info.path).ok().flatten() == identity
+                    && matches!(read_marker(&info.path), MarkerRead::Valid(ref marker) if marker.id == info.id && marker.area == self.key().label())
+                {
+                    let _ = hold::record_activity(
+                        &activity,
+                        &info.id,
+                        info.last_used_unix_ms,
+                        recorded,
+                    );
+                }
+            }
         }
         size
     }
@@ -525,13 +547,23 @@ impl Area {
             )));
         }
         let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
+        let _area_lock = AreaLock::acquire(&directory)?;
+        let marker = match read_marker(&current.path) {
+            MarkerRead::Valid(marker) if marker.id == id && marker.area == self.key().label() => {
+                marker
+            }
+            _ => return Err(Error::not_found("root marker changed while acquiring hold")),
+        };
+        let root_directory = File::open(&current.path)
+            .map_err(|e| Error::io("cannot open root", &current.path, &e))?;
         self.record_activity(&directory, id, self.core.clock.now_unix_ms());
         Ok(Some(Hold::new(
-            id.to_string(),
             mode,
             file,
             activity,
             current.path,
+            marker,
+            root_directory,
             self.core.clock.clone(),
         )))
     }
@@ -553,14 +585,28 @@ impl Area {
                 continue;
             }
             match self.evict(&info.id) {
-                Ok(eviction) => report.deleted.push(SweptRoot {
+                Ok(eviction) if eviction.deleted => report.deleted.push(SweptRoot {
                     path: eviction.trash_path,
                     bytes: eviction.bytes,
                 }),
-                Err(error) => report.kept.push(SkippedRoot {
-                    path: info.path,
-                    reason: error.message().to_string(),
+                Ok(eviction) => report.kept.push(SkippedRoot {
+                    path: eviction.trash_path,
+                    reason: eviction
+                        .kept_reason
+                        .unwrap_or_else(|| "trash retained".into()),
                 }),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        crate::ErrorKind::Refused | crate::ErrorKind::NotFound
+                    ) =>
+                {
+                    report.kept.push(SkippedRoot {
+                        path: info.path,
+                        reason: error.message().to_string(),
+                    })
+                }
+                Err(error) => return Err(error),
             }
         }
         Ok(report)
@@ -1137,6 +1183,83 @@ mod eviction_identity_tests {
 
         assert_eq!(error.kind(), crate::error::ErrorKind::UnknownState);
         assert!(area.try_hold(&root.id, Mode::Exclusive).unwrap().is_some());
+    }
+
+    #[test]
+    fn drop_after_eviction_does_not_write_activity_for_replacement() {
+        let (_temp, barge) = fixture();
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let dir = area.location().unwrap().path().unwrap().to_path_buf();
+        fs::create_dir_all(dir.join("slot")).unwrap();
+        let root = area.adopt_root("slot", "slot", "same-id").unwrap();
+        let hold = area.hold(&root.id, Mode::Exclusive).unwrap();
+        let other = area.clone();
+        let replacement = root.path.clone();
+        crate::hold::DROP_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                other.evict("same-id").unwrap();
+                fs::create_dir(&replacement).unwrap();
+                fs::write(replacement.join("data"), vec![1; 100]).unwrap();
+                other.adopt_root("slot", "slot", "same-id").unwrap();
+            }))
+        });
+        drop(hold);
+        let activity = dir.join(BARGE_DIR).join(ACTIVITY_DIR);
+        assert_eq!(hold::read_activity_bytes(&activity, "same-id"), None);
+        assert!(area.list().unwrap().get("same-id").unwrap().bytes >= 100);
+    }
+
+    #[test]
+    fn deletion_error_is_returned_after_rename() {
+        let (_temp, barge) = fixture();
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let root = area.create_root("slot").unwrap();
+        crate::trash::FAIL_DELETE.with(|flag| flag.set(true));
+        let error = area.evict(&root.id).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Io);
+        assert!(error.message().contains("trash"));
+        assert!(!root.path.exists());
+    }
+
+    #[test]
+    fn adoptions_on_both_locations_serialize_duplicate_ids() {
+        use std::sync::Barrier;
+        let (temp, barge) = fixture();
+        let fallback = temp.path().join("fallback");
+        let area = barge
+            .area(
+                AreaSpec::new("test", "roots", "disk").absent(Absent::Fallback {
+                    path: fallback.clone(),
+                }),
+            )
+            .unwrap();
+        let volume = area.location().unwrap().path().unwrap().to_path_buf();
+        fs::create_dir_all(volume.join("one")).unwrap();
+        fs::create_dir_all(fallback.join("two")).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let threads: Vec<_> = ["one", "two"]
+            .into_iter()
+            .map(|name| {
+                let area = area.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    ADOPT_HOOK.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            barrier.wait();
+                        }))
+                    });
+                    area.adopt_root(name, "slot", "same-id")
+                })
+            })
+            .collect();
+        assert_eq!(
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .filter(Result::is_ok)
+                .count(),
+            1
+        );
     }
 
     #[test]

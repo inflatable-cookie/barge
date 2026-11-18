@@ -1,7 +1,7 @@
 //! Reviewed resource moves on a registered volume.
 
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,8 @@ pub struct MovePlan {
     pub source_identity: MoveIdentity,
     pub destination: PathBuf,
     pub destination_parent_identity: MoveIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_directory: Option<PathBuf>,
     pub bindings: Vec<MoveBinding>,
     pub layout: Option<MoveLayout>,
     pub areas: Vec<MoveArea>,
@@ -98,6 +100,7 @@ impl Barge {
                 before,
                 after,
             }),
+            None,
         )
     }
 
@@ -134,7 +137,14 @@ impl Barge {
         } else {
             volume.base().join(&placement.path).join(sub)
         };
-        self.plan_move(&placement.volume, &source, &destination, None)
+        let class_dir = volume.base().join(&placement.path);
+        self.plan_move(
+            &placement.volume,
+            &source,
+            &destination,
+            None,
+            Some(&class_dir),
+        )
     }
 
     fn plan_move(
@@ -143,6 +153,7 @@ impl Barge {
         source: &Path,
         destination: &Path,
         layout: Option<MoveLayout>,
+        creatable: Option<&Path>,
     ) -> Result<MovePlan> {
         let volume = self.volume(volume_name)?;
         volume.require_present()?;
@@ -158,7 +169,29 @@ impl Barge {
         let parent = destination
             .parent()
             .ok_or_else(|| Error::usage("destination needs a parent"))?;
-        let parent = canonical(parent)?;
+        let (parent, create_directory, identity_parent) = match canonical(parent) {
+            Ok(parent) => (parent.clone(), None, parent),
+            Err(_error) if creatable == Some(parent) && !parent.exists() => {
+                let ancestor = parent
+                    .parent()
+                    .ok_or_else(|| Error::usage("class folder needs a parent"))?;
+                let ancestor = canonical(ancestor)?;
+                let name = parent
+                    .file_name()
+                    .ok_or_else(|| Error::usage("class folder needs a name"))?;
+                let parent = ancestor.join(name);
+                let class_folder = self.layout()?.classes.values().any(|placement| {
+                    placement.volume == volume_name && base.join(&placement.path) == parent
+                });
+                if !class_folder {
+                    return Err(Error::refused(
+                        "missing destination parent is not a placed class folder",
+                    ));
+                }
+                (parent.clone(), Some(parent), ancestor)
+            }
+            Err(error) => return Err(error),
+        };
         let name = destination
             .file_name()
             .ok_or_else(|| Error::usage("destination needs a name"))?;
@@ -183,7 +216,7 @@ impl Barge {
             Err(e) => return Err(Error::io("cannot inspect", &destination, &e)),
         }
         let source_identity = identity(&source)?;
-        let destination_parent_identity = identity(&parent)?;
+        let destination_parent_identity = identity(&identity_parent)?;
         if source_identity.dev != destination_parent_identity.dev {
             return Err(Error::refused(
                 "move crosses a filesystem; copy is not supported",
@@ -290,6 +323,7 @@ impl Barge {
             source_identity,
             destination,
             destination_parent_identity,
+            create_directory,
             bindings,
             layout,
             areas,
@@ -372,6 +406,7 @@ impl Barge {
             &plan.source,
             &plan.destination,
             plan.layout.clone(),
+            plan.create_directory.as_deref(),
         )?;
         if &current != plan {
             return Err(Error::refused("move plan changed since review"));
@@ -393,6 +428,12 @@ impl Barge {
             if self.layout_disagrees(&plan.volume)? {
                 return Err(Error::refused("volume layout disagrees with account"));
             }
+        }
+        if let Some(directory) = &plan.create_directory {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(directory)
+                .map_err(|e| Error::io("cannot create class folder", directory, &e))?;
         }
         let mut records = crate::bindings::read(&self.core)?;
         let original_records = records.clone();
